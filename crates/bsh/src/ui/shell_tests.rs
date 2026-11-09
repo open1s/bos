@@ -4324,7 +4324,7 @@ fn the_history_section_collapses_and_clears(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let mode = cx
-        .debug_bounds("task-graph-mode")
+        .debug_bounds("task-view-board")
         .expect("the Tree/List control");
     cx.simulate_click(mode.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -4522,7 +4522,7 @@ fn the_board_retries_a_failed_turn_task(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let mode = cx
-        .debug_bounds("task-graph-mode")
+        .debug_bounds("task-view-board")
         .expect("the Tree/List control");
     cx.simulate_click(mode.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -5193,7 +5193,7 @@ fn the_board_stop_marks_a_running_task(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let mode = cx
-        .debug_bounds("task-graph-mode")
+        .debug_bounds("task-view-board")
         .expect("the Tree/List control");
     cx.simulate_click(mode.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -5310,10 +5310,30 @@ fn the_tasks_graph_draws_the_run_tree(cx: &mut TestAppContext) {
         "a task_create record is a graph node"
     );
 
+    let list = cx
+        .debug_bounds("task-graph-list")
+        .expect("the List segment");
+    cx.simulate_click(list.center(), Modifiers::default());
+    draw_until(cx, "the work-unit list opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("task-graph-list-view").is_some()
+            && cx.debug_bounds("task-view-board").is_some()
+    });
+    let tree = cx
+        .debug_bounds("task-graph-tree")
+        .expect("the Tree segment");
+    cx.simulate_click(tree.center(), Modifiers::default());
+    draw_until(cx, "the tree returns", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("task-graph-canvas").is_some()
+    });
     assert!(
         cx.update(|_, cx| shell.read(cx).right.graph_fit),
         "the graph fits the pane by default"
     );
+    let main = cx.debug_bounds(main_selector).expect("the main node");
+    cx.simulate_click(main.center(), Modifiers::default());
+    draw_until(cx, "the work-unit inspector opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("task-graph-inspector").is_some()
+    });
     let plus = cx
         .debug_bounds("task-graph-zoom-in")
         .expect("the zoom in control");
@@ -5376,7 +5396,7 @@ fn the_tasks_tab_shows_the_workspace_board(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     // The tab opens on the run graph; the store board is the List view.
     let mode = cx
-        .debug_bounds("task-graph-mode")
+        .debug_bounds("task-view-board")
         .expect("the Tree/List control");
     cx.simulate_click(mode.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));

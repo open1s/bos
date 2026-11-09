@@ -172,6 +172,52 @@ fn chip_label(label: impl Into<SharedString>, weight: FontWeight) -> Div {
         .whitespace_nowrap()
 }
 
+/// One row in the new menus: a 30px rounded row on the page, a check slot, and
+/// the soft accent fill the rest of the shell uses for a selected option.
+fn menu_row(label: impl Into<SharedString>, active: bool, disabled: bool) -> AnyElement {
+    let label = label.into();
+    div()
+        .h(px(30.0))
+        .px(px(8.0))
+        .rounded(px(8.0))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .when(active, |row| row.bg(rgb(theme::soft(theme::accent()))))
+        .when(!active && !disabled, |row| {
+            row.hover(|style| style.bg(rgb(theme::hover())))
+        })
+        .when(disabled, |row| row.opacity(0.45))
+        .child(
+            div()
+                .w(px(14.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(active, |slot| {
+                    slot.child(icon(IconName::Check, 14.0, theme::accent()))
+                }),
+        )
+        .child(
+            txt(
+                label,
+                12.5,
+                if disabled {
+                    theme::faint()
+                } else if active {
+                    theme::accent()
+                } else {
+                    theme::text()
+                },
+            )
+            .flex_1()
+            .min_w_0()
+            .truncate(),
+        )
+        .into_any_element()
+}
+
 /// The chip's text: the mode in force, in plain words.
 ///
 /// The effective value is the one the tools obey. A preset ceiling is a
@@ -704,7 +750,10 @@ impl Shell {
                 .ghost()
                 .flex()
                 .items_center()
-                .cursor_pointer(),
+                .cursor_pointer()
+                .bg(rgb(theme::page()))
+                .border_1()
+                .border_color(rgb(theme::border_soft())),
             MODEL_CHIP_CAP,
         )
         .child(chip_label(label, FontWeight::NORMAL));
@@ -784,17 +833,20 @@ impl Shell {
                                 for (model, active) in model_choices(models, &current) {
                                     let pick = shell.clone();
                                     let name = model.clone();
+                                    let label = model.clone();
                                     let owner = provider.clone();
-                                    submenu = submenu.item(
-                                        PopupMenuItem::new(model).checked(active).on_click(
-                                            move |_, _window, cx| {
+                                    submenu =
+                                        submenu.item(
+                                            PopupMenuItem::element(move |_window, _cx| {
+                                                menu_row(label.clone(), active, false)
+                                            })
+                                            .on_click(move |_, _window, cx| {
                                                 pick.update(cx, |this, cx| {
                                                     this.state.select_model_from(&owner, &name);
                                                     cx.notify();
                                                 });
-                                            },
-                                        ),
-                                    );
+                                            }),
+                                        );
                                 }
                             }
                             submenu
@@ -812,15 +864,19 @@ impl Shell {
                             for level in EFFORT_LEVELS {
                                 let pick = effort_shell.clone();
                                 let active = effort_row.as_deref() == level;
+                                let label = effort_level_label(lang, level);
                                 submenu = submenu.item(
-                                    PopupMenuItem::new(effort_level_label(lang, level))
-                                        .checked(active)
-                                        .on_click(move |_, _window, cx| {
+                                    PopupMenuItem::element(move |_window, _cx| {
+                                        menu_row(label.clone(), active, false)
+                                    })
+                                    .on_click(
+                                        move |_, _window, cx| {
                                             pick.update(cx, |this, cx| {
                                                 this.state.set_reasoning_effort(level);
                                                 cx.notify();
                                             });
-                                        }),
+                                        },
+                                    ),
                                 );
                             }
                             submenu
@@ -904,7 +960,7 @@ impl Shell {
             .debug_selector(|| "agent-preset".to_string())
             .child(
                 chip.dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-                    let mut menu = menu;
+                    let mut menu = menu.min_w(px(220.0)).max_w(px(320.0));
                     let pick_default = shell.clone();
                     let session_default = session.clone();
                     let current = explicit.clone();
@@ -913,19 +969,27 @@ impl Shell {
                     // visible: the selection is kept, and the switch that turns
                     // it back on lives in the Agent presets pane.
                     if presets_disabled {
-                        menu = menu
-                            .item(PopupMenuItem::new(lang.tr("input.presetsOff")).disabled(true));
+                        let off = lang.tr("input.presetsOff");
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_window, _cx| {
+                                menu_row(off.clone(), false, true)
+                            })
+                            .disabled(true),
+                        );
                     }
+                    let default_label = lang.tr("input.defaultPreset");
+                    let default_active = current.is_none();
                     menu = menu.item(
-                        PopupMenuItem::new(lang.tr("input.defaultPreset"))
-                            .checked(current.is_none())
-                            .disabled(presets_disabled)
-                            .on_click(move |_, _window, cx| {
-                                pick_default.update(cx, |this, cx| {
-                                    this.state.select_session_preset(&session_default, "");
-                                    cx.notify();
-                                });
-                            }),
+                        PopupMenuItem::element(move |_window, _cx| {
+                            menu_row(default_label.clone(), default_active, presets_disabled)
+                        })
+                        .disabled(presets_disabled)
+                        .on_click(move |_, _window, cx| {
+                            pick_default.update(cx, |this, cx| {
+                                this.state.select_session_preset(&session_default, "");
+                                cx.notify();
+                            });
+                        }),
                     );
                     for (name, widens) in listed.iter() {
                         let pick = shell.clone();
@@ -933,23 +997,31 @@ impl Shell {
                         let picked = name.clone();
                         let chosen = explicit.as_deref() == Some(name.as_str());
                         if presets_disabled {
+                            let label = name.clone();
                             menu = menu.item(
-                                PopupMenuItem::new(name.clone())
-                                    .checked(chosen)
-                                    .disabled(true),
+                                PopupMenuItem::element(move |_window, _cx| {
+                                    menu_row(label.clone(), chosen, true)
+                                })
+                                .disabled(true),
                             );
                         } else if *widens {
                             // Disabled AND labelled: a click cannot record a
                             // preset the send gate would refuse, and the reason
                             // is visible where the choice is made.
+                            let label = format!("{name} · {refused_label}");
                             menu = menu.item(
-                                PopupMenuItem::new(format!("{name} · {refused_label}"))
-                                    .checked(chosen)
-                                    .disabled(true),
+                                PopupMenuItem::element(move |_window, _cx| {
+                                    menu_row(label.clone(), chosen, true)
+                                })
+                                .disabled(true),
                             );
                         } else {
+                            let label = name.clone();
                             menu = menu.item(
-                                PopupMenuItem::new(name.clone()).checked(chosen).on_click(
+                                PopupMenuItem::element(move |_window, _cx| {
+                                    menu_row(label.clone(), chosen, false)
+                                })
+                                .on_click(
                                     move |_, _window, cx| {
                                         pick.update(cx, |this, cx| {
                                             this.state.select_session_preset(&sid, &picked);

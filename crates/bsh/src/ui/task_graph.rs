@@ -16,6 +16,8 @@ pub(crate) enum NodeKind {
     Subagent,
     /// A durable task from the store.
     Task,
+    /// A remote execution node in the federation, not a local child run.
+    Peer,
 }
 
 /// The display state of a node.
@@ -25,6 +27,8 @@ pub(crate) enum GraphStatus {
     Running,
     /// Waiting for a resource.
     Queued,
+    /// Waiting on a dependency or an external result.
+    Waiting,
     /// Between firings.
     Scheduled,
     /// Waiting for an approval.
@@ -43,6 +47,7 @@ impl GraphStatus {
         match self {
             Self::Running => "right.tasks.running",
             Self::Queued => "right.tasks.queued",
+            Self::Waiting => "right.tasks.waiting",
             Self::Scheduled => "right.tasks.scheduled",
             Self::Blocked => "right.tasks.blocked",
             Self::Done => "right.tasks.done",
@@ -71,10 +76,27 @@ pub(crate) struct GraphNode {
     pub(crate) y: f32,
     /// Depth in the tree.
     pub(crate) depth: usize,
+    /// A longer line the inspector shows: a peer objective or a failure.
+    pub(crate) note: Option<String>,
+    /// Work units inside the node: attempts for a task, messages for a run.
+    pub(crate) steps: usize,
 }
 
 /// One connector: parent index to child index.
 pub(crate) type Edge = (usize, usize);
+
+/// A remote peer delegation drawn as its own node.
+#[derive(Clone, Debug)]
+pub(crate) struct PeerNode {
+    /// The delegation id.
+    pub(crate) id: String,
+    /// The objective the peer was handed.
+    pub(crate) title: String,
+    /// The target node name.
+    pub(crate) target: String,
+    /// The delegation's state.
+    pub(crate) status: GraphStatus,
+}
 
 /// The whole graph.
 #[derive(Clone, Debug, Default)]
@@ -92,7 +114,7 @@ pub(crate) struct Graph {
 /// Card geometry, in unscaled pixels.
 pub(crate) const CARD_W: f32 = 260.0;
 /// Card height.
-pub(crate) const CARD_H: f32 = 96.0;
+pub(crate) const CARD_H: f32 = 128.0;
 /// Horizontal gap between siblings.
 pub(crate) const GAP_X: f32 = 40.0;
 /// Vertical gap between levels.
@@ -113,12 +135,34 @@ pub(crate) fn fit_zoom(graph_w: f32, graph_h: f32, available_w: f32, available_h
 }
 
 /// Build the graph for one session.
+#[cfg(test)]
 pub(crate) fn layout(
     session: &str,
     main_title: &str,
     main_status: GraphStatus,
     tasks: &[Task],
     runs: &[SubagentRun],
+    max_width: Option<f32>,
+) -> Graph {
+    layout_with_peers(
+        session,
+        main_title,
+        main_status,
+        tasks,
+        runs,
+        &[],
+        max_width,
+    )
+}
+
+/// Build the graph with remote peer delegations drawn as depth-one peers.
+pub(crate) fn layout_with_peers(
+    session: &str,
+    main_title: &str,
+    main_status: GraphStatus,
+    tasks: &[Task],
+    runs: &[SubagentRun],
+    peers: &[PeerNode],
     max_width: Option<f32>,
 ) -> Graph {
     let mut graph = Graph::default();
@@ -131,6 +175,8 @@ pub(crate) fn layout(
         x: 0.0,
         y: 0.0,
         depth: 0,
+        note: None,
+        steps: 0,
     });
 
     let mut children: Vec<&SubagentRun> =
@@ -170,6 +216,8 @@ pub(crate) fn layout(
             x: 0.0,
             y: 0.0,
             depth: 1,
+            note: Some(task.intent.clone()),
+            steps: task.attempts.len(),
         });
         graph.edges.push((0, index));
     }
@@ -199,8 +247,30 @@ pub(crate) fn layout(
             x: 0.0,
             y: 0.0,
             depth: run.depth,
+            note: Some(run.prompt.clone()),
+            steps: run.transcript.len(),
         });
         graph.edges.push((parent, index));
+    }
+
+    // Remote peers are not local subagent runs: they hang under the main agent
+    // with their own kind, so the tree never conflates a delegation with a
+    // child conversation.
+    for peer in peers {
+        let index = graph.nodes.len();
+        graph.nodes.push(GraphNode {
+            id: peer.id.clone(),
+            kind: NodeKind::Peer,
+            title: peer.target.clone(),
+            subtitle: Some("right.tasks.remotePeer"),
+            status: peer.status,
+            x: 0.0,
+            y: 0.0,
+            depth: 1,
+            note: Some(peer.title.clone()),
+            steps: 0,
+        });
+        graph.edges.push((0, index));
     }
     place(&mut graph);
     if let Some(max_width) = max_width {
@@ -263,7 +333,8 @@ fn wrap(graph: &mut Graph, inner: f32) {
 fn task_status(status: TaskStatus) -> GraphStatus {
     match status {
         TaskStatus::Running => GraphStatus::Running,
-        TaskStatus::Queued | TaskStatus::Waiting => GraphStatus::Queued,
+        TaskStatus::Queued => GraphStatus::Queued,
+        TaskStatus::Waiting => GraphStatus::Waiting,
         TaskStatus::Scheduled => GraphStatus::Scheduled,
         TaskStatus::Blocked => GraphStatus::Blocked,
         TaskStatus::Succeeded => GraphStatus::Done,
@@ -512,5 +583,33 @@ mod tests {
         );
         assert_eq!(graph.nodes.len(), 1);
         assert!(graph.edges.is_empty());
+    }
+
+    /// A remote delegation is its own node kind; it never borrows the local
+    /// Subagent badge or its continuable subtitle.
+    #[test]
+    fn a_peer_delegation_keeps_its_own_kind() {
+        let graph = layout_with_peers(
+            "s",
+            "main",
+            GraphStatus::Running,
+            &[],
+            &[],
+            &[PeerNode {
+                id: "d1".to_string(),
+                title: "Ping the peer".to_string(),
+                target: "Ping 1.2.3.4".to_string(),
+                status: GraphStatus::Done,
+            }],
+            None,
+        );
+        let peer = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Peer)
+            .expect("a peer node");
+        assert_eq!(peer.title, "Ping 1.2.3.4");
+        assert_eq!(peer.subtitle, Some("right.tasks.remotePeer"));
+        assert_eq!(peer.note.as_deref(), Some("Ping the peer"));
     }
 }

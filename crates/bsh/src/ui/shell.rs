@@ -288,6 +288,10 @@ pub(crate) struct Shell {
     pub(crate) graph_pan: (f32, f32),
     /// A pan in flight: the pan and mouse position when the drag began.
     pub(crate) graph_pan_drag: Option<((f32, f32), (f32, f32))>,
+    /// The task graph node whose inspector is open.
+    pub(crate) graph_selected: Option<String>,
+    /// The durable task board, reached from the List view's header.
+    pub(crate) graph_board: bool,
     /// Sessions with an extension-started run in flight, by run id.
     task_run_sessions: std::collections::BTreeMap<String, String>,
     /// Peer tasks this shell is running, by session.
@@ -1992,6 +1996,8 @@ impl Shell {
             graph_tree: true,
             graph_pan: (0.0, 0.0),
             graph_pan_drag: None,
+            graph_selected: None,
+            graph_board: false,
             task_run_sessions: std::collections::BTreeMap::new(),
             peer_task_runs: std::collections::BTreeMap::new(),
             peer_task_deadlines: std::collections::BTreeMap::new(),

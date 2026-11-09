@@ -2609,11 +2609,257 @@ impl Shell {
 
     /// The Tasks tab: the run graph by default, the store list on request.
     fn tasks_pane(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.graph_tree {
+        if self.graph_board {
+            self.tasks_list(cx)
+        } else if self.graph_tree {
             self.task_graph_pane(cx)
         } else {
-            self.tasks_list(cx)
+            self.task_graph_list(cx)
         }
+    }
+
+    /// The List projection of the same work-unit graph. It is deliberately not
+    /// the durable task board: a session with subagents but no task records
+    /// still has work units, and this is where they are listed.
+    fn task_graph_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::ui::task_graph::{GraphStatus, NodeKind};
+        let lang = self.state.lang;
+        let session = self.state.active_id.clone().unwrap_or_default();
+        let title = self
+            .state
+            .store
+            .session(&session)
+            .and_then(|session| {
+                session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == crate::model::Role::User)
+                    .map(|message| message.text.clone())
+            })
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| {
+                self.state
+                    .store
+                    .session(&session)
+                    .map(|session| session.title.clone())
+                    .unwrap_or_default()
+            });
+        let title: String = title.chars().take(64).collect();
+        let status = if self.state.streams.contains_key(&session) {
+            GraphStatus::Running
+        } else {
+            GraphStatus::Done
+        };
+        let runs = self.state.subagents.runs();
+        let workspace = self.task_workspace_root();
+        let tasks = {
+            use crate::extension::tasks::TasksStore as _;
+            let mut cache = self.right.tasks.borrow_mut();
+            if cache.is_none() {
+                *cache = Some(
+                    crate::extension::tasks::FileTasksStore
+                        .list(&workspace)
+                        .unwrap_or_default(),
+                );
+            }
+            cache.clone().unwrap_or_default()
+        };
+        let peers: Vec<crate::ui::task_graph::PeerNode> = self
+            .right
+            .federation
+            .delegations
+            .iter()
+            .map(|row| crate::ui::task_graph::PeerNode {
+                id: row.id.clone(),
+                title: row.objective.clone(),
+                target: row.target.clone(),
+                status: peer_graph_status(row.state),
+            })
+            .collect();
+        let graph = crate::ui::task_graph::layout_with_peers(
+            &session, &title, status, &tasks, &runs, &peers, None,
+        );
+        let delegated = graph
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::Subagent | NodeKind::Peer))
+            .count();
+        let meta = format!(
+            "1 {} \u{00B7} {} {} \u{00B7} {} {}",
+            lang.tr("right.tasks.mainTask"),
+            delegated,
+            lang.tr("right.tasks.delegatedTasks"),
+            graph.nodes.len(),
+            lang.tr("right.tasks.totalNodes"),
+        );
+        let mut rows = div()
+            .id("task-list-scroll")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px(px(10.0))
+            .py(px(8.0));
+        for node in &graph.nodes {
+            let id = node.id.clone();
+            let click_id = node.id.clone();
+            let kind = match node.kind {
+                NodeKind::Main => lang.tr("right.tasks.mainAgent"),
+                NodeKind::Subagent => lang.tr("right.tasks.subagent"),
+                NodeKind::Task => lang.tr("right.tasks.task"),
+                NodeKind::Peer => lang.tr("right.tasks.peer"),
+            };
+            let ink = match node.status {
+                GraphStatus::Failed => theme::error(),
+                GraphStatus::Blocked | GraphStatus::Waiting => theme::warn(),
+                GraphStatus::Running => theme::accent(),
+                GraphStatus::Cancelled => theme::faint(),
+                _ => theme::success(),
+            };
+            let selected = self.graph_selected.as_deref() == Some(id.as_str());
+            rows = rows.child(
+                div()
+                    .id(SharedString::from(format!("task-list-row-{id}")))
+                    .debug_selector(move || format!("task-list-row-{id}"))
+                    .h(px(54.0))
+                    .px(px(8.0))
+                    .rounded(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .when(selected, |row| row.bg(rgb(theme::soft(theme::accent()))))
+                    .when(!selected, |row| row.hover(|s| s.bg(rgb(theme::hover()))))
+                    .cursor_pointer()
+                    .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(ink)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                txt(node.title.clone(), 12.0, theme::text())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .truncate(),
+                            )
+                            .child(
+                                txt(
+                                    format!(
+                                        "{} \u{00B7} {} \u{00B7} {} {}",
+                                        kind,
+                                        lang.tr(node.status.key()),
+                                        node.steps,
+                                        lang.tr("right.tasks.steps")
+                                    ),
+                                    10.0,
+                                    theme::muted(),
+                                )
+                                .truncate(),
+                            ),
+                    )
+                    .child(txt(lang.tr(node.status.key()), 10.0, ink))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.graph_selected = Some(click_id.clone());
+                        this.graph_tree = true;
+                        this.graph_board = false;
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .debug_selector(|| "task-graph-list-view".to_string())
+            .flex()
+            .flex_col()
+            .h_full()
+            .child(
+                div()
+                    .px(px(12.0))
+                    .pt(px(12.0))
+                    .pb(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                txt(title, 13.0, theme::text())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate(),
+                            )
+                            .child(
+                                div()
+                                    .id("task-view-board")
+                                    .debug_selector(|| "task-view-board".to_string())
+                                    .h(px(24.0))
+                                    .px(px(8.0))
+                                    .rounded(px(7.0))
+                                    .border_1()
+                                    .border_color(rgb(theme::border_soft()))
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(theme::hover())))
+                                    .child(txt(lang.tr("right.tasks.board"), 10.0, theme::muted()))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.graph_board = true;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(txt(meta, 10.0, theme::faint())),
+            )
+            .child(
+                div()
+                    .px(px(12.0))
+                    .pb(px(7.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("task-graph-tree")
+                            .debug_selector(|| "task-graph-tree".to_string())
+                            .h(px(26.0))
+                            .px(px(9.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::hover())))
+                            .child(txt(
+                                format!("\u{2191} {}", lang.tr("right.tasks.tree")),
+                                11.5,
+                                theme::faint(),
+                            ))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.graph_tree = true;
+                                this.graph_board = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .h(px(26.0))
+                            .px(px(9.0))
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(rgb(theme::border_soft()))
+                            .bg(rgb(theme::page()))
+                            .flex()
+                            .items_center()
+                            .child(txt(lang.tr("right.tasks.list"), 11.5, theme::text())),
+                    ),
+            )
+            .child(rows)
+            .into_any_element()
     }
 
     /// The DSH-style task graph: a main-agent card over its subagent children.
@@ -2666,13 +2912,29 @@ impl Shell {
         // The graph fits the pane by default: a wide tree wraps into staggered
         // rows first, then scales down only if the rows are still too wide.
         let available_w = (self.right_panel_w() - 24.0).max(240.0);
-        let available_h = (self.viewport_h - 104.0).max(220.0);
-        let graph = crate::ui::task_graph::layout(
+        // The inspector is part of the pane, not a popover: the main agent is
+        // selected until the reader picks a child, so the graph always leaves
+        // it its measured band.
+        let available_h = (self.viewport_h - 194.0 - 104.0).max(220.0);
+        let peers: Vec<crate::ui::task_graph::PeerNode> = self
+            .right
+            .federation
+            .delegations
+            .iter()
+            .map(|row| crate::ui::task_graph::PeerNode {
+                id: row.id.clone(),
+                title: row.objective.clone(),
+                target: row.target.clone(),
+                status: peer_graph_status(row.state),
+            })
+            .collect();
+        let graph = crate::ui::task_graph::layout_with_peers(
             &session,
             &title,
             status,
             &tasks,
             &runs,
+            &peers,
             Some(available_w),
         );
         let fit = crate::ui::task_graph::fit_zoom(
@@ -2746,35 +3008,108 @@ impl Shell {
             },
         );
 
-        let task_count = graph
-            .nodes
-            .iter()
-            .filter(|node| node.kind == crate::ui::task_graph::NodeKind::Task)
-            .count();
         let subagent_count = graph
             .nodes
             .iter()
             .filter(|node| node.kind == crate::ui::task_graph::NodeKind::Subagent)
             .count();
-        let running = graph
+        let peer_count = graph
             .nodes
             .iter()
-            .filter(|node| node.status == crate::ui::task_graph::GraphStatus::Running)
+            .filter(|node| node.kind == crate::ui::task_graph::NodeKind::Peer)
             .count();
-        let summary = txt(
-            format!(
-                "{} {} \u{00B7} {} {} \u{00B7} {} {}",
-                task_count,
-                lang.tr("right.tasks.tasks"),
-                subagent_count,
-                lang.tr("right.tasks.subagents"),
-                running,
-                lang.tr("right.tasks.summaryRunning")
-            ),
-            12.0,
-            theme::muted(),
-        )
-        .debug_selector(|| "task-graph-summary".to_string());
+        let active_subagents = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind == crate::ui::task_graph::NodeKind::Subagent
+                    && node.status == crate::ui::task_graph::GraphStatus::Running
+            })
+            .count();
+        let total_nodes = graph.nodes.len();
+        let meta = format!(
+            "1 {} \u{00B7} {} {} \u{00B7} {} {}",
+            lang.tr("right.tasks.mainTask"),
+            subagent_count + peer_count,
+            lang.tr("right.tasks.delegatedTasks"),
+            total_nodes,
+            lang.tr("right.tasks.totalNodes"),
+        );
+        let header = div()
+            .debug_selector(|| "task-graph-header".to_string())
+            .px(px(12.0))
+            .pt(px(12.0))
+            .pb(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        txt(title.clone(), 13.0, theme::text())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .flex_1()
+                            .min_w_0()
+                            .truncate(),
+                    )
+                    .when(active_subagents > 0, |row| {
+                        row.child(
+                            div()
+                                .h(px(20.0))
+                                .px(px(7.0))
+                                .rounded(px(999.0))
+                                .bg(rgb(theme::soft(theme::success())))
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .rounded_full()
+                                        .bg(rgb(theme::success())),
+                                )
+                                .child(txt(
+                                    format!(
+                                        "{} {}",
+                                        active_subagents,
+                                        lang.tr("right.tasks.subagents")
+                                    ),
+                                    9.5,
+                                    theme::success(),
+                                )),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(txt(meta, 10.0, theme::faint()).flex_1().truncate())
+                    .child(
+                        div()
+                            .id("task-view-board")
+                            .debug_selector(|| "task-view-board".to_string())
+                            .h(px(22.0))
+                            .px(px(8.0))
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(rgb(theme::border_soft()))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::hover())))
+                            .child(txt(lang.tr("right.tasks.board"), 9.5, theme::muted()))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.graph_board = true;
+                                cx.notify();
+                            })),
+                    ),
+            );
         let mut cards: Vec<AnyElement> = Vec::with_capacity(graph.nodes.len());
         for node in &graph.nodes {
             cards.push(self.task_graph_node(
@@ -2782,30 +3117,77 @@ impl Shell {
                 zoom,
                 (pan.0 + offset_x, pan.1 + offset_y),
                 lang,
+                cx,
             ));
         }
-        let tree_label = lang.tr(if self.graph_tree {
-            "right.tasks.tree"
-        } else {
-            "right.tasks.list"
-        });
+        let tree_label = lang.tr("right.tasks.tree");
+        let list_label = lang.tr("right.tasks.list");
+        let tree_segment = {
+            let on = self.graph_tree;
+            div()
+                .id("task-graph-tree")
+                .debug_selector(|| "task-graph-tree".to_string())
+                .cursor_pointer()
+                .h(px(26.0))
+                .px(px(9.0))
+                .rounded(px(7.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .when(on, |cell| {
+                    cell.bg(rgb(theme::page()))
+                        .border_1()
+                        .border_color(rgb(theme::border_soft()))
+                })
+                .child(txt(
+                    format!("\u{2191} {tree_label}"),
+                    11.5,
+                    if on { theme::text() } else { theme::faint() },
+                ))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.graph_tree = true;
+                    cx.notify();
+                }))
+        };
+        let list_segment = {
+            let on = !self.graph_tree;
+            div()
+                .id("task-graph-list")
+                .debug_selector(|| "task-graph-list".to_string())
+                .cursor_pointer()
+                .h(px(26.0))
+                .px(px(9.0))
+                .rounded(px(7.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .when(on, |cell| {
+                    cell.bg(rgb(theme::page()))
+                        .border_1()
+                        .border_color(rgb(theme::border_soft()))
+                })
+                .child(txt(
+                    list_label,
+                    11.5,
+                    if on { theme::text() } else { theme::faint() },
+                ))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.graph_tree = false;
+                    cx.notify();
+                }))
+        };
         let mode = div()
             .id("task-graph-mode")
             .debug_selector(|| "task-graph-mode".to_string())
             .flex()
             .items_center()
-            .gap(px(6.0))
-            .h(px(28.0))
-            .px(px(10.0))
-            .rounded(px(8.0))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::hover())))
-            .child(icon(IconName::GitBranch, 13.0, theme::muted()))
-            .child(txt(tree_label, 12.0, theme::text()))
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.graph_tree = !this.graph_tree;
-                cx.notify();
-            }));
+            .gap(px(2.0))
+            .p(px(2.0))
+            .h(px(32.0))
+            .rounded(px(9.0))
+            .bg(rgb(theme::new_session_fill()))
+            .child(tree_segment)
+            .child(list_segment);
         let zoom_out = zoom_button("task-graph-zoom-out", "\u{2212}", cx, move |this| {
             let base = if this.right.graph_fit {
                 fit
@@ -2835,18 +3217,36 @@ impl Shell {
         )
         .w(px(44.0))
         .text_align(gpui::TextAlign::Center);
-        // A narrow pane keeps only the controls it can show: the summary is
-        // the first thing to go.
-        let mut left = div().flex().items_center().gap(px(10.0)).child(mode);
-        if available_w > 560.0 {
-            left = left.child(summary);
-        }
+        // The reference's Live chip is a state, not a filter: the tree is the
+        // run's own event projection, so it cannot show a stale snapshot.
+        let live_chip = div()
+            .h(px(26.0))
+            .px(px(8.0))
+            .rounded(px(999.0))
+            .bg(rgb(theme::soft(theme::success())))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .child(
+                div()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .rounded_full()
+                    .bg(rgb(theme::success())),
+            )
+            .child(txt(lang.tr("right.tasks.live"), 10.0, theme::success()));
+        let left = div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(mode)
+            .child(live_chip);
         let toolbar = div()
             .flex()
             .items_center()
             .justify_between()
             .px(px(12.0))
-            .py(px(8.0))
+            .py(px(7.0))
             .border_b_1()
             .border_color(rgb(theme::border_soft()))
             .child(left)
@@ -2860,10 +3260,55 @@ impl Shell {
                     .child(zoom_in)
                     .child(zoom_fit),
             );
+        let selected = self
+            .graph_selected
+            .as_deref()
+            .and_then(|id| graph.nodes.iter().find(|node| node.id == id))
+            .or_else(|| graph.nodes.first());
+        let footer = div()
+            .h(px(34.0))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .border_t_1()
+            .border_color(rgb(theme::border_soft()))
+            .child(
+                div()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .rounded_full()
+                    .bg(rgb(theme::success())),
+            )
+            .child(txt(lang.tr("right.tasks.liveTree"), 10.0, theme::muted()))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("task-graph-fit-view")
+                    .debug_selector(|| "task-graph-fit-view".to_string())
+                    .h(px(24.0))
+                    .px(px(9.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(lang.tr("right.tasks.fitView"), 10.0, theme::muted()))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.right.graph_fit = true;
+                        this.graph_zoom = 1.0;
+                        this.graph_pan = (0.0, 0.0);
+                        cx.notify();
+                    })),
+            );
+        let inspector = selected.map(|node| self.task_graph_inspector(node, lang));
         div()
             .flex()
             .flex_col()
             .h_full()
+            .child(header)
             .child(toolbar)
             .child(
                 div()
@@ -2919,6 +3364,84 @@ impl Shell {
                             .children(cards),
                     ),
             )
+            .child(footer)
+            .when_some(inspector, |pane, inspector| pane.child(inspector))
+            .into_any_element()
+    }
+
+    /// The selected work unit's bottom inspector: identity on the left,
+    /// delegation facts on the right, with the full prompt/result as the note.
+    fn task_graph_inspector(
+        &self,
+        node: &crate::ui::task_graph::GraphNode,
+        lang: crate::i18n::Lang,
+    ) -> AnyElement {
+        let kind = match node.kind {
+            crate::ui::task_graph::NodeKind::Main => lang.tr("right.tasks.mainAgent"),
+            crate::ui::task_graph::NodeKind::Subagent => lang.tr("right.tasks.subagent"),
+            crate::ui::task_graph::NodeKind::Task => lang.tr("right.tasks.task"),
+            crate::ui::task_graph::NodeKind::Peer => lang.tr("right.tasks.peer"),
+        };
+        let status = node.status;
+        let status_ink = match status {
+            crate::ui::task_graph::GraphStatus::Failed => theme::error(),
+            crate::ui::task_graph::GraphStatus::Blocked
+            | crate::ui::task_graph::GraphStatus::Waiting => theme::warn(),
+            crate::ui::task_graph::GraphStatus::Running => theme::accent(),
+            crate::ui::task_graph::GraphStatus::Cancelled => theme::faint(),
+            _ => theme::success(),
+        };
+        div()
+            .debug_selector(|| "task-graph-inspector".to_string())
+            .mx(px(8.0))
+            .mb(px(8.0))
+            .p(px(10.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::page()))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(txt(node.title.clone(), 12.0, theme::text()).truncate())
+                    .child(txt(
+                        format!(
+                            "{} · {} · {} {}",
+                            kind,
+                            lang.tr(status.key()),
+                            node.steps,
+                            lang.tr("right.tasks.steps")
+                        ),
+                        10.0,
+                        theme::muted(),
+                    )),
+            )
+            .child(
+                div()
+                    .w(px(180.0))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(txt(lang.tr("right.tasks.delegation"), 9.0, theme::faint()))
+                    .child(
+                        txt(node.note.clone().unwrap_or_default(), 10.0, theme::muted()).truncate(),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .rounded_full()
+                    .bg(rgb(status_ink)),
+            )
             .into_any_element()
     }
 
@@ -2929,53 +3452,103 @@ impl Shell {
         zoom: f32,
         pan: (f32, f32),
         lang: crate::i18n::Lang,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::ui::task_graph::{GraphStatus, NodeKind, CARD_H, CARD_W, MARGIN};
-        let kind = match node.kind {
+        let (kind_key, kind_ink) = match node.kind {
             NodeKind::Main => ("right.tasks.mainAgent", theme::accent()),
-            NodeKind::Subagent => ("right.tasks.subagent", theme::muted()),
+            NodeKind::Subagent => ("right.tasks.subagent", theme::accent()),
             NodeKind::Task => ("right.tasks.task", theme::muted()),
+            NodeKind::Peer => ("right.tasks.peer", theme::warn()),
         };
         let (status_label, status_color) = match node.status {
             GraphStatus::Running => (lang.tr(node.status.key()), theme::accent()),
             GraphStatus::Queued | GraphStatus::Scheduled => {
                 (lang.tr(node.status.key()), theme::muted())
             }
+            GraphStatus::Waiting => (lang.tr(node.status.key()), theme::warn()),
             GraphStatus::Blocked => (lang.tr(node.status.key()), theme::warn()),
             GraphStatus::Done => (lang.tr(node.status.key()), theme::success()),
             GraphStatus::Failed => (lang.tr(node.status.key()), theme::error()),
             GraphStatus::Cancelled => (lang.tr(node.status.key()), theme::faint()),
         };
-        let border = match node.kind {
-            NodeKind::Main => theme::accent(),
-            NodeKind::Subagent | NodeKind::Task => theme::border_soft(),
-        };
+        let selected = self
+            .graph_selected
+            .as_deref()
+            .map_or(node.kind == NodeKind::Main, |id| id == node.id);
         let x = MARGIN + node.x * zoom + pan.0;
         let y = MARGIN + node.y * zoom + pan.1;
         let id = format!("task-graph-node-{}", node.id);
-        let mut header = div().flex().items_center().gap(px(6.0)).child(
-            div()
-                .px(px(6.0))
-                .py(px(1.0))
-                .rounded(px(4.0))
-                .border_1()
-                .border_color(rgb(theme::border_soft()))
-                .child(txt(lang.tr(kind.0), 11.0, kind.1)),
-        );
-        if let Some(subtitle) = node.subtitle {
-            header = header.child(txt(lang.tr(subtitle), 11.0, theme::muted()));
-        }
+        let click_id = node.id.clone();
+        let subtitle = node
+            .note
+            .as_deref()
+            .map(|note| {
+                let flat = note.split_whitespace().collect::<Vec<_>>().join(" ");
+                if flat.chars().count() > 72 {
+                    format!("{}...", flat.chars().take(72).collect::<String>())
+                } else {
+                    flat
+                }
+            })
+            .or_else(|| node.subtitle.map(|key| lang.tr(key)));
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .h(px(18.0))
+                    .px(px(6.0))
+                    .rounded(px(5.0))
+                    .bg(rgb(theme::soft(kind_ink)))
+                    .flex()
+                    .items_center()
+                    .child(txt(lang.tr(kind_key).to_uppercase(), 8.5, kind_ink)),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .h(px(18.0))
+                    .px(px(6.0))
+                    .rounded(px(999.0))
+                    .bg(rgb(theme::soft(status_color)))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .w(px(5.0))
+                            .h(px(5.0))
+                            .rounded_full()
+                            .bg(rgb(status_color)),
+                    )
+                    .child(txt(status_label.clone(), 9.0, status_color)),
+            );
         div()
+            .id(SharedString::from(format!("task-graph-card-{click_id}")))
             .absolute()
             .left(px(x))
             .top(px(y))
             .w(px(CARD_W * zoom))
             .h(px(CARD_H * zoom))
             .debug_selector(move || id.clone())
-            .rounded(px(10.0))
+            .rounded(px(12.0))
             .border_1()
-            .border_color(rgb(border))
-            .bg(rgb(theme::page()))
+            .border_color(rgb(if selected || node.kind == NodeKind::Main {
+                theme::accent()
+            } else {
+                theme::border_soft()
+            }))
+            .bg(rgb(if selected {
+                theme::soft(theme::accent())
+            } else {
+                theme::page()
+            }))
+            .cursor_pointer()
+            .hover(|style| style.border_color(rgb(theme::accent())))
             .flex()
             .flex_col()
             .justify_between()
@@ -2986,15 +3559,27 @@ impl Shell {
                     .flex_col()
                     .w_full()
                     .min_w_0()
-                    .gap(px(6.0))
+                    .gap(px(5.0))
                     .child(header)
-                    .child(txt(node.title.clone(), 14.0, theme::text()).truncate()),
+                    .child(
+                        txt(node.title.clone(), 13.0, theme::text())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .line_height(px(18.0))
+                            .line_clamp(2),
+                    )
+                    .when_some(subtitle, |column, subtitle| {
+                        column.child(
+                            txt(subtitle, 10.0, theme::muted())
+                                .line_height(px(15.0))
+                                .truncate(),
+                        )
+                    }),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(px(5.0))
                     .border_t_1()
                     .border_color(rgb(theme::border_soft()))
                     .pt(px(6.0))
@@ -3002,12 +3587,21 @@ impl Shell {
                         div()
                             .w(px(6.0))
                             .h(px(6.0))
-                            .flex_none()
                             .rounded_full()
                             .bg(rgb(status_color)),
                     )
-                    .child(txt(status_label, 12.0, theme::muted())),
+                    .child(txt(status_label, 10.0, theme::muted()))
+                    .child(div().flex_1())
+                    .child(txt(
+                        format!("{} {}", node.steps, lang.tr("right.tasks.steps")),
+                        9.5,
+                        theme::faint(),
+                    )),
             )
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.graph_selected = Some(click_id.clone());
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -3022,6 +3616,39 @@ impl Shell {
             }
             cache.clone().unwrap_or_default()
         };
+        let board_header = div()
+            .px(px(12.0))
+            .pt(px(10.0))
+            .pb(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                txt(lang.tr("right.tasks.board"), 12.0, theme::text())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .flex_1(),
+            )
+            .child(
+                div()
+                    .id("task-view-list")
+                    .debug_selector(|| "task-view-list".to_string())
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(rgb(theme::border_soft()))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(lang.tr("right.tasks.list"), 10.0, theme::muted()))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.graph_board = false;
+                        this.graph_tree = false;
+                        cx.notify();
+                    })),
+            );
+
         let board = crate::extension::tasks::board(&tasks);
         let mut list = div()
             .id("tasks-scroll")
@@ -3122,6 +3749,26 @@ impl Shell {
                 .items_center()
                 .justify_center()
                 .gap(px(6.0))
+                .child(
+                    div()
+                        .id("task-view-list")
+                        .debug_selector(|| "task-view-list".to_string())
+                        .h(px(24.0))
+                        .px(px(8.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(rgb(theme::border_soft()))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::hover())))
+                        .child(txt(lang.tr("right.tasks.list"), 10.0, theme::muted()))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.graph_board = false;
+                            this.graph_tree = false;
+                            cx.notify();
+                        })),
+                )
                 .child(txt(
                     lang.tr("right.tasks.empty"),
                     theme::SIDEBAR_SIZE,
@@ -3138,6 +3785,7 @@ impl Shell {
             .flex()
             .flex_col()
             .h_full()
+            .child(board_header)
             .child(list)
             .into_any_element()
     }
@@ -7055,8 +7703,11 @@ impl Shell {
         self.right.catalog_open = false;
         self.record_panel_recent(tab);
         if tab == RightTab::Tasks {
-            // One store read per open, never per frame.
+            // One store read per open, never per frame. Peer delegations are
+            // read from the same reload the federation pane uses, so the tree
+            // can distinguish a peer from a local child without inventing one.
             *self.right.tasks.borrow_mut() = None;
+            self.reload_federation_quiet();
         }
         if tab == RightTab::Federation {
             self.reload_federation();
@@ -10165,6 +10816,18 @@ pub(crate) fn federation_delegation_rows(
             ),
         })
         .collect()
+}
+
+/// The graph status for a federation delegation's state key.
+fn peer_graph_status(state: &str) -> crate::ui::task_graph::GraphStatus {
+    use crate::ui::task_graph::GraphStatus;
+    match state {
+        "right.federation.stateRunning" => GraphStatus::Running,
+        "right.federation.stateSucceeded" => GraphStatus::Done,
+        "right.federation.stateFailed" | "right.federation.stateRejected" => GraphStatus::Failed,
+        "right.federation.stateCancelled" => GraphStatus::Cancelled,
+        _ => GraphStatus::Queued,
+    }
 }
 
 /// Files in the local artifact store, sorted by name.
