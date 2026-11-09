@@ -92,7 +92,9 @@ pub(crate) struct Event {
     /// its settled span). `None` is a record written before timing existed,
     /// which the view reports as unavailable rather than as a zero.
     pub(crate) ms: Option<u64>,
-    /// True while the row is the newest one and its turn still streams.
+    /// True while the row is still producing data: a call whose result has
+    /// not landed yet, or the model's own row while no call is in flight and
+    /// its turn still streams. A settled row in a live turn is NOT live.
     pub(crate) live: bool,
     /// The message this line came from, and - for a tool line - its index among
     /// that message's tools. `usize::MAX` for anything that is not a tool line.
@@ -206,6 +208,10 @@ fn clip(text: &str, max: usize) -> String {
     let cut: String = flat.chars().take(max).collect();
     format!("{}...", cut.trim_end())
 }
+
+/// The header width a run row keeps before it gives up its refused Pause
+/// control: the title truncates and the status chip and the mode switch stay.
+const PANE_HEADER_ROOM: f32 = 300.0;
 
 /// The width an equal-width block draws at, in CSS pixels.
 ///
@@ -720,7 +726,16 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 });
             }
         }
-        let live = streaming && index == last;
+        // Only the LAST message of a streaming turn can own a live row, and
+        // inside it only the row still producing data: a call with no result
+        // yet, or the model itself while no call is in flight. A completed
+        // call in the same message is done, not "running" until the turn ends.
+        let message_live = streaming && index == last;
+        let call_running = message
+            .tools
+            .iter()
+            .any(|tool| tool.output.is_none() && tool.ms.is_none());
+        let assistant_live = message_live && !call_running && message.error.is_none();
         // The message's own clock is the turn's recorded start. A record with
         // no timing falls back to its first call, then to the call before it,
         // so an old log still places its rows.
@@ -739,7 +754,8 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 raw: message.text.clone(),
                 source: "Message".to_string(),
                 ms: user_wait(session, index, message),
-                live,
+                // A submitted prompt is never a row still in progress.
+                live: false,
                 message: index,
                 tool: usize::MAX,
                 at: anchor,
@@ -756,7 +772,8 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 raw: error.clone(),
                 source: "Turn".to_string(),
                 ms: message_ms,
-                live,
+                // A failure is a settled fact, not work in flight.
+                live: false,
                 message: index,
                 tool: usize::MAX,
                 at: anchor,
@@ -772,7 +789,7 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 raw: message.text.clone(),
                 source: "Message".to_string(),
                 ms: message_ms,
-                live,
+                live: assistant_live,
                 message: index,
                 tool: usize::MAX,
                 at: anchor,
@@ -787,7 +804,7 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 raw: String::new(),
                 source: "Message".to_string(),
                 ms: message_ms,
-                live,
+                live: assistant_live,
                 message: index,
                 tool: usize::MAX,
                 at: anchor,
@@ -823,7 +840,9 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 ),
                 source: tool.name.clone(),
                 ms: tool.ms,
-                live,
+                // A call whose result has landed is done, even while the rest
+                // of the same message is still streaming.
+                live: message_live && tool.output.is_none() && tool.ms.is_none(),
                 message: index,
                 tool: tool_index,
                 at: tool.at,
@@ -1126,7 +1145,15 @@ impl Shell {
             .enumerate()
             .filter(|(_, event)| event.turn == selected_turn)
             .collect();
-        let live = self.state.any_streaming() && run_events.iter().any(|(_, event)| event.live);
+        // The CURRENT run is live while its own session streams; a history run
+        // never is, however long that session kept streaming afterwards. The
+        // session is the source of truth for the run status, while each row
+        // separately says whether its own step is still producing.
+        let live = selected_turn == current_turn
+            && self
+                .state
+                .active_session()
+                .is_some_and(|session| self.state.is_streaming(&session.id));
         let failed = run_events
             .iter()
             .any(|(_, event)| event.kind == Kind::Error);
@@ -1157,7 +1184,28 @@ impl Shell {
             .unwrap_or_default();
         let run_label = format!("{} #{}", lang.tr("traj.run"), selected_turn);
 
-        let nav = self.traj_run_nav(&runs, selected_turn, current_turn, &events, cx);
+        // The pane's own width budget, measured against the column this frame.
+        // Three columns at their designed 220 + 390 need more than the centre
+        // column has once the right panel is expanded; the side columns take a
+        // share of a narrower pane instead, and when even that cannot leave the
+        // run list a readable body the step detail floats over it (the detail
+        // already carries its own close). An unmeasured frame keeps the design
+        // width, so the first frame draws the full layout.
+        let pane_w = self.conversation_w.as_f32();
+        let measured = pane_w > 0.0;
+        let nav_w = crate::theme::pane_side(pane_w, 220.0, 0.28, 160.0);
+        let parked_w = crate::theme::pane_side(pane_w, 390.0, 0.42, 280.0);
+        let detail_floats = measured && pane_w - nav_w - parked_w < crate::theme::PANE_BODY_MIN;
+        // A floating card answers to the pane, not to the design width: it is
+        // the body's rect less its margin, capped at the parked 390.
+        let detail_w = if detail_floats {
+            (pane_w - nav_w - 24.0).clamp(0.0, 390.0)
+        } else {
+            parked_w
+        };
+        let main_w = pane_w - nav_w - if detail_floats { 0.0 } else { detail_w };
+
+        let nav = self.traj_run_nav(&runs, selected_turn, current_turn, &events, nav_w, cx);
 
         let header = div()
             .px(px(22.0))
@@ -1170,9 +1218,20 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(10.0))
-                    .child(txt(run_label, 22.0, theme::text()).font_weight(FontWeight::SEMIBOLD))
+                    // The title is the only child that gives: it truncates before
+                    // any control is pushed past the pane's right edge, which is
+                    // what a narrowed pane used to do to the buttons. The spacer
+                    // after the status chip keeps the controls on the right.
+                    .child(
+                        txt(run_label, 22.0, theme::text())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .flex_shrink(1.0)
+                            .min_w_0()
+                            .truncate(),
+                    )
                     .child(
                         div()
+                            .flex_none()
                             .h(px(22.0))
                             .px(px(8.0))
                             .rounded(px(999.0))
@@ -1192,6 +1251,7 @@ impl Shell {
                     .child(div().flex_1())
                     .child(
                         div()
+                            .flex_none()
                             .id("traj-timeline-toggle")
                             .debug_selector(|| "traj-timeline-toggle".to_string())
                             .h(px(28.0))
@@ -1209,30 +1269,37 @@ impl Shell {
                                 cx.notify();
                             })),
                     )
-                    .child(
-                        div()
-                            .id("traj-pause")
-                            .debug_selector(|| "traj-pause".to_string())
-                            .h(px(28.0))
-                            .px(px(12.0))
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(rgb(theme::border()))
-                            .flex()
-                            .items_center()
-                            .opacity(0.45)
-                            .tooltip({
-                                let text = lang.tr("traj.noPause");
-                                move |window, cx| {
-                                    gpui_kit::component::tooltip::Tooltip::new(text.clone())
-                                        .build(window, cx)
-                                }
-                            })
-                            .child(txt(lang.tr("traj.pause"), 11.0, theme::muted())),
-                    )
+                    // Pause is a refused control (bsh has no pause seam), so it
+                    // is the first thing a narrowed header gives up; the body is
+                    // the thing a reader needs, not a button that cannot act.
+                    .when(!measured || main_w >= PANE_HEADER_ROOM, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .id("traj-pause")
+                                .debug_selector(|| "traj-pause".to_string())
+                                .h(px(28.0))
+                                .px(px(12.0))
+                                .rounded(px(8.0))
+                                .border_1()
+                                .border_color(rgb(theme::border()))
+                                .flex()
+                                .items_center()
+                                .opacity(0.45)
+                                .tooltip({
+                                    let text = lang.tr("traj.noPause");
+                                    move |window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(text.clone())
+                                            .build(window, cx)
+                                    }
+                                })
+                                .child(txt(lang.tr("traj.pause"), 11.0, theme::muted())),
+                        )
+                    })
                     .when(live, |row| {
                         row.child(
                             div()
+                                .flex_none()
                                 .id("traj-stop-run")
                                 .debug_selector(|| "traj-stop-run".to_string())
                                 .h(px(28.0))
@@ -1267,7 +1334,10 @@ impl Shell {
                     11.5,
                     theme::muted(),
                 )
-                .whitespace_nowrap(),
+                // The session line is one long nowrap sentence; at a narrowed
+                // pane it ellipsises instead of running under the buttons.
+                .min_w_0()
+                .truncate(),
             );
 
         let header = header.child(
@@ -1340,20 +1410,20 @@ impl Shell {
             timeline = timeline.child(self.traj_run_waiting());
         }
 
-        let inspector = if let Some(event) = self
+        let selected_event = self
             .traj_select
             .and_then(|index| events.get(index))
-            .filter(|event| event.turn == selected_turn)
-        {
+            .filter(|event| event.turn == selected_turn);
+        let inspector = if let Some(event) = selected_event {
             div()
-                .w(px(390.0))
+                .w(px(detail_w))
                 .flex_none()
                 .h_full()
-                .child(self.traj_detail_at(event, 390.0, cx))
+                .child(self.traj_detail_at(event, detail_w, cx))
                 .into_any_element()
         } else {
             div()
-                .w(px(390.0))
+                .w(px(detail_w))
                 .flex_none()
                 .h_full()
                 .border_l_1()
@@ -1378,6 +1448,41 @@ impl Shell {
                 .into_any_element()
         };
 
+        // Parked beside the timeline while the pane can seat all three
+        // columns, floated over it when it cannot: the body keeps the room its
+        // run cards need, and the detail keeps its own close
+        // (traj-detail-close).
+        let timeline_row = div()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .flex()
+            .flex_row()
+            .child(timeline);
+        let timeline_row = if !detail_floats {
+            timeline_row.child(inspector)
+        } else if selected_event.is_some() {
+            timeline_row.child(
+                div()
+                    .debug_selector(|| "traj-detail-float".to_string())
+                    .occlude()
+                    .absolute()
+                    .top(px(8.0))
+                    .bottom(px(8.0))
+                    .right(px(8.0))
+                    .w(px(detail_w))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(rgb(theme::border()))
+                    .bg(rgb(theme::page()))
+                    .overflow_hidden()
+                    .shadow_lg()
+                    .child(inspector),
+            )
+        } else {
+            timeline_row
+        };
+
         let main = div()
             .flex_1()
             .min_w_0()
@@ -1385,15 +1490,7 @@ impl Shell {
             .flex()
             .flex_col()
             .child(header)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_row()
-                    .child(timeline)
-                    .child(inspector),
-            );
+            .child(timeline_row);
 
         div()
             .debug_selector(|| "trajectory".to_string())
@@ -1414,6 +1511,7 @@ impl Shell {
         selected_turn: usize,
         current_turn: usize,
         events: &[Event],
+        width: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let lang = self.state.lang;
@@ -1447,7 +1545,9 @@ impl Shell {
                             11.5,
                             theme::text(),
                         )
-                        .flex_1(),
+                        .flex_1()
+                        .min_w_0()
+                        .truncate(),
                     )
                     .child(txt(
                         status,
@@ -1468,10 +1568,10 @@ impl Shell {
         let current_failed = events
             .iter()
             .any(|event| event.turn == current_turn && event.kind == Kind::Error);
-        let current_live = self.state.any_streaming()
-            && events
-                .iter()
-                .any(|event| event.turn == current_turn && event.live);
+        let current_live = self
+            .state
+            .active_session()
+            .is_some_and(|session| self.state.is_streaming(&session.id));
         let current_status = if current_failed {
             lang.tr("traj.failed")
         } else if current_live {
@@ -1484,9 +1584,11 @@ impl Shell {
             .filter(|event| event.turn == current_turn)
             .count();
         div()
-            .w(px(220.0))
+            .w(px(width))
+            .min_w_0()
             .flex_none()
             .h_full()
+            .overflow_hidden()
             .border_r_1()
             .border_color(rgb(theme::border_soft()))
             .bg(rgb(theme::new_session_fill()))
@@ -1682,6 +1784,18 @@ impl Shell {
                             )
                             .child(
                                 div()
+                                    .debug_selector(move || {
+                                        format!(
+                                            "traj-step-status-{index}-{}",
+                                            if failed {
+                                                "failed"
+                                            } else if running {
+                                                "running"
+                                            } else {
+                                                "done"
+                                            }
+                                        )
+                                    })
                                     .h(px(18.0))
                                     .px(px(6.0))
                                     .rounded(px(999.0))
@@ -2943,12 +3057,22 @@ mod tests {
         PolicyVerdict, Projection, MINIMUM_BLOCK_MS,
     };
     use crate::i18n::Lang;
-    use crate::model::{ChatMessage, Session};
+    use crate::model::{ChatMessage, Session, ToolEvent};
 
     fn session_with(messages: Vec<ChatMessage>) -> Session {
         let mut session = Session::new("w", "timing");
         session.messages = messages;
         session
+    }
+
+    fn call(name: &str, output: Option<&str>, ms: Option<u64>) -> ToolEvent {
+        ToolEvent {
+            name: name.to_string(),
+            args: "{}".to_string(),
+            output: output.map(str::to_string),
+            ms,
+            at: Some(1_000),
+        }
     }
 
     /// The two switches compose into four projections, exactly as the
@@ -3353,6 +3477,88 @@ mod tests {
         assert_eq!(log[0].ms, Some(200), "the wait is already measured");
         assert_eq!(log[1].ms, None, "the model span is not closed yet");
         assert!(log[1].live, "and the row says it is running");
+    }
+
+    /// A call that already returned is DONE, even while the turn around it is
+    /// still streaming. The old rule marked every row of the newest message
+    /// live, so a 0 ms `list_dir` kept saying "running" for the rest of the
+    /// turn.
+    #[test]
+    fn a_settled_call_in_a_live_turn_is_not_running() {
+        let mut assistant = ChatMessage::assistant();
+        assistant.text = "let me look".to_string();
+        assistant.tools = vec![call("list_dir", Some("a.txt"), Some(0))];
+        let log = events_for(
+            &session_with(vec![ChatMessage::user("hello"), assistant]),
+            true,
+            Lang::En,
+        );
+        let call_row = log
+            .iter()
+            .find(|event| event.kind == Kind::Tool)
+            .expect("the call row");
+        assert!(
+            !call_row.live,
+            "a call with a result is settled, not running"
+        );
+        assert_eq!(call_row.ms, Some(0), "even when it took no measurable time");
+        // Nothing is executing, so the MODEL is the row still producing.
+        let model_row = log
+            .iter()
+            .find(|event| event.kind == Kind::Assistant)
+            .expect("the model row");
+        assert!(model_row.live, "the model is the active producer");
+    }
+
+    /// While a call waits for its result it owns the live flag, the settled
+    /// call above it stays done, and the model row hands the turn off.
+    #[test]
+    fn a_call_still_running_owns_the_live_flag() {
+        let mut assistant = ChatMessage::assistant();
+        assistant.text = "let me look".to_string();
+        assistant.tools = vec![
+            call("list_dir", Some("a.txt"), Some(0)),
+            call("bash", None, None),
+        ];
+        let log = events_for(
+            &session_with(vec![ChatMessage::user("hello"), assistant]),
+            true,
+            Lang::En,
+        );
+        let calls: Vec<&Event> = log
+            .iter()
+            .filter(|event| matches!(event.kind, Kind::Tool | Kind::Subtool))
+            .collect();
+        assert_eq!(calls.len(), 2, "both calls are rows");
+        assert!(!calls[0].live, "the settled first call is done");
+        assert!(calls[1].live, "the call waiting for its result is live");
+        let model_row = log
+            .iter()
+            .find(|event| event.kind == Kind::Assistant)
+            .expect("the model row");
+        assert!(!model_row.live, "the model handed the turn to the call");
+        let user_row = log
+            .iter()
+            .find(|event| event.kind == Kind::User)
+            .expect("the user row");
+        assert!(!user_row.live, "a submitted prompt never runs");
+    }
+
+    /// A turn that ended paints no running row at all.
+    #[test]
+    fn a_finished_turn_has_no_live_row() {
+        let mut assistant = ChatMessage::assistant();
+        assistant.text = "done".to_string();
+        assistant.tools = vec![call("list_dir", Some("a.txt"), Some(4))];
+        let log = events_for(
+            &session_with(vec![ChatMessage::user("hello"), assistant]),
+            false,
+            Lang::En,
+        );
+        assert!(
+            log.iter().all(|event| !event.live),
+            "a settled turn has nothing in progress"
+        );
     }
 
     /// The window keeps the log's own geometry: the built band plus the two

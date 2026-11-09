@@ -366,20 +366,28 @@ impl Shell {
                     // and its left edge takes only CHAT_LEFT_SHARE of the band,
                     // so the text starts where the eye expects it instead of
                     // behind a wide empty margin.
+                    //
+                    // The band is the TRANSCRIPT's, not the column's. Charging
+                    // it to a master-detail pane (Trajectory, Audit, Review)
+                    // took the room its own side columns need, so those panes
+                    // paint at the column's full width and carry their own
+                    // padding - the tab strip above them is full width too.
                     let band = ((self.conversation_w.as_f32() - self.chat_w()) / 2.0).max(0.0);
+                    let column = div()
+                        .debug_selector(|| String::from("chat-band"))
+                        .w_full()
+                        .min_h_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(body)
+                        .when_some(goal, |column, goal| column.child(goal));
                     middle
-                        .child(
-                            div()
-                                .w_full()
-                                .pl(px(self.chat_left_inset()))
-                                .pr(px(band))
-                                .min_h_0()
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .child(body)
-                                .when_some(goal, |column, goal| column.child(goal)),
-                        )
+                        .child(if self.state.tab == Tab::Chat {
+                            column.pl(px(self.chat_left_inset())).pr(px(band))
+                        } else {
+                            column
+                        })
                         // Measured: the composer card is the chat content width + 32.
                         .child(
                             div()
@@ -1806,10 +1814,13 @@ impl Shell {
                 .id(id)
                 .pb(px(9.0))
                 .border_b_2()
+                // rgba, not rgb: rgb() reads only the low 24 bits, so a packed
+                // zero alpha came out opaque black and every unselected tab
+                // drew a dark underline under its label.
                 .border_color(if selected {
                     rgb(theme::accent())
                 } else {
-                    rgb(0x00000000)
+                    rgba(0x00000000)
                 })
                 .cursor_pointer()
                 .child(

@@ -21269,6 +21269,65 @@ fn the_run_view_opens_a_step_and_returns_to_the_timeline(cx: &mut TestAppContext
     });
 }
 
+/// A settled call is drawn as done even while its turn still streams; only the
+/// call still waiting for a result is drawn as running.
+///
+/// This is the reader's bug: a 0 ms `list_dir` kept painting "进行中" for the
+/// rest of the turn, because every row of the newest message shared one live
+/// flag. The step status now carries a debug selector so the test pins the
+/// label the chip actually draws, not only the event behind it.
+#[gpui::test]
+fn a_settled_call_is_not_drawn_as_running(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("traj-live-status", 1);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(crate::model::ToolEvent {
+                name: "list_dir".to_string(),
+                args: "{\"path\":\"/w\"}".to_string(),
+                output: Some("a.txt".to_string()),
+                ms: Some(0),
+                at: Some(1_000),
+            });
+            session.messages[1].tools.push(crate::model::ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\":\"ls\"}".to_string(),
+                output: None,
+                ms: None,
+                at: Some(1_000),
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // The turn is live: the old rule marked every row of the newest message
+    // running, including the call that had already returned.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            let id = this.state.active_id.clone().expect("an active session");
+            this.state.streams.insert(id, 1);
+            this.state.tab = Tab::Trajectory;
+            this.traj_runs = true;
+            this.traj_select = None;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the call in flight is running", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-step-status-3-running").is_some()
+    });
+    assert!(
+        cx.debug_bounds("traj-step-status-2-done").is_some(),
+        "the call whose result landed is done, not running"
+    );
+    assert!(
+        cx.debug_bounds("traj-step-status-1-done").is_some(),
+        "the model row hands the turn to the call in flight"
+    );
+}
+
 /// The trajectory tab scrolls the same way, through its own tracked handle.
 #[gpui::test]
 fn the_trajectory_scrolls_with_the_wheel(cx: &mut TestAppContext) {
@@ -35273,23 +35332,65 @@ fn a_missing_extension_command_is_reported(cx: &mut TestAppContext) {
     );
 }
 
-
+/// The pane a reader is looking at follows the centre column when the right
+/// panel takes half of it.
+///
+/// Trajectory, Audit and Review are master-detail panes: each parks a side
+/// column (a run history, a change list, a detail card) beside its body at a
+/// designed width. An expanded right panel halves the centre column, and those
+/// fixed columns then painted past the pane's edge - the run timeline was
+/// squeezed to 44px and the Pause control sat outside the window entirely, so
+/// an Audit export button was not even laid out. A pane must fit the column it
+/// is given at every width the shell can produce.
 #[gpui::test]
-fn probe_pane_fit(cx: &mut TestAppContext) {
+fn the_panes_fit_a_narrowed_centre_column(cx: &mut TestAppContext) {
     init_test_app(cx);
-    let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("pane-fit-probe", 8);
-        tests_pin_reference_defaults(&mut state);
-        let id = state.active_id.clone().expect("an active session");
-        if let Some(session) = state.store.session_mut(&id) {
-            session.messages[1].tools.push(ToolEvent {
-                name: "bash".to_string(),
-                args: "{\"command\":\"ls\"}".to_string(),
-                output: Some("a.md".to_string()),
-                ms: Some(7),
-                at: None,
-            });
+    let mut state = AppState::with_store(scratch_store("pane-fit"));
+    let session = state.new_session().expect("a session");
+    state.settings.global.general.active_session = session.clone();
+    if let Some(workspace) = state
+        .store
+        .session(&session)
+        .map(|session| session.workspace.clone())
+    {
+        state.settings.global.general.active_workspace = workspace;
+    }
+    if let Some(entry) = state.store.session_mut(&session) {
+        for turn in 0..6 {
+            entry
+                .messages
+                .push(ChatMessage::user(format!("turn {turn}")));
+            let mut reply = ChatMessage::assistant();
+            if turn == 1 {
+                reply.tools.push(ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{\"command\":\"ls\"}".to_string(),
+                    output: Some("a.md".to_string()),
+                    ms: Some(7),
+                    at: None,
+                });
+            }
+            entry.messages.push(reply);
         }
+    }
+    // One sealed review keeps the Review tab on its real body rather than the
+    // empty state, and gives the Audit tab a decision to strip.
+    let root = state.workspace_root().expect("a workspace root");
+    std::fs::create_dir_all(root.join("src")).expect("src");
+    let path = root.join("src").join("lib.rs");
+    std::fs::write(&path, "fn old() {}\n").expect("old");
+    let runtime = state.begin_review(&session).expect("a runtime");
+    let before = runtime.before(&path);
+    std::fs::write(&path, "fn new() {}\n").expect("new");
+    runtime.record(
+        &path,
+        crate::review::domain::ChangeOperation::Edit,
+        before,
+        "edit_file",
+    );
+    state.finish_review(&session);
+
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -35297,27 +35398,174 @@ fn probe_pane_fit(cx: &mut TestAppContext) {
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| {
+            // The reported state: the right panel dragged wide, so the centre
+            // column is about half its full width.
             this.right.open = true;
-            this.right.user_w = Some(620.0);
+            this.right.user_w = Some(640.0);
+            this.traj_runs = true;
+            // A selected step opens the detail card, which is the column that
+            // used to be parked at 390 and painted past the pane. The runs view
+            // only shows a selection in the newest turn's own events, so the
+            // index comes from the log rather than a guess.
+            this.traj_select = this
+                .traj_log()
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    let newest = this.traj_log().iter().map(|e| e.turn).max().unwrap_or(0);
+                    event.turn == newest
+                })
+                .map(|(index, _)| index)
+                .next();
+            cx.notify();
+        });
+    });
+
+    for vw in [1638.0f32, 1438.0, 1338.0] {
+        resize_viewport(cx, vw);
+        for (tab, selectors) in [
+            (
+                Tab::Trajectory,
+                &[
+                    "trajectory",
+                    "traj-list",
+                    "traj-timeline-toggle",
+                    "traj-detail",
+                ][..],
+            ),
+            (Tab::Audit, &["audit", "audit-export", "audit-list"][..]),
+            (
+                Tab::Review,
+                &[
+                    "review",
+                    "review-actions",
+                    "review-change-list",
+                    "review-detail",
+                ][..],
+            ),
+        ] {
+            cx.update(|_, cx| {
+                shell.update(cx, |this, cx| {
+                    this.state.tab = tab;
+                    cx.notify();
+                });
+            });
+            draw_until(cx, "the pane mounts", DRAW_UNTIL_MAX, |cx| {
+                cx.debug_bounds(selectors[0]).is_some()
+            });
+            let column = cx.debug_bounds("main-column").expect("the column");
+            let left = column.origin.x;
+            let right = column.origin.x + column.size.width;
+            let tol = px(2.0);
+
+            for selector in selectors {
+                let bounds = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{tab:?} at {vw}: {selector} renders"));
+                assert!(
+                    bounds.origin.x >= left - tol,
+                    "{tab:?} at {vw}: {selector} starts inside the column: {bounds:?} vs {column:?}"
+                );
+                assert!(
+                    bounds.origin.x + bounds.size.width <= right + tol,
+                    "{tab:?} at {vw}: {selector} ends inside the column: {bounds:?} vs {column:?}"
+                );
+            }
+            if tab == Tab::Review {
+                // The change list gives width back so the diff keeps a column
+                // it can be read in; at its designed 330 the diff was the part
+                // that lost the room.
+                let diff = cx.debug_bounds("review-detail").expect("the diff column");
+                assert!(
+                    diff.size.width >= px(220.0),
+                    "at {vw}: the diff keeps a readable column: {diff:?}"
+                );
+                let changes = cx
+                    .debug_bounds("review-change-list")
+                    .expect("the change list");
+                assert!(
+                    changes.size.width < px(330.0),
+                    "at {vw}: the change list gives width back: {changes:?}"
+                );
+            }
+            // The transcript's band belongs to the transcript: a pane owns the
+            // column's full width, so its own edge is the column's edge.
+            let pane = cx.debug_bounds(selectors[0]).expect("the pane root");
+            assert!(
+                pane.origin.x <= left + tol && pane.size.width >= column.size.width - tol,
+                "{tab:?} at {vw}: the pane is the whole column: {pane:?} vs {column:?}"
+            );
+        }
+    }
+
+    // The run body keeps enough width to read a card at the narrowest column,
+    // which is what the fixed 220 + 390 columns took away, and the diff keeps
+    // a readable column beside the change list.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
             this.state.tab = Tab::Trajectory;
             this.traj_runs = true;
             cx.notify();
         });
     });
     draw_until(cx, "the runs view renders", DRAW_UNTIL_MAX, |cx| {
-        cx.debug_bounds("trajectory").is_some()
+        cx.debug_bounds("traj-list").is_some()
     });
-    let column = cx.debug_bounds("main-column").unwrap();
-    let body = cx.debug_bounds("chat-body").unwrap();
-    let traj = cx.debug_bounds("trajectory").unwrap();
-    let panel = cx.debug_bounds("right-panel").unwrap();
-    let pause = cx.debug_bounds("traj-pause");
-    let list = cx.debug_bounds("traj-list");
-    let (conv, chat, vw) = cx.update(|_, cx| {
-        let s = shell.read(cx);
-        (s.conversation_w, s.chat_w(), s.viewport_w)
+    let list = cx.debug_bounds("traj-list").expect("the timeline");
+    assert!(
+        list.size.width >= px(320.0),
+        "the run body is readable at a half-width column: {list:?}"
+    );
+    let detail = cx.debug_bounds("traj-detail").expect("the selected step");
+    assert!(
+        cx.debug_bounds("traj-detail-float").is_some(),
+        "a detail with no room of its own floats over the body: {detail:?}"
+    );
+
+    // A column with room parks the detail again: the fix must not turn every
+    // pane into a two-column one at a wide window.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = false;
+            this.state.tab = Tab::Trajectory;
+            this.traj_runs = true;
+            cx.notify();
+        });
     });
-    eprintln!(
-        "PROBE vw={vw} conv={conv:?} chat={chat} column={column:?} body={body:?} traj={traj:?} panel={panel:?} pause={pause:?} list={list:?}"
+    draw_until(cx, "the runs view at full width", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("traj-list").is_some() && cx.debug_bounds("traj-detail").is_some()
+    });
+    let parked = cx.debug_bounds("traj-detail").expect("the parked detail");
+    assert!(
+        parked.size.width >= px(380.0),
+        "a full-width column parks the detail at its design width: {parked:?}"
+    );
+    assert!(
+        cx.debug_bounds("traj-detail-float").is_none(),
+        "and it is not floating"
+    );
+
+    // The audit's flat table: its own columns are the floor, so the detail
+    // card floats rather than letting the table clip them.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.state.tab = Tab::Audit;
+            this.audit_table = true;
+            this.audit_event = Some(0);
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the audit table renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("audit-list").is_some() && cx.debug_bounds("audit-detail").is_some()
+    });
+    let table = cx.debug_bounds("audit-list").expect("the table");
+    assert!(
+        table.size.width >= px(430.0),
+        "the table keeps the width its own columns need: {table:?}"
+    );
+    assert!(
+        cx.debug_bounds("audit-detail-float").is_some(),
+        "so the detail card floats over it"
     );
 }

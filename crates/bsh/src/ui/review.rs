@@ -16,6 +16,16 @@ use crate::review::domain::{
 };
 use crate::theme;
 
+/// The width a diff needs before the change list starts giving its own width
+/// back. A diff is a row of gutter, mark and code, so it is the column that has
+/// to stay legible; the list can shorten its paths instead.
+const REVIEW_DIFF_MIN: f32 = 360.0;
+/// The pane's own horizontal chrome around the two columns: 18 a side plus the
+/// 12 between them.
+const REVIEW_PANE_CHROME: f32 = 48.0;
+/// The narrowest the change list goes before the diff takes the squeeze.
+const REVIEW_LIST_MIN: f32 = 210.0;
+
 /// The Review tab's cache key.
 #[derive(Clone, PartialEq, Eq)]
 struct ReviewKey {
@@ -154,6 +164,9 @@ impl Shell {
         let header = div()
             .flex()
             .flex_row()
+            // A narrowed pane drops the decision buttons under the title rather
+            // than letting them paint past the right edge.
+            .flex_wrap()
             .items_start()
             .justify_between()
             .gap(px(16.0))
@@ -168,6 +181,9 @@ impl Shell {
                     .child(
                         div()
                             .flex()
+                            // The chips and the digest wrap before they run off
+                            // the pane; the digest is the last thing to give.
+                            .flex_wrap()
                             .flex_row()
                             .items_center()
                             .gap(px(8.0))
@@ -190,10 +206,22 @@ impl Shell {
             )
             .child(actions);
 
+        // The list and the diff share the pane. The list keeps its designed 330
+        // while the diff still gets the width a diff needs to be read; past
+        // that the list is what gives, down to its own floor. An expanded right
+        // panel used to leave the diff with the leftover - 151px at a half-width
+        // column - because the list held its 330.
+        let changes_w = if self.conversation_w > px(0.0) {
+            let pane = self.conversation_w.as_f32();
+            (pane - REVIEW_DIFF_MIN - REVIEW_PANE_CHROME).clamp(REVIEW_LIST_MIN, 330.0)
+        } else {
+            330.0
+        };
         let mut changes = div()
             .debug_selector(|| "review-change-list".to_string())
             .id("review-change-list")
-            .w(px(330.0))
+            .w(px(changes_w))
+            .min_w_0()
             .flex_none()
             .flex()
             .flex_col()
@@ -254,6 +282,7 @@ impl Shell {
             .child(changes)
             .child(
                 div()
+                    .debug_selector(|| "review-detail".to_string())
                     .id("review-detail")
                     .flex()
                     .flex_1()
@@ -267,8 +296,11 @@ impl Shell {
             );
 
         div()
+            .debug_selector(|| "review".to_string())
             .flex()
             .flex_col()
+            .w_full()
+            .min_w_0()
             .h_full()
             .p(px(18.0))
             .gap(px(14.0))

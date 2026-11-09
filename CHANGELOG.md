@@ -10,6 +10,19 @@
   review decision across changesets as a timeline. Binary changes report byte counts, and images also report
   their dimensions. Shell output remains explicitly unattributed, while
   PDF/document/archive support is metadata-level in this cut.
+- **Pane fit**: the Trajectory, Audit and Review tabs now fit the centre column
+  at any width. Their side columns take a share of a narrowed pane instead of
+  holding their designed 220/330/380/390, the step and event detail cards float
+  over the body (keeping their own close) when the body would fall under a
+  readable width, and the run header, filter rows and decision buttons truncate
+  or wrap instead of painting past the pane's edge. An expanded right panel used
+  to squeeze the run timeline to 44px, clip the session line under the header
+  buttons, and put Audit's export control outside the pane.
+- **Trajectory liveness**: a step now reads 进行中 only while it is still
+  producing data. A tool call whose result has landed is 已完成 even while the
+  rest of its turn streams, the model-inference row hands off to a call in
+  flight, and a historical run no longer reports running because its session is
+  still streaming.
 
 ## v4.0.3 (2026-11-09)
 

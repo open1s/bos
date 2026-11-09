@@ -1007,6 +1007,33 @@ pub(crate) fn resolve_content_width(column: f32, preference: Option<f32>) -> f32
     }
 }
 
+/// The width a master-detail pane gives one of its own side columns.
+///
+/// The Trajectory, the Audit and the Review are three-column panes: a side
+/// column (the run history, a change list, a detail card), the pane's own body,
+/// and sometimes a second side column. Their designed widths assume the whole
+/// centre column, so an expanded right panel - which halves that column - left
+/// the body crushed to a sliver and the columns painting past the pane's edge.
+///
+/// The rule is fluid, like the transcript's own clamp: the designed width while
+/// the pane can seat it, `share` of a narrower pane, and never less than
+/// `floor`. A zero pane is an unmeasured frame and keeps the design width, so
+/// the first frame draws the full layout instead of collapsing.
+pub(crate) fn pane_side(pane: f32, designed: f32, share: f32, floor: f32) -> f32 {
+    if pane <= 0.0 {
+        return designed;
+    }
+    let floor = floor.min(designed);
+    (pane * share).clamp(floor, designed)
+}
+
+/// The narrowest a pane's body keeps when a side column is parked beside it.
+///
+/// Below this the body stops being readable (a run card's title and status, the
+/// audit table's own columns), so the pane stops squeezing it and gives the
+/// detail column the overlay the pane already knows how to close.
+pub(crate) const PANE_BODY_MIN: f32 = 220.0;
+
 /// The measured handle strip: min(10px, calc((100% - content) / 2 - 24px -
 /// 24px)) - the gutter it sits in, capped at ten.
 pub(crate) fn handle_width_at(column: f32, content: f32) -> f32 {

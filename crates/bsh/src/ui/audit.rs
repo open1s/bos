@@ -451,6 +451,13 @@ impl Shell {
     /// The turn row's own height: exact, which is what lets the window place a
     /// row it does not build.
     pub(crate) const TURN_ROW_H: f32 = 38.0;
+    /// The width the flat table's own columns need before its detail card
+    /// stops being parked beside it.
+    ///
+    /// The row's fixed cells (time 86, kind 132, actor 104, result 76) plus
+    /// their gaps are the floor; under it the table would clip its own columns,
+    /// so the card floats over the table instead.
+    const AUDIT_TABLE_MIN_W: f32 = 430.0;
     /// The measure bar's full width.
     const MEASURE_W: f32 = 96.0;
     /// The measure bar's thickness.
@@ -574,6 +581,23 @@ impl Shell {
             })
             .collect();
         let selected = self.audit_event.filter(|index| *index < filtered.len());
+
+        // The table and its detail card share the pane, and an expanded right
+        // panel halves that pane: the card takes a share instead of its
+        // designed 380, and floats over the table once the table's own columns
+        // would be squeezed under their measured widths. The card carries its
+        // own close either way.
+        let pane_w = self.conversation_w.as_f32();
+        let measured = pane_w > 0.0;
+        let parked_w = crate::theme::pane_side(pane_w, 380.0, 0.40, 260.0);
+        let detail_floats = measured && pane_w - 36.0 - parked_w < Self::AUDIT_TABLE_MIN_W;
+        // A floating card answers to the pane, not to the design width: the
+        // body's rect less its padding, capped at the parked 380.
+        let detail_w = if detail_floats {
+            (pane_w - 36.0).clamp(0.0, 380.0)
+        } else {
+            parked_w
+        };
 
         let control = |id: &'static str, label: String, active: bool| -> Button {
             Button::new(id)
@@ -989,7 +1013,9 @@ impl Shell {
             };
             let turn = event.turn;
             div()
-                .w(px(380.0))
+                .debug_selector(|| "audit-detail".to_string())
+                .w(px(detail_w))
+                .min_w_0()
                 .flex_none()
                 .h_full()
                 .ml(px(14.0))
@@ -1146,7 +1172,9 @@ impl Shell {
                 .into_any_element()
         } else {
             div()
-                .w(px(380.0))
+                .debug_selector(|| "audit-detail".to_string())
+                .w(px(detail_w))
+                .min_w_0()
                 .flex_none()
                 .h_full()
                 .ml(px(14.0))
@@ -1189,6 +1217,10 @@ impl Shell {
                     .child(
                         div()
                             .flex()
+                            // The filter strip wraps before it overflows: at a
+                            // narrowed pane the search and the two actions drop
+                            // to a second line instead of painting past the edge.
+                            .flex_wrap()
                             .items_center()
                             .gap(px(8.0))
                             .child(type_control)
@@ -1198,7 +1230,7 @@ impl Shell {
                                 div()
                                     .h(px(34.0))
                                     .flex_1()
-                                    .min_w(px(180.0))
+                                    .min_w(px(140.0))
                                     .max_w(px(340.0))
                                     .px(px(10.0))
                                     .rounded(px(10.0))
@@ -1264,16 +1296,37 @@ impl Shell {
                         header.child(strip)
                     }),
             )
-            .child(
-                div()
+            .child({
+                // Parked while the table keeps its measured columns, floated
+                // when it cannot: the table is never squeezed under its own
+                // column widths, and the card keeps audit-detail-close.
+                let body = div()
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
                     .p(px(18.0))
+                    .relative()
                     .flex()
-                    .child(table)
-                    .child(inspector),
-            )
+                    .child(table);
+                if !detail_floats {
+                    body.child(inspector)
+                } else if selected.is_some() {
+                    body.child(
+                        div()
+                            .debug_selector(|| "audit-detail-float".to_string())
+                            .occlude()
+                            .absolute()
+                            .top(px(18.0))
+                            .bottom(px(18.0))
+                            .right(px(18.0))
+                            .w(px(detail_w))
+                            .shadow_lg()
+                            .child(inspector),
+                    )
+                } else {
+                    body
+                }
+            })
             .into_any_element()
     }
 
@@ -1286,8 +1339,15 @@ impl Shell {
         div()
             .flex()
             .flex_row()
+            // The row is a toolbar, not a line: a narrowed pane wraps the
+            // filter controls instead of painting them past the pane's edge.
+            // The category pills absorb the spare width and scroll inside
+            // their own slot, so wrapping is the last resort and not a way to
+            // grow the header on every resize.
+            .flex_wrap()
             .items_center()
-            .h(px(38.0))
+            .min_h(px(38.0))
+            .py(px(6.0))
             .px(px(10.0))
             .gap(px(8.0))
             .flex_none()
@@ -1297,6 +1357,7 @@ impl Shell {
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .flex_row()
                     .items_center()
                     .gap(px(2.0))
@@ -1328,6 +1389,13 @@ impl Shell {
             )
             .child(
                 div()
+                    // The pills take the toolbar's spare width and give it
+                    // back under the pointer when the pane narrows, so nine
+                    // categories never decide the row's width.
+                    .id("audit-categories")
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_x_scroll()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -1350,6 +1418,7 @@ impl Shell {
                             let on = self.audit_category == category;
                             div()
                                 .id(SharedString::from(format!("audit-category-{}", key)))
+                                .flex_none()
                                 .h(px(22.0))
                                 .px(px(7.0))
                                 .flex()
@@ -1378,7 +1447,9 @@ impl Shell {
                         }),
                     ),
             )
-            .child(div().flex_1())
+            // No flex spacer: the category pills own the spare width, so the
+            // search, the review switch and the export sit at the row's right
+            // until the row cannot hold them, and then drop to a second line.
             .child(
                 div()
                     .flex()
@@ -1388,6 +1459,7 @@ impl Shell {
                     .px(px(8.0))
                     .h(px(26.0))
                     .w(px(180.0))
+                    .min_w(px(140.0))
                     .flex_none()
                     .rounded(px(8.0))
                     .border_1()
