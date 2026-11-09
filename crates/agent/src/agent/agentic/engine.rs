@@ -211,8 +211,8 @@ impl Agent {
 
         // A withheld tool is still callable; these two are how the model finds
         // one and runs it. Registering them only when something is withheld
-        // keeps the pair honest: with nothing to find they are two names that
-        // can only answer "nothing".
+        // keeps the search honest: with nothing to find it is a name that can
+        // only answer "nothing".
         if self.has_deferred_tools() {
             // The host's own withheld names travel with the search, so a tool
             // it listed can be found even though the tool itself carries no
@@ -233,13 +233,6 @@ impl Agent {
                 self.hooks.clone(),
                 self.config.name.clone(),
             ))));
-            let call = super::discovery::CallTool::new(
-                self.registry.clone(),
-                Arc::clone(&self.live_tools),
-            );
-            builder = builder.with_tool(ToolVariant::Async(Box::new(
-                AsyncExtensibleToolAdapter::new(Arc::new(call)),
-            )));
         }
 
         // Skills are searched the same way when the catalogue is off: one tool

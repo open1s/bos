@@ -188,7 +188,7 @@ pub(crate) const READ_ONLY_PERSONA: &str = "You are a read-only analyst: you rea
 /// `exit_plan_mode` tool. BSH has no such tool: plan mode is a per-turn
 /// directive and the reader approves in conversation, so the directive says
 /// that instead of naming a tool BSH does not register.
-pub(crate) const PLAN_DIRECTIVE: &str = "[Plan mode] Inspect what the task needs and reply with a concrete, step-by-step plan. Resolve discoverable facts by inspection; if one decision is genuinely the reader's, ask it in the plan with the default you would pick instead of guessing. Do not edit files, run mutating commands, or begin the work until the reader approves the plan.";
+pub(crate) const PLAN_DIRECTIVE: &str = "[Plan mode] Inspect what the task needs and reply with a concrete, step-by-step plan. This mode overrides the standing instruction to start work: inspect and propose first. Resolve discoverable facts by inspection; if one decision is genuinely the reader's, ask it in the plan with the default you would pick instead of guessing. Do not edit files, run mutating commands, or begin the work until the reader approves the plan.";
 
 /// What BSH tells the model about the app it is running inside.
 ///
@@ -199,7 +199,7 @@ pub(crate) const PLAN_DIRECTIVE: &str = "[Plan mode] Inspect what the task needs
 /// ways a reader interrupts a turn (a queued message, the Stop button, a new
 /// instruction), and the routing rules that keep a short UI reference from
 /// becoming a speculative debugging detour.
-pub(crate) const HARNESS_CONTEXT: &str = "## Working inside BSH\n\nYou run inside BSH, the BOS desktop app. A workspace is one folder; a session is one conversation in it; the reader sees your steps, plans and diffs in the same window. The .bsh/ directory holds BSH's own settings, policies and history and is on the deny list: do not read, list or edit it, and do not treat a refusal there as a task to work around.\n\n- The conversation carries the intent; the workspace carries the evidence. Read the workspace before you decide what a terse request means.\n- An attached image is evidence of what the reader sees, not a task on its own. When a short message points at a control in a screenshot, ask one direct question before acting: is this a bug report about the app, or a request to change code? Do not pick an unrelated tool or skill and start debugging it.\n- A terse request in a workspace with an open file usually means doing it in the code; if it is equally likely to be a plain question, say which you are doing in one sentence instead of answering with a placeholder.\n- A message sent while a turn runs is queued for the next turn, not injected into this one. Treat it as steering when it arrives; do not restart work the reader has already seen.\n- The Stop button ends the turn on purpose. A stopped turn is a decision, not a failure to retry: do not reopen the same work unless the reader asks.\n- Load a skill only when its stated use matches the request. Being the only installed skill is not a reason to load it.\n- Stop after two identical tool failures. Report the exact error and what must change in the environment instead of retrying the same call.";
+pub(crate) const HARNESS_CONTEXT: &str = "## Working inside BSH\n\nYou run inside BSH, the BOS desktop app. A workspace is one folder; a session is one conversation in it; the reader sees your steps, plans and diffs in the same window. The .bsh/ directory holds BSH's own settings, policies and history and is on the deny list: do not read, list or edit it, and do not treat a refusal there as a task to work around.\n\n- The conversation carries the intent; the workspace carries the evidence. Read the workspace before you decide what a terse request means.\n- An attached image is evidence of what the reader sees, not a task on its own. When a short message points at a control in a screenshot, ask one direct question before acting: is this a bug report about the app, or a request to change code? Do not pick an unrelated tool or skill and start debugging it.\n- A terse request in an open workspace is work in the code; when it is equally likely to be a plain question, say which reading you take in one sentence.\n- A message sent while a turn runs is queued for the next turn, not injected into this one. Treat it as steering when it arrives; do not restart work the reader has already seen.\n- The Stop button ends the turn on purpose. A stopped turn is a decision, not a failure to retry: do not reopen the same work unless the reader asks.\n- Load a skill only when its stated use matches the request. Being the only installed skill is not a reason to load it.";
 
 /// Append guidance for every tool the agent actually carries.
 ///
@@ -254,12 +254,11 @@ mod tests {
     use super::*;
 
     /// The product context carries the facts the model cannot discover from
-    /// the code: the internal directory, the retry limit, and the three ways a
-    /// reader interrupts a turn.
+    /// the code: the internal directory and the three ways a reader interrupts
+    /// a turn.
     #[test]
-    fn the_harness_context_names_the_internal_directory_and_the_retry_rule() {
+    fn the_harness_context_names_the_internal_directory_and_the_interruptions() {
         assert!(HARNESS_CONTEXT.contains(".bsh/"));
-        assert!(HARNESS_CONTEXT.contains("two identical tool failures"));
         assert!(HARNESS_CONTEXT.contains("conversation carries the intent"));
         assert!(HARNESS_CONTEXT.contains("queued for the next turn"));
         assert!(HARNESS_CONTEXT.contains("Stop button"));
@@ -270,6 +269,7 @@ mod tests {
     /// names the single decision and the default to propose.
     #[test]
     fn plan_mode_asks_only_for_a_reader_owned_decision() {
+        assert!(PLAN_DIRECTIVE.contains("overrides the standing instruction to start work"));
         assert!(PLAN_DIRECTIVE.contains("if one decision is genuinely the reader's"));
         assert!(PLAN_DIRECTIVE.contains("with the default you would pick"));
         assert!(!PLAN_DIRECTIVE.contains("exit_plan_mode"));

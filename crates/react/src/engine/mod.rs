@@ -306,6 +306,37 @@ impl<A: ReActApp> ReActEngine<A> {
         }
         clean
     }
+    /// Add the tool definitions a find_tool result just returned to the
+    /// live context, so the next model step can call them by name. The definitions
+    /// carry the same name/description/schema the search reported; the search's
+    /// names-only listing intentionally reveals nothing until a name is asked for.
+    fn reveal_tools<C: ReactContext>(result: &Value, context: &mut C) {
+        let mut entries: Vec<&Value> = Vec::new();
+        if let Some(tools) = result.get("tools").and_then(Value::as_array) {
+            entries.extend(tools);
+        }
+        if result.get("name").is_some() && result.get("parameters").is_some() {
+            entries.push(result);
+        }
+        for entry in entries {
+            let Some(name) = entry.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(parameters) = entry.get("parameters") else {
+                continue;
+            };
+            let description = entry
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            context.add_tool(crate::llm::types::LlmTool::function(
+                name,
+                description,
+                parameters.clone(),
+            ));
+        }
+    }
+
     /// Core ReAct step loop. Runs up to max_steps iterations of:
     /// LLM call → match response (ToolCall / Text+ParsedIntent / Done) → tool execution → continue
     /// Returns the final thought text.
@@ -538,6 +569,14 @@ skill_dir: {}
                             for ((name, call_id, args), mut result) in
                                 batch.into_iter().zip(results)
                             {
+                                // A discovery adds the reported schemas to the
+                                // live context, so the next model step can call
+                                // those tools directly by name.
+                                if name == "find_tool" {
+                                    if let Ok(reported) = &result {
+                                        Self::reveal_tools(reported, context);
+                                    }
+                                }
                                 // What the call actually was, when the tool that
                                 // ran was a dispatcher for another one.
                                 let observed =
@@ -772,6 +811,15 @@ skill_dir: {}
                                     tool_started.elapsed().as_nanos() as u64,
                                     Ordering::Relaxed,
                                 );
+
+                                // A discovery reveals the reported schemas to
+                                // the next request so the model can call them
+                                // directly.
+                                if name == "find_tool" {
+                                    if let Ok(reported) = &result {
+                                        Self::reveal_tools(reported, context);
+                                    }
+                                }
 
                                 match self
                                     .react_app
@@ -1114,6 +1162,14 @@ skill_dir: {}
                             self.tool_call_count.fetch_add(1, Ordering::Relaxed);
                             self.tool_time_nanos
                                 .fetch_add(tool_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+                            // A discovery reveals the reported schemas to the
+                            // next request so the model can call them directly.
+                            if name == "find_tool" {
+                                if let Ok(reported) = &result {
+                                    Self::reveal_tools(reported, context);
+                                }
+                            }
 
                             match self.react_app
                                 .after_tool_result(

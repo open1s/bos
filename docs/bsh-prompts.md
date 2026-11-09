@@ -17,18 +17,18 @@ each is an intent with missing pieces. The agent has to recover the missing
 pieces from the conversation and the workspace, decide how much to ask, and
 still finish the job in one turn when it can.
 
-A prompt cannot enumerate every case. It can make the right reading the
-default. The strategy here is four defaults, in the order a turn runs:
+A prompt cannot enumerate every case, and a list of virtues ("infer the goal",
+"think briefly", "be careful") does not change a choice. The strategy here is a
+decision procedure with four questions, in the order a turn runs:
 
-1. **Read the intent before choosing an action.** Infer the goal, not the
-   literal words; inspect before asking; ask only for a decision that belongs
-   to the reader.
-2. **Act on that reading.** Batch independent tool calls, keep changes small,
-   and never spend a turn narrating a step that could have been taken.
-3. **Verify with evidence.** Run the command that proves the change, or say
-   plainly what could not be checked.
-4. **Report the outcome, not the process.** Lead with the result, name the
-   files, state the evidence and the gaps.
+1. **What is being asked?** Judge the verb, not the punctuation: a question, a
+   defect report, an instruction, or a goal with no target.
+2. **Which instruction wins?** The reader's latest explicit instruction, a
+   correction they accepted, workspace instructions, then the contract.
+3. **Act or ask?** Inspect first. Act when both readings are cheap; ask one
+   question, with a default, only when the wrong reading is expensive.
+4. **When is the turn done?** A question is answered; a change is made and
+   verified. Then stop - no refactor, no commit, no narration.
 
 Everything else in the corpus serves one of those four.
 
@@ -42,11 +42,17 @@ prefix stays stable.
 |---|-------|----------|-------|------|
 | 1 | Harness identity | `HARNESS_IDENTITY` | `agent` | always |
 | 2 | Persona slot | `DEFAULT_PERSONA` or the workspace/preset persona | `agent` | always (unless `complete`) |
-| 3 | Operating contract | `WORKFLOW_GUIDANCE` | `agent` | always (unless `complete`) |
+| 3 | Decision procedure | `WORKFLOW_GUIDANCE` | `agent` | always (unless `complete`) |
 | 4 | Product context | `HARNESS_CONTEXT` | `bsh` | when the persona is not `complete` |
 | 5 | Tool sections | `agent::prompts::TOOL_GUIDANCE` then `bsh::prompts::TOOL_GUIDANCE` | both | only for registered tools |
 | 6 | Per-turn plan directive | `PLAN_DIRECTIVE` | `bsh` | plan mode only |
 | 7 | Workspace instructions | `instructions::render` | `bsh` | every turn, framed as a user-role reminder |
+| 8 | Runtime snapshot | `context::render_snapshot` | `bsh` | every turn, first user message |
+
+A subagent child inherits the parent's layers, drops the delegation tail
+(`## Delegating with subagents`) because a leaf cannot delegate again, and
+gains a prefix that names its reporting contract: the parent cannot see the
+child's transcript, so the result must carry the evidence the parent needs.
 
 A `complete: true` persona replaces layers 1-5 with exactly the persona text
 (the DeepSeek Harness arm). It is deliberate, off by default, and still scanned
@@ -76,8 +82,6 @@ length (about 18 KB in the measured desktop build). Its clauses:
 - **Steering is explicit.** A message during a turn is "steering the active
   task rather than replacing it"; status questions are answered briefly and the
   task resumes; replacement needs an explicit cancel or an incompatible goal.
-- **Compaction is not an ending.** Work spanning compactions is "one logical
-  chain of events"; do not restart or redo completed work.
 
 BSH adopts the completion contract, the ambiguity rule, the permission
 economics and the steering rule. It does not copy Codex's length or its
@@ -95,17 +99,14 @@ OpenCode's prompt is mid-sized (under 10 KB) and spends its words on stance:
   into taking actions."
 - **Vagueness is a reason to ask.** "When the user's request is vague, use the
   question tool to clarify before reading files or making changes."
-- **Tool discipline is explicit.** Run independent calls in parallel, dependent
-  calls in sequence, and do not repeat a call with the same arguments once it
-  produced a useful result.
 - **Verification is part of the task.** Find the project's real lint and
   typecheck commands and run them before claiming completion.
 
-BSH adopts the proactiveness boundary and the parallel/sequential rule. It
-keeps the "ask" instinct but cannot copy the mechanism: BSH has no
-`ask_user_question` tool, so a question is a reply that ends the turn. The
-prompt therefore says to finish independent work first and ask one
-self-contained question with a default, rather than asking before reading.
+BSH adopts the proactiveness boundary. It keeps the "ask" instinct but cannot
+copy the mechanism: BSH has no `ask_user_question` tool, so a question is a
+reply that ends the turn. The contract therefore makes the question the last
+resort and requires a default with it. Plan mode is the structured version of
+the same path: the reader approves a concrete plan before work starts.
 
 ### DeepSeek Harness: intent as capability-gated context
 
@@ -113,17 +114,16 @@ DSH is the smallest static prompt of the three. It sends an identity, a
 persona, short per-tool sections and runtime context; it does not carry a long
 workflow block. What makes it precise:
 
-- **Sections are capability-gated.** A tool section is registered only when the
-  tool is mounted (the `SECTION_ORDERS` table in `dsh-system-prompt`), so the
-  prompt cannot name a tool the request does not carry.
+- **Sections are capability-gated.** Each `dsh-tool-*` package gates its
+  section on `ctx.tools.get(...)`; `SECTION_ORDERS` only fixes placement, so
+  the prompt cannot name a tool the request does not carry.
 - **Runtime context is a snapshot.** Working directory, sandbox policy,
   approval policy, subagent depth and time arrive as context that "supersedes
   earlier runtime-context snapshots" - facts, not prose the model has to infer.
 - **Questions have semantics.** `ask_user_question` asks "brief, direct,
   self-contained questions about missing information, preferences, or
   decisions"; a skipped question means "continue without it, do not ask it
-  again, and do not treat the skip as permission"; a pending result means the
-  user can still answer.
+  again, and do not treat the skip as permission".
 - **Tool rules live with the tool.** "Use the glob tool - not shell find",
   "check the [exit code: N] marker", "do not busy-poll or sleep" - one sentence
   where the model needs it, not a general essay.
@@ -131,39 +131,58 @@ workflow block. What makes it precise:
 BSH adopts capability-gating (its `append_tool_guidance` is the same idea), the
 "one sentence at the point of use" rule, and the question semantics. It cannot
 adopt runtime interpolation: BSH sends one static system prompt for the build,
-so per-turn facts arrive as user-role context instead.
+so per-turn facts arrive as user-role context instead. BSH's runtime snapshot
+already carries cwd, the workspace layout, sandbox, permission and preset.
 
-### The comparison that matters
+### Why the first BSH revision was too long
 
-| Behaviour | Codex | OpenCode | DSH | BSH |
-|---|---|---|---|---|
-| Infer the goal, not the words | yes | partial | via context | yes |
-| Ask only when the reader owns the decision | yes (progress first) | yes (before reading) | yes (tool semantics) | yes (work first, then one question) |
-| Authorization persists | explicit | implicit | host policy | explicit |
-| Mid-turn message steers | explicit | not covered | host/UI | explicit in BSH context |
-| Verify with evidence | yes | yes (lint/typecheck) | tool-owned | yes |
-| Capability-gated guidance | yes | per-agent | yes | yes |
-| Static prompt | no | no | no | yes |
+The first revision of this contract was 3,001 bytes of well-written rules -
+"infer the goal", "think briefly", "plan once", "ask only for what you cannot
+discover". It read better than the old seven-point list and changed less than
+it should have. Three failure modes:
 
-## 4. The clauses BSH ships
+- **Virtues instead of decisions.** "Infer the goal" tells the model what to
+  value, not what to do when a request is a question, a defect, or a goal with
+  no target. A clause has to resolve a choice.
+- **No precedence.** Six intent bullets and seven action bullets left the
+  order between the reader's latest instruction, an accepted correction,
+  workspace instructions and the contract implicit. Models resolve conflicts
+  with whichever rule is most recent in the prompt.
+- **No stop condition.** "Work until done" plus "stay in scope" does not say
+  when done is. The model kept polishing or added a summary the reader did not
+  ask for.
 
-Each clause exists because one of the behaviours above fails without it.
+The current contract is 1,966 bytes: 34% shorter than that revision, with more
+decisions in it. Design rules for a clause:
 
-| Clause | Why it is there | Pinned by |
+1. It must name a choice or a contrast ("A question ends without an edit"),
+   never a virtue ("Be careful", "Think deeply").
+2. Precedence beats repetition: state the order once, then stop repeating it
+   in every bullet.
+3. If the runtime or a tool already enforces the fact, cut the clause. cwd,
+   sandbox and the workspace layout are in the snapshot; file-tool behaviour is
+   in the tool sections.
+4. One concrete example per ambiguous case, not a taxonomy of cases.
+5. Every byte rides on every step, so a clause that does not change a decision
+   is a per-request cost with no benefit.
+
+## 4. The decisions BSH ships
+
+| Decision | Clause | Why it is there |
 |---|---|---|
-| "You and the reader share one workspace... carry it to a finished, verified result." | Sets completion, not conversation, as the success condition. | `the_default_prompt_pins_every_workflow_rule` |
-| "Infer the goal ... not from the words alone. A terse instruction in a code workspace usually means 'change the code'; a question usually wants an answer, not an edit." | The two most common misreads: answering an instruction, or editing in reply to a question. | same |
-| "Act on the obvious reading. Inspect before asking." | Prevents a clarification turn for a fact the workspace can answer. | `the_contract_reads_intent_before_work_and_reporting` |
-| "Ask only when ... the reader's and a wrong guess would be expensive ... one short, self-contained question ... which default you would pick." | Keeps questions rare, answerable and actionable; BSH has no question tool, so the reply must carry everything. | same |
-| "Do not ask the reader to confirm what the session already authorized ... ask once, when the next step is irreversible and the result is concrete enough to review." | Stops repeated permission turns; makes the approval a review of a result. | same |
-| "A message that arrives while you work steers this task ... replace only when the reader cancels it or asks for something incompatible." | Prevents a correction from silently replacing the objective. | same |
-| "Workspace instructions and the reader's explicit choices outrank these defaults. A skill applies only when its stated use matches the request." | Sets the precedence order and stops keyword-triggered skill loads. | same |
-| "Start now ... batching every independent call ... never send a message that only describes the next step." | The narration failure is the most expensive one: a whole turn with no progress. | `the_default_prompt_pins_every_workflow_rule` |
-| "Plan once ... exactly one active ... skip ... for a single trivial step." | Plans are useful for multi-step work and pure overhead for one edit. | same |
-| "Read before you change ... follow the workspace's existing functions and patterns ... smallest that solves the task." | Convention drift is the most common review rejection. | same |
-| "Verify before you claim done ... after two identical failures, stop and report the exact error." | Evidence closes the turn; a retry loop is not progress. | same |
-| "Stay in scope ... do not commit, push or open a pull request unless the reader asks." | Intent is also a boundary: fixing one bug is not licence to refactor, and history is the reader's to write. | same |
-| "Lead with the outcome, then the evidence ... no preamble ... plain words and concrete nouns ... name files as paths they can open." | The reader sees the final message; it must stand alone, and filler hides the result. | same |
+| What kind of request is this? | "Judge the verb, not the punctuation: 'why does X fail?' asks for an explanation, 'can you fix X?' asks for a change. A defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target ('make it faster') is measured before it is changed." | The four readings that most often pick the wrong first action. |
+| What shape does the answer take? | "A question ends without an edit; a change request ends with the change made, not instructions for making it." | The two symmetric failures: editing on a question, and explaining instead of doing. |
+| Which instruction wins? | "When instructions conflict, obey the reader's latest explicit instruction, then a correction they accepted, then workspace instructions and loaded skills, then this contract." | A general rule never overrides a specific request; a correction outranks the original, and a skill ranks with the workspace. |
+| Act or ask? | "Inspect before asking. If the wrong reading is cheap to undo, take the one that acts on the workspace; if it would delete, publish or spend something the reader owns, stop and ask one short question, naming the default you would use." | Cheap ambiguity should not cost a turn; expensive ambiguity should not be guessed. |
+| When is a question allowed? | "Never ask for a fact the workspace can answer, and never ask twice for what the session already authorized." | Removes the two question classes that waste the reader's time. |
+| What does a later message mean? | "A later message corrects the current task; it replaces the task only when it cancels it or asks for something incompatible." | Steering, not silent replacement. |
+| How does work start? | "Start now, batch independent calls, and never spend a turn narrating the next step." | The narration failure costs a whole turn. |
+| How large is a change? | "Read before you edit; make the smallest change that satisfies the request; follow the workspace's existing patterns." | Convention drift and scope creep are the common review rejections. |
+| How is done proved? | "Prove it with the command that checks it, or say what you could not check. After two identical failures, stop and report the error and what must change in the environment." | Evidence closes the turn; a retry loop is not progress, and a repeated failure is usually an environment fact. |
+| When does the turn end? | "Stop when the request is answered or the change is verified. Do not refactor, commit, push or open a pull request unless asked." | The stop condition the first revision lacked. |
+| How is it reported? | "Outcome first, then evidence, then anything unverified. No preamble or process narration." | The final message must stand alone. |
+| What does it sound like? | "Plain words, concrete nouns, file paths the reader can open; no filler or praise." | Filler hides the result. |
+| How much? | "Match the reader's language; brief by default, thorough when the decision needs it." | Length is a property of the decision, not a fixed cap. |
 
 The BSH product context adds the facts the code cannot reveal:
 
@@ -173,22 +192,26 @@ The BSH product context adds the facts the code cannot reveal:
 - a message during a turn is queued for the next turn, not injected;
 - the Stop button is a decision, not a failure to retry;
 - `.bsh/` is internal and denied;
-- two identical failures end the attempt.
+- a terse request in an open workspace is work in the code; say which reading
+  you take when it is equally likely to be a question;
+
+Plan mode is the one mode that overrides the start-now rule, and it says so in
+the directive: inspect and propose first, then wait for the reader's approval.
 
 ## 5. Deliberate omissions
 
 - **OpenCode's "fewer than 4 lines" rule.** BSH answers often need a diff
   summary and evidence; a hard line cap would truncate the part the reader
-  needs. BSH asks for "brief by default, thorough when the decision needs it".
+  needs. The contract makes length follow the decision.
 - **Codex's "do not add or run tests unless asked".** This workspace requires
   verification; the contract says run the command that proves the change.
 - **Codex's absolute "do not ask permission".** BSH has real sandbox approvals
-  and a deny list. The prompt governs the conversational question, not the
+  and a deny list. The contract governs the conversational question, not the
   host's approval flow.
 - **DSH runtime interpolation.** The BSH prompt is one static string per build.
-  Per-turn facts (directory, plan mode, instructions) arrive as context or
-  directives, and the prompt never pretends to interpolate them.
-- **OpenCode's question tool.** BSH has no `ask_user_question`; the workflow
+  Per-turn facts (directory, layout, sandbox, plan mode, instructions) arrive as
+  context or directives, and the prompt never pretends to interpolate them.
+- **OpenCode's question tool.** BSH has no `ask_user_question`; the contract
   says how to ask in a reply instead of naming a tool that does not exist.
 
 ## 6. Budget
@@ -198,17 +221,43 @@ per-request cost. Measured bytes:
 
 | Layer | Bytes |
 |---|---|
-| `DEFAULT_SYSTEM_PROMPT` (identity + persona + contract) | 3,143 |
-| `HARNESS_CONTEXT` | 1,623 |
+| `DEFAULT_SYSTEM_PROMPT` (identity + persona + contract) | 2,108 |
+| `HARNESS_CONTEXT` | 1,421 |
 | Tool sections (bare build) | 5,143 |
-| Built prompt | 9,909 |
+| Built prompt | 8,672 |
+
+The first contract revision measured 3,001 bytes and a 9,909-byte built prompt;
+this one is 34% shorter in the contract and 12.5% shorter overall, with the
+precedence, question and stop rules it lacked.
 
 `the_system_prompt_stays_within_its_budget` in `crates/bsh/src/caps.rs` caps
 the built prompt at 12,000 bytes; `the_framework_prompt_stays_small` caps the
 framework default at 6,000. The skill catalogue is deliberately not in the
 prompt: it is ranked against the request instead.
 
-## 7. Changing a prompt clause
+## 7. Scenario checks
+
+The contract is only as good as the first move it produces. These are the
+scenarios a prompt change is checked against; "first move" means the first tool
+call or the reply, before any correction from the reader.
+
+| Reader message | Context | First move | Clause that decides it |
+|---|---|---|---|
+| "why does login fail?" | repo open | read the auth path and answer; no edit | Judge the verb; a question ends without an edit |
+| "login is broken" | repo open | reproduce, fix, verify | A defect report is reproduced, fixed and verified |
+| "can you fix the retry?" | repo open | read the call site, change it, test it | "can you fix X?" asks for a change |
+| "make it faster" | no metric | measure or profile first, then change | A goal with no target is measured first |
+| "fix this" + button screenshot | app | ask: bug report or code change? | Product context: a screenshot is evidence, not a task |
+| "actually keep the old API" | mid-turn | fold the constraint into the current task | A later message corrects the current task |
+| "is this file used?" | repo open | grep, read the callers, answer | A question ends without an edit |
+| "drop the users table" | repo open | inspect the target, then ask before executing | Expensive ambiguity asks one question |
+| "what is the test command?" | repo open | read the README or justfile; do not ask | Never ask for a fact the workspace can answer |
+| "reduce latency" | product tradeoff | measure; ask only if the target belongs to the reader | Cheap readings act; expensive ones ask |
+
+A scenario that produces the wrong first move is a prompt bug even when the
+final answer is right: the reader paid for the wrong step.
+
+## 8. Changing a prompt clause
 
 1. Change the constant, never a rendered copy. `DEFAULT_SYSTEM_PROMPT` is a
    literal of the three layers; regenerate it when the workflow changes, or
@@ -218,15 +267,17 @@ prompt: it is ranked against the request instead.
    `TOOL_GUIDANCE`, appended only when the tool is registered.
 3. Add or update the test that pins the clause. A deleted line is a changed
    instruction, not a cosmetic diff.
-4. Re-measure the budget and update the table above.
-5. If a clause was copied from a reference, record the exact source here. If it
+4. Apply the five design rules in section 3 before adding a clause. A rule
+   that does not resolve a choice is prose, and prose is charged every step.
+5. Re-measure the budget and update the table above.
+6. If a clause was copied from a reference, record the exact source here. If it
    states a BSH fact, say which fact and where it is enforced.
 
-## 8. Sources
+## 9. Sources
 
 - Codex: `openai/codex`, `codex-rs/core/prompt.md` and
   `gpt_5_codex_prompt.md`; measured from the desktop build's base
-  instructions (`~/Library/.../ChatGPT.app/Contents/Resources/codex-cli` and
+  instructions (`/Applications/ChatGPT.app/Contents/Resources/codex-cli` and
   the rollout records under `~/.codex/sessions`).
 - OpenCode: `sst/opencode`, `packages/opencode/src/session/prompt/*.txt`;
   measured from the installed binary at `~/.opencode/bin/opencode` (the
@@ -237,4 +288,5 @@ prompt: it is ranked against the request instead.
   `/Applications/DeepSeek Harness.app/Contents/Resources/app.asar` with the
   header parser used by the UI-mirror rounds (`data base = 8 + pickle size`).
 - BSH: `crates/agent/src/agent/prompts.rs`,
-  `crates/bsh/src/prompts.rs`, `crates/bsh/src/instructions.rs`.
+  `crates/bsh/src/prompts.rs`, `crates/bsh/src/instructions.rs`,
+  `crates/bsh/src/context.rs`.

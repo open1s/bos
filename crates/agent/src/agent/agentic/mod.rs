@@ -293,7 +293,7 @@ pub struct Agent {
     /// Tools kept out of the advertised array by exact name.
     ///
     /// A deferred tool stays registered and callable; the model reaches it
-    /// through `find_tool` and `call_tool`. The point is prompt bytes: the
+    /// through `find_tool`. The point is prompt bytes: the
     /// advertised array is part of every step's cached prefix.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     deferred_tools: Vec<String>,
@@ -752,7 +752,7 @@ impl Agent {
     /// Keep a registered tool out of the advertised array.
     ///
     /// The tool stays registered and callable. What changes is that its schema
-    /// is no longer sent on every step: `find_tool` and `call_tool` are
+    /// is no longer sent on every step: `find_tool` is
     /// advertised instead, and the model reaches it on demand. Use this for the
     /// long tail, not for a tool the prompt itself names.
     #[must_use]
@@ -789,7 +789,7 @@ impl Agent {
 
     /// Whether any registered tool is withheld from the advertised array.
     ///
-    /// False means `find_tool` and `call_tool` have nothing to find, so they
+    /// False means `find_tool` has nothing to find, so it
     /// are not advertised either: two tools that can only answer "none" are
     /// prompt bytes for no capability.
     pub fn has_deferred_tools(&self) -> bool {
@@ -896,8 +896,8 @@ impl Agent {
     /// This is [`Agent::all_tools`] minus everything withheld: a tool marked
     /// [`react::tool::Tool::deferred`], an MCP tool (withheld by default), and
     /// any name this agent was told to defer. The model reaches a withheld tool
-    /// through `find_tool` and `call_tool` instead, so the array the provider
-    /// sees stays a function of the set rather than of the turn.
+    /// through `find_tool`; the tools that search reports join the next
+    /// request, so the provider sees only the definitions the model asked for.
     pub fn model_tools(&self) -> Vec<react::llm::LlmTool> {
         let all = self.all_tools();
         let deferred: std::collections::HashSet<String> = self
@@ -941,12 +941,11 @@ impl Agent {
         // a host that prices or lists the array must see what the request
         // actually carries, and a surface reading `model_tools` alone would
         // undercount the two entries that make deferral usable.
-        // The SAME predicate the engine registers the pair with: a host that
+        // The SAME predicate the engine registers the search with: a host that
         // deferred a name before its tool exists still gets the way back to it,
         // and the request never advertises a tool the engine did not build.
         if self.has_deferred_tools() {
             tools.push(discovery::find_tool_definition());
-            tools.push(discovery::call_tool_definition());
             tools.sort_by(|a, b| a.name.cmp(&b.name));
         }
         tools

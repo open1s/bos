@@ -73,7 +73,7 @@ impl FunctionTool {
     /// Keep this tool out of the advertised array.
     ///
     /// The tool stays callable; the model reaches it through `find_tool` and
-    /// `call_tool`. See [`Tool::deferred`].
+    /// the discovered definition. See [`Tool::deferred`].
     pub fn with_deferred(mut self, deferred: bool) -> Self {
         self.deferred = deferred;
         self
@@ -270,7 +270,7 @@ impl AsyncFunctionTool {
     /// Keep this tool out of the advertised array.
     ///
     /// The tool stays callable; the model reaches it through `find_tool` and
-    /// `call_tool`. See [`AsyncTool::deferred`].
+    /// the discovered definition. See [`AsyncTool::deferred`].
     pub fn with_deferred(mut self, deferred: bool) -> Self {
         self.deferred = deferred;
         self

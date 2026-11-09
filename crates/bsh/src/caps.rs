@@ -2607,7 +2607,7 @@ impl SubagentContext {
             config.system_prompt = config.system_prompt.trim_end().to_string();
         }
         config.system_prompt = format!(
-            "You are a focused subagent. Complete the task and return a concise result.\n\n{}",
+            "You are a focused subagent. Your parent cannot see this transcript: complete the task you were given and return a concise result that carries the evidence it needs.\n\n{}",
             config.system_prompt
         );
         let mut child = Agent::from_config(config).with_context_budget(self.context_budget);
@@ -5501,8 +5501,8 @@ mod tests {
             .collect();
         assert!(
             advertised.iter().any(|name| name == "find_tool")
-                && advertised.iter().any(|name| name == "call_tool"),
-            "the pair replaces the family: {advertised:?}"
+                && !advertised.iter().any(|name| name == "call_tool"),
+            "the search replaces the family: {advertised:?}"
         );
         for tool in [
             "browser_open",
@@ -6015,8 +6015,8 @@ mod tests {
         }
         assert!(
             model_names.iter().any(|name| name == "find_tool")
-                && model_names.iter().any(|name| name == "call_tool"),
-            "the pair replaces the withheld tools: {model_names:?}"
+                && !model_names.iter().any(|name| name == "call_tool"),
+            "the search replaces the withheld tools: {model_names:?}"
         );
         let registered: Vec<String> = built
             .agent
@@ -6878,7 +6878,11 @@ mod tests {
         assert!(prompt.contains(agent::WORKFLOW_GUIDANCE));
         assert!(prompt.contains(crate::prompts::HARNESS_CONTEXT));
         assert!(
-            prompt.contains("A message that arrives while you work steers this task"),
+            prompt.contains("A question ends without an edit"),
+            "the question/change decision reaches the request"
+        );
+        assert!(
+            prompt.contains("A later message corrects the current task"),
             "the steering rule reaches the request"
         );
         assert!(
@@ -6895,7 +6899,7 @@ mod tests {
 
     /// The system prompt rides on EVERY step of EVERY turn, so its size is a
     /// per-request cost, not a wording preference. A change that doubles it is a
-    /// performance bug: measured at 9,909 bytes with the full tool roster, and
+    /// performance bug: measured at 8,672 bytes with the full tool roster, and
     /// the skill catalogue is deliberately NOT part of it (the vendor ranks that
     /// against the request instead). The headroom below the cap is kept for
     /// capability-gated rules, not for prose.

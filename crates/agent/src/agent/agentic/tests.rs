@@ -1024,8 +1024,8 @@ fn a_deferred_tool_leaves_the_array_and_the_discovery_pair_takes_its_place() {
     );
     assert!(
         names.iter().any(|name| name == "find_tool")
-            && names.iter().any(|name| name == "call_tool"),
-        "the way back to a withheld tool is advertised: {names:?}"
+            && !names.iter().any(|name| name == "call_tool"),
+        "the search is advertised, the dispatcher is gone: {names:?}"
     );
 }
 
@@ -1044,40 +1044,8 @@ fn nothing_is_deferred_by_default() {
         !names
             .iter()
             .any(|name| name == "find_tool" || name == "call_tool"),
-        "no withheld tool means no discovery pair: {names:?}"
+        "no withheld tool means no discovery search: {names:?}"
     );
-}
-
-/// The dispatcher runs a registered tool and returns its result unchanged.
-#[tokio::test]
-async fn the_dispatcher_runs_the_tool_it_names() {
-    let mut registry = crate::tools::ToolRegistry::new();
-    registry
-        .register(Arc::new(FunctionTool::new(
-            "echo",
-            "echo the arguments",
-            serde_json::json!({"type": "object"}),
-            |args| Ok(args.clone()),
-        )))
-        .expect("the tool registers");
-    let live = Arc::new(std::sync::RwLock::new(crate::tools::ToolRegistry::new()));
-    let dispatcher =
-        crate::agent::agentic::discovery::CallTool::new(Some(Arc::new(registry)), live);
-
-    let result = react::tool::registry::AsyncTool::run(
-        &dispatcher,
-        &serde_json::json!({"name": "echo", "args": {"text": "hi"}}),
-    )
-    .await
-    .expect("the dispatch succeeds");
-    assert_eq!(result["text"], "hi");
-
-    let missing = react::tool::registry::AsyncTool::run(
-        &dispatcher,
-        &serde_json::json!({"name": "nope", "args": {}}),
-    )
-    .await;
-    assert!(missing.is_err(), "an unknown name is an error, not silence");
 }
 
 // =========================================================================
@@ -1133,8 +1101,8 @@ impl AgentHook for ToolNameHook {
     }
 }
 
-/// A model that discovers a withheld tool through `find_tool`, then runs it
-/// through `call_tool` - the whole round trip, through the real agent loop.
+/// A model that discovers a withheld tool through `find_tool`, then calls it
+/// directly - the whole round trip, through the real agent loop.
 struct DiscoveringLlm {
     step: std::sync::atomic::AtomicUsize,
     advertised: Arc<std::sync::Mutex<Vec<String>>>,
@@ -1149,17 +1117,16 @@ impl LlmClient<AgentSession, AgentReactContext> for DiscoveringLlm {
         _session: &mut AgentSession,
         context: &mut AgentReactContext,
     ) -> Result<LlmResponse, LlmError> {
-        if self.step.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The discovery result must join the NEXT request's tool array; that is
+        // the step where the model calls the reported tool directly.
+        if step == 1 {
             let names = context.tools.iter().map(|tool| tool.name.clone()).collect();
             *self.advertised.lock().unwrap() = names;
         }
-        let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(match step {
             0 => make_tool_call_response("find_tool", "{\"query\":\"github issue search\"}"),
-            1 => make_tool_call_response(
-                "call_tool",
-                "{\"name\":\"github_search\",\"args\":{\"query\":\"bug\"}}",
-            ),
+            1 => make_tool_call_response("github_search", "{\"query\":\"bug\"}"),
             _ => make_text_response("Final Answer: found the issues".to_string()),
         })
     }
@@ -1203,7 +1170,7 @@ fn discovering_agent(
 }
 
 /// An MCP tool is callable, and unreachable without the pair: the model asks
-/// `find_tool`, runs the answer through `call_tool`, and the hooks and the tool
+/// `find_tool`, calls the reported answer directly, and the hooks and the tool
 /// itself see one real invocation - not a dispatcher and a victim.
 #[tokio::test]
 async fn a_withheld_mcp_tool_is_found_and_run_through_the_agent() {
@@ -1234,17 +1201,18 @@ async fn a_withheld_mcp_tool_is_found_and_run_through_the_agent() {
     );
     let seen = advertised.lock().unwrap().clone();
     assert!(
-        seen.iter().any(|name| name == "find_tool") && seen.iter().any(|name| name == "call_tool"),
-        "the pair is advertised: {seen:?}"
+        seen.iter().any(|name| name == "find_tool")
+            && seen.iter().any(|name| name == "github_search"),
+        "the search and the discovered tool are both advertised: {seen:?}"
     );
     assert!(
-        !seen.iter().any(|name| name == "github_search"),
-        "the MCP tool is not advertised: {seen:?}"
+        !seen.iter().any(|name| name == "call_tool"),
+        "the dispatcher is gone: {seen:?}"
     );
     assert_eq!(
         *hook_names.lock().unwrap(),
         vec!["find_tool".to_string(), "github_search".to_string()],
-        "the second hook sees the tool behind the dispatcher"
+        "the second hook sees the real discovered tool"
     );
 }
 
@@ -1454,8 +1422,8 @@ fn tool_chars(tool: &react::llm::LlmTool) -> usize {
 ///
 /// The whole reason for deferral is prompt bytes: the advertised array is part
 /// of every step's cached prefix. This pins the arithmetic in both directions -
-/// what leaves, and what the two discovery tools plus their prompt paragraph
-/// cost - so a future change that makes the pair expensive, or the filter
+/// what leaves, and what the discovery search plus its prompt paragraph
+/// costs - so a future change that makes it expensive, or the filter
 /// ineffective, fails here rather than in a bill.
 #[test]
 fn withholding_an_mcp_namespace_pays_for_the_discovery_pair() {
@@ -1474,13 +1442,10 @@ fn withholding_an_mcp_namespace_pays_for_the_discovery_pair() {
 
     let full: usize = agent.all_tools().iter().map(tool_chars).sum();
     let advertised: usize = agent.model_tools().iter().map(tool_chars).sum();
-    let pair: usize = [
-        crate::agent::agentic::discovery::find_tool_definition(),
-        crate::agent::agentic::discovery::call_tool_definition(),
-    ]
-    .iter()
-    .map(tool_chars)
-    .sum();
+    let pair: usize = [crate::agent::agentic::discovery::find_tool_definition()]
+        .iter()
+        .map(tool_chars)
+        .sum();
     let paragraph = crate::agent::prompts::DISCOVERY_GUIDANCE.len() + 2;
 
     let saved = full - advertised;
@@ -1488,12 +1453,12 @@ fn withholding_an_mcp_namespace_pays_for_the_discovery_pair() {
         "mcp={SERVERS} full={full} advertised={advertised} pair={pair} paragraph={paragraph} saved={saved}"
     );
 
-    // The pair is INSIDE `model_tools`, so the count difference is what was
-    // withheld minus the two entries that replaced it.
+    // The search is INSIDE `model_tools`, so the count difference is what was
+    // withheld minus the one entry that replaced it.
     assert_eq!(
         agent.all_tools().len() as i64 - agent.model_tools().len() as i64,
-        SERVERS as i64 - 2,
-        "every MCP tool leaves the array, and the pair joins it"
+        SERVERS as i64 - 1,
+        "every MCP tool leaves the array, and the search joins it"
     );
     let net = saved.saturating_sub(paragraph);
     assert!(

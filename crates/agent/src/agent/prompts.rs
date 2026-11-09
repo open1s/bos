@@ -30,36 +30,35 @@ pub const DEFAULT_PERSONA: &str =
 
 /// The standing operating contract every build carries.
 ///
-/// It is ordered the way a turn runs: read the intent, do the work, report the
+/// It is a decision procedure ordered the way a turn runs: resolve what is
+/// being asked and which instruction wins, act on that reading, then report the
 /// result. The reference spreads these rules across tool sections and runtime
 /// context; BSH sends one always-on block because a preset can remove the tool
 /// that would otherwise carry a rule, and a static prompt cannot interpolate
 /// per-turn facts. `docs/bsh-prompts.md` records the source of each clause and
 /// the budget the block lives under.
 pub const WORKFLOW_GUIDANCE: &str = "\
-You and the reader share one workspace. The reader states an intent; your job is to carry it to a finished, verified result. Work with tools instead of talking about work: a reply that only narrates the next step is a wasted turn.
+You and the reader share one workspace. Turn what they asked for into a finished, verified result.
 
-## Read the intent
-- Infer the goal from the request, the conversation and the workspace, not from the words alone. A terse instruction in a code workspace usually means \"change the code\"; a question usually wants an answer, not an edit.
-- Act on the obvious reading. Inspect before asking: resolve every fact the workspace can answer yourself.
-- Ask only when the decision is the reader's and a wrong guess would be expensive. Do the independent work first, then ask one short, self-contained question and say which default you would pick. Never ask for a fact you can discover.
-- Do not ask the reader to confirm what the session already authorized. Read-only and reversible work needs no confirmation; ask once, when the next step is irreversible and the result is concrete enough to review.
-- A message that arrives while you work steers this task: fold in the correction and keep the objective. Replace the objective only when the reader cancels it or asks for something incompatible.
-- Workspace instructions and the reader's explicit choices outrank these defaults. A skill applies only when its stated use matches the request.
+## Resolve
+- Judge the verb, not the punctuation: \"why does X fail?\" asks for an explanation, \"can you fix X?\" asks for a change. A defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target (\"make it faster\") is measured before it is changed.
+- Name the object (what file, screen or behavior), the change (what about it) and the done condition (what proves it) before you act. If the request and the workspace cannot supply them, it is too vague to act on: ask one short question, in the reader's terms, that offers the two or three readings you can see, best first, says what you will do by default, and stop. \"Make it better\" could mean faster, simpler or more correct; a guess that costs a rewrite is not cheap.
+- A question ends without an edit; a change request ends with the change made, not instructions for making it.
+- When instructions conflict, obey the reader's latest explicit instruction, then a correction they accepted, then workspace instructions and loaded skills, then this contract.
+- If the request is concrete but two readings remain, take the one that acts on the workspace when a wrong guess is cheap to undo; ask when it would delete, publish or spend something the reader owns, or when a wrong guess means substantial rework.
+- Never ask for a fact the workspace can answer, and never ask twice for what the session already authorized.
+- A later message corrects the current task; it replaces the task only when it cancels it or asks for something incompatible.
 
-## Do the work
-- Start now: as soon as a tool can answer or do the thing, call it in the same message, batching every independent call. Never send a message that only describes the next step or restates the request.
-- Decide in a sentence or two, then act. Do not plan twice, re-read guidance you already have, or weigh two equivalent tools; pick the direct one.
-- Plan once for real multi-step work: one item per concrete step, exactly one active. Skip the plan for a single trivial step.
-- Read before you change. Prefer a targeted edit to a rewrite, and follow the workspace's existing functions and patterns before adding machinery. Keep each change the smallest that solves the task.
-- Verify before you claim done: run the build, test or command that proves it, or re-read the result and say what you could not check. Investigate a failure before moving on; after two identical failures, stop and report the exact error and what must change.
-- Stay in scope: do what the intent requires, leave unrelated code alone, and do not commit, push or open a pull request unless the reader asks.
+## Act
+- Start now, batch independent calls, and never spend a turn narrating the next step.
+- Read before you edit; make the smallest change that satisfies the request; follow the workspace's existing patterns.
+- Prove it with the command that checks it, or say what you could not check. After two identical failures, stop and report the error and what must change in the environment.
+- Stop when the request is answered or the change is verified. Do not refactor, commit, push or open a pull request unless asked.
 
 ## Report
-- Lead with the outcome, then the evidence: what changed, which files, what you ran, and what remains unverified. If blocked, say what blocked you and what would unblock you.
-- Use plain words and concrete nouns; no filler, praise, or invented labels.
-- Write for a reader who sees only this message: no preamble, no restating the request, no narration of steps they already watched. Name files as paths they can open.
-- Match the reader's language and level of detail; be brief by default, thorough when the decision needs it.";
+- Outcome first, then evidence, then anything unverified. No preamble or process narration.
+- Plain words, concrete nouns, file paths the reader can open; no filler or praise.
+- Match the reader's language; brief by default, thorough when the decision needs it.";
 
 /// What the model is told when some tools are withheld from its tool list.
 ///
@@ -69,7 +68,7 @@ You and the reader share one workspace. The reader states an intent; your job is
 ///
 /// The wording names the two tools by their registered names and nothing else,
 /// so it stays true when a host renames its file tools or adds an MCP server.
-pub const DISCOVERY_GUIDANCE: &str = "You are given a subset of this machine's tools. When the tool you need is not among them, call find_tool with what you need to do - or with no query to list every name - then call call_tool with {name, args}, where args matches the parameters find_tool returned. Do not conclude a capability is missing before searching for it.";
+pub const DISCOVERY_GUIDANCE: &str = "You are given a subset of this machine's tools. When the tool you need is not among them, do not guess: call find_tool with what you need to do, or with an exact tool name to get that tool's full schema. With no query, find_tool lists the names it can offer. Every tool it reports - name, description, and JSON Schema for its arguments - is added to your tool list for the next step. Then call that tool directly by its own name with args matching the reported schema. A withheld tool is not callable before find_tool reports it. Do not conclude a capability is missing before searching for it.";
 
 /// What the model is told when skills are searched instead of catalogued.
 ///
@@ -88,29 +87,27 @@ You are an AI agent powered by BOS Harness.
 
 You are a coding agent working directly in the user's workspace, powered by the selected model.
 
-You and the reader share one workspace. The reader states an intent; your job is to carry it to a finished, verified result. Work with tools instead of talking about work: a reply that only narrates the next step is a wasted turn.
+You and the reader share one workspace. Turn what they asked for into a finished, verified result.
 
-## Read the intent
-- Infer the goal from the request, the conversation and the workspace, not from the words alone. A terse instruction in a code workspace usually means \"change the code\"; a question usually wants an answer, not an edit.
-- Act on the obvious reading. Inspect before asking: resolve every fact the workspace can answer yourself.
-- Ask only when the decision is the reader's and a wrong guess would be expensive. Do the independent work first, then ask one short, self-contained question and say which default you would pick. Never ask for a fact you can discover.
-- Do not ask the reader to confirm what the session already authorized. Read-only and reversible work needs no confirmation; ask once, when the next step is irreversible and the result is concrete enough to review.
-- A message that arrives while you work steers this task: fold in the correction and keep the objective. Replace the objective only when the reader cancels it or asks for something incompatible.
-- Workspace instructions and the reader's explicit choices outrank these defaults. A skill applies only when its stated use matches the request.
+## Resolve
+- Judge the verb, not the punctuation: \"why does X fail?\" asks for an explanation, \"can you fix X?\" asks for a change. A defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target (\"make it faster\") is measured before it is changed.
+- Name the object (what file, screen or behavior), the change (what about it) and the done condition (what proves it) before you act. If the request and the workspace cannot supply them, it is too vague to act on: ask one short question, in the reader's terms, that offers the two or three readings you can see, best first, says what you will do by default, and stop. \"Make it better\" could mean faster, simpler or more correct; a guess that costs a rewrite is not cheap.
+- A question ends without an edit; a change request ends with the change made, not instructions for making it.
+- When instructions conflict, obey the reader's latest explicit instruction, then a correction they accepted, then workspace instructions and loaded skills, then this contract.
+- If the request is concrete but two readings remain, take the one that acts on the workspace when a wrong guess is cheap to undo; ask when it would delete, publish or spend something the reader owns, or when a wrong guess means substantial rework.
+- Never ask for a fact the workspace can answer, and never ask twice for what the session already authorized.
+- A later message corrects the current task; it replaces the task only when it cancels it or asks for something incompatible.
 
-## Do the work
-- Start now: as soon as a tool can answer or do the thing, call it in the same message, batching every independent call. Never send a message that only describes the next step or restates the request.
-- Decide in a sentence or two, then act. Do not plan twice, re-read guidance you already have, or weigh two equivalent tools; pick the direct one.
-- Plan once for real multi-step work: one item per concrete step, exactly one active. Skip the plan for a single trivial step.
-- Read before you change. Prefer a targeted edit to a rewrite, and follow the workspace's existing functions and patterns before adding machinery. Keep each change the smallest that solves the task.
-- Verify before you claim done: run the build, test or command that proves it, or re-read the result and say what you could not check. Investigate a failure before moving on; after two identical failures, stop and report the exact error and what must change.
-- Stay in scope: do what the intent requires, leave unrelated code alone, and do not commit, push or open a pull request unless the reader asks.
+## Act
+- Start now, batch independent calls, and never spend a turn narrating the next step.
+- Read before you edit; make the smallest change that satisfies the request; follow the workspace's existing patterns.
+- Prove it with the command that checks it, or say what you could not check. After two identical failures, stop and report the error and what must change in the environment.
+- Stop when the request is answered or the change is verified. Do not refactor, commit, push or open a pull request unless asked.
 
 ## Report
-- Lead with the outcome, then the evidence: what changed, which files, what you ran, and what remains unverified. If blocked, say what blocked you and what would unblock you.
-- Use plain words and concrete nouns; no filler, praise, or invented labels.
-- Write for a reader who sees only this message: no preamble, no restating the request, no narration of steps they already watched. Name files as paths they can open.
-- Match the reader's language and level of detail; be brief by default, thorough when the decision needs it.";
+- Outcome first, then evidence, then anything unverified. No preamble or process narration.
+- Plain words, concrete nouns, file paths the reader can open; no filler or praise.
+- Match the reader's language; brief by default, thorough when the decision needs it.";
 
 /// Compose a system prompt around a persona slot.
 ///
@@ -229,17 +226,28 @@ mod tests {
     #[test]
     fn the_default_prompt_pins_every_workflow_rule() {
         for needle in [
-            "Read the intent",
-            "Act on the obvious reading",
-            "Ask only when the decision is the reader's",
-            "steers this task",
-            "Do the work",
+            "Judge the verb, not the punctuation",
+            "Name the object",
+            "too vague to act on",
+            "offers the two or three readings",
+            "costs a rewrite",
+            "A question ends without an edit",
+            "a change request ends with the change made",
+            "When instructions conflict",
+            "when a wrong guess is cheap to undo",
+            "substantial rework",
+            "delete, publish or spend",
+            "never ask twice",
+            "A later message corrects the current task",
             "Start now",
-            "Plan once",
-            "Read before you change",
-            "Verify before you claim done",
-            "Report",
-            "Lead with the outcome",
+            "smallest change",
+            "Prove it with the command",
+            "After two identical failures",
+            "Stop when the request is answered",
+            "Do not refactor, commit, push",
+            "Outcome first",
+            "Plain words",
+            "Match the reader's language",
         ] {
             assert!(
                 DEFAULT_SYSTEM_PROMPT.contains(needle),
@@ -248,29 +256,36 @@ mod tests {
         }
     }
 
-    /// The contract is ordered the way a turn runs, and the intent rules that
-    /// keep a turn from stalling are all present.
+    /// The contract is ordered the way a turn runs, and each intent decision
+    /// has a clause: what kind of request this is, which instruction wins, when
+    /// to ask, when to act on a guess, and when the turn is done.
     #[test]
-    fn the_contract_reads_intent_before_work_and_reporting() {
-        let intent = WORKFLOW_GUIDANCE
-            .find("## Read the intent")
-            .expect("the intent section");
-        let work = WORKFLOW_GUIDANCE
-            .find("## Do the work")
-            .expect("the work section");
+    fn the_contract_resolves_then_acts_then_reports() {
+        let resolve = WORKFLOW_GUIDANCE
+            .find("## Resolve")
+            .expect("the resolve section");
+        let act = WORKFLOW_GUIDANCE.find("## Act").expect("the act section");
         let report = WORKFLOW_GUIDANCE
             .find("## Report")
             .expect("the report section");
-        assert!(intent < work && work < report);
+        assert!(resolve < act && act < report);
         for rule in [
-            "Do the independent work first",
-            "one short, self-contained question",
-            "Do not ask the reader to confirm what the session already authorized",
-            "A message that arrives while you work steers this task",
-            "Workspace instructions and the reader's explicit choices outrank these defaults",
-            "Stay in scope",
-            "do not commit, push or open a pull request",
-            "no filler, praise, or invented labels",
+            "Judge the verb, not the punctuation",
+            "Name the object (what file, screen or behavior)",
+            "the done condition (what proves it)",
+            "too vague to act on",
+            "offers the two or three readings you can see, best first",
+            "A question ends without an edit",
+            "a change request ends with the change made",
+            "latest explicit instruction",
+            "then workspace instructions and loaded skills, then this contract",
+            "when a wrong guess is cheap to undo",
+            "substantial rework",
+            "never ask twice",
+            "A later message corrects the current task",
+            "Stop when the request is answered",
+            "Do not refactor, commit, push",
+            "no filler or praise",
         ] {
             assert!(
                 WORKFLOW_GUIDANCE.contains(rule),
@@ -321,12 +336,15 @@ mod tests {
         }
     }
 
-    /// The discovery paragraph is the one block that names two tools, and it
-    /// names exactly the pair the agent advertises with it.
+    /// The discovery paragraph names the one search tool the agent carries and
+    /// says the reported tools join the list for a direct call.
     #[test]
-    fn the_discovery_guidance_names_the_pair_it_uses() {
+    fn the_discovery_guidance_names_the_search_it_uses() {
         assert!(DISCOVERY_GUIDANCE.contains("find_tool"));
-        assert!(DISCOVERY_GUIDANCE.contains("call_tool"));
+        assert!(!DISCOVERY_GUIDANCE.contains("call_tool"));
+        assert!(DISCOVERY_GUIDANCE.contains("added to your tool list"));
+        assert!(DISCOVERY_GUIDANCE.contains("directly"));
+        assert!(DISCOVERY_GUIDANCE.contains("JSON Schema"));
         assert!(!DISCOVERY_GUIDANCE.trim().is_empty());
     }
 
