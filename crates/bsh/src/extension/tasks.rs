@@ -308,6 +308,9 @@ pub(crate) struct Attempt {
     pub(crate) error: Option<String>,
     /// When the harness delivered this attempt to the origin session.
     pub(crate) delivered_ms: Option<u64>,
+    /// The exact-change set this attempt produced, when review is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) change_set_id: Option<String>,
 }
 
 impl Attempt {
@@ -324,6 +327,7 @@ impl Attempt {
             usage: None,
             error: None,
             delivered_ms: None,
+            change_set_id: None,
         }
     }
 }

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Intelligent Review (MVP)**: file tools now capture exact before/after
+  snapshots into a content-addressed store under .bsh/review; text and
+  tree-sitter structural diffs are derived from those snapshots, a new Review
+  tab renders changes, findings and digest-bound decisions, and task attempts
+  plus the Audit tab link to the captured changeset. Shell output remains
+  explicitly unattributed, and image/PDF/document/archive support is
+  metadata-level in this cut.
+
 ## v4.0.3 (2026-11-09)
 
 - **BSH interface refresh**: the settings shell now uses the macOS-style

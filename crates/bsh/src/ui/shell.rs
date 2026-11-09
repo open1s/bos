@@ -717,6 +717,14 @@ pub(crate) struct Shell {
     pub(crate) audit_scroll: ScrollHandle,
     /// The audit page's built view model, kept until the facts it reads change.
     pub(crate) audit_cache: std::cell::RefCell<super::audit::AuditCache>,
+    /// The Review tab's latest snapshot, keyed by session and review epoch.
+    pub(crate) review_cache: std::cell::RefCell<super::review::ReviewCache>,
+    /// A changeset the reader explicitly opened, rather than the session latest.
+    pub(crate) review_requested: Option<String>,
+    /// The change whose prepared diff is selected, if any.
+    pub(crate) review_selected: Option<String>,
+    /// The selected change's prepared diff, built on click rather than per frame.
+    pub(crate) review_diff: std::cell::RefCell<Option<(String, crate::review::domain::FileDiff)>>,
     /// The sidebar tree's scroll position, so the wheel, the keys and a test can
     /// all address the same offset.
     pub(crate) side_scroll: ScrollHandle,
@@ -2195,6 +2203,10 @@ impl Shell {
             traj_scroll: ScrollHandle::new(),
             audit_scroll: ScrollHandle::new(),
             audit_cache: std::cell::RefCell::new(super::audit::AuditCache::default()),
+            review_cache: std::cell::RefCell::new(super::review::ReviewCache::default()),
+            review_requested: None,
+            review_selected: None,
+            review_diff: std::cell::RefCell::new(None),
             side_scroll: ScrollHandle::new(),
             side_focus: cx.focus_handle(),
             rail_scroll: ScrollHandle::new(),
@@ -3268,6 +3280,67 @@ impl Shell {
         }
     }
 
+    /// Send words the reader did not type into the composer, as a turn of its
+    /// own.
+    ///
+    /// A file comment is a request about the file: parking it in the composer
+    /// would overwrite whatever the reader was drafting, and asking them to
+    /// press send afterwards makes the comment a two-step gesture. So it goes
+    /// through the same submission path the composer uses - queued behind a
+    /// running turn, opened when the session is idle, announced to the
+    /// extension bus - and the draft is left alone.
+    ///
+    /// A refusal (a stale model, a locked vault) falls back to the composer, so
+    /// the words the reader just wrote are never lost to a gate they can fix.
+    /// Returns whether a turn or a queue row took the text.
+    pub(crate) fn deliver_request(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if text.trim().is_empty() {
+            return false;
+        }
+        if let Some(id) = self
+            .state
+            .subagent
+            .as_ref()
+            .map(|subagent| subagent.id.clone())
+        {
+            self.send_to_subagent(id, text, window, cx);
+            return true;
+        }
+        let bytes = text.len();
+        let model = self.state.effective().model_name;
+        match self.submit(text.clone(), Vec::new(), cx) {
+            Submit::Accepted => {
+                let session_id = self.state.active_session();
+                crate::extension::publish(
+                    crate::extension::topics::MODEL_REQUESTED,
+                    serde_json::json!({
+                        "model": model,
+                        "session": session_id,
+                        "bytes": bytes,
+                    }),
+                );
+                crate::extension::publish(
+                    crate::extension::topics::AGENT_STARTED,
+                    serde_json::json!({ "session": session_id }),
+                );
+                cx.notify();
+                true
+            }
+            Submit::Refused(_) => {
+                self.composer
+                    .update(cx, |state, cx| state.set_value(text.clone(), window, cx));
+                self.composer_value = text;
+                cx.notify();
+                false
+            }
+        }
+    }
+
     /// Tell the reader when a leading `/name` token names no enabled skill.
     ///
     /// The palette only offers enabled skills, so a hand-typed gesture is the
@@ -4064,7 +4137,7 @@ impl Shell {
         transcript: Vec<crate::model::ChatMessage>,
         budget: usize,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<String> {
         // The vault is the ONLY source for a provider credential: the entry
         // (or provider:<id>:api_key) the session's selected provider names is
         // resolved here, at build time, so the secret never has to be written
@@ -4078,10 +4151,15 @@ impl Shell {
             self.state
                 .apply_event(&id, crate::runner::AgentEvent::Error(why.clone()));
             self.state.notice(why);
-            return;
+            return None;
         }
         let goal = self.state.goal(&id);
-        let built = crate::caps::build_agent_for_session_with_subagents_and_jobs(
+        // Exact-change capture is per turn. It is additive: a workspace that
+        // cannot open the store still runs the turn, and the Review tab simply
+        // has no new snapshot.
+        let review = self.state.begin_review(&id);
+        let change_set = review.as_ref().map(|runtime| runtime.change_set_id());
+        let built = crate::caps::build_agent_for_session_with_subagents_jobs_and_review(
             &self.state.settings,
             &self.state.vault,
             &choice,
@@ -4092,12 +4170,14 @@ impl Shell {
             self.state.jobs.clone(),
             self.state.browser.clone(),
             goal,
+            review,
         );
         if let Some(error) = &built.credential_error {
             // No turn opens without a credential: a locked vault names itself
             // instead of sending the request unauthenticated.
+            self.state.abandon_review(&id);
             self.state.notice(error.message(self.state.lang));
-            return;
+            return None;
         }
         self.state.set_tools_schema(built.tools_schema_chars);
         self.state.set_policy(built.policy.clone());
@@ -4165,6 +4245,7 @@ impl Shell {
             .runner
             .spawn(&id, agent, input, transcript, facts, auto_retain, cap);
         self.pump(id, rx, cx);
+        change_set
     }
 
     /// Save the queue row being edited, which is Enter in its own editor.
@@ -5436,6 +5517,7 @@ impl Shell {
                     shell.frame_notify("stream-ended", cx);
                 }
                 shell.state.finish_plan(&id);
+                shell.state.finish_review(&id);
                 // A stop still settles what the model already recorded: a
                 // completion committed before the reader stopped the round is
                 // not thrown away.
@@ -6219,10 +6301,41 @@ impl Shell {
         let plan = self.state.plan_mode(&spec.session);
         let request = crate::state::turn_text(&spec.objective, plan);
         let input = crate::state::turn_input(&request, &[]);
-        self.spawn_turn(spec.session.clone(), input, transcript, budget, cx);
+        let change_set = self.spawn_turn(spec.session.clone(), input, transcript, budget, cx);
+        if let Some(change_set) = change_set {
+            self.link_task_change(&spec.trace, run, &change_set);
+        }
         self.task_run_sessions
             .insert(spec.session.clone(), run.to_string());
         Ok(())
+    }
+
+    /// Attach a task attempt to the changeset its turn produced.
+    ///
+    /// The scheduler saves the attempt before it starts the run, so the link is
+    /// written after the turn has opened and is idempotent: a retry or a restart
+    /// that finds the same run keeps the first changeset.
+    fn link_task_change(&mut self, task_id: &str, run: &str, change_set: &str) {
+        use crate::extension::tasks::{FileTasksStore, TasksStore};
+        for root in self.task_roots() {
+            let Ok(Some(mut record)) = FileTasksStore.load(&root, task_id) else {
+                continue;
+            };
+            let Some(attempt) = record
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.run.as_deref() == Some(run))
+            else {
+                return;
+            };
+            let attempt_id = attempt.id.clone();
+            attempt.change_set_id = Some(change_set.to_string());
+            record.updated_ms = crate::settings::unix_now().saturating_mul(1_000);
+            let _ = FileTasksStore.save(&root, &record);
+            self.state
+                .link_review_task(change_set, task_id, &attempt_id);
+            return;
+        }
     }
 
     /// Settle the run this shell started for a session, after its turn ended.
@@ -6759,6 +6872,8 @@ impl Shell {
             self.cancel_session_rename(cx);
         }
         self.state.select(id);
+        self.review_requested = None;
+        self.review_selected = None;
         self.maybe_compact_history(cx);
         self.composer
             .update(cx, |input, cx| input.focus(window, cx));
@@ -6768,6 +6883,8 @@ impl Shell {
     /// Create a chat and focus the composer.
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.new_session();
+        self.review_requested = None;
+        self.review_selected = None;
         self.composer
             .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
@@ -6962,6 +7079,7 @@ impl Render for Shell {
                     crate::state::Tab::Chat => "chat",
                     crate::state::Tab::Trajectory => "trajectory",
                     crate::state::Tab::Audit => "audit",
+                    crate::state::Tab::Review => "review",
                     crate::state::Tab::Extensions => "extensions",
                 },
                 streaming,

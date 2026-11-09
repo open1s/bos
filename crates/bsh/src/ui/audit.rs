@@ -1378,6 +1378,31 @@ impl Shell {
             )
             .child(
                 div()
+                    .debug_selector(|| "audit-review".to_string())
+                    .id("audit-review")
+                    .h(px(24.0))
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .flex_none()
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .hover(|cell| cell.bg(rgb(theme::hover())))
+                    .child(icon(IconName::GitCompareArrows, 11.0, theme::muted()))
+                    .child(txt(
+                        self.state.lang.tr("review.openReview"),
+                        12.0,
+                        theme::muted(),
+                    ))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.review_requested = None;
+                        this.state.tab = crate::state::Tab::Review;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
                     .debug_selector(|| "audit-export".to_string())
                     .id("audit-export")
                     .h(px(24.0))

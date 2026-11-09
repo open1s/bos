@@ -2239,10 +2239,72 @@ fn tab_click_switches_the_main_column(cx: &mut TestAppContext) {
     assert!(on_trajectory, "the Trajectory tab must switch the column");
 
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    let review = cx.debug_bounds("tab-review").expect("the Review tab");
+    cx.simulate_click(review.center(), Modifiers::default());
+    let on_review = cx.update(|_, cx| matches!(shell.read(cx).state.tab, Tab::Review));
+    assert!(on_review, "the Review tab must switch the column");
+
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     let chat = cx.debug_bounds("tab-chat").expect("the Chat tab");
     cx.simulate_click(chat.center(), Modifiers::default());
     let back_on_chat = cx.update(|_, cx| matches!(shell.read(cx).state.tab, Tab::Chat));
     assert!(back_on_chat, "the Chat tab must switch back");
+}
+
+/// The Review tab renders a sealed changeset and its decision controls.
+#[gpui::test]
+fn review_tab_renders_a_captured_changeset(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let mut state = AppState::with_store(scratch_store("review-tab"));
+    let session = state.new_session().expect("a session");
+    let root = state.workspace_root().expect("a workspace root");
+    std::fs::create_dir_all(root.join("src")).expect("src");
+    let path = root.join("src").join("lib.rs");
+    std::fs::write(&path, "fn old() {}\n").expect("old");
+    let runtime = state.begin_review(&session).expect("a runtime");
+    let before = runtime.before(&path);
+    std::fs::write(&path, "fn new() {}\n").expect("new");
+    runtime.record(
+        &path,
+        crate::review::domain::ChangeOperation::Edit,
+        before,
+        "edit_file",
+    );
+    state.finish_review(&session);
+    assert!(
+        state.review_snapshot(&session).is_some(),
+        "the state can load the sealed review"
+    );
+
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|_, cx| {
+        harness.update(cx, |harness, cx| {
+            harness.shell.update(cx, |shell, cx| {
+                shell.state.tab = Tab::Review;
+                cx.notify();
+            });
+        });
+    });
+    let active = cx.update(|_, cx| harness.read(cx).shell.read(cx).state.active_id.clone());
+    assert_eq!(
+        active.as_deref(),
+        Some(session.as_str()),
+        "the same session"
+    );
+    let view = cx.update(|_, cx| harness.read(cx).shell.read(cx).review_view());
+    assert!(view.is_some(), "the shell can read the review view");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("review-actions").is_some(),
+        "the Review tab body is mounted"
+    );
+    assert!(
+        cx.debug_bounds("review-change-list").is_some(),
+        "the captured change is listed"
+    );
 }
 
 /// The sidebar gear opens the settings dialog.
@@ -17186,6 +17248,7 @@ fn an_image_tab_outside_the_root_says_so(cx: &mut TestAppContext) {
                 editor: None,
                 kind: crate::files::Kind::Image,
                 dirty: false,
+                decorations: None,
             });
             this.files.active = Some(0);
             cx.notify();
@@ -19691,11 +19754,7 @@ fn a_pinned_comment_draws_at_its_line(cx: &mut TestAppContext) {
             this.open_file(std::path::Path::new("inline.txt"), window, cx);
             this.files.notes.add(
                 std::path::Path::new("inline.txt"),
-                crate::notes::Note {
-                    line: Some(2),
-                    to: Some(3),
-                    text: "this range".to_string(),
-                },
+                crate::notes::Note::new(Some(2), Some(3), "this range", "two\nthree"),
             );
             cx.notify();
         });
@@ -19749,11 +19808,7 @@ fn commenting_sends_the_review_to_the_queue(cx: &mut TestAppContext) {
             });
             this.files.notes.add(
                 std::path::Path::new("send.txt"),
-                crate::notes::Note {
-                    line: Some(1),
-                    to: Some(2),
-                    text: "tighten this".to_string(),
-                },
+                crate::notes::Note::new(Some(1), Some(2), "tighten this", "one\ntwo"),
             );
             cx.notify();
         });
@@ -19936,11 +19991,7 @@ fn review_notes_become_a_prompt(cx: &mut TestAppContext) {
             this.open_file(std::path::Path::new("review.txt"), window, cx);
             this.files.notes.add(
                 std::path::Path::new("review.txt"),
-                crate::notes::Note {
-                    line: Some(1),
-                    to: None,
-                    text: "rename this".to_string(),
-                },
+                crate::notes::Note::new(Some(1), None, "rename this", "one"),
             );
             this.files.notes_open = true;
             cx.notify();
@@ -21744,11 +21795,7 @@ fn the_right_panel_refusals_are_translated() {
 fn notes_follow_a_rename_and_go_with_a_delete() {
     use std::path::Path;
     let mut notes = crate::notes::Notes::default();
-    let note = |text: &str| crate::notes::Note {
-        to: None,
-        line: Some(3),
-        text: text.to_string(),
-    };
+    let note = |text: &str| crate::notes::Note::new(Some(3), None, text, "");
     notes.add(Path::new("src/lib.rs"), note("first"));
     notes.rename(Path::new("src/lib.rs"), Path::new("src/main.rs"));
     assert!(

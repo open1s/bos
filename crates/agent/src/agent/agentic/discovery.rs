@@ -75,7 +75,7 @@ pub fn find_tool_schema() -> Value {
 pub const FIND_SKILL: &str = "find_skill";
 
 /// The description both the definition and the tool carry.
-const FIND_SKILL_DESCRIPTION: &str = "Find a skill by what you need to do. Returns the best matches with their descriptions; read one with load_skill. Call it with no query to list every skill name.";
+const FIND_SKILL_DESCRIPTION: &str = "Check this before starting work a skill might cover: find a skill by what you need to do. Returns the best matches with their descriptions; read one with load_skill. Call it with no query to list every skill name.";
 
 /// Most skills one search describes in full.
 const FIND_SKILL_DESCRIBED: usize = 3;

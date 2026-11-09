@@ -81,6 +81,21 @@ fn offers_web_search(enabled: bool, api_mode: &str) -> bool {
 /// send-side ceiling without any model call.
 const COMPACT_MIN_SPAN_TOKENS: usize = 512;
 
+/// Append one prompt section, separated from what is already there.
+///
+/// The system prompt is joined by blank lines everywhere else in the corpus, so
+/// one helper owns the separator: a section that is empty adds nothing, and the
+/// first section never opens with a leading newline.
+fn push_paragraph(base: &mut String, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if !base.is_empty() {
+        base.push_str("\n\n");
+    }
+    base.push_str(text);
+}
+
 impl Agent {
     /// Prepare context with tools and skills populated from the agent's state.
     /// Shared by react() and stream() to avoid code duplication.
@@ -340,33 +355,32 @@ impl Agent {
 
     /// Compose the system prompt for a run, appending recalled memories.
     ///
+    /// Discovery is written FIRST, ahead of the standing contract, because the
+    /// search is a step before acting rather than a fallback after a failure:
+    /// a paragraph appended after the whole prompt arrived once the model had
+    /// already picked its first action. The block is capability-gated the same
+    /// way it always was - an agent that withholds nothing and catalogues its
+    /// skills never names a search it does not carry.
+    ///
     /// Non-text input (images/audio only) has no query to match against, so
-    /// it uses the configured prompt unchanged.
+    /// it uses the composed prompt unchanged.
     async fn system_prompt_for(&self, task: &Content) -> String {
-        let mut base = self.config.system_prompt.clone();
-        // A withheld tool is only usable if the model knows the way back to it;
-        // the paragraph that says so is appended here, not in the constant, so
-        // an agent that withholds nothing never names a tool it does not carry.
-        if self.has_deferred_tools() {
-            if !base.is_empty() {
-                base.push_str("\n\n");
-            }
-            base.push_str(crate::agent::prompts::DISCOVERY_GUIDANCE);
+        let tool_search = self.has_deferred_tools();
+        let skill_search = self.skill_search();
+        let mut base = String::new();
+        if tool_search || skill_search {
+            base.push_str(crate::agent::prompts::DISCOVERY_PRIORITY);
         }
-        // The same rule for skills: no catalogue means the model needs the
-        // paragraph that names the way to one.
-        if self.skill_search() {
-            if !base.is_empty() {
-                base.push_str("\n\n");
-            }
-            base.push_str(crate::agent::prompts::SKILL_DISCOVERY_GUIDANCE);
+        if tool_search {
+            push_paragraph(&mut base, crate::agent::prompts::DISCOVERY_GUIDANCE);
         }
+        if skill_search {
+            push_paragraph(&mut base, crate::agent::prompts::SKILL_DISCOVERY_GUIDANCE);
+        }
+        push_paragraph(&mut base, &self.config.system_prompt);
         if let Ok(prompts) = self.live_prompts.read() {
             for prompt in prompts.iter() {
-                if !base.is_empty() {
-                    base.push_str("\n\n");
-                }
-                base.push_str(prompt);
+                push_paragraph(&mut base, prompt);
             }
         }
         let Some(query) = task.as_text() else {

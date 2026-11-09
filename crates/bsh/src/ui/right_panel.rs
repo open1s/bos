@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::input::{
-    Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
+    Editor, EditorState, Input, InputEvent, InputState, RangeDecoration, RangeDecorationCollection,
+    RangeDecorationStyle, Textarea, TextareaState,
 };
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
@@ -49,7 +50,7 @@ use gpui_libghostty::TerminalOptions;
 // native document editor does it.
 actions!(
     bsh_files,
-    [SaveFile, TerminalTab, BrowserTab, FocusLauncher]
+    [SaveFile, TerminalTab, BrowserTab, FocusLauncher, AddComment]
 );
 
 /// How close in time two blank-space presses must be to read as a double-click.
@@ -702,6 +703,11 @@ pub(crate) struct FilesPane {
     pub(crate) notes_open: bool,
     /// Whether the inline comment card is up over the document.
     pub(crate) comment_open: bool,
+    /// The comment the reader is reading, by index into the active file's
+    /// notes. The thread panel under the editor shows this one and resumes its
+    /// line in the code; none leaves the document unobstructed, which is the
+    /// state browsing wants.
+    pub(crate) focus_note: Option<usize>,
     /// The note being typed into the drawer's field.
     pub(crate) note_text: Entity<TextareaState>,
 }
@@ -717,6 +723,11 @@ pub(crate) struct FileTab {
     pub(crate) kind: Kind,
     /// Whether the buffer holds changes the disk does not.
     pub(crate) dirty: bool,
+    /// The editor's comment marks: a soft fill under every line a note is
+    /// pinned to. The collection tracks the buffer's own edits, so the marks
+    /// ride the code through typing and scrolling instead of being recomputed
+    /// per frame; it is created on the first note a file carries.
+    pub(crate) decorations: Option<RangeDecorationCollection>,
 }
 
 impl FileTab {
@@ -756,6 +767,7 @@ impl FilesPane {
             notes: crate::notes::Notes::default(),
             notes_open: false,
             comment_open: false,
+            focus_note: None,
             note_text,
         }
     }
@@ -1577,8 +1589,11 @@ impl Shell {
             Some(tab) => Some(StripSlot::Pane(tab)),
             None => Some(StripSlot::Start),
         };
+        // The comment control is a document's own: it appears with a document
+        // and shares the strip's trailing budget with the other three.
+        let comments = self.comments_control_shown();
         let plan = plan_open_strip(
-            self.strip_budget(band, 3),
+            self.strip_budget(band, 3 + usize::from(comments)),
             start,
             &panes,
             &file_widths,
@@ -1612,6 +1627,7 @@ impl Shell {
         let content = row
             .child(strip)
             .child(self.right_new_tab(cx))
+            .when(comments, |row| row.child(self.right_comments_control(cx)))
             .child(self.right_panel_control(
                 "right-maximize",
                 if self.right.maximized {
@@ -1623,6 +1639,70 @@ impl Shell {
             ))
             .child(self.right_panel_close(cx));
         bar.child(content)
+    }
+
+    /// Whether the strip carries the document's comment control.
+    fn comments_control_shown(&self) -> bool {
+        self.right.tab == Some(RightTab::Files) && self.files.active_tab().is_some()
+    }
+
+    /// The document's comment control: how many remarks are open, and the door
+    /// to the drawer that lists them.
+    ///
+    /// It lives in the strip because comments belong to the document the strip
+    /// names, and it carries a dot rather than a count so a narrow panel never
+    /// has to clip the control that says whether anything is pinned.
+    fn right_comments_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = self.state.lang;
+        let open = self
+            .files
+            .active_tab()
+            .map(|tab| self.files.notes.open_count(&tab.rel))
+            .unwrap_or(0);
+        let total = self
+            .files
+            .active_tab()
+            .map(|tab| self.files.notes.on(&tab.rel).len())
+            .unwrap_or(0);
+        let label = format!("{} ({open}/{total})", lang.tr("right.files.notes"));
+        let active = self.files.notes_open;
+        div()
+            .id("right-comments")
+            .debug_selector(|| String::from("right-comments"))
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex_none()
+            .relative()
+            .rounded(px(theme::RADIUS_SM))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .when(active, |control| control.bg(rgb(theme::selected_row())))
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .tooltip_show_delay(std::time::Duration::from_millis(400))
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .child(icon(
+                IconName::MessageSquare,
+                14.0,
+                if open > 0 { theme::text() } else { theme::faint() },
+            ))
+            .when(open > 0, |control| {
+                control.child(
+                    div()
+                        .absolute()
+                        .top(px(5.0))
+                        .right(px(5.0))
+                        .w(px(4.0))
+                        .h(px(4.0))
+                        .rounded_full()
+                        .bg(rgb(theme::accent())),
+                )
+            })
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.files.notes_open = !this.files.notes_open;
+                cx.notify();
+            }))
     }
 
     /// The pixels the strip itself may use, after the padding and the three
@@ -3884,6 +3964,26 @@ impl Shell {
                         11.0,
                         theme::muted(),
                     ));
+                    if let Some(change_set) = &attempt.change_set_id {
+                        let change_set = change_set.clone();
+                        let review_id = format!("task-review-{}", attempt.id);
+                        detail = detail.child(
+                            div()
+                                .id(SharedString::from(review_id.clone()))
+                                .debug_selector(move || review_id.clone())
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(theme::hover())))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.review_requested = Some(change_set.clone());
+                                    this.state.tab = crate::state::Tab::Review;
+                                    cx.notify();
+                                }))
+                                .child(txt(lang.tr("right.tasks.review"), 10.5, theme::accent())),
+                        );
+                    }
                 }
             }
         }
@@ -5909,6 +6009,12 @@ impl Shell {
     fn files_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = div()
             .debug_selector(|| String::from("files-pane"))
+            // cmd-alt-m: the keyboard path to a comment, so a reader marking
+            // code does not have to find the + first. It bubbles here from the
+            // focused editor.
+            .on_action(cx.listener(|this, _: &AddComment, _window, cx| {
+                this.open_comment_card(cx);
+            }))
             .flex_1()
             .min_h_0()
             .w_full()
@@ -6638,27 +6744,29 @@ impl Shell {
         cx.notify();
     }
 
-    /// Every pinned comment, drawn at the line it is anchored to.
+    /// One mark per comment on the editor's left edge, at the line it is
+    /// pinned to.
     ///
-    /// The reference interleaves these into the code so the text below shifts
-    /// down; a kit `Editor` paints one block and offers no seam between two
-    /// lines, so bsh puts each card at its anchor's own pixels instead. Same
-    /// place, same caption, same menu - the code simply does not move.
-    fn notes_inline(&self, rel: &Path, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// This is the browsing half of a comment: a reader scrolling a file sees
+    /// where the remarks are without opening anything, and a press puts that
+    /// remark into the thread panel under the code instead of covering the code
+    /// it is about. Resolved remarks keep a faint mark so the history stays
+    /// findable, and the mark the reader is reading grows.
+    fn note_rail(&self, rel: &Path, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(editor) = self.files.active_tab().and_then(|tab| tab.editor.clone()) else {
             return Vec::new();
         };
-        // Every anchor is measured against the same buffer, so the buffer is
-        // read ONCE: reading it inside the loop cloned the whole file per note
-        // per frame. The read is also scoped, because `cx.listener` below needs
-        // the context mutably.
-        let tops: Vec<(usize, f32)> = {
+        if self.files.notes.on(rel).is_empty() {
+            return Vec::new();
+        }
+        let marks: Vec<(usize, f32, bool, usize)> = {
             let state = editor.read(cx);
             let text = state.value();
-            // The kit answers in window space; the cards are positioned inside
-            // the editor, so its own box is what they are measured against. No
-            // box yet means no first layout, and no card can be placed either.
-            let editor_box = state.text_bounds();
+            let Some(editor_box) = state.text_bounds() else {
+                return Vec::new();
+            };
+            let height = f32::from(editor_box.size.height);
+            let mut per_line: HashMap<usize, usize> = HashMap::new();
             self.files
                 .notes
                 .on(rel)
@@ -6667,68 +6775,278 @@ impl Shell {
                 .filter_map(|(index, note)| {
                     let line = note.line?;
                     let start = crate::notes::line_start_offset(text.as_ref(), line);
-                    let bounds = state.range_to_bounds(&(start..start))?;
-                    let (_, y) = document_origin(bounds, editor_box?);
-                    Some((index, y + f32::from(bounds.size.height) + 6.0))
+                    let end = (start + 1).min(text.len());
+                    let bounds = state.range_to_bounds(&(start..end))?;
+                    let (_, y) = document_origin(bounds, editor_box);
+                    // Only the laid-out part of the document can carry a mark: a
+                    // line above or below the viewport has no box to sit on.
+                    if y < -1.0 || y > height {
+                        return None;
+                    }
+                    let slot = per_line.entry(line).or_insert(0);
+                    let column = *slot;
+                    *slot += 1;
+                    Some((index, y, note.resolved, column))
                 })
                 .collect()
         };
-        let mut out = Vec::with_capacity(tops.len());
-        for (index, top) in tops {
-            let note = &self.files.notes.on(rel)[index];
-            let anchor = note.anchor();
-            let body = note.text.clone();
-            let del_rel = rel.to_path_buf();
+        let focused = self.files.focus_note;
+        let jump_rel = rel.to_path_buf();
+        let mut out = Vec::with_capacity(marks.len());
+        for (index, y, resolved, column) in marks {
+            let mut tip = self.files.notes.on(rel)[index]
+                .text
+                .trim()
+                .replace('\n', " ");
+            if tip.chars().count() > 48 {
+                tip = format!("{}…", tip.chars().take(47).collect::<String>());
+            }
+            let color = if resolved {
+                theme::border_strong()
+            } else {
+                theme::accent()
+            };
+            let wide = if focused == Some(index) { 6.0 } else { 4.0 };
+            let jump = jump_rel.clone();
+            let tip_text = tip.clone();
             out.push(
                 div()
-                    .id(SharedString::from(format!("note-inline-{index}")))
-                    .debug_selector(move || format!("note-inline-{index}"))
+                    .id(SharedString::from(format!("note-mark-{index}")))
+                    .debug_selector(move || format!("note-mark-{index}"))
                     .absolute()
-                    .top(px(top))
-                    .left(px(theme::RIGHT_PAD + 24.0))
-                    .right(px(16.0))
-                    .max_w(px(520.0))
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(rgb(theme::border_soft()))
-                    .bg(rgb(theme::page()))
-                    .shadow_lg()
-                    .px(px(10.0))
-                    .py(px(7.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(txt(body, 12.0, theme::text()).line_height(px(18.0)))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(txt(anchor, 11.0, theme::faint()))
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("note-delete-{index}")))
-                                    .debug_selector(move || format!("note-delete-{index}"))
-                                    .w(px(20.0))
-                                    .h(px(20.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(theme::hover())))
-                                    .child(icon(IconName::X, 11.0, theme::faint()))
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        this.delete_note(&del_rel, index, cx);
-                                    })),
-                            ),
-                    )
+                    .top(px(y))
+                    .left(px(3.0 + column as f32 * 6.0))
+                    .w(px(wide))
+                    .h(px(13.0))
+                    .rounded_full()
+                    .bg(rgb(color))
+                    .occlude()
+                    .cursor_pointer()
+                    .hover(|s| s.w(px(6.0)))
+                    .tooltip_show_delay(std::time::Duration::from_millis(400))
+                    .tooltip(move |window, cx| Tooltip::new(tip_text.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.focus_comment(&jump, index, cx);
+                    }))
                     .into_any_element(),
             );
         }
         out
+    }
+
+    /// The comment the reader is reading, docked under the code.
+    ///
+    /// The panel is a sibling of the editor and not an overlay: a card that
+    /// covers the line it describes is the one thing a comment surface cannot
+    /// ask a reader to accept, and a docked panel keeps every control
+    /// hit-testable at the panel's narrowest width. It carries the quote, the
+    /// remark, and the three things a comment is for - ask the model, resolve
+    /// it, or delete it.
+    fn note_thread(&self, rel: &Path, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let index = self.files.focus_note?;
+        let note = self.files.notes.on(rel).get(index)?.clone();
+        let lang = self.state.lang;
+        let text = self
+            .files
+            .active_tab()
+            .filter(|tab| tab.rel == rel)
+            .and_then(|tab| tab.editor.clone())
+            .map(|editor| editor.read(cx).value().to_string());
+        let quote = match text.as_ref() {
+            Some(text) => crate::notes::excerpt(&note, text),
+            None => note.quote.clone(),
+        };
+        let shown: Vec<&str> = quote.lines().take(3).collect();
+        let mut quote = shown.join("\n");
+        if quote.lines().count() < note.quote.lines().count() || quote.lines().count() > shown.len()
+        {
+            quote.push('…');
+        }
+        let anchor = note.anchor();
+        let body = note.text.clone();
+        let resolved = note.resolved;
+        let sent = note.sent;
+        let name = self
+            .files
+            .active_tab()
+            .map(|tab| tab.label())
+            .unwrap_or_default();
+        let ask_rel = rel.to_path_buf();
+        let res_rel = rel.to_path_buf();
+        let del_rel = rel.to_path_buf();
+        let jump_rel = rel.to_path_buf();
+        let resolve_label = if resolved {
+            lang.tr("right.files.commentReopen")
+        } else {
+            lang.tr("right.files.commentResolve")
+        };
+        let ask_label = lang.tr("right.files.commentAsk");
+        let delete_label = lang.tr("right.files.commentDelete");
+        Some(
+            div()
+                .debug_selector(|| String::from("files-thread"))
+                .id("files-thread")
+                .flex_none()
+                .w_full()
+                .border_t_1()
+                .border_color(rgb(theme::border_soft()))
+                .bg(rgb(theme::page()))
+                .px(px(theme::RIGHT_PAD))
+                .py(px(8.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(icon(
+                            IconName::MessageSquare,
+                            12.0,
+                            if resolved {
+                                theme::faint()
+                            } else {
+                                theme::accent()
+                            },
+                        ))
+                        .child(txt(anchor, 11.0, theme::muted()))
+                        .child(txt(name, 11.0, theme::faint()).truncate())
+                        .child(div().flex_1())
+                        .when(resolved, |row| {
+                            row.child(
+                                txt(lang.tr("right.files.commentResolved"), 11.0, theme::faint())
+                                    .font_weight(FontWeight::MEDIUM),
+                            )
+                        })
+                        .when(sent, |row| {
+                            row.child(
+                                txt(lang.tr("right.files.commentSent"), 11.0, theme::faint())
+                                    .font_weight(FontWeight::MEDIUM),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id("files-thread-close")
+                                .debug_selector(|| String::from("files-thread-close"))
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::hover())))
+                                .child(icon(IconName::X, 11.0, theme::faint()))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.files.focus_note = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .when(!quote.trim().is_empty(), |panel| {
+                    panel.child(
+                        div()
+                            .id("files-thread-quote")
+                            .debug_selector(|| String::from("files-thread-quote"))
+                            .w_full()
+                            .px(px(8.0))
+                            .py(px(5.0))
+                            .rounded(px(6.0))
+                            .bg(rgb(theme::hover()))
+                            .cursor_pointer()
+                            .child(
+                                txt(quote, 11.0, theme::muted())
+                                    .font_family(theme::CODE_FONT)
+                                    .line_height(px(16.0))
+                                    .max_h(px(48.0))
+                                    .overflow_hidden(),
+                            )
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.reveal_comment(&jump_rel, index, cx);
+                            })),
+                    )
+                })
+                .child(txt(body, 12.5, theme::text()).line_height(px(18.0)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .id("files-thread-ask")
+                                .debug_selector(|| String::from("files-thread-ask"))
+                                .h(px(26.0))
+                                .px(px(10.0))
+                                .rounded(px(theme::RADIUS_SM))
+                                .bg(rgb(theme::accent()))
+                                .cursor_pointer()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(icon(IconName::ArrowUp, 12.0, theme::page()))
+                                .child(
+                                    txt(ask_label, theme::CHIP_SIZE, theme::page())
+                                        .font_weight(FontWeight::MEDIUM),
+                                )
+                                .on_click(cx.listener(move |this, _event, window, cx| {
+                                    this.ask_comment(&ask_rel, index, window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("files-thread-resolve")
+                                .debug_selector(|| String::from("files-thread-resolve"))
+                                .h(px(26.0))
+                                .px(px(8.0))
+                                .rounded(px(theme::RADIUS_SM))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::hover())))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(icon(
+                                    if resolved {
+                                        IconName::Circle
+                                    } else {
+                                        IconName::Check
+                                    },
+                                    12.0,
+                                    theme::muted(),
+                                ))
+                                .child(txt(resolve_label, theme::CHIP_SIZE, theme::muted()))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.resolve_comment(&res_rel, index, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("files-thread-delete")
+                                .debug_selector(|| String::from("files-thread-delete"))
+                                .h(px(26.0))
+                                .px(px(8.0))
+                                .rounded(px(theme::RADIUS_SM))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::hover())))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(icon(IconName::Trash, 12.0, theme::muted()))
+                                .child(txt(delete_label, theme::CHIP_SIZE, theme::muted()))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.files.focus_note = None;
+                                    this.delete_note(&del_rel, index, cx);
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The inline review card, shaped like the reference's: a titled box over the
@@ -6799,28 +7117,28 @@ impl Shell {
     }
     fn comment_card(&self, rel: &Path, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.state.lang;
-        let lines = self
-            .files
-            .active_tab()
-            .and_then(|tab| tab.editor.clone())
-            .map(|editor| {
-                let state = editor.read(cx);
-                let range = state.selected_range();
-                let text = state.value();
-                (
-                    crate::notes::line_at_offset(text.as_ref(), range.start),
-                    crate::notes::line_at_offset(text.as_ref(), range.end),
-                )
-            });
-        let anchor = match lines {
-            Some((from, end)) if end > from => lang
+        // The scope is the same fact pinning reads, so the card cannot label a
+        // range the note will not carry.
+        let (line, to, quote) = self.note_scope(cx);
+        let anchor = match (line, to) {
+            (Some(from), Some(to)) if to > from => lang
                 .tr("right.files.commentLines")
                 .replace("{from}", &from.to_string())
-                .replace("{to}", &end.to_string()),
-            Some((from, _)) => lang
+                .replace("{to}", &to.to_string()),
+            (Some(from), _) => lang
                 .tr("right.files.commentLine")
                 .replace("{line}", &from.to_string()),
-            None => lang.tr("right.files.commentFile"),
+            (None, _) => lang.tr("right.files.commentFile"),
+        };
+        let quote = {
+            let mut lines: Vec<&str> = quote.lines().take(3).collect();
+            let more = quote.lines().count() > lines.len();
+            let mut text = lines.join("\n");
+            if more {
+                text.push('…');
+            }
+            lines.clear();
+            text
         };
 
         // The card hangs directly under the lines being commented, the way the
@@ -6879,6 +7197,24 @@ impl Shell {
                         txt(lang.tr("right.files.commentTitle"), 13.0, theme::text())
                             .font_weight(FontWeight::SEMIBOLD),
                     )
+                    // What the reader is commenting on, shown before they type:
+                    // a remark is about a place, and the quote is that place.
+                    .when(!quote.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .debug_selector(|| String::from("files-comment-quote"))
+                                .w_full()
+                                .px(px(8.0))
+                                .py(px(5.0))
+                                .rounded(px(6.0))
+                                .bg(rgb(theme::hover()))
+                                .child(
+                                    txt(quote, 11.0, theme::muted())
+                                        .font_family(theme::CODE_FONT)
+                                        .line_height(px(16.0)),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .debug_selector(|| String::from("files-comment-field"))
@@ -6947,7 +7283,6 @@ impl Shell {
                                         // does, so nothing is sent twice or lost.
                                         this.pin_note(window, cx);
                                         this.send_review_to_chat(&send_rel, window, cx);
-                                        this.send(window, cx);
                                         this.files.comment_open = false;
                                         this.files.notes_open = false;
                                         cx.notify();
@@ -6956,153 +7291,219 @@ impl Shell {
                     ),
             )
     }
-    /// The drawer's toggle: a labelled control in the panel's tab strip.
-    /// The notes drawer: what the reader pinned to the open file, plus the
-    /// field that pins another.
+    /// The drawer that lists a file's comments, in the order they were pinned.
+    ///
+    /// It is a list and not a second place to write: the card over the code is
+    /// where a comment is composed, so the drawer's job is to show what is
+    /// there, to move the reader to each remark, and to send the open ones to
+    /// the model as one review.
     fn files_notes(&self, rel: &Path, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.state.lang;
         let notes = self.files.notes.on(rel);
-        div()
-            .debug_selector(|| String::from("files-notes"))
-            .flex_none()
-            .w_full()
-            .px(px(theme::RIGHT_PAD))
-            .pt(px(6.0))
-            .pb(px(6.0))
-            .border_b_1()
-            .border_color(rgb(theme::border_soft()))
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            // The pin field is always there, so adding a note is one click and
-            // one keystroke away rather than a mode the reader has to enter -
-            // except while the review card is up, because the card hosts the
-            // SAME `note_text` entity. A frame that draws one entity twice
-            // duplicates its accessibility node, which gpui-pre panics on in a
-            // debug build: that was the crash a press on the + hit, since
-            // raising the card also raises this drawer. One draft, one field.
-            .when(!self.files.comment_open, |drawer| {
-                drawer.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            div()
-                                .debug_selector(|| String::from("files-note-field"))
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    Textarea::new(&self.files.note_text)
-                                        .appearance(false)
-                                        .h(px(56.0)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("files-note-add")
-                                .debug_selector(|| String::from("files-note-add"))
-                                .h(px(28.0))
-                                .px(px(10.0))
-                                .rounded(px(theme::RADIUS_SM))
-                                .border_1()
-                                .border_color(rgb(theme::border()))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(theme::hover())))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(4.0))
-                                .child(icon(IconName::Plus, 13.0, theme::text()))
-                                .child(
-                                    txt(
-                                        lang.tr("right.files.noteAdd"),
-                                        theme::CHIP_SIZE,
-                                        theme::text(),
-                                    )
-                                    .font_weight(FontWeight::MEDIUM),
-                                )
-                                .on_click(cx.listener(|this, _event, window, cx| {
-                                    this.pin_note(window, cx);
-                                })),
-                        )
-                        // The review goes to the model: the notes a reader wrote are a
-                        // prompt they should not have to retype. Only offered when
-                        // there is something to send.
-                        .when(!notes.is_empty(), |row| {
-                            let send_rel = rel.to_path_buf();
-                            row.child(
-                                div()
-                                    .id("files-note-send")
-                                    .debug_selector(|| String::from("files-note-send"))
-                                    .h(px(28.0))
-                                    .px(px(10.0))
-                                    .rounded(px(theme::RADIUS_SM))
-                                    .bg(rgb(theme::accent()))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(4.0))
-                                    .child(icon(IconName::ArrowUp, 13.0, theme::page()))
-                                    .child(
-                                        txt(
-                                            lang.tr("right.files.noteSend"),
-                                            theme::CHIP_SIZE,
-                                            theme::page(),
-                                        )
-                                        .font_weight(FontWeight::MEDIUM),
-                                    )
-                                    .on_click(cx.listener(move |this, _event, window, cx| {
-                                        this.send_review_to_chat(&send_rel, window, cx);
-                                    })),
-                            )
-                        }),
-                )
-            })
-            .children(notes.iter().enumerate().map(|(index, note)| {
+        let open = notes.iter().filter(|note| !note.resolved).count();
+        let resolved = notes.len().saturating_sub(open);
+        let send_rel = rel.to_path_buf();
+        let send = open > 0;
+        let counts = lang
+            .tr("right.files.commentOpen")
+            .replace("{open}", &open.to_string())
+            .replace("{resolved}", &resolved.to_string());
+        let rows = notes
+            .iter()
+            .enumerate()
+            .map(|(index, note)| {
                 let anchor = note.anchor();
+                let debug_anchor = anchor.clone();
                 let text = note.text.clone();
+                let resolved = note.resolved;
+                let sent = note.sent;
+                let jump_rel = rel.to_path_buf();
+                let res_rel = rel.to_path_buf();
                 let del_rel = rel.to_path_buf();
                 let del_anchor = anchor.clone();
+                let row_id = SharedString::from(format!("files-note-row-{index}"));
                 div()
-                    .debug_selector(|| format!("files-note-{anchor}"))
-                    .id(SharedString::from(format!("files-note-row-{index}")))
+                    .debug_selector(move || format!("files-note-{debug_anchor}"))
+                    .id(row_id)
                     .w_full()
-                    .px(px(10.0))
+                    .px(px(8.0))
                     .py(px(5.0))
                     .rounded(px(theme::RADIUS_SM))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
+                    .cursor_pointer()
                     .hover(|s| s.bg(rgb(theme::hover())))
-                    .child(
-                        txt(anchor, theme::CHIP_SIZE, theme::muted())
-                            .flex_none()
-                            .w(px(44.0)),
-                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.focus_comment(&jump_rel, index, cx);
+                    }))
+                    .child(txt(anchor, 11.0, theme::muted()).flex_none().w(px(46.0)))
                     .child(
                         txt(text, theme::SIDEBAR_SIZE, theme::text())
                             .truncate()
                             .flex_1()
-                            .min_w_0(),
+                            .min_w_0()
+                            .when(resolved, |line| line.opacity(0.55)),
+                    )
+                    .when(sent, |row| {
+                        row.child(
+                            txt(lang.tr("right.files.commentSent"), 10.0, theme::faint())
+                                .flex_none(),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("files-note-resolve-{index}")))
+                            .debug_selector(move || format!("files-note-resolve-{index}"))
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::hover())))
+                            .child(icon(
+                                if resolved {
+                                    IconName::Circle
+                                } else {
+                                    IconName::CircleCheck
+                                },
+                                13.0,
+                                if resolved {
+                                    theme::faint()
+                                } else {
+                                    theme::success()
+                                },
+                            ))
+                            .on_click(cx.listener(
+                                move |this, event: &gpui::ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = event;
+                                    this.resolve_comment(&res_rel, index, cx);
+                                },
+                            )),
                     )
                     .child(
                         div()
                             .id(SharedString::from(format!("files-note-del-{index}")))
                             .debug_selector(move || format!("files-note-del-{del_anchor}"))
-                            .px(px(4.0))
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .rounded(px(4.0))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(theme::hover())))
                             .child(icon(IconName::Trash, 12.0, theme::faint()))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.delete_note(&del_rel, index, cx);
+                            .on_click(cx.listener(
+                                move |this, event: &gpui::ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = event;
+                                    this.delete_note(&del_rel, index, cx);
+                                },
+                            )),
+                    )
+            })
+            .collect::<Vec<_>>();
+        div()
+            .debug_selector(|| String::from("files-notes"))
+            .flex_none()
+            .w_full()
+            .px(px(theme::RIGHT_PAD))
+            .pt(px(6.0))
+            .pb(px(4.0))
+            .border_b_1()
+            .border_color(rgb(theme::border_soft()))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        txt(lang.tr("right.files.notes"), 12.0, theme::text())
+                            .font_weight(FontWeight::MEDIUM),
+                    )
+                    .child(txt(counts, 11.0, theme::faint()))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("files-note-add")
+                            .debug_selector(|| String::from("files-note-add"))
+                            .h(px(22.0))
+                            .px(px(7.0))
+                            .rounded(px(theme::RADIUS_SM))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::hover())))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(3.0))
+                            .child(icon(IconName::Plus, 12.0, theme::muted()))
+                            .child(txt(lang.tr("right.files.noteAdd"), 11.0, theme::muted()))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.open_comment_card(cx);
                             })),
                     )
-            }))
+                    .when(send, |row| {
+                        row.child(
+                            div()
+                                .id("files-note-send")
+                                .debug_selector(|| String::from("files-note-send"))
+                                .h(px(22.0))
+                                .px(px(7.0))
+                                .rounded(px(theme::RADIUS_SM))
+                                .bg(rgb(theme::accent()))
+                                .cursor_pointer()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(3.0))
+                                .child(icon(IconName::ArrowUp, 11.0, theme::page()))
+                                .child(
+                                    txt(lang.tr("right.files.noteSend"), 11.0, theme::page())
+                                        .font_weight(FontWeight::MEDIUM),
+                                )
+                                .on_click(cx.listener(move |this, _event, window, cx| {
+                                    this.send_review_to_chat(&send_rel, window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("files-notes-close")
+                            .debug_selector(|| String::from("files-notes-close"))
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::hover())))
+                            .child(icon(IconName::X, 11.0, theme::faint()))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.files.notes_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(notes.is_empty(), |drawer| {
+                drawer.child(div().px(px(8.0)).py(px(4.0)).child(txt(
+                    lang.tr("right.files.commentEmpty"),
+                    11.0,
+                    theme::faint(),
+                )))
+            })
+            .children(rows)
     }
 
     /// The editor over the active tab: the file's own header, then the body.
@@ -7188,7 +7589,7 @@ impl Shell {
                                     // the review card come LAST so they paint over the
                                     // document: added before the editor they were drawn
                                     // UNDER it, and the editor swallowed their presses.
-                                    .children(self.notes_inline(&rel, cx))
+                                    .children(self.note_rail(&rel, cx))
                                     .children(self.comment_plus(cx))
                                     .when(self.files.comment_open, |fill| {
                                         fill.child(self.comment_card(&rel, cx))
@@ -7245,6 +7646,11 @@ impl Shell {
                         .text_align(TextAlign::Center)
                         .line_height(px(18.0)),
                     ),
+            })
+            // The focused comment is a dock under the code, so reading a remark
+            // and reading the line it is about happen at the same time.
+            .when_some(self.note_thread(&rel, cx), |column, thread| {
+                column.child(thread)
             })
     }
 }
@@ -8822,6 +9228,7 @@ impl Shell {
         self.files.deleting = None;
         self.files.new_file_open = false;
         self.files.notes_open = false;
+        self.files.focus_note = None;
         self.files.last_blank_press = None;
         if self.right.tab == Some(RightTab::Files) {
             // This also reloads the notes, which travel with the workspace.
@@ -8931,45 +9338,234 @@ impl Shell {
     /// format decides the body: a text file lands in a highlighted editor, an
     /// image lands in an image pane, and anything else says it cannot be shown
     /// rather than dropping bytes into a buffer.
-    /// Send a file's review notes to the composer as a prompt.
+    /// Send the file's open, not-yet-sent comments to the model as one review.
     ///
-    /// A note is already anchored to a line, so the prompt says which line and
-    /// what the reader wants changed; the reader edits it before sending rather
-    /// than the app sending on its own.
+    /// This is the deliberate batch - the drawer's button, and the card's own
+    /// Comment action right after it pins the remark the reader just wrote.
+    /// Notes that already went out are skipped, so a second comment's review
+    /// asks about the new comment instead of repeating the whole file's
+    /// history at the model.
     pub(crate) fn send_review_to_chat(
         &mut self,
         rel: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let notes = self.files.notes.on(rel);
-        if notes.is_empty() {
+        let indices: Vec<usize> = self
+            .files
+            .notes
+            .on(rel)
+            .iter()
+            .enumerate()
+            .filter(|(_, note)| !note.resolved && !note.sent)
+            .map(|(index, _)| index)
+            .collect();
+        if indices.is_empty() {
             return;
         }
-        let mut prompt = format!("Review of {}:\n", rel.display());
-        for note in notes {
-            // `line` is already one-based (it comes from the editor's own
-            // numbering), so it is printed as-is; a range prints as a range.
-            match (note.line, note.to) {
-                (Some(from), Some(to)) if to > from => {
-                    prompt.push_str(&format!("- lines {from}-{to}: {}\n", note.text));
-                }
-                (Some(line), _) => {
-                    prompt.push_str(&format!("- line {line}: {}\n", note.text));
-                }
-                (None, _) => {
-                    prompt.push_str(&format!("- {}\n", note.text));
-                }
-            }
-        }
-        prompt.push('\n');
-        self.composer
-            .update(cx, |state, cx| state.set_value(prompt.clone(), window, cx));
-        self.composer_value = prompt;
+        self.send_notes(rel, &indices, window, cx);
         self.files.notes_open = false;
         self.files.comment_open = false;
+    }
+
+    /// Ask the model about one comment: the thread panel's own action.
+    pub(crate) fn ask_comment(
+        &mut self,
+        rel: &Path,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_notes(rel, &[index], window, cx);
         cx.notify();
     }
+
+    /// Deliver the given notes to the model and record that they went out.
+    ///
+    /// The request is sent as a turn of its own, not parked in the composer:
+    /// pressing Ask on a comment is a question about this file, and the
+    /// reader's draft is left exactly where it was because it is not about this
+    /// comment. A refusal (a stale model, a locked vault) is the one case that
+    /// lands in the composer instead, so the words are not lost just because
+    /// the turn could not open.
+    fn send_notes(
+        &mut self,
+        rel: &Path,
+        indices: &[usize],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self
+            .files
+            .active_tab()
+            .filter(|tab| tab.rel == rel)
+            .and_then(|tab| tab.editor.clone())
+            .map(|editor| editor.read(cx).value().to_string())
+            .unwrap_or_default();
+        let notes = self.files.notes.on(rel);
+        let selected: Vec<crate::notes::Note> = indices
+            .iter()
+            .filter_map(|index| notes.get(*index).cloned())
+            .collect();
+        let prompt = crate::notes::review_prompt(rel, &selected, &text);
+        if prompt.trim().is_empty() {
+            return;
+        }
+        if self.deliver_request(prompt, window, cx) {
+            self.files.notes.mark_sent(rel, indices);
+            self.save_notes();
+            self.files.focus_note = indices.last().copied().or(self.files.focus_note);
+        }
+        cx.notify();
+    }
+
+    /// The scope a comment would take right now: the selected lines and the
+    /// code they cover.
+    ///
+    /// One definition for the card's label, the note that gets pinned and the
+    /// quote stored with it, so the three cannot disagree about which lines a
+    /// remark is about or what it quoted.
+    pub(crate) fn note_scope(&self, cx: &App) -> (Option<usize>, Option<usize>, String) {
+        let Some(editor) = self.files.active_tab().and_then(|tab| tab.editor.clone()) else {
+            return (None, None, String::new());
+        };
+        let state = editor.read(cx);
+        let range = state.selected_range();
+        let text = state.value();
+        let from = crate::notes::line_at_offset(text.as_ref(), range.start);
+        let end = crate::notes::line_at_offset(text.as_ref(), range.end);
+        let to = (end > from).then_some(end);
+        let quote = crate::notes::quote_of(text.as_ref(), from, end);
+        (Some(from), to, quote)
+    }
+
+    /// Put a comment in focus and bring its line into view.
+    pub(crate) fn focus_comment(&mut self, rel: &Path, index: usize, cx: &mut Context<Self>) {
+        self.files.focus_note = Some(index);
+        self.reveal_comment(rel, index, cx);
+        cx.notify();
+    }
+
+    /// Scroll the document to a comment's anchor and mark its lines.
+    ///
+    /// Selecting the range is what makes the code the comment is about
+    /// obvious after the reader jumped from the drawer; it also puts the
+    /// keyboard where the reader was reading.
+    pub(crate) fn reveal_comment(&mut self, rel: &Path, index: usize, cx: &mut Context<Self>) {
+        let Some(note) = self.files.notes.on(rel).get(index).cloned() else {
+            return;
+        };
+        let Some(line) = note.line else {
+            return;
+        };
+        let end = note.end().unwrap_or(line);
+        let Some(editor) = self
+            .files
+            .active_tab()
+            .filter(|tab| tab.rel == rel)
+            .and_then(|tab| tab.editor.clone())
+        else {
+            return;
+        };
+        editor.update(cx, |state, cx| {
+            let text = state.value();
+            let start = crate::notes::line_start_offset(text.as_ref(), line);
+            let stop = crate::notes::line_start_offset(text.as_ref(), end.saturating_add(1));
+            let stop = stop.min(text.len());
+            if stop > start {
+                state.set_selected_range(start..stop, cx);
+            }
+            let line_height = f32::from(state.line_height().unwrap_or(px(20.0)));
+            // Three lines of context above the anchor, so the mark the reader
+            // asked for is not glued to the viewport's top edge.
+            let top = (line.saturating_sub(1)) as f32 * line_height - line_height * 3.0;
+            state.set_scroll_offset(gpui_kit::point(px(0.0), px(-top.max(0.0))), cx);
+        });
+    }
+
+    /// Flip one comment between open and resolved.
+    pub(crate) fn resolve_comment(&mut self, rel: &Path, index: usize, cx: &mut Context<Self>) {
+        let Some(resolved) = self
+            .files
+            .notes
+            .on(rel)
+            .get(index)
+            .map(|note| note.resolved)
+        else {
+            return;
+        };
+        self.files.notes.set_resolved(rel, index, !resolved);
+        self.save_notes();
+        self.sync_note_marks(rel, cx);
+        cx.notify();
+    }
+
+    /// Re-point the editor's comment marks at a file's notes.
+    ///
+    /// The marks are a range-decoration collection, which tracks the buffer's
+    /// own edits: typing above a comment moves its tint with the code without
+    /// this being called. It is called when the NOTES change - a pin, a delete,
+    /// a resolve, a re-anchor after a save - because that is when the ranges
+    /// themselves are redefined.
+    fn sync_note_marks(&mut self, rel: &Path, cx: &mut Context<Self>) {
+        let Some(index) = self.files.tab_index(rel) else {
+            return;
+        };
+        let Some(editor) = self.files.tabs[index].editor.clone() else {
+            return;
+        };
+        if self.files.notes.on(rel).is_empty() && self.files.tabs[index].decorations.is_none() {
+            return;
+        }
+        let mut marks = Vec::new();
+        {
+            let text = editor.read(cx).value();
+            for note in self.files.notes.on(rel) {
+                let Some(from) = note.line else {
+                    continue;
+                };
+                let to = note.end().unwrap_or(from);
+                let start = crate::notes::line_start_offset(text.as_ref(), from);
+                let end = crate::notes::line_start_offset(text.as_ref(), to.saturating_add(1));
+                let end = end.min(text.len());
+                if end <= start {
+                    continue;
+                }
+                let color = if note.resolved {
+                    rgb(theme::muted()).alpha(0.06)
+                } else {
+                    rgb(theme::accent()).alpha(0.10)
+                };
+                marks.push(
+                    RangeDecoration::new(start..end)
+                        .with_style(RangeDecorationStyle::Fill)
+                        .with_color(color),
+                );
+            }
+        }
+        let collection = match self.files.tabs[index].decorations.clone() {
+            Some(collection) => collection,
+            None => {
+                let created = editor.update(cx, |state, cx| {
+                    state.create_range_decorations_collection(Vec::new(), cx)
+                });
+                self.files.tabs[index].decorations = Some(created.clone());
+                created
+            }
+        };
+        collection.set(marks, cx);
+    }
+
+    /// Persist the notes, reporting a write that failed where the pane does.
+    fn save_notes(&mut self) {
+        let Some(root) = self.state.workspace_root() else {
+            return;
+        };
+        if let Err(error) = self.files.notes.save(&root) {
+            self.files.error = Some(io_msg(&error));
+        }
+    }
+
     /// Record one workspace activation in the launcher's automatic recent list.
     pub(crate) fn record_workspace_recent(&mut self, id: &str) {
         let (label, root) = self
@@ -9021,6 +9617,11 @@ impl Shell {
         // chips rely on: every open file is a tab you can see and return to.
         self.show_right_tab(RightTab::Files, cx);
         if let Some(index) = self.files.tab_index(rel) {
+            if self.files.active != Some(index) {
+                // The focused thread belongs to the document that was on
+                // screen, and this is a different one.
+                self.files.focus_note = None;
+            }
             self.files.active = Some(index);
             // Reopening a tab shows its remarks if it has any; a file with
             // none keeps the surface clean until the reader opens the drawer.
@@ -9051,6 +9652,7 @@ impl Shell {
             editor: None,
             kind,
             dirty: false,
+            decorations: None,
         };
         if !matches!(kind, Kind::Text(_)) {
             self.files.tabs.push(tab);
@@ -9130,6 +9732,9 @@ impl Shell {
     /// it, not merely recolouring the chip.
     pub(crate) fn focus_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.files.tabs.len() {
+            if self.files.active != Some(index) {
+                self.files.focus_note = None;
+            }
             self.show_right_tab(RightTab::Files, cx);
             self.files.active = Some(index);
             cx.notify();
@@ -9139,6 +9744,7 @@ impl Shell {
     /// Show the tree again, which is what pressing the Files chip does.
     pub(crate) fn focus_tree(&mut self, cx: &mut Context<Self>) {
         self.files.active = None;
+        self.files.focus_note = None;
         self.right.catalog_open = false;
         cx.notify();
     }
@@ -9156,6 +9762,7 @@ impl Shell {
         }
         let was_active = self.files.active == Some(index);
         self.files.tabs.remove(index);
+        self.files.focus_note = None;
         self.files.active = if was_active {
             if self.files.tabs.is_empty() {
                 None
@@ -9466,6 +10073,13 @@ impl Shell {
                 // keeps its own unsaved marker.
                 self.files.tabs[index].dirty = false;
                 self.files.error = None;
+                // The buffer is now the file, so the notes can follow an edit
+                // that moved their lines: the saved text is the authority the
+                // re-anchor reads.
+                if self.files.notes.reanchor(rel, &text) {
+                    self.save_notes();
+                }
+                self.sync_note_marks(rel, cx);
             }
             Err(error) => self.files.error = Some(io_msg(&error)),
         }
@@ -9494,44 +10108,37 @@ impl Shell {
         };
         // The SELECTION is the anchor: a note about three lines says three lines,
         // the way the reference's card reports them.
-        let (line, to) = self
-            .files
-            .active_tab()
-            .and_then(|tab| tab.editor.clone())
-            .map(|editor| {
-                let state = editor.read(cx);
-                let range = state.selected_range();
-                let text = state.value();
-                let from = crate::notes::line_at_offset(text.as_ref(), range.start);
-                let end = crate::notes::line_at_offset(text.as_ref(), range.end);
-                (Some(from), (end > from).then_some(end))
-            })
-            .unwrap_or((None, None));
-        let Some(root) = self.state.workspace_root() else {
-            return;
-        };
+        // The scope carries the code as well as the lines: the quote is what
+        // lets the note follow its code after an edit, and what the panel shows
+        // the reader is commenting on.
+        let (line, to, quote) = self.note_scope(cx);
         self.files
             .notes
-            .add(&rel, crate::notes::Note { line, to, text });
-        if let Err(error) = self.files.notes.save(&root) {
-            self.files.error = Some(io_msg(&error));
-        }
+            .add(&rel, crate::notes::Note::new(line, to, text, quote));
+        self.save_notes();
+        self.sync_note_marks(&rel, cx);
         self.files.note_text.update(cx, |state, cx| {
             state.set_value(String::new(), window, cx);
         });
-        self.files.notes_open = true;
+        // The remark the reader just wrote is the one they want to read back:
+        // focus it in the thread panel instead of covering the code with a
+        // drawer.
+        self.files.focus_note = Some(self.files.notes.on(&rel).len().saturating_sub(1));
         cx.notify();
     }
 
     /// Remove one note from the document, by its index in the drawer.
     pub(crate) fn delete_note(&mut self, rel: &Path, index: usize, cx: &mut Context<Self>) {
-        let Some(root) = self.state.workspace_root() else {
-            return;
-        };
         self.files.notes.remove(rel, index);
-        if let Err(error) = self.files.notes.save(&root) {
-            self.files.error = Some(io_msg(&error));
-        }
+        self.save_notes();
+        // The panel must not keep pointing at a comment that is gone, and a
+        // later note's index has shifted if it sat after the removed one.
+        self.files.focus_note = match self.files.focus_note {
+            Some(focus) if focus > index => Some(focus - 1),
+            Some(focus) if focus == index => None,
+            other => other,
+        };
+        self.sync_note_marks(rel, cx);
         cx.notify();
     }
 

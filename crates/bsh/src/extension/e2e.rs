@@ -376,11 +376,7 @@ async fn disabling_the_annotations_package_disables_the_notes_store() {
     let mut notes = crate::notes::Notes::default();
     notes.add(
         std::path::Path::new("a.txt"),
-        crate::notes::Note {
-            line: None,
-            to: None,
-            text: "hi".into(),
-        },
+        crate::notes::Note::new(None, None, "hi", ""),
     );
     notes.save(&root).expect("save through provider");
     host.shutdown().await;

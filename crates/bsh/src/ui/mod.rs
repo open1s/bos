@@ -24,6 +24,7 @@ pub(crate) mod workspace_menu;
 
 pub(crate) mod queue_dock;
 pub(crate) mod reference_chip;
+pub(crate) mod review;
 pub(crate) mod right_panel;
 pub(crate) mod settings;
 pub(crate) mod shell;
@@ -249,6 +250,9 @@ impl Startup {
 pub(crate) fn bind_global_actions(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-s", right_panel::SaveFile, None),
+        // Comments are the files editor's other gesture: a reader who has
+        // selected code can open the card without aiming at the +.
+        KeyBinding::new("alt-cmd-m", right_panel::AddComment, None),
         // The Browser pane's Start card prints this chord, so it has to open
         // the pane - a hint that presses nothing is a lying control.
         KeyBinding::new("cmd-t", right_panel::BrowserTab, None),

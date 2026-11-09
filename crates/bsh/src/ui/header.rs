@@ -269,6 +269,7 @@ impl Shell {
             Tab::Chat => self.render_transcript(cx).into_any_element(),
             Tab::Trajectory => self.render_trajectory(cx).into_any_element(),
             Tab::Audit => self.render_audit(cx).into_any_element(),
+            Tab::Review => self.render_review(cx).into_any_element(),
             Tab::Extensions => match self.center_extension_panels.clone() {
                 Some(view) => view.into_any_element(),
                 None => div()
@@ -287,7 +288,7 @@ impl Shell {
             Tab::Chat => self.goal_row(cx),
             // The trajectory pane already shows the goal as a card, the audit is
             // about tool calls, and an extension panel is not the conversation.
-            Tab::Trajectory | Tab::Audit | Tab::Extensions => None,
+            Tab::Trajectory | Tab::Audit | Tab::Review | Tab::Extensions => None,
         };
         let column = div()
             .debug_selector(|| String::from("main-column"))
@@ -1829,6 +1830,10 @@ impl Shell {
                     if this_tab == Tab::Trajectory && this.trace_pages == 0 {
                         this.request_trace_page(cx);
                     }
+                    if this_tab == Tab::Review {
+                        this.review_requested = None;
+                        this.review_selected = None;
+                    }
                     cx.notify();
                 }))
         };
@@ -1841,6 +1846,7 @@ impl Shell {
             .items_end()
             .gap(px(36.0))
             .child(entry("tab-chat", "tab.chat", Tab::Chat, cx))
+            .child(entry("tab-review", "tab.review", Tab::Review, cx))
             // The reference renders the trajectory tab only while its own
             // `developerTools` preference (Show coding view) is on; measured
             // in `dsh-client-ui-conversation`, whose header does

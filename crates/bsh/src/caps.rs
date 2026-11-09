@@ -44,6 +44,7 @@ fn declare(name: &str) -> agent::tools::ToolMetadata {
 }
 
 use crate::plugins::{self, PluginInfo};
+use crate::review::domain::{ChangeOperation, SnapshotState};
 use crate::settings::{Effective, Settings};
 use crate::vault::{self, Vault, VaultError};
 
@@ -702,6 +703,7 @@ pub(crate) fn build_agent_for_session(
         // A pricing build carries no goal: it is pricing what a turn would
         // send, and the goal tools are added only to a real turn's build.
         None,
+        None,
     )
 }
 
@@ -754,6 +756,26 @@ pub(crate) fn build_agent_for_session_with_subagents_and_jobs(
     browser: Arc<crate::browser::BrowserHandle>,
     goal: Option<Goal>,
 ) -> BuiltAgent {
+    build_agent_for_session_with_subagents_jobs_and_review(
+        settings, vault, choice, mcp, session, parent, subagents, jobs, browser, goal, None,
+    )
+}
+
+/// Build a turn that also records exact file changes for review.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_agent_for_session_with_subagents_jobs_and_review(
+    settings: &Settings,
+    vault: &Vault,
+    choice: &crate::settings::resolve::SessionChoice,
+    mcp: &crate::mcp::McpPool,
+    session: &str,
+    parent: &str,
+    subagents: Arc<crate::subagent::SubagentRegistry>,
+    jobs: Arc<agent::jobs::JobRegistry>,
+    browser: Arc<crate::browser::BrowserHandle>,
+    goal: Option<Goal>,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
+) -> BuiltAgent {
     build_agent_for_session_inner(
         settings,
         vault,
@@ -764,6 +786,7 @@ pub(crate) fn build_agent_for_session_with_subagents_and_jobs(
         jobs,
         browser,
         goal,
+        review,
     )
 }
 
@@ -778,6 +801,7 @@ fn build_agent_for_session_inner(
     jobs: Arc<agent::jobs::JobRegistry>,
     browser: Arc<crate::browser::BrowserHandle>,
     goal: Option<Goal>,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
 ) -> BuiltAgent {
     let eff = settings.effective_for(choice);
     // A contributed provider may declare that it needs no credential - an open
@@ -1111,6 +1135,7 @@ fn build_agent_for_session_inner(
                     policy.clone(),
                     session.to_string(),
                     preset.clone(),
+                    review.clone(),
                 )),
                 declare("write_file"),
             )));
@@ -1123,6 +1148,7 @@ fn build_agent_for_session_inner(
                     policy.clone(),
                     session.to_string(),
                     preset.clone(),
+                    review.clone(),
                 )),
                 declare("edit_file"),
             )));
@@ -1135,6 +1161,7 @@ fn build_agent_for_session_inner(
                     policy.clone(),
                     session.to_string(),
                     preset.clone(),
+                    review.clone(),
                 )),
                 declare("apply_patch"),
             )));
@@ -4728,6 +4755,7 @@ fn apply_patch_tool(
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
 ) -> FunctionTool {
     FunctionTool::new(
         "apply_patch",
@@ -4892,6 +4920,10 @@ fn apply_patch_tool(
 
                     let lock = file_lock(&target);
                     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let before = review
+                        .as_ref()
+                        .map(|runtime| runtime.before(&target))
+                        .unwrap_or(SnapshotState::Absent);
                     let original = read_editable(&target)?;
                     let mut content = original.clone();
                     let mut replacements = 0usize;
@@ -4933,6 +4965,14 @@ fn apply_patch_tool(
                     let unchanged = original == content;
                     if !unchanged {
                         write_bytes(&target, content.as_bytes())?;
+                        if let Some(runtime) = &review {
+                            runtime.record(
+                                &target,
+                                ChangeOperation::Patch,
+                                before,
+                                "apply_patch",
+                            );
+                        }
                         changed_files += 1;
                     }
                     Ok(serde_json::json!({
@@ -4968,6 +5008,7 @@ fn write_file_tool(
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
 ) -> FunctionTool {
     FunctionTool::new(
         "write_file",
@@ -5001,7 +5042,22 @@ fn write_file_tool(
             // rename and lose one of the two results.
             let lock = file_lock(&target);
             let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = review
+                .as_ref()
+                .map(|runtime| runtime.before(&target))
+                .unwrap_or(SnapshotState::Absent);
+            let existed = before.is_present();
             let outcome = write_bytes(&target, content.as_bytes())?;
+            if !outcome.unchanged {
+                if let Some(runtime) = &review {
+                    let operation = if existed {
+                        ChangeOperation::Write
+                    } else {
+                        ChangeOperation::Create
+                    };
+                    runtime.record(&target, operation, before, "write_file");
+                }
+            }
             Ok(serde_json::json!({
                 "path": target.display().to_string(),
                 "bytes": outcome.bytes,
@@ -5024,6 +5080,7 @@ fn edit_file_tool(
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
 ) -> FunctionTool {
     FunctionTool::new(
         "edit_file",
@@ -5075,6 +5132,10 @@ fn edit_file_tool(
             // start from the original bytes.
             let lock = file_lock(&target);
             let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = review
+                .as_ref()
+                .map(|runtime| runtime.before(&target))
+                .unwrap_or(SnapshotState::Absent);
             let content = read_editable(&target)?;
             let outcome = replace_text(&content, &old, &new, replace_all).map_err(|error| {
                 match error {
@@ -5090,6 +5151,9 @@ fn edit_file_tool(
             let unchanged = outcome.updated.is_none();
             if let Some(updated) = &outcome.updated {
                 write_bytes(&target, updated.as_bytes())?;
+                if let Some(runtime) = &review {
+                    runtime.record(&target, ChangeOperation::Edit, before, "edit_file");
+                }
             }
             Ok(serde_json::json!({
                 "path": target.display().to_string(),
@@ -5467,14 +5531,16 @@ mod tests {
         agent_messages, allows_writes, build_agent, check_spawn, compactable_span,
         egress_allowlist_path, is_confined, offers_local_web_search, plugin_provider_node,
         read_egress_rules, refresh_plugin_providers, sandbox_spec_for, surfaced_capabilities,
-        tool_gates_for, web_search_config, with_bridge_pool, BuiltAgent, WorkspaceEgress,
-        EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, MAX_BATCH_READ_BYTES, READ_ONLY, WORKSPACE_WRITE,
+        tool_gates_for, web_search_config, with_bridge_pool, write_file_tool, BuiltAgent,
+        WorkspaceEgress, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, MAX_BATCH_READ_BYTES, READ_ONLY,
+        WORKSPACE_WRITE,
     };
     use crate::settings::global::{ModelEntry, Preset};
     use crate::settings::resolve::SessionChoice;
     use crate::settings::Settings;
     use crate::vault::Vault;
-    use agent::policy::{Action, EgressRuleSet, PolicyInput, Target};
+    use agent::policy::{Action, EgressRuleSet, PolicyData, PolicyInput, PolicySet, Target};
+    use agent::tools::Tool as _;
 
     /// Serialises the tests that share the process-wide schedule queue.
     static SCHEDULE_QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -7883,6 +7949,40 @@ mod tests {
             shell.tools.is_empty(),
             "the registry must hold none of its tools, and caps adds exactly those"
         );
+    }
+
+    /// A write through the real tool records an exact before/after changeset.
+    #[test]
+    fn write_file_records_an_exact_review_changeset() {
+        let root = scratch("review-write");
+        let policy =
+            std::sync::Arc::new(PolicySet::compile_baseline(PolicyData::new(root.clone())));
+        let runtime = crate::review::ReviewRuntime::new(&root, "session").expect("runtime");
+        let tool = write_file_tool(
+            Some(root.clone()),
+            true,
+            policy,
+            "session".to_string(),
+            "preset".to_string(),
+            Some(runtime.clone()),
+        );
+        tool.run(&serde_json::json!({
+            "path": "src/new.rs",
+            "content": "fn added() {}\n"
+        }))
+        .expect("the write succeeds");
+        let snapshot = runtime.seal().expect("a review snapshot");
+        assert_eq!(snapshot.changeset.changes.len(), 1);
+        assert_eq!(
+            snapshot.changeset.changes[0].kind,
+            crate::review::domain::ChangeKind::Created
+        );
+        assert!(snapshot.changeset.changes[0]
+            .revisions
+            .last()
+            .is_some_and(
+                |revision| revision.before == crate::review::domain::SnapshotState::Absent
+            ));
     }
 
     /// A scratch directory no other test shares.

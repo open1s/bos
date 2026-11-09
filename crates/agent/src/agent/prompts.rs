@@ -12,10 +12,12 @@
 //! registered on the agent, so a prompt can never tell the model to use a tool
 //! the request does not carry.
 
-/// The harness identity that opens every assembled system prompt.
+/// The harness identity that opens the assembled system prompt.
 ///
 /// The reference's line is `You are an AI agent powered by DeepSeek Harness.`;
-/// the product name is the only substitution.
+/// the product name is the only substitution. It opens the STANDING prompt;
+/// the discovery block is written ahead of it when the agent carries a search,
+/// so the first rule is "check what you were given" (see [`DISCOVERY_PRIORITY`]).
 pub const HARNESS_IDENTITY: &str = "You are an AI agent powered by BOS Harness.";
 
 /// The persona every agent runs with until a workspace or preset names one.
@@ -60,22 +62,34 @@ You and the reader share one workspace. Turn what they asked for into a finished
 - Plain words, concrete nouns, file paths the reader can open; no filler or praise.
 - Match the reader's language; brief by default, thorough when the decision needs it.";
 
+/// The heading that makes discovery the prompt's FIRST section.
+///
+/// A withheld tool is unreachable until the model knows to look for it, and a
+/// paragraph appended after the whole standing prompt arrives after the model
+/// has already chosen its first action. The block under this heading is written
+/// first into the system prompt, and only for an agent that really carries a
+/// search, so the capability gate in [`DISCOVERY_GUIDANCE`] still holds.
+pub const DISCOVERY_PRIORITY: &str = "## Check what you were given first";
+
 /// What the model is told when some tools are withheld from its tool list.
 ///
-/// Appended only when the agent actually withholds a tool: a prompt that named
+/// Written only when the agent actually withholds a tool: a prompt that named
 /// `find_tool` on an agent that does not carry it would be the stale-reference
 /// mistake the workflow guidance itself warns about.
 ///
 /// The wording names the two tools by their registered names and nothing else,
 /// so it stays true when a host renames its file tools or adds an MCP server.
-pub const DISCOVERY_GUIDANCE: &str = "You are given a subset of this machine's tools. When the tool you need is not among them, do not guess: call find_tool with what you need to do, or with an exact tool name to get that tool's full schema. With no query, find_tool lists the names it can offer. Every tool it reports - name, description, and JSON Schema for its arguments - is added to your tool list for the next step. Then call that tool directly by its own name with args matching the reported schema. A withheld tool is not callable before find_tool reports it. Do not conclude a capability is missing before searching for it.";
+/// It opens with the priority rule because the paragraph is placed first in the
+/// prompt: searching is a step before acting, not a fallback after a failure.
+pub const DISCOVERY_GUIDANCE: &str = "Before you reach for any tool: the list you were given is a subset of this machine's tools. When the tool you need is not among them, do not guess and do not conclude a capability is missing: call find_tool with what you need to do, or with an exact tool name to get that tool's full schema. With no query, find_tool lists the names it can offer. Every tool it reports - name, description, and JSON Schema for its arguments - is added to your tool list for the next step. Then call that tool directly by its own name with args matching the reported schema. A withheld tool is not callable before find_tool reports it.";
 
 /// What the model is told when skills are searched instead of catalogued.
 ///
-/// Appended only when the agent carries model-invocable skills and its
+/// Written only when the agent carries model-invocable skills and its
 /// catalogue is off, for the same reason as [`DISCOVERY_GUIDANCE`]: a prompt
-/// that names a tool on an agent that does not carry it is a lie.
-pub const SKILL_DISCOVERY_GUIDANCE: &str = "Skills work the same way. When one could apply, call find_skill with what you need to do - or with no query to list every skill name - then call load_skill with a name to read its instructions. Load one only when its description matches the request; being listed is not a reason.";
+/// that names a tool on an agent that does not carry it is a lie. It rides in
+/// the same priority block, so a skill is checked before the work starts.
+pub const SKILL_DISCOVERY_GUIDANCE: &str = "Before you start work a skill might cover: call find_skill with what you need to do - or with no query to list every skill name - then call load_skill with a name to read its instructions. Load one only when its description matches the request; being listed is not a reason.";
 
 /// The default system prompt: identity, the default persona, then workflow guidance.
 ///
@@ -375,6 +389,17 @@ mod tests {
         assert!(!SKILL_DISCOVERY_GUIDANCE.trim().is_empty());
     }
 
+    /// Discovery is a priority block, not a footnote: it has a heading, both
+    /// paragraphs open with a before-you-act rule, and the engine writes them
+    /// ahead of the standing contract (see the agentic prompt test).
+    #[test]
+    fn discovery_opens_with_a_priority_rule() {
+        assert!(DISCOVERY_PRIORITY.contains("first"));
+        assert!(!DISCOVERY_PRIORITY.trim().is_empty());
+        assert!(DISCOVERY_GUIDANCE.starts_with("Before you reach for any tool"));
+        assert!(SKILL_DISCOVERY_GUIDANCE.starts_with("Before you start work"));
+    }
+
     /// The prompt must not name a tool the request does not carry.
     #[test]
     fn no_stale_reference_to_a_removed_tool() {
@@ -384,6 +409,7 @@ mod tests {
             TOOL_BASH,
             TOOL_JOBS,
             TOOL_PLAN,
+            DISCOVERY_PRIORITY,
             DISCOVERY_GUIDANCE,
             SKILL_DISCOVERY_GUIDANCE,
         ];

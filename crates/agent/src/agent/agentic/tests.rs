@@ -1495,8 +1495,61 @@ async fn the_discovery_paragraph_appears_only_when_a_tool_is_withheld() {
     let _ = agent.react("task".to_string()).await;
     let guided = seen.lock().unwrap().clone().expect("a persona");
     assert!(
+        guided.starts_with(crate::agent::prompts::DISCOVERY_PRIORITY),
+        "the way back to a withheld tool is the prompt's first section"
+    );
+    assert!(
         guided.contains(crate::agent::prompts::DISCOVERY_GUIDANCE),
         "a withheld tool comes with the way back to it"
+    );
+    let priority = guided
+        .find(crate::agent::prompts::DISCOVERY_PRIORITY)
+        .expect("the priority heading");
+    let contract = guided
+        .find(crate::agent::prompts::WORKFLOW_GUIDANCE)
+        .expect("the standing contract");
+    assert!(
+        priority < contract,
+        "discovery is read before the standing contract, not after it"
+    );
+}
+
+/// The skill paragraph rides the same priority block: a searched skill is
+/// announced before the work starts, and the paragraph that only applies to a
+/// withheld tool is left out.
+#[tokio::test]
+async fn the_skill_paragraph_opens_the_prompt_when_skills_are_searched() {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(PersonaCapturingLlm(seen.clone())),
+    );
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    agent.add_live_skill(crate::skills::SkillContent {
+        metadata: crate::skills::SkillMetadata::new(
+            "review-skill".to_string(),
+            "review a change".to_string(),
+            std::path::PathBuf::from("/skills/review-skill/SKILL.md"),
+        ),
+        instructions: "review it".to_string(),
+        skill_dir: std::path::PathBuf::from("/skills/review-skill"),
+    });
+
+    let _ = agent.react("task".to_string()).await;
+    let guided = seen.lock().unwrap().clone().expect("a persona");
+    assert!(
+        guided.starts_with(crate::agent::prompts::DISCOVERY_PRIORITY),
+        "a searched skill is announced first"
+    );
+    assert!(guided.contains(crate::agent::prompts::SKILL_DISCOVERY_GUIDANCE));
+    assert!(
+        !guided.contains(crate::agent::prompts::DISCOVERY_GUIDANCE),
+        "nothing is withheld, so find_tool is not named"
+    );
+    assert!(
+        guided.contains(crate::agent::prompts::WORKFLOW_GUIDANCE),
+        "the standing contract still follows the priority block"
     );
 }
 

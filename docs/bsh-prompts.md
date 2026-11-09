@@ -39,11 +39,20 @@ Everything else in the corpus serves one of those five.
 ## 2. Assembly order
 
 `compose_system_prompt` joins the first three layers; the BSH build appends
-the rest. Order is deterministic, so a request is reproducible and the KV-cache
-prefix stays stable.
+the rest, and `Agent::system_prompt_for` writes the discovery block ahead of
+all of them. Order is deterministic, so a request is reproducible and the
+KV-cache prefix stays stable.
+
+Discovery is layer 0, not a tail paragraph: a withheld tool or a searched skill
+is unreachable until the model knows to look, and a paragraph appended after the
+whole contract arrives after the first action has been chosen. The block keeps
+the capability gate - it is written only for a search this agent really carries -
+and it is the first thing in the system prompt, under
+`## Check what you were given first`.
 
 | # | Layer | Constant | Owner | When |
 |---|-------|----------|-------|------|
+| 0 | Discovery priority | `DISCOVERY_PRIORITY` + `DISCOVERY_GUIDANCE` / `SKILL_DISCOVERY_GUIDANCE` | `agent` | when a tool is withheld or a skill is searched |
 | 1 | Harness identity | `HARNESS_IDENTITY` | `agent` | always |
 | 2 | Persona slot | `DEFAULT_PERSONA` or the workspace/preset persona | `agent` | always (unless `complete`) |
 | 3 | Decision procedure | `WORKFLOW_GUIDANCE` | `agent` | always (unless `complete`) |
@@ -244,6 +253,10 @@ the built prompt at 12,000 bytes; `the_framework_prompt_stays_small` caps the
 framework default at 6,000. The skill catalogue is deliberately not in the
 prompt: it is ranked against the request instead.
 
+The discovery block is extra when a search is carried: `DISCOVERY_PRIORITY`
+(34 bytes), `DISCOVERY_GUIDANCE` (617) and `SKILL_DISCOVERY_GUIDANCE` (274) -
+929 bytes with both, written first and gated on the search that makes it true.
+
 ## 7. Scenario checks
 
 The contract is only as good as the first move it produces. These are the
@@ -264,6 +277,8 @@ call or the reply, before any correction from the reader.
 | "drop the users table" | repo open | inspect the target, then ask before executing | Expensive ambiguity asks one question |
 | "what is the test command?" | repo open | read the README or justfile; do not ask | Never ask for a fact the workspace can answer |
 | "reduce latency" | product tradeoff | measure; ask only if the target belongs to the reader | Concrete readings act; destructive or wasteful ones ask |
+| "can you deploy this?" | no deploy tool in the list | call `find_tool` with "deploy", then call what it reports | Discovery is the first priority: check what you were given before concluding it is missing |
+| any task a specialist procedure covers | skills are searched | call `find_skill`, then `load_skill` for the match | The skill paragraph rides the same priority block |
 
 A scenario that produces the wrong first move is a prompt bug even when the
 final answer is right: the reader paid for the wrong step.

@@ -41,6 +41,7 @@ pub(crate) mod preset_catalogue;
 pub(crate) mod prompts;
 pub(crate) mod recent;
 pub(crate) mod reference;
+pub(crate) mod review;
 pub(crate) mod runner;
 pub(crate) mod schedule;
 pub(crate) mod settings;

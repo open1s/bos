@@ -18,6 +18,8 @@ use crate::model::{
     ChatMessage, CompactCommand, CompactOutcome, CompactionReport, MessageMeta, MessageUsage,
     PlanItem, PlanStore, Role, Session, SkillInvocation, ToolEvent,
 };
+use crate::review::domain::{Change, Decision, FileDiff, Review, ReviewSnapshot};
+use crate::review::store::{ReviewRuntime, ReviewStore};
 use crate::runner::{AgentEvent, Runner};
 use crate::settings::Settings;
 use crate::store::Store;
@@ -244,6 +246,8 @@ pub(crate) enum Tab {
     Trajectory,
     /// The deterministic tool-call and refusal audit.
     Audit,
+    /// Exact captured changes and their review.
+    Review,
     /// Extension panels declared for the main column.
     Extensions,
 }
@@ -501,6 +505,12 @@ pub(crate) struct AppState {
     /// turn's plan is read from here and the finished copy is saved onto the
     /// session it belongs to.
     plans: HashMap<String, PlanStore>,
+    /// The exact-change runtime of each session whose turn is still writing.
+    review_runtimes: HashMap<String, Arc<ReviewRuntime>>,
+    /// Bumped when a review is sealed, so the Review tab rebuilds its cache.
+    pub(crate) review_epoch: u64,
+    /// Task/attempt ids waiting for their changeset to seal.
+    review_links: HashMap<String, (String, String)>,
     /// The live goal store of every session whose turn is still running.
     ///
     /// The agent's `get_goal` / `update_goal` tools write through it, and the
@@ -848,6 +858,9 @@ impl AppState {
             streams: HashMap::new(),
             jobs: Arc::new(agent::jobs::JobRegistry::new()),
             plans: HashMap::new(),
+            review_runtimes: HashMap::new(),
+            review_epoch: 0,
+            review_links: HashMap::new(),
             goals: HashMap::new(),
             subagents,
             subagent: None,
@@ -2131,6 +2144,7 @@ impl AppState {
         self.turn_extension_activations.remove(id);
         self.turn_agents.remove(id);
         self.restore_orphan_steers(id);
+        self.finish_review(id);
         let stopped = now_ms();
         if let Some(session) = self.store.session_mut(id) {
             if let Some(message) = session.messages.last_mut() {
@@ -2623,6 +2637,101 @@ impl AppState {
             session.plan = items;
         }
         self.save_session(id);
+    }
+
+    /// Open the exact-change runtime for a turn about to start.
+    ///
+    /// The runtime is shared with the file tools for the turn's lifetime and
+    /// removed when the turn settles. A workspace with no root, or a filesystem
+    /// error, disables capture for this turn rather than failing the send: a
+    /// review is additive, and the turn still runs without it.
+    pub(crate) fn begin_review(&mut self, session: &str) -> Option<Arc<ReviewRuntime>> {
+        let root = self.workspace_root()?;
+        match ReviewRuntime::new(&root, session) {
+            Ok(runtime) => {
+                self.review_runtimes
+                    .insert(session.to_string(), runtime.clone());
+                Some(runtime)
+            }
+            Err(error) => {
+                log::warn!("review capture is unavailable for {session}: {error}");
+                None
+            }
+        }
+    }
+
+    /// Drop a runtime whose turn never started.
+    pub(crate) fn abandon_review(&mut self, session: &str) {
+        self.review_runtimes.remove(session);
+    }
+
+    /// Seal the turn's changeset and make the Review tab read a new snapshot.
+    pub(crate) fn finish_review(&mut self, session: &str) {
+        let Some(runtime) = self.review_runtimes.remove(session) else {
+            return;
+        };
+        let change_set = runtime.change_set_id();
+        let sealed = runtime.seal();
+        let Some((task, attempt)) = self.review_links.remove(&change_set) else {
+            if sealed.is_some() {
+                self.review_epoch = self.review_epoch.wrapping_add(1);
+            }
+            return;
+        };
+        if sealed.is_some() {
+            self.review_epoch = self.review_epoch.wrapping_add(1);
+            if let Some(store) = self.review_store() {
+                let _ = store.link_task(&change_set, &task, &attempt);
+            }
+        }
+    }
+
+    /// The newest review snapshot for a session, read on cache misses only.
+    pub(crate) fn review_snapshot(&self, session: &str) -> Option<ReviewSnapshot> {
+        self.review_store()?.load_snapshot(session)
+    }
+
+    /// One changeset's review snapshot, for a task attempt link.
+    pub(crate) fn review_snapshot_for(&self, change_set_id: &str) -> Option<ReviewSnapshot> {
+        self.review_store()?.load_snapshot_for(change_set_id)
+    }
+
+    /// Record the task attempt that produced a changeset.
+    ///
+    /// The manifest may not exist until the first tool call, so the link waits
+    /// in memory and is written when the turn seals.
+    pub(crate) fn link_review_task(&mut self, change_set_id: &str, task: &str, attempt: &str) {
+        self.review_links.insert(
+            change_set_id.to_string(),
+            (task.to_string(), attempt.to_string()),
+        );
+    }
+
+    /// Build the prepared diff for one change.
+    pub(crate) fn review_diff(&self, change: &Change) -> FileDiff {
+        match self.review_store() {
+            Some(store) => crate::review::diff::build(&store, change),
+            None => FileDiff::unavailable(change, "no workspace review store is open"),
+        }
+    }
+
+    /// Record a human decision against the current review digest.
+    pub(crate) fn decide_review(
+        &mut self,
+        change_set_id: &str,
+        decision: Decision,
+        rationale: String,
+    ) -> Result<Review, String> {
+        let Some(store) = self.review_store() else {
+            return Err("no workspace review store is open".to_string());
+        };
+        let review = store.decide(change_set_id, decision, rationale)?;
+        self.review_epoch = self.review_epoch.wrapping_add(1);
+        Ok(review)
+    }
+
+    fn review_store(&self) -> Option<ReviewStore> {
+        Some(ReviewStore::open(&self.workspace_root()?))
     }
 
     /// Set, replace or clear one session's goal.
@@ -3645,6 +3754,7 @@ impl AppState {
             self.turn_agents.remove(id);
             self.restore_orphan_steers(id);
             self.turn_started = None;
+            self.finish_review(id);
             self.refresh_policy_audit();
             // Bound the live window like a restored one: paging trims at the
             // same ceiling, but a session that only streams never pages. Done
@@ -7254,6 +7364,44 @@ mod tests {
             Some("second-model"),
             "the model rides with the usage, not with the current setting"
         );
+    }
+
+    /// A turn's exact changes seal into a review the shell can read and decide.
+    #[test]
+    fn a_review_seals_and_accepts_a_digest_bound_decision() {
+        let dir = std::env::temp_dir().join(format!("bsh-review-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        let root = state.workspace_root().expect("a workspace root");
+        let path = root.join("src").join("lib.rs");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("src");
+        std::fs::write(&path, "fn old() {}\n").expect("old file");
+        let runtime = state.begin_review("session").expect("runtime");
+        let before = runtime.before(&path);
+        std::fs::write(&path, "fn new() {}\n").expect("new file");
+        runtime.record(
+            &path,
+            crate::review::domain::ChangeOperation::Edit,
+            before,
+            "edit_file",
+        );
+        state.finish_review("session");
+        let snapshot = state.review_snapshot("session").expect("a sealed review");
+        assert_eq!(snapshot.changeset.changes.len(), 1);
+        let id = snapshot.changeset.id.clone();
+        let decided = state
+            .decide_review(
+                &id,
+                crate::review::domain::Decision::Approve,
+                "reviewed".to_string(),
+            )
+            .expect("the decision");
+        assert_eq!(
+            decided.status,
+            crate::review::domain::ReviewStatus::Approved
+        );
+        assert_eq!(decided.decisions.len(), 1);
     }
 
     /// A session with no model anywhere names none, rather than an empty chip.
