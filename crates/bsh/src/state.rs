@@ -18,7 +18,7 @@ use crate::model::{
     ChatMessage, CompactCommand, CompactOutcome, CompactionReport, MessageMeta, MessageUsage,
     PlanItem, PlanStore, Role, Session, SkillInvocation, ToolEvent,
 };
-use crate::review::domain::{Change, Decision, FileDiff, Review, ReviewSnapshot};
+use crate::review::domain::{Change, Decision, DecisionEvent, FileDiff, Review, ReviewSnapshot};
 use crate::review::store::{ReviewRuntime, ReviewStore};
 use crate::runner::{AgentEvent, Runner};
 use crate::settings::Settings;
@@ -2694,6 +2694,13 @@ impl AppState {
     /// One changeset's review snapshot, for a task attempt link.
     pub(crate) fn review_snapshot_for(&self, change_set_id: &str) -> Option<ReviewSnapshot> {
         self.review_store()?.load_snapshot_for(change_set_id)
+    }
+
+    /// Every recorded review decision for a session, oldest first.
+    pub(crate) fn review_decisions(&self, session: &str) -> Vec<DecisionEvent> {
+        self.review_store()
+            .map(|store| store.decisions_for_session(session))
+            .unwrap_or_default()
     }
 
     /// Record the task attempt that produced a changeset.

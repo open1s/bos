@@ -3973,6 +3973,32 @@ Traps worth keeping:
   each other's `.rmeta` ("extern location for log does not exist"). Wait for the
   peer's cargo to exit before starting a build.
 
+Performance, same round: the rail used to read the whole buffer every frame
+just to find each comment's line offset, and the thread panel cloned it again
+to draw its quote. The editor's range-decoration collection already tracks the
+commented ranges through every edit, so the rail now maps the collection's
+ranges back to their notes through FileTab.note_marks - a frame reads no text
+at all - and the thread's excerpt is cached in FilesPane.thread_quote, seeded
+on focus and refreshed by the editor's Change event. The fallback path still
+measures the buffer when a note was added without the sync (a test, or a
+sidecar read before the first frame), so the rail never silently draws
+nothing.
+
+Bug found by the user's own screenshot, and why it existed: every overlay was
+converted against the kit's `text_bounds()`, which is `last_bounds` - the
+element box AFTER the editor's scroll is folded in, negative once the document
+is scrolled. A selection at line 21 put the + about fifteen lines lower and the
+card slid off the bottom of the pane. The box the overlay's parent is measured
+from is the VIEWPORT, `input_bounds()`; `viewport_box` now feeds `document_point`,
+`document_origin` and both anchors, with a zero-box guard for the first frame.
+The card additionally flips above the selection when the reserved 260px of card
+room does not fit below, so a selection near the pane's bottom no longer opens a
+surface whose buttons are cut off. Test: `the_comment_affordance_rides_the_selection_in_a_tall_document`
+scrolls a 60-line file, selects lines 21-25 and pins the + and the card against
+the selection's own box; it fails on the old conversion (plus 477 vs selection
+256..356) and passes now. The earlier plus tests never caught it because they
+selected in an unscrolled document, where `last_bounds == input_bounds`.
+
 Honest gaps: the kit editor exposes no soft wrap and no outline/minimap, so the
 reference's wrap toggle cannot be mirrored; a comment is a line-anchored remark
 with no reply chain (the conversation happens in chat); the rail dash is not

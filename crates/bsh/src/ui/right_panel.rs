@@ -69,13 +69,14 @@ const SELF_DOUBLE_PX: f32 = 6.0;
 /// The top-left a document-anchored overlay sits at, in the editor's own
 /// coordinates.
 ///
-/// The kit reports text boxes in WINDOW space - `range_to_bounds` is
-/// `text_bounds().origin + glyph offset` - while `absolute()` places a child
-/// against its PARENT. The editor's box is that parent, so subtracting its
-/// origin is the whole conversion. Without it the offset was added twice
-/// (once by the kit, once by the panel sitting to the window's right), which
-/// is why the note affordance only showed while the editor happened to start
-/// at the window's left edge.
+/// The kit reports text boxes in WINDOW space while `absolute()` places a child
+/// against its PARENT, so subtracting the element's own viewport origin is the
+/// whole conversion. Two traps live here: using `last_bounds` instead of
+/// `input_bounds` folds the editor's SCROLL into the origin (a scrolled document
+/// puts every overlay hundreds of pixels below its selection), and the offset was
+/// once added twice (once by the kit, once by the panel to the window's right),
+/// which is why the note affordance only showed while the editor happened to
+/// start at the window's left edge.
 ///
 /// The point is the middle of the part of `bounds` the document SHOWS: the
 /// control sits on the text the reader marked rather than hanging off one
@@ -141,6 +142,27 @@ fn document_origin(bounds: Bounds<Pixels>, editor: Bounds<Pixels>) -> (f32, f32)
         f32::from(bounds.origin.y - editor.origin.y),
     )
 }
+
+/// The editor element's own box, which is the overlay container's frame.
+///
+/// The kit keeps two boxes: `input_bounds` is the element's viewport (what the
+/// reader sees, scroll NOT folded in) and `last_bounds` is the same box after
+/// the editor's scroll offset moved it - negative once the document is scrolled,
+/// which is exactly how a scrolled mark ended up hundreds of pixels below the
+/// selection. The overlays are children of the element, so the viewport box is
+/// the one every window-space text box is converted against.
+fn viewport_box(state: &EditorState) -> Bounds<Pixels> {
+    state.input_bounds()
+}
+
+/// How much room the review card needs under its anchor.
+///
+/// The card has no fixed height (a quote of up to three lines, a growing field
+/// and one action row), so the flip decision reserves the tallest it can get
+/// rather than measuring a surface that has not laid out yet. A card that does
+/// not fit below its lines opens above them, which is the shape a context menu
+/// uses for the same reason.
+const CARD_ROOM: f32 = 260.0;
 
 /// The wording the panel reports an I/O failure with.
 ///
@@ -708,6 +730,10 @@ pub(crate) struct FilesPane {
     /// line in the code; none leaves the document unobstructed, which is the
     /// state browsing wants.
     pub(crate) focus_note: Option<usize>,
+    /// The excerpt the thread panel draws: the focused note's current code,
+    /// read once when the note is focused or its buffer changes. A frame must
+    /// not clone a whole file to draw one panel.
+    pub(crate) thread_quote: Option<(PathBuf, usize, String)>,
     /// The note being typed into the drawer's field.
     pub(crate) note_text: Entity<TextareaState>,
 }
@@ -728,6 +754,11 @@ pub(crate) struct FileTab {
     /// ride the code through typing and scrolling instead of being recomputed
     /// per frame; it is created on the first note a file carries.
     pub(crate) decorations: Option<RangeDecorationCollection>,
+    /// Which note each decoration range belongs to, in the collection's own
+    /// order. The collection is the tracked truth about WHERE a comment sits
+    /// after edits, so the rail reads its ranges instead of re-measuring the
+    /// buffer every frame; this list is what maps a range back to its note.
+    pub(crate) note_marks: Vec<usize>,
 }
 
 impl FileTab {
@@ -768,6 +799,7 @@ impl FilesPane {
             notes_open: false,
             comment_open: false,
             focus_note: None,
+            thread_quote: None,
             note_text,
         }
     }
@@ -6759,30 +6791,60 @@ impl Shell {
     /// it is about. Resolved remarks keep a faint mark so the history stays
     /// findable, and the mark the reader is reading grows.
     fn note_rail(&self, rel: &Path, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let Some(editor) = self.files.active_tab().and_then(|tab| tab.editor.clone()) else {
+        let Some(tab) = self.files.active_tab() else {
             return Vec::new();
         };
-        if self.files.notes.on(rel).is_empty() {
+        let Some(editor) = tab.editor.clone() else {
+            return Vec::new();
+        };
+        let notes = self.files.notes.on(rel);
+        if notes.is_empty() {
             return Vec::new();
         }
+        // The decoration collection already tracks every commented range through
+        // the buffer's own edits, so the ordinary path reads NO text: the ranges
+        // it holds are the line positions, in the same order the notes were
+        // synced into it. A note added without that sync (a test, a sidecar read
+        // before the first frame) falls back to measuring the buffer once.
+        let ranged: Vec<(usize, std::ops::Range<usize>)> = match tab.decorations.clone() {
+            Some(collection) if !tab.note_marks.is_empty() => collection
+                .get_ranges(cx)
+                .into_iter()
+                .zip(tab.note_marks.iter().copied())
+                .map(|(range, index)| (index, range))
+                .collect(),
+            _ => {
+                let text = editor.read(cx).value();
+                notes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, note)| {
+                        let from = note.line?;
+                        let to = note.end().unwrap_or(from);
+                        let start = crate::notes::line_start_offset(text.as_ref(), from);
+                        let end =
+                            crate::notes::line_start_offset(text.as_ref(), to.saturating_add(1))
+                                .min(text.len())
+                                .max(start + 1);
+                        (end > start).then_some((index, start..end))
+                    })
+                    .collect()
+            }
+        };
         let marks: Vec<(usize, f32, bool, usize)> = {
             let state = editor.read(cx);
-            let text = state.value();
-            let Some(editor_box) = state.text_bounds() else {
-                return Vec::new();
-            };
+            let editor_box = viewport_box(state);
             let height = f32::from(editor_box.size.height);
+            if height <= 1.0 {
+                return Vec::new();
+            }
             let mut per_line: HashMap<usize, usize> = HashMap::new();
-            self.files
-                .notes
-                .on(rel)
-                .iter()
-                .enumerate()
-                .filter_map(|(index, note)| {
+            ranged
+                .into_iter()
+                .filter_map(|(index, range)| {
+                    let note = notes.get(index)?;
                     let line = note.line?;
-                    let start = crate::notes::line_start_offset(text.as_ref(), line);
-                    let end = (start + 1).min(text.len());
-                    let bounds = state.range_to_bounds(&(start..end))?;
+                    let bounds = state.range_to_bounds(&range)?;
                     let (_, y) = document_origin(bounds, editor_box);
                     // Only the laid-out part of the document can carry a mark: a
                     // line above or below the viewport has no box to sit on.
@@ -6852,15 +6914,14 @@ impl Shell {
         let index = self.files.focus_note?;
         let note = self.files.notes.on(rel).get(index)?.clone();
         let lang = self.state.lang;
-        let text = self
-            .files
-            .active_tab()
-            .filter(|tab| tab.rel == rel)
-            .and_then(|tab| tab.editor.clone())
-            .map(|editor| editor.read(cx).value().to_string());
-        let quote = match text.as_ref() {
-            Some(text) => crate::notes::excerpt(&note, text),
-            None => note.quote.clone(),
+        // The excerpt is cached when the note is focused and refreshed by the
+        // editor's Change event: a frame must not clone the whole file to draw
+        // a three-line quote.
+        let quote = match &self.files.thread_quote {
+            Some((quote_rel, quote_index, text)) if quote_rel == rel && *quote_index == index => {
+                text.clone()
+            }
+            _ => note.quote.clone(),
         };
         let quote = {
             let total = quote.lines().count();
@@ -7093,7 +7154,13 @@ impl Shell {
         let bounds = state
             .range_to_bounds(&(from..to))
             .or_else(|| state.range_to_bounds(&(start..(start + 1).min(text.len()))))?;
-        let editor = state.text_bounds()?;
+        // The element's VIEWPORT box (before the editor's own scroll is folded
+        // into it), which is what the overlay's parent is measured from. A box
+        // with no size yet has no frame to place a control in.
+        let editor = viewport_box(state);
+        if f32::from(editor.size.width) <= 1.0 || f32::from(editor.size.height) <= 1.0 {
+            return None;
+        }
         let (left, top) = document_point(bounds, editor, 20.0);
         Some(
             div()
@@ -7162,12 +7229,25 @@ impl Shell {
             .and_then(|editor| {
                 let state = editor.read(cx);
                 let selection = state.range_to_bounds(&state.selected_range())?;
-                let editor_box = state.text_bounds()?;
+                let editor_box = viewport_box(state);
+                let height = f32::from(editor_box.size.height);
+                if height <= 1.0 {
+                    return None;
+                }
                 // The BOTTOM edge, from the normalised corners: the kit's box
                 // has a negative height when the range ends on a shorter line,
                 // and adding that put the card above the lines it describes.
+                let top = selection.origin.y.min(selection.bottom_right().y);
                 let bottom = selection.origin.y.max(selection.bottom_right().y);
-                Some(f32::from(bottom - editor_box.origin.y) + 8.0)
+                let below = f32::from(bottom - editor_box.origin.y) + 8.0;
+                // The card must not be cut by the pane it is drawn in: a
+                // selection near the bottom flips the card above itself instead
+                // of opening a surface whose buttons sit off screen.
+                Some(if below + CARD_ROOM <= height {
+                    below
+                } else {
+                    (f32::from(top - editor_box.origin.y) - CARD_ROOM - 8.0).max(4.0)
+                })
             });
         let send_rel = rel.to_path_buf();
         let can_send = !self.files.note_text.read(cx).value().trim().is_empty();
@@ -7505,14 +7585,27 @@ impl Shell {
                             })),
                     ),
             )
-            .when(notes.is_empty(), |drawer| {
-                drawer.child(div().px(px(8.0)).py(px(4.0)).child(txt(
-                    lang.tr("right.files.commentEmpty"),
-                    11.0,
-                    theme::faint(),
-                )))
-            })
-            .children(rows)
+            .child(
+                // A long review scrolls inside its own 168px plate instead of
+                // taking the document's height: the drawer is a roster, not the
+                // surface the reader is working on.
+                div()
+                    .id("files-notes-list")
+                    .debug_selector(|| String::from("files-notes-list"))
+                    .w_full()
+                    .max_h(px(168.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .when(notes.is_empty(), |list| {
+                        list.child(div().px(px(8.0)).py(px(4.0)).child(txt(
+                            lang.tr("right.files.commentEmpty"),
+                            11.0,
+                            theme::faint(),
+                        )))
+                    })
+                    .children(rows),
+            )
     }
 
     /// The editor over the active tab: the file's own header, then the body.
@@ -9238,6 +9331,7 @@ impl Shell {
         self.files.new_file_open = false;
         self.files.notes_open = false;
         self.files.focus_note = None;
+        self.files.thread_quote = None;
         self.files.last_blank_press = None;
         if self.right.tab == Some(RightTab::Files) {
             // This also reloads the notes, which travel with the workspace.
@@ -9474,6 +9568,22 @@ impl Shell {
     pub(crate) fn focus_comment(&mut self, rel: &Path, index: usize, cx: &mut Context<Self>) {
         self.files.focus_note = Some(index);
         self.reveal_comment(rel, index, cx);
+        // Read the code once, here, so every frame the panel draws its quote
+        // without touching the buffer.
+        let excerpt = self
+            .files
+            .active_tab()
+            .filter(|tab| tab.rel == rel)
+            .and_then(|tab| tab.editor.clone())
+            .and_then(|editor| {
+                self.files
+                    .notes
+                    .on(rel)
+                    .get(index)
+                    .map(|note| crate::notes::excerpt(note, editor.read(cx).value().as_ref()))
+            })
+            .unwrap_or_default();
+        self.files.thread_quote = Some((rel.to_path_buf(), index, excerpt));
         cx.notify();
     }
 
@@ -9549,9 +9659,10 @@ impl Shell {
             return;
         }
         let mut marks = Vec::new();
+        let mut owners = Vec::new();
         {
             let text = editor.read(cx).value();
-            for note in self.files.notes.on(rel) {
+            for (note_index, note) in self.files.notes.on(rel).iter().enumerate() {
                 let Some(from) = note.line else {
                     continue;
                 };
@@ -9572,6 +9683,7 @@ impl Shell {
                         .with_style(RangeDecorationStyle::Fill)
                         .with_color(color),
                 );
+                owners.push(note_index);
             }
         }
         let collection = match self.files.tabs[index].decorations.clone() {
@@ -9584,6 +9696,7 @@ impl Shell {
                 created
             }
         };
+        self.files.tabs[index].note_marks = owners;
         collection.set(marks, cx);
     }
 
@@ -9660,6 +9773,7 @@ impl Shell {
                 // The focused thread belongs to the document that was on
                 // screen, and this is a different one.
                 self.files.focus_note = None;
+                self.files.thread_quote = None;
             }
             self.files.active = Some(index);
             // Reopening a tab shows its remarks if it has any; a file with
@@ -9692,6 +9806,7 @@ impl Shell {
             kind,
             dirty: false,
             decorations: None,
+            note_marks: Vec::new(),
         };
         if !matches!(kind, Kind::Text(_)) {
             self.files.tabs.push(tab);
@@ -9733,21 +9848,39 @@ impl Shell {
                 });
                 let editor_id = editor.clone();
                 let open_rel = rel.to_path_buf();
-                cx.subscribe_in(&editor, window, move |this, _editor, event, _window, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        // The dirty mark belongs to the tab holding this exact
-                        // editor, so a second tab over another file is never
-                        // marked by the first one's keystrokes.
-                        if let Some(tab) = this.files.tabs.iter_mut().find(|tab| {
-                            tab.rel == open_rel && tab.editor.as_ref() == Some(&editor_id)
-                        }) {
-                            if !tab.dirty {
-                                tab.dirty = true;
-                                cx.notify();
+                cx.subscribe_in(
+                    &editor,
+                    window,
+                    move |this, editor_source, event, _window, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            // The dirty mark belongs to the tab holding this exact
+                            // editor, so a second tab over another file is never
+                            // marked by the first one's keystrokes.
+                            if let Some(tab) = this.files.tabs.iter_mut().find(|tab| {
+                                tab.rel == open_rel && tab.editor.as_ref() == Some(&editor_id)
+                            }) {
+                                if !tab.dirty {
+                                    tab.dirty = true;
+                                    cx.notify();
+                                }
+                            }
+                            // A keystroke can move the focused comment's code, so
+                            // the cached excerpt is refreshed here, once per edit,
+                            // instead of by a frame reading the file.
+                            if let Some(index) = this.files.focus_note {
+                                let note = this.files.notes.on(&open_rel).get(index).cloned();
+                                if let Some(note) = note {
+                                    let text = editor_source.read(cx).value();
+                                    this.files.thread_quote = Some((
+                                        open_rel.clone(),
+                                        index,
+                                        crate::notes::excerpt(&note, text.as_ref()),
+                                    ));
+                                }
                             }
                         }
-                    }
-                })
+                    },
+                )
                 .detach();
                 tab.editor = Some(editor);
                 self.files.tabs.push(tab);
@@ -9773,6 +9906,7 @@ impl Shell {
         if index < self.files.tabs.len() {
             if self.files.active != Some(index) {
                 self.files.focus_note = None;
+                self.files.thread_quote = None;
             }
             self.show_right_tab(RightTab::Files, cx);
             self.files.active = Some(index);
@@ -9784,6 +9918,7 @@ impl Shell {
     pub(crate) fn focus_tree(&mut self, cx: &mut Context<Self>) {
         self.files.active = None;
         self.files.focus_note = None;
+        self.files.thread_quote = None;
         self.right.catalog_open = false;
         cx.notify();
     }
@@ -9802,6 +9937,7 @@ impl Shell {
         let was_active = self.files.active == Some(index);
         self.files.tabs.remove(index);
         self.files.focus_note = None;
+        self.files.thread_quote = None;
         self.files.active = if was_active {
             if self.files.tabs.is_empty() {
                 None
@@ -10151,6 +10287,7 @@ impl Shell {
         // lets the note follow its code after an edit, and what the panel shows
         // the reader is commenting on.
         let (line, to, quote) = self.note_scope(cx);
+        let shown = quote.clone();
         self.files
             .notes
             .add(&rel, crate::notes::Note::new(line, to, text, quote));
@@ -10162,7 +10299,9 @@ impl Shell {
         // The remark the reader just wrote is the one they want to read back:
         // focus it in the thread panel instead of covering the code with a
         // drawer.
-        self.files.focus_note = Some(self.files.notes.on(&rel).len().saturating_sub(1));
+        let index = self.files.notes.on(&rel).len().saturating_sub(1);
+        self.files.focus_note = Some(index);
+        self.files.thread_quote = Some((rel.clone(), index, shown));
         cx.notify();
     }
 
@@ -10175,6 +10314,18 @@ impl Shell {
         self.files.focus_note = match self.files.focus_note {
             Some(focus) if focus > index => Some(focus - 1),
             Some(focus) if focus == index => None,
+            other => other,
+        };
+        self.files.thread_quote = match self.files.thread_quote.take() {
+            Some((cached_rel, cached_index, text)) if cached_rel == rel => {
+                if cached_index > index {
+                    Some((cached_rel, cached_index - 1, text))
+                } else if cached_index == index {
+                    None
+                } else {
+                    Some((cached_rel, cached_index, text))
+                }
+            }
             other => other,
         };
         self.sync_note_marks(rel, cx);

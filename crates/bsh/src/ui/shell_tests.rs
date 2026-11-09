@@ -2008,6 +2008,9 @@ fn the_centre_column_takes_the_measured_chrome(cx: &mut TestAppContext) {
     let header = cx.debug_bounds("hdr-header").expect("the header renders");
     let title = cx.debug_bounds("hdr-title").expect("the title row renders");
     let chat = cx.debug_bounds("tab-chat").expect("the chat tab renders");
+    let review = cx
+        .debug_bounds("tab-review")
+        .expect("the review tab renders");
     let traj = cx
         .debug_bounds("tab-trajectory")
         .expect("the trajectory tab renders");
@@ -2041,9 +2044,14 @@ fn the_centre_column_takes_the_measured_chrome(cx: &mut TestAppContext) {
         "16px of line over a 9px pad and the 2px rule"
     );
     assert_eq!(
-        traj.origin.x,
+        review.origin.x,
         chat.origin.x + chat.size.width + px(36.0),
         "the measured tab gap is 36"
+    );
+    assert_eq!(
+        traj.origin.x,
+        review.origin.x + review.size.width + px(36.0),
+        "the measured tab gap holds after the Review tab"
     );
     assert_eq!(
         card.size.width,
@@ -2279,10 +2287,45 @@ fn review_tab_renders_a_captured_changeset(cx: &mut TestAppContext) {
         "edit_file",
     );
     state.finish_review(&session);
-    assert!(
-        state.review_snapshot(&session).is_some(),
-        "the state can load the sealed review"
+    let first = state
+        .review_snapshot(&session)
+        .expect("the state can load the sealed review")
+        .changeset
+        .id;
+
+    // A second changeset proves the Audit strip is a timeline, not just the
+    // latest review.
+    let second_path = root.join("src").join("other.rs");
+    std::fs::write(&second_path, "fn before() {}\n").expect("second old");
+    let second_runtime = state.begin_review(&session).expect("a second runtime");
+    let second_before = second_runtime.before(&second_path);
+    std::fs::write(&second_path, "fn after() {}\n").expect("second new");
+    second_runtime.record(
+        &second_path,
+        crate::review::domain::ChangeOperation::Edit,
+        second_before,
+        "edit_file",
     );
+    state.finish_review(&session);
+    let second = state
+        .review_snapshot(&session)
+        .expect("the second review")
+        .changeset
+        .id;
+    state
+        .decide_review(
+            &first,
+            crate::review::domain::Decision::Approve,
+            "first reviewed".to_string(),
+        )
+        .expect("first decision");
+    state
+        .decide_review(
+            &second,
+            crate::review::domain::Decision::RequestChanges,
+            "second reviewed".to_string(),
+        )
+        .expect("second decision");
 
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -2312,6 +2355,26 @@ fn review_tab_renders_a_captured_changeset(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("review-change-list").is_some(),
         "the captured change is listed"
+    );
+
+    // The Audit tab joins every decision, in the order it happened.
+    cx.update(|_, cx| {
+        harness.update(cx, |harness, cx| {
+            harness.shell.update(cx, |shell, cx| {
+                shell.state.tab = Tab::Audit;
+                cx.notify();
+            });
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("audit-review-decisions").is_some(),
+        "the Audit tab shows the decision timeline"
+    );
+    assert!(
+        cx.debug_bounds("audit-decision-0").is_some()
+            && cx.debug_bounds("audit-decision-1").is_some(),
+        "both changesets' decisions are listed"
     );
 }
 
@@ -17257,6 +17320,7 @@ fn an_image_tab_outside_the_root_says_so(cx: &mut TestAppContext) {
                 kind: crate::files::Kind::Image,
                 dirty: false,
                 decorations: None,
+                note_marks: Vec::new(),
             });
             this.files.active = Some(0);
             cx.notify();
@@ -20067,6 +20131,148 @@ fn review_notes_become_a_prompt(cx: &mut TestAppContext) {
     );
     assert!(!open, "the drawer closes once the review goes out");
 }
+/// The + and the review card sit on the selection itself, in a tall
+/// document: a reader who marked lines 21-25 must not find the affordance 15
+/// lines lower and the card sliding off the bottom of the pane.
+#[gpui::test]
+fn the_comment_affordance_rides_the_selection_in_a_tall_document(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let body: String = (1..=60)
+        .map(|n| {
+            if n % 2 == 0 {
+                String::from("\n")
+            } else {
+                format!("line {n} text text text text text text\n")
+            }
+        })
+        .collect();
+    let file = body.clone();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("comment-tall", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("tall.md"), file).expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // A scrolled document, so the selection has to be found in the viewport the
+    // editor actually holds rather than at the document's origin.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.right.maximized = true;
+            this.open_file(std::path::Path::new("tall.md"), window, cx);
+            if let Some(editor) = this.files.active_tab().and_then(|tab| tab.editor.clone()) {
+                let from = crate::notes::line_start_offset(&body, 21);
+                let to = crate::notes::line_start_offset(&body, 25);
+                editor.update(cx, |state, cx| {
+                    let line_height = f32::from(state.line_height().unwrap_or(px(20.0)));
+                    state.set_scroll_offset(gpui_kit::point(px(0.0), px(-line_height * 10.0)), cx);
+                    state.set_selected_range(from..to, cx);
+                });
+            }
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the + follows the selection", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("files-comment-plus").is_some()
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.open_comment_card(cx));
+    });
+    draw_until(cx, "the card is up", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("files-comment-card").is_some()
+    });
+
+    let (selection, editor_box) = cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            let editor = this
+                .files
+                .active_tab()
+                .and_then(|tab| tab.editor.clone())
+                .expect("the open editor");
+            let state = editor.read(cx);
+            (
+                state
+                    .range_to_bounds(&state.selected_range())
+                    .expect("the selection box"),
+                state.text_bounds().expect("the editor box"),
+            )
+        })
+    });
+    let plus = cx
+        .debug_bounds("files-comment-plus")
+        .expect("the + follows the selection");
+    let card = cx
+        .debug_bounds("files-comment-card")
+        .expect("the card is up");
+    let selection_top = f32::from(selection.origin.y.min(selection.bottom_right().y));
+    let selection_bottom = f32::from(selection.origin.y.max(selection.bottom_right().y));
+    let editor_top = f32::from(editor_box.origin.y);
+    let editor_bottom = editor_top + f32::from(editor_box.size.height);
+    let plus_top = f32::from(plus.top());
+    let card_top = f32::from(card.top());
+    assert!(
+        plus_top >= selection_top - 2.0 && plus_top + 20.0 <= selection_bottom + 2.0,
+        "the + sits on the marked lines: plus {plus_top} selection {selection_top}..{selection_bottom}"
+    );
+    assert!(
+        (card_top - (selection_bottom + 8.0)).abs() < 24.0,
+        "the card hangs under the marked lines: card {card_top} selection bottom {selection_bottom}"
+    );
+    assert!(
+        f32::from(card.bottom()) <= editor_bottom + 1.0,
+        "and stays inside the pane it belongs to: card bottom {} editor bottom {editor_bottom}",
+        f32::from(card.bottom())
+    );
+
+    // A selection near the bottom has no room below it, so the card flips
+    // ABOVE the marked lines instead of opening a surface the pane cuts off.
+    cx.update(|_window, cx| {
+        shell.update(cx, |this, cx| {
+            if let Some(editor) = this.files.active_tab().and_then(|tab| tab.editor.clone()) {
+                let from = crate::notes::line_start_offset(&body, 52);
+                let to = crate::notes::line_start_offset(&body, 55);
+                editor.update(cx, |state, cx| state.set_selected_range(from..to, cx));
+            }
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let card = cx
+        .debug_bounds("files-comment-card")
+        .expect("the card is still up");
+    let (selection, editor_box) = cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            let editor = this
+                .files
+                .active_tab()
+                .and_then(|tab| tab.editor.clone())
+                .expect("the open editor");
+            let state = editor.read(cx);
+            (
+                state
+                    .range_to_bounds(&state.selected_range())
+                    .expect("the selection box"),
+                state.input_bounds(),
+            )
+        })
+    });
+    let editor_bottom = f32::from(editor_box.origin.y) + f32::from(editor_box.size.height);
+    assert!(
+        f32::from(card.bottom()) <= editor_bottom + 1.0,
+        "the flipped card still fits the pane: card bottom {} editor bottom {editor_bottom}",
+        f32::from(card.bottom())
+    );
+    assert!(
+        f32::from(card.top()) < f32::from(selection.origin.y.max(selection.bottom_right().y)),
+        "and sits above the marked lines"
+    );
+}
+
 /// Pinning a comment records the code it quotes, focuses it in the thread
 /// panel, and does not ask the model by itself.
 #[gpui::test]
@@ -24159,10 +24365,16 @@ fn a_note_pins_to_the_file_and_survives_a_reload(cx: &mut TestAppContext) {
         "the drawer is up"
     );
 
-    // Type into the note field and press the add control.
+    // Open the comment card, type into its field, and press its add control.
+    let open = cx
+        .debug_bounds("files-note-add")
+        .expect("the add control renders")
+        .center();
+    cx.simulate_click(open, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     let field = cx
-        .debug_bounds("files-note-field")
-        .expect("the note field renders")
+        .debug_bounds("files-comment-field")
+        .expect("the comment field renders")
         .center();
     cx.simulate_click(field, Modifiers::default());
     cx.update(|window, cx| {
@@ -24173,7 +24385,7 @@ fn a_note_pins_to_the_file_and_survives_a_reload(cx: &mut TestAppContext) {
         });
     });
     let add = cx
-        .debug_bounds("files-note-add")
+        .debug_bounds("files-comment-add")
         .expect("the add control renders")
         .center();
     cx.simulate_click(add, Modifiers::default());
@@ -24189,6 +24401,15 @@ fn a_note_pins_to_the_file_and_survives_a_reload(cx: &mut TestAppContext) {
         1,
         "the note pins to the open file"
     );
+    // The card's Comment action sends the open remark and closes the drawer,
+    // so reopen it before checking the list.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.files.notes_open = true;
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
         cx.debug_bounds("files-note-L1").is_some(),
         "and the drawer lists it under its line anchor"
@@ -35049,5 +35270,54 @@ fn a_missing_extension_command_is_reported(cx: &mut TestAppContext) {
         cx.update(|_, cx| shell.read(cx).state.notice.clone()),
         None,
         "a loaded command composes, so there is nothing to report"
+    );
+}
+
+
+#[gpui::test]
+fn probe_pane_fit(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("pane-fit-probe", 8);
+        tests_pin_reference_defaults(&mut state);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\":\"ls\"}".to_string(),
+                output: Some("a.md".to_string()),
+                ms: Some(7),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.user_w = Some(620.0);
+            this.state.tab = Tab::Trajectory;
+            this.traj_runs = true;
+            cx.notify();
+        });
+    });
+    draw_until(cx, "the runs view renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("trajectory").is_some()
+    });
+    let column = cx.debug_bounds("main-column").unwrap();
+    let body = cx.debug_bounds("chat-body").unwrap();
+    let traj = cx.debug_bounds("trajectory").unwrap();
+    let panel = cx.debug_bounds("right-panel").unwrap();
+    let pause = cx.debug_bounds("traj-pause");
+    let list = cx.debug_bounds("traj-list");
+    let (conv, chat, vw) = cx.update(|_, cx| {
+        let s = shell.read(cx);
+        (s.conversation_w, s.chat_w(), s.viewport_w)
+    });
+    eprintln!(
+        "PROBE vw={vw} conv={conv:?} chat={chat} column={column:?} body={body:?} traj={traj:?} panel={panel:?} pause={pause:?} list={list:?}"
     );
 }

@@ -28,13 +28,17 @@ pub(crate) fn build(store: &ReviewStore, change: &Change) -> FileDiff {
     let new_bytes = state_bytes(&last.after);
     let binary = is_binary(&first.before) || is_binary(&last.after);
     if binary {
-        let mut diff = FileDiff::unavailable(
-            change,
-            "binary or document format; the review shows metadata and hashes, not a semantic diff",
-        );
+        let mut diff = FileDiff::unavailable(change, "");
         diff.old_bytes = old_bytes;
         diff.new_bytes = new_bytes;
         diff.binary = true;
+        diff.note = Some(binary_note(
+            store,
+            &first.before,
+            &last.after,
+            old_bytes,
+            new_bytes,
+        ));
         return diff;
     }
     let Some(old) = old else {
@@ -121,6 +125,44 @@ fn is_binary(state: &SnapshotState) -> bool {
         state,
         SnapshotState::Present(snapshot) if !snapshot.family.is_text()
     )
+}
+
+fn binary_note(
+    store: &ReviewStore,
+    before: &SnapshotState,
+    after: &SnapshotState,
+    old_bytes: u64,
+    new_bytes: u64,
+) -> String {
+    let mut note = format!("binary or document format; {old_bytes} -> {new_bytes} bytes");
+    let old = image_dimensions(store, before);
+    let new = image_dimensions(store, after);
+    match (old, new) {
+        (Some((width, height)), Some((new_width, new_height))) => {
+            note.push_str(&format!(
+                "; image {width}x{height} -> {new_width}x{new_height}"
+            ));
+        }
+        (None, Some((width, height))) => {
+            note.push_str(&format!("; image {width}x{height}"));
+        }
+        _ => {}
+    }
+    note
+}
+
+fn image_dimensions(store: &ReviewStore, state: &SnapshotState) -> Option<(u32, u32)> {
+    let SnapshotState::Present(snapshot) = state else {
+        return None;
+    };
+    if snapshot.family != ResourceFamily::Image {
+        return None;
+    }
+    let bytes = store.read_blob(&snapshot.hash).ok()?;
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.into_dimensions().ok()
 }
 
 fn side_text(store: &ReviewStore, state: &SnapshotState) -> Option<String> {
@@ -640,6 +682,70 @@ mod tests {
             .structural
             .iter()
             .any(|node| node.qualified_name == "b" && node.change == "modified"));
+    }
+
+    #[test]
+    fn an_image_change_reports_its_dimensions() {
+        let root = std::env::temp_dir().join(format!("bsh-diff-image-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = ReviewStore::open(&root);
+        let old = png(2, 3);
+        let new = png(4, 3);
+        let before = store
+            .put_blob(
+                &old,
+                ResourceFamily::Image,
+                0o644,
+                crate::review::domain::SnapshotSource::ToolBefore,
+            )
+            .unwrap();
+        let after = store
+            .put_blob(
+                &new,
+                ResourceFamily::Image,
+                0o644,
+                crate::review::domain::SnapshotSource::ToolAfter,
+            )
+            .unwrap();
+        let change = Change {
+            id: "change".to_string(),
+            path: crate::review::domain::ResourcePath {
+                workspace_relative: "art/logo.png".to_string(),
+                display: "art/logo.png".to_string(),
+                container: None,
+            },
+            kind: ChangeKind::Modified,
+            revisions: vec![Revision {
+                id: "revision".to_string(),
+                seq: 1,
+                operation: ChangeOperation::Edit,
+                before: SnapshotState::Present(before),
+                after: SnapshotState::Present(after),
+                tool: None,
+                captured_at_ms: 0,
+            }],
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+        };
+        let diff = build(&store, &change);
+        assert!(diff.binary);
+        assert!(
+            diff.note
+                .as_deref()
+                .is_some_and(|note| note.contains("2x3 -> 4x3")),
+            "dimensions are metadata the review can trust: {:?}",
+            diff.note
+        );
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbaImage::new(width, height);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("png");
+        bytes.into_inner()
     }
 
     #[test]

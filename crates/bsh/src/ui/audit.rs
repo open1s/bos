@@ -35,6 +35,7 @@ use crate::audit::{
     AuditTurn, AuditView,
 };
 use crate::i18n::tr_args;
+use crate::review::domain::{Decision, DecisionEvent};
 use crate::state::Tab;
 use crate::theme;
 
@@ -72,6 +73,8 @@ struct AuditKey {
 pub(crate) struct AuditCache {
     key: Option<AuditKey>,
     view: std::rc::Rc<AuditView>,
+    review_key: Option<(String, u64)>,
+    review_decisions: std::rc::Rc<Vec<DecisionEvent>>,
 }
 
 /// One flat event the table shows, built from the audit view's turns,
@@ -186,6 +189,25 @@ impl Shell {
             cache.view = std::rc::Rc::new(view);
         }
         cache.view.clone()
+    }
+
+    /// Every review decision for the active session, kept until a decision lands.
+    fn audit_decisions(&self) -> std::rc::Rc<Vec<DecisionEvent>> {
+        let Some(session) = self.state.active_session() else {
+            return std::rc::Rc::new(Vec::new());
+        };
+        let key = (session.id.clone(), self.state.review_epoch);
+        let stale = {
+            let cache = self.audit_cache.borrow();
+            cache.review_key.as_ref() != Some(&key)
+        };
+        if stale {
+            let decisions = self.state.review_decisions(&key.0);
+            let mut cache = self.audit_cache.borrow_mut();
+            cache.review_decisions = std::rc::Rc::new(decisions);
+            cache.review_key = Some(key);
+        }
+        self.audit_cache.borrow().review_decisions.clone()
     }
 
     /// The live MCP namespaces, sorted and deduped: the classifier's own input.
@@ -1237,7 +1259,10 @@ impl Shell {
                                     })),
                             ),
                     )
-                    .child(stats),
+                    .child(stats)
+                    .when_some(self.audit_review_strip(cx), |header, strip| {
+                        header.child(strip)
+                    }),
             )
             .child(
                 div()
@@ -1424,6 +1449,102 @@ impl Shell {
                         this.export_audit(window, cx);
                     })),
             )
+    }
+
+    /// The latest review's decision history, as a strip inside Audit.
+    ///
+    /// The change review is a separate aggregate, so this strip is a join at
+    /// the surface: it reads the same ReviewSnapshot the Review tab reads and
+    /// opens that exact changeset when clicked.
+    fn audit_review_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let decisions = self.audit_decisions();
+        if decisions.is_empty() {
+            return None;
+        }
+        let lang = self.state.lang;
+        let count = tr_args(
+            lang,
+            "audit.review.count",
+            &[("count", decisions.len().to_string())],
+        );
+        let mut timeline = div()
+            .id("audit-review-timeline")
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .max_h(px(132.0))
+            .overflow_y_scroll();
+        for (index, event) in decisions.iter().rev().enumerate() {
+            let (label, color) = match event.decision {
+                Decision::Approve => (lang.tr("review.decision.approve"), theme::success()),
+                Decision::Reject => (lang.tr("review.decision.reject"), theme::error()),
+                Decision::RequestChanges => {
+                    (lang.tr("review.decision.requestChanges"), theme::warn())
+                }
+            };
+            let rationale = if event.rationale.trim().is_empty() {
+                lang.tr("audit.review.noReason")
+            } else {
+                event.rationale.chars().take(100).collect()
+            };
+            let when = crate::state::local_stamp(event.at_ms / 1_000);
+            let change_set = event.change_set.chars().take(8).collect::<String>();
+            let target = event.change_set.clone();
+            let row_id = format!("audit-decision-{index}");
+            timeline = timeline.child(
+                div()
+                    .id(SharedString::from(row_id.clone()))
+                    .debug_selector(move || row_id.clone())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(4.0))
+                    .py(px(4.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(|row| row.bg(rgb(theme::hover())))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.review_requested = Some(target.clone());
+                        this.review_selected = None;
+                        this.state.tab = Tab::Review;
+                        cx.notify();
+                    }))
+                    .child(txt(when, 10.0, theme::faint()).flex_none().w(px(104.0)))
+                    .child(txt(label, 10.5, color).flex_none().w(px(88.0)))
+                    .child(
+                        txt(format!("#{change_set}"), 10.0, theme::faint())
+                            .font_family(theme::CODE_FONT)
+                            .flex_none(),
+                    )
+                    .child(
+                        txt(rationale, 10.5, theme::muted())
+                            .min_w_0()
+                            .text_ellipsis(),
+                    ),
+            );
+        }
+        Some(
+            div()
+                .debug_selector(|| "audit-review-decisions".to_string())
+                .id("audit-review-decisions")
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .px(px(4.0))
+                .py(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(txt(lang.tr("audit.review.title"), 11.0, theme::faint()))
+                        .child(txt(count, 10.5, theme::faint())),
+                )
+                .child(timeline)
+                .into_any_element(),
+        )
     }
 
     /// The deterministic summary line: every figure is a count over the records.
@@ -2459,6 +2580,9 @@ impl Shell {
             .min_w_0()
             .child(self.audit_toolbar(cx))
             .child(self.audit_summary(&view))
+            .when_some(self.audit_review_strip(cx), |column, strip| {
+                column.child(strip)
+            })
             .child(self.audit_policy_strip(&view))
             .child(
                 div()
