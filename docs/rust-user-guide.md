@@ -395,18 +395,15 @@ agent.register_mcp_tools_with_namespace(mcp_client, "mcp").await?;
 Every registered tool is advertised on every step, and its name, description
 and JSON schema are prompt bytes inside the provider's cached prefix. A machine
 with MCP servers can carry hundreds of tools that a given turn never touches.
-`defer_tool` withholds one; the tool stays registered and callable, and two
-tools are advertised in its place: `find_tool` (a ranked search over the
-withheld tools - a tool the model already has is never a result) and
-`call_tool` (`{name, args}`).
+`defer_tool` withholds one; the tool stays registered and callable, and one
+tool is advertised in its place: `find_tool`, a ranked search over the
+withheld tools (a tool the model already has is never a result).
 
-`find_tool` answers with each shortlisted tool's full JSON Schema under
-`parameters`, not a short rendering of it, so the model has the field names,
-types and `required` list the call must match. `call_tool` validates `args`
-against that same schema before dispatch, exactly as a direct call does; a
-rejected call names the field at fault and quotes the shape the tool expects,
-and a failure at run time carries the tool's own sentence rather than a debug
-rendering of it.
+`find_tool` answers with each shortlisted tool's name, description and full
+JSON Schema under `parameters`, not a short rendering of it. Those definitions
+are added to the live context, so the next model step can call the tool
+directly by name with arguments matching the schema. No dispatcher is involved:
+hooks, policy, telemetry and the audit all see the real tool name.
 
 ```rust
 let agent = Agent::from_config(AgentConfig::default())
@@ -419,15 +416,14 @@ family are deferred by default, because that is where the count comes from - a
 package installs a family at once, and three installed packages plus the nine
 browser tools were twenty-seven schemas on every step.
 `Agent::defer_tool` and `Agent::defer_tool_prefix` cover the rest. An agent
-that withholds nothing advertises neither `find_tool` nor `call_tool`, and
-its system prompt does not mention them.
+that withholds nothing advertises no `find_tool`, and its system prompt does
+not mention it.
 
 The Tools pane lists `all_tools`, so a withheld tool stays visible and
 switchable there; the meter and the request are priced from `model_tools`, the
-smaller array. Deferring is not a permission boundary: `call_tool` reaches every
-registered tool. What is withheld is the definition, not the ability. The engine resolves
-the dispatcher's target before dispatch, so hooks, policy rules, telemetry and
-the repeated-failure guard all see the tool that actually ran.
+smaller array. Deferring is not a permission boundary: the tool stays
+registered and callable. What is withheld is the definition, not the ability;
+once `find_tool` reports it, the direct call carries the real name.
 
 Defer a tool only when the prompt does not name it. An instruction that says
 `update_plan` is a promise that `update_plan` is advertised.
@@ -466,9 +462,8 @@ let content = agent.get_skills_content();
 
 Skills are searched, not catalogued: the request carries no skill metadata, and
 one tool named `find_skill` answers "which skill fits this?" while
-`load_skill` reads the one it picked. That is the same shape as
-`find_tool`/`call_tool`, and it keeps a 100-skill install from spending a
-catalogue block on every step.
+`load_skill` reads the one it picked. That is the same shape as `find_tool`,
+and it keeps a 100-skill install from spending a catalogue block on every step.
 
 ```rust
 let agent = Agent::from_config(AgentConfig::default())     // find_skill (default)

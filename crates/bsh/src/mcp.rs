@@ -996,9 +996,9 @@ verdict := {"allow": false, "rule": "no-mcp-spawn", "reason": "mcp spawns are re
             &pool,
         );
         // The request array no longer carries an extension's MCP tools: they
-        // are a family installed at once and travel behind the find_tool /
-        // call_tool pair instead, so the schema stays the baseline. The tool is
-        // still registered and callable, which the registry assertion proves.
+        // are a family installed at once and travel behind find_tool instead,
+        // so the schema stays the baseline. The tool is still registered and
+        // callable once reported, which the registry assertion proves.
         assert_eq!(
             built.tools_schema_chars, baseline,
             "an MCP tool stays behind find_tool, so the request array is unchanged"

@@ -209,13 +209,13 @@ mod tests {
     #[test]
     fn an_event_labels_the_tool_a_dispatcher_ran() {
         let manager = ToolRunManager::new();
-        manager.register_with_label("call-1", "call_tool", "bash");
+        manager.register_with_label("call-1", "proxy_tool", "bash");
 
         assert!(manager.is_running("call-1"));
         assert_eq!(manager.label_for("call-1").as_deref(), Some("bash"));
         assert_eq!(
             manager.cancel("call-1"),
-            Some("call_tool".to_string()),
+            Some("proxy_tool".to_string()),
             "cancellation resolves the tool the engine holds"
         );
         assert_eq!(manager.cancel("call-1"), None, "a settled call is gone");

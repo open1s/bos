@@ -124,7 +124,7 @@ impl AsyncTool for CapturingTool {
 }
 
 #[tokio::test]
-async fn call_tool_injects_call_id_into_args() {
+async fn run_tool_injects_call_id_into_args() {
     let (tool, received_args, _cancel_calls) = CapturingTool::new("capturing", true);
     let hook_args = Arc::new(DashMap::new());
     let hook_results = Arc::new(DashMap::new());

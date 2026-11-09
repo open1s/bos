@@ -2175,8 +2175,8 @@ pub(crate) fn capabilities(agent: &Agent) -> Vec<CapInfo> {
     // The pane lists what the model can CALL, which is the whole registry: a
     // row read from the build registry alone left every extension package's
     // tool out of the pane it was installed for, and reading the advertised
-    // array instead hid every deferred tool - still callable through
-    // `call_tool`, so still a capability the reader may switch. The meter
+    // array instead hid every deferred tool - still callable once found, so
+    // still a capability the reader may switch. The meter
     // prices the advertised array separately (see `build_agent_for_session`).
     let mut caps: Vec<CapInfo> = agent
         .all_tools()
@@ -5989,8 +5989,8 @@ mod tests {
         };
         // A package's tools are WITHHELD from the request's array now: they are
         // a family installed at once, and a step paid for every schema. The
-        // contract is the pair instead - the array carries `find_tool` and
-        // `call_tool`, the pane still lists the tools, and each one still runs.
+        // contract is the search instead - the array carries `find_tool`, the
+        // tools it reports join the next request, and each one still runs.
         let platform_names: Vec<String> = built
             .extension_activations
             .iter()
@@ -6882,6 +6882,10 @@ mod tests {
             "the question/change decision reaches the request"
         );
         assert!(
+            prompt.contains("too vague to act on"),
+            "the concreteness gate reaches the request"
+        );
+        assert!(
             prompt.contains("A later message corrects the current task"),
             "the steering rule reaches the request"
         );
@@ -6899,7 +6903,7 @@ mod tests {
 
     /// The system prompt rides on EVERY step of EVERY turn, so its size is a
     /// per-request cost, not a wording preference. A change that doubles it is a
-    /// performance bug: measured at 8,672 bytes with the full tool roster, and
+    /// performance bug: measured at 9,191 bytes with the full tool roster, and
     /// the skill catalogue is deliberately NOT part of it (the vendor ranks that
     /// against the request instead). The headroom below the cap is kept for
     /// capability-gated rules, not for prose.
@@ -8803,8 +8807,8 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
     /// number again is the wrong fix - trim the copy instead.
     ///
     /// A DEFERRED tool is not in the array: the browser family and the
-    /// federation family are registered and callable through `find_tool` /
-    /// `call_tool`, which is how a rare family stays off every request. The
+    /// federation family are registered and callable after `find_tool`
+    /// reports them, which is how a rare family stays off every request. The
     /// measure is therefore the advertised set, not the registry - counting a
     /// schema that is never sent would charge the budget for a tool the model
     /// cannot see until it asks.
@@ -11429,8 +11433,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     }
 
     /// The shipped everyday presets carry the federation family. It is
-    /// CALLABLE through `find_tool`/`call_tool` without riding every request,
-    /// and the Extensions switch still closes it.
+    /// CALLABLE through `find_tool` without riding every request, and the
+    /// Extensions switch still closes it.
     #[test]
     fn the_standard_preset_offers_the_federation_tools() {
         let built = build(&bare());

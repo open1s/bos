@@ -333,8 +333,8 @@ impl Tool for FederationTool {
     /// Six schemas ride every request for a surface most turns never touch, and
     /// the tool array has a wire budget (see the budget test in `caps`). The
     /// browser made the same call: `find_tool` names the withheld tools and
-    /// `call_tool` runs one, so a turn that needs a peer pays for the discovery
-    /// step and every other turn pays nothing.
+    /// the reported tool runs directly, so a turn that needs a peer pays for
+    /// the discovery step and every other turn pays nothing.
     ///
     /// `federation_status` stays in the array on purpose: it is the one cheap
     /// schema that tells the model the family EXISTS, so a prompt about peers

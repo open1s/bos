@@ -937,7 +937,7 @@ impl Agent {
             .into_iter()
             .filter(|tool| !deferred.contains(&tool.name) && !deferred_live.contains(&tool.name))
             .collect();
-        // The pair that reaches a withheld tool belongs in the SAME derivation:
+        // The search that reaches a withheld tool belongs in the SAME derivation:
         // a host that prices or lists the array must see what the request
         // actually carries, and a surface reading `model_tools` alone would
         // undercount the two entries that make deferral usable.

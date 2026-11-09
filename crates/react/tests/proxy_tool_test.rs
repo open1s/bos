@@ -1,6 +1,6 @@
 //! A dispatcher reports the tool it forwarded to.
 //!
-//! `call_tool` is one advertised tool that runs many: the provider still sees
+//! `proxy_tool` is one advertised tool that runs many: the provider still sees
 //! one name (the transcript has to pair the call it emitted), but hooks, bus
 //! events and the repeated-failure guard must see the tool that actually ran.
 //! The engine resolves the proxy before dispatch; this test pins that.
@@ -60,7 +60,7 @@ struct Dispatcher;
 
 impl Tool for Dispatcher {
     fn name(&self) -> &str {
-        "call_tool"
+        "proxy_tool"
     }
 
     fn description(&self) -> String {
@@ -178,7 +178,7 @@ impl LlmClient<LlmSession, LlmContext> for TwoStepLlm {
     ) -> LlmResponseResult {
         let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(if step == 0 {
-            tool_call_response("call_tool", r#"{"name":"bash","args":{"command":"ls"}}"#)
+            tool_call_response("proxy_tool", r#"{"name":"bash","args":{"command":"ls"}}"#)
         } else {
             text_response("Final Answer: dispatched")
         })
@@ -249,7 +249,7 @@ fn a_proxy_call_reaches_the_hooks_as_the_tool_it_forwarded_to() {
     );
 
     // The transcript keeps the name the model emitted: a provider pairs a tool
-    // result with the call it produced, and that call said `call_tool`.
+    // result with the call it produced, and that call said `proxy_tool`.
     let recorded = session
         .history()
         .expect("history")
@@ -259,5 +259,5 @@ fn a_proxy_call_reaches_the_hooks_as_the_tool_it_forwarded_to() {
             _ => None,
         })
         .expect("a tool call was recorded");
-    assert_eq!(recorded, "call_tool");
+    assert_eq!(recorded, "proxy_tool");
 }

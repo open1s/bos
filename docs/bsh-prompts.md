@@ -19,18 +19,22 @@ still finish the job in one turn when it can.
 
 A prompt cannot enumerate every case, and a list of virtues ("infer the goal",
 "think briefly", "be careful") does not change a choice. The strategy here is a
-decision procedure with four questions, in the order a turn runs:
+decision procedure with five questions, in the order a turn runs:
 
 1. **What is being asked?** Judge the verb, not the punctuation: a question, a
    defect report, an instruction, or a goal with no target.
-2. **Which instruction wins?** The reader's latest explicit instruction, a
-   correction they accepted, workspace instructions, then the contract.
-3. **Act or ask?** Inspect first. Act when both readings are cheap; ask one
-   question, with a default, only when the wrong reading is expensive.
-4. **When is the turn done?** A question is answered; a change is made and
+2. **Is it concrete enough to act on?** Name the object, the change and the
+   done condition. If neither the request nor the workspace supplies them, the
+   request is too vague; ask, do not guess.
+3. **Which instruction wins?** The reader's latest explicit instruction, a
+   correction they accepted, workspace instructions and loaded skills, then the
+   contract.
+4. **Act or ask?** When the request is concrete, act if a wrong guess is cheap
+   to undo; ask if it would destroy something or cost substantial rework.
+5. **When is the turn done?** A question is answered; a change is made and
    verified. Then stop - no refactor, no commit, no narration.
 
-Everything else in the corpus serves one of those four.
+Everything else in the corpus serves one of those five.
 
 ## 2. Assembly order
 
@@ -151,9 +155,11 @@ it should have. Three failure modes:
 - **No stop condition.** "Work until done" plus "stay in scope" does not say
   when done is. The model kept polishing or added a summary the reader did not
   ask for.
+- **No concreteness gate.** "Ask when vague" was a feeling; nothing defined
+  vague, so a request like "make it better" had no decision attached to it.
 
-The current contract is 1,966 bytes: 34% shorter than that revision, with more
-decisions in it. Design rules for a clause:
+The current contract is 2,485 bytes: 17% shorter than that revision, with the
+concreteness gate and stop condition it lacked. Design rules for a clause:
 
 1. It must name a choice or a contrast ("A question ends without an edit"),
    never a virtue ("Be careful", "Think deeply").
@@ -163,7 +169,9 @@ decisions in it. Design rules for a clause:
    sandbox and the workspace layout are in the snapshot; file-tool behaviour is
    in the tool sections.
 4. One concrete example per ambiguous case, not a taxonomy of cases.
-5. Every byte rides on every step, so a clause that does not change a decision
+5. Vagueness is a missing slot, not a feeling: name the slots (object, change,
+   done condition) and the shape of the question that fills them.
+6. Every byte rides on every step, so a clause that does not change a decision
    is a per-request cost with no benefit.
 
 ## 4. The decisions BSH ships
@@ -171,12 +179,13 @@ decisions in it. Design rules for a clause:
 | Decision | Clause | Why it is there |
 |---|---|---|
 | What kind of request is this? | "Judge the verb, not the punctuation: 'why does X fail?' asks for an explanation, 'can you fix X?' asks for a change. A defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target ('make it faster') is measured before it is changed." | The four readings that most often pick the wrong first action. |
+| Is it concrete enough? | "Name the object (what file, screen or behavior), the change (what about it) and the done condition (what proves it) before you act. If the request and the workspace cannot supply them, it is too vague to act on: ask one short question, in the reader's terms, that offers the two or three readings you can see, best first, and says what you will do by default; then stop." | Vagueness is missing information, not a tone; the question must be answerable in one line, with options. |
 | What shape does the answer take? | "A question ends without an edit; a change request ends with the change made, not instructions for making it." | The two symmetric failures: editing on a question, and explaining instead of doing. |
 | Which instruction wins? | "When instructions conflict, obey the reader's latest explicit instruction, then a correction they accepted, then workspace instructions and loaded skills, then this contract." | A general rule never overrides a specific request; a correction outranks the original, and a skill ranks with the workspace. |
-| Act or ask? | "Inspect before asking. If the wrong reading is cheap to undo, take the one that acts on the workspace; if it would delete, publish or spend something the reader owns, stop and ask one short question, naming the default you would use." | Cheap ambiguity should not cost a turn; expensive ambiguity should not be guessed. |
+| Act or ask? | "If the request is concrete but two readings remain, take the one that acts on the workspace when a wrong guess is cheap to undo; ask when it would delete, publish or spend something the reader owns, or when a wrong guess means substantial rework." | Cheap ambiguity should not cost a turn; destructive or wasteful ambiguity should not be guessed. |
 | When is a question allowed? | "Never ask for a fact the workspace can answer, and never ask twice for what the session already authorized." | Removes the two question classes that waste the reader's time. |
 | What does a later message mean? | "A later message corrects the current task; it replaces the task only when it cancels it or asks for something incompatible." | Steering, not silent replacement. |
-| How does work start? | "Start now, batch independent calls, and never spend a turn narrating the next step." | The narration failure costs a whole turn. |
+| How does work start? | "Start now once the request is concrete: batch independent calls, and never spend a turn narrating the next step." | The narration failure costs a whole turn; the concreteness gate comes first. |
 | How large is a change? | "Read before you edit; make the smallest change that satisfies the request; follow the workspace's existing patterns." | Convention drift and scope creep are the common review rejections. |
 | How is done proved? | "Prove it with the command that checks it, or say what you could not check. After two identical failures, stop and report the error and what must change in the environment." | Evidence closes the turn; a retry loop is not progress, and a repeated failure is usually an environment fact. |
 | When does the turn end? | "Stop when the request is answered or the change is verified. Do not refactor, commit, push or open a pull request unless asked." | The stop condition the first revision lacked. |
@@ -221,14 +230,14 @@ per-request cost. Measured bytes:
 
 | Layer | Bytes |
 |---|---|
-| `DEFAULT_SYSTEM_PROMPT` (identity + persona + contract) | 2,108 |
+| `DEFAULT_SYSTEM_PROMPT` (identity + persona + contract) | 2,627 |
 | `HARNESS_CONTEXT` | 1,421 |
 | Tool sections (bare build) | 5,143 |
-| Built prompt | 8,672 |
+| Built prompt | 9,191 |
 
 The first contract revision measured 3,001 bytes and a 9,909-byte built prompt;
-this one is 34% shorter in the contract and 12.5% shorter overall, with the
-precedence, question and stop rules it lacked.
+this one is 17% shorter in the contract and 7.2% shorter overall, with the
+concreteness gate, precedence, question and stop rules it lacked.
 
 `the_system_prompt_stays_within_its_budget` in `crates/bsh/src/caps.rs` caps
 the built prompt at 12,000 bytes; `the_framework_prompt_stays_small` caps the
@@ -247,12 +256,14 @@ call or the reply, before any correction from the reader.
 | "login is broken" | repo open | reproduce, fix, verify | A defect report is reproduced, fixed and verified |
 | "can you fix the retry?" | repo open | read the call site, change it, test it | "can you fix X?" asks for a change |
 | "make it faster" | no metric | measure or profile first, then change | A goal with no target is measured first |
+| "make it better" | file open | ask: faster, simpler or more correct, and which screen or file; offer those options, best first | Name the object, change and done condition before acting |
+| "fix the app" | no file, no symptom | ask which screen and what happened; do not open a random file | Too vague to act on; ask, do not guess |
 | "fix this" + button screenshot | app | ask: bug report or code change? | Product context: a screenshot is evidence, not a task |
 | "actually keep the old API" | mid-turn | fold the constraint into the current task | A later message corrects the current task |
 | "is this file used?" | repo open | grep, read the callers, answer | A question ends without an edit |
 | "drop the users table" | repo open | inspect the target, then ask before executing | Expensive ambiguity asks one question |
 | "what is the test command?" | repo open | read the README or justfile; do not ask | Never ask for a fact the workspace can answer |
-| "reduce latency" | product tradeoff | measure; ask only if the target belongs to the reader | Cheap readings act; expensive ones ask |
+| "reduce latency" | product tradeoff | measure; ask only if the target belongs to the reader | Concrete readings act; destructive or wasteful ones ask |
 
 A scenario that produces the wrong first move is a prompt bug even when the
 final answer is right: the reader paid for the wrong step.

@@ -70,7 +70,7 @@ them, not the runtimes.
 | `McpPolicy` | `crates/agent/src/mcp/policy.rs:88` | Allow/deny/ask per (server, tool) | Enforcement is a pre-filter at registration, not an invocation decision |
 | `AgentCallerTool` | `crates/agent/src/bus/tool.rs:13` | Remote agent tool over bus RPC | Grants, provenance, idempotency, dual authorization — it is agent RPC, not a capability proxy |
 | `ResourceTool` | `crates/resource/src/tool.rs:13` | Resource URI → JSON ResourceAction invocation | It does not implement `react::Tool`; no schema; no registry entry |
-| Discovery (find_tool / call_tool) | `crates/agent/src/agent/agentic/discovery.rs:768` | On-demand tool shortlist + dispatcher, Withheld set | It is **explicitly not an authorization boundary** (`:17`) |
+| Discovery (find_tool) | `crates/agent/src/agent/agentic/discovery.rs` | On-demand tool shortlist; reported schemas join the next request, Withheld set | It is **explicitly not an authorization boundary** |
 | Policy at the tool boundary | `crates/agent/src/policy/target.rs:10`, `:260` | Action (Read/Write/Egress/Spawn/Capability), PolicyInput (session, preset, tool, action, target) | `tool` is a bare name; there is no capability ID, no version, no provider |
 
 Two facts from the audit matter more than the rest:
@@ -163,8 +163,8 @@ Severity: **P0** = blocks the phase-1 exit criteria, **P1** = blocks federation 
 3. **Error meaning.** ToolError::Failed(String) is where policy denials, provider crashes, and
    transport failures currently converge. §12.2 requires them to be distinguishable *before*
    anything federated exists, because the remote contract is defined in those terms.
-4. **Authority.** call_tool deliberately reaches every registered tool
-   (`crates/agent/src/agent/agentic/discovery.rs:17`). That is correct today and fatal for a
+4. **Authority.** Discovery deliberately does not gate execution: a deferred tool stays
+   registered and callable once found. That is correct today and fatal for a
    workspace-scoped view: withholding the *definition* is not withholding the *ability*.
 
 ### 3.2 The missing split: Local Composition and Federation Composition
@@ -606,9 +606,8 @@ impl WorkspaceView {
 ```
 
 The invariant that makes it real: **the host builds the turn's `ToolRegistry` from `project()`**, so a
-capability outside the view is not registered, and call_tool cannot reach it. If the view were
-applied only to the advertised array, call_tool would still reach everything
-(`crates/agent/src/agent/agentic/discovery.rs:17`) and §10.3 would be cosmetics.
+capability outside the view is not registered, and no direct call can reach it. If the view were
+applied only to the advertised array, a discovered tool would still run and §10.3 would be cosmetics.
 
 Deferral stays what it is — a prompt-bytes optimization *inside* the admitted set — so the two
 mechanisms compose: the view decides what exists, deferral decides what is described up front.
@@ -801,8 +800,8 @@ inode; readers merge the per-process files with the legacy log by event time.
 ### Slice 2 — Workspace view
 
 - Build the turn's registry from WorkspaceView::project() in the host.
-- Static guard: a tool outside the view is not merely deferred — it is absent, and a call_tool
-  attempt is NotFound.
+- Static guard: a tool outside the view is not merely deferred — it is absent, and a direct
+  call attempt is NotFound.
 - Measure prompt bytes and tool count before/after for a preset with extensions and MCP.
 
 **Exit:** §10.3 is observable as a number, not a claim.

@@ -834,7 +834,8 @@ shell tool.
 ### Deferred tools, live skills and prompt sections
 
 defer_tool(name) / defer_tool_prefix(prefix) keep a tool out of the advertised
-array while leaving it callable through find_tool/call_tool.
+array while keeping it discoverable through find_tool; the reported tool is
+called directly by name on the next step.
 register_skill adds an inline skill with no SKILL.md file, and
 add_live_prompt_section appends a host-owned prompt fragment.
 

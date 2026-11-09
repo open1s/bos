@@ -94,7 +94,7 @@ bundle, so their turns carry `federation_status`, `federation_peers`,
 `federation_cleanup`. Only `federation_status` rides every request: it is
 the signpost that tells the model the family exists. The other five are
 deferred like the browser, so a turn that needs a peer calls `find_tool` and
-then `call_tool` (the prompt's discovery paragraph says so), and every other
+then the reported tool directly (the prompt's discovery paragraph says so), and every other
 turn pays only the small status schema. A read-only turn keeps the three
 queries and loses the three actions.
 

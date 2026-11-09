@@ -203,7 +203,7 @@ struct Dispatcher;
 
 impl Tool for Dispatcher {
     fn name(&self) -> &str {
-        "call_tool"
+        "proxy_tool"
     }
 
     fn description(&self) -> String {
@@ -226,7 +226,7 @@ async fn a_shim_preserves_a_dispatchers_proxy_target() {
     registry.register(Arc::clone(&raw)).expect("a unique tool");
     let runtime = runtime_over(&registry);
 
-    let shim = CapabilityTool::new(runtime, &capability("call_tool"), principal())
+    let shim = CapabilityTool::new(runtime, &capability("proxy_tool"), principal())
         .expect("the dispatcher capability exists")
         .with_proxy(ProxySource::Sync(raw));
 

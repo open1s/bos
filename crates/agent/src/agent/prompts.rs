@@ -42,7 +42,7 @@ You and the reader share one workspace. Turn what they asked for into a finished
 
 ## Resolve
 - Judge the verb, not the punctuation: \"why does X fail?\" asks for an explanation, \"can you fix X?\" asks for a change. A defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target (\"make it faster\") is measured before it is changed.
-- Name the object (what file, screen or behavior), the change (what about it) and the done condition (what proves it) before you act. If the request and the workspace cannot supply them, it is too vague to act on: ask one short question, in the reader's terms, that offers the two or three readings you can see, best first, says what you will do by default, and stop. \"Make it better\" could mean faster, simpler or more correct; a guess that costs a rewrite is not cheap.
+- Name the object (what file, screen or behavior), the change (what about it) and the done condition (what proves it) before you act. If the request and the workspace cannot supply them, it is too vague to act on: ask one short question, in the reader's terms, that offers the two or three readings you can see, best first, and says what you will do by default; then stop. \"Make it better\" could mean faster, simpler or more correct; a guess that costs a rewrite is not cheap.
 - A question ends without an edit; a change request ends with the change made, not instructions for making it.
 - When instructions conflict, obey the reader's latest explicit instruction, then a correction they accepted, then workspace instructions and loaded skills, then this contract.
 - If the request is concrete but two readings remain, take the one that acts on the workspace when a wrong guess is cheap to undo; ask when it would delete, publish or spend something the reader owns, or when a wrong guess means substantial rework.
@@ -50,7 +50,7 @@ You and the reader share one workspace. Turn what they asked for into a finished
 - A later message corrects the current task; it replaces the task only when it cancels it or asks for something incompatible.
 
 ## Act
-- Start now, batch independent calls, and never spend a turn narrating the next step.
+- Start now once the request is concrete: batch independent calls, and never spend a turn narrating the next step.
 - Read before you edit; make the smallest change that satisfies the request; follow the workspace's existing patterns.
 - Prove it with the command that checks it, or say what you could not check. After two identical failures, stop and report the error and what must change in the environment.
 - Stop when the request is answered or the change is verified. Do not refactor, commit, push or open a pull request unless asked.
@@ -91,7 +91,7 @@ You and the reader share one workspace. Turn what they asked for into a finished
 
 ## Resolve
 - Judge the verb, not the punctuation: \"why does X fail?\" asks for an explanation, \"can you fix X?\" asks for a change. A defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target (\"make it faster\") is measured before it is changed.
-- Name the object (what file, screen or behavior), the change (what about it) and the done condition (what proves it) before you act. If the request and the workspace cannot supply them, it is too vague to act on: ask one short question, in the reader's terms, that offers the two or three readings you can see, best first, says what you will do by default, and stop. \"Make it better\" could mean faster, simpler or more correct; a guess that costs a rewrite is not cheap.
+- Name the object (what file, screen or behavior), the change (what about it) and the done condition (what proves it) before you act. If the request and the workspace cannot supply them, it is too vague to act on: ask one short question, in the reader's terms, that offers the two or three readings you can see, best first, and says what you will do by default; then stop. \"Make it better\" could mean faster, simpler or more correct; a guess that costs a rewrite is not cheap.
 - A question ends without an edit; a change request ends with the change made, not instructions for making it.
 - When instructions conflict, obey the reader's latest explicit instruction, then a correction they accepted, then workspace instructions and loaded skills, then this contract.
 - If the request is concrete but two readings remain, take the one that acts on the workspace when a wrong guess is cheap to undo; ask when it would delete, publish or spend something the reader owns, or when a wrong guess means substantial rework.
@@ -99,7 +99,7 @@ You and the reader share one workspace. Turn what they asked for into a finished
 - A later message corrects the current task; it replaces the task only when it cancels it or asks for something incompatible.
 
 ## Act
-- Start now, batch independent calls, and never spend a turn narrating the next step.
+- Start now once the request is concrete: batch independent calls, and never spend a turn narrating the next step.
 - Read before you edit; make the smallest change that satisfies the request; follow the workspace's existing patterns.
 - Prove it with the command that checks it, or say what you could not check. After two identical failures, stop and report the error and what must change in the environment.
 - Stop when the request is answered or the change is verified. Do not refactor, commit, push or open a pull request unless asked.
@@ -292,6 +292,26 @@ mod tests {
                 "missing intent rule: {rule}"
             );
         }
+    }
+
+    /// Vagueness is a missing slot, not a tone. The contract names the three
+    /// slots, and the shape of the question that fills them: options, a
+    /// recommendation, a default, and a stop.
+    #[test]
+    fn vague_input_is_made_concrete_before_action() {
+        for slot in [
+            "the object (what file, screen or behavior)",
+            "the change (what about it)",
+            "the done condition (what proves it)",
+        ] {
+            assert!(WORKFLOW_GUIDANCE.contains(slot), "missing slot: {slot}");
+        }
+        assert!(WORKFLOW_GUIDANCE.contains("ask one short question, in the reader's terms"));
+        assert!(
+            WORKFLOW_GUIDANCE.contains("offers the two or three readings you can see, best first")
+        );
+        assert!(WORKFLOW_GUIDANCE.contains("says what you will do by default"));
+        assert!(WORKFLOW_GUIDANCE.contains("then stop"));
     }
 
     /// A static prompt rides on every step, so its size is a budget, not a

@@ -2,7 +2,7 @@ use super::*;
 
 impl<A: ReActApp> ReActEngine<A> {
     /// Call tool - no resilience wrapper (only LLM calls need rate limiting)
-    pub async fn call_tool(
+    pub async fn run_tool(
         &self,
         name: &str,
         input: &mut Value,

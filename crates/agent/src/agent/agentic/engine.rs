@@ -108,7 +108,7 @@ impl Agent {
 
         // The array is part of the provider's cached prefix, so its order must
         // be a function of the set, not of what was appended last. The
-        // discovery pair is already part of `model_tools` when anything is
+        // discovery search is already part of `model_tools` when anything is
         // withheld; nothing is added here.
         context.tools.sort_by(|a, b| a.name.cmp(&b.name));
 

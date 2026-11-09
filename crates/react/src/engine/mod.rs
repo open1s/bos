@@ -537,7 +537,7 @@ skill_dir: {}
                                         |entry: &mut (String, String, serde_json::Value)| {
                                             let (name, call_id, args) =
                                                 (&entry.0, &entry.1, &mut entry.2);
-                                            async move { this.call_tool(name, args, call_id).await }
+                                            async move { this.run_tool(name, args, call_id).await }
                                         },
                                     ))
                                     .await;
@@ -552,7 +552,7 @@ skill_dir: {}
                                     let mut out = Vec::with_capacity(batch.len());
                                     for (name, call_id, args) in batch.iter_mut() {
                                         let tool_started = Instant::now();
-                                        let result = self.call_tool(name, args, call_id).await;
+                                        let result = self.run_tool(name, args, call_id).await;
                                         self.tool_call_count.fetch_add(1, Ordering::Relaxed);
                                         self.tool_time_nanos.fetch_add(
                                             tool_started.elapsed().as_nanos() as u64,
@@ -805,7 +805,7 @@ skill_dir: {}
                                 }
 
                                 let tool_started = Instant::now();
-                                let mut result = self.call_tool(&name, &mut args, &call_id).await;
+                                let mut result = self.run_tool(&name, &mut args, &call_id).await;
                                 self.tool_call_count.fetch_add(1, Ordering::Relaxed);
                                 self.tool_time_nanos.fetch_add(
                                     tool_started.elapsed().as_nanos() as u64,
@@ -1154,10 +1154,10 @@ skill_dir: {}
                                         "cached": true
                                     }))
                                 } else {
-                                    self.call_tool(&name, &mut args, &call_id).await
+                                    self.run_tool(&name, &mut args, &call_id).await
                                 }
                             } else {
-                                self.call_tool(&name, &mut args, &call_id).await
+                                self.run_tool(&name, &mut args, &call_id).await
                             };
                             self.tool_call_count.fetch_add(1, Ordering::Relaxed);
                             self.tool_time_nanos

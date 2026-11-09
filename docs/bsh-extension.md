@@ -261,9 +261,10 @@ Which surface a kind reaches is part of the contract, not an implementation deta
 
 A package's tools are DEFERRED: registered and callable, but not part of the
 request's tool array, because one install contributes a family and every schema
-is re-sent on every step. The build advertises `find_tool` and `call_tool` in
-their place, and the Tools pane still lists them (it reads the registered set,
-not the advertised one). A tool the model should see without searching is a
+is re-sent on every step. The build advertises `find_tool`; the definitions it
+reports join the next request, and the model calls those tools directly. The
+Tools pane still lists them (it reads the registered set, not the advertised
+one). A tool the model should see without searching is a
 tool the prompt should name; the deferral exists for the long tail.
 
 A command is never promoted to a tool: the reader invokes it, and the model

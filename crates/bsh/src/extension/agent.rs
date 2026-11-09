@@ -620,8 +620,8 @@ impl react::tool::registry::AsyncTool for ExtensionTool {
     /// turn.
     ///
     /// They stay registered and callable; the model reaches one through
-    /// `find_tool`/`call_tool`, which the build advertises as soon as it
-    /// withholds anything. The Tools pane still lists them, because the pane
+    /// `find_tool`, whose reported definition joins the next request, and the
+    /// build advertises it as soon as it withholds anything. The Tools pane still lists them, because the pane
     /// lists capabilities (`Agent::all_tools`), not advertisement.
     fn deferred(&self) -> bool {
         true
