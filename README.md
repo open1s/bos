@@ -39,6 +39,10 @@
 
 ---
 
+> **Release 4.1.0** — intelligent review and audit, a pane layout that fits any
+> window, and per-step trajectory status. See the [changelog](CHANGELOG.md) for
+> the full set.
+
 ## What is BOS?
 
 **BOS is a Rust-native foundation for building, composing and operating AI agents as a distributed system.**
@@ -300,6 +304,10 @@ BSH provides a native GPUI environment for developing, using and operating agent
 - **Settings and credentials** — provider configuration and an encrypted vault.
 - **Bilingual interface** — English and Chinese.
 - **Extensions** — add tools, commands, panels, prompts, contexts, skills, themes, language services, agent roles, workflows, storage and hooks.
+- **Review and audit** — file changesets with structural diffs, findings and
+  decisions, plus an audit timeline over the same tool calls.
+- **Run trajectory** — a run navigator, step timeline, progress and a
+  per-step inspector for every turn.
 
 ### BSH interface preview
 

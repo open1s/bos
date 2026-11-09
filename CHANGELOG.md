@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v4.1.0 (2026-11-09)
 
 - **Intelligent Review (MVP)**: file tools now capture exact before/after
   snapshots into a content-addressed store under .bsh/review; text and

@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "agent"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "bsh"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "agent",
  "anyhow",
@@ -1470,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "bus"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "log",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "capability"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "async-trait",
  "semver",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "federation"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -6158,7 +6158,7 @@ dependencies = [
 
 [[package]]
 name = "jsbos"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "agent",
  "async-trait",
@@ -6635,7 +6635,7 @@ dependencies = [
 
 [[package]]
 name = "logging"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "config",
  "dirs 6.0.0",
@@ -7173,7 +7173,7 @@ dependencies = [
 
 [[package]]
 name = "nbos"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "agent",
  "async-trait",
@@ -9080,7 +9080,7 @@ dependencies = [
 
 [[package]]
 name = "qserde"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "bincode",
  "ciborium",
@@ -9094,7 +9094,7 @@ dependencies = [
 
 [[package]]
 name = "qserde_derive"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "quote",
  "syn 2.0.117",
@@ -9483,7 +9483,7 @@ dependencies = [
 
 [[package]]
 name = "react"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -9810,7 +9810,7 @@ dependencies = [
 
 [[package]]
 name = "resource"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
