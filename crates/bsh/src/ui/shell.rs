@@ -553,6 +553,8 @@ pub(crate) struct Shell {
     /// The footer Save's confirmation, or none when nothing was saved this
     /// visit. At most ONE: a repeated save refreshes this instead of stacking a
     /// second notice.
+    /// The settings file's last-write instant, read when the dialog opens.
+    pub(crate) settings_activity_at: Option<u64>,
     /// The settings nav's own filter field.
     pub(crate) settings_search: Entity<InputState>,
     /// The settings nav filter; empty shows every cell.
@@ -2076,6 +2078,7 @@ impl Shell {
             trust_confirm: None,
             trust_error: None,
             developer_tools_failed: false,
+            settings_activity_at: None,
             settings_search,
             settings_query: String::new(),
             settings_toast: None,
@@ -2917,6 +2920,11 @@ impl Shell {
     /// Open the settings dialog, loading the fields from the saved settings.
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.open_settings();
+        // The nav filter belongs to one visit; a fresh open shows every cell.
+        self.settings_activity_at = super::settings::settings_activity_at();
+        self.settings_query.clear();
+        self.settings_search
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.preset_editor = None;
         self.preset_editor_error = None;
         self.preset_details = None;
@@ -3123,6 +3131,18 @@ impl Shell {
     /// both land here, so the inline error and the notice cannot disagree.
     pub(crate) fn open_config(&mut self, cx: &mut Context<Self>) {
         super::settings::reveal_config_shared(self, cx);
+    }
+
+    /// Open the bsh data directory in the platform file browser.
+    pub(crate) fn open_data_dir(&mut self, cx: &mut Context<Self>) {
+        let lang = self.state.lang;
+        match crate::settings::reveal(&crate::settings::dir()) {
+            Ok(()) => self.state.notice(lang.tr("settings.openedDataDir")),
+            Err(error) => self
+                .state
+                .notice(format!("{} {error}", lang.tr("settings.revealFailed"))),
+        }
+        cx.notify();
     }
 
     /// Open the active workspace's egress allowlist in the platform browser.

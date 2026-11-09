@@ -71,6 +71,12 @@ pub(crate) fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Format a past instant in the reader's local time.
+pub(crate) fn local_stamp(at: u64) -> String {
+    let (year, month, day, hour, minute) = local_parts(at);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
 /// Format a past instant as a UTC date and time.
 pub(crate) fn stamp(at: u64) -> String {
     let days = (at / 86_400) as i64;

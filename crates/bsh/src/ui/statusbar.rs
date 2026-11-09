@@ -49,11 +49,26 @@ impl Shell {
         // The model name is not repeated here: the composer's own chip already
         // names it, and this row belongs to the figures about the turn.
         if let Some(notice) = &self.state.notice {
-            row = row.child(txt(
-                notice.clone(),
-                theme::stat_size_at(size),
-                theme::warn(),
-            ));
+            row = row.child(
+                div()
+                    .debug_selector(|| "status-notice".to_string())
+                    .h(px(24.0))
+                    .px(px(10.0))
+                    .rounded(px(999.0))
+                    .bg(rgb(theme::soft(theme::warn())))
+                    .border_1()
+                    .border_color(rgb(theme::blend_into(theme::warn(), theme::page(), 0.72)))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(icon(IconName::Info, 12.0, theme::warn()))
+                    .child(
+                        txt(notice.clone(), theme::stat_size_at(size), theme::warn())
+                            .max_w(px(560.0))
+                            .whitespace_nowrap()
+                            .text_ellipsis(),
+                    ),
+            );
         }
         row
     }

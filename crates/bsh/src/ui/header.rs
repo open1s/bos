@@ -332,6 +332,19 @@ impl Shell {
                     )
                     .child(self.chat_handle(HandleSide::Left, cx))
                     .child(self.chat_handle(HandleSide::Right, cx));
+                // The blank conversation gets the launcher's blue-white wash:
+                // a page-wide gradient, so no clipped blob edge can show.
+                let middle = if hero {
+                    let start = theme::blend_into(theme::accent(), theme::page(), 0.965);
+                    let page = theme::page();
+                    middle.bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(rgba((start << 8) | 0xFF), 0.0),
+                        linear_color_stop(rgba((page << 8) | 0xFF), 1.0),
+                    ))
+                } else {
+                    middle
+                };
                 if hero {
                     middle.justify_center().child(self.hero_group(cx))
                 } else {

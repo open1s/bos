@@ -102,6 +102,58 @@ fn host_operating_system() -> gpui_kit::OperatingSystem {
     }
 }
 
+/// gpui-pre's gradient stops want 0xRRGGBBAA, while theme colours are 0xRRGGBB.
+fn settings_opaque(color: u32) -> Rgba {
+    rgba((color << 8) | 0xFF)
+}
+
+/// The instant the settings document was last written, for the Account page's
+/// one activity row. A missing file means there is nothing to date yet.
+pub(crate) fn settings_activity_at() -> Option<u64> {
+    std::fs::metadata(crate::settings::settings_path())
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+/// The hero glyph, tint and decorative glyph for one settings section.
+fn settings_hero_meta(section: usize) -> (IconName, u32, IconName) {
+    const VIOLET: u32 = 0x7C5CFC;
+    const AMBER: u32 = 0xE8912D;
+    const TEAL: u32 = 0x0E9F9F;
+    match section {
+        0 => (IconName::User, theme::accent(), IconName::ShieldCheck),
+        1 => (IconName::ShieldCheck, 0x3B82F6, IconName::Lock),
+        2 => (IconName::Settings, 0x64748B, IconName::SlidersHorizontal),
+        3 => (IconName::Box, VIOLET, IconName::Sparkles),
+        16 => (IconName::Globe, TEAL, IconName::Search),
+        17 => (IconName::Puzzle, AMBER, IconName::Boxes),
+        12 => (IconName::Sparkles, 0x8B5CF6, IconName::Wand),
+        _ => (
+            IconName::PanelsTopLeft,
+            theme::accent(),
+            IconName::PanelsTopLeft,
+        ),
+    }
+}
+
+/// The rail cell's glyph and subtitle, by section index.
+fn nav_meta(index: usize) -> (IconName, &'static str) {
+    match index {
+        0 => (IconName::User, "settings.accountSub"),
+        1 => (IconName::ShieldCheck, "settings.vaultSub"),
+        2 => (IconName::Settings, "settings.generalSub"),
+        3 => (IconName::Box, "settings.modelsSub"),
+        16 => (IconName::Globe, "settings.webSearchSub"),
+        17 => (IconName::Puzzle, "settings.extensionsSub"),
+        12 => (IconName::Sparkles, "settings.agentPresetsSub"),
+        _ => (IconName::PanelsTopLeft, "settings.accountSub"),
+    }
+}
+
 pub(crate) fn section_index(id: &str) -> Option<usize> {
     SECTIONS.iter().position(|key| {
         // A pane the rail does not carry is reached by its short id, so the
@@ -1112,6 +1164,15 @@ struct PresetCardData {
     slot: String,
 }
 
+/// The stable selectors and switch state one master row owns.
+struct MasterRow {
+    row_selector: &'static str,
+    title_selector: &'static str,
+    consequence_selector: &'static str,
+    switch_id: &'static str,
+    on: bool,
+}
+
 impl Shell {
     /// The modal card.
     pub(crate) fn render_settings(
@@ -1153,65 +1214,198 @@ impl Shell {
             self.plugins_ready = true;
         }
 
-        // Measured (SettingsRoot.module.css): the rail is 188 wide over an 18px
-        // gap with 22/12 padding, a 16px/500 title, then 4px-spaced 40px cells with
-        // radius 12 and 9/16/9/12 padding. Like the reference's, it carries no own
-        // background or divider - the panel surface runs under it, and the cell
-        // label is label-primary whether or not the cell is the active one.
+        let query = self.settings_query.trim().to_lowercase();
         let mut list = div().flex().flex_col().gap(px(4.0));
-        // `NAV` names the rail's cells in display order and `section_index`
+        let mut shown = 0usize;
+        // NAV names the rail's cells in display order and section_index
         // resolves each to its pane, so a cell and its pane cannot disagree.
         for (cell, id) in NAV.iter().enumerate() {
             let Some(index) = section_index(id) else {
                 continue;
             };
+            let (glyph, subtitle_key) = nav_meta(index);
+            let title = tr(lang, SECTIONS[index]);
+            let subtitle = tr(lang, subtitle_key);
+            if !query.is_empty()
+                && !title.to_lowercase().contains(&query)
+                && !subtitle.to_lowercase().contains(&query)
+            {
+                continue;
+            }
+            shown += 1;
             let selected = index == section;
             list = list.child(
                 div()
                     .id(SharedString::from(format!("set-{index}")))
                     .debug_selector(move || format!("set-nav-{cell}"))
-                    .h(px(40.0))
-                    .pt(px(9.0))
-                    .pb(px(9.0))
-                    .pl(px(12.0))
-                    .pr(px(16.0))
+                    .relative()
+                    .h(px(58.0))
+                    .px(px(10.0))
                     .rounded(px(12.0))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(9.0))
                     .cursor_pointer()
-                    .when(selected, |row| row.bg(rgb(theme::selected_row())))
+                    .when(selected, |row| {
+                        row.bg(rgb(theme::blend_into(theme::accent(), theme::page(), 0.88)))
+                            .border_1()
+                            .border_color(rgb(theme::blend_into(
+                                theme::accent(),
+                                theme::page(),
+                                0.72,
+                            )))
+                    })
                     .when(!selected, |row| row.hover(|s| s.bg(rgb(theme::hover()))))
+                    .when(selected, |row| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .left(px(0.0))
+                                .top(px(12.0))
+                                .bottom(px(12.0))
+                                .w(px(3.0))
+                                .rounded(px(2.0))
+                                .bg(linear_gradient(
+                                    180.0,
+                                    linear_color_stop(settings_opaque(theme::accent()), 0.0),
+                                    linear_color_stop(settings_opaque(0x22D3EE), 1.0),
+                                )),
+                        )
+                    })
                     .child(
-                        txt(tr(lang, SECTIONS[index]), 14.0, theme::text())
+                        div()
+                            .flex_none()
+                            .w(px(30.0))
+                            .h(px(30.0))
+                            .rounded(px(9.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(selected, |tile| tile.bg(rgb(theme::page())))
+                            .child(icon(
+                                glyph,
+                                15.0,
+                                if selected {
+                                    theme::accent()
+                                } else {
+                                    theme::muted()
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
                             .flex_1()
                             .min_w_0()
-                            .overflow_hidden(),
+                            .child(
+                                txt(title, 12.5, theme::text())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_ellipsis(),
+                            )
+                            .child(
+                                txt(subtitle, 9.5, theme::faint())
+                                    .min_w_0()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis(),
+                            ),
                     )
+                    .child(icon(
+                        IconName::ChevronRight,
+                        12.0,
+                        if selected {
+                            theme::accent()
+                        } else {
+                            theme::faint()
+                        },
+                    ))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.state.settings_section = index;
                         cx.notify();
                     })),
             );
         }
+        if shown == 0 {
+            list = list.child(div().px(px(10.0)).py(px(10.0)).child(txt(
+                tr(lang, "settings.noMatch"),
+                11.0,
+                theme::faint(),
+            )));
+        }
+        let search_field = div()
+            .id("settings-search")
+            .debug_selector(|| "settings-search".to_string())
+            .h(px(36.0))
+            .px(px(10.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .bg(rgb(theme::page()))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(icon(IconName::Search, 13.0, theme::faint()))
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.settings_search)
+                        .appearance(false)
+                        .w_full()
+                        .h(px(28.0)),
+                ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(18.0))
+                    .px(px(4.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(theme::new_session_fill()))
+                    .flex()
+                    .items_center()
+                    .child(txt("\u{2318}K", 8.5, theme::faint())),
+            );
+        let runtime = div()
+            .debug_selector(|| "settings-runtime".to_string())
+            .px(px(8.0))
+            .pb(px(4.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(rgb(0x22C55E)))
+                    .child(txt(tr(lang, "settings.running"), 11.0, theme::text())),
+            )
+            .child(txt(
+                tr_args(
+                    lang,
+                    "settings.runtime",
+                    &[("version", env!("CARGO_PKG_VERSION").to_string())],
+                ),
+                9.5,
+                theme::faint(),
+            ));
         let nav = div()
-            .w(px(188.0))
+            .w(px(210.0))
             .flex_none()
             .flex()
             .flex_col()
-            .gap(px(18.0))
+            .gap(px(10.0))
             .pt(px(22.0))
             .px(px(12.0))
-            .child(
-                txt(tr(lang, "settings.title"), 16.0, theme::text())
-                    .font_weight(FontWeight::MEDIUM)
-                    .px(px(12.0)),
-            )
-            .child(list);
+            .pb(px(14.0))
+            .child(search_field)
+            .child(list)
+            .child(div().flex_1())
+            .child(runtime);
 
         let (title, hint, content) = match section {
-            0 => self.section_account(),
+            0 => self.section_account(cx),
             1 => self.section_vault(cx),
             2 => self.section_general(cx),
             3 => self.section_models(cx),
@@ -1241,8 +1435,23 @@ impl Shell {
         // The Plugins page carries Refresh and a filled Add plugin in the
         // header's top-right, before the config and close controls. They belong
         // to the list tab only: the other tabs have their own toolbars.
+        let nav_section = NAV
+            .iter()
+            .filter_map(|id| section_index(id))
+            .any(|index| index == section);
+
+        // The TOML editor is a focus mode: its code well and Save must be on
+        // screen without scrolling, so the hero yields the pane while it is open.
+        let hero_section = nav_section && !(section == 12 && self.preset_editor.is_some());
+        let hero = if hero_section {
+            let (glyph, tint, decor) = settings_hero_meta(section);
+            Some(self.settings_hero(glyph, tint, decor, title, hint))
+        } else {
+            None
+        };
         let header_actions =
             (section == 13 && self.plugins_tab == 0).then(|| self.plugins_page_actions(cx));
+        let document_action = (section != 0).then(|| self.document_action(cx));
         let header = div()
             .debug_selector(|| "settings-header".to_string())
             .flex_none()
@@ -1256,14 +1465,17 @@ impl Shell {
             .items_start()
             .justify_between()
             .gap(px(8.0))
-            .child(
+            .child(if hero_section {
+                div().flex_1().into_any_element()
+            } else {
                 txt(tr(lang, title), 16.0, theme::text())
                     .font_weight(FontWeight::MEDIUM)
                     .flex_1()
-                    .min_w_0(),
-            )
+                    .min_w_0()
+                    .into_any_element()
+            })
             .children(header_actions)
-            .child(self.document_action(cx))
+            .children(document_action)
             .child(
                 div()
                     .id("settings-close")
@@ -1289,6 +1501,9 @@ impl Shell {
         // leaves the Save where it was: the bar is anchored at the panel's
         // foot, and the confirmation only takes space from the scroller.
         let mut footer = div().pt(px(16.0)).flex().flex_col().gap(px(8.0));
+        if section == 0 {
+            footer = footer.child(self.account_security_note());
+        }
         if let Some(toast) = self.settings_toast.as_ref() {
             footer = footer.child(
                 div()
@@ -1310,13 +1525,15 @@ impl Shell {
                     div()
                         .id("settings-save")
                         .debug_selector(|| "settings-save".to_string())
-                        .px(px(14.0))
-                        .py(px(5.0))
-                        .rounded(px(12.0))
-                        .bg(rgb(theme::text()))
+                        .h(px(32.0))
+                        .px(px(16.0))
+                        .rounded(px(9.0))
+                        .bg(rgb(theme::accent()))
+                        .flex()
+                        .items_center()
                         .cursor_pointer()
                         .hover(|s| s.opacity(0.9))
-                        .child(txt(tr(lang, "settings.save"), 13.0, theme::page()))
+                        .child(txt(tr(lang, "settings.save"), 13.0, 0xFFFFFF))
                         .on_click(cx.listener(|this, _event, _window, cx| {
                             this.save_settings(cx);
                         })),
@@ -1334,7 +1551,7 @@ impl Shell {
         };
         let mut pane = div().flex_1().min_w_0().flex().flex_col().child(header);
         if let Some(tabs) = tab_strip {
-            pane = pane.child(div().flex_none().px(px(24.0)).child(tabs));
+            pane = pane.child(div().flex_none().px(px(28.0)).child(tabs));
         }
         pane = pane
             .child(
@@ -1346,7 +1563,7 @@ impl Shell {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.settings_scroll)
-                    .px(px(24.0))
+                    .px(px(28.0))
                     .pb(px(24.0))
                     .flex()
                     .flex_col()
@@ -1357,7 +1574,11 @@ impl Shell {
                             .flex_row()
                             .items_center()
                             .gap(px(4.0))
-                            .child(txt(tr(lang, hint), 12.0, theme::faint()))
+                            .child(if hero_section {
+                                div().into_any_element()
+                            } else {
+                                txt(tr(lang, hint), 12.0, theme::faint()).into_any_element()
+                            })
                             // The reference puts a small info glyph beside the
                             // Plugins page subtitle; its tooltip is the same
                             // sentence, which is the only help copy here.
@@ -1399,6 +1620,7 @@ impl Shell {
                                 )
                             }),
                     )
+                    .children(hero)
                     .children(content),
             )
             // The save bar is pinned under the scrolling box, not carried in it.
@@ -1407,12 +1629,12 @@ impl Shell {
             // y=1214 in a 900-tall window - off screen - so the reader had to
             // scroll to find the only control that commits, and nothing reachable
             // by keyboard could replace it.
-            .child(div().flex_none().px(px(24.0)).pb(px(24.0)).child(footer));
+            .child(div().flex_none().px(px(28.0)).pb(px(24.0)).child(footer));
 
         // Measured (SettingsRoot.module.css): 800 wide and as tall as
         // min(800, viewport - 48) - the mask's own 24px inset on each side - on
         // radius-panel (28) with the prominent elevation and no border.
-        let panel_max = if section == 12 { 1080.0 } else { 800.0 };
+        let panel_max = if section == 12 { 1140.0 } else { 920.0 };
         let panel_w = (view_width - 48.0).clamp(320.0, panel_max);
         let panel_h = (view_height - 48.0).clamp(240.0, 800.0);
 
@@ -1441,7 +1663,18 @@ impl Shell {
                     .w(px(panel_w))
                     .h(px(panel_h))
                     .rounded(px(28.0))
-                    .bg(rgb(theme::page()))
+                    .bg(linear_gradient(
+                        160.0,
+                        linear_color_stop(settings_opaque(theme::page()), 0.0),
+                        linear_color_stop(
+                            settings_opaque(theme::blend_into(
+                                theme::accent(),
+                                theme::page(),
+                                0.94,
+                            )),
+                            1.0,
+                        ),
+                    ))
                     .shadow_lg()
                     .overflow_hidden()
                     .flex()
@@ -1493,10 +1726,6 @@ impl Shell {
     }
 
     /// A read-only label/value row.
-    fn settings_row(&self, label: &'static str, value: String) -> AnyElement {
-        self.settings_control_row(label, txt(value, 13.0, theme::text()))
-    }
-
     /// A label plus any trailing control.
     fn settings_control_row(&self, label: &'static str, control: impl IntoElement) -> AnyElement {
         hairline_bottom(
@@ -1675,7 +1904,7 @@ impl Shell {
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .flex_basis(px(180.0))
+                    .flex_basis(px(170.0))
                     .flex_grow(1.0)
                     .flex_shrink(1.0)
                     .gap(px(4.0))
@@ -1809,30 +2038,472 @@ impl Shell {
         .into_any_element()
     }
 
-    /// Account: identity, paths and the way to the configuration file.
+    /// Account: identity, paths, the file and the local-only promise.
     ///
     /// No Workspace row. bsh holds several workspaces at once - the sidebar
     /// lists them and the General pane's own Workspaces group is where one is
     /// chosen - so a single row here could only ever name whichever happened to
     /// be active, which reads as a setting that is not one. The identity and the
     /// two paths that really are this build's are all that stay.
-    fn section_account(&self) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let rows = vec![
-            self.settings_row(
-                "settings.identity",
-                self.state.lang.tr("side.local").to_string(),
-            ),
-            self.settings_row("settings.version", env!("CARGO_PKG_VERSION").to_string()),
-            self.settings_row(
-                "settings.configFile",
-                crate::settings::settings_path().display().to_string(),
-            ),
-            self.settings_row(
-                "settings.dataDir",
-                crate::settings::dir().display().to_string(),
-            ),
-        ];
-        ("settings.account", "settings.accountHint", rows)
+    fn section_account(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> (&'static str, &'static str, Vec<AnyElement>) {
+        let lang = self.state.lang;
+        let identity = div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(txt(tr(lang, "side.local"), 12.0, theme::text()))
+            .child(
+                div()
+                    .h(px(20.0))
+                    .px(px(7.0))
+                    .rounded(px(999.0))
+                    .bg(rgb(theme::soft(theme::success())))
+                    .flex()
+                    .items_center()
+                    .child(txt(
+                        tr(lang, "settings.localMachine"),
+                        9.5,
+                        theme::success(),
+                    )),
+            );
+        let config_path = crate::settings::settings_path().display().to_string();
+        let data_dir = crate::settings::dir().display().to_string();
+        let config_open =
+            self.account_open_button("settings-account-open-config", IconName::FileText, true, cx);
+        let data_open = self.account_open_button(
+            "settings-account-open-data",
+            IconName::FolderOpen,
+            false,
+            cx,
+        );
+        let basic = self.settings_card(
+            IconName::Info,
+            "settings.basicInfo",
+            None,
+            vec![
+                self.account_info_row(
+                    IconName::User,
+                    "settings.identity",
+                    identity.into_any_element(),
+                    None,
+                ),
+                self.account_info_row(
+                    IconName::Layers,
+                    "settings.version",
+                    txt(env!("CARGO_PKG_VERSION"), 12.0, theme::text()).into_any_element(),
+                    None,
+                ),
+                self.account_info_row(
+                    IconName::FileText,
+                    "settings.configFile",
+                    txt(config_path, 11.5, theme::text())
+                        .text_ellipsis()
+                        .into_any_element(),
+                    Some(config_open),
+                ),
+                self.account_info_row(
+                    IconName::Database,
+                    "settings.dataDir",
+                    txt(data_dir, 11.5, theme::text())
+                        .text_ellipsis()
+                        .into_any_element(),
+                    Some(data_open),
+                ),
+            ],
+        );
+
+        let loaded_at = self
+            .settings_activity_at
+            .map(crate::state::local_stamp)
+            .unwrap_or_else(|| "—".to_string());
+        let refresh = div()
+            .id("settings-refresh-activity")
+            .debug_selector(|| "settings-refresh-activity".to_string())
+            .h(px(26.0))
+            .px(px(9.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(icon(IconName::RefreshCw, 11.0, theme::muted()))
+            .child(txt(tr(lang, "settings.refresh"), 10.5, theme::muted()))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.settings_activity_at = settings_activity_at();
+                cx.notify();
+            }));
+        let activity = self.settings_card(
+            IconName::Clock,
+            "settings.recentActivity",
+            Some(refresh.into_any_element()),
+            vec![div()
+                .py(px(10.0))
+                .flex()
+                .items_start()
+                .gap(px(9.0))
+                .child(
+                    div()
+                        .mt(px(5.0))
+                        .w(px(7.0))
+                        .h(px(7.0))
+                        .rounded_full()
+                        .bg(rgb(theme::success())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(txt(
+                            tr(lang, "settings.activityConfigLoaded"),
+                            12.0,
+                            theme::text(),
+                        ))
+                        .child(txt(loaded_at, 10.5, theme::faint())),
+                )
+                .into_any_element()],
+        );
+
+        let mut content = vec![basic, activity];
+        if self.config_open_failed {
+            content.insert(
+                1,
+                div()
+                    .w_full()
+                    .mb(px(10.0))
+                    .px(px(4.0))
+                    .child(txt(tr(lang, "settings.revealFailed"), 11.0, theme::error()))
+                    .into_any_element(),
+            );
+        }
+        ("settings.account", "settings.accountHint", content)
+    }
+
+    /// The Account page's local-only note, pinned above the Save bar.
+    fn account_security_note(&self) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .debug_selector(|| "settings-account-local-note".to_string())
+            .w_full()
+            .px(px(16.0))
+            .py(px(13.0))
+            .rounded(px(16.0))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::blend_into(theme::accent(), theme::page(), 0.92)))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(icon(IconName::ShieldCheck, 19.0, theme::accent()))
+            .child(txt(tr(lang, "settings.localOnly"), 11.5, theme::muted()).flex_1())
+            .into_any_element()
+    }
+
+    /// The gradient card every settings section will lead with.
+    fn settings_hero(
+        &self,
+        glyph: IconName,
+        tint: u32,
+        decor: IconName,
+        title_key: &'static str,
+        hint_key: &'static str,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        let accent = theme::accent();
+        let cyan = 0x22D3EE;
+        let violet = 0x7C5CFC;
+        let start = theme::blend_into(accent, theme::page(), 0.88);
+        let end = theme::blend_into(cyan, theme::page(), 0.90);
+        let glow_a = theme::blend_into(accent, theme::page(), 0.58);
+        let glow_b = theme::blend_into(0x2DD4BF, theme::page(), 0.72);
+        let rim = theme::blend_into(violet, theme::page(), 0.70);
+        let inner = div()
+            .relative()
+            .w_full()
+            .h(px(152.0))
+            .rounded(px(21.0))
+            .overflow_hidden()
+            .bg(linear_gradient(
+                135.0,
+                linear_color_stop(settings_opaque(start), 0.0),
+                linear_color_stop(settings_opaque(end), 1.0),
+            ))
+            .child(
+                div()
+                    .absolute()
+                    .right(px(-52.0))
+                    .top(px(-62.0))
+                    .w(px(210.0))
+                    .h(px(210.0))
+                    .rounded_full()
+                    .bg(rgb(glow_a))
+                    .opacity(0.38),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(-34.0))
+                    .bottom(px(-70.0))
+                    .w(px(184.0))
+                    .h(px(184.0))
+                    .rounded_full()
+                    .bg(rgb(glow_b))
+                    .opacity(0.34),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(10.0))
+                    .top(px(12.0))
+                    .w(px(126.0))
+                    .h(px(126.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgba(0xFFFFFF3D)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(40.0))
+                    .top(px(42.0))
+                    .w(px(66.0))
+                    .h(px(66.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgba(0xFFFFFF2E)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(18.0))
+                    .top(px(4.0))
+                    .opacity(0.34)
+                    .child(icon(decor, 104.0, accent)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(148.0))
+                    .top(px(28.0))
+                    .w(px(5.0))
+                    .h(px(5.0))
+                    .rounded_full()
+                    .bg(rgb(0xFFFFFF))
+                    .opacity(0.8),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(122.0))
+                    .bottom(px(30.0))
+                    .w(px(3.0))
+                    .h(px(3.0))
+                    .rounded_full()
+                    .bg(rgb(0xFFFFFF))
+                    .opacity(0.65),
+            )
+            .child(
+                div()
+                    .relative()
+                    .h_full()
+                    .p(px(22.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(18.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(62.0))
+                            .h(px(62.0))
+                            .rounded(px(999.0))
+                            .bg(linear_gradient(
+                                140.0,
+                                linear_color_stop(settings_opaque(tint), 0.0),
+                                linear_color_stop(
+                                    settings_opaque(theme::blend_into(tint, 0xFFFFFF, 0.35)),
+                                    1.0,
+                                ),
+                            ))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon(glyph, 29.0, 0xFFFFFF)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .flex_1()
+                            .min_w_0()
+                            .pr(px(104.0))
+                            .child(
+                                txt(tr(lang, title_key), 24.0, theme::text())
+                                    .font_weight(FontWeight::MEDIUM),
+                            )
+                            .child(txt(tr(lang, hint_key), 12.0, theme::muted()))
+                            .child(
+                                div()
+                                    .debug_selector(|| "settings-hero-local".to_string())
+                                    .mt(px(2.0))
+                                    .self_start()
+                                    .h(px(22.0))
+                                    .px(px(8.0))
+                                    .rounded(px(999.0))
+                                    .bg(rgb(theme::page()))
+                                    .border_1()
+                                    .border_color(rgb(rim))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .rounded_full()
+                                            .bg(rgb(theme::success())),
+                                    )
+                                    .child(txt(tr(lang, "settings.heroLocal"), 8.5, accent)),
+                            ),
+                    ),
+            );
+        div()
+            .debug_selector(|| "settings-hero".to_string())
+            .w_full()
+            .mb(px(14.0))
+            .p(px(1.5))
+            .rounded(px(23.0))
+            .bg(linear_gradient(
+                120.0,
+                linear_color_stop(settings_opaque(accent), 0.0),
+                linear_color_stop(settings_opaque(cyan), 1.0),
+            ))
+            .child(inner)
+            .into_any_element()
+    }
+
+    /// A white card with an icon-and-title header over its rows.
+    fn settings_card(
+        &self,
+        glyph: IconName,
+        title_key: &'static str,
+        action: Option<AnyElement>,
+        rows: Vec<AnyElement>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .w_full()
+            .mb(px(14.0))
+            .p(px(18.0))
+            .rounded(px(18.0))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::page()))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .mb(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .child(
+                        div()
+                            .w(px(30.0))
+                            .h(px(30.0))
+                            .rounded(px(9.0))
+                            .bg(rgb(theme::soft(theme::accent())))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon(glyph, 15.0, theme::accent())),
+                    )
+                    .child(
+                        txt(tr(lang, title_key), 13.5, theme::text())
+                            .font_weight(FontWeight::MEDIUM)
+                            .flex_1(),
+                    )
+                    .children(action),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// One label/value row inside a settings card.
+    fn account_info_row(
+        &self,
+        glyph: IconName,
+        label_key: &'static str,
+        value: AnyElement,
+        action: Option<AnyElement>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        hairline_bottom(
+            div()
+                .h(px(50.0))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .border_color(rgb(theme::border_soft()))
+                .child(icon(glyph, 16.0, theme::muted()))
+                .child(
+                    txt(tr(lang, label_key), 12.5, theme::text())
+                        .font_weight(FontWeight::MEDIUM)
+                        .w(px(120.0)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .child(value),
+                )
+                .children(action),
+        )
+        .into_any_element()
+    }
+
+    /// The outline Open control the Account paths carry.
+    fn account_open_button(
+        &self,
+        id: &'static str,
+        glyph: IconName,
+        config: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .h(px(28.0))
+            .px(px(10.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(icon(glyph, 11.0, theme::accent()))
+            .child(txt(tr(lang, "settings.open"), 10.5, theme::accent()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if config {
+                    this.open_config(cx);
+                } else {
+                    this.open_data_dir(cx);
+                }
+            }))
+            .into_any_element()
     }
 
     /// The header's Open-configuration-file action, measured from the
@@ -3150,23 +3821,26 @@ impl Shell {
     /// below decides whether presets apply at all. The consequence names both
     /// losses while it is off and says presets still apply, so the cost is on
     /// the row rather than only inside the confirmation.
-    fn sandbox_master_row(&self, on: bool, cx: &mut Context<Shell>) -> AnyElement {
-        let lang = self.state.lang;
-        let consequence = if on {
-            tr(lang, "settings.sandboxEnabledConsequence")
-        } else {
-            tr(lang, "settings.sandboxOffConsequence")
-        };
+    /// The one master-row style both preset masters wear: a tinted, bordered
+    /// line with the title and its consequence before the switch.
+    fn master_row<F>(
+        &self,
+        spec: MasterRow,
+        title: String,
+        consequence: String,
+        action: F,
+        cx: &mut Context<Shell>,
+    ) -> AnyElement
+    where
+        F: Fn(&mut Shell, bool, &mut Context<Shell>) + 'static,
+    {
+        let row_selector = spec.row_selector;
         div()
-            .debug_selector(|| "sandbox-master-row".to_string())
-            // The pane's height is load-bearing: this header sits above the
-            // whole roster, and the custom section's edit control must stay in
-            // the harness viewport. The tinted band is the distinction, not
-            // extra padding.
-            .mb(px(2.0))
-            .px(px(12.0))
-            .py(px(3.0))
-            .rounded(px(10.0))
+            .debug_selector(move || row_selector.to_string())
+            .mb(px(6.0))
+            .px(px(14.0))
+            .py(px(9.0))
+            .rounded(px(12.0))
             .border_1()
             .border_color(rgb(theme::border_soft()))
             .bg(rgb(theme::new_session_fill()))
@@ -3176,7 +3850,7 @@ impl Shell {
             .gap(px(10.0))
             .child(
                 div()
-                    .debug_selector(|| "sandbox-master-text".to_string())
+                    .debug_selector(move || spec.row_selector.replace("-row", "-text"))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -3184,24 +3858,42 @@ impl Shell {
                     .flex_1()
                     .min_w_0()
                     .child(
-                        txt(
-                            tr(lang, "settings.sandboxEnabledTitle"),
-                            13.0,
-                            theme::text(),
-                        )
-                        .debug_selector(|| "sandbox-master-title".to_string())
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .flex_none(),
+                        txt(title, 13.0, theme::text())
+                            .debug_selector(move || spec.title_selector.to_string())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .flex_none(),
                     )
                     .child(
                         txt(consequence, 11.0, theme::faint())
-                            .debug_selector(|| "sandbox-master-consequence".to_string())
+                            .debug_selector(move || spec.consequence_selector.to_string())
                             .min_w_0()
                             .truncate(),
                     ),
             )
-            .child(self.switch("sandbox-enabled", on, true, sandbox_enabled_action, cx))
+            .child(self.switch(spec.switch_id, spec.on, true, action, cx))
             .into_any_element()
+    }
+
+    fn sandbox_master_row(&self, on: bool, cx: &mut Context<Shell>) -> AnyElement {
+        let lang = self.state.lang;
+        let consequence = if on {
+            tr(lang, "settings.sandboxEnabledConsequence")
+        } else {
+            tr(lang, "settings.sandboxOffConsequence")
+        };
+        self.master_row(
+            MasterRow {
+                row_selector: "sandbox-master-row",
+                title_selector: "sandbox-master-title",
+                consequence_selector: "sandbox-master-consequence",
+                switch_id: "sandbox-enabled",
+                on,
+            },
+            tr(lang, "settings.sandboxEnabledTitle"),
+            consequence,
+            sandbox_enabled_action,
+            cx,
+        )
     }
 
     /// General's pointer to the ONE sandbox switch, which lives in Agent presets.
@@ -3274,55 +3966,24 @@ impl Shell {
         } else {
             tr(lang, "settings.presetsOffConsequence")
         };
-        // The selector names the sentence's own state, so a test proves the
-        // RENDERED sentence changed with the heel switch rather than only the
-        // helper behind it.
         let consequence_selector = if sandbox_on {
             "presets-consequence-sandbox"
         } else {
             "presets-consequence-no-sandbox"
         };
-        // ONE line, not a two-line preference row: this pane already carries
-        // more content than the dialog's height, so a taller master row would
-        // push the Custom cards' footers out of reach without a scroll.
-        hairline_bottom(
-            div()
-                .debug_selector(|| "presets-master-row".to_string())
-                .py(px(8.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(16.0))
-                .border_color(rgb(theme::border_soft()))
-                .child(
-                    div()
-                        .debug_selector(|| "presets-master-text".to_string())
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            txt(
-                                tr(lang, "settings.presetsEnabledTitle"),
-                                13.0,
-                                theme::text(),
-                            )
-                            .debug_selector(|| "presets-master-title".to_string())
-                            .font_weight(FontWeight::MEDIUM)
-                            .flex_none(),
-                        )
-                        .child(
-                            txt(consequence, 11.5, theme::faint())
-                                .debug_selector(move || consequence_selector.to_string())
-                                .min_w_0()
-                                .truncate(),
-                        ),
-                )
-                .child(self.switch("presets-enabled", on, true, presets_enabled_action, cx)),
+        self.master_row(
+            MasterRow {
+                row_selector: "presets-master-row",
+                title_selector: "presets-master-title",
+                consequence_selector,
+                switch_id: "presets-enabled",
+                on,
+            },
+            tr(lang, "settings.presetsEnabledTitle"),
+            consequence,
+            presets_enabled_action,
+            cx,
         )
-        .into_any_element()
     }
 
     /// Agent presets: the declarative agent a preset file names.
@@ -3352,20 +4013,68 @@ impl Shell {
         let workspace_reach =
             crate::preset_catalogue::workspace_reach(self.state.policy.as_deref());
         let sandbox_on = self.state.settings.global.general.sandbox_active();
-        let mut rows: Vec<AnyElement> = vec![
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if self.preset_editor.is_none() {
+            rows.push(
+                div()
+                    .w_full()
+                    .mb(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        txt(tr(lang, "settings.presetToolbar"), 11.5, theme::muted())
+                            .font_weight(FontWeight::MEDIUM)
+                            .flex_1(),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "preset-add-custom".to_string())
+                            .id("preset-add-custom")
+                            .h(px(32.0))
+                            .px(px(14.0))
+                            .rounded(px(9.0))
+                            .bg(rgb(theme::accent()))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .cursor_pointer()
+                            .hover(|style| style.opacity(0.9))
+                            .child(icon(IconName::Plus, 13.0, 0xFFFFFF))
+                            .child(
+                                txt(tr(lang, "settings.presetNew"), 12.0, 0xFFFFFF)
+                                    .font_weight(FontWeight::MEDIUM),
+                            )
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                let id = this.state.add_custom_preset();
+                                this.preset_details = Some(id);
+                                this.state.notice(
+                                    tr(this.state.lang, "settings.presetAdded").to_string(),
+                                );
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows.push(
             // The HEEL master leads: it confines the shell and terminal for
             // every preset below, so it is the switch a reader looking for
             // "stop the sandbox" must meet first. It is a committed setting and
             // owns its own save, so it is read from the committed tree.
             self.sandbox_master_row(sandbox_on, cx),
+        );
+        rows.push(
             // The preset master follows: it decides whether anything below it
             // applies at all, and its sentence reads the sandbox state above so
             // it never claims a cap that is not in force.
             self.presets_enabled_row(presets_on, cx),
+        );
+        rows.push(
             txt(tr(lang, "settings.presetScopeHint"), 12.0, theme::muted())
                 .mb(px(10.0))
                 .into_any_element(),
-        ];
+        );
 
         // The no-preset choice is a compact row, not a mode card: it inherits
         // rather than naming a preset. Its hint states the ACTUAL default - a
@@ -3727,61 +4436,6 @@ impl Shell {
             rows.push(block.into_any_element());
         }
 
-        if self.preset_editor.is_none() {
-            rows.push(
-                div()
-                    .debug_selector(|| "preset-add-custom".to_string())
-                    .id("preset-add-custom")
-                    .w_full()
-                    .mt(px(12.0))
-                    .px(px(14.0))
-                    .py(px(12.0))
-                    .rounded(px(12.0))
-                    .border_1()
-                    .border_dashed()
-                    .border_color(rgb(theme::border()))
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::hover())))
-                    .child(
-                        div()
-                            .w(px(28.0))
-                            .h(px(28.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(rgb(theme::border_soft()))
-                            .bg(rgb(theme::page()))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icon(IconName::Plus, 13.0, theme::muted())),
-                    )
-                    .child(
-                        div()
-                            .flex_col()
-                            .gap(px(1.0))
-                            .child(
-                                txt(tr(lang, "settings.presetCreate"), 13.0, theme::text())
-                                    .font_weight(FontWeight::MEDIUM),
-                            )
-                            .child(txt(
-                                tr(lang, "settings.presetCreateHint"),
-                                11.0,
-                                theme::muted(),
-                            )),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        let id = this.state.add_custom_preset();
-                        this.preset_details = Some(id);
-                        this.state
-                            .notice(tr(this.state.lang, "settings.presetAdded").to_string());
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-        }
         ("settings.agent-presets", "settings.agentPresetsHint", rows)
     }
 

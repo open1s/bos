@@ -420,6 +420,7 @@ impl Shell {
         let lang = self.state.lang;
         let streaming = self.state.any_streaming();
         let sendable = can_send(&self.composer_value, self.state.attachments.len());
+        let hero = self.state.hero_phase();
         // One resolution per frame: `effective()` clones a whole resolved
         // workspace, and the chip asks three separate facts of it. The
         // resolution is the ACTIVE SESSION's choice, which is what the menu
@@ -604,7 +605,31 @@ impl Shell {
                     // slash palette while a leading slash is being typed, otherwise
                     // the plus card.
                     .when_some(self.composer_overlay(cx), |card, menu| card.child(menu));
-                hairline_all(card).border_color(rgb(theme::border_soft()))
+                let card = hairline_all(card).border_color(rgb(theme::border_soft()));
+                if hero {
+                    div()
+                        .debug_selector(|| "composer-frame".to_string())
+                        .relative()
+                        .w_full()
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(-2.0))
+                                .left(px(-2.0))
+                                .right(px(-2.0))
+                                .bottom(px(-2.0))
+                                .rounded(px(30.0))
+                                .bg(linear_gradient(
+                                    135.0,
+                                    linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
+                                    linear_color_stop(rgba((0x22D3EE << 8) | 0xFF), 1.0),
+                                )),
+                        )
+                        .child(card)
+                        .into_any_element()
+                } else {
+                    card.into_any_element()
+                }
             });
         // The context meter moved into the status row, at its left end, so the
         // reading sits with the other figures about the same turn instead of on
@@ -867,6 +892,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .cursor_pointer()
+                .bg(rgb(theme::page()))
                 .border_1()
                 .border_color(rgb(theme::border())),
             CHIP_CAP,
@@ -1130,7 +1156,11 @@ impl Shell {
             .h(px(34.0))
             .flex_none()
             .rounded_full()
-            .bg(rgb(theme::accent()))
+            .bg(linear_gradient(
+                135.0,
+                linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
+                linear_color_stop(rgba((0x7C5CFC << 8) | 0xFF), 1.0),
+            ))
             .flex()
             .items_center()
             .justify_center()

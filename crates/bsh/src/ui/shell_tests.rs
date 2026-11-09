@@ -90,6 +90,21 @@ fn draw_until(
     );
 }
 
+/// Put the settings scroller at the bottom or the top and settle a frame.
+fn scroll_settings(shell: &Entity<Shell>, cx: &mut VisualTestContext, bottom: bool) {
+    cx.update(|window, cx| {
+        shell.update(cx, |this, _| {
+            if bottom {
+                this.settings_scroll.scroll_to_bottom();
+            } else {
+                this.settings_scroll
+                    .set_offset(gpui_kit::point(px(0.0), px(0.0)));
+            }
+        });
+        window.draw(cx).clear(cx);
+    });
+}
+
 /// Scroll a row into a STABLE position and return its painted y together with
 /// the transcript offset that produced it.
 ///
@@ -6005,7 +6020,7 @@ fn preset_trust_click_flips_the_draft_without_selecting(cx: &mut TestAppContext)
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-
+    scroll_settings(&shell, cx, true);
     let trust = cx
         .debug_bounds("preset-trust-0")
         .expect("the trust control");
@@ -6061,6 +6076,7 @@ fn preset_use_in_chat_writes_the_session_not_the_default(cx: &mut TestAppContext
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     let active = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
 
+    scroll_settings(&shell, cx, true);
     let use_chat = cx.debug_bounds("preset-use-0").expect("the use action");
     cx.simulate_click(use_chat.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -6079,6 +6095,7 @@ fn preset_use_in_chat_writes_the_session_not_the_default(cx: &mut TestAppContext
         "using a preset in a chat must not change the global default"
     );
 
+    scroll_settings(&shell, cx, false);
     let clear = cx
         .debug_bounds("preset-use-default")
         .expect("the default action");
@@ -6270,6 +6287,7 @@ fn preset_details_show_the_applied_config(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    scroll_settings(&shell, cx, true);
     assert!(
         cx.debug_bounds("preset-config-0").is_none(),
         "details start collapsed"
@@ -6499,6 +6517,7 @@ fn a_required_untrusted_preset_cannot_be_used_in_a_chat(cx: &mut TestAppContext)
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    scroll_settings(&shell, cx, true);
     assert!(
         cx.debug_bounds("preset-level-1").is_some(),
         "the built-in inspect card carries a level badge"
@@ -6595,6 +6614,7 @@ fn a_custom_preset_can_be_edited_and_deleted(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
 
+    scroll_settings(&shell, cx, true);
     let edit = cx.debug_bounds("preset-edit-0").expect("the edit action");
     cx.simulate_click(edit.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -6639,6 +6659,7 @@ fn a_custom_preset_can_be_edited_and_deleted(cx: &mut TestAppContext) {
             );
         });
     });
+    scroll_settings(&shell, cx, true);
     let save = cx
         .debug_bounds("preset-editor-save")
         .expect("the save control");
@@ -6664,6 +6685,7 @@ fn a_custom_preset_can_be_edited_and_deleted(cx: &mut TestAppContext) {
         }),
         Some("Edited".to_string())
     );
+    scroll_settings(&shell, cx, false);
     assert!(
         cx.debug_bounds("preset-add-custom").is_some(),
         "saving brings the roster back"
@@ -11537,7 +11559,7 @@ fn the_appearance_cubes_set_the_colour_mode(cx: &mut TestAppContext) {
 }
 
 /// The settings dialog's own skeleton is measured, not guessed: the panel is 800
-/// wide on the reference's 24px mask inset, the rail is 188 over 40px cells, the
+/// wide on the reference's 24px mask inset, the rail is 210 over 58px cells, the
 /// header is 54 tall with a 28x28 close, and a text field's chrome is 34 tall.
 #[gpui::test]
 fn the_settings_dialog_takes_the_measured_shape(cx: &mut TestAppContext) {
@@ -11549,7 +11571,7 @@ fn the_settings_dialog_takes_the_measured_shape(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let panel = cx.debug_bounds("settings-panel").expect("the panel draws");
-    assert_eq!(panel.size.width, px(800.0), "the measured panel width");
+    assert_eq!(panel.size.width, px(920.0), "the measured panel width");
     let viewport = cx.update(|window, _| window.viewport_size());
     assert_eq!(
         panel.size.height,
@@ -11559,7 +11581,7 @@ fn the_settings_dialog_takes_the_measured_shape(cx: &mut TestAppContext) {
     let header = cx.debug_bounds("settings-header").expect("the pane header");
     assert_eq!(header.size.height, px(54.0), "the measured header row");
     let cell = cx.debug_bounds("set-nav-1").expect("a rail cell draws");
-    assert_eq!(cell.size.height, px(40.0), "the measured rail cell");
+    assert_eq!(cell.size.height, px(58.0), "the measured rail cell");
     assert_eq!(
         cell.origin.x,
         panel.origin.x + px(12.0),
@@ -11567,7 +11589,7 @@ fn the_settings_dialog_takes_the_measured_shape(cx: &mut TestAppContext) {
     );
     assert_eq!(
         cx.debug_bounds("settings-pane").map(|b| b.origin.x),
-        Some(panel.origin.x + px(188.0)),
+        Some(panel.origin.x + px(210.0)),
         "the options box starts after the measured 188px rail"
     );
     let close = cx
@@ -15509,6 +15531,73 @@ fn the_settings_rail_is_the_measured_cells_plus_the_vault_and_web_search() {
     );
 }
 
+/// The Account page is the settings design-system baseline: a gradient hero,
+/// white information cards, the runtime status, and the two real path actions.
+#[gpui::test]
+fn the_account_page_draws_the_settings_design_baseline(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("settings-account-design"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("account"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "settings-search",
+        "settings-hero",
+        "settings-hero-local",
+        "settings-runtime",
+        "settings-account-open-config",
+        "settings-account-open-data",
+        "settings-account-local-note",
+        "settings-refresh-activity",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is part of the Account baseline"
+        );
+    }
+    let badge = cx
+        .debug_bounds("settings-hero-local")
+        .expect("the local-only badge");
+    assert!(
+        badge.size.width < px(90.0),
+        "the status badge stays a chip, not a full-width bar"
+    );
+}
+
+/// The nav field is real: cmd-k focuses it and typing narrows the rail by the
+/// subtitle, not only the title.
+#[gpui::test]
+fn cmd_k_filters_the_settings_rail_by_subtitle(cx: &mut TestAppContext) {
+    use super::settings::section_index;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("settings-search"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("account"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    assert!(
+        cx.debug_bounds("set-nav-0").is_some() && cx.debug_bounds("set-nav-1").is_some(),
+        "the rail starts complete"
+    );
+    cx.update(|window, cx| {
+        use gpui_kit::Focusable as _;
+        shell.update(cx, |this, cx| {
+            this.composer
+                .update(cx, |state, cx| state.focus_handle(cx).focus(window, cx));
+        });
+    });
+    cx.simulate_keystrokes("cmd-k");
+    cx.simulate_keystrokes("keys");
+    draw_until(cx, "the rail narrows to the Vault", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("set-nav-1").is_some() && cx.debug_bounds("set-nav-0").is_none()
+    });
+}
+
 /// The settings rail draws every `NAV` cell - seven, and no eighth - and the
 /// About block is General's own last row group, not a cell.
 #[gpui::test]
@@ -16469,6 +16558,9 @@ fn the_coding_view_toggle_gates_the_trajectory_tab(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     let before = cx.update(|_, cx| shell.read(cx).state.draft().global.general.developer_tools);
+    // The hero pushes this last row below the viewport; a reader scrolls to it.
+    shell.update(cx, |this, _| this.settings_scroll.scroll_to_bottom());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     let track = cx
         .debug_bounds("settings-developer-tools")
         .expect("the toggle draws");
@@ -30385,6 +30477,7 @@ fn a_widening_preset_change_waits_for_confirmation(cx: &mut TestAppContext) {
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     let active = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("session"));
 
+    scroll_settings(&shell, cx, true);
     let use_chat = cx.debug_bounds("preset-use-0").expect("the use action");
     cx.simulate_click(use_chat.center(), Modifiers::default());
     draw_until(cx, "the widening gate opens", DRAW_UNTIL_MAX, |cx| {

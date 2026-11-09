@@ -63,12 +63,22 @@ impl Shell {
                             // height because a child does not push a fixed box.
                             .child(
                                 div()
+                                    .relative()
                                     .w(px(theme::HERO_MARK))
                                     .h(px(theme::HERO_MARK))
                                     .flex_shrink_0()
                                     .flex()
                                     .items_center()
                                     .justify_center()
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .w(px(56.0))
+                                            .h(px(56.0))
+                                            .rounded_full()
+                                            .bg(rgb(theme::soft(theme::accent())))
+                                            .opacity(0.8),
+                                    )
                                     .child(
                                         img(crate::assets::mark())
                                             .w(px(theme::HERO_MARK_DRAWN))
@@ -85,6 +95,19 @@ impl Shell {
                                     .child(headline)
                                     .child(self.hero_preview_badge()),
                             ),
+                    )
+                    .child(
+                        div().w_full().mt(px(10.0)).flex().justify_center().child(
+                            div()
+                                .w(px(44.0))
+                                .h(px(3.0))
+                                .rounded_full()
+                                .bg(linear_gradient(
+                                    90.0,
+                                    linear_color_stop(rgba((theme::accent() << 8) | 0xFF), 0.0),
+                                    linear_color_stop(rgba((0x22D3EE << 8) | 0xFF), 1.0),
+                                )),
+                        ),
                     ),
             )
     }
@@ -155,6 +178,9 @@ impl Shell {
             .h(px(theme::HERO_WS_MIN_H))
             .px(px(theme::HERO_WS_PAD_X))
             .rounded(px(theme::RADIUS_SM))
+            .bg(rgb(theme::page()))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
             .gap(px(theme::HERO_WS_GAP))
             .max_w(px(theme::HERO_WS_MAX_W))
             .child(icon(glyph, theme::HERO_WS_ICON, theme::text()))
