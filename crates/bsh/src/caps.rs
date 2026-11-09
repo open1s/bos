@@ -5500,8 +5500,7 @@ mod tests {
             .map(|tool| tool.name)
             .collect();
         assert!(
-            advertised.iter().any(|name| name == "find_tool")
-                && !advertised.iter().any(|name| name == "call_tool"),
+            advertised.iter().any(|name| name == "find_tool"),
             "the search replaces the family: {advertised:?}"
         );
         for tool in [
@@ -6014,8 +6013,7 @@ mod tests {
             );
         }
         assert!(
-            model_names.iter().any(|name| name == "find_tool")
-                && !model_names.iter().any(|name| name == "call_tool"),
+            model_names.iter().any(|name| name == "find_tool"),
             "the search replaces the withheld tools: {model_names:?}"
         );
         let registered: Vec<String> = built

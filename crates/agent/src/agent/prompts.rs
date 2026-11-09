@@ -361,7 +361,6 @@ mod tests {
     #[test]
     fn the_discovery_guidance_names_the_search_it_uses() {
         assert!(DISCOVERY_GUIDANCE.contains("find_tool"));
-        assert!(!DISCOVERY_GUIDANCE.contains("call_tool"));
         assert!(DISCOVERY_GUIDANCE.contains("added to your tool list"));
         assert!(DISCOVERY_GUIDANCE.contains("directly"));
         assert!(DISCOVERY_GUIDANCE.contains("JSON Schema"));

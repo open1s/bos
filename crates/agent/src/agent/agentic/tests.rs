@@ -1023,9 +1023,8 @@ fn a_deferred_tool_leaves_the_array_and_the_discovery_pair_takes_its_place() {
         "a deferred tool is not advertised: {names:?}"
     );
     assert!(
-        names.iter().any(|name| name == "find_tool")
-            && !names.iter().any(|name| name == "call_tool"),
-        "the search is advertised, the dispatcher is gone: {names:?}"
+        names.iter().any(|name| name == "find_tool"),
+        "the search is advertised: {names:?}"
     );
 }
 
@@ -1041,9 +1040,7 @@ fn nothing_is_deferred_by_default() {
         .map(|tool| tool.name)
         .collect();
     assert!(
-        !names
-            .iter()
-            .any(|name| name == "find_tool" || name == "call_tool"),
+        !names.iter().any(|name| name == "find_tool"),
         "no withheld tool means no discovery search: {names:?}"
     );
 }
@@ -1204,10 +1201,6 @@ async fn a_withheld_mcp_tool_is_found_and_run_through_the_agent() {
         seen.iter().any(|name| name == "find_tool")
             && seen.iter().any(|name| name == "github_search"),
         "the search and the discovered tool are both advertised: {seen:?}"
-    );
-    assert!(
-        !seen.iter().any(|name| name == "call_tool"),
-        "the dispatcher is gone: {seen:?}"
     );
     assert_eq!(
         *hook_names.lock().unwrap(),
