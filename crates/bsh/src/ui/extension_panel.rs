@@ -5,13 +5,21 @@
 //! renders the bounded tree with GPUI widgets, and routes every action back with
 //! the revision it was rendered from. A stale action is refused, so a button
 //! from an old frame cannot mutate a newer one.
+//!
+//! The chooser above the document is one searchable dropdown over the panels
+//! installed for this mount, so the surface keeps its shape whether one package
+//! ships a panel or a dozen do.
 
 use serde_json::{json, Value};
 
 use gpui_kit::component::button::Button;
+use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
+use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
+use gpui_kit::component::IndexPath;
 use gpui_kit::*;
 
 use crate::extension::host::PanelSurface;
+use crate::i18n::{tr, Lang};
 use crate::theme;
 use ferris_sdk::host_runtime::CallContext;
 use ferris_sdk::types::ExtensionError;
@@ -78,6 +86,30 @@ impl Palette {
     }
 }
 
+/// One row of the installed-panel picker.
+///
+/// The row label is the text the picker searches, so it carries the location
+/// too: two packages can ship a panel with the same title, and a reader looking
+/// for the right one needs to tell them apart.
+#[derive(Clone, Debug)]
+struct PanelItem {
+    /// Index into the view's `panels`, not into the filtered list.
+    index: usize,
+    label: String,
+}
+
+impl SearchableListItem for PanelItem {
+    type Value = usize;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(self.label.clone())
+    }
+
+    fn value(&self) -> &usize {
+        &self.index
+    }
+}
+
 /// One extension panel surface in the settings dialog.
 pub(crate) struct ExtensionPanelView {
     panels: Vec<PanelSurface>,
@@ -97,11 +129,22 @@ pub(crate) struct ExtensionPanelView {
     /// The action request carries this, not the live session revision: stamping
     /// it at dispatch time made the staleness check unable to fail.
     render_revision: u64,
+    /// The language the picker's own labels are written in.
+    lang: Lang,
+    /// The installed-panel picker.
+    ///
+    /// Its state needs a `Window`, so it is built on the first frame rather than
+    /// in `new`, and kept afterwards so a re-render does not rebuild it (which
+    /// would drop the reader's search query and the open popover).
+    picker: Option<Entity<ComboboxState<SearchableVec<PanelItem>>>>,
+    /// Dropping this unsubscribes the picker, and a chosen row would then stop
+    /// switching panels, so the view holds it for its whole life.
+    picker_subscription: Option<Subscription>,
 }
 
 impl ExtensionPanelView {
     /// Build a view over the panels the host currently offers.
-    pub(crate) fn new(panels: Vec<PanelSurface>) -> Self {
+    pub(crate) fn new(panels: Vec<PanelSurface>, lang: Lang) -> Self {
         let selected = panels
             .iter()
             .position(|panel| matches!(panel.visibility, ferris_sdk::ui::PanelVisibility::Visible))
@@ -124,6 +167,9 @@ impl ExtensionPanelView {
             tabs: std::collections::BTreeMap::new(),
             panel_root,
             render_revision: 0,
+            lang,
+            picker: None,
+            picker_subscription: None,
         };
         if let Some(panel) = view.panels.get(selected) {
             if let Some(document) = &panel.initial {
@@ -164,6 +210,50 @@ impl ExtensionPanelView {
             self.load(cx);
         }
         cx.notify();
+    }
+
+    /// The picker's rows, in the order the view holds the panels.
+    fn picker_items(panels: &[PanelSurface]) -> Vec<PanelItem> {
+        panels
+            .iter()
+            .enumerate()
+            .map(|(index, panel)| PanelItem {
+                index,
+                label: format!("{} · {}", panel.title, location_label(panel.location)),
+            })
+            .collect()
+    }
+
+    /// Build the picker on the first frame.
+    ///
+    /// `ComboboxState` needs a `Window`, and the view is constructed before one
+    /// is available, so this is the earliest point that can build it.
+    fn ensure_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() || self.panels.is_empty() {
+            return;
+        }
+        let items = SearchableVec::new(Self::picker_items(&self.panels));
+        let selected = vec![IndexPath::default().row(self.selected)];
+        let picker = cx.new(|cx| {
+            ComboboxState::new(items, selected, window, cx)
+                .searchable(true)
+                .multiple(false)
+        });
+        // The row carries the panel's own index, so a filtered list's row
+        // number can never be mistaken for a panel one.
+        let subscription = cx.subscribe(
+            &picker,
+            |this, _picker, event: &ComboboxEvent<SearchableVec<PanelItem>>, cx| {
+                let values = match event {
+                    ComboboxEvent::Change(values) | ComboboxEvent::Confirm(values) => values,
+                };
+                if let Some(index) = values.first().copied() {
+                    this.select(index, cx);
+                }
+            },
+        );
+        self.picker = Some(picker);
+        self.picker_subscription = Some(subscription);
     }
 
     fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
@@ -709,6 +799,16 @@ impl ExtensionPanelView {
     }
 }
 
+/// Where a panel mounts, as the picker spells it.
+fn location_label(location: PanelLocation) -> &'static str {
+    match location {
+        PanelLocation::Right => "right",
+        PanelLocation::Left => "left",
+        PanelLocation::Bottom => "bottom",
+        PanelLocation::Center => "center",
+    }
+}
+
 fn summarize(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -720,8 +820,9 @@ fn summarize(value: &Value) -> String {
 }
 
 impl Render for ExtensionPanelView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_loaded(cx);
+        self.ensure_picker(window, cx);
         // Record what this frame draws from; a click later in the frame's life
         // is an action on this revision, not on whatever replaced it since.
         self.render_revision = self.session.as_ref().map(UiSession::revision).unwrap_or(0);
@@ -734,57 +835,41 @@ impl Render for ExtensionPanelView {
             .h_full();
         if self.panels.is_empty() {
             return root.child(txt(
-                "No extension panels are installed.",
+                tr(self.lang, "right.extensions.empty"),
                 13.0,
                 self.palette.muted,
             ));
         }
-        let mut tabs = div().flex().flex_row().flex_wrap().gap(px(6.0));
-        for (index, panel) in self.panels.iter().enumerate() {
-            let selected = index == self.selected;
-            let location = match panel.location {
-                PanelLocation::Right => "right",
-                PanelLocation::Left => "left",
-                PanelLocation::Bottom => "bottom",
-                PanelLocation::Center => "center",
-            };
-            tabs = tabs.child(
+        // One searchable dropdown over every panel installed for this mount.
+        // The pill strip it replaces had to be scanned left to right, and a
+        // reader with a dozen packages had no way to ask for one by name.
+        let mut chooser = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .w_full()
+            .debug_selector(|| "extension-panel-chooser".to_string())
+            .child(txt(
+                tr(self.lang, "right.extensions.picker"),
+                12.0,
+                self.palette.muted,
+            ));
+        if let Some(picker) = self.picker.clone() {
+            chooser = chooser.child(
                 div()
-                    .id(format!("extension-panel-{}", panel.panel_id))
-                    .debug_selector(|| format!("extension-panel-{}", panel.panel_id))
-                    .role(Role::Button)
-                    .aria_label(panel.title.clone())
-                    .px(px(10.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .rounded(px(7.0))
-                    .bg(rgb(if selected {
-                        self.palette.accent
-                    } else {
-                        self.palette.new_session_fill
-                    }))
-                    .cursor_pointer()
-                    .children(panel.icon.as_deref().and_then(|icon| {
-                        let relative = icon.strip_prefix("asset/")?;
-                        let path = panel.root.join(relative);
-                        path.is_file()
-                            .then(|| img(path).max_h(px(14.0)).max_w(px(14.0)).into_any_element())
-                    }))
-                    .child(txt(
-                        format!("{} · {location}", panel.title),
-                        12.0,
-                        if selected {
-                            self.palette.page
-                        } else {
-                            self.palette.text
-                        },
-                    ))
-                    .on_click(cx.listener(move |this, _event, _window, cx| this.select(index, cx))),
+                    .flex_1()
+                    .h(px(30.0))
+                    .debug_selector(|| "extension-panel-picker".to_string())
+                    .child(
+                        Combobox::new(&picker)
+                            .placeholder(tr(self.lang, "right.extensions.picker"))
+                            .search_placeholder(tr(self.lang, "right.extensions.search"))
+                            .menu_width(px(320.0)),
+                    ),
             );
         }
-        root = root.child(tabs);
+        root = root.child(chooser);
         if self.loading {
             root = root.child(txt("Loading panel…", 12.0, self.palette.muted));
         }
@@ -815,13 +900,15 @@ impl Render for ExtensionPanelView {
 
 #[cfg(test)]
 mod tests {
-    use super::ExtensionPanelView;
+    use super::{ExtensionPanelView, PanelItem};
     use crate::extension::host::PanelSurface;
+    use crate::i18n::Lang;
     use crate::theme;
     use async_trait::async_trait;
     use ferris_sdk::host_runtime::{CallContext, Runtime, ToolDescriptor};
     use ferris_sdk::types::{ExtensionError, ExtensionId, RuntimeKind};
     use ferris_sdk::ui::{PanelLocation, ThemePalette, UiDocument};
+    use gpui_kit::component::searchable_list::SearchableListItem;
     use serde_json::Value;
     use std::sync::Arc;
 
@@ -886,7 +973,7 @@ mod tests {
             }
         }))
         .expect("document");
-        let view = ExtensionPanelView::new(vec![panel(document)]);
+        let view = ExtensionPanelView::new(vec![panel(document)], Lang::En);
         assert!(view.session.is_some());
         assert!(view.document.is_some());
         assert!(view.error.is_none());
@@ -909,9 +996,48 @@ mod tests {
             name: "Test theme".to_string(),
             colors,
         });
-        let view = ExtensionPanelView::new(vec![surface]);
+        let view = ExtensionPanelView::new(vec![surface], Lang::En);
         assert_eq!(view.palette.page, 0x112233);
         assert_eq!(view.palette.accent, 0x445566);
         assert_eq!(view.palette.text, theme::text());
+    }
+
+    /// Every installed panel is one row of the picker, and the row carries the
+    /// panel's own index: the dropdown is searchable, so a row number in the
+    /// filtered list is not a panel index and must never stand in for one.
+    #[test]
+    fn the_picker_lists_every_panel_with_its_mount() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "revision": 1,
+            "root": {"type": "text", "text": "x"}
+        }))
+        .expect("document");
+        let mut right = panel(document.clone());
+        right.title = "Greeting".to_string();
+        right.location = PanelLocation::Right;
+        let mut left = panel(document);
+        left.title = "Second".to_string();
+        left.location = PanelLocation::Left;
+
+        let items = ExtensionPanelView::picker_items(&[right, left]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].value(), &0);
+        assert_eq!(items[0].title().to_string(), "Greeting · right");
+        assert_eq!(items[1].value(), &1);
+        assert_eq!(items[1].title().to_string(), "Second · left");
+    }
+
+    /// The search field filters on the row text, case-insensitively, which is
+    /// the whole point of replacing the pill strip with a dropdown.
+    #[test]
+    fn the_picker_search_matches_a_row_case_insensitively() {
+        let item = PanelItem {
+            index: 0,
+            label: "Extension DevKit · right".to_string(),
+        };
+        assert!(item.matches("devkit"));
+        assert!(item.matches("RIGHT"));
+        assert!(!item.matches("federation"));
     }
 }

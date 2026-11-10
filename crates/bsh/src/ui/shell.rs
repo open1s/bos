@@ -547,6 +547,8 @@ pub(crate) struct Shell {
     pub(crate) task_search: Entity<InputState>,
     /// The name/id filter on the Installed extensions pane.
     pub(crate) extension_search: Entity<InputState>,
+    /// The name/description filter on the Tools and skills tab.
+    pub(crate) tools_search: Entity<InputState>,
     /// The new-task name field.
     pub(crate) task_name: Entity<InputState>,
     /// The new-task instruction field.
@@ -1294,8 +1296,9 @@ impl Shell {
                     .into_iter()
                     .filter(|panel| panel.location == ferris_sdk::ui::PanelLocation::Center)
                     .collect();
-            (!panels.is_empty())
-                .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
+            (!panels.is_empty()).then(|| {
+                cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels, state.lang))
+            })
         };
         let left_extension_panels = {
             let root = state.settings.active_workspace_root();
@@ -1305,8 +1308,9 @@ impl Shell {
                     .into_iter()
                     .filter(|panel| panel.location == ferris_sdk::ui::PanelLocation::Left)
                     .collect();
-            (!panels.is_empty())
-                .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
+            (!panels.is_empty()).then(|| {
+                cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels, state.lang))
+            })
         };
         let right_extension_panels = {
             let root = state.settings.active_workspace_root();
@@ -1316,8 +1320,9 @@ impl Shell {
                     .into_iter()
                     .filter(|panel| panel.location == ferris_sdk::ui::PanelLocation::Right)
                     .collect();
-            (!panels.is_empty())
-                .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
+            (!panels.is_empty()).then(|| {
+                cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels, state.lang))
+            })
         };
         let bottom_extension_panels = {
             let root = state.settings.active_workspace_root();
@@ -1327,8 +1332,9 @@ impl Shell {
                     .into_iter()
                     .filter(|panel| panel.location == ferris_sdk::ui::PanelLocation::Bottom)
                     .collect();
-            (!panels.is_empty())
-                .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels)))
+            (!panels.is_empty()).then(|| {
+                cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(panels, state.lang))
+            })
         };
         // A workspace file written before the model became session-scoped
         // still names one. It is handed to the session that is now open, once,
@@ -1510,6 +1516,9 @@ impl Shell {
         let extension_search = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(crate::i18n::tr(lang, "settings.extensionsSearch"))
+        });
+        let tools_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.toolsSearch"))
         });
         let task_name = cx.new(|cx| InputState::new(window, cx));
         let task_prompt = cx.new(|cx| InputState::new(window, cx));
@@ -1736,6 +1745,21 @@ impl Shell {
             ),
             cx.subscribe_in(
                 &extension_search,
+                window,
+                |_this: &mut Shell,
+                 _state: &Entity<InputState>,
+                 event: &InputEvent,
+                 _window: &mut Window,
+                 cx: &mut Context<Shell>| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                },
+            ),
+            // The Tools tab filters while it renders, like the Installed tab, so
+            // a keystroke only has to schedule the frame that reads the field.
+            cx.subscribe_in(
+                &tools_search,
                 window,
                 |_this: &mut Shell,
                  _state: &Entity<InputState>,
@@ -2110,6 +2134,7 @@ impl Shell {
             right_search_scope: super::right_panel::RightSearchScope::All,
             task_search,
             extension_search,
+            tools_search,
             task_name,
             task_prompt,
             task_every,
@@ -3050,6 +3075,7 @@ impl Shell {
         }
         self.extension_themes = Some(themes);
         let panels = crate::extension::panels(&self.state.settings, workspace.as_deref(), None);
+        let lang = self.state.lang;
         let take = |location: PanelLocation| {
             panels
                 .iter()
@@ -3059,16 +3085,16 @@ impl Shell {
         };
         let center = take(PanelLocation::Center);
         self.center_extension_panels = (!center.is_empty())
-            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(center)));
+            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(center, lang)));
         let left = take(PanelLocation::Left);
         self.left_extension_panels = (!left.is_empty())
-            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(left)));
+            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(left, lang)));
         let right = take(PanelLocation::Right);
         self.right_extension_panels = (!right.is_empty())
-            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(right)));
+            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(right, lang)));
         let bottom = take(PanelLocation::Bottom);
         self.bottom_extension_panels = (!bottom.is_empty())
-            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(bottom)));
+            .then(|| cx.new(|_| crate::ui::extension_panel::ExtensionPanelView::new(bottom, lang)));
         self.publish_config_changed();
     }
 

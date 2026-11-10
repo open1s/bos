@@ -34825,6 +34825,88 @@ fn the_extensions_pane_renders_its_inventory(cx: &mut TestAppContext) {
     );
 }
 
+/// Type into the Tools tab's filter field.
+///
+/// The harness's `set_value` does not fire the kit's `InputEvent::Change`, so
+/// the frame that reads the field is requested here, the way the queue-draft
+/// helper does it.
+fn set_tools_query(shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &str) {
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell
+                .tools_search
+                .update(cx, |input, cx| input.set_value(text, window, cx));
+            cx.notify();
+        });
+    });
+}
+
+/// The Tools and skills tab filters its rows through its own field.
+///
+/// The row draws a name, a category badge and a one-line description, so the
+/// field answers to all three - the seeded rows differ on each axis, and the
+/// query below matches only through the badge.
+#[gpui::test]
+fn the_tools_tab_filters_its_rows(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("tools-filter"));
+        let section = section_index("extensions").expect("the extensions index");
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, Some(section), state, cx);
+            shell.extensions_tab = 5;
+            shell.caps = vec![
+                crate::caps::CapInfo {
+                    name: "bash".to_string(),
+                    description: "Run a shell command".to_string(),
+                    category: "tool".to_string(),
+                },
+                crate::caps::CapInfo {
+                    name: "code-review".to_string(),
+                    description: "Review a diff".to_string(),
+                    category: "skill".to_string(),
+                },
+            ];
+            shell
+        });
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("tools-search").is_some(),
+        "the Tools tab draws its filter field above the rows"
+    );
+    assert!(
+        cx.debug_bounds("cap-0").is_some() && cx.debug_bounds("cap-1").is_some(),
+        "an empty field lists every row"
+    );
+    let field = cx.debug_bounds("tools-search").expect("the filter field");
+    let web_row = cx
+        .debug_bounds("settings-web-tools")
+        .expect("the web-search master switch");
+    let first_row = cx.debug_bounds("cap-0").expect("the first row");
+    assert!(
+        web_row.bottom() <= field.top() && field.bottom() <= first_row.top(),
+        "the filter sits between the tool master switch and the rows it narrows"
+    );
+    set_tools_query(&shell, cx, "skill");
+    draw_until(cx, "the badge narrows the rows", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("cap-1").is_some() && cx.debug_bounds("cap-0").is_none()
+    });
+    set_tools_query(&shell, cx, "zzz");
+    draw_until(
+        cx,
+        "the no-match state replaces the rows",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.debug_bounds("tools-no-matches").is_some()
+                && cx.debug_bounds("cap-0").is_none()
+                && cx.debug_bounds("cap-1").is_none()
+        },
+    );
+}
+
 /// The Extensions rail cell opens the extension platform inventory, not the
 /// legacy plugin list.
 #[gpui::test]

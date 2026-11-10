@@ -168,6 +168,17 @@ pub(crate) fn section_index(id: &str) -> Option<usize> {
     })
 }
 
+/// Whether a tool or skill row matches the pane's filter query.
+///
+/// The row draws the name, the category badge and the one-line description, so
+/// all three answer to the field: searching `skill` or `run commands` finds the
+/// row whose badge or summary says so, not only one whose name happens to.
+fn cap_matches(query: &str, cap: &crate::caps::CapInfo) -> bool {
+    crate::state::matches(query, &cap.name)
+        || crate::state::matches(query, &cap.category)
+        || crate::state::matches(query, &cap.description)
+}
+
 /// The text fields the panes edit.
 ///
 /// The connection fields are not here any more: an endpoint belongs to a
@@ -7221,14 +7232,53 @@ impl Shell {
                 .child(self.switch("settings-web-tools", web, true, web_tools_action, cx)),
         )
         .into_any_element()];
+        // The filter sits where the list starts: it narrows the rows below it
+        // and leaves the tool's own master switch above it alone, the same
+        // shape the Installed tab gives its inventory.
+        let query = self.tools_search.read(cx).value().to_string();
+        rows.push(
+            div()
+                .mb(px(8.0))
+                .px(px(8.0))
+                .py(px(4.0))
+                .rounded(px(6.0))
+                .bg(rgb(theme::new_session_fill()))
+                .border_1()
+                .border_color(rgb(theme::border_soft()))
+                .debug_selector(|| "tools-search".to_string())
+                .child(Input::new(&self.tools_search).appearance(false))
+                .into_any_element(),
+        );
+        let matching = self
+            .caps
+            .iter()
+            .filter(|cap| cap_matches(&query, cap))
+            .count();
         if self.caps.is_empty() {
             rows.push(
-                txt(tr(self.state.lang, "settings.empty"), 13.0, theme::muted())
+                txt(tr(lang, "settings.empty"), 13.0, theme::muted())
                     .pt(px(10.0))
                     .into_any_element(),
             );
+        } else if matching == 0 {
+            rows.push(
+                div()
+                    .debug_selector(|| "tools-no-matches".to_string())
+                    .pt(px(10.0))
+                    .child(txt(
+                        tr(lang, "settings.toolsNoMatches"),
+                        13.0,
+                        theme::muted(),
+                    ))
+                    .into_any_element(),
+            );
         }
-        for (index, cap) in self.caps.iter().enumerate() {
+        for (index, cap) in self
+            .caps
+            .iter()
+            .enumerate()
+            .filter(|(_, cap)| cap_matches(&query, cap))
+        {
             let name = cap.name.clone();
             let category = cap.category.clone();
             let description = cap.description.clone();
@@ -7253,6 +7303,7 @@ impl Shell {
             rows.push(
                 div()
                     .id(SharedString::from(format!("cap-{index}")))
+                    .debug_selector(move || format!("cap-{index}"))
                     .py(px(8.0))
                     .flex()
                     .flex_row()
