@@ -88,6 +88,10 @@ struct WriteRequest {
 struct McpChild(Child);
 
 impl McpChild {
+    // Read only by kill_process_group, which is unix-only: Windows has no
+    // process group to signal, and an ungated accessor there is dead code that
+    // the Windows lint job turns into an error.
+    #[cfg(unix)]
     fn id(&self) -> u32 {
         self.0.id()
     }
