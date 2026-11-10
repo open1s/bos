@@ -287,6 +287,17 @@ Linux 构建依赖见 [Rust workflow](.github/workflows/rust.yml)。
 各版本支持的平台和安装格式以 Release 说明为准，每个版本均附带
 `SHA256SUMS` 校验文件。
 
+Linux 每个架构只发布一个 AppImage：
+
+```bash
+chmod +x bsh-<version>-linux-x86_64.AppImage
+./bsh-<version>-linux-x86_64.AppImage
+```
+
+镜像里带的是 bsh 以及发行版不保证提供的库；运行需要 glibc 2.35 以上和
+WebKitGTK 4.1，缺失时会直接给出要装的包名。宿主机没有 FUSE 2 时用
+`--appimage-extract-and-run` 运行；`--integrate` 安装菜单项，`--uninstall` 卸载。
+
 Tag 驱动的构建、签名和公证流程见
 [docs/bsh-release.md](docs/bsh-release.md)。
 

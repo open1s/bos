@@ -1,5 +1,31 @@
 # Changelog
 
+## v4.1.2 (2026-11-10)
+
+- **Linux ships one AppImage**: the `.deb`, `.rpm` and portable tarball are
+  gone, replaced by `bsh-<version>-linux-<arch>.AppImage`. The deb could not be
+  installed on Ubuntu 24.04 at all: its `Depends` came from the release
+  binary's full `ldd` closure, which included WebKitGTK's transitive
+  `libicu70`/`libunistring2` because the package was built on 22.04, and apt on
+  24.04 has neither. Packaging the app instead of declaring its dependencies
+  removes that whole class of failure.
+- **What the image carries, and why not WebKit**: bsh plus the libraries the
+  host's own WebKitGTK does not already load, computed at package time from
+  `ldd` - so the set maintains itself. WebKitGTK is a host prerequisite on
+  purpose: it resolves its helper processes and injected bundle at paths
+  compiled into the library, which no environment variable relocates, so a
+  bundled copy cannot be found without a mount namespace over `/usr`.
+- **Readable start-up failures**: `AppRun` checks glibc and every unresolved
+  library before the exec, and prints the one command the detected distribution
+  needs (`apt`, `dnf`, `pacman`, `zypper`) instead of a loader error. FUSE 2
+  is optional via `--appimage-extract-and-run`.
+- **Desktop integration without a package manager**: `--integrate` writes a
+  menu entry pointing at the image where it sits and `--uninstall` removes it,
+  compensating for the deleted deb's `.desktop` file and uninstall path.
+- **Verified on clean systems**: the release job runs the image in
+  `ubuntu:22.04`, `ubuntu:24.04`, `debian:12` and `fedora:41` containers with
+  WebKitGTK installed, and in one without it to prove the preflight fires.
+
 ## v4.1.1 (2026-11-10)
 
 - **Tool and skill discovery in the prompt**: the system prompt now opens with

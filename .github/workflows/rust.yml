@@ -238,15 +238,23 @@ jobs:
       - name: Check the release workflow and packagers
         run: bash scripts/ci/check-release-pipeline.sh
 
+      # AppRun is the only thing that runs before bsh, and it is plain shell, so
+      # it is testable without building or mounting an image.
+      - name: Test the AppImage entry point
+        run: bash scripts/ci/test-apprun.sh
+
       - name: Install the packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm
+          # libwebkit2gtk-4.1-0 is not for the app in this job: the packager
+          # derives the host-guaranteed library set from that library's own ldd
+          # output, and refuses to guess when it is absent.
+          sudo apt-get install -y libwebkit2gtk-4.1-0 squashfs-tools
 
-      # Run the real dpkg-deb/rpmbuild path with a stand-in binary. The release
-      # job supplies the built bsh; here the packaging logic, control files and
-      # RPM spec are under test, on every change.
-      - name: Build the Linux packages from a stand-in binary
+      # Run the real AppImage path with a stand-in binary. The release job
+      # supplies the built bsh; here the AppRun, the desktop entry, the library
+      # filter and the tool invocation are under test, on every change.
+      - name: Build the AppImage from a stand-in binary
         run: |
           # /usr/bin/true, not `command -v true`: true is a bash builtin, so
           # command -v prints the bare word and the packager rejects it.
@@ -255,12 +263,29 @@ jobs:
             --binary /usr/bin/true \
             --out target/ci-package
 
-      - name: Inspect the Linux packages
+      - name: Inspect the AppImage
         run: |
-          dpkg-deb --info target/ci-package/*.deb
-          rpm -qip target/ci-package/*.rpm
-          rpm -qp --requires target/ci-package/*.rpm
-          tar -tzf target/ci-package/*.tar.gz | sed -n '1,5p'
+          set -euo pipefail
+          image="$(readlink -f "$(ls target/ci-package/*.AppImage)")"
+          file "$image"
+          file "$image" | grep -q ELF
+          # --appimage-extract needs no FUSE, so the payload is inspectable on a
+          # runner. Extract into a scratch directory and check the pieces the
+          # release depends on.
+          scratch="$(mktemp -d)"
+          ( cd "$scratch" && "$image" --appimage-extract > /dev/null )
+          root="$scratch/squashfs-root"
+          for path in AppRun usr/bin/bsh bsh.desktop bsh.png \
+                      usr/share/applications/bsh.desktop \
+                      usr/share/icons/hicolor/512x512/apps/bsh.png; do
+            if [[ ! -e "$root/$path" ]]; then
+              echo "::error::the AppImage is missing $path"
+              exit 1
+            fi
+          done
+          [[ -x "$root/AppRun" ]] || { echo "::error::AppRun is not executable"; exit 1; }
+          head -1 "$root/AppRun" | grep -qx '#!/bin/bash'
+          rm -rf "$scratch"
 
   packaging-macos:
     name: Validate the macOS packager

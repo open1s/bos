@@ -232,7 +232,8 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev \
-            libc++-dev libc++abi-dev libxml2-dev rpm
+            libc++-dev libc++abi-dev libxml2-dev \
+            squashfs-tools
 
       # Zig 0.16's libc++ headers need LLVM 21 symbols that jammy/noble's
       # default libc++ (14/18) does not export. Install LLVM 21's static
@@ -313,7 +314,7 @@ jobs:
             --binary target/release/bsh \
             --out dist
 
-      - name: Package Linux deb and tarball
+      - name: Package the Linux AppImage
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -321,6 +322,74 @@ jobs:
             --version "$VERSION" \
             --binary target/release/bsh \
             --out dist
+
+      # The AppImage is the only Linux artifact, so its start-up failure modes
+      # are release blockers: the self-mount (FUSE) and the host's WebKitGTK.
+      # This runner has libwebkit2gtk-4.1-dev, so a real --help proves the image
+      # starts; --appimage-extract-and-run is the FUSE-less path the release
+      # notes document, so it is the one exercised here.
+      - name: Smoke-test the AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$(ls dist/*.AppImage)"
+          "$image" --appimage-extract-and-run --help > /dev/null
+          echo "started $image"
+
+      # A self-contained image can still fail on a host that lacks WebKitGTK,
+      # and "clean distribution" is not a state any runner is in. These two
+      # cases are the whole portability contract, so they run against real
+      # images of the distributions the release notes name.
+      - name: Smoke-test the AppImage on clean distributions
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$(basename "$(ls dist/*.AppImage)")"
+          for distro in ubuntu:22.04 ubuntu:24.04 debian:12; do
+            echo "::group::$distro with WebKitGTK"
+            docker run --rm -v "$PWD/dist:/dist:ro" "$distro" bash -c "
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq libwebkit2gtk-4.1-0 > /dev/null
+              /dist/$image --appimage-extract-and-run --help > /dev/null
+              echo '$distro: started'
+            "
+            echo "::endgroup::"
+          done
+          echo "::group::fedora:41 with WebKitGTK"
+          docker run --rm -v "$PWD/dist:/dist:ro" fedora:41 bash -c "
+            set -e
+            dnf install -y -q webkit2gtk4.1 > /dev/null
+            /dist/$image --appimage-extract-and-run --help > /dev/null
+            echo 'fedora:41: started'
+          "
+          echo "::endgroup::"
+
+          # The negative case: without WebKitGTK the image must name the package
+          # that provides it instead of dying inside the loader.
+          echo "::group::ubuntu:24.04 without WebKitGTK"
+          set +e
+          output="$(docker run --rm -v "$PWD/dist:/dist:ro" ubuntu:24.04 \
+            bash -c "/dist/$image --appimage-extract-and-run --help" 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          echo "::endgroup::"
+          if [[ "$status" -eq 0 ]]; then
+            echo "::error::the image started on a host without WebKitGTK; the AppRun preflight did not fire"
+            exit 1
+          fi
+          if ! grep -q 'libwebkit2gtk-4.1.so.0' <<<"$output"; then
+            echo "::error::the preflight did not name the missing WebKitGTK library"
+            exit 1
+          fi
+          if ! grep -q 'apt install libwebkit2gtk-4.1-0' <<<"$output"; then
+            echo "::error::the preflight did not give the install command"
+            exit 1
+          fi
 
       - name: Prepare the Windows signing certificate
         if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE_PFX != ''
@@ -366,9 +435,7 @@ jobs:
           retention-days: 7
           path: |
             dist/*.dmg
-            dist/*.deb
-            dist/*.rpm
-            dist/*.tar.gz
+            dist/*.AppImage
             dist/*.msi
             dist/*.zip
 
@@ -396,13 +463,10 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          deb_version="$(printf '%s' "$VERSION" | sed 's/-/~/')"
           expected=(
             "bsh-${VERSION}-macos-arm64.dmg"
             "bsh-${VERSION}-macos-arm64.app.zip"
-            "bsh-${VERSION}-linux-x86_64.tar.gz"
-            "bsh_${deb_version}_amd64.deb"
-            "bsh-${VERSION}-linux-x86_64.rpm"
+            "bsh-${VERSION}-linux-x86_64.AppImage"
             "bsh-${VERSION}-windows-x64.zip"
             "bsh-${VERSION}-windows-x64.msi"
             "bsh-${VERSION}-windows-arm64.zip"
@@ -453,9 +517,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist/*.dmg
-            dist/*.deb
-            dist/*.rpm
-            dist/*.tar.gz
+            dist/*.AppImage
             dist/*.msi
             dist/*.zip
             dist/SHA256SUMS

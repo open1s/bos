@@ -289,6 +289,19 @@ Prebuilt installers are published on the
 platform coverage are listed with each release. Each release carries
 `SHA256SUMS`.
 
+Linux ships one AppImage per architecture:
+
+```bash
+chmod +x bsh-<version>-linux-x86_64.AppImage
+./bsh-<version>-linux-x86_64.AppImage
+```
+
+The image carries bsh and the libraries your distribution is not guaranteed to
+have. It needs glibc 2.35 or newer and WebKitGTK 4.1, and names the package to
+install when that is missing. On a host without FUSE 2, run it with
+`--appimage-extract-and-run`; `--integrate` adds a menu entry and `--uninstall`
+removes it.
+
 The tag-driven build, signing and notarization setup is documented in
 [docs/bsh-release.md](docs/bsh-release.md).
 

@@ -11,7 +11,6 @@ set -euo pipefail
 
 version="${1:?usage: release-notes.sh <version>}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-deb_version="$(printf '%s' "$version" | sed 's/-/~/')"
 
 section="$(
   awk -v tag="v$version" '
@@ -46,15 +45,31 @@ section="$(printf '%s\n' "$section" | sed '/./,$!d')"
 | Platform | Artifact | How |
 |---|---|---|
 | macOS (Apple silicon) | `bsh-@VERSION@-macos-arm64.dmg` | Open the dmg, drag **BSH** to Applications. |
-| Linux (x86_64) | `bsh_@DEB@_amd64.deb` / `bsh-@VERSION@-linux-x86_64.rpm` | `sudo apt install ./bsh_@DEB@_amd64.deb` or `sudo dnf install ./bsh-@VERSION@-linux-x86_64.rpm` |
-| Linux (arm64, when available) | `bsh_@DEB@_arm64.deb` / `bsh-@VERSION@-linux-aarch64.rpm` | Same, on an arm64 machine. |
-| Linux (portable) | `bsh-@VERSION@-linux-<arch>.tar.gz` | `tar xzf ...` then `./install.sh` (installs to `~/.local`; `PREFIX` overrides). |
+| Linux (x86_64) | `bsh-@VERSION@-linux-x86_64.AppImage` | `chmod +x` it and run it. Needs glibc 2.35 and WebKitGTK 4.1. |
+| Linux (arm64, when available) | `bsh-@VERSION@-linux-aarch64.AppImage` | Same, on an arm64 machine with glibc 2.39. |
 | Windows (x64) | `bsh-@VERSION@-windows-x64.msi` | Per-user install, no administrator rights required. |
 | Windows (arm64) | `bsh-@VERSION@-windows-arm64.msi` | Same, on Windows on Arm. |
 | Windows (portable) | `bsh-@VERSION@-windows-<arch>.zip` | Unzip and run `bsh.exe`. |
 
 The `.app.zip` files are the same signed bundles as the dmgs, for tools that
 prefer a zip.
+
+The Linux AppImage is one file per architecture; there is no deb, rpm or tarball.
+It carries bsh and the libraries your distribution is not guaranteed to have, and
+it deliberately does not carry WebKitGTK: WebKitGTK finds its helper processes at
+absolute paths compiled into the library, which no environment variable can
+relocate, so a copy inside the image could not be found. The one package it needs
+is named for you when it is missing.
+
+```bash
+chmod +x bsh-@VERSION@-linux-x86_64.AppImage
+./bsh-@VERSION@-linux-x86_64.AppImage                 # run
+./bsh-@VERSION@-linux-x86_64.AppImage --integrate     # add a menu entry
+```
+
+If it reports `Cannot mount AppImage`, this host has no FUSE 2: either install
+`libfuse2t64` (Ubuntu 24.04+) or `libfuse2` (22.04, Debian 12), or run it
+without FUSE: `./bsh-@VERSION@-linux-x86_64.AppImage --appimage-extract-and-run`.
 
 ## Verification
 
@@ -73,12 +88,13 @@ sha256sum --check SHA256SUMS
   **System Settings > Privacy & Security > Open Anyway**, or clear the
   quarantine attribute:
   `xattr -dr com.apple.quarantine /Applications/BSH.app`.
-- **Linux** x86_64 builds need glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+);
-  arm64 builds need glibc 2.39 (Ubuntu 24.04+, Debian 13+). The arm64 job is
-  best-effort because GitHub's free arm64 runners are periodically preempted;
-  a release may carry only the x86_64 Linux packages. The WebView pane needs
-  WebKitGTK 4.1, which the `.deb` declares and the `.rpm` discovers by soname.
-  The RPM is unsigned. A Wayland or X11 session is required.
+- **Linux** x86_64 builds need glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+)
+  and WebKitGTK 4.1 (`libwebkit2gtk-4.1-0` on Debian and Ubuntu,
+  `webkit2gtk4.1` on Fedora, `webkit2gtk-4.1` on Arch); arm64 builds need
+  glibc 2.39 (Ubuntu 24.04+, Debian 13+). The arm64 job is best-effort because
+  GitHub's free arm64 runners are periodically preempted, so a release may carry
+  only the x86_64 image. A Wayland or X11 session is required. There is no
+  self-update: a new release replaces the file.
 - **Windows** builds are x64 and arm64 (Windows on Arm), and unsigned unless
   the Windows signing secret is configured. The terminal pane is not available on Windows yet: the vendored
   Ghostty surface only implements macOS and Wayland, so the pane reports that
@@ -89,4 +105,4 @@ sha256sum --check SHA256SUMS
 Release automation and signing setup:
 https://github.com/open1s/bos/blob/main/docs/bsh-release.md
 TEMPLATE
-} | sed -e "s/@VERSION@/$version/g" -e "s/@DEB@/$deb_version/g"
+} | sed -e "s/@VERSION@/$version/g"
