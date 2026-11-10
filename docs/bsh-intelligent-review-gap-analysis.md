@@ -6,7 +6,7 @@
 - **Baseline:** BSH working copy slkkupuqztnx
 - **Companion RFC:** [BSH Intelligent Review 架构 RFC](bsh-intelligent-review-rfc.md)
 - **Method:** 对当前工作副本做静态代码审查；没有把任何“计划中的能力”当成已实现。本文不是 release audit，文件行号以 baseline 为准。
-- **Implementation update:** 2026-11-09 的 MVP 已关闭 P0 的领域/存储/精确文件捕获，以及 P1 的 Review tab、结构 diff、digest-bound decision、Task/Audit 链接与跨 changeset 的 Audit decision timeline。下面的 Gap Register 保留为**实现前基线**；仍未关闭的项在 RFC 第 0 节列出。
+- **Implementation update:** 2026-11-09 的 MVP 已关闭 P0 的领域/存储/精确文件捕获，以及 P1 的 Review tab、结构 diff、digest-bound decision、Task/Audit 链接与跨 changeset 的 Audit decision timeline。2026-11-10 又补齐了 Review -> full Diff、finding -> change、tool/provenance、验证区与结构父节点缩进；逐项 feature matrix 见 [bsh-diff-architecture-audit.md](bsh-diff-architecture-audit.md)。下面的 Gap Register 保留为**实现前基线**；仍未关闭的项（验证生产者、多格式语义、rationale 输入等）在 RFC 第 0 节与审计文档第 3 节列出。
 
 ---
 

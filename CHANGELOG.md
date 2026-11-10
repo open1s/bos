@@ -5,10 +5,14 @@
 - **Intelligent Review (MVP)**: file tools now capture exact before/after
   snapshots into a content-addressed store under .bsh/review; text and
   tree-sitter structural diffs are derived from those snapshots, a new Review
-  tab renders changes, findings and digest-bound decisions, task attempts
-  plus the Audit tab link to the captured changeset, and Audit shows every
-  review decision across changesets as a timeline. Binary changes report byte counts, and images also report
-  their dimensions. Shell output remains explicitly unattributed, while
+  tab renders changes, findings, verification placeholders, tool provenance and
+  digest-bound decisions, task attempts plus the Audit tab link to the captured
+  changeset, and Audit shows every review decision across changesets as a
+  timeline. Any changed file can open the full Diff pane (split/unified,
+  syntax, wrapping) from its snapshots, structural rows keep their parent
+  indentation, and findings open the change they name. Binary changes report
+  byte counts, and images also report their dimensions. Shell output remains
+  explicitly unattributed, verification evidence has no producer yet, and
   PDF/document/archive support is metadata-level in this cut.
 - **Pane fit**: the Trajectory, Audit and Review tabs now fit the centre column
   at any width. Their side columns take a share of a narrowed pane instead of

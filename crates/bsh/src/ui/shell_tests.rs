@@ -2356,6 +2356,31 @@ fn review_tab_renders_a_captured_changeset(cx: &mut TestAppContext) {
         cx.debug_bounds("review-change-list").is_some(),
         "the captured change is listed"
     );
+    assert!(
+        cx.debug_bounds("review-verifications").is_some(),
+        "the verification section is present"
+    );
+    assert!(
+        cx.debug_bounds("review-findings").is_some(),
+        "the findings section is present"
+    );
+
+    // A selected change hands its snapshots to the full Diff pane, so split
+    // view, syntax highlighting and the rest of that surface are reachable.
+    let row = cx
+        .debug_bounds("review-change-row")
+        .expect("the change row is painted");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the selected diff detail", 20, |cx| {
+        cx.debug_bounds("review-open-diff").is_some()
+    });
+    let open = cx
+        .debug_bounds("review-open-diff")
+        .expect("the Diff handoff is painted");
+    cx.simulate_click(open.center(), Modifiers::default());
+    draw_until(cx, "the full Diff pane", 20, |cx| {
+        cx.debug_bounds("diff-pane").is_some()
+    });
 
     // The Audit tab joins every decision, in the order it happened.
     cx.update(|_, cx| {

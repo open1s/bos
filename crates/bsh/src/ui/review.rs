@@ -12,7 +12,8 @@ use super::shell::Shell;
 use super::{icon, txt, DivExt, IconName};
 use crate::i18n::{tr, tr_args};
 use crate::review::domain::{
-    CaptureMode, Decision, FileDiff, ReviewSnapshot, ReviewStatus, RiskLevel, Severity,
+    CaptureMode, Change, ChangeKind, ChangeSet, Decision, FileDiff, ReviewSnapshot, ReviewStatus,
+    RiskLevel, Severity,
 };
 use crate::theme;
 
@@ -91,6 +92,9 @@ impl Shell {
             .as_ref()
             .filter(|id| changeset.changes.iter().any(|change| &change.id == *id))
             .cloned();
+        let selected_change = selected
+            .as_ref()
+            .and_then(|id| changeset.changes.iter().find(|change| &change.id == id));
         let diff = selected.as_ref().and_then(|id| {
             let guard = self.review_diff.borrow();
             guard
@@ -178,6 +182,9 @@ impl Shell {
                     .min_w_0()
                     .child(txt(tr(lang, "review.changes"), 16.0, theme::text()))
                     .child(txt(counts, 11.5, theme::faint()))
+                    .when_some(scope_line(changeset, lang), |column, scope| {
+                        column.child(txt(scope, 10.5, theme::faint()))
+                    })
                     .child(
                         div()
                             .flex()
@@ -233,9 +240,25 @@ impl Shell {
         for change in &changeset.changes {
             let active = selected.as_deref() == Some(change.id.as_str());
             let change_clone = change.clone();
+            let mut tools: Vec<&str> = Vec::new();
+            for revision in &change.revisions {
+                if let Some(tool) = &revision.tool {
+                    if !tools.contains(&tool.name.as_str()) {
+                        tools.push(tool.name.as_str());
+                    }
+                }
+            }
+            let tool_label = tools.first().map(|tool| {
+                if tools.len() > 1 {
+                    format!("{tool} +{}", tools.len() - 1)
+                } else {
+                    (*tool).to_string()
+                }
+            });
             changes = changes.child(
                 div()
                     .id(format!("review-change-{}", change.id))
+                    .debug_selector(|| "review-change-row".to_string())
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
@@ -262,17 +285,31 @@ impl Shell {
                             .flex_row()
                             .gap(px(6.0))
                             .child(txt(change_kind(lang, &change.kind), 10.0, theme::faint()))
+                            .when_some(tool_label, |row, tool| {
+                                row.child(txt(tool, 10.0, theme::faint()).min_w_0().text_ellipsis())
+                            })
                             .child(txt(
                                 format!("{} rev", change.revisions.len()),
                                 10.0,
                                 theme::faint(),
                             )),
-                    ),
+                    )
+                    .when(matches!(&change.kind, ChangeKind::Renamed { .. }), |row| {
+                        let from = match &change.kind {
+                            ChangeKind::Renamed { from } => from.workspace_relative.clone(),
+                            _ => String::new(),
+                        };
+                        row.child(txt(
+                            format!("{from} → {}", change.path.workspace_relative),
+                            10.0,
+                            theme::faint(),
+                        ))
+                    }),
             );
         }
 
-        let findings = findings_section(&snapshot, lang);
-        let detail = self.review_detail(diff.as_ref(), lang);
+        let findings = findings_section(&snapshot, lang, cx);
+        let detail = self.review_detail(selected_change, diff.as_ref(), lang, cx);
         let body = div()
             .flex()
             .flex_row()
@@ -291,6 +328,7 @@ impl Shell {
                     .flex_col()
                     .gap(px(12.0))
                     .overflow_y_scroll()
+                    .child(verifications_section(&snapshot, lang))
                     .child(findings)
                     .child(detail),
             );
@@ -327,7 +365,13 @@ impl Shell {
         }
     }
 
-    fn review_detail(&self, diff: Option<&FileDiff>, lang: crate::i18n::Lang) -> AnyElement {
+    fn review_detail(
+        &self,
+        change: Option<&Change>,
+        diff: Option<&FileDiff>,
+        lang: crate::i18n::Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(diff) = diff else {
             return div()
                 .flex()
@@ -338,6 +382,8 @@ impl Shell {
                 .child(txt(tr(lang, "review.selectHint"), 12.0, theme::faint()))
                 .into_any_element();
         };
+        let show_open = change.is_some() && !diff.binary && !diff.lines.is_empty();
+        let change_for_diff = change.cloned();
         let mut detail = div().flex().flex_col().gap(px(8.0));
         detail = detail.child(
             div()
@@ -365,6 +411,38 @@ impl Shell {
                         ))
                         .when(diff.binary, |row| {
                             row.child(txt(tr(lang, "review.binary"), 10.5, theme::warn()))
+                        })
+                        .when(show_open, |row| {
+                            row.child(
+                                div()
+                                    .debug_selector(|| "review-open-diff".to_string())
+                                    .id("review-open-diff")
+                                    .px(px(8.0))
+                                    .py(px(3.0))
+                                    .rounded(px(6.0))
+                                    .border_1()
+                                    .border_color(rgb(theme::border()))
+                                    .cursor_pointer()
+                                    .hover(|button| button.bg(rgb(theme::hover())))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let Some(change) = change_for_diff.as_ref() else {
+                                            return;
+                                        };
+                                        match this.state.review_patch(change) {
+                                            Some(patch) => this.open_diff_text(
+                                                &change.path.workspace_relative,
+                                                &patch,
+                                                cx,
+                                            ),
+                                            None => {
+                                                this.state
+                                                    .notice(tr(lang, "review.diffUnavailable"));
+                                                cx.notify();
+                                            }
+                                        }
+                                    }))
+                                    .child(txt(tr(lang, "review.openDiff"), 10.0, theme::text())),
+                            )
                         }),
                 ),
         );
@@ -379,9 +457,27 @@ impl Shell {
             );
         }
         if !diff.structural.is_empty() {
+            let parents: std::collections::HashMap<&str, &str> = diff
+                .structural
+                .iter()
+                .filter_map(|node| {
+                    node.parent
+                        .as_deref()
+                        .map(|parent| (node.id.as_str(), parent))
+                })
+                .collect();
             let mut structure = div().flex().flex_col().gap(px(3.0));
             structure = structure.child(txt(tr(lang, "review.structure"), 12.0, theme::muted()));
             for node in diff.structural.iter().take(200) {
+                let mut depth = 0usize;
+                let mut cursor = node.parent.as_deref();
+                while let Some(parent) = cursor {
+                    depth += 1;
+                    if depth >= 4 {
+                        break;
+                    }
+                    cursor = parents.get(parent).copied();
+                }
                 let color = match node.change.as_str() {
                     "added" => theme::success(),
                     "removed" => theme::error(),
@@ -394,7 +490,8 @@ impl Shell {
                         .flex_row()
                         .items_center()
                         .gap(px(8.0))
-                        .px(px(8.0))
+                        .pl(px(8.0 + 8.0 * depth as f32))
+                        .pr(px(8.0))
                         .py(px(4.0))
                         .rounded(px(6.0))
                         .bg(rgb(theme::page()))
@@ -493,37 +590,155 @@ impl Shell {
     }
 }
 
-fn findings_section(snapshot: &ReviewSnapshot, lang: crate::i18n::Lang) -> AnyElement {
-    let mut section = div().flex().flex_col().gap(px(4.0));
+fn verifications_section(snapshot: &ReviewSnapshot, lang: crate::i18n::Lang) -> AnyElement {
+    let count = snapshot.review.verifications.len();
+    let title = if count == 0 {
+        tr(lang, "review.verificationsTitle")
+    } else {
+        tr_args(
+            lang,
+            "review.verifications",
+            &[("count", count.to_string())],
+        )
+    };
+    let mut section = div()
+        .debug_selector(|| "review-verifications".to_string())
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(txt(title, 12.0, theme::muted()));
+    if count == 0 {
+        return section
+            .child(txt(
+                tr(lang, "review.noVerifications"),
+                11.0,
+                theme::faint(),
+            ))
+            .into_any_element();
+    }
+    for verification in snapshot.review.verifications.iter().take(20) {
+        let status = verification.status.to_ascii_lowercase();
+        let color =
+            if status.contains("pass") || status.contains("ok") || status.contains("success") {
+                theme::success()
+            } else if status.contains("fail") || status.contains("error") {
+                theme::error()
+            } else {
+                theme::warn()
+            };
+        let mut row = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(9.0))
+            .py(px(6.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::page()))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(txt(verification.kind.clone(), 10.0, theme::faint()))
+                    .child(txt(verification.status.clone(), 10.0, color))
+                    .when_some(verification.exit_code, |line, code| {
+                        line.child(txt(
+                            tr_args(
+                                lang,
+                                "review.verification.exit",
+                                &[("code", code.to_string())],
+                            ),
+                            10.0,
+                            theme::faint(),
+                        ))
+                    }),
+            )
+            .child(txt(verification.summary.clone(), 10.5, theme::muted()));
+        if let Some(command) = &verification.command {
+            row = row.child(
+                txt(command.clone(), 10.0, theme::faint())
+                    .font_family(theme::CODE_FONT)
+                    .whitespace_nowrap()
+                    .text_ellipsis(),
+            );
+        }
+        section = section.child(row);
+    }
+    section.into_any_element()
+}
+
+fn findings_section(
+    snapshot: &ReviewSnapshot,
+    lang: crate::i18n::Lang,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
+    let mut section = div()
+        .debug_selector(|| "review-findings".to_string())
+        .flex()
+        .flex_col()
+        .gap(px(4.0));
     section = section.child(txt(tr(lang, "review.findings"), 12.0, theme::muted()));
     if snapshot.review.findings.is_empty() {
         section = section.child(txt(tr(lang, "review.noFindings"), 11.0, theme::faint()));
         return section.into_any_element();
     }
-    for finding in &snapshot.review.findings {
+    for (index, finding) in snapshot.review.findings.iter().enumerate() {
         let color = severity_color(finding.severity);
-        section = section.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .px(px(9.0))
-                .py(px(6.0))
-                .rounded(px(8.0))
-                .bg(rgb(theme::page()))
-                .border_1()
-                .border_color(rgb(theme::border_soft()))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(txt(severity_label(lang, finding.severity), 9.5, color))
-                        .child(txt(finding.title.clone(), 11.5, theme::text())),
-                )
-                .child(txt(finding.detail.clone(), 10.5, theme::muted())),
-        );
+        let target = finding.change_id.as_ref().and_then(|id| {
+            snapshot
+                .changeset
+                .changes
+                .iter()
+                .find(|change| &change.id == id)
+                .cloned()
+        });
+        let row = div()
+            .id(format!("review-finding-{index}"))
+            .debug_selector(|| "review-finding-row".to_string())
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(9.0))
+            .py(px(6.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::page()))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .when(target.is_some(), |row| {
+                row.cursor_pointer()
+                    .hover(|row| row.bg(rgb(theme::hover())))
+            })
+            .when_some(target, |row, change| {
+                row.on_click(cx.listener(move |this, _, _, cx| {
+                    let diff = this.state.review_diff(&change);
+                    this.review_selected = Some(change.id.clone());
+                    *this.review_diff.borrow_mut() = Some((change.id.clone(), diff));
+                    cx.notify();
+                }))
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(txt(severity_label(lang, finding.severity), 9.5, color))
+                    .child(txt(finding.title.clone(), 11.5, theme::text())),
+            )
+            .child(txt(finding.detail.clone(), 10.5, theme::muted()));
+        let row = if finding.evidence.is_empty() {
+            row
+        } else {
+            row.child(div().flex().flex_row().flex_wrap().gap(px(6.0)).children(
+                finding.evidence.iter().take(4).map(|evidence| {
+                    txt(evidence.label.clone(), 9.5, theme::faint()).font_family(theme::CODE_FONT)
+                }),
+            ))
+        };
+        section = section.child(row);
     }
     section.into_any_element()
 }
@@ -626,6 +841,32 @@ fn change_kind(lang: crate::i18n::Lang, kind: &crate::review::domain::ChangeKind
             crate::review::domain::ChangeKind::Unchanged => "review.change.unchanged",
         },
     )
+}
+
+fn scope_line(changeset: &ChangeSet, lang: crate::i18n::Lang) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(turn) = changeset.turn.as_deref() {
+        parts.push(tr_args(lang, "review.turn", &[("id", short_id(turn))]));
+    }
+    if let Some(task) = changeset.task.as_deref() {
+        parts.push(tr_args(lang, "review.task", &[("id", short_id(task))]));
+    }
+    if let Some(attempt) = changeset.attempt.as_deref() {
+        parts.push(tr_args(
+            lang,
+            "review.attempt",
+            &[("id", short_id(attempt))],
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 fn short_digest(digest: Option<&str>) -> String {

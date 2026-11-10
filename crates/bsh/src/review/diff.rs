@@ -108,6 +108,39 @@ pub(crate) fn build(store: &ReviewStore, change: &Change) -> FileDiff {
     }
 }
 
+/// Build a unified patch for a change, for the kit's full Diff pane.
+///
+/// The Review row is a compact read-only view; the Diff pane owns split view,
+/// syntax highlighting, wrapping and the conflict surface. Handing it the same
+/// snapshots as a real patch keeps one comparison engine instead of two.
+pub(crate) fn build_patch(store: &ReviewStore, change: &Change) -> Option<String> {
+    let first = change.revisions.first()?;
+    let last = change.revisions.last()?;
+    if is_binary(&first.before) || is_binary(&last.after) {
+        return None;
+    }
+    let old = side_text(store, &first.before)?;
+    let new = side_text(store, &last.after)?;
+    if old.len() > MAX_DIFF_TEXT || new.len() > MAX_DIFF_TEXT {
+        return None;
+    }
+    let path = &change.path.workspace_relative;
+    let old_label = if matches!(&first.before, SnapshotState::Absent) {
+        "/dev/null".to_string()
+    } else {
+        format!("a/{path}")
+    };
+    let new_label = if matches!(&last.after, SnapshotState::Absent) {
+        "/dev/null".to_string()
+    } else {
+        format!("b/{path}")
+    };
+    let diff = TextDiff::from_lines(&old, &new);
+    let mut unified = diff.unified_diff();
+    unified.header(&old_label, &new_label).context_radius(3);
+    Some(unified.to_string())
+}
+
 fn kind_label(change: &Change) -> String {
     match &change.kind {
         super::domain::ChangeKind::Created => "created",
@@ -229,6 +262,7 @@ struct Definition {
     name: String,
     line: u32,
     text: String,
+    parent: Option<String>,
 }
 
 fn structural_diff(path: &str, old: &str, new: &str) -> Vec<StructuralNode> {
@@ -261,16 +295,23 @@ fn definitions(lang: Lang, source: &str) -> BTreeMap<String, Definition> {
         return BTreeMap::new();
     };
     let mut out = BTreeMap::new();
-    walk_definitions(tree.root_node(), source.as_bytes(), lang, &mut out);
+    walk_definitions(tree.root_node(), source.as_bytes(), lang, None, &mut out);
     out
 }
 
-fn walk_definitions(node: Node, source: &[u8], lang: Lang, out: &mut BTreeMap<String, Definition>) {
+fn walk_definitions(
+    node: Node,
+    source: &[u8],
+    lang: Lang,
+    parent: Option<&str>,
+    out: &mut BTreeMap<String, Definition>,
+) {
     if let Some(kind) = structural_kind(lang, node.kind()) {
         if let Some(name) = definition_name(node, source) {
             let key = format!("{kind}:{name}");
             let line = node.start_position().row as u32 + 1;
-            out.entry(key).or_insert_with(|| {
+            let parent = parent.map(str::to_string);
+            out.entry(key.clone()).or_insert_with(|| {
                 let text = node
                     .utf8_text(source)
                     .map(|text| text.to_string())
@@ -280,13 +321,19 @@ fn walk_definitions(node: Node, source: &[u8], lang: Lang, out: &mut BTreeMap<St
                     name,
                     line,
                     text,
+                    parent,
                 }
             });
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk_definitions(child, source, lang, Some(&key), out);
+            }
+            return;
         }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_definitions(child, source, lang, out);
+        walk_definitions(child, source, lang, parent, out);
     }
 }
 
@@ -352,8 +399,7 @@ fn compare_definitions(
             Some(new) if old.text == new.text && old.line == new.line => {}
             Some(new) if old.text == new.text => nodes.push(node_for(
                 key,
-                old.kind,
-                &old.name,
+                old,
                 "moved",
                 Some(old.line),
                 Some(new.line),
@@ -361,8 +407,7 @@ fn compare_definitions(
             )),
             Some(new) => nodes.push(node_for(
                 key,
-                old.kind,
-                &old.name,
+                old,
                 "modified",
                 Some(old.line),
                 Some(new.line),
@@ -370,8 +415,7 @@ fn compare_definitions(
             )),
             None => nodes.push(node_for(
                 key,
-                old.kind,
-                &old.name,
+                old,
                 "removed",
                 Some(old.line),
                 None,
@@ -383,8 +427,7 @@ fn compare_definitions(
         if !before.contains_key(key) {
             nodes.push(node_for(
                 key,
-                new.kind,
-                &new.name,
+                new,
                 "added",
                 None,
                 Some(new.line),
@@ -402,8 +445,7 @@ fn compare_definitions(
 
 fn node_for(
     key: &str,
-    kind: &'static str,
-    name: &str,
+    definition: &Definition,
     change: &'static str,
     old_line: Option<u32>,
     new_line: Option<u32>,
@@ -411,9 +453,9 @@ fn node_for(
 ) -> StructuralNode {
     StructuralNode {
         id: key.to_string(),
-        parent: None,
-        kind: kind.to_string(),
-        qualified_name: name.to_string(),
+        parent: definition.parent.clone(),
+        kind: definition.kind.to_string(),
+        qualified_name: definition.name.clone(),
         change: change.to_string(),
         old_line,
         new_line,
@@ -519,6 +561,16 @@ fn config_node(
     }
 }
 
+fn section_definition(name: &str, line: u32) -> Definition {
+    Definition {
+        kind: "section",
+        name: name.to_string(),
+        line,
+        text: String::new(),
+        parent: None,
+    }
+}
+
 fn markdown_diff(old: &str, new: &str) -> Vec<StructuralNode> {
     let old = headings(old);
     let new = headings(new);
@@ -528,8 +580,7 @@ fn markdown_diff(old: &str, new: &str) -> Vec<StructuralNode> {
             Some(next) if next == line => {}
             Some(next) => nodes.push(node_for(
                 &format!("section:{name}"),
-                "section",
-                name,
+                &section_definition(name, *line),
                 "moved",
                 Some(*line),
                 Some(*next),
@@ -537,8 +588,7 @@ fn markdown_diff(old: &str, new: &str) -> Vec<StructuralNode> {
             )),
             None => nodes.push(node_for(
                 &format!("section:{name}"),
-                "section",
-                name,
+                &section_definition(name, *line),
                 "removed",
                 Some(*line),
                 None,
@@ -550,8 +600,7 @@ fn markdown_diff(old: &str, new: &str) -> Vec<StructuralNode> {
         if !old.contains_key(name) {
             nodes.push(node_for(
                 &format!("section:{name}"),
-                "section",
-                name,
+                &section_definition(name, *line),
                 "added",
                 None,
                 Some(*line),
@@ -649,6 +698,18 @@ mod tests {
     }
 
     #[test]
+    fn a_patch_carries_both_sides_to_the_diff_pane() {
+        let root = std::env::temp_dir().join(format!("bsh-patch-{}", std::process::id()));
+        let (store, change) = change_with(&root, "src/lib.rs", "fn old() {}\n", "fn new() {}\n");
+        let patch = build_patch(&store, &change).expect("a unified patch");
+        assert!(patch.contains("--- a/src/lib.rs"), "{patch}");
+        assert!(patch.contains("+++ b/src/lib.rs"), "{patch}");
+        assert!(patch.contains("-fn old() {}"), "{patch}");
+        assert!(patch.contains("+fn new() {}"), "{patch}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rust_structure_names_the_changed_function() {
         let root = std::env::temp_dir().join(format!("bsh-diff-rust-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -664,6 +725,25 @@ mod tests {
             .structural
             .iter()
             .any(|node| node.qualified_name == "changed" && node.change == "modified"));
+    }
+
+    #[test]
+    fn a_method_names_its_impl_parent() {
+        let root = std::env::temp_dir().join(format!("bsh-parent-{}", std::process::id()));
+        let (store, change) = change_with(
+            &root,
+            "src/lib.rs",
+            "struct A;\nimpl A { fn old() {} }\n",
+            "struct A;\nimpl A { fn new() {} }\n",
+        );
+        let diff = build(&store, &change);
+        let method = diff
+            .structural
+            .iter()
+            .find(|node| node.kind == "function" && node.qualified_name == "old")
+            .expect("the removed method");
+        assert_eq!(method.parent.as_deref(), Some("impl:A"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -786,6 +866,9 @@ mod tests {
         assert_eq!(diff.added, 2);
         assert_eq!(diff.removed, 0);
         assert!(diff.lines.iter().all(|line| line.mark == "+"));
+        let patch = build_patch(&store, &change).expect("a created-file patch");
+        assert!(patch.contains("--- /dev/null"), "{patch}");
+        assert!(patch.contains("+++ b/src/new.rs"), "{patch}");
     }
 
     #[test]

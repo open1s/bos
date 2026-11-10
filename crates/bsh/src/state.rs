@@ -2722,6 +2722,12 @@ impl AppState {
         }
     }
 
+    /// The change's snapshots as a unified patch for the full Diff pane.
+    pub(crate) fn review_patch(&self, change: &Change) -> Option<String> {
+        self.review_store()
+            .and_then(|store| crate::review::diff::build_patch(&store, change))
+    }
+
     /// Record a human decision against the current review digest.
     pub(crate) fn decide_review(
         &mut self,
