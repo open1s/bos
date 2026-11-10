@@ -39,9 +39,9 @@
 
 ---
 
-> **Release 4.1.0** — intelligent review and audit, a pane layout that fits any
-> window, and per-step trajectory status. See the [changelog](CHANGELOG.md) for
-> the full set.
+> **Release 4.1.1** — tool and skill discovery in the prompt, a workspace ignore
+> file every file tool honours, and rendered file previews. See the
+> [changelog](CHANGELOG.md) for the full set.
 
 ## What is BOS?
 

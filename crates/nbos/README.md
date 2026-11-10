@@ -1,4 +1,4 @@
-# nbos — v4.1.0
+# nbos — v4.1.1
 
 [![PyPI](https://img.shields.io/pypi/v/nbos?label=pypi&logo=pypi&color=3776AB)](https://pypi.org/project/nbos)
 [![License](https://img.shields.io/github/license/open1s/bos?color=blue)](https://github.com/open1s/bos/blob/main/LICENSE)
@@ -9,7 +9,7 @@
 agent runtime implementing the ReAct (Reason + Act) paradigm. It is the same engine the
 [BSH desktop harness](https://github.com/open1s/bos#bsh-platform) runs on, exposed to
 Python through [PyO3](https://pyo3.rs/) — so a tool you write here behaves the same in Rust,
-JavaScript and the app. This release tracks BSH 4.1.0; the binding API is unchanged, and the
+JavaScript and the app. This release tracks BSH 4.1.1; the binding API is unchanged, and the
 [changelog](https://github.com/open1s/bos/blob/main/CHANGELOG.md) lists the desktop-side work.
 
 ## Features

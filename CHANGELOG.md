@@ -1,5 +1,29 @@
 # Changelog
 
+## v4.1.1 (2026-11-10)
+
+- **Tool and skill discovery in the prompt**: the system prompt now opens with
+  a discovery section derived from the request's own tool array. Its heading
+  names `find_tool` and/or `find_skill` only when the request carries them, so
+  a withheld tool family is never hidden and a search the request does not carry
+  is never promised. The section still leads the prompt, and a build that
+  withholds nothing says nothing about a search it does not have.
+- **Workspace ignore file**: `.bsh/.ignore` (gitignore syntax) is honoured by
+  every file tool - `list_dir`, `read_file`, `read_files`, `write_file`,
+  `edit_file`, `apply_patch`, `glob` and `grep` - with the harness's own
+  `.bsh` and `.bos` trees always excluded. A fresh workspace gets the file with
+  every rule commented out, so nothing changes until its reader uncomments a
+  line; an existing file is never overwritten.
+- **File preview**: a Markdown tab opens on its rendered document with a
+  Source/Preview switch, an image tab adds a `W x H - size` caption, and SVG is
+  rasterized instead of painted as a tinted mask. The source buffer remains the
+  editable truth for save, undo and comments.
+- **Extensions pane**: tools, skills and installed extensions are searchable
+  from the pane, and a declarative extension panel picks which installed
+  extension it mounts.
+- **Transcript scrolling**: a long, scrolled transcript keeps only its visible
+  rows built and bounded instead of laying out the whole history.
+
 ## v4.1.0 (2026-11-09)
 
 - **Intelligent Review (MVP)**: file tools now capture exact before/after

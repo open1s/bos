@@ -1,4 +1,4 @@
-# @open1s/jsbos — v4.1.0
+# @open1s/jsbos — v4.1.1
 
 [![npm](https://img.shields.io/npm/v/@open1s/jsbos?label=npm&logo=npm&color=CB3837)](https://www.npmjs.com/package/@open1s/jsbos)
 [![License](https://img.shields.io/github/license/open1s/bos?color=blue)](https://github.com/open1s/bos/blob/main/LICENSE)
@@ -9,7 +9,7 @@
 Rust-based agent runtime implementing the ReAct (Reason + Act) paradigm. It is the same engine the
 [BSH desktop harness](https://github.com/open1s/bos#bsh-platform) runs on, exposed to
 Node.js through [NAPI-RS](https://napi.rs/) — so a tool you write here behaves the same in Rust,
-Python and the app. This release tracks BSH 4.1.0; the binding API is unchanged, and the
+Python and the app. This release tracks BSH 4.1.1; the binding API is unchanged, and the
 [changelog](https://github.com/open1s/bos/blob/main/CHANGELOG.md) lists the desktop-side work.
 
 ## Features

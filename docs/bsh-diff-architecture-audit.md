@@ -1,6 +1,6 @@
 # BSH Diff / Review Architecture and Feature Audit
 
-Status: 2026-11-10, after BSH 4.1.0.
+Status: 2026-11-10, after BSH 4.1.1.
 
 This audit answers one question: **is any diff/review feature missing from the
 shipped surface, and is the architecture behind it coherent?** It is deliberately
