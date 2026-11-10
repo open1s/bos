@@ -7549,11 +7549,6 @@ impl Render for Shell {
             // the transcript and the right panel; it is opened from the header
             // chip and closes on an outside press (below) or a session switch.
             .when_some(self.render_jobs_panel(cx), |root, panel| root.child(panel))
-            // The diff preview is a window-level overlay: it must not be clipped
-            // by the transcript or lose the wheel to the scroller behind it.
-            .when_some(self.changes_preview_overlay(cx), |root, panel| {
-                root.child(panel)
-            })
             // The reference draws its DragHandle over the seam at z-index 11,
             // and only while the column is expanded.
             .when(!self.sidebar_folded(), |root| {

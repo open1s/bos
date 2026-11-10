@@ -247,6 +247,17 @@ features = ["handshake"]
 # hand over (TIFF from Preview/PixPin/screenshot tools, plus BMP, ICO and PNM)
 # as PNG, so those decoders are declared here rather than inherited from
 # gpui-pre's feature unification.
+# SVG is TEXT in this pane (the source stays editable), but its preview needs a
+# colour raster and GPUI's own `svg()` element paints an alpha mask tinted by the
+# text colour - a logo would come out as a silhouette. resvg is ALREADY in the
+# build graph through gpui-pre (same 0.46.0, same features), so naming it here
+# adds no package and no second parser; it is the one the kit itself rasterizes
+# with.
+[dependencies.resvg]
+version = "0.46.0"
+default-features = false
+features = ["text", "system-fonts", "raster-images"]
+
 [dependencies.image]
 version = "0.25"
 default-features = false

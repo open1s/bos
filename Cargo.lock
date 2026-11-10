@@ -1415,6 +1415,7 @@ dependencies = [
  "react",
  "regorus 0.14.0",
  "reqwest",
+ "resvg 0.46.0",
  "rust-i18n",
  "semver",
  "serde",

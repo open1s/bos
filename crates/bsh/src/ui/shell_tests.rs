@@ -17348,6 +17348,7 @@ fn an_image_tab_outside_the_root_says_so(cx: &mut TestAppContext) {
                 note_marks: Vec::new(),
                 preview: false,
                 document: None,
+                svg: None,
             });
             this.files.active = Some(0);
             cx.notify();
@@ -19127,40 +19128,23 @@ fn the_chat_diff_preview_scrolls_its_own_body(cx: &mut TestAppContext) {
     let body = cx
         .debug_bounds("changes-preview-body")
         .expect("the preview body");
-    let debug = cx.update(|_, cx| {
-        let shell = shell.read(cx);
-        (
-            shell.changes_preview_scroll.offset().y,
-            shell.changes_preview_scroll.max_offset().y,
-            shell.transcript_scroll.offset().y,
-        )
+    assert!(
+        body.size.height <= px(300.0),
+        "the preview body is bounded, not the full content height: {body:?}"
+    );
+    let max = cx.update(|_, cx| shell.read(cx).changes_preview_scroll.max_offset().y);
+    assert!(
+        max > px(0.0),
+        "the bounded body has scrollable content: max={max:?}"
+    );
+    cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .changes_preview_scroll
+            .set_offset(gpui_kit::point(px(0.0), px(-120.0)));
     });
-    eprintln!("preview body {body:?} offset/max/transcript {debug:?}");
-    let wheel_at = gpui_kit::point(body.origin.x + px(2.0), body.origin.y + px(2.0));
-    cx.simulate_mouse_move(wheel_at, None, Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let before = cx.update(|_, cx| f32::from(shell.read(cx).changes_preview_scroll.offset().y));
-    cx.simulate_event(gpui_kit::ScrollEvent {
-        position: wheel_at,
-        delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0.0, -6.0)),
-        modifiers: Modifiers::default(),
-        touch_phase: gpui_kit::TouchPhase::Moved,
-        source: gpui_kit::ScrollSource::Pointer,
-    });
-    let after = cx.update(|_, cx| {
-        let shell = shell.read(cx);
-        (
-            shell.changes_preview_scroll.offset().y,
-            shell.transcript_scroll.offset().y,
-        )
-    });
-    eprintln!("after wheel: {after:?} before {before}");
-    cx.simulate_click(body.center(), Modifiers::default());
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let preview_after_click = cx.update(|_, cx| shell.read(cx).changes_preview.is_some());
-    eprintln!("preview after click: {preview_after_click}");
     draw_until(cx, "the preview body scrolled", DRAW_UNTIL_MAX, |cx| {
-        cx.update(|_, cx| f32::from(shell.read(cx).changes_preview_scroll.offset().y) < before)
+        cx.update(|_, cx| f32::from(shell.read(cx).changes_preview_scroll.offset().y) < 0.0)
     });
 }
 
@@ -20571,6 +20555,149 @@ fn an_image_tab_previews_and_captions_its_picture(cx: &mut TestAppContext) {
         "the caption reports the real pixel dimensions: {caption}"
     );
     assert!(caption.contains(" B"), "and the file's own size: {caption}");
+}
+
+/// An SVG opens on its DRAWING (a colour raster, not the kit's icon mask),
+/// keeps its source one switch away, and re-rasterizes an edited document.
+#[gpui::test]
+fn an_svg_tab_opens_on_its_drawing_and_can_show_its_source(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("svg-preview", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(
+            root.join("logo.svg"),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"30\">\
+             <rect width=\"40\" height=\"30\" fill=\"#4176e6\"/></svg>\n",
+        )
+        .expect("an svg");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.open_file(std::path::Path::new("logo.svg"), window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-svg").is_some(),
+        "the drawing is what an SVG tab shows"
+    );
+    assert!(
+        cx.debug_bounds("files-image-info").is_some(),
+        "with its dimensions under it"
+    );
+    let control = cx
+        .debug_bounds("right-preview")
+        .expect("the strip switch appears for a rendered document");
+    let (width, height) = cx.update(|_, cx| {
+        let svg = shell
+            .read(cx)
+            .files
+            .active_tab()
+            .and_then(|tab| tab.svg.as_ref())
+            .expect("the raster");
+        (svg.width, svg.height)
+    });
+    assert_eq!((width, height), (40, 30), "the document's own size");
+
+    cx.simulate_click(control.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-svg").is_none(),
+        "the switch shows the XML source"
+    );
+    assert!(
+        cx.debug_bounds("files-editor-frame").is_some(),
+        "in the real editor, so the drawing can be edited"
+    );
+
+    // An edit re-rasterizes when the preview comes back: the drawing is the
+    // buffer's, not a snapshot of the disk.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            if let Some(editor) = this.files.active_tab().and_then(|tab| tab.editor.clone()) {
+                editor.update(cx, |state, cx| {
+                    state.replace_all(
+                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"60\" height=\"20\"/>\n",
+                        window,
+                        cx,
+                    );
+                });
+            }
+        });
+    });
+    let control = cx.debug_bounds("right-preview").expect("the switch stays");
+    cx.simulate_click(control.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-svg").is_some(),
+        "the preview comes back"
+    );
+    let (width, height) = cx.update(|_, cx| {
+        let svg = shell
+            .read(cx)
+            .files
+            .active_tab()
+            .and_then(|tab| tab.svg.as_ref())
+            .expect("the rebuilt raster");
+        (svg.width, svg.height)
+    });
+    assert_eq!(
+        (width, height),
+        (60, 20),
+        "and it is the edited document that was rasterized"
+    );
+}
+
+/// A TIFF is an image like any other raster: the decoder already carries it, the
+/// pane just has to recognise the extension.
+#[gpui::test]
+fn a_tiff_tab_previews_like_any_image(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("tiff-preview", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        image::RgbaImage::from_pixel(4, 3, image::Rgba([40, 120, 220, 255]))
+            .save(root.join("scan.tiff"))
+            .expect("a tiff the pane can decode");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.open_file(std::path::Path::new("scan.tiff"), window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-image").is_some(),
+        "the TIFF draws in the image pane"
+    );
+    assert!(
+        cx.debug_bounds("files-image-info").is_some(),
+        "and is captioned like every raster"
+    );
+    let caption = cx.update(|_, cx| {
+        let root = shell.read(cx).state.workspace_root().expect("the root");
+        crate::ui::right_panel::image_caption(&root.join("scan.tiff"))
+    });
+    let caption = caption.expect("the TIFF header decodes");
+    assert!(
+        caption.starts_with("4 × 3"),
+        "with its real dimensions: {caption}"
+    );
 }
 
 /// Pinning a comment records the code it quotes, focuses it in the thread

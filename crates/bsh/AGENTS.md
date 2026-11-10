@@ -4044,6 +4044,39 @@ not previewable (the decoder has no SVG and `image_extension` deliberately exclu
 it), and there is no auto-refresh when the file changes on disk - the buffer is the
 truth the reader is editing, and re-reading it behind their back would be worse.
 
+Round 190, follow-up: SVG and TIFF preview.
+
+- TIFF is just another raster: `image_extension` gained `tif`/`tiff`, and the
+  `image` crate's tiff feature was already built for the pane, so `img()` decodes
+  it and `image_dimensions` captions it. Test:
+  `a_tiff_tab_previews_like_any_image`.
+- SVG is BOTH: `files::is_svg` marks it, while it stays `Kind::Text(None)` - the
+  XML source is editable and commentable, and the drawing is a switch away, the
+  same shape Markdown uses. The raster is made with resvg 0.46
+  (`right_panel::svg_preview`), NOT GPUI's `svg()` element: that element paints
+  an ALPHA MASK tinted by the text colour, which is right for icons and turns a
+  colour logo into a silhouette. resvg was already in the build graph through
+  gpui-pre at the same version and features, so naming it adds no package; its
+  pixmap is PREMULTIPLIED, so `demultiply()` runs before RenderImage or every
+  edge darkens.
+- The raster is bounded to 1600px on the long side, never upscaled past 2x,
+  built at open from the buffer, and rebuilt from the buffer when the preview
+  comes back (`refresh_svg`), so an edited drawing previews its edit. A
+  document that will not parse keeps the source on screen and reports
+  `right.files.svgFailed`.
+- Traps: `resvg::usvg::Tree::from_data(&bytes, &Options::default())`,
+  `resvg::render(&tree, Transform::from_scale(s, s), &mut pixmap.as_mut())`,
+  `pixmap.pixels()` then `demultiply()`; a RenderImage is painted as
+  `img(ImageSource::Render(arc))`; and the SVG test asserts the tab's raster
+  DIMENSIONS instead of trying to read pixels back out of the atlas.
+- Evidence: `an_svg_tab_opens_on_its_drawing_and_can_show_its_source` (open,
+  switch to source, replace the document with a 60x20 one, switch back and
+  assert the rebuilt raster), `a_tiff_tab_previews_like_any_image`, and the unit
+  `tiff_is_an_image_and_svg_is_a_rendered_document`.
+
+Remaining gap: the kit's language set has no XML grammar, so an SVG's source
+view is uncoloured; the preview itself is the real reader.
+
 Honest gaps: the kit editor exposes no soft wrap and no outline/minimap, so the
 reference's wrap toggle cannot be mirrored; a comment is a line-anchored remark
 with no reply chain (the conversation happens in chat); the rail dash is not

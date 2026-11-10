@@ -767,6 +767,22 @@ pub(crate) struct FileTab {
     /// The parsed document the preview draws, built when the tab opened on
     /// Markdown or when the reader switched to it. None on every other file.
     pub(crate) document: Option<Entity<TextViewState>>,
+    /// The rasterized picture an SVG tab previews, with the document's own
+    /// dimensions for its caption. Built at open and rebuilt from the buffer
+    /// whenever the preview comes back up, so an edited SVG previews its edit.
+    pub(crate) svg: Option<SvgPreview>,
+}
+
+/// A rasterized SVG, ready for the image element.
+pub(crate) struct SvgPreview {
+    /// The document's own width, in user units (what the caption reports).
+    pub(crate) width: u32,
+    /// The document's own height, in user units.
+    pub(crate) height: u32,
+    /// The file's size on disk, for the same caption the rasters use.
+    pub(crate) bytes: u64,
+    /// The colour raster the pane paints.
+    pub(crate) frame: std::sync::Arc<gpui_kit::RenderImage>,
 }
 
 impl FileTab {
@@ -1690,7 +1706,7 @@ impl Shell {
             && self
                 .files
                 .active_tab()
-                .is_some_and(|tab| files::is_markdown(&tab.rel))
+                .is_some_and(|tab| renders_preview(&tab.rel))
     }
 
     /// The Markdown tab's switch between the rendered document and its source.
@@ -6858,14 +6874,59 @@ impl Shell {
         let Some(index) = self.files.tab_index(rel) else {
             return;
         };
-        if !files::is_markdown(rel) || self.files.tabs[index].preview == on {
+        if !renders_preview(rel) || self.files.tabs[index].preview == on {
             return;
         }
-        if on {
-            self.refresh_document(index, cx);
+        if on && !self.refresh_render(index, cx) {
+            // A document that will not render keeps its source on screen: the
+            // reader can fix it there, and the pane says why it refused.
+            cx.notify();
+            return;
         }
         self.files.tabs[index].preview = on;
         cx.notify();
+    }
+
+    /// Re-render whichever document the tab paints.
+    fn refresh_render(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        let rel = self.files.tabs[index].rel.clone();
+        if files::is_svg(&rel) {
+            self.refresh_svg(index, cx)
+        } else {
+            self.refresh_document(index, cx);
+            true
+        }
+    }
+
+    /// Re-rasterize an SVG from its live buffer.
+    fn refresh_svg(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        let Some(editor) = self
+            .files
+            .tabs
+            .get(index)
+            .and_then(|tab| tab.editor.clone())
+        else {
+            return false;
+        };
+        let text = editor.read(cx).value().to_string();
+        let rel = self.files.tabs[index].rel.clone();
+        let bytes = self
+            .state
+            .workspace_root()
+            .and_then(|root| files::resolve(&root, &rel))
+            .and_then(|path| path.metadata().ok())
+            .map(|meta| meta.len())
+            .unwrap_or(text.len() as u64);
+        match svg_preview(text.as_bytes(), bytes) {
+            Some(svg) => {
+                self.files.tabs[index].svg = Some(svg);
+                true
+            }
+            None => {
+                self.files.error = Some(self.state.lang.tr("right.files.svgFailed"));
+                false
+            }
+        }
     }
 
     /// Re-parse a tab's document from its live buffer.
@@ -7767,6 +7828,45 @@ impl Shell {
             )
     }
 
+    /// The rasterized picture an SVG tab previews.
+    ///
+    /// The source stays one switch away: an SVG is text, and the editor is where
+    /// it is edited, but the pane opens on the drawing because that is what a
+    /// reader opening a picture asked for.
+    fn files_svg(&self, svg: &SvgPreview) -> Div {
+        let caption = format!(
+            "{} × {} · {}",
+            svg.width,
+            svg.height,
+            size_label(svg.bytes, false)
+        );
+        div()
+            .debug_selector(|| String::from("files-svg"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        img(ImageSource::Render(svg.frame.clone()))
+                            .max_w(relative(1.0))
+                            .max_h(relative(0.88)),
+                    )
+                    .child(
+                        txt(caption, 11.0, theme::faint())
+                            .debug_selector(|| String::from("files-image-info")),
+                    ),
+            )
+    }
+
     /// The editor over the active tab: the file's own header, then the body.
     /// Absent when no tab is open, which leaves the tree the full width.
     ///
@@ -7806,8 +7906,11 @@ impl Shell {
                 editor.child(self.files_notes(&rel, cx))
             })
             .child(match (&open.editor, open.kind) {
-                // A Markdown tab opened on its rendered document (or the reader
-                // switched to it): paint the parsed view instead of the source.
+                // A rendered tab paints its document instead of its source:
+                // an SVG is a picture, a Markdown file is a parsed view.
+                (Some(_), _) if open.preview && open.svg.is_some() => {
+                    self.files_svg(open.svg.as_ref().expect("the svg preview"))
+                }
                 (Some(_), _) if open.preview && open.document.is_some() => {
                     self.files_preview(open.document.as_ref().expect("the preview document"))
                 }
@@ -9986,8 +10089,9 @@ impl Shell {
             dirty: false,
             decorations: None,
             note_marks: Vec::new(),
-            preview: files::is_markdown(rel),
+            preview: files::is_markdown(rel) || files::is_svg(rel),
             document: None,
+            svg: None,
         };
         if !matches!(kind, Kind::Text(_)) {
             self.files.tabs.push(tab);
@@ -10067,7 +10171,18 @@ impl Shell {
                 // and settles the comment anchors against the text the reader
                 // is about to see.
                 let buffer = editor.read(cx).value().to_string();
-                if tab.preview {
+                if files::is_svg(rel) {
+                    // Rasterized at open, from the buffer the editor holds: the
+                    // preview shows the document that was read, and a rebuild on
+                    // the next preview shows an edit.
+                    match svg_preview(buffer.as_bytes(), size) {
+                        Some(svg) => tab.svg = Some(svg),
+                        None => {
+                            tab.preview = false;
+                            self.files.error = Some(self.state.lang.tr("right.files.svgFailed"));
+                        }
+                    }
+                } else if tab.preview {
                     // Parsed at open: a reader who opens a .md file asked for
                     // the rendered document, so the first frame has it.
                     tab.document = Some(cx.new(|cx| TextViewState::markdown(buffer.as_str(), cx)));
@@ -10758,6 +10873,54 @@ fn file_glyph(row: &files::Row) -> IconName {
         Some(_) => IconName::FileCode,
         None => IconName::FileText,
     }
+}
+
+/// Whether a tab has a rendered form the strip can switch to.
+fn renders_preview(rel: &Path) -> bool {
+    files::is_markdown(rel) || files::is_svg(rel)
+}
+
+/// The largest raster an SVG preview pays for, on its long side.
+///
+/// A retina window needs at most ~2x the pane; 1600 covers a wide preview
+/// without paying for a poster-sized document the reader will never see at 1:1.
+const SVG_RASTER_MAX: f32 = 1600.0;
+
+/// Rasterize an SVG into the colour picture the pane paints.
+///
+/// GPUI's own `svg()` element renders an ALPHA MASK tinted with the text
+/// colour, which is right for icons and wrong for a logo; resvg (the same
+/// 0.46 crate the kit rasterizes with) gives the document's own colours. The
+/// bytes come from the editor's buffer so an edited drawing previews its edit.
+pub(crate) fn svg_preview(data: &[u8], bytes: u64) -> Option<SvgPreview> {
+    let tree = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let (width, height) = (size.width(), size.height());
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let scale = (SVG_RASTER_MAX / width.max(height)).clamp(0.01, 2.0);
+    let raster_w = ((width * scale).ceil() as u32).max(1);
+    let raster_h = ((height * scale).ceil() as u32).max(1);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(raster_w, raster_h)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let mut buffer = image::RgbaImage::new(raster_w, raster_h);
+    for (source, target) in pixmap.pixels().iter().zip(buffer.pixels_mut()) {
+        // tiny-skia hands back PREMULTIPLIED bytes while the image element
+        // wants straight RGBA: skipping the division darkens every edge.
+        let color = source.demultiply();
+        *target = image::Rgba([color.red(), color.green(), color.blue(), color.alpha()]);
+    }
+    Some(SvgPreview {
+        width: width.round().max(1.0) as u32,
+        height: height.round().max(1.0) as u32,
+        bytes,
+        frame: std::sync::Arc::new(gpui_kit::RenderImage::new([image::Frame::new(buffer)])),
+    })
 }
 
 /// What an image pane says under its picture: the decoded dimensions and the

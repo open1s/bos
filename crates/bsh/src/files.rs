@@ -267,7 +267,7 @@ pub(crate) fn image_extension(name: &str) -> bool {
     };
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff"
     )
 }
 
@@ -280,6 +280,14 @@ pub(crate) fn is_markdown(rel: &Path) -> bool {
     rel.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown"))
+}
+
+/// Whether a path names an SVG document, which renders as a picture but is
+/// still TEXT: the source stays the editable truth behind the preview switch.
+pub(crate) fn is_svg(rel: &Path) -> bool {
+    rel.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
 }
 
 /// Whether the bytes are text the editor can hold.
@@ -581,6 +589,23 @@ mod tests {
         assert!(!is_markdown(Path::new("notes.mdx")));
         assert!(!is_markdown(Path::new("lib.rs")));
         assert!(!is_markdown(Path::new("md")));
+    }
+
+    /// TIFF joins the raster family, and SVG is recognised as a document with a
+    /// rendered preview while still staying text.
+    #[test]
+    fn tiff_is_an_image_and_svg_is_a_rendered_document() {
+        assert_eq!(kind_for("scan.tiff", 100), Kind::Image);
+        assert_eq!(kind_for("scan.TIF", 100), Kind::Image, "case-blind");
+        assert!(is_svg(Path::new("logo.svg")));
+        assert!(is_svg(Path::new("art/LOGO.SVG")));
+        assert!(!is_svg(Path::new("logo.svgz")));
+        assert!(!is_svg(Path::new("logo.png")));
+        assert_eq!(
+            kind_for("logo.svg", 100),
+            Kind::Text(None),
+            "an SVG is still the XML the reader can edit"
+        );
     }
 
     /// Images are recognised apart from the editor's text families.

@@ -1312,6 +1312,7 @@
 "right.files.commentSent": "已提问"
 "right.files.commentEmpty": "此文件还没有评论。"
 "right.files.commentOpen": "{open} 条未解决 · {resolved} 条已解决"
+"right.files.svgFailed": "该 SVG 无法渲染。"
 "right.files.preview": "预览"
 "right.files.source": "源码"
 "right.terminal.restartHint": "按回车启动新的 shell"
