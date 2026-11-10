@@ -58,6 +58,7 @@ pub(crate) mod ui;
 pub(crate) mod vault;
 /// The local web-search tool: the model's own search client.
 pub(crate) mod web;
+pub(crate) mod workspace_ignore;
 pub(crate) mod workspace_templates;
 
 /// Run the extension developer CLI and return its exit code.

@@ -331,6 +331,19 @@ explicit empty list mounts nothing:
   `tools` to widen the permission matrix: the allowlist is intersected with
   the effective permission, so `tools = ["subagent"]` under a read-only
   ceiling still registers no subagent tool.
+
+### The file tools' own ignore file
+
+`<workspace>/.bsh/.ignore` is not a policy module. It is a `.gitignore`-syntax
+list the file tools (`list_dir`, `read_file`, `read_files`, `write_file`,
+`edit_file`, `apply_patch`, `glob`, `grep`) consult on every call. A matched
+path is hidden from listings and searches and refused by the read/write tools;
+`!` re-includes a path, and `.bsh`/`.bos` are excluded unconditionally. The
+file is created on the first file-tool call with every common tree commented
+out, so a fresh workspace filters nothing. Because it can only narrow, it is a
+reader convenience rather than a security boundary; use `policy.rego` for a
+rule that must hold against a caller who ignores the tool.
+
 - system_prompt replaces the workspace prompt for the chats that select the
   preset; absent keeps the workspace prompt. It is the persona the LLM call
   receives.

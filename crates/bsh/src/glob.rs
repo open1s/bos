@@ -44,10 +44,11 @@ const MAX_CANDIDATES: usize = 10_000;
 
 /// Entries that are never returned, even when ignored files are requested.
 ///
-/// Version-control internals are unreadable to the file tools and .bsh holds
-/// the workspace policy itself; listing any of them would hand the model names
-/// it cannot then open. BOS develops in jj, so .jj is VCS metadata here too.
-const ALWAYS_SKIP: [&str; 3] = [".git", ".jj", ".bsh"];
+/// Version-control internals are unreadable to the file tools, .bsh holds the
+/// workspace policy itself, and .bos holds BOS's own state; listing any of them
+/// would hand the model names it cannot then open. BOS develops in jj, so .jj
+/// is VCS metadata here too.
+const ALWAYS_SKIP: [&str; 4] = [".git", ".jj", ".bsh", ".bos"];
 
 /// Dependency, build and cache trees the walk does not descend into by
 /// default.
@@ -96,6 +97,10 @@ pub(crate) struct Query<'a> {
     pub(crate) include_ignored: bool,
     /// The most paths to return; clamped to MAX_RESULTS.
     pub(crate) limit: usize,
+    /// The workspace's own .bsh/.ignore rules, or none when this search is
+    /// outside a workspace. These are always applied: include_ignored widens
+    /// gitignore and hidden-file handling, never the reader's own exclusions.
+    pub(crate) workspace_ignore: Option<&'a crate::workspace_ignore::Rules>,
 }
 
 /// What one search found.
@@ -126,6 +131,14 @@ pub(crate) fn search(root: &Path, base: &Path, query: &Query) -> Result<Found, S
     if !root.is_dir() {
         return Err(format!("{} is not a directory", root.display()));
     }
+    // The reader's own ignore file is checked before the walk, so naming an
+    // excluded directory explicitly gets the same refusal the other file tools
+    // give instead of a silently empty result.
+    if let Some(rules) = query.workspace_ignore {
+        if rules.is_ignored(root, true) {
+            return Err(rules.refusal(root));
+        }
+    }
     // One include pattern is the tool's contract. Override globs read a leading
     // ! as an exclusion (ripgrep's -g), and a lone exclusion would match
     // nothing, so it is refused by name instead of returning a silent empty
@@ -144,7 +157,7 @@ pub(crate) fn search(root: &Path, base: &Path, query: &Query) -> Result<Found, S
     let limit = query.limit.clamp(1, MAX_RESULTS);
     let mut found: Vec<PathBuf> = Vec::new();
     let mut capped = false;
-    for result in build_walker(root, query.include_ignored).build() {
+    for result in build_walker(root, query.include_ignored, query.workspace_ignore).build() {
         let Ok(entry) = result else { continue };
         let Some(file_type) = entry.file_type() else {
             continue;
@@ -181,8 +194,17 @@ pub(crate) fn search(root: &Path, base: &Path, query: &Query) -> Result<Found, S
 ///
 /// One policy for both: ignore files and hidden entries are respected unless
 /// asked otherwise, symlinks are never followed, the build/dependency trees are
-/// skipped, and the VCS/policy metadata is never handed back.
-pub(crate) fn build_walker(root: &Path, include_ignored: bool) -> WalkBuilder {
+/// skipped, and the VCS/policy metadata is never handed back. The reader's own
+/// .bsh/.ignore rules are applied at every depth and are NOT widened by
+/// include_ignored, which is what makes them a workspace decision rather than a
+/// search preference.
+pub(crate) fn build_walker(
+    root: &Path,
+    include_ignored: bool,
+    workspace_ignore: Option<&crate::workspace_ignore::Rules>,
+) -> WalkBuilder {
+    let workspace_ignore = workspace_ignore.cloned();
+    let root_is_dir = root.is_dir();
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(!include_ignored)
@@ -203,6 +225,25 @@ pub(crate) fn build_walker(root: &Path, include_ignored: bool) -> WalkBuilder {
         builder.add_custom_ignore_filename(".rgignore");
     }
     builder.filter_entry(move |entry| {
+        if let Some(rules) = &workspace_ignore {
+            let is_dir = if entry.depth() == 0 {
+                root_is_dir
+            } else {
+                entry.file_type().is_some_and(|kind| kind.is_dir())
+            };
+            // The root is matched against its ancestors too, so an explicitly
+            // named directory inside an excluded tree is refused rather than
+            // silently walked. A descendant can use the cheaper direct match
+            // because its parent was already accepted.
+            let ignored = if entry.depth() == 0 {
+                rules.is_ignored(entry.path(), is_dir)
+            } else {
+                rules.is_ignored_child(entry.path(), is_dir)
+            };
+            if ignored {
+                return false;
+            }
+        }
         if entry.depth() == 0 {
             return true;
         }
@@ -246,6 +287,7 @@ mod tests {
                 pattern,
                 include_ignored,
                 limit,
+                workspace_ignore: None,
             },
         )
         .expect("search succeeds")
@@ -338,6 +380,7 @@ mod tests {
                 pattern: "*.rs",
                 include_ignored: false,
                 limit: 100,
+                workspace_ignore: None,
             },
         )
         .expect("an explicit root is walked");
@@ -416,6 +459,7 @@ mod tests {
                 pattern: "[unclosed",
                 include_ignored: false,
                 limit: 10,
+                workspace_ignore: None,
             },
         )
         .expect_err("an unclosed class does not compile");
@@ -435,6 +479,7 @@ mod tests {
                 pattern: "   ",
                 include_ignored: false,
                 limit: 10,
+                workspace_ignore: None,
             },
         );
         assert!(empty.err().is_some_and(|error| error.contains("empty")));
@@ -447,6 +492,7 @@ mod tests {
                 pattern: &long,
                 include_ignored: false,
                 limit: 10,
+                workspace_ignore: None,
             },
         );
         assert!(oversized
@@ -469,6 +515,7 @@ mod tests {
                 pattern: "*.rs",
                 include_ignored: false,
                 limit: 10,
+                workspace_ignore: None,
             },
         )
         .expect_err("a file is not a directory");
@@ -533,6 +580,7 @@ mod tests {
                 pattern: "!*.rs",
                 include_ignored: false,
                 limit: 10,
+                workspace_ignore: None,
             },
         )
         .expect_err("a lone exclusion is not a discovery query");

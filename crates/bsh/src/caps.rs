@@ -47,6 +47,7 @@ use crate::plugins::{self, PluginInfo};
 use crate::review::domain::{ChangeOperation, SnapshotState};
 use crate::settings::{Effective, Settings};
 use crate::vault::{self, Vault, VaultError};
+use crate::workspace_ignore::Rules;
 
 /// The capabilities this shell can actually put in front of the reader.
 ///
@@ -3753,6 +3754,30 @@ pub(crate) fn write_egress_allowlist_template(root: &Path) -> std::io::Result<()
     std::fs::write(&path, EGRESS_ALLOWLIST_TEMPLATE)
 }
 
+/// The workspace's .bsh/.ignore rules, when a turn has a workspace root.
+///
+/// Loading them creates the file on first use, which is why it happens here and
+/// not when the agent is built: opening a settings pane must not write into a
+/// workspace, but the first file tool call must leave the reader a rule file to
+/// edit.
+fn ignore_rules(root: Option<&Path>) -> Option<Rules> {
+    root.map(Rules::load)
+}
+
+/// Refuse a path the workspace ignore file excludes.
+///
+/// The policy is still asked separately; this refusal is the reader's own
+/// preference, not a security boundary, so it runs before the policy and names
+/// the file to edit.
+fn refuse_ignored(rules: Option<&Rules>, target: &Path) -> Result<(), ToolError> {
+    if let Some(rules) = rules {
+        if rules.is_ignored(target, target.is_dir()) {
+            return Err(ToolError::Failed(rules.refusal(target)));
+        }
+    }
+    Ok(())
+}
+
 /// Ask the policy about one concrete path before a tool touches it.
 fn check_path(
     policy: &PolicySet,
@@ -4184,7 +4209,11 @@ fn first_line_match(content: &str, old: &str) -> Option<usize> {
 }
 
 /// One directory's entries, names and kinds, in a stable order.
-fn list_entries(dir: &Path) -> Result<Listing, ToolError> {
+///
+/// The workspace ignore rules are the caller's, so a listing does not read the
+/// rule file once per row. The two harness directories are skipped by name even
+/// when there are no rules at all.
+fn list_entries(dir: &Path, rules: Option<&Rules>) -> Result<Listing, ToolError> {
     let reader = fs::read_dir(dir).map_err(|error| failed(dir, &error))?;
     let mut rows: Vec<(String, &'static str)> = Vec::new();
     let mut truncated = false;
@@ -4193,6 +4222,10 @@ fn list_entries(dir: &Path) -> Result<Listing, ToolError> {
         if rows.len() >= MAX_LIST_ENTRIES {
             truncated = true;
             break;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == crate::workspace_ignore::BSH_DIR || name == crate::workspace_ignore::BOS_DIR {
+            continue;
         }
         // The d_type from readdir answers the common case with no stat at all;
         // only a symlink pays for one, to answer the question the agent is
@@ -4212,7 +4245,10 @@ fn list_entries(dir: &Path) -> Result<Listing, ToolError> {
         } else {
             "file"
         };
-        rows.push((entry.file_name().to_string_lossy().into_owned(), kind));
+        if rules.is_some_and(|rules| rules.is_ignored_child(&entry.path(), kind == "dir")) {
+            continue;
+        }
+        rows.push((name, kind));
     }
     // Plain byte ordering: a name sort is the cheap, total order the agent
     // needs, and a case-folding comparison measured 15ms slower on 5k entries.
@@ -4325,6 +4361,10 @@ pub(crate) fn glob_tool(
                 .as_deref()
                 .filter(|workspace| search_root.starts_with(workspace))
                 .unwrap_or(&search_root);
+            let ignore = root
+                .as_deref()
+                .filter(|workspace| search_root.starts_with(workspace))
+                .map(Rules::load);
             let found = crate::glob::search(
                 &search_root,
                 base,
@@ -4332,6 +4372,7 @@ pub(crate) fn glob_tool(
                     pattern: &pattern,
                     include_ignored,
                     limit,
+                    workspace_ignore: ignore.as_ref(),
                 },
             )
             .map_err(ToolError::InvalidInput)?;
@@ -4450,6 +4491,10 @@ pub(crate) fn grep_tool(
                 .as_deref()
                 .filter(|workspace| search_root.starts_with(workspace))
                 .unwrap_or(&search_root);
+            let ignore = root
+                .as_deref()
+                .filter(|workspace| search_root.starts_with(workspace))
+                .map(Rules::load);
             let query = crate::grep::Query {
                 pattern: &pattern,
                 include_ignored,
@@ -4460,6 +4505,7 @@ pub(crate) fn grep_tool(
                 files_without_match,
                 include: include.as_deref(),
                 text,
+                workspace_ignore: ignore.as_ref(),
             };
             let found =
                 crate::grep::search(&search_root, base, &query).map_err(ToolError::InvalidInput)?;
@@ -4525,7 +4571,7 @@ pub(crate) fn read_file_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "read_file",
-        "Read a UTF-8 text file. Paths may be absolute or relative to the workspace. A file past the read ceiling is refused; pass offset (1-based line) and limit to read a window of a large file instead.",
+        "Read a UTF-8 text file. Paths may be absolute or relative to the workspace. A path excluded by the workspace's .bsh/.ignore is refused. A file past the read ceiling is refused; pass offset (1-based line) and limit to read a window of a large file instead.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -4542,6 +4588,7 @@ pub(crate) fn read_file_tool(
             let limit = arg_positive(args, "limit")?;
             let target =
                 resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &target)?;
             check_path(
                 &policy,
                 &session,
@@ -4656,6 +4703,7 @@ pub(crate) fn read_files_tool(
                     }
                 }
             }
+            let rules = ignore_rules(root.as_deref());
             let mut results = Vec::with_capacity(targets.len());
             let mut remaining = MAX_BATCH_READ_BYTES;
             let mut total_bytes = 0usize;
@@ -4673,6 +4721,7 @@ pub(crate) fn read_files_tool(
                     }
                 };
                 let result = (|| -> Result<serde_json::Value, ToolError> {
+                    refuse_ignored(rules.as_ref(), &target)?;
                     check_path(
                         &policy,
                         &session,
@@ -4828,6 +4877,7 @@ fn apply_patch_tool(
             // Preflight every path and the aggregate patch payload before any
             // file is read or written. Duplicate aliases must not partially
             // apply the first occurrence before the second is discovered.
+            let rules = ignore_rules(root.as_deref());
             let mut input_bytes = 0usize;
             let mut seen_targets = HashSet::with_capacity(changes.len());
             let mut targets = Vec::with_capacity(changes.len());
@@ -4849,6 +4899,7 @@ fn apply_patch_tool(
                         target.display()
                     )));
                 }
+                refuse_ignored(rules.as_ref(), &target)?;
                 check_path(
                     &policy,
                     &session,
@@ -5012,7 +5063,7 @@ fn write_file_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "write_file",
-        "Write a UTF-8 text file, creating parent directories as needed. The write is atomic, and a byte-identical write is a no-op, so it cannot wake a build watcher for nothing.",
+        "Write a UTF-8 text file, creating parent directories as needed. A path excluded by the workspace's .bsh/.ignore is refused. The write is atomic, and a byte-identical write is a no-op, so it cannot wake a build watcher for nothing.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -5027,6 +5078,7 @@ fn write_file_tool(
             let content = arg_str(args, "content")?;
             let target =
                 resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &target)?;
             // The check is BEFORE the parent directory is created: a denied
             // write must not leave the parent's mtime moved as a side effect.
             check_path(
@@ -5117,6 +5169,7 @@ fn edit_file_tool(
                 .unwrap_or(false);
             let target =
                 resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &target)?;
             // Before the read: a denied edit is refused before its content is
             // even observed.
             check_path(
@@ -5174,7 +5227,7 @@ fn list_dir_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "list_dir",
-        "List a directory's entries (name and kind), sorted by name. Up to 2000 entries are returned; truncated reports a larger directory.",
+        "List a directory's entries (name and kind), sorted by name. Entries excluded by the workspace's .bsh/.ignore are omitted. Up to 2000 entries are returned; truncated reports a larger directory.",
         serde_json::json!({
             "type": "object",
             "properties": { "path": { "type": "string", "description": "Directory to list, relative to the workspace or absolute inside the allowed workspace." } },
@@ -5185,6 +5238,8 @@ fn list_dir_tool(
             let raw = arg_str(args, "path")?;
             let target =
                 resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            let rules = ignore_rules(root.as_deref());
+            refuse_ignored(rules.as_ref(), &target)?;
             check_path(
                 &policy,
                 &session,
@@ -5193,7 +5248,7 @@ fn list_dir_tool(
                 Action::Read,
                 &target,
             )?;
-            let listing = list_entries(&target)?;
+            let listing = list_entries(&target, rules.as_ref())?;
             Ok(serde_json::json!({
                 "path": target.display().to_string(),
                 "entries": listing.entries,
@@ -10212,6 +10267,209 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             ]
         );
         assert_eq!(result["truncated"], false);
+    }
+
+    /// The ignore file is created on the first file-tool call, with the common
+    /// trees commented out: creating it must not change what a fresh workspace
+    /// shows.
+    #[test]
+    fn the_default_ignore_file_is_created_commented_out() {
+        let root = scratch("ignore-default");
+        std::fs::write(root.join("keep.txt"), "needle").expect("keep");
+        std::fs::create_dir_all(root.join("node_modules").join("pkg")).expect("node_modules");
+        std::fs::write(root.join("node_modules").join("pkg").join("x.js"), "needle").expect("dep");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        registry
+            .execute("read_file", &serde_json::json!({ "path": "keep.txt" }))
+            .expect("the first call succeeds");
+        let file = root.join(".bsh").join(".ignore");
+        let text = std::fs::read_to_string(&file).expect("the ignore file was created");
+        for needle in ["# node_modules", "# __pycache__", "# .venv"] {
+            assert!(
+                text.contains(needle),
+                "{needle} is missing from the template"
+            );
+        }
+        let listing = registry
+            .execute("list_dir", &serde_json::json!({ "path": "." }))
+            .expect("list");
+        let names: Vec<&str> = listing["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"node_modules"),
+            "a commented pattern must not hide anything: {names:?}"
+        );
+        assert!(
+            !names.contains(&".bsh"),
+            "the harness directory is always hidden: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One uncommented rule hides a listing entry, refuses a read and a write,
+    /// and keeps glob and grep from returning the excluded tree.
+    #[test]
+    fn the_workspace_ignore_filters_the_file_tools() {
+        let root = scratch("ignore-filter");
+        std::fs::create_dir_all(root.join("secret")).expect("secret");
+        std::fs::write(root.join("secret").join("key.txt"), "needle secret").expect("key");
+        std::fs::write(root.join("keep.txt"), "needle keep").expect("keep");
+        std::fs::write(root.join("debug.skip"), "needle debug").expect("debug");
+        std::fs::write(root.join("keep.skip"), "needle keep log").expect("keep log");
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            root.join(".bsh").join(".ignore"),
+            "secret/\n*.skip\n!keep.skip\n",
+        )
+        .expect("rules");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let read = registry
+            .execute("read_file", &serde_json::json!({ "path": "keep.txt" }))
+            .expect("an allowed file still reads");
+        assert_eq!(read["content"], "needle keep");
+
+        let refused = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": "secret/key.txt" }),
+            )
+            .expect_err("an excluded file is refused");
+        let message = refused.to_string();
+        assert!(
+            message.contains("excluded by the workspace ignore file"),
+            "{message}"
+        );
+        assert!(!message.contains("needle secret"), "the file was read");
+
+        let dir_refused = registry
+            .execute("list_dir", &serde_json::json!({ "path": "secret" }))
+            .expect_err("an excluded directory is refused");
+        assert!(
+            dir_refused
+                .to_string()
+                .contains("excluded by the workspace ignore file"),
+            "{dir_refused}"
+        );
+
+        let glob_refused = registry
+            .execute(
+                "glob",
+                &serde_json::json!({ "pattern": "*", "path": "secret" }),
+            )
+            .expect_err("a glob rooted in an excluded tree is refused");
+        assert!(
+            glob_refused
+                .to_string()
+                .contains("excluded by the workspace ignore file"),
+            "{glob_refused}"
+        );
+        let grep_refused = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "path": "secret" }),
+            )
+            .expect_err("a grep rooted in an excluded tree is refused");
+        assert!(
+            grep_refused
+                .to_string()
+                .contains("excluded by the workspace ignore file"),
+            "{grep_refused}"
+        );
+
+        let reserved = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": ".bsh/settings/settings.toml" }),
+            )
+            .expect_err("the harness directory is always excluded");
+        assert!(
+            reserved.to_string().contains("always exclude"),
+            "{reserved}"
+        );
+
+        let written = registry.execute(
+            "write_file",
+            &serde_json::json!({ "path": "secret/new.txt", "content": "x" }),
+        );
+        assert!(written.is_err(), "a write into an excluded tree is refused");
+        assert!(!root.join("secret").join("new.txt").exists());
+
+        let listing = registry
+            .execute("list_dir", &serde_json::json!({ "path": "." }))
+            .expect("list");
+        let names: Vec<&str> = listing["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"secret"), "{names:?}");
+        assert!(!names.contains(&"debug.skip"), "{names:?}");
+        assert!(
+            names.contains(&"keep.skip"),
+            "a negation re-includes: {names:?}"
+        );
+        assert!(names.contains(&"keep.txt"), "{names:?}");
+
+        let globbed = registry
+            .execute("glob", &serde_json::json!({ "pattern": "*" }))
+            .expect("glob");
+        let matches: Vec<&str> = globbed["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|path| path.as_str())
+            .collect();
+        assert!(!matches.contains(&"debug.skip"), "{matches:?}");
+        assert!(
+            !matches.iter().any(|path| path.starts_with("secret/")),
+            "{matches:?}"
+        );
+        assert!(matches.contains(&"keep.skip"), "{matches:?}");
+        assert!(matches.contains(&"keep.txt"), "{matches:?}");
+
+        let wide = registry
+            .execute(
+                "glob",
+                &serde_json::json!({ "pattern": "*", "include_ignored": true }),
+            )
+            .expect("glob");
+        let wide_matches: Vec<&str> = wide["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|path| path.as_str())
+            .collect();
+        assert!(
+            !wide_matches.iter().any(|path| path.starts_with("secret/")),
+            "include_ignored widens gitignore, never .bsh/.ignore: {wide_matches:?}"
+        );
+
+        let grepped = registry
+            .execute("grep", &serde_json::json!({ "pattern": "needle" }))
+            .expect("grep");
+        let found: Vec<&str> = grepped["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|hit| hit["path"].as_str())
+            .collect();
+        assert!(!found.contains(&"debug.skip"), "{found:?}");
+        assert!(
+            !found.iter().any(|path| path.starts_with("secret/")),
+            "{found:?}"
+        );
+        assert!(found.contains(&"keep.txt"), "{found:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

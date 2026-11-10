@@ -74,6 +74,10 @@ pub(crate) struct Query<'a> {
     pub(crate) include: Option<&'a str>,
     /// Whether to search binary files as text, like `rg -a`.
     pub(crate) text: bool,
+    /// The workspace's own .bsh/.ignore rules, or none when this search is
+    /// outside a workspace. Always applied, even to a named file, because the
+    /// reader's exclusions are not a search preference.
+    pub(crate) workspace_ignore: Option<&'a crate::workspace_ignore::Rules>,
 }
 
 impl Default for Query<'_> {
@@ -88,6 +92,7 @@ impl Default for Query<'_> {
             files_without_match: false,
             include: None,
             text: false,
+            workspace_ignore: None,
         }
     }
 }
@@ -152,8 +157,10 @@ pub(crate) struct Found {
 ///
 /// Root is a directory to walk or one file to read: an agent that greps a path
 /// it just listed should not have to name the parent and filter the rest out
-/// itself. A named file is read whatever the ignore, hidden and include rules
-/// say, because naming it is the whole point; a file past the size ceiling or
+/// itself. A named file is read whatever the gitignore, hidden and include
+/// rules say, because naming it is the whole point; the one exception is the
+/// workspace's own .bsh/.ignore, which is a reader decision and is honored even
+/// for a named path. A file past the size ceiling or
 /// one the searcher finds binary with no match before the NUL is refused by
 /// name rather than reported as no match, since there is no other file in the
 /// call that could answer.
@@ -179,6 +186,13 @@ pub(crate) fn search(root: &Path, base: &Path, query: &Query) -> Result<Found, S
         } else {
             format!("{} does not exist", root.display())
         });
+    }
+    // The reader's own ignore file is checked before the search, so a named
+    // path gets a refusal that says why instead of an empty match list.
+    if let Some(rules) = query.workspace_ignore {
+        if rules.is_ignored(root, !single) {
+            return Err(rules.refusal(root));
+        }
     }
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(query.case_insensitive)
@@ -243,7 +257,7 @@ pub(crate) fn search(root: &Path, base: &Path, query: &Query) -> Result<Found, S
             _ => {}
         }
     } else {
-        for result in build_walker(root, query.include_ignored).build() {
+        for result in build_walker(root, query.include_ignored, query.workspace_ignore).build() {
             let Ok(entry) = result else { continue };
             let Some(file_type) = entry.file_type() else {
                 continue;

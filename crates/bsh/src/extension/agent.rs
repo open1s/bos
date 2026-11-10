@@ -1029,7 +1029,10 @@ fn scope_matches_within(workspace: &std::path::Path, pattern: &str, budget: usiz
         ..glob::MatchOptions::new()
     };
     let mut seen = 0usize;
-    for entry in crate::glob::build_walker(&base, false).build().flatten() {
+    for entry in crate::glob::build_walker(&base, false, None)
+        .build()
+        .flatten()
+    {
         if entry.depth() == 0 {
             continue;
         }

@@ -234,10 +234,11 @@ fn render_layout(root: &Path) -> Option<String> {
 /// `.aws` unreadable, so naming them in the snapshot invites the model to
 /// spend a step on a refusal. The rest are build output that says nothing about
 /// the workspace shape.
-const LAYOUT_HIDDEN: [&str; 10] = [
+const LAYOUT_HIDDEN: [&str; 11] = [
     ".git",
     ".jj",
     ".bsh",
+    ".bos",
     ".env",
     "secrets",
     ".ssh",

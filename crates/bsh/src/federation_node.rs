@@ -952,6 +952,7 @@ impl agent::tools::Tool for WorkspaceContextTool {
         &self,
         _input: &serde_json::Value,
     ) -> Result<serde_json::Value, agent::tools::ToolError> {
+        let rules = crate::workspace_ignore::Rules::load(&self.root);
         let mut entries = Vec::new();
         let directory = std::fs::read_dir(&self.root).map_err(|error| {
             agent::tools::ToolError::Failed(format!("workspace_context: {error}"))
@@ -960,9 +961,18 @@ impl agent::tools::Tool for WorkspaceContextTool {
             let entry = entry.map_err(|error| {
                 agent::tools::ToolError::Failed(format!("workspace_context: {error}"))
             })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == crate::workspace_ignore::BSH_DIR || name == crate::workspace_ignore::BOS_DIR
+            {
+                continue;
+            }
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            if rules.is_ignored_child(&entry.path(), is_dir) {
+                continue;
+            }
             entries.push(serde_json::json!({
-                "name": entry.file_name().to_string_lossy(),
-                "directory": entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false),
+                "name": name,
+                "directory": is_dir,
             }));
         }
         Ok(serde_json::json!({
