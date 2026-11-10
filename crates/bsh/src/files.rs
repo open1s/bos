@@ -271,6 +271,17 @@ pub(crate) fn image_extension(name: &str) -> bool {
     )
 }
 
+/// Whether a path names a Markdown document the pane can also render.
+///
+/// The source stays the editable truth (comments, save, undo), so this only
+/// decides whether the tab OPENS on the rendered document and which glyph the
+/// strip's preview control offers; an unknown extension is not a guess.
+pub(crate) fn is_markdown(rel: &Path) -> bool {
+    rel.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown"))
+}
+
 /// Whether the bytes are text the editor can hold.
 ///
 /// NUL in the first 8KiB is the portable test: a UTF-8 file never contains
@@ -560,6 +571,16 @@ mod tests {
         // The three extensionless names that own a language.
         assert_eq!(language_for("Makefile"), Some("make"));
         assert_eq!(language_for("CMakeLists.txt"), Some("cmake"));
+    }
+
+    /// A Markdown document is recognised by its extension, case-blind.
+    #[test]
+    fn markdown_is_recognised_by_its_extension() {
+        assert!(is_markdown(Path::new("notes.md")));
+        assert!(is_markdown(Path::new("docs/README.MARKDOWN")));
+        assert!(!is_markdown(Path::new("notes.mdx")));
+        assert!(!is_markdown(Path::new("lib.rs")));
+        assert!(!is_markdown(Path::new("md")));
     }
 
     /// Images are recognised apart from the editor's text families.

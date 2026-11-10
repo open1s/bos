@@ -26,6 +26,7 @@ use gpui_kit::component::input::{
     RangeDecorationStyle, Textarea, TextareaState,
 };
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::Focusable;
 use gpui_kit::*;
@@ -759,6 +760,13 @@ pub(crate) struct FileTab {
     /// after edits, so the rail reads its ranges instead of re-measuring the
     /// buffer every frame; this list is what maps a range back to its note.
     pub(crate) note_marks: Vec<usize>,
+    /// Whether a Markdown tab shows its RENDERED document instead of its
+    /// source. The source stays the editable truth: comments, save and undo
+    /// all act on it, and the preview only decides what is painted.
+    pub(crate) preview: bool,
+    /// The parsed document the preview draws, built when the tab opened on
+    /// Markdown or when the reader switched to it. None on every other file.
+    pub(crate) document: Option<Entity<TextViewState>>,
 }
 
 impl FileTab {
@@ -1621,11 +1629,13 @@ impl Shell {
             Some(tab) => Some(StripSlot::Pane(tab)),
             None => Some(StripSlot::Start),
         };
-        // The comment control is a document's own: it appears with a document
-        // and shares the strip's trailing budget with the other three.
+        // The comment control is a document's own, and so is the preview
+        // switch: both appear with their document and share the strip's
+        // trailing budget with the other three.
         let comments = self.comments_control_shown();
+        let preview = self.preview_control_shown();
         let plan = plan_open_strip(
-            self.strip_budget(band, 3 + usize::from(comments)),
+            self.strip_budget(band, 3 + usize::from(comments) + usize::from(preview)),
             start,
             &panes,
             &file_widths,
@@ -1659,6 +1669,7 @@ impl Shell {
         let content = row
             .child(strip)
             .child(self.right_new_tab(cx))
+            .when(preview, |row| row.child(self.right_preview_control(cx)))
             .when(comments, |row| row.child(self.right_comments_control(cx)))
             .child(self.right_panel_control(
                 "right-maximize",
@@ -1671,6 +1682,57 @@ impl Shell {
             ))
             .child(self.right_panel_close(cx));
         bar.child(content)
+    }
+
+    /// Whether the strip carries the document's preview switch.
+    fn preview_control_shown(&self) -> bool {
+        self.right.tab == Some(RightTab::Files)
+            && self
+                .files
+                .active_tab()
+                .is_some_and(|tab| files::is_markdown(&tab.rel))
+    }
+
+    /// The Markdown tab's switch between the rendered document and its source.
+    ///
+    /// The icon names the state the press will produce (a book while the source
+    /// is up, code while the preview is), so the control reads as an action
+    /// rather than as a status light.
+    fn right_preview_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = self.state.lang;
+        let preview = self.files.active_tab().is_some_and(|tab| tab.preview);
+        let label = lang.tr(if preview {
+            "right.files.source"
+        } else {
+            "right.files.preview"
+        });
+        div()
+            .id("right-preview")
+            .debug_selector(|| String::from("right-preview"))
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex_none()
+            .rounded(px(theme::RADIUS_SM))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .when(preview, |control| control.bg(rgb(theme::selected_row())))
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .tooltip_show_delay(std::time::Duration::from_millis(400))
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .child(icon(
+                if preview {
+                    IconName::Code
+                } else {
+                    IconName::BookOpen
+                },
+                14.0,
+                theme::muted(),
+            ))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_preview(cx);
+            }))
     }
 
     /// Whether the strip carries the document's comment control.
@@ -6773,8 +6835,72 @@ impl Shell {
             })
     }
 
+    /// Show the active Markdown tab's rendered document, or its source.
+    ///
+    /// The manual switch is the strip's control: turning the preview ON puts
+    /// the source-anchored surfaces away, because a comment panel pointing at
+    /// lines cannot be read over a rendered document.
+    pub(crate) fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(rel) = self.files.active_tab().map(|tab| tab.rel.clone()) else {
+            return;
+        };
+        let on = !self.files.active_tab().is_some_and(|tab| tab.preview);
+        if on {
+            self.files.focus_note = None;
+            self.files.thread_quote = None;
+            self.files.comment_open = false;
+        }
+        self.set_preview(&rel, on, cx);
+    }
+
+    /// Put one tab into (or out of) its rendered view.
+    pub(crate) fn set_preview(&mut self, rel: &Path, on: bool, cx: &mut Context<Self>) {
+        let Some(index) = self.files.tab_index(rel) else {
+            return;
+        };
+        if !files::is_markdown(rel) || self.files.tabs[index].preview == on {
+            return;
+        }
+        if on {
+            self.refresh_document(index, cx);
+        }
+        self.files.tabs[index].preview = on;
+        cx.notify();
+    }
+
+    /// Re-parse a tab's document from its live buffer.
+    ///
+    /// The buffer, not the disk: a reader who edited the source and switched to
+    /// the preview expects to read what they just wrote, and the preview must
+    /// not resurrect the saved text behind their back.
+    fn refresh_document(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(editor) = self
+            .files
+            .tabs
+            .get(index)
+            .and_then(|tab| tab.editor.clone())
+        else {
+            return;
+        };
+        let text = editor.read(cx).value().to_string();
+        match self.files.tabs[index].document.clone() {
+            Some(document) => document.update(cx, |state, cx| state.set_text(text.as_str(), cx)),
+            None => {
+                let document = cx.new(|cx| TextViewState::markdown(text.as_str(), cx));
+                self.files.tabs[index].document = Some(document);
+            }
+        }
+    }
+
     /// Raise the review card for the current selection.
     pub(crate) fn open_comment_card(&mut self, cx: &mut Context<Self>) {
+        // The card quotes source lines, so a rendered Markdown tab shows its
+        // source first: commenting from the preview is not a dead control.
+        if let Some(rel) = self.files.active_tab().map(|tab| tab.rel.clone()) {
+            if self.files.active_tab().is_some_and(|tab| tab.preview) {
+                self.set_preview(&rel, false, cx);
+            }
+        }
         // The card is the write surface and the thread panel is the reading one,
         // so raising the card does not also open the drawer: the drawer would
         // take the code's height for a list the reader did not ask to see.
@@ -7608,6 +7734,39 @@ impl Shell {
             )
     }
 
+    /// The rendered document a Markdown tab shows instead of its source.
+    ///
+    /// The kit's markdown view is the same renderer the transcript uses, so a
+    /// document reads here exactly as it reads in a reply. It scrolls on its
+    /// own and is selectable, and it is read-only by contract: the source stays
+    /// the editable truth behind the strip's preview control.
+    fn files_preview(&self, document: &Entity<TextViewState>) -> Div {
+        div()
+            .debug_selector(|| String::from("files-preview"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .debug_selector(|| String::from("files-preview-body"))
+                    .id("files-preview-body")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .px(px(theme::RIGHT_PAD))
+                    .py(px(10.0))
+                    .child(
+                        TextView::new(document)
+                            .style(self.markdown_style())
+                            .selectable(true)
+                            .w_full(),
+                    ),
+            )
+    }
+
     /// The editor over the active tab: the file's own header, then the body.
     /// Absent when no tab is open, which leaves the tree the full width.
     ///
@@ -7647,6 +7806,11 @@ impl Shell {
                 editor.child(self.files_notes(&rel, cx))
             })
             .child(match (&open.editor, open.kind) {
+                // A Markdown tab opened on its rendered document (or the reader
+                // switched to it): paint the parsed view instead of the source.
+                (Some(_), _) if open.preview && open.document.is_some() => {
+                    self.files_preview(open.document.as_ref().expect("the preview document"))
+                }
                 (Some(editor), _) => div()
                     .debug_selector(|| String::from("files-editor-body"))
                     .flex_1()
@@ -7710,7 +7874,20 @@ impl Shell {
                         .overflow_hidden();
                     match files::resolve(root, &rel) {
                         Some(path) => {
-                            pane = pane.child(img(path).max_w(relative(1.0)).max_h(relative(1.0)));
+                            let caption = image_caption(&path);
+                            let mut stack = div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(img(path).max_w(relative(1.0)).max_h(relative(0.88)));
+                            if let Some(caption) = caption {
+                                stack = stack.child(
+                                    txt(caption, 11.0, theme::faint())
+                                        .debug_selector(|| String::from("files-image-info")),
+                                );
+                            }
+                            pane = pane.child(stack);
                         }
                         // The tab's path must resolve inside the root; if it no
                         // longer does, say so rather than handing the image pane
@@ -9596,6 +9773,8 @@ impl Shell {
         let Some(note) = self.files.notes.on(rel).get(index).cloned() else {
             return;
         };
+        // A jump selects source lines: the rendered view has none to select.
+        self.set_preview(rel, false, cx);
         let Some(line) = note.line else {
             return;
         };
@@ -9807,6 +9986,8 @@ impl Shell {
             dirty: false,
             decorations: None,
             note_marks: Vec::new(),
+            preview: files::is_markdown(rel),
+            document: None,
         };
         if !matches!(kind, Kind::Text(_)) {
             self.files.tabs.push(tab);
@@ -9882,11 +10063,26 @@ impl Shell {
                     },
                 )
                 .detach();
+                // The buffer is read once here: it seeds the Markdown preview
+                // and settles the comment anchors against the text the reader
+                // is about to see.
+                let buffer = editor.read(cx).value().to_string();
+                if tab.preview {
+                    // Parsed at open: a reader who opens a .md file asked for
+                    // the rendered document, so the first frame has it.
+                    tab.document = Some(cx.new(|cx| TextViewState::markdown(buffer.as_str(), cx)));
+                }
                 tab.editor = Some(editor);
                 self.files.tabs.push(tab);
                 self.files.active = Some(self.files.tabs.len() - 1);
+                self.files.focus_note = None;
+                self.files.thread_quote = None;
                 self.files.notes_open = self.files.notes.has_notes(rel);
                 self.files.error = None;
+                if self.files.notes.reanchor(rel, &buffer) {
+                    self.save_notes();
+                }
+                self.sync_note_marks(rel, cx);
                 cx.notify();
             }
             Err(error) => {
@@ -10562,6 +10758,14 @@ fn file_glyph(row: &files::Row) -> IconName {
         Some(_) => IconName::FileCode,
         None => IconName::FileText,
     }
+}
+
+/// What an image pane says under its picture: the decoded dimensions and the
+/// file's size, read from the header rather than by decoding the whole image.
+pub(crate) fn image_caption(path: &Path) -> Option<String> {
+    let (width, height) = image::image_dimensions(path).ok()?;
+    let size = path.metadata().ok()?.len();
+    Some(format!("{width} × {height} · {}", size_label(size, false)))
 }
 
 /// The size a row shows: a directory has none, and a file's bytes are grouped

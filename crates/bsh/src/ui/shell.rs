@@ -627,6 +627,9 @@ pub(crate) struct Shell {
     pub(crate) catalogue_open: bool,
     /// The transcript scroll position, so the turn rail can jump within it.
     pub(crate) transcript_scroll: ScrollHandle,
+    /// The changed-file preview's own scroll position, independent of the
+    /// transcript behind it.
+    pub(crate) changes_preview_scroll: ScrollHandle,
     /// The rail's turn indices, kept until the session's turn shape changes.
     pub(crate) turn_index_cache: std::cell::RefCell<TurnIndexCache>,
     /// The flattened trajectory log, kept until the session's shape changes.
@@ -2176,6 +2179,7 @@ impl Shell {
             mcp_args,
             mcp_url,
             transcript_scroll: ScrollHandle::new(),
+            changes_preview_scroll: ScrollHandle::new(),
             turn_index_cache: std::cell::RefCell::new(TurnIndexCache::default()),
             traj_events: std::cell::RefCell::new(super::trajectory::EventsCache::default()),
             transcript_layout: std::cell::RefCell::new(
@@ -7545,6 +7549,11 @@ impl Render for Shell {
             // the transcript and the right panel; it is opened from the header
             // chip and closes on an outside press (below) or a session switch.
             .when_some(self.render_jobs_panel(cx), |root, panel| root.child(panel))
+            // The diff preview is a window-level overlay: it must not be clipped
+            // by the transcript or lose the wheel to the scroller behind it.
+            .when_some(self.changes_preview_overlay(cx), |root, panel| {
+                root.child(panel)
+            })
             // The reference draws its DragHandle over the seam at z-index 11,
             // and only while the column is expanded.
             .when(!self.sidebar_folded(), |root| {

@@ -1312,6 +1312,8 @@
 "right.files.commentSent": "已提问"
 "right.files.commentEmpty": "此文件还没有评论。"
 "right.files.commentOpen": "{open} 条未解决 · {resolved} 条已解决"
+"right.files.preview": "预览"
+"right.files.source": "源码"
 "right.terminal.restartHint": "按回车启动新的 shell"
 "chat.stepEmpty": "这一步没有记录参数或输出。"
 "settings.presetPolicyTrusted": "策略已信任"

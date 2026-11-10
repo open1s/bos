@@ -17346,6 +17346,8 @@ fn an_image_tab_outside_the_root_says_so(cx: &mut TestAppContext) {
                 dirty: false,
                 decorations: None,
                 note_marks: Vec::new(),
+                preview: false,
+                document: None,
             });
             this.files.active = Some(0);
             cx.notify();
@@ -19067,6 +19069,101 @@ fn hovering_a_changed_file_previews_its_diff(cx: &mut TestAppContext) {
     assert!(hovered, "the shell holds the preview it drew");
 }
 
+/// A preview with more rows than the card shows scrolls inside its own body,
+/// without moving the transcript behind it.
+#[gpui::test]
+fn the_chat_diff_preview_scrolls_its_own_body(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("changes-preview-scroll", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        let old: String = (1..=20).map(|line| format!("old {line}\n")).collect();
+        let new: String = (1..=20).map(|line| format!("new {line}\n")).collect();
+        // The edit has landed: the new block is what the file holds now.
+        std::fs::write(root.join("big.rs"), format!("{new}{old}")).expect("the file");
+        let old = old.replace('\n', "\\n");
+        let new = new.replace('\n', "\\n");
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(crate::model::ToolEvent {
+                name: "edit_file".to_string(),
+                args: format!(r#"{{"path":"big.rs","old_string":"{old}","new_string":"{new}"}}"#),
+                output: Some("ok".to_string()),
+                ms: Some(4),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    draw_until(cx, "the changed-files card renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("changes-card-1").is_some()
+    });
+    let header = cx
+        .debug_bounds("changes-header-1")
+        .expect("the card header");
+    cx.simulate_mouse_move(
+        header.center(),
+        None::<gpui_kit::MouseButton>,
+        Modifiers::default(),
+    );
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_millis(600));
+    cx.run_until_parked();
+    draw_until(cx, "the long preview opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("changes-preview-body").is_some()
+    });
+    let rows = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .changes_preview
+            .as_ref()
+            .map_or(0, |(_, _, _, rows)| rows.len())
+    });
+    assert!(rows > 10, "the preview has more rows than fit: {rows}");
+    let body = cx
+        .debug_bounds("changes-preview-body")
+        .expect("the preview body");
+    let debug = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.changes_preview_scroll.offset().y,
+            shell.changes_preview_scroll.max_offset().y,
+            shell.transcript_scroll.offset().y,
+        )
+    });
+    eprintln!("preview body {body:?} offset/max/transcript {debug:?}");
+    let wheel_at = gpui_kit::point(body.origin.x + px(2.0), body.origin.y + px(2.0));
+    cx.simulate_mouse_move(wheel_at, None, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let before = cx.update(|_, cx| f32::from(shell.read(cx).changes_preview_scroll.offset().y));
+    cx.simulate_event(gpui_kit::ScrollEvent {
+        position: wheel_at,
+        delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0.0, -6.0)),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui_kit::TouchPhase::Moved,
+        source: gpui_kit::ScrollSource::Pointer,
+    });
+    let after = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.changes_preview_scroll.offset().y,
+            shell.transcript_scroll.offset().y,
+        )
+    });
+    eprintln!("after wheel: {after:?} before {before}");
+    cx.simulate_click(body.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let preview_after_click = cx.update(|_, cx| shell.read(cx).changes_preview.is_some());
+    eprintln!("preview after click: {preview_after_click}");
+    draw_until(cx, "the preview body scrolled", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| f32::from(shell.read(cx).changes_preview_scroll.offset().y) < before)
+    });
+}
+
 /// The Files tab carries the action that FEEDS the comparison pane. The Diff
 /// tab on its own can never load anything, because a comparison needs a file
 /// and that tab has no picker - which is why the surface read as unreachable.
@@ -20176,7 +20273,7 @@ fn the_comment_affordance_rides_the_selection_in_a_tall_document(cx: &mut TestAp
         let mut state = state_with_turns("comment-tall", 1);
         tests_pin_reference_defaults(&mut state);
         let root = state.workspace_root().expect("a workspace root");
-        std::fs::write(root.join("tall.md"), file).expect("a file");
+        std::fs::write(root.join("tall.txt"), file).expect("a file");
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -20189,7 +20286,7 @@ fn the_comment_affordance_rides_the_selection_in_a_tall_document(cx: &mut TestAp
             this.right.open = true;
             this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
             this.right.maximized = true;
-            this.open_file(std::path::Path::new("tall.md"), window, cx);
+            this.open_file(std::path::Path::new("tall.txt"), window, cx);
             if let Some(editor) = this.files.active_tab().and_then(|tab| tab.editor.clone()) {
                 let from = crate::notes::line_start_offset(&body, 21);
                 let to = crate::notes::line_start_offset(&body, 25);
@@ -20296,6 +20393,184 @@ fn the_comment_affordance_rides_the_selection_in_a_tall_document(cx: &mut TestAp
         f32::from(card.top()) < f32::from(selection.origin.y.max(selection.bottom_right().y)),
         "and sits above the marked lines"
     );
+}
+
+/// A Markdown file opens on its RENDERED document, and the strip's switch
+/// brings the source back: the source stays the editable truth, the preview is
+/// what the reader asked for by opening a .md file. A plain text file has no
+/// preview at all.
+#[gpui::test]
+fn a_markdown_tab_opens_on_its_rendered_document(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("markdown-preview", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("notes.md"), "# Title\n\nSome *body* text.\n").expect("a file");
+        std::fs::write(root.join("lib.rs"), "fn main() {}\n").expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.open_file(std::path::Path::new("notes.md"), window, cx);
+        });
+    });
+    // The kit's document parses before it measures, so the first frame with the
+    // preview up may not have painted its body yet.
+    draw_until(cx, "the rendered document draws", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("files-preview").is_some()
+    });
+    assert!(
+        cx.debug_bounds("files-preview").is_some(),
+        "the rendered document is what a .md tab shows"
+    );
+    assert!(
+        cx.debug_bounds("files-editor-frame").is_none(),
+        "and not the source editor"
+    );
+    assert!(
+        cx.debug_bounds("files-preview-body").is_some(),
+        "inside its own scroller"
+    );
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .files
+            .active_tab()
+            .expect("the open tab")
+            .preview),
+        "the tab records the mode"
+    );
+
+    let control = cx
+        .debug_bounds("right-preview")
+        .expect("the strip carries the preview switch on a Markdown tab");
+    cx.simulate_click(control.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-preview").is_none(),
+        "the switch shows the source"
+    );
+    assert!(
+        cx.debug_bounds("files-editor-frame").is_some(),
+        "which is the real editor, not a read-only copy"
+    );
+
+    let control = cx.debug_bounds("right-preview").expect("the switch stays");
+    cx.simulate_click(control.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-preview").is_some(),
+        "and switches back to the rendered document"
+    );
+
+    // A file with no rendered form has no preview switch and no preview body.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_file(std::path::Path::new("lib.rs"), window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("right-preview").is_none(),
+        "a Rust file has no rendered view"
+    );
+    assert!(
+        cx.debug_bounds("files-preview").is_none(),
+        "so the editor is what draws"
+    );
+    assert!(cx.debug_bounds("files-editor-frame").is_some());
+}
+
+/// A comment is about source lines, so the card raised from a rendered
+/// document moves the tab back to its source first: the control cannot act on
+/// a surface that has no lines to quote.
+#[gpui::test]
+fn commenting_from_a_preview_returns_to_the_source(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("markdown-comment", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        std::fs::write(root.join("notes.md"), "# Title\n\nbody\n").expect("a file");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.open_file(std::path::Path::new("notes.md"), window, cx);
+        });
+    });
+    draw_until(cx, "the preview draws", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("files-preview").is_some()
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.open_comment_card(cx));
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).files.active_tab().expect("the tab").preview),
+        "the card put the tab back on its source"
+    );
+    assert!(
+        cx.debug_bounds("files-comment-card").is_some(),
+        "and the card is up over the code it quotes"
+    );
+}
+
+/// An image tab paints the picture and captions it with its real dimensions, so
+/// the pane answers "what am I looking at" without a file-manager round trip.
+#[gpui::test]
+fn an_image_tab_previews_and_captions_its_picture(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("image-preview", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        let path = root.join("dot.png");
+        image::RgbaImage::from_pixel(4, 3, image::Rgba([220, 40, 40, 255]))
+            .save(&path)
+            .expect("a png the pane can decode");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.open_file(std::path::Path::new("dot.png"), window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("files-image").is_some(),
+        "the picture draws in the pane"
+    );
+    assert!(
+        cx.debug_bounds("files-image-info").is_some(),
+        "with its dimensions under it"
+    );
+    let caption = cx.update(|_, cx| {
+        let root = shell.read(cx).state.workspace_root().expect("the root");
+        crate::ui::right_panel::image_caption(&root.join("dot.png"))
+    });
+    let caption = caption.expect("the image header decodes");
+    assert!(
+        caption.starts_with("4 × 3"),
+        "the caption reports the real pixel dimensions: {caption}"
+    );
+    assert!(caption.contains(" B"), "and the file's own size: {caption}");
 }
 
 /// Pinning a comment records the code it quotes, focuses it in the thread
@@ -24335,6 +24610,13 @@ fn an_edit_marks_the_file_dirty_and_save_clears_it(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = state_with_workspace_tree("right-dirty");
+        // A plain text file: a .md fixture would open on its rendered
+        // document, and this test is about the editor's own edit loop.
+        std::fs::write(
+            workspace_tree_root("right-dirty").join("notes.txt"),
+            "# original\n",
+        )
+        .expect("a text file");
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -24349,7 +24631,7 @@ fn an_edit_marks_the_file_dirty_and_save_clears_it(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.update(|window, cx| {
         shell.update(cx, |this, cx| {
-            this.open_file(std::path::Path::new("README.md"), window, cx);
+            this.open_file(std::path::Path::new("notes.txt"), window, cx);
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -24362,7 +24644,7 @@ fn an_edit_marks_the_file_dirty_and_save_clears_it(cx: &mut TestAppContext) {
                 .active_tab()
                 .and_then(|tab| tab.editor.clone())
         })
-        .expect("README.md opens in an editor");
+        .expect("notes.txt opens in an editor");
     cx.update(|window, cx| {
         // `set_value` deliberately suppresses Change - it is a load, not an
         // edit - so the test edits the way a reader does, through the path
@@ -24404,7 +24686,7 @@ fn an_edit_marks_the_file_dirty_and_save_clears_it(cx: &mut TestAppContext) {
             .is_some_and(|tab| tab.dirty)),
         "saving clears the dirty mark"
     );
-    let written = std::fs::read_to_string(workspace_tree_root("right-dirty").join("README.md"))
+    let written = std::fs::read_to_string(workspace_tree_root("right-dirty").join("notes.txt"))
         .expect("the save reaches the disk");
     assert_eq!(written, "# edited\n", "and writes the buffer back");
 }

@@ -3999,6 +3999,51 @@ the selection's own box; it fails on the old conversion (plus 477 vs selection
 256..356) and passes now. The earlier plus tests never caught it because they
 selected in an unscrolled document, where `last_bounds == input_bounds`.
 
+Round 190: the file pane renders Markdown and captions its images (2026-11-10)
+
+The file pane already painted a picture and edited text; what was missing was a
+READING surface for the two formats a document actually arrives in.
+
+- A Markdown tab now opens on the kit's TextView - the same renderer and
+  TextViewStyle the transcript uses - and the strip carries a document-scoped
+  switch (`right-preview`) between that document and the source. The icon names
+  the ACTION (a book while the source is up, code while the preview is). The
+  source stays the editable truth: save, undo, comments and the dirty mark all
+  act on it, and the preview is only what is painted.
+- The parsed document is created at OPEN (a reader opening a .md file asked for
+  the rendered view) and re-parsed from the live BUFFER whenever the switch goes
+  back to preview, so unsaved edits are what the reader reads.
+- A rendered surface has no source lines to quote, so `open_comment_card` and
+  `reveal_comment` put the tab back on its source before acting: commenting from
+  the preview is not a dead control, and a drawer jump lands on the line.
+- An image tab keeps its picture and gains a caption decoded from the header
+  (`image::image_dimensions`, not a full decode): `W x H - file size`, with the
+  picture capped at 88% of the pane so the caption is never clipped.
+- Every other text file is unchanged: no switch, no preview, the editor as before.
+
+Traps worth keeping:
+- The preview root needs `.flex().flex_col()` as well as `flex_1()`; without the
+  flex container its `flex_1` scroller collapses to zero height, and the debug
+  selector never appears even though the arm IS taken (the first version failed
+  exactly that way, and the probe showed `preview=true doc=false` because the
+  document had silently not been created either).
+- `TextViewState` parses before it measures, so a preview test must `draw_until`
+  the body, not assert after one draw.
+- Comment and edit tests that used `.md`/README.md now open in the PREVIEW, so a
+  source-editor test must use `.txt`: both `the_comment_affordance_rides_the_selection_in_a_tall_document`
+  and `an_edit_marks_the_file_dirty_and_save_clears_it` went red for that reason alone.
+
+Evidence: `a_markdown_tab_opens_on_its_rendered_document`,
+`commenting_from_a_preview_returns_to_the_source`,
+`an_image_tab_previews_and_captions_its_picture`, and the unit
+`markdown_is_recognised_by_its_extension`.
+
+Honest gaps: links inside the preview are not clickable (the kit view exposes no
+link callback here), code blocks carry no per-block copy control, SVG and TIFF are
+not previewable (the decoder has no SVG and `image_extension` deliberately excludes
+it), and there is no auto-refresh when the file changes on disk - the buffer is the
+truth the reader is editing, and re-reading it behind their back would be worse.
+
 Honest gaps: the kit editor exposes no soft wrap and no outline/minimap, so the
 reference's wrap toggle cannot be mirrored; a comment is a line-anchored remark
 with no reply chain (the conversation happens in chat); the rail dash is not

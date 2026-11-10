@@ -887,6 +887,28 @@ fn chat_wheel(this: &mut Shell, event: &ScrollEvent, window: &mut Window, cx: &m
     cx.stop_propagation();
 }
 
+/// The changed-file preview's wheel handler.
+///
+/// The preview is an absolute sibling of the transcript, not its child, so the
+/// wheel must be taken here: without it the transcript behind the card would
+/// scroll instead of the rows under the pointer.
+fn preview_wheel(
+    this: &mut Shell,
+    event: &ScrollEvent,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) {
+    let dy = wheel_delta(event, window);
+    eprintln!("preview_wheel dy={dy}");
+    let current = f32::from(this.changes_preview_scroll.offset().y);
+    let max = f32::from(this.changes_preview_scroll.max_offset().y);
+    let next = (current + dy).clamp(-max, 0.0);
+    this.changes_preview_scroll
+        .set_offset(point(px(0.0), px(next)));
+    cx.stop_propagation();
+    cx.notify();
+}
+
 /// The trajectory tab's wheel handler.
 pub(crate) fn traj_wheel(
     this: &mut Shell,
@@ -2615,6 +2637,8 @@ impl Shell {
         }
         self.changes_hover = Some(ChangesHover { message, file, at });
         self.changes_preview = None;
+        self.changes_preview_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -2676,6 +2700,8 @@ impl Shell {
         }
         self.changes_hover = None;
         self.changes_preview = None;
+        self.changes_preview_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
 
@@ -2686,7 +2712,7 @@ impl Shell {
     /// row would be cut at the viewport edge. The pointer's window position is
     /// therefore taken back to that frame through the scroller's bounds, which is
     /// the box the frame wraps.
-    fn changes_preview_overlay(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn changes_preview_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (message, index, path, rows) = self.changes_preview.clone()?;
         let hover = self.changes_hover?;
         if hover.message != message || hover.file != index {
@@ -2711,10 +2737,12 @@ impl Shell {
         const HEAD_H: f32 = 28.0;
         const ROW_H: f32 = 18.0;
         let panel_h = (HEAD_H + rows.len() as f32 * ROW_H).min(MAX_H);
-        let y = crate::ui::diff_pane::preview_top(hover.at.1 - origin_y, panel_h, view_h);
+        let y =
+            origin_y + crate::ui::diff_pane::preview_top(hover.at.1 - origin_y, panel_h, view_h);
         let lines: Vec<AnyElement> = rows
             .iter()
-            .map(|row| {
+            .enumerate()
+            .map(|(index, row)| {
                 // The wash carries the row, but the MARKER states it: a reader
                 // scanning a diff looks for the glyph, and a tint alone leaves
                 // them hunting for whether a line was added or removed.
@@ -2738,11 +2766,13 @@ impl Shell {
                     _ => theme::faint(),
                 };
                 div()
+                    .id(SharedString::from(format!("changes-preview-row-{index}")))
                     .w_full()
                     .flex()
                     .flex_row()
                     .items_center()
                     .h(px(ROW_H))
+                    .on_scroll(cx.listener(preview_wheel))
                     .bg(rgb(fill))
                     .child(
                         txt(
@@ -2800,7 +2830,7 @@ impl Shell {
                 .top(px(y))
                 .border_color(rgb(theme::border_soft()))
                 .w(px(W))
-                .max_h(px(MAX_H))
+                .h(px(panel_h))
                 .occlude()
                 .rounded(px(12.0))
                 .bg(rgb(theme::page()))
@@ -2808,6 +2838,14 @@ impl Shell {
                 .overflow_hidden()
                 .flex()
                 .flex_col()
+                .on_scroll(cx.listener(preview_wheel))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.changes_preview = None;
+                        cx.notify();
+                    }),
+                )
                 .child(
                     div()
                         .px(px(10.0))
@@ -2823,9 +2861,13 @@ impl Shell {
                 .child(
                     div()
                         .id("changes-preview-body")
+                        .debug_selector(|| "changes-preview-body".to_string())
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scroll()
+                        .track_scroll(&self.changes_preview_scroll)
+                        .occlude()
+                        .on_scroll(cx.listener(preview_wheel))
                         // Full-bleed rows, the way the reference draws a patch: a
                         // wash inset from the card edge reads as a highlighted
                         // block rather than as the line itself.
