@@ -36173,3 +36173,177 @@ fn the_panes_fit_a_narrowed_centre_column(cx: &mut TestAppContext) {
         "so the detail card floats over it"
     );
 }
+
+/// Wraps the shell the way `gpui_kit::open_window` does.
+///
+/// The plain `Harness` renders the shell alone, and `open_window` is the caller
+/// that mounts `base::Root` around it - which is what owns the window's text
+/// selection layer. A selection test needs that layer, because without it no run
+/// registers and no drag can select: the test would then encode a window shape
+/// no reader ever runs.
+struct SelectionHarness {
+    root: Entity<gpui_kit::base::Root>,
+}
+
+impl Render for SelectionHarness {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.root.clone()
+    }
+}
+
+/// A drag that starts on a prompt selects the prompt's text.
+///
+/// The reference is a web page, where every glyph a reader can read can be
+/// selected. The transcript gets that for an answer body from its `TextView`,
+/// but a prompt, a step's output and an error were plain painted leaves: a drag
+/// that began on them selected NOTHING while the same drag over a reply worked.
+/// That is the "sometimes I cannot select text in the chat" report, so the
+/// prompt's own glyphs must register a run with the window selection.
+#[gpui::test]
+fn a_drag_over_a_prompt_selects_its_text(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("prompt-selection", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        let root = cx.new(|cx| gpui_kit::base::Root::new(shell, window, cx));
+        SelectionHarness { root }
+    });
+    draw_until(cx, "the prompt renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("user-bubble-0").is_some()
+    });
+
+    let bubble = cx
+        .debug_bounds("user-bubble-0")
+        .expect("the prompt renders its bubble");
+    // The bubble's measured padding is 10px top and 16px left, and the text
+    // starts inside it; start the drag on that first line, not on the padding,
+    // then travel along it.
+    let start = gpui_kit::point(bubble.origin.x + px(20.0), bubble.origin.y + px(21.0));
+    let end = gpui_kit::point(bubble.origin.x + px(140.0), bubble.origin.y + px(21.0));
+    cx.simulate_mouse_move(start, None::<gpui_kit::MouseButton>, Modifiers::default());
+    cx.simulate_mouse_down(start, gpui_kit::MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(end, Some(gpui_kit::MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(end, gpui_kit::MouseButton::Left, Modifiers::default());
+
+    let selected = cx.update(gpui_kit::base::TextSelection::selected_text);
+    assert!(
+        !selected.trim().is_empty(),
+        "a drag over the prompt must select text, got {selected:?}"
+    );
+    assert!(
+        "turn 0: lorem ipsum dolor sit amet".contains(selected.trim()),
+        "and the selected run must be the prompt's own words, got {selected:?}"
+    );
+}
+
+/// A drag over a step's plain output selects its text too.
+///
+/// A step body has two shapes: a fenced code block, which is a `TextView` and was
+/// already selectable, and plain text - most tool output - which was a painted
+/// leaf. That split is the other half of "sometimes I can select, sometimes I
+/// cannot": the same step selected when its payload was highlighted as code and
+/// did nothing when it was not.
+#[gpui::test]
+fn a_drag_over_a_step_output_selects_its_text(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("step-selection", 1);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            let mut reply = ChatMessage::assistant();
+            reply.text = "the reply".to_string();
+            reply.parts = vec![
+                crate::model::TurnPart::Content(9),
+                crate::model::TurnPart::Tool(0),
+            ];
+            reply.tools.push(ToolEvent {
+                name: "search_web".to_string(),
+                args: "{\"query\":\"the step's input\"}".to_string(),
+                output: Some("the step output says hello".to_string()),
+                ms: Some(4),
+                at: None,
+            });
+            // `state_with_turns` seeds one prompt and an empty reply
+            // placeholder; the step belongs to that reply, row 1.
+            session.messages[1] = reply;
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        // Verbose (完全展开): every step body is open, so the output paints
+        // without a click.
+        shell.update(cx, |this, cx| {
+            this.state.settings.global.general.transcript_view = "verbose".to_string();
+            cx.notify();
+        });
+        let root = cx.new(|cx| gpui_kit::base::Root::new(shell, window, cx));
+        SelectionHarness { root }
+    });
+    draw_until(cx, "the step's output renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("step-body-1-0-out").is_some()
+    });
+    let body = cx
+        .debug_bounds("step-body-1-0-out")
+        .expect("the step's output body renders");
+    // A few pixels into the first line: on glyphs, not on the body's edge.
+    let start = gpui_kit::point(body.origin.x + px(6.0), body.origin.y + px(6.0));
+    let end = gpui_kit::point(body.origin.x + px(120.0), body.origin.y + px(6.0));
+    cx.simulate_mouse_move(start, None::<gpui_kit::MouseButton>, Modifiers::default());
+    cx.simulate_mouse_down(start, gpui_kit::MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(end, Some(gpui_kit::MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(end, gpui_kit::MouseButton::Left, Modifiers::default());
+
+    let selected = cx.update(gpui_kit::base::TextSelection::selected_text);
+    assert!(
+        selected.contains("step output"),
+        "a drag over a step's output must select its text, got {selected:?}"
+    );
+}
+
+/// A conversation too long for one body-cache window still selects.
+///
+/// A message body is identified by its slot, and the window selection hangs a
+/// drag off the TextViewState entity that slot owns. The body cache used to
+/// evict entries painted in the CURRENT frame once one row painted more bodies
+/// than its cap (48): with 60 parts, every frame re-created every body, so
+/// every participant departed at the frame boundary and a drag was cancelled
+/// before it could extend - the whole answer was unselectable.
+#[gpui::test]
+fn a_long_message_still_selects(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let mut markdown = String::new();
+    let mut parts = Vec::new();
+    for part in 0..60 {
+        let line = format!("part {part} carries a line of prose a reader can select.\n\n");
+        markdown.push_str(&line);
+        parts.push(crate::model::TurnPart::Content(line.len()));
+    }
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("long-message", 1);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            let mut reply = ChatMessage::assistant();
+            reply.text = markdown.clone();
+            reply.parts = parts.clone();
+            session.messages[0] = ChatMessage::user("hi");
+            session.messages[1] = reply;
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        let root = cx.new(|cx| gpui_kit::base::Root::new(shell, window, cx));
+        SelectionHarness { root }
+    });
+    draw_until(cx, "the long message renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("msg-part-1-59").is_some()
+    });
+    let body = cx.debug_bounds("msg-part-1-59").expect("the body");
+    let start = gpui_kit::point(body.origin.x + px(6.0), body.origin.y + px(6.0));
+    let end = gpui_kit::point(body.origin.x + px(300.0), body.origin.y + px(6.0));
+    cx.simulate_mouse_move(start, None::<gpui_kit::MouseButton>, Modifiers::default());
+    cx.simulate_mouse_down(start, gpui_kit::MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(end, Some(gpui_kit::MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(end, gpui_kit::MouseButton::Left, Modifiers::default());
+
+    let selected = cx.update(gpui_kit::base::TextSelection::selected_text);
+    assert!(
+        selected.contains("59 carries a line of prose"),
+        "a message longer than the body-cache cap must still select, got {selected:?}"
+    );
+}

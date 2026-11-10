@@ -80,9 +80,9 @@ async fn the_declarative_example_applies_all_file_contributions() {
 async fn a_git_market_install_reaches_the_installed_inventory() {
     let root = scratch("market");
     std::fs::create_dir_all(root.join("workspace")).expect("workspace");
-    // Seed the cache a successful `bsh ext market` sync leaves behind. The
-    // clone itself is covered by the CLI run; forking `git` from a
-    // multithreaded test process is unsafe on macOS.
+    // Seed the cache a successful `bsh ext market` sync leaves behind: a real
+    // checkout, because the install compares the index hash with the commit,
+    // not with whatever the disk holds.
     let provider = root.join("market/provider");
     std::fs::create_dir_all(provider.join("packages")).expect("provider");
     copy_dir(&examples().join("hello"), &provider.join("packages/hello"));
@@ -91,6 +91,29 @@ async fn a_git_market_install_reaches_the_installed_inventory() {
         r#"{"schema_version":1,"extensions":[{"id":"com.example.hello","name":"Hello","version":"1.0.0","description":"hello","path":"packages/hello"}]}"#,
     )
     .expect("index");
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "seed",
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&provider)
+            .args(&args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &root)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
 
     let store = ExtensionStore::open(&root).expect("store");
     let market = GitMarket::open(&root, "https://example.invalid/provider");

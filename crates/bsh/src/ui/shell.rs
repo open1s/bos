@@ -6893,10 +6893,18 @@ impl Shell {
         BODIES_PARSED.with(|parsed| parsed.set(parsed.get() + 1));
         let state = cx.new(|cx| TextViewState::markdown(text, cx));
         states.insert(slot, (text.to_string(), frame, state.clone()));
-        // Bound the cache: drop the body that has gone longest without a paint.
+        // Bound the cache: drop the body that has gone longest without a paint,
+        // never one THIS frame painted. A row can carry more bodies than the cap
+        // (a long answer is a hundred timeline segments), and evicting a body
+        // from the current frame re-creates it next frame: every TextViewState
+        // identity then churns, and the window selection - which hangs a drag
+        // off those identities - cancels the gesture at the frame boundary, so
+        // the whole answer selects nothing. The cap is therefore a budget across
+        // frames: within one, the working set is what it is.
         if states.len() > BODY_STATES_MAX {
             let oldest = states
                 .iter()
+                .filter(|(_, (_, used, _))| *used != frame)
                 .min_by_key(|(_, (_, used, _))| *used)
                 .map(|(slot, _)| *slot);
             if let Some(oldest) = oldest {

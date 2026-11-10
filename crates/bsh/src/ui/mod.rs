@@ -75,6 +75,39 @@ pub(crate) fn txt(text: impl Into<SharedString>, size: f32, color: u32) -> Div {
         .child(text.into())
 }
 
+/// A read-only prose leaf whose glyphs join the window's text selection.
+///
+/// The shell draws static text as `div` leaves, which paint glyphs but register
+/// no selectable run: the window selection layer can only start and extend over
+/// text that registered itself, which is why a drag that began on a prompt, a
+/// step's output or an error did nothing while the same drag over a reply body
+/// (a `TextView`) selected. The reference is a web page, where every glyph a
+/// reader can read can be selected, so the reading text opts in here.
+///
+/// `id` must stay stable across frames - the element keeps its selection handle
+/// in its own keyed state - and `order` places the run in the transcript's
+/// reading order, so a copy that spans several of these leaves joins them the
+/// way they read. Keep the two apart: a row that renumbers its id on every
+/// frame loses the handle, and a row that reuses its neighbour's order copies
+/// out of order.
+///
+/// One known seam: a `TextView` orders itself by paint order, a separate scale
+/// from this explicit one, so a selection that spans a markdown body AND one of
+/// these leaves keeps each interval exact but may place the two runs by their
+/// own orders rather than by screen position. Within one kind the order holds.
+pub(crate) fn selectable_txt(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    size: f32,
+    color: u32,
+    order: u64,
+) -> Div {
+    div()
+        .text_size(px(size))
+        .text_color(rgb(color))
+        .child(gpui_kit::base::SelectableText::new(id, text).document_order(order))
+}
+
 /// A styled glyph leaf, for the few marks that are text rather than icons.
 pub(crate) fn glyph(text: &'static str, size: f32, color: u32) -> Div {
     div().text_size(px(size)).text_color(rgb(color)).child(text)

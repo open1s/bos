@@ -615,7 +615,9 @@ Process `entry` may also be one of the allowlisted launchers: `python3`,
 does not need a launcher.
 
 The host clears the environment and forwards only `PATH`, `HOME`, `TMPDIR`,
-`LANG` and `LC_ALL`, plus the manifest's own variables. It refuses to set
+`LANG` and `LC_ALL`, plus the manifest's own variables. It always sets
+`BSH_IPC_TOKEN`, and `BSH_BIN` names the running host executable so a package
+can call `bsh ext ...` instead of reimplementing host tooling. It refuses to set
 `PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, any `DYLD_*`, `PYTHONPATH` or
 `NODE_OPTIONS`. If your tool needs a secret, use the vault capability, not an
 environment variable baked into the manifest.

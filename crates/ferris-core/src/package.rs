@@ -13,8 +13,9 @@
 //! never half-populates an installed version.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,7 +33,14 @@ pub const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_PACKAGE_FILES: usize = 10_000;
 
 /// Directory names that are never part of a package.
-const IGNORED_DIRECTORIES: [&str; 4] = [".git", "target", "node_modules", ".jj"];
+const IGNORED_DIRECTORIES: [&str; 5] = [".git", "target", "node_modules", ".jj", "__pycache__"];
+
+/// File suffixes that are never part of a package.
+///
+/// These are build artifacts a checkout can hold but a commit does not, so
+/// skipping them is what makes a working tree and the commit it came from
+/// hash the same.
+const IGNORED_SUFFIXES: [&str; 3] = [".tmp", ".pyc", ".pyo"];
 
 /// One loaded package and the facts the host established about it.
 #[derive(Debug, Clone)]
@@ -166,9 +174,13 @@ impl Package {
 /// The digest covers each file's relative path, byte length and content
 /// digest, in sorted path order. Directory metadata, mtimes and modes are
 /// deliberately excluded: two copies of the same package with different
-/// timestamps must hash the same.
+/// timestamps must hash the same. Build artifacts a commit cannot carry
+/// (`.git`, `target`, `node_modules`, `.jj`, `__pycache__`, `*.tmp`,
+/// `*.pyc`, `*.pyo`, `.DS_Store`) are excluded too, so hashing a working
+/// tree and hashing the clone a publisher ships give one digest rather than
+/// two.
 pub fn package_hash(root: &Path) -> Result<String, ExtensionError> {
-    let mut hasher = Sha256::new();
+    let mut digest = PackageDigest::new();
     let mut files = 0usize;
     let mut bytes = 0u64;
     for entry in WalkDir::new(root)
@@ -236,13 +248,312 @@ pub fn package_hash(root: &Path) -> Result<String, ExtensionError> {
             }
             file_hasher.update(&buffer[..read]);
         }
-        let digest = file_hasher.finalize();
-        hasher.update(relative.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(file_bytes.to_le_bytes());
-        hasher.update(digest);
+        digest.file(&relative, file_bytes, file_hasher.finalize());
     }
-    Ok(hex_digest(hasher.finalize()))
+    Ok(digest.finish())
+}
+
+/// The one framing every package digest uses.
+struct PackageDigest(Sha256);
+
+impl PackageDigest {
+    fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    /// Fold one file into the digest.
+    fn file(&mut self, relative: &str, bytes: u64, digest: impl AsRef<[u8]>) {
+        self.0.update(relative.as_bytes());
+        self.0.update([0u8]);
+        self.0.update(bytes.to_le_bytes());
+        self.0.update(digest);
+    }
+
+    fn finish(self) -> String {
+        hex_digest(self.0.finalize())
+    }
+}
+
+/// Hash the package tree as one Git revision commits it.
+///
+/// This is the digest a market index must carry. The host installs from a
+/// clone, and a clone carries committed files only, so reading the revision
+/// instead of the disk is what keeps a build artifact, an editor swapfile or
+/// an uncommitted edit from publishing a digest no clone can reproduce.
+pub fn package_hash_at_rev(root: &Path, rev: &str) -> Result<String, ExtensionError> {
+    if git_text(root, &["rev-parse", "--show-toplevel"])?.is_empty() {
+        return Err(ExtensionError::Corrupt {
+            path: root.to_path_buf(),
+            message: format!("{} is not inside a Git work tree", root.display()),
+        });
+    }
+    let prefix = git_text(root, &["rev-parse", "--show-prefix"])?;
+    let prefix = prefix.trim_end_matches('/').to_string();
+    let spec = if prefix.is_empty() {
+        ".".to_string()
+    } else {
+        prefix.clone()
+    };
+    let listing = git_bytes(
+        root,
+        &["ls-tree", "-r", "-z", "--full-tree", rev, "--", &spec],
+    )?;
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for record in listing.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| ExtensionError::Corrupt {
+                path: root.to_path_buf(),
+                message: format!("git ls-tree returned a record without a path at {rev}"),
+            })?;
+        let head =
+            std::str::from_utf8(&record[..tab]).map_err(|error| ExtensionError::Corrupt {
+                path: root.to_path_buf(),
+                message: format!("git ls-tree returned an unreadable entry: {error}"),
+            })?;
+        let path =
+            std::str::from_utf8(&record[tab + 1..]).map_err(|error| ExtensionError::Corrupt {
+                path: root.to_path_buf(),
+                message: format!("git ls-tree returned an unreadable path: {error}"),
+            })?;
+        let mut fields = head.split(' ');
+        let mode = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        let sha = fields.next().unwrap_or_default();
+        let relative = if prefix.is_empty() {
+            path.to_string()
+        } else {
+            let tail = format!("{prefix}/");
+            path.strip_prefix(&tail)
+                .map(str::to_string)
+                .ok_or_else(|| ExtensionError::Corrupt {
+                    path: root.to_path_buf(),
+                    message: format!("git ls-tree returned {path}, outside {tail}"),
+                })?
+        };
+        if kind != "blob" {
+            return Err(ExtensionError::Limit {
+                extension: root.display().to_string(),
+                message: format!(
+                    "{rev} carries {kind} at {relative}, which is not a file; packages must be self-contained"
+                ),
+            });
+        }
+        if mode == "120000" {
+            return Err(ExtensionError::Limit {
+                extension: root.display().to_string(),
+                message: format!(
+                    "{rev} carries a symbolic link at {relative}; packages must be self-contained"
+                ),
+            });
+        }
+        if is_ignored_file(&relative) || relative.rsplit('/').next() == Some(SIGNATURE_FILE) {
+            continue;
+        }
+        entries.push((relative, sha.to_string()));
+    }
+
+    if entries.is_empty() {
+        return Err(ExtensionError::Corrupt {
+            path: root.to_path_buf(),
+            message: format!("{rev} commits no files under {}", root.display()),
+        });
+    }
+
+    let order = walk_order(
+        &entries
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let positions: std::collections::HashMap<&str, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path.as_str(), index))
+        .collect();
+    entries.sort_by_key(|(path, _)| positions[path.as_str()]);
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| ExtensionError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    let mut requests = String::new();
+    for (_, sha) in &entries {
+        requests.push_str(sha);
+        requests.push('\n');
+    }
+    let mut stdin = child.stdin.take().ok_or_else(|| ExtensionError::Corrupt {
+        path: root.to_path_buf(),
+        message: "git cat-file stdin is not piped".to_string(),
+    })?;
+    // A writer thread keeps the request pipe from deadlocking the output pipe
+    // on a package large enough to fill both.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(requests.as_bytes());
+    });
+    let stdout = child.stdout.take().ok_or_else(|| ExtensionError::Corrupt {
+        path: root.to_path_buf(),
+        message: "git cat-file stdout is not piped".to_string(),
+    })?;
+    let result = (|| -> Result<String, ExtensionError> {
+        let mut reader = BufReader::new(stdout);
+        let mut digest = PackageDigest::new();
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        let mut buffer = vec![0u8; 64 * 1024];
+        for (relative, sha) in &entries {
+            let mut header = String::new();
+            reader
+                .read_line(&mut header)
+                .map_err(|source| ExtensionError::Io {
+                    path: root.to_path_buf(),
+                    source,
+                })?;
+            let mut fields = header.trim_end().split(' ');
+            let _oid = fields.next();
+            let kind = fields.next();
+            let size = fields.next().and_then(|value| value.parse::<u64>().ok());
+            let (Some("blob"), Some(size)) = (kind, size) else {
+                return Err(ExtensionError::Corrupt {
+                    path: root.to_path_buf(),
+                    message: format!(
+                        "git cat-file could not read blob {sha}: {}",
+                        header.trim_end()
+                    ),
+                });
+            };
+            let mut file = Sha256::new();
+            let mut remaining = size;
+            while remaining > 0 {
+                let want = remaining.min(buffer.len() as u64) as usize;
+                reader
+                    .read_exact(&mut buffer[..want])
+                    .map_err(|source| ExtensionError::Io {
+                        path: root.to_path_buf(),
+                        source,
+                    })?;
+                file.update(&buffer[..want]);
+                remaining -= want as u64;
+                bytes += want as u64;
+                if bytes > MAX_PACKAGE_BYTES {
+                    return Err(ExtensionError::Limit {
+                        extension: root.display().to_string(),
+                        message: format!("package is larger than {MAX_PACKAGE_BYTES} bytes"),
+                    });
+                }
+            }
+            let mut newline = [0u8; 1];
+            reader
+                .read_exact(&mut newline)
+                .map_err(|source| ExtensionError::Io {
+                    path: root.to_path_buf(),
+                    source,
+                })?;
+            files += 1;
+            if files > MAX_PACKAGE_FILES {
+                return Err(ExtensionError::Limit {
+                    extension: root.display().to_string(),
+                    message: format!("package contains more than {MAX_PACKAGE_FILES} files"),
+                });
+            }
+            digest.file(relative, size, file.finalize());
+        }
+        Ok(digest.finish())
+    })();
+    if result.is_err() {
+        // git is blocked writing blobs we stopped reading; end it before wait.
+        let _ = child.kill();
+    }
+    let _ = writer.join();
+    let _ = child.wait();
+    result
+}
+
+fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, ExtensionError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|source| ExtensionError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(ExtensionError::Corrupt {
+            path: root.to_path_buf(),
+            message: format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    Ok(output.stdout)
+}
+
+fn git_text(root: &Path, args: &[&str]) -> Result<String, ExtensionError> {
+    Ok(String::from_utf8_lossy(&git_bytes(root, args)?)
+        .trim()
+        .to_string())
+}
+
+/// A directory tree built from package-relative paths, so a committed listing
+/// visits in the same pre-order the disk walk uses.
+#[derive(Default)]
+struct VersionTree(BTreeMap<String, VersionTree>);
+
+fn walk_order(paths: &[&str]) -> Vec<String> {
+    let mut root = VersionTree::default();
+    for path in paths {
+        let mut node = &mut root;
+        for part in path.split('/') {
+            node = node.0.entry(part.to_string()).or_default();
+        }
+    }
+    fn visit(node: &VersionTree, prefix: &str, out: &mut Vec<String>) {
+        for (name, child) in &node.0 {
+            let path = format!("{prefix}{name}");
+            if child.0.is_empty() {
+                out.push(path);
+            } else {
+                visit(child, &format!("{path}/"), out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(&root, "", &mut out);
+    out
+}
+
+/// The file half of is_ignored for a path that is known to be a file.
+fn is_ignored_file(relative: &str) -> bool {
+    let mut parts = relative.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_some() {
+            if IGNORED_DIRECTORIES.contains(&part) {
+                return true;
+            }
+        } else {
+            return part == ".DS_Store"
+                || IGNORED_SUFFIXES.iter().any(|suffix| part.ends_with(suffix));
+        }
+    }
+    false
 }
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
@@ -255,13 +566,18 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     out
 }
 
-fn is_ignored(path: &Path) -> bool {
+/// Whether a path is build junk rather than package content.
+///
+/// [`package_hash`] and [`copy_tree`] share this one rule, which is what
+/// guarantees an excluded path is both unhashed and uncopied. Archive
+/// builders outside this crate reuse it for the same reason.
+pub fn is_ignored(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     name == ".DS_Store"
-        || name.ends_with(".tmp")
+        || IGNORED_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
         || (path.is_dir() && IGNORED_DIRECTORIES.contains(&name))
 }
 
@@ -1410,6 +1726,93 @@ max_execution_ms = 1000
         std::fs::write(root.join("tools").join("echo.json"), "{\"changed\":true}").expect("change");
         let third = package_hash(&root).expect("hash changed");
         assert_ne!(first, third);
+    }
+
+    #[test]
+    fn build_artifacts_a_commit_cannot_carry_do_not_change_the_hash() {
+        let scratch = Scratch::new("hash-artifacts");
+        let root = scratch.0.join("package");
+        write_package(&root, &manifest());
+        let committed = package_hash(&root).expect("clean hash");
+
+        // A Python test run and a Finder visit leave files a clone never has.
+        // The digest must describe the commit, not the disk.
+        std::fs::create_dir_all(root.join("__pycache__")).expect("cache dir");
+        std::fs::write(root.join("__pycache__").join("echo.pyc"), "bytecode").expect("cache");
+        std::fs::write(root.join("tools").join("stray.pyc"), "bytecode").expect("stray bytecode");
+        std::fs::write(root.join("tools").join("scratch.tmp"), "scratch").expect("scratch");
+        std::fs::write(root.join("tools").join("stray.pyo"), "bytecode").expect("stray optimized");
+        assert_eq!(package_hash(&root).expect("hash with artifacts"), committed);
+
+        // A file the package really ships still moves it.
+        std::fs::write(root.join("tools").join("notes.txt"), "notes").expect("real file");
+        assert_ne!(
+            package_hash(&root).expect("hash with a new file"),
+            committed
+        );
+
+        // The copy must skip the same files the hash skipped, or the installed
+        // tree would carry bytes no digest covers.
+        std::fs::remove_file(root.join("tools").join("notes.txt")).expect("drop real file");
+        let store = ExtensionStore::open(scratch.0.join("store")).expect("store");
+        let installed = store.install(&root).expect("install");
+        assert!(!installed.root.join("__pycache__").exists());
+        assert!(!installed.root.join("tools").join("stray.pyc").exists());
+        assert_eq!(installed.hash, committed);
+    }
+    #[test]
+    fn a_revision_hashes_the_commit_not_the_checkout() {
+        let scratch = Scratch::new("hash-rev");
+        let root = scratch.0.join("package");
+        write_package(&root, &manifest());
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "one",
+            ],
+        );
+        let committed = package_hash(&root).expect("disk hash");
+        assert_eq!(
+            package_hash_at_rev(&root, "HEAD").expect("HEAD hash"),
+            committed
+        );
+
+        // Build junk is invisible to both; an uncommitted edit is visible to
+        // the checkout only, which is the whole point of hashing the commit.
+        std::fs::create_dir_all(root.join("__pycache__")).expect("cache dir");
+        std::fs::write(root.join("__pycache__").join("echo.pyc"), "bytecode").expect("cache");
+        assert_eq!(package_hash(&root).expect("disk hash"), committed);
+        assert_eq!(
+            package_hash_at_rev(&root, "HEAD").expect("HEAD hash"),
+            committed
+        );
+
+        std::fs::write(root.join("tools").join("echo.json"), "{\"changed\":true}").expect("edit");
+        assert_ne!(package_hash(&root).expect("disk hash"), committed);
+        assert_eq!(
+            package_hash_at_rev(&root, "HEAD").expect("HEAD hash"),
+            committed
+        );
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", root)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
     }
 
     #[test]

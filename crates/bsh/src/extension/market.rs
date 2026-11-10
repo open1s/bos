@@ -11,7 +11,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use ferris_sdk::package::{ExtensionStore, Package};
+use ferris_sdk::package::{package_hash_at_rev, ExtensionStore, Package};
 use ferris_sdk::types::{ExtensionError, ExtensionSource, TrustLevel};
 
 /// The official provider repository.
@@ -210,6 +210,22 @@ fn validate_entry(entry: &MarketEntry, path: &Path) -> Result<(), ExtensionError
     Ok(())
 }
 
+/// The refusal a package earns when its bytes disagree with the index.
+///
+/// Both digests travel with it: the reader's next step is to work out which
+/// side moved (an index built from a working tree, or a package replaced after
+/// publication), and naming only the fact turns that into a hunt through the
+/// provider's history.
+fn integrity_denial(extension: &str, declared: &str, actual: &str) -> ExtensionError {
+    ExtensionError::Denied {
+        extension: extension.to_string(),
+        capability: "package.integrity".to_string(),
+        reason: format!(
+            "market package does not match the hash its index declares (index {declared}, package {actual})"
+        ),
+    }
+}
+
 /// A shallow checkout of one provider.
 #[derive(Debug, Clone)]
 pub(crate) struct GitMarket {
@@ -320,7 +336,8 @@ impl GitMarket {
         }
         // The index is not trusted to describe what the directory contains: the
         // installed id and version must match the entry, and a declared hash
-        // must be the hash of the bytes that install.
+        // must be the hash of the commit that install. The check asks the same
+        // function the index was built with (the revision, not the checkout).
         let declared = Package::load(&source, ExtensionSource::Development, TrustLevel::Community)?;
         if declared.id().as_str() != entry.id || declared.version() != entry.version {
             return Err(ExtensionError::Manifest {
@@ -334,14 +351,24 @@ impl GitMarket {
                 ),
             });
         }
+        let committed = package_hash_at_rev(&source, "HEAD")?;
         if let Some(hash) = entry.hash.as_deref().filter(|hash| !hash.is_empty()) {
-            if declared.hash != hash {
-                return Err(ExtensionError::Denied {
-                    extension: entry.id.clone(),
-                    capability: "package.integrity".to_string(),
-                    reason: "market package does not match the hash its index declares".to_string(),
-                });
+            if committed != hash {
+                return Err(integrity_denial(&entry.id, hash, &committed));
             }
+        }
+        // The store installs the checkout's bytes, not the commit's blobs, so a
+        // checkout that drifted from its commit is refused even when the index
+        // agrees with the commit: those bytes are not the ones it describes.
+        if !declared.hash.is_empty() && declared.hash != committed {
+            return Err(ExtensionError::Denied {
+                extension: entry.id.clone(),
+                capability: "package.integrity".to_string(),
+                reason: format!(
+                    "the market checkout does not match the commit the index describes (commit {committed}, checkout {})",
+                    declared.hash
+                ),
+            });
         }
         store.install_community(
             &source,
@@ -463,10 +490,138 @@ mod tests {
     }
 
     #[test]
+    fn a_hash_mismatch_names_both_digests() {
+        let error = integrity_denial("com.example.devkit", "aaaa", "bbbb");
+        let text = error.to_string();
+        assert!(text.contains("aaaa"), "the index's digest is named: {text}");
+        assert!(text.contains("bbbb"), "and the package's own: {text}");
+        assert!(
+            text.contains("package.integrity"),
+            "under the denied capability: {text}"
+        );
+    }
+
+    #[test]
     fn an_escaping_path_is_refused() {
         let text = r#"{"schema_version":1,"extensions":[
             {"id":"com.example.hello","name":"Hello","version":"1.0.0","path":"../outside"}
         ]}"#;
         assert!(MarketIndex::parse(text, Path::new("index.json")).is_err());
+    }
+
+    fn manifest_v2() -> String {
+        r#"
+schema_version = "2.0"
+
+[extension]
+id = "com.example.hello"
+name = "Hello"
+version = "1.0.0"
+description = "A market install fixture"
+authors = ["BSH"]
+license = "MIT"
+
+[compatibility]
+host = ">=3.0.0, <9.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[[contribution]]
+kind = "tool"
+id = "echo"
+
+[contribution.payload]
+"#
+        .to_string()
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        std::fs::create_dir_all(root).expect("git root");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", root)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn the_index_hash_is_the_commits_and_checkout_drift_is_refused() {
+        let root = std::env::temp_dir().join(format!("bsh-market-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let package = repo
+            .join("packages")
+            .join("com.example.hello")
+            .join("1.0.0");
+        std::fs::create_dir_all(package.join("tools")).expect("package dirs");
+        std::fs::write(package.join("extension.toml"), manifest_v2()).expect("manifest");
+        std::fs::write(package.join("tools").join("echo.json"), "{}").expect("tool");
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "one",
+            ],
+        );
+
+        let committed = package_hash_at_rev(&package, "HEAD").expect("commit hash");
+        let market = GitMarket {
+            cache: repo.clone(),
+            url: "file://test".to_string(),
+            revision: committed.clone(),
+        };
+        let mut entry = MarketEntry {
+            id: "com.example.hello".to_string(),
+            name: "Hello".to_string(),
+            version: "1.0.0".to_string(),
+            description: String::new(),
+            path: "packages/com.example.hello/1.0.0".to_string(),
+            hash: Some(committed.clone()),
+        };
+
+        let store = ExtensionStore::open(root.join("store-a")).expect("store");
+        market.install(&store, &entry).expect("the commit installs");
+
+        // An uncommitted edit is bytes the index never described, even though
+        // the commit and therefore the index still hash the same.
+        std::fs::write(
+            package.join("tools").join("echo.json"),
+            "{\"changed\":true}",
+        )
+        .expect("edit");
+        let store = ExtensionStore::open(root.join("store-b")).expect("store");
+        let error = market
+            .install(&store, &entry)
+            .expect_err("a drifted checkout is refused")
+            .to_string();
+        assert!(error.contains("does not match the commit"), "{error}");
+
+        // A wrong declared digest is named alongside the commit's.
+        entry.hash = Some("0".repeat(64));
+        let store = ExtensionStore::open(root.join("store-c")).expect("store");
+        let error = market
+            .install(&store, &entry)
+            .expect_err("a wrong digest is refused")
+            .to_string();
+        assert!(error.contains(&"0".repeat(64)), "{error}");
+        assert!(error.contains(&committed), "{error}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

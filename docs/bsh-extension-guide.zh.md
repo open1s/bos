@@ -1951,7 +1951,8 @@ LOG_LEVEL = "info"
 
 - 以包根为工作目录；
 - **清空环境**，只保留 `PATH`、`HOME`、`TMPDIR`、`LANG`、`LC_ALL`，
-  加上 `runtime.config.env` 和 `BSH_IPC_TOKEN`；
+  加上 `runtime.config.env`、`BSH_IPC_TOKEN` 和 `BSH_BIN`（宿主可执行文件路径，
+  扩展可直接调用 `bsh ext ...`）；
 - stdout/stdin 管道，stderr 记日志；
 - 不经过 shell；
 - Linux 用 `bwrap`、macOS 用 `sandbox-exec` 做文件系统沙箱（默认开启）；

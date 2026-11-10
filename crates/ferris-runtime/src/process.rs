@@ -1136,6 +1136,11 @@ impl ProcessRuntime {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         command.env("BSH_IPC_TOKEN", &token);
+        // The running host, so an extension can call `bsh ext ...` without
+        // guessing where the host binary lives.
+        if let Ok(exe) = std::env::current_exe() {
+            command.env("BSH_BIN", exe);
+        }
         for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);

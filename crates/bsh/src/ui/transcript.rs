@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use super::shell::{BodySlot, ChangesHover, Shell};
 use super::todo_panel::spinner;
-use super::{glyph, icon, txt, DivExt, IconName};
+use super::{glyph, icon, selectable_txt, txt, DivExt, IconName};
 use crate::i18n::{tr, Lang};
 use crate::model::{ChatMessage, PlanStatus, Role, Session, ToolEvent, TurnPart};
 use crate::settings::{StepGrouping, TranscriptPolicy};
@@ -2465,7 +2465,18 @@ impl Shell {
                         .rounded(px(20.0))
                         .bg(rgb(theme::user_bubble()))
                         .child(
-                            txt(message.text.clone(), size, theme::text()).line_height(px(line)),
+                            // The prompt is the reader's own words: in the
+                            // reference every glyph of it is selectable, so the
+                            // bubble's text is a registered run rather than a
+                            // painted leaf.
+                            selectable_txt(
+                                ("user-bubble-text", index),
+                                message.text.clone(),
+                                size,
+                                theme::text(),
+                                index as u64 * 1024 + 1,
+                            )
+                            .line_height(px(line)),
                         ),
                 );
             }
@@ -2521,7 +2532,13 @@ impl Shell {
                     .border_color(rgb(theme::error()))
                     .px(px(10.0))
                     .py(px(8.0))
-                    .child(txt(error.clone(), theme::CHIP_SIZE, theme::error())),
+                    .child(selectable_txt(
+                        ("message-error", index),
+                        error.clone(),
+                        theme::CHIP_SIZE,
+                        theme::error(),
+                        index as u64 * 1024 + 900,
+                    )),
             );
         }
 
@@ -2529,11 +2546,15 @@ impl Shell {
         // it reads as an empty reply. The marker is also what keeps the row out
         // of the next request (see Runner::seed_session).
         if message.meta.as_ref().is_some_and(|meta| meta.cancelled) {
-            column = column.child(div().rounded(px(8.0)).px(px(10.0)).py(px(8.0)).child(txt(
-                self.state.lang.tr("msg.cancelled"),
-                theme::CHIP_SIZE,
-                theme::muted(),
-            )));
+            column = column.child(div().rounded(px(8.0)).px(px(10.0)).py(px(8.0)).child(
+                selectable_txt(
+                    ("message-cancelled", index),
+                    self.state.lang.tr("msg.cancelled"),
+                    theme::CHIP_SIZE,
+                    theme::muted(),
+                    index as u64 * 1024 + 901,
+                ),
+            ));
         }
 
         column
@@ -3734,10 +3755,14 @@ impl Shell {
                 theme::faint(),
             ))
             .child(
-                txt(
+                // The block is the prompt the model received, so it is reading
+                // text rather than a control label.
+                selectable_txt(
+                    ("skill-body", row * 64 + slot),
                     skill.content.clone(),
                     theme::small_size_at(content),
                     theme::muted(),
+                    row as u64 * 1024 + 2 + slot as u64,
                 )
                 .line_height(px(theme::body_line_at(content))),
             )
@@ -4666,6 +4691,15 @@ impl Shell {
         // The slot already says which body this is, so the tone follows it
         // rather than a second flag that could disagree.
         let is_input = matches!(slot, BodySlot::Step { out: false, .. });
+        // A plain body - a command, its output - is reading text, so it
+        // registers a selectable run; the code body below is a `TextView` and
+        // already does. Both the id and the order come from the slot, so a step
+        // keeps its run across frames and a copy of several steps joins them in
+        // transcript order.
+        let (step_message, step_tool) = match slot {
+            BodySlot::Step { message, tool, .. } => (message, tool),
+            BodySlot::Row(..) | BodySlot::Segment(..) => (0, 0),
+        };
         let payload = text.to_string();
         let copy_id = format!("step-copy-{label}-{}-{is_input}", payload.len());
 
@@ -4713,7 +4747,11 @@ impl Shell {
             .max_h(px(theme::TOOL_BODY_MAX))
             .overflow_hidden()
             .into_any_element(),
-            None => txt(
+            None => selectable_txt(
+                (
+                    "step-body",
+                    step_message * 64 + step_tool * 2 + usize::from(!is_input),
+                ),
                 text.to_string(),
                 theme::CHIP_SIZE,
                 if is_input {
@@ -4721,13 +4759,27 @@ impl Shell {
                 } else {
                     theme::faint()
                 },
+                step_message as u64 * 1024 + 8 + step_tool as u64 * 2 + u64::from(!is_input),
             )
             .line_height(px(theme::stat_line_at(chrome.content_size)))
             .max_h(px(theme::TOOL_BODY_MAX))
             .overflow_hidden()
             .into_any_element(),
         };
-        block = block.child(body);
+        // The body itself is either a markdown `TextView` (a fenced payload) or
+        // a selectable plain run, so the frame a test locates it by is this
+        // wrapper rather than either implementation.
+        block = block.child(
+            div()
+                .w_full()
+                .debug_selector(move || {
+                    format!(
+                        "step-body-{step_message}-{step_tool}-{}",
+                        if is_input { "in" } else { "out" }
+                    )
+                })
+                .child(body),
+        );
         block.into_any_element()
     }
     /// Nothing to show.

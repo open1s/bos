@@ -15,7 +15,7 @@ use ferris_sdk::core_manifest::MANIFEST_FILE;
 use ferris_sdk::host_runtime::declarative::{load_contributions, DeclarativeRuntime};
 use ferris_sdk::host_runtime::mcp::McpRuntime;
 use ferris_sdk::host_runtime::process::ProcessRuntime;
-use ferris_sdk::package::{package_hash, ExtensionStore, Package};
+use ferris_sdk::package::{is_ignored, package_hash, package_hash_at_rev, ExtensionStore, Package};
 use ferris_sdk::resolver;
 use ferris_sdk::signing::{
     generate_key, sign_package, verify_package, SignatureVerification, TrustStore,
@@ -29,7 +29,7 @@ Commands:
   new <id> [--dir <path>] [--force]   scaffold a declarative extension package
   validate <path>                     parse and validate a package
   migrate <path> [--write]            print or write a manifest 2.0 migration
-  hash <path>                         print the canonical package hash
+  hash <path> [--rev <rev>]           print the canonical package hash (working tree, or one Git revision)
   build <path> [--out <dir>]          validate and build a .tar.gz release
   package <path> [--out <dir>]        alias for build
   test <path>                         validate the package and its contributions
@@ -387,6 +387,13 @@ fn command_validate(args: &[String]) -> Result<i32, String> {
         println!("hash:    (not computed while the manifest is invalid)");
     } else {
         println!("hash:    {}", package.hash);
+        // The market index must carry the commit's digest. Name it when the
+        // checkout differs, so a publisher cannot paste the wrong one.
+        if let Ok(committed) = package_hash_at_rev(&path, "HEAD") {
+            if committed != package.hash {
+                println!("commit:  {committed} (a market index must carry this one)");
+            }
+        }
     }
     for warning in &package.report.warnings {
         println!("warning: {warning}");
@@ -509,14 +516,39 @@ fn validate_runtime(package: &Package) -> Result<(), String> {
 }
 
 fn command_hash(args: &[String]) -> Result<i32, String> {
-    let path = PathBuf::from(one_argument(args, "bsh ext hash <path>")?);
-    match package_hash(&path) {
-        Ok(hash) => {
-            println!("{hash}");
-            Ok(0)
+    let mut path: Option<PathBuf> = None;
+    let mut rev: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--rev" => {
+                rev = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--rev needs a revision".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option {other:?}"));
+            }
+            other => {
+                if path.is_some() {
+                    return Err("bsh ext hash takes one path".to_string());
+                }
+                path = Some(PathBuf::from(other));
+                index += 1;
+            }
         }
-        Err(error) => Err(error.to_string()),
     }
+    let path = path.ok_or_else(|| "usage: bsh ext hash <path> [--rev <rev>]".to_string())?;
+    let hash = match &rev {
+        Some(rev) => package_hash_at_rev(&path, rev),
+        None => package_hash(&path),
+    }
+    .map_err(|error| error.to_string())?;
+    println!("{hash}");
+    Ok(0)
 }
 
 fn command_install(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
@@ -1410,15 +1442,16 @@ fn append_tree(
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
+        let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if matches!(
-            name.as_ref(),
-            ".git" | "target" | "node_modules" | ".jj" | "dist"
-        ) {
+        // One rule for the hash, the install copy and the archive: the store
+        // ignores a path or it ships it, so extracting the archive reproduces
+        // the digest `package` reports instead of a tree missing files the
+        // hash counted.
+        if is_ignored(&path) {
             continue;
         }
-        let path = entry.path();
         let relative = archive.join(name.as_ref());
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
