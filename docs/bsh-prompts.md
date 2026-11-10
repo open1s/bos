@@ -48,7 +48,11 @@ is unreachable until the model knows to look, and a paragraph appended after the
 whole contract arrives after the first action has been chosen. The block keeps
 the capability gate - it is written only for a search this agent really carries -
 and it is the first thing in the system prompt, under
-`## Check what you were given first`.
+`## Check what you were given first`, whose line then names the searches the
+request actually carries (`find_tool`, `find_skill`, or both). The heading is
+derived from the request's tool array, not from a second guess at the same
+policy, so it can neither promise a search the request dropped nor hide one it
+kept.
 
 | # | Layer | Constant | Owner | When |
 |---|-------|----------|-------|------|
@@ -253,9 +257,11 @@ the built prompt at 12,000 bytes; `the_framework_prompt_stays_small` caps the
 framework default at 6,000. The skill catalogue is deliberately not in the
 prompt: it is ranked against the request instead.
 
-The discovery block is extra when a search is carried: `DISCOVERY_PRIORITY`
-(34 bytes), `DISCOVERY_GUIDANCE` (617) and `SKILL_DISCOVERY_GUIDANCE` (274) -
-929 bytes with both, written first and gated on the search that makes it true.
+The discovery block is extra when a search is carried: the heading base
+`DISCOVERY_PRIORITY` (34 bytes) plus the name it appends (15 for one search,
+28 for "with find_tool or find_skill"), `DISCOVERY_GUIDANCE` (617) and
+`SKILL_DISCOVERY_GUIDANCE` (274) - 957 bytes with both, written first and
+gated on the search that makes it true.
 
 ## 7. Scenario checks
 

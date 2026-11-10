@@ -21628,6 +21628,94 @@ fn the_chat_scrolls_smoothly_with_the_wheel(cx: &mut TestAppContext) {
     );
 }
 
+/// Scrolling a long chat must never paint a row the viewport shows as a blank
+/// spacer, and the work one frame does must follow the viewport, not the history.
+///
+/// The transcript builds the rows near the viewport and places the rest by an
+/// average height. That arithmetic is over ESTIMATED heights in a stretch that was
+/// never painted, so it drifts, and a row it culled could still be on screen - the
+/// reader saw the text vanish and come back frame after frame, which is the
+/// flicker a scroll report is about. A row the last paint showed near the viewport
+/// stays built now, and a fixed number of rows on each side of the row at the
+/// viewport's top edge is built too, so a row's first measurement lands while it
+/// is still off screen.
+#[gpui::test]
+fn scrolling_a_long_chat_never_blanks_a_visible_row(cx: &mut TestAppContext) {
+    const TURNS: usize = 400;
+    const STEPS: usize = 24;
+    /// Rows one frame may build: the prefetch window on both sides, the band and
+    /// the newest few, with room for the tail rows a turn adds.
+    const ROWS_PER_FRAME: usize = 80;
+
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("scroll-blank", TURNS);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    for _ in 0..4 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let shell = cx.update(|_, cx| _harness.read(cx).shell.clone());
+    let body = cx.debug_bounds("transcript").expect("the transcript");
+    let selectors: Vec<&'static str> = (0..TURNS)
+        .map(|turn| Box::leak(format!("user-bubble-{}", turn * 2).into_boxed_str()) as &'static str)
+        .collect();
+    let opened = cx.update(|_, cx| f32::from(shell.read(cx).transcript_scroll.offset().y));
+    let mut worst_frame = 0;
+    for step in 0..STEPS {
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
+                    position: body.center(),
+                    delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(160.0))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: gpui_kit::TouchPhase::Moved,
+                    source: gpui_kit::ScrollSource::Pointer,
+                }),
+                cx,
+            );
+        });
+        for _ in 0..4 {
+            let rows_before = crate::ui::transcript::transcript_rows_built();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            worst_frame =
+                worst_frame.max(crate::ui::transcript::transcript_rows_built() - rows_before);
+            // Only rows FULLY inside the viewport: a clipped row reports a clipped
+            // box, which makes "is it on screen" a guess.
+            let visible: Vec<usize> = cx.update(|_, cx| {
+                let shell = shell.read(cx);
+                let scroll = &shell.transcript_scroll;
+                let view_top = -f32::from(scroll.offset().y);
+                let view_bottom = view_top + f32::from(scroll.bounds().size.height);
+                (0..TURNS)
+                    .filter(|turn| {
+                        scroll.bounds_for_item(1 + turn * 2).is_some_and(|item| {
+                            f32::from(item.top()) >= view_top + 24.0
+                                && f32::from(item.bottom()) <= view_bottom - 16.0
+                        })
+                    })
+                    .collect()
+            });
+            for turn in visible {
+                assert!(
+                    cx.debug_bounds(selectors[turn]).is_some(),
+                    "turn {turn} is inside the viewport but was painted as a spacer (step {step})"
+                );
+            }
+        }
+    }
+    let reached = cx.update(|_, cx| f32::from(shell.read(cx).transcript_scroll.offset().y));
+    assert!(
+        reached > opened + 2000.0 || reached >= -1.0,
+        "the premise: the wheel travelled up the history: {opened} -> {reached}"
+    );
+    assert!(
+        worst_frame <= ROWS_PER_FRAME,
+        "one frame built {worst_frame} rows of a {TURNS}-turn chat; the window must bound the work"
+    );
+}
+
 /// The new run view: a run navigator, a status header, a step timeline and the
 /// selected step's inspector, with the measured timeline still one press away.
 #[gpui::test]

@@ -6587,6 +6587,40 @@ impl Shell {
     /// Returns whether another frame is needed. The target is set by
     /// [`Shell::wheel_chat`], so a wheel event only decides WHERE to go; the
     /// motion happens here, which is what makes it smooth instead of a jump.
+    /// Keep the row the reader is reading where it is on screen.
+    ///
+    /// The transcript measures the rows it built and estimates the rest; when a
+    /// measured height above the reader's row replaces an estimate, the
+    /// arithmetic that places every row below it moves too, so the text under
+    /// the pointer shifted by tens of pixels on top of the wheel's own motion -
+    /// the flicker a scroll report is about. The layout reports how far the
+    /// anchored row moved; taking that out of the offset is this function's
+    /// whole job. It is skipped at the tail, where the pin owns the offset, and
+    /// when the correction would leave the scroller's range, where applying it
+    /// would only move the text the other way.
+    pub(crate) fn settle_anchor(&mut self) {
+        if self.following_tail {
+            return;
+        }
+        let height = self.transcript_scroll.bounds().size.height;
+        if height <= px(0.0) {
+            return;
+        }
+        let mut layout = self.transcript_layout.borrow_mut();
+        layout.observe(&self.transcript_scroll);
+        let Some(delta) = layout.anchor_delta() else {
+            return;
+        };
+        let current = self.transcript_scroll.offset().y;
+        let max = self.transcript_scroll.max_offset().y;
+        let next = current - px(delta);
+        if next > px(0.0) || next < -max {
+            return;
+        }
+        self.transcript_scroll.set_offset(point(px(0.0), next));
+        self.chat_smooth.shift(-delta);
+    }
+
     pub(crate) fn advance_smooth(&mut self) -> bool {
         let mut animating = false;
         if self.chat_smooth.animating() {
@@ -7313,6 +7347,13 @@ impl Render for Shell {
         // frame while it is still moving.
         if self.advance_smooth() {
             self.frame_notify("wheel-ease", cx);
+        }
+        // The reader's row keeps its place when a height above it is measured.
+        // After the easing, so the correction lands inside the movement rather
+        // than against it, and before the offset is recorded, so the next wheel
+        // delta starts from where the text actually is.
+        if self.state.tab == crate::state::Tab::Chat {
+            self.settle_anchor();
         }
         self.chat_last_offset = f32::from(self.transcript_scroll.offset().y);
         self.traj_last_offset = f32::from(self.traj_scroll.offset().y);

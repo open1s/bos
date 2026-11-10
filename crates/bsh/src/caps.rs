@@ -5644,6 +5644,41 @@ mod tests {
             );
         }
     }
+
+    /// The prompt rule for a missing tool is carried by every BSH build.
+    ///
+    /// "When the tool you need is not among them, call find_tool" is written
+    /// by `Agent::system_prompt_for` only when the build really withholds a
+    /// tool (the paragraph itself is pinned by the agent crate's discovery
+    /// tests). BSH stays on that side of the gate on every build: the browser
+    /// family is registered and withheld, so `find_tool` replaces it even on
+    /// a fresh install with no MCP server, extension or federation peer. Losing
+    /// that would silently drop the way back to a withheld tool, because the
+    /// prompt would have nothing true to say.
+    #[test]
+    fn every_build_carries_the_tool_search() {
+        let built = build_agent(
+            &Settings::default(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert!(
+            built.agent.has_deferred_tools(),
+            "a build withholds at least the browser family"
+        );
+        let advertised: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            advertised.iter().any(|name| name == "find_tool"),
+            "the discovery block's precondition: {advertised:?}"
+        );
+    }
+
     /// The egress file carries three rule shapes, and a line is classified by
     /// what it can be: a port number, an address, or a hostname. The reader also
     /// reports the file's own STATE, which the rule lists cannot carry: absent

@@ -89,6 +89,44 @@ pub fn find_skill_definition() -> LlmTool {
     LlmTool::function(FIND_SKILL, FIND_SKILL_DESCRIPTION, find_skill_schema())
 }
 
+/// The discovery section for the tool array a request actually carries.
+///
+/// The array is the one fact that says what the model may call. A prompt that
+/// named a search the request does not carry tells the model to call a tool it
+/// was never given, and a prompt that omitted one the request does carry hides
+/// the way back to every withheld tool - so the block is derived from the same
+/// list the request sends, never from a second guess at the same policy.
+///
+/// The heading is written once, and a paragraph appears only for the search
+/// that is really there. An empty return means this request carries nothing to
+/// search, and the model is told nothing it cannot do.
+pub(crate) fn prompt_block(tools: &[LlmTool]) -> String {
+    let tool_search = tools.iter().any(|tool| tool.name == FIND_TOOL);
+    let skill_search = tools.iter().any(|tool| tool.name == FIND_SKILL);
+    if !tool_search && !skill_search {
+        return String::new();
+    }
+    let mut block = String::from(crate::agent::prompts::DISCOVERY_PRIORITY);
+    // The heading names the searches it introduces, and only those. Naming
+    // both unconditionally was the first draft of this block, and it told a
+    // request that carried only one search to call the other.
+    block.push_str(&match (tool_search, skill_search) {
+        (true, true) => format!(" with {FIND_TOOL} or {FIND_SKILL}"),
+        (true, false) => format!(" with {FIND_TOOL}"),
+        (false, true) => format!(" with {FIND_SKILL}"),
+        (false, false) => String::new(),
+    });
+    if tool_search {
+        block.push_str("\n\n");
+        block.push_str(crate::agent::prompts::DISCOVERY_GUIDANCE);
+    }
+    if skill_search {
+        block.push_str("\n\n");
+        block.push_str(crate::agent::prompts::SKILL_DISCOVERY_GUIDANCE);
+    }
+    block
+}
+
 /// The argument schema of the skill search.
 pub fn find_skill_schema() -> Value {
     json!({
@@ -615,6 +653,56 @@ mod tests {
             instructions: format!("instructions for {name}"),
             skill_dir: std::path::PathBuf::from(format!("/skills/{name}")),
         }
+    }
+
+    /// The discovery block follows the REQUEST's tool array: a search the
+    /// request carries is named, one it does not carry is silent, and the
+    /// heading is written once even when both searches ride the same request.
+    #[test]
+    fn the_discovery_block_names_exactly_the_searches_the_request_carries() {
+        let tool = |name: &str| LlmTool::function(name, "does a thing", json!({"type": "object"}));
+
+        assert!(
+            prompt_block(&[]).is_empty(),
+            "an empty array has nothing to search"
+        );
+
+        let tools = prompt_block(&[tool(FIND_TOOL)]);
+        assert!(tools.starts_with(crate::agent::prompts::DISCOVERY_PRIORITY));
+        assert!(
+            tools.contains(&format!("with {FIND_TOOL}")),
+            "the heading names the search it introduces: {tools}"
+        );
+        assert!(
+            !tools.contains(FIND_SKILL),
+            "a search the request does not carry is not named"
+        );
+        assert!(tools.contains(crate::agent::prompts::DISCOVERY_GUIDANCE));
+        assert!(!tools.contains(crate::agent::prompts::SKILL_DISCOVERY_GUIDANCE));
+        assert_eq!(
+            tools
+                .matches(crate::agent::prompts::DISCOVERY_PRIORITY)
+                .count(),
+            1,
+            "one heading, however many paragraphs follow it"
+        );
+
+        let skills = prompt_block(&[tool(FIND_SKILL)]);
+        assert!(skills.starts_with(crate::agent::prompts::DISCOVERY_PRIORITY));
+        assert!(skills.contains(&format!("with {FIND_SKILL}")));
+        assert!(!skills.contains(FIND_TOOL));
+        assert!(skills.contains(crate::agent::prompts::SKILL_DISCOVERY_GUIDANCE));
+        assert!(!skills.contains(crate::agent::prompts::DISCOVERY_GUIDANCE));
+
+        let both = prompt_block(&[tool(FIND_TOOL), tool(FIND_SKILL)]);
+        assert!(both.contains(&format!("with {FIND_TOOL} or {FIND_SKILL}")));
+        assert!(both.contains(crate::agent::prompts::DISCOVERY_GUIDANCE));
+        assert!(both.contains(crate::agent::prompts::SKILL_DISCOVERY_GUIDANCE));
+        assert_eq!(
+            both.matches(crate::agent::prompts::DISCOVERY_PRIORITY)
+                .count(),
+            1
+        );
     }
 
     #[test]

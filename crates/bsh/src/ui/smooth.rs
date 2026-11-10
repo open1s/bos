@@ -34,6 +34,18 @@ impl Smooth {
         self.target.is_some()
     }
 
+    /// Move a target already aimed at, without restarting the motion.
+    ///
+    /// The transcript corrects its offset when a measured height above the
+    /// reader's row revises the layout; an eased scroll in flight has to take the
+    /// same correction, or the next frame would ease straight back to where the
+    /// text used to be.
+    pub(crate) fn shift(&mut self, delta: f32) {
+        if let Some(target) = self.target {
+            self.target = Some(target + delta);
+        }
+    }
+
     /// The next offset, given the live one.
     ///
     /// Returns `None` once the target is reached, which is also when the caller

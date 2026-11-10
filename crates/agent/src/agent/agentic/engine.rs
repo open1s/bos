@@ -358,25 +358,19 @@ impl Agent {
     /// Discovery is written FIRST, ahead of the standing contract, because the
     /// search is a step before acting rather than a fallback after a failure:
     /// a paragraph appended after the whole prompt arrived once the model had
-    /// already picked its first action. The block is capability-gated the same
-    /// way it always was - an agent that withholds nothing and catalogues its
-    /// skills never names a search it does not carry.
+    /// already picked its first action.
+    ///
+    /// The block is read from the REQUEST's own tool array, not from a second
+    /// derivation of the same policy. That is the whole guarantee: if the
+    /// request carries `find_tool` or `find_skill`, the prompt names it; if it
+    /// does not, the prompt is silent about it. A build that changes what it
+    /// advertises therefore cannot leave the prompt pointing at a search it
+    /// dropped, or hiding one it kept.
     ///
     /// Non-text input (images/audio only) has no query to match against, so
     /// it uses the composed prompt unchanged.
-    async fn system_prompt_for(&self, task: &Content) -> String {
-        let tool_search = self.has_deferred_tools();
-        let skill_search = self.skill_search();
-        let mut base = String::new();
-        if tool_search || skill_search {
-            base.push_str(crate::agent::prompts::DISCOVERY_PRIORITY);
-        }
-        if tool_search {
-            push_paragraph(&mut base, crate::agent::prompts::DISCOVERY_GUIDANCE);
-        }
-        if skill_search {
-            push_paragraph(&mut base, crate::agent::prompts::SKILL_DISCOVERY_GUIDANCE);
-        }
+    async fn system_prompt_for(&self, task: &Content, tools: &[react::llm::LlmTool]) -> String {
+        let mut base = super::discovery::prompt_block(tools);
         push_paragraph(&mut base, &self.config.system_prompt);
         if let Ok(prompts) = self.live_prompts.read() {
             for prompt in prompts.iter() {
@@ -446,7 +440,12 @@ impl Agent {
             session.take_messages()
         };
         let mut session_restore = SessionRestore::new(self, messages);
-        let system_prompt = self.system_prompt_for(&task_content).await;
+        let tools = context
+            .as_ref()
+            .expect("a prepared context for this run")
+            .tools
+            .as_slice();
+        let system_prompt = self.system_prompt_for(&task_content, tools).await;
         let prompt_text = task_content.as_text().unwrap_or_default().to_string();
 
         let request = LlmRequest {
@@ -839,7 +838,9 @@ impl Agent {
                 *tt = std::time::Duration::ZERO;
             }
 
-            let system_prompt = self.system_prompt_for(&task_content).await;
+            let system_prompt = self
+                .system_prompt_for(&task_content, context.tools.as_slice())
+                .await;
             let prompt_text = task_content.as_text().unwrap_or_default().to_string();
             let request = LlmRequest {
                 model: self.config.model.clone(),

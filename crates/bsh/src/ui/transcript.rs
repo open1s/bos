@@ -924,6 +924,19 @@ pub(crate) struct TranscriptLayout {
     /// drag ENDS (during the drag the old heights are kept, so dragging a long
     /// chat does not re-measure it on every pointer move).
     remeasure: bool,
+    /// Where the last plan put the row the reader is reading. A height revision
+    /// anywhere above it moves every row below, so this is the fact the offset
+    /// is corrected by; see [TranscriptLayout::anchor_delta].
+    anchor: Option<Anchor>,
+}
+
+/// One row the reader is looking at, at one content-space position.
+#[derive(Clone, Copy, Debug)]
+struct Anchor {
+    /// The scroller child index of the row crossing the viewport's top edge.
+    index: usize,
+    /// Its content-space top in the layout the last frame painted.
+    top: f32,
 }
 
 /// What a cached height is keyed on: the facts that decide whether the cached
@@ -1001,6 +1014,7 @@ impl TranscriptLayout {
             self.shape = Some(shape);
             self.loaded_from = loaded_from;
             self.heights = vec![None; rows];
+            self.anchor = None;
             #[cfg(test)]
             LAYOUT_RESETS.with(|resets| resets.set(resets.get() + 1));
             return Prepared::MeasureAll;
@@ -1036,12 +1050,14 @@ impl TranscriptLayout {
                     });
                     self.loaded_from = saved_from;
                     self.heights = heights;
+                    self.anchor = None;
                     stale = true;
                 }
                 None => {
                     self.shape = Some(shape);
                     self.loaded_from = loaded_from;
                     self.heights = vec![None; rows];
+                    self.anchor = None;
                     #[cfg(test)]
                     LAYOUT_RESETS.with(|resets| resets.set(resets.get() + 1));
                     return Prepared::MeasureAll;
@@ -1069,6 +1085,7 @@ impl TranscriptLayout {
             self.heights.push(timestamp);
             self.heights.extend(messages);
             self.loaded_from = loaded_from;
+            self.anchor = None;
             stale = true;
         }
         match rows.cmp(&self.heights.len()) {
@@ -1089,12 +1106,40 @@ impl TranscriptLayout {
     /// already MEASURED (an unmeasured row is built instead), so reading the
     /// spacers back is a no-op and reading the built rows is the new
     /// measurement.
-    fn observe(&mut self, scroll: &ScrollHandle) {
+    pub(crate) fn observe(&mut self, scroll: &ScrollHandle) {
         for (index, height) in self.heights.iter_mut().enumerate() {
             if let Some(bounds) = scroll.bounds_for_item(index) {
                 *height = Some(bounds.size.height.as_f32());
             }
         }
+    }
+
+    /// How far the layout moved the anchored row since the last plan.
+    ///
+    /// Positive means the content above the row grew, so every row below it sits
+    /// that much further down. The caller subtracts this from the scroller's
+    /// offset, which is what holds the reader's row still while a measured height
+    /// above it replaces an estimate. The walk is the plan's own arithmetic, so
+    /// the two agree row for row.
+    pub(crate) fn anchor_delta(&mut self) -> Option<f32> {
+        let anchor = self.anchor.take()?;
+        if anchor.index == 0 || anchor.index > self.heights.len() {
+            return None;
+        }
+        let estimate = self.estimate();
+        let mut top = TRANSCRIPT_PAD_Y;
+        for index in 0..anchor.index {
+            let height = self
+                .heights
+                .get(index)
+                .copied()
+                .flatten()
+                .filter(|height| *height >= 8.0)
+                .unwrap_or(estimate);
+            top += height + TRANSCRIPT_GAP;
+        }
+        let delta = top - anchor.top;
+        (delta.abs() >= 0.5).then_some(delta)
     }
 
     /// Adopt one session's measured rows for another that renders the same.
@@ -1162,6 +1207,23 @@ impl TranscriptLayout {
     fn height(&self, index: usize) -> Option<f32> {
         self.heights.get(index).copied().flatten()
     }
+
+    /// The row the viewport's top edge falls in, by the plan's own arithmetic.
+    fn row_at(&self, rows: usize, view_top: f32) -> usize {
+        let estimate = self.estimate();
+        let mut top = TRANSCRIPT_PAD_Y;
+        for index in 0..rows {
+            let row_h = self
+                .height(index)
+                .filter(|height| *height >= 8.0)
+                .unwrap_or(estimate);
+            if top + row_h > view_top {
+                return index;
+            }
+            top += row_h + TRANSCRIPT_GAP;
+        }
+        rows.saturating_sub(1)
+    }
 }
 
 /// Whether a message row carries images.
@@ -1187,7 +1249,7 @@ fn transcript_spacer(height: f32) -> AnyElement {
 
 /// Rows this close to the viewport are built too, so a small scroll never
 /// reveals an empty frame.
-const TRANSCRIPT_OVERDRAW: f32 = 480.0;
+const TRANSCRIPT_OVERDRAW: f32 = 1000.0;
 /// The scroller's top padding and the gap between rows, in one definition:
 /// the window's geometry maths and the element tree must agree.
 const TRANSCRIPT_PAD_Y: f32 = 24.0;
@@ -1197,6 +1259,16 @@ const SAVED_LAYOUTS: usize = 8;
 /// The newest rows are always built: a stream writes into them and a turn's
 /// fold state changes at the tail.
 const TRANSCRIPT_TAIL_BUILT: usize = 4;
+/// How many rows on each side of the row at the viewport's top edge are built.
+///
+/// A row's first paint is also its first measurement, and the height it lands at
+/// replaces the estimate the rows around it were placed by - which moves every
+/// row below it. Building by DISTANCE IN ROWS, not only by the pixel band, is
+/// what makes that first measurement land while the row is still far off screen:
+/// the band's arithmetic is over estimated heights, and in a stretch that was
+/// never painted the estimate is all there is, so a pixel band alone lets a row
+/// reach the viewport before it has ever been measured.
+const TRANSCRIPT_PREFETCH_ROWS: usize = 10;
 
 // How many message rows the last frame actually built, for the performance
 // test. Per-thread, because tests run in parallel inside one process.
@@ -1352,7 +1424,7 @@ impl Shell {
         policy: TranscriptPolicy,
     ) -> Vec<Option<f32>> {
         let mut layout = self.transcript_layout.borrow_mut();
-        layout.prepare(
+        let prepared = layout.prepare(
             TranscriptShape {
                 session: session.id.clone(),
                 width: self.chat_w().to_bits(),
@@ -1375,7 +1447,22 @@ impl Shell {
         let view_h = f32::from(view.size.height);
         let view_top = -f32::from(self.transcript_scroll.offset().y);
         let estimate = layout.estimate();
+        // The bounds the last paint recorded are the only positions that are
+        // TRUE: `top` below is arithmetic over cached heights, and a row that was
+        // never measured is placed by the average. A row the last paint put near
+        // the viewport is therefore built whatever the arithmetic says, which is
+        // what stops a visible row from blinking into a blank spacer while the
+        // reader scrolls. Stale bounds address the wrong rows, so only the exact
+        // case uses them.
+        let painted = matches!(prepared, Prepared::Exact);
+        // The rows the reader is at, and a fixed number of rows on each side of
+        // them, built whatever the estimates say: the first paint of a row is its
+        // first measurement, and measuring it while it is on screen moves every
+        // row below it under the reader's eyes.
+        let nearest = layout.row_at(rows, view_top);
+        let prefetch = |index: usize| index.abs_diff(nearest) <= TRANSCRIPT_PREFETCH_ROWS;
         let mut plans = Vec::with_capacity(rows);
+        let mut anchor = None;
         let mut top = TRANSCRIPT_PAD_Y;
         for index in 0..rows {
             let measured = layout.height(index).filter(|height| *height >= 8.0);
@@ -1384,9 +1471,25 @@ impl Shell {
             let in_band = view_h > 0.0
                 && top + row_h > view_top - TRANSCRIPT_OVERDRAW
                 && top < view_top + view_h + TRANSCRIPT_OVERDRAW;
+            let painted_near = painted
+                && view_h > 0.0
+                && self
+                    .transcript_scroll
+                    .bounds_for_item(index)
+                    .is_some_and(|bounds| {
+                        f32::from(bounds.bottom()) > view_top - TRANSCRIPT_OVERDRAW
+                            && f32::from(bounds.top()) < view_top + view_h + TRANSCRIPT_OVERDRAW
+                    });
             // An image row keeps building: its gallery can grow when a data URL
             // finishes decoding, so a spacer would go stale.
-            let build = forced || has_images(session, index) || in_band;
+            let build =
+                forced || has_images(session, index) || in_band || painted_near || prefetch(index);
+            // The row the reader is reading: the first one whose span reaches the
+            // viewport's top edge. Its painted position is what the next plan
+            // holds still (see `anchor_delta`).
+            if anchor.is_none() && view_h > 0.0 && top + row_h > view_top {
+                anchor = Some(Anchor { index, top });
+            }
             // A row outside the band is a spacer at its MEASURED height, or at
             // the estimate while it has never been measured: pushing `measured`
             // here would push None, which the consumer reads as "build it", and
@@ -1394,6 +1497,7 @@ impl Shell {
             plans.push(if build { None } else { Some(row_h) });
             top += row_h + TRANSCRIPT_GAP;
         }
+        layout.anchor = anchor;
         plans
     }
 

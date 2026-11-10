@@ -69,6 +69,12 @@ You and the reader share one workspace. Turn what they asked for into a finished
 /// has already chosen its first action. The block under this heading is written
 /// first into the system prompt, and only for an agent that really carries a
 /// search, so the capability gate in [`DISCOVERY_GUIDANCE`] still holds.
+///
+/// This is the heading's BASE, not the whole line: the block appends the
+/// searches the request actually carries (`find_tool`, `find_skill`, or both),
+/// because a heading that promised a search the request does not carry would
+/// be the same lie as a paragraph that did. The block is composed by
+/// `discovery::prompt_block` from the request's own tool array.
 pub const DISCOVERY_PRIORITY: &str = "## Check what you were given first";
 
 /// What the model is told when some tools are withheld from its tool list.

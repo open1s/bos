@@ -4082,3 +4082,57 @@ reference's wrap toggle cannot be mirrored; a comment is a line-anchored remark
 with no reply chain (the conversation happens in chat); the rail dash is not
 reachable by the synthetic harness, so the click tests drive `focus_comment`
 and assert the dock/drawer geometry instead.
+
+Round 191 audited every pane's cost against an arbitrarily large history, and
+closed the chat transcript's scroll window. The report was "the chat flickers when
+it scrolls".
+
+- The transcript is the one pane that VIRTUALIZES BY SPACER: a culled row is a div
+  of a cached height, and the plan's `top` arithmetic over those heights decides
+  which rows are built. In a stretch that was never painted the only height there
+  is is `estimate()` - the average of what HAS been measured - so the arithmetic
+  drifts, and a row it culled could still be on screen. Two seams close it.
+  `painted_near` builds a row whose LAST PAINT put it inside the band, whatever the
+  arithmetic says (`bounds_for_item` is the only true position; `Prepared::Stale`
+  bounds address the wrong rows, so only the exact case uses them).
+  `TRANSCRIPT_PREFETCH_ROWS` builds a fixed ten rows on each side of the row at the
+  viewport's top edge BY INDEX, so a row's first measurement - the frame its real
+  height replaces the estimate and moves everything below it - lands while it is
+  still far off screen. `TRANSCRIPT_OVERDRAW` widened 480 -> 1000 for the same
+  reason. The existing budgets still hold (`a_long_transcript_only_builds_the_rows_near_the_viewport`
+  is unchanged and green).
+- `TranscriptLayout::anchor_delta` is the safety net: it re-walks the plan's own
+  arithmetic for the row at the viewport's top edge and reports how far that row
+  moved, and `Shell::settle_anchor` takes the delta out of the scroller's offset
+  (and out of `chat_smooth`'s target, through `Smooth::shift`) before the frame
+  paints. It is skipped while `following_tail` holds, where the tail pin owns the
+  offset, and when the correction would leave the scroller's range.
+- Evidence: `scrolling_a_long_chat_never_blanks_a_visible_row` (400 turns, 24 wheel
+  detents, four frames each: every row FULLY inside the viewport has its debug
+  selector and a frame builds at most 80 rows). Trap worth keeping: measuring a
+  scroll fix is harder than making it. `bounds_for_item` and `debug_bounds` do not
+  agree on space or clipping, and a wheel event also applies the scroller's own
+  jump, so `Δ(painted top) - Δ(offset)` reads the wheel's own motion as reflow. What
+  a test can assert honestly is the INVARIANT (a visible row is built) and the
+  bounded frame, not a pixel residual.
+- Pageable work, audited end to end this round. Chat holds `store::WINDOW` =
+  2 x `history::PAGE` (256) messages, hydrated from the tail;
+  `page_older_at_the_top` prepends a page and `TranscriptLayout::prepare` SHIFTS the
+  cached heights, so a page costs its new rows, not a re-measure. Trajectory caches
+  the flattened log (`EventsCache`, keyed on the session's shape) and paints the band
+  behind ONE leading and ONE trailing spacer, so its element count is the
+  viewport's. Audit pages 20 turns and, while every turn is collapsed, windows that
+  page behind two spacers, with its view model `Rc`-cached behind `AuditKey`.
+  Review caps its body (200 structural nodes, 1 200 diff lines) and caches the
+  parsed diff in `review_diff`, keyed by change id. Each pane has its bounded-window
+  test: `a_long_transcript_only_builds_the_rows_near_the_viewport`,
+  `a_long_log_paints_a_bounded_window`,
+  `a_long_audit_page_paints_a_bounded_window`.
+- Known limit, reported rather than changed: a document written before the Parquet
+  log still carries its transcript inline, and `Store::ensure_document` keeps all of
+  it so the first save can migrate it (`store.rs` "keep it so the first save
+  migrates"). A legacy chat with tens of thousands of rows therefore reaches the
+  transcript window unbounded once, until a save writes the log. Bounding it needs
+  the migration to write the log BEFORE the window is trimmed; that is a migration
+  round, not a scroll fix.
+
