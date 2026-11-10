@@ -12,12 +12,69 @@
 //! The file is created on the first file-tool call, with every common tree
 //! COMMENTED OUT: a fresh workspace changes nothing until its reader uncomments
 //! a line. An existing file is never overwritten, so edits survive every call.
+//!
+//! # Caching
+//!
+//! Parsing is cached per workspace and validated by the file's modification
+//! time and size on every load. A create, edit or delete changes that
+//! fingerprint, so the next file-tool call reparses; a hit costs one stat
+//! instead of opening and compiling the file. There is no background watcher on
+//! purpose: the cache is only read from a tool call, so the call is the earliest
+//! point a refresh could be observed.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::SystemTime;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+/// The metadata that invalidates one cached rule set.
+///
+/// Modification time plus length catches a normal editor save, a truncation,
+/// an append and a replacement. A same-size edit inside the filesystem's
+/// timestamp granularity is the one window this cannot see; the alternative - a
+/// content hash on every call - would defeat the cache it is meant to protect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fingerprint {
+    len: u64,
+    modified: SystemTime,
+}
+
+impl Fingerprint {
+    /// The fingerprint of a metadata record, or none when the platform cannot
+    /// report a modification time (in which case the file is not cached).
+    fn of(meta: &fs::Metadata) -> Option<Self> {
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+        })
+    }
+}
+
+/// One parsed workspace, kept with the fingerprint it was parsed from.
+#[derive(Clone, Debug)]
+struct Cached {
+    fingerprint: Fingerprint,
+    rules: Rules,
+}
+
+/// The process-wide cache, keyed by the absolute ignore-file path.
+///
+/// A mutex rather than a read-write lock: a hit is one map lookup plus a clone
+/// of the parsed matcher, and file tools are not called at frame rate.
+fn cache() -> &'static Mutex<HashMap<PathBuf, Cached>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Cached>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_lock() -> MutexGuard<'static, HashMap<PathBuf, Cached>> {
+    cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// The directory BSH and BOS use for their own workspace state.
 pub(crate) const BSH_DIR: &str = ".bsh";
@@ -103,9 +160,10 @@ pub(crate) const DEFAULT_IGNORE: &str = r#"# ===================================
 
 /// The parsed rules for one workspace, or an empty set when there is no file.
 ///
-/// load is called once per tool call rather than once per launch on purpose:
-/// the file is a small text file, and reading it at the call is what makes an
-/// edit take effect on the next tool call instead of after a restart.
+/// A load is served from the process-wide cache when the file's fingerprint is
+/// unchanged, so a tool call does not open and compile the rules every time.
+/// Any create, edit or delete changes the fingerprint and reparses on that
+/// call; see the module's caching note.
 #[derive(Clone, Debug)]
 pub(crate) struct Rules {
     root: PathBuf,
@@ -119,27 +177,51 @@ impl Rules {
     /// directory (a symlink out of the workspace, for example), and an
     /// unreadable file all degrade to "no rules": the file is a convenience,
     /// and a tool call must not fail because it cannot be read.
+    ///
+    /// The cache is validated by the file's modification time and length, not
+    /// trusted by path alone, so an edit reaches the very next call.
     pub(crate) fn load(root: &Path) -> Self {
-        let mut rules = Self {
-            root: root.to_path_buf(),
-            matcher: None,
+        let file_hint = root.join(BSH_DIR).join(IGNORE_NAME);
+        let Some((file, fingerprint)) = ensure(root) else {
+            // A .bsh that became a symlink, or an ignore file that became a
+            // directory, must not keep serving the rules it had before.
+            cache_lock().remove(&file_hint);
+            return Self::empty(root);
         };
-        let Some(file) = ensure(root) else {
+        if let Some(rules) = Self::cached(&file, fingerprint) {
             return rules;
-        };
-        let Ok(meta) = fs::metadata(&file) else {
-            return rules;
-        };
-        if meta.len() > MAX_IGNORE_BYTES {
+        }
+        if fingerprint.len > MAX_IGNORE_BYTES {
             log::warn!(
                 "workspace ignore file {} is {} bytes, past the {MAX_IGNORE_BYTES} byte ceiling; ignoring it",
                 file.display(),
-                meta.len()
+                fingerprint.len
             );
+            // Cache the refusal too: an oversized file should be reported once
+            // per fingerprint, not once per tool call, and a later truncation
+            // changes the fingerprint and is parsed normally.
+            let rules = Self::empty(root);
+            Self::remember(file, fingerprint, rules.clone());
             return rules;
         }
+        let rules = Self::parse(root, &file);
+        Self::remember(file, fingerprint, rules.clone());
+        rules
+    }
+
+    /// The empty rule set for a workspace with no readable file.
+    fn empty(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            matcher: None,
+        }
+    }
+
+    /// Parse one ignore file, logging a bad rule without failing the call.
+    fn parse(root: &Path, file: &Path) -> Self {
+        let mut rules = Self::empty(root);
         let mut builder = GitignoreBuilder::new(root);
-        if let Some(error) = builder.add(&file) {
+        if let Some(error) = builder.add(file) {
             log::warn!(
                 "workspace ignore file {} has a bad rule: {error}",
                 file.display()
@@ -153,6 +235,20 @@ impl Rules {
             ),
         }
         rules
+    }
+
+    /// The cached rules for this file and fingerprint, when they still match.
+    fn cached(file: &Path, fingerprint: Fingerprint) -> Option<Self> {
+        let cache = cache_lock();
+        cache
+            .get(file)
+            .filter(|entry| entry.fingerprint == fingerprint)
+            .map(|entry| entry.rules.clone())
+    }
+
+    /// Replace this workspace's cache entry with the rules just parsed.
+    fn remember(file: PathBuf, fingerprint: Fingerprint, rules: Self) {
+        cache_lock().insert(file, Cached { fingerprint, rules });
     }
 
     /// The absolute path of the file these rules came from.
@@ -237,10 +333,10 @@ impl Rules {
 
 /// Create <root>/.bsh/.ignore with DEFAULT_IGNORE when it is missing.
 ///
-/// Returns the file path when one exists afterwards. Every failure is a None
-/// and not an error: the rules are an aid, and a read-only workspace must
-/// still support every file tool.
-fn ensure(root: &Path) -> Option<PathBuf> {
+/// Returns the file path and the fingerprint of the bytes now on disk when one
+/// exists afterwards. Every failure is a None and not an error: the rules are an
+/// aid, and a read-only workspace must still support every file tool.
+fn ensure(root: &Path) -> Option<(PathBuf, Fingerprint)> {
     if !root.is_dir() {
         return None;
     }
@@ -261,7 +357,10 @@ fn ensure(root: &Path) -> Option<PathBuf> {
     let file = dir.join(IGNORE_NAME);
     match fs::symlink_metadata(&file) {
         Ok(meta) => {
-            return meta.is_file().then_some(file);
+            if !meta.is_file() {
+                return None;
+            }
+            return Fingerprint::of(&meta).map(|fingerprint| (file, fingerprint));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(_) => return None,
@@ -279,10 +378,22 @@ fn ensure(root: &Path) -> Option<PathBuf> {
                 let _ = fs::remove_file(&file);
                 return None;
             }
-            Some(file)
+            // Fingerprint the file this call just wrote. A platform that cannot
+            // report its mtime is left uncached rather than cached forever.
+            let fingerprint = handle
+                .metadata()
+                .ok()
+                .and_then(|meta| Fingerprint::of(&meta));
+            fingerprint.map(|fingerprint| (file, fingerprint))
         }
         // Another tool call won the race; use the file it wrote.
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Some(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let meta = fs::symlink_metadata(&file).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Fingerprint::of(&meta).map(|fingerprint| (file, fingerprint))
+        }
         Err(_) => None,
     }
 }
@@ -360,6 +471,93 @@ build/
         assert!(!rules.is_ignored(&root.join("build"), false));
         assert!(rules.is_ignored(&root.join("build").join("out.o"), false));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An edit (a different fingerprint) must reach the next load instead of
+    /// serving the previous parsed rules, and deleting the file must recreate
+    /// the default rather than leaving the old rules cached.
+    #[test]
+    fn a_changed_file_refreshes_the_cache() {
+        let root = scratch("cache-change");
+        fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        let file = root.join(".bsh").join(".ignore");
+        fs::write(&file, "one/\n").expect("the first rules");
+        let first = Rules::load(&root);
+        assert!(first.is_ignored(&root.join("one"), true));
+        assert!(!first.is_ignored(&root.join("two"), true));
+
+        // A different length guarantees a different fingerprint even on a
+        // filesystem with coarse modification times.
+        fs::write(&file, "two/\n# a longer line changes the file length\n").expect("the edit");
+        let second = Rules::load(&root);
+        assert!(
+            !second.is_ignored(&root.join("one"), true),
+            "the edit did not reach the next load"
+        );
+        assert!(second.is_ignored(&root.join("two"), true));
+
+        fs::remove_file(&file).expect("remove the file");
+        let third = Rules::load(&root);
+        assert!(file.is_file(), "a missing file is recreated");
+        assert!(
+            !third.is_ignored(&root.join("two"), true),
+            "the removed rule is still being served"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A hit is a stat and a map lookup, not another open: the file can be
+    /// unreadable and the cached rules still answer.
+    #[test]
+    #[cfg(unix)]
+    fn a_cache_hit_does_not_read_the_file_again() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("cache-hit");
+        fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        let file = root.join(".bsh").join(".ignore");
+        fs::write(&file, "secret/\n").expect("the rules");
+        let first = Rules::load(&root);
+        assert!(first.is_ignored(&root.join("secret"), true));
+
+        let mut permissions = fs::metadata(&file).expect("metadata").permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&file, permissions).expect("make the file unreadable");
+        let second = Rules::load(&root);
+        assert!(
+            second.is_ignored(&root.join("secret"), true),
+            "a cache hit must not open the file again"
+        );
+
+        let mut permissions = fs::metadata(&file).expect("metadata").permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&file, permissions).expect("restore the file");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two workspaces with different rules must not share one cache entry.
+    #[test]
+    fn the_cache_is_keyed_by_workspace() {
+        let alpha = scratch("cache-alpha");
+        fs::create_dir_all(alpha.join(".bsh")).expect(".bsh");
+        fs::write(alpha.join(".bsh").join(".ignore"), "alpha-only/\n").expect("alpha rules");
+        let beta = scratch("cache-beta");
+        fs::create_dir_all(beta.join(".bsh")).expect(".bsh");
+        fs::write(beta.join(".bsh").join(".ignore"), "beta-only/\n").expect("beta rules");
+
+        let alpha_rules = Rules::load(&alpha);
+        let beta_rules = Rules::load(&beta);
+        assert!(alpha_rules.is_ignored(&alpha.join("alpha-only"), true));
+        assert!(!alpha_rules.is_ignored(&alpha.join("beta-only"), true));
+        assert!(beta_rules.is_ignored(&beta.join("beta-only"), true));
+        assert!(!beta_rules.is_ignored(&beta.join("alpha-only"), true));
+
+        // Loading alpha again after beta must still be alpha's entry.
+        let alpha_again = Rules::load(&alpha);
+        assert!(alpha_again.is_ignored(&alpha.join("alpha-only"), true));
+        assert!(!alpha_again.is_ignored(&alpha.join("beta-only"), true));
+        let _ = fs::remove_dir_all(&alpha);
+        let _ = fs::remove_dir_all(&beta);
     }
 
     /// .bsh and .bos are excluded even when the ignore file is empty, and a

@@ -340,9 +340,12 @@ list the file tools (`list_dir`, `read_file`, `read_files`, `write_file`,
 path is hidden from listings and searches and refused by the read/write tools;
 `!` re-includes a path, and `.bsh`/`.bos` are excluded unconditionally. The
 file is created on the first file-tool call with every common tree commented
-out, so a fresh workspace filters nothing. Because it can only narrow, it is a
-reader convenience rather than a security boundary; use `policy.rego` for a
-rule that must hold against a caller who ignores the tool.
+out, so a fresh workspace filters nothing. The parsed rules are cached per
+workspace and revalidated from the file's modification time and size, so a tool
+call costs a stat rather than a read; an edit is picked up on the next call.
+Because it can only narrow, it is a reader convenience rather than a security
+boundary; use `policy.rego` for a rule that must hold against a caller who
+ignores the tool.
 
 - system_prompt replaces the workspace prompt for the chats that select the
   preset; absent keeps the workspace prompt. It is the persona the LLM call

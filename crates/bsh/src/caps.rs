@@ -4361,10 +4361,10 @@ pub(crate) fn glob_tool(
                 .as_deref()
                 .filter(|workspace| search_root.starts_with(workspace))
                 .unwrap_or(&search_root);
-            let ignore = root
-                .as_deref()
-                .filter(|workspace| search_root.starts_with(workspace))
-                .map(Rules::load);
+            // Loaded for every glob call, not only one rooted inside the
+            // workspace: the first file-tool call is what leaves the reader a
+            // rule file, and a search outside the workspace is still a call.
+            let ignore = root.as_deref().map(Rules::load);
             let found = crate::glob::search(
                 &search_root,
                 base,
@@ -4491,10 +4491,9 @@ pub(crate) fn grep_tool(
                 .as_deref()
                 .filter(|workspace| search_root.starts_with(workspace))
                 .unwrap_or(&search_root);
-            let ignore = root
-                .as_deref()
-                .filter(|workspace| search_root.starts_with(workspace))
-                .map(Rules::load);
+            // Same as glob: the call itself ensures the file, even when the
+            // searched path happens to be outside the workspace.
+            let ignore = root.as_deref().map(Rules::load);
             let query = crate::grep::Query {
                 pattern: &pattern,
                 include_ignored,
@@ -10310,6 +10309,53 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "the harness directory is always hidden: {names:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every file tool, not only the first one tried, ensures the rule file
+    /// exists before it answers. Each case gets its own workspace, so a file
+    /// created by an earlier tool cannot make a later one pass.
+    #[test]
+    fn every_file_tool_creates_the_ignore_file_when_missing() {
+        let cases: [(&str, serde_json::Value); 8] = [
+            ("read_file", serde_json::json!({ "path": "a.txt" })),
+            ("read_files", serde_json::json!({ "paths": ["a.txt"] })),
+            (
+                "write_file",
+                serde_json::json!({ "path": "new.txt", "content": "new" }),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({
+                    "path": "a.txt",
+                    "old_string": "needle",
+                    "new_string": "changed"
+                }),
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({
+                    "changes": [{
+                        "path": "a.txt",
+                        "edits": [{ "old_string": "needle", "new_string": "changed" }]
+                    }]
+                }),
+            ),
+            ("list_dir", serde_json::json!({ "path": "." })),
+            ("glob", serde_json::json!({ "pattern": "*" })),
+            ("grep", serde_json::json!({ "pattern": "needle" })),
+        ];
+        for (tool, args) in cases {
+            let root = scratch(&format!("auto-ignore-{tool}"));
+            std::fs::write(root.join("a.txt"), "needle").expect("a file to act on");
+            let built = build(&confined(&root));
+            let registry = built.agent.registry().expect("registry");
+            registry
+                .execute(tool, &args)
+                .unwrap_or_else(|error| panic!("{tool} failed: {error}"));
+            let file = root.join(".bsh").join(".ignore");
+            assert!(file.is_file(), "{tool} did not create {}", file.display());
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// One uncommented rule hides a listing entry, refuses a read and a write,
