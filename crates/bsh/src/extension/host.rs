@@ -1391,9 +1391,10 @@ impl ExtensionHost {
                     source_path: None,
                 };
                 let tools = runtime.descriptors();
+                let id = package.id().to_string();
                 self.builtins.push(BuiltinLoaded {
                     package,
-                    runtime: Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    runtime: Arc::new(LazyRuntime::new(id, Arc::new(runtime))),
                     tools,
                 });
             }
@@ -1475,9 +1476,10 @@ impl ExtensionHost {
                     source_path: None,
                 };
                 let tools = runtime.descriptors();
+                let id = package.id().to_string();
                 self.builtins.push(BuiltinLoaded {
                     package,
-                    runtime: Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    runtime: Arc::new(LazyRuntime::new(id, Arc::new(runtime))),
                     tools,
                 });
             }
@@ -1503,9 +1505,10 @@ impl ExtensionHost {
                     source_path: None,
                 };
                 let tools = runtime.descriptors();
+                let id = package.id().to_string();
                 self.builtins.push(BuiltinLoaded {
                     package,
-                    runtime: Arc::new(LazyRuntime::new(Arc::new(runtime))),
+                    runtime: Arc::new(LazyRuntime::new(id, Arc::new(runtime))),
                     tools,
                 });
             }
@@ -3016,6 +3019,17 @@ impl ExtensionHost {
         surfaces
     }
 
+    /// One panel's surface in this generation, by qualified panel id.
+    ///
+    /// A panel view is created from a snapshot and outlives the generation that
+    /// made it: a rebuild shuts the old runtime down and builds a new one. This
+    /// is how the view asks for the replacement without reopening the host.
+    pub(crate) fn live_panel(&self, panel_id: &str) -> Option<PanelSurface> {
+        self.panel_surfaces()
+            .into_iter()
+            .find(|panel| panel.panel_id == panel_id)
+    }
+
     /// Every theme a package contributes, keyed by a host-owned id.
     pub(crate) fn theme_surfaces(&self) -> BTreeMap<String, ferris_sdk::ui::ThemePalette> {
         let mut themes = BTreeMap::new();
@@ -3707,6 +3721,17 @@ pub(crate) fn panels(
         .as_ref()
         .map(ExtensionHost::panel_surfaces)
         .unwrap_or_default()
+}
+
+/// One panel's live surface, from the already-open host.
+///
+/// A mounted view holds the surface it was built with; after a rebuild that
+/// runtime is shut down and this returns the current generation's. It never
+/// opens or refreshes the host, so a panel render never pays for a store scan.
+pub(crate) fn live_panel(panel_id: &str) -> Option<PanelSurface> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let guard = slot.lock().ok()?;
+    guard.as_ref()?.live_panel(panel_id)
 }
 
 /// The extension themes the current configuration offers.
@@ -4645,6 +4670,52 @@ tools = ["echo"]
             .unload(&mut crate::extension::framework::HostNoopHost)
             .await
             .expect("unload");
+    }
+
+    /// A rebuild retires the runtime a mounted panel holds, and the panel's id
+    /// still resolves to the live one. This is the regression behind
+    /// `Panel error: extension lazy runtime error: runtime is shut down`: the
+    /// view keeps a `PanelSurface` across generations, so both halves have to
+    /// hold — the old handle is dead, and the id finds its replacement.
+    #[test]
+    fn a_rebuild_retires_the_runtime_an_open_panel_holds() {
+        let root = scratch("panel-generation");
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/hello");
+        let store = ExtensionStore::open(&root).expect("store");
+        let package = store.install(&source).expect("install");
+        let policy =
+            PolicyEngine::open(store.grants_path(), store.audit_path(), PolicyMode::Enforce)
+                .expect("policy");
+        for capability in &package.manifest.capabilities.required {
+            policy
+                .grant(package.id().as_str(), *capability, GrantScope::Any, None)
+                .expect("grant");
+        }
+        drop(policy);
+
+        let mut host = ExtensionHost::open(config(&root)).expect("host");
+        let held = host
+            .panel_surfaces()
+            .into_iter()
+            .find(|panel| panel.owner.as_str() == "com.example.hello")
+            .expect("the hello panel is mounted");
+        assert!(!held.runtime.is_shutdown(), "the first generation is live");
+
+        host.rebuild().expect("second rebuild");
+        assert!(
+            held.runtime.is_shutdown(),
+            "the rebuild retires the runtime the open view still holds"
+        );
+        let fresh = host
+            .live_panel(&held.panel_id)
+            .expect("the panel is offered by the current generation");
+        assert!(
+            !Arc::ptr_eq(&held.runtime, &fresh.runtime),
+            "the lookup answers with the new runtime, not the retired one"
+        );
+        assert!(!fresh.runtime.is_shutdown(), "the replacement serves calls");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

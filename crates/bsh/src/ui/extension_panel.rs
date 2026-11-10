@@ -10,6 +10,8 @@
 //! installed for this mount, so the surface keeps its shape whether one package
 //! ships a panel or a dozen do.
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 
 use gpui_kit::component::button::Button;
@@ -110,6 +112,12 @@ impl SearchableListItem for PanelItem {
     }
 }
 
+/// Looks up a panel's surface in the current host generation.
+///
+/// A panel is identified by its qualified id, and the answer is the surface the
+/// live host offers right now — never a stored snapshot.
+type SurfaceResolver = Arc<dyn Fn(&str) -> Option<PanelSurface> + Send + Sync>;
+
 /// One extension panel surface in the settings dialog.
 pub(crate) struct ExtensionPanelView {
     panels: Vec<PanelSurface>,
@@ -140,6 +148,13 @@ pub(crate) struct ExtensionPanelView {
     /// Dropping this unsubscribes the picker, and a chosen row would then stop
     /// switching panels, so the view holds it for its whole life.
     picker_subscription: Option<Subscription>,
+    /// How the view finds a panel's surface in the current host generation.
+    ///
+    /// The surfaces a view is built with name the runtimes of the generation
+    /// that was live when it was made, and a rebuild shuts those down. This
+    /// resolves the replacement. It is a field, not a direct call, so the rebind
+    /// path can be tested without the process-global host.
+    surface_resolver: SurfaceResolver,
 }
 
 impl ExtensionPanelView {
@@ -170,6 +185,7 @@ impl ExtensionPanelView {
             lang,
             picker: None,
             picker_subscription: None,
+            surface_resolver: Arc::new(crate::extension::live_panel),
         };
         if let Some(panel) = view.panels.get(selected) {
             if let Some(document) = &panel.initial {
@@ -262,6 +278,20 @@ impl ExtensionPanelView {
         }
     }
 
+    /// Point the view's copy of a panel at the runtime that just answered.
+    ///
+    /// A panel is looked up by id, not by its row index, because the reader can
+    /// switch panels while the call is in flight.
+    fn rebind(&mut self, surface: &PanelSurface) {
+        if let Some(index) = self
+            .panels
+            .iter()
+            .position(|panel| panel.panel_id == surface.panel_id)
+        {
+            self.panels[index] = surface.clone();
+        }
+    }
+
     fn load(&mut self, cx: &mut Context<Self>) {
         let Some(panel) = self.panels.get(self.selected).cloned() else {
             return;
@@ -269,9 +299,17 @@ impl ExtensionPanelView {
         self.loading = true;
         self.error = None;
         self.message = None;
+        let resolve = Arc::clone(&self.surface_resolver);
         cx.spawn(async move |this, cx| {
+            // A rebuild can land between the view being built and the first
+            // frame that needs the document, so resolve the generation here.
+            let resolved = live_surface(&panel, &*resolve);
+            let panel = resolved.clone().unwrap_or(panel);
             let outcome = panel.runtime.panel(&panel.contribution_id).await;
             let _ = this.update(cx, |this, cx| {
+                if let Some(fresh) = resolved {
+                    this.rebind(&fresh);
+                }
                 this.loading = false;
                 match outcome {
                     Ok(value) => match serde_json::from_value::<UiDocument>(value) {
@@ -344,10 +382,14 @@ impl ExtensionPanelView {
             }),
         );
         let action = action.to_string();
-        let runtime = panel.runtime.clone();
+        let resolve = Arc::clone(&self.surface_resolver);
         self.message = Some("Running…".to_string());
         cx.spawn(async move |this, cx| {
             let action_for_call = action.clone();
+            // The card may have outlived the generation that served it; asking
+            // the retired handle would only report that it is gone.
+            let resolved = live_surface(&panel, &*resolve);
+            let surface = resolved.clone().unwrap_or_else(|| panel.clone());
             let context = CallContext::new(
                 panel.owner.clone(),
                 format!("panel:{}", panel.panel_id),
@@ -358,6 +400,7 @@ impl ExtensionPanelView {
                 // An action names either a tool or a runtime command. Tools are
                 // the common case (the hello panel's Echo is a tool); fall back
                 // to the command seam only when no tool owns the id.
+                let runtime = surface.runtime.clone();
                 match runtime
                     .call_tool(&action_for_call, payload.clone(), &context)
                     .await
@@ -370,6 +413,9 @@ impl ExtensionPanelView {
             })
             .await;
             let _ = this.update(cx, |this, cx| {
+                if let Some(fresh) = resolved {
+                    this.rebind(&fresh);
+                }
                 this.message = None;
                 match outcome {
                     Ok(value) => {
@@ -809,6 +855,23 @@ fn location_label(location: PanelLocation) -> &'static str {
     }
 }
 
+/// The surface a call must use, when the stored one has been retired.
+///
+/// A view keeps the `PanelSurface` it was built with, and a host rebuild shuts
+/// that surface's runtime down before building the package again. Calling the
+/// dead handle is what surfaced `extension lazy runtime error: runtime is shut
+/// down`; a retired surface is swapped for the current generation's instead.
+/// `None` means the stored surface is still the live one.
+fn live_surface(
+    stored: &PanelSurface,
+    resolve: &dyn Fn(&str) -> Option<PanelSurface>,
+) -> Option<PanelSurface> {
+    if !stored.runtime.is_shutdown() {
+        return None;
+    }
+    resolve(&stored.panel_id).filter(|fresh| !Arc::ptr_eq(&fresh.runtime, &stored.runtime))
+}
+
 fn summarize(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -900,7 +963,7 @@ impl Render for ExtensionPanelView {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtensionPanelView, PanelItem};
+    use super::{live_surface, ExtensionPanelView, PanelItem};
     use crate::extension::host::PanelSurface;
     use crate::i18n::Lang;
     use crate::theme;
@@ -910,6 +973,7 @@ mod tests {
     use ferris_sdk::ui::{PanelLocation, ThemePalette, UiDocument};
     use gpui_kit::component::searchable_list::SearchableListItem;
     use serde_json::Value;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     struct Noop;
@@ -932,7 +996,59 @@ mod tests {
         }
     }
 
-    fn panel(document: UiDocument) -> PanelSurface {
+    /// A runtime whose life-cycle state the test controls.
+    ///
+    /// `is_shutdown` is what the rebind path keys on, so the state has to be
+    /// settable without standing up a real host and rebuilding it.
+    struct Swappable {
+        alive: AtomicBool,
+    }
+
+    impl Swappable {
+        fn alive() -> Self {
+            Self {
+                alive: AtomicBool::new(true),
+            }
+        }
+
+        fn retired() -> Self {
+            Self {
+                alive: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Runtime for Swappable {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Declarative
+        }
+
+        fn is_shutdown(&self) -> bool {
+            !self.alive.load(Ordering::Relaxed)
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+
+        async fn panel(&self, _id: &str) -> Result<Value, ExtensionError> {
+            Ok(
+                serde_json::json!({"schema_version": "1.0", "root": {"type": "text", "text": "live"}}),
+            )
+        }
+    }
+
+    fn surface_with(runtime: Arc<dyn Runtime>, initial: Option<UiDocument>) -> PanelSurface {
         PanelSurface {
             panel_id: "com.example.ui.greeting".to_string(),
             contribution_id: "greeting".to_string(),
@@ -940,10 +1056,10 @@ mod tests {
             icon: None,
             location: PanelLocation::Right,
             visibility: ferris_sdk::ui::PanelVisibility::Visible,
-            runtime: Arc::new(Noop),
+            runtime,
             owner: ExtensionId::parse("com.example.ui").expect("id"),
             theme: None,
-            initial: Some(document),
+            initial,
             policy: Arc::new(
                 ferris_sdk::capability::PolicyEngine::open(
                     std::env::temp_dir().join(format!("bsh-panel-grants-{}", std::process::id())),
@@ -957,6 +1073,10 @@ mod tests {
             workspace: None,
             root: std::path::PathBuf::from("/nonexistent-panel-root"),
         }
+    }
+
+    fn panel(document: UiDocument) -> PanelSurface {
+        surface_with(Arc::new(Noop), Some(document))
     }
 
     #[test]
@@ -1026,6 +1146,49 @@ mod tests {
         assert_eq!(items[0].title().to_string(), "Greeting · right");
         assert_eq!(items[1].value(), &1);
         assert_eq!(items[1].title().to_string(), "Second · left");
+    }
+
+    /// A pane that outlived a host rebuild must ask the new runtime, not the
+    /// dead handle it was built with. This is the regression behind
+    /// `Panel error: extension lazy runtime error: runtime is shut down`: the
+    /// stored surface is retired, the host has a replacement, and the call is
+    /// made against the replacement.
+    #[test]
+    fn a_retired_panel_moves_to_the_current_generations_runtime() {
+        let stored = surface_with(Arc::new(Swappable::retired()), None);
+        let fresh = surface_with(Arc::new(Swappable::alive()), None);
+        let looked_up = AtomicUsize::new(0);
+        let resolve = |id: &str| {
+            looked_up.fetch_add(1, Ordering::Relaxed);
+            (id == stored.panel_id).then(|| fresh.clone())
+        };
+        let resolved = live_surface(&stored, &resolve).expect("the live generation");
+        assert_eq!(resolved.panel_id, stored.panel_id);
+        assert!(
+            !resolved.runtime.is_shutdown(),
+            "the replacement is the runtime the call uses"
+        );
+        assert!(!Arc::ptr_eq(&resolved.runtime, &stored.runtime));
+        assert_eq!(looked_up.load(Ordering::Relaxed), 1, "one lookup");
+    }
+
+    /// A live surface is never relooked-up: the check is one atomic read, and
+    /// resolving on every render would put a host lock on the panel path.
+    #[test]
+    fn a_live_panel_is_never_relooked_up() {
+        let stored = surface_with(Arc::new(Swappable::alive()), None);
+        let resolved = live_surface(&stored, &|_: &str| -> Option<PanelSurface> {
+            panic!("a live panel must not be relooked up")
+        });
+        assert!(resolved.is_none(), "the stored surface is still live");
+    }
+
+    /// A retired surface with no replacement keeps its own error: guessing at a
+    /// package that is gone would be worse than reporting the shutdown.
+    #[test]
+    fn a_retired_panel_without_a_replacement_stays_put() {
+        let stored = surface_with(Arc::new(Swappable::retired()), None);
+        assert!(live_surface(&stored, &|_| None).is_none());
     }
 
     /// The search field filters on the row text, case-insensitively, which is

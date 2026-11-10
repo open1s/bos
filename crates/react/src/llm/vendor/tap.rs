@@ -199,6 +199,38 @@ impl Trace {
     }
 }
 
+/// What a streamed body has collected so far, shared with the drop guard.
+struct TraceState {
+    trace: Option<Trace>,
+    collected: Vec<u8>,
+    truncated: bool,
+}
+
+/// Report the exchange when the caller drops the stream instead of draining it.
+struct FinishOnDrop {
+    state: Arc<Mutex<TraceState>>,
+}
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        finish_state(&self.state);
+    }
+}
+
+/// Report once: the natural end and the drop guard both call this, and the
+/// trace is taken so whichever runs second does nothing.
+fn finish_state(state: &Arc<Mutex<TraceState>>) {
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    let Some(trace) = state.trace.take() else {
+        return;
+    };
+    let (captured, cut) = bounded(&state.collected, TAP_BODY_CAP);
+    let total = state.collected.len() as u64;
+    trace.finish(Some(captured), total, state.truncated || cut);
+}
+
 /// A response whose body is captured on the way to the caller.
 ///
 /// The wrapper exists so the vendors keep their own reading code: status, text,
@@ -252,33 +284,47 @@ impl TracedResponse {
     }
 
     /// Stream the body, capturing a bounded copy of it.
+    ///
+    /// The report must not depend on the caller draining the stream to `None`:
+    /// a vendor stops at its own done marker (OpenAI's stream returns on
+    /// `[DONE]`) and drops the iterator, which used to skip the report
+    /// entirely — the whole exchange, headers and bodies included, was lost.
     pub fn bytes_stream(self) -> ByteStream {
         let Self { response, trace } = self;
         let Some(trace) = trace else {
             return Box::pin(response.bytes_stream());
         };
         let inner = response.bytes_stream();
-        let mut collected: Vec<u8> = Vec::new();
-        let mut truncated = false;
+        let state = Arc::new(Mutex::new(TraceState {
+            trace: Some(trace),
+            collected: Vec::new(),
+            truncated: false,
+        }));
         Box::pin(stream! {
+            // Lives as long as the generator: dropping the stream reports what
+            // was read, and the natural end below reports it first (the guard
+            // then finds nothing left to report).
+            let _report = FinishOnDrop {
+                state: Arc::clone(&state),
+            };
             futures::pin_mut!(inner);
             while let Some(chunk) = inner.next().await {
                 if let Ok(bytes) = &chunk {
-                    if !truncated {
-                        let room = TAP_BODY_CAP.saturating_sub(collected.len());
-                        if bytes.len() <= room {
-                            collected.extend_from_slice(bytes);
-                        } else {
-                            collected.extend_from_slice(&bytes[..room]);
-                            truncated = true;
+                    if let Ok(mut state) = state.lock() {
+                        if !state.truncated {
+                            let room = TAP_BODY_CAP.saturating_sub(state.collected.len());
+                            if bytes.len() <= room {
+                                state.collected.extend_from_slice(bytes);
+                            } else {
+                                state.collected.extend_from_slice(&bytes[..room]);
+                                state.truncated = true;
+                            }
                         }
                     }
                 }
                 yield chunk;
             }
-            let (captured, _) = bounded(&collected, TAP_BODY_CAP);
-            let total = collected.len() as u64;
-            trace.finish(Some(captured), total, truncated);
+            finish_state(&state);
         })
     }
 }
@@ -454,6 +500,40 @@ mod tests {
     // The guard is the point: it serialises these tests around a process-global
     // sink. The runtime is current-thread, so holding it across an await cannot
     // stall another test's task.
+    /// A vendor that stops reading at its own done marker (the OpenAI stream
+    /// returns on `[DONE]`) drops the stream without draining it to `None`.
+    /// The exchange still happened and must still be reported.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_stream_the_caller_stops_reading_is_still_reported() {
+        let _turn = exclusive();
+        let url = serve("hello").await;
+        let captured: Arc<Mutex<Vec<HttpExchange>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        set_http_tap(Some(Arc::new(move |exchange| {
+            sink.lock().unwrap().push(exchange);
+        })));
+        let client = Client::new();
+        let builder = client.get(&url);
+        let response = traced_send("test", "GET", &url, Some("req-2"), &client, builder)
+            .await
+            .expect("response");
+        {
+            let mut stream = response.bytes_stream();
+            let first = stream.next().await.expect("a chunk");
+            assert!(first.is_ok());
+            // The caller stops here, like a stream that hit its done marker.
+        }
+        let event = captured
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("the exchange is reported even when the read stopped early");
+        set_http_tap(None);
+        assert_eq!(event.status, Some(200));
+        assert_eq!(event.response_body.as_deref(), Some("hello"));
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn an_exchange_carries_both_bodies_and_both_header_sets() {

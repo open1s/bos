@@ -130,7 +130,7 @@ pub(crate) mod market;
 pub(crate) use ferris_sdk::events::topics;
 pub(crate) use host::{
     activate, approve_process, cached_commands, cached_model_providers, cached_presets,
-    grant_required, install_with_fibers, panels, publish, statuses, themes, uninstall,
+    grant_required, install_with_fibers, live_panel, panels, publish, statuses, themes, uninstall,
     CommandSurface,
 };
 

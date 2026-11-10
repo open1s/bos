@@ -297,6 +297,16 @@ pub trait Runtime: Send + Sync {
         self.deactivate().await
     }
 
+    /// Whether this handle has been terminally shut down.
+    ///
+    /// A shut-down runtime refuses every call and cannot be reactivated, so a
+    /// holder that kept the handle across a host rebuild (a mounted panel, a
+    /// cached tool) can tell that it is stale before paying for a call. The
+    /// default is `false`: only a wrapper that owns a shutdown flag answers.
+    fn is_shutdown(&self) -> bool {
+        false
+    }
+
     /// Stop outstanding work, keeping the runtime loadable.
     async fn cancel(&self) -> Result<(), ExtensionError> {
         self.deactivate().await
@@ -535,6 +545,12 @@ pub fn load_tool_descriptors(
 /// keeps the build path synchronous and still gives the runtime one activation
 /// per process rather than one per call.
 pub struct LazyRuntime {
+    /// The extension the wrapped runtime serves, named in its errors.
+    ///
+    /// Without it every activation or shutdown failure reported by a wrapped
+    /// runtime was attributed to `lazy`, which is the adapter and not a
+    /// package, so the message could not name the one thing a reader can act on.
+    id: String,
     inner: Arc<dyn Runtime>,
     /// Whether the inner runtime is currently activated. A plain bool under an
     /// async mutex (rather than a OnceCell) lets deactivation reopen the gate.
@@ -548,9 +564,14 @@ pub struct LazyRuntime {
 }
 
 impl LazyRuntime {
-    /// Wrap one runtime.
-    pub fn new(inner: Arc<dyn Runtime>) -> Self {
+    /// Wrap one runtime, naming the extension it serves.
+    ///
+    /// The id is what a life-cycle failure reports, so a shutdown or a failed
+    /// activation reads as `extension <id> runtime error: ...` instead of
+    /// naming the adapter.
+    pub fn new(id: impl Into<String>, inner: Arc<dyn Runtime>) -> Self {
         Self {
+            id: id.into(),
             inner,
             activated: tokio::sync::Mutex::new(false),
             shutdown: AtomicBool::new(false),
@@ -568,7 +589,7 @@ impl LazyRuntime {
     async fn ensure(&self) -> Result<(), ExtensionError> {
         if self.shutdown.load(Ordering::SeqCst) {
             return Err(ExtensionError::Runtime {
-                extension: "lazy".to_string(),
+                extension: self.id.clone(),
                 message: "runtime is shut down".to_string(),
             });
         }
@@ -602,6 +623,10 @@ impl Runtime for LazyRuntime {
         self.inner.kind()
     }
 
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
     fn fuel_used(&self) -> Option<u64> {
         self.inner.fuel_used()
     }
@@ -624,6 +649,10 @@ impl Runtime for LazyRuntime {
     /// a runtime-registered skill never reached the agent.
     fn skills_dir(&self) -> Option<PathBuf> {
         self.inner.skills_dir()
+    }
+
+    fn declarative(&self) -> crate::declarative::DeclarativeContributions {
+        self.inner.declarative()
     }
 
     async fn activate(&self) -> Result<(), ExtensionError> {
@@ -711,6 +740,17 @@ impl Runtime for LazyRuntime {
         let _lifecycle = self.lifecycle.read().await;
         self.ensure().await?;
         self.inner.panel(id).await
+    }
+
+    /// Deliver an observe-hook batch to the wrapped runtime.
+    ///
+    /// The host's only hook path is a factory-wrapped runtime, so this method
+    /// is the difference between a package that declared `http.exchange`
+    /// receiving its batches and one that silently receives nothing.
+    async fn hook(&self, point: &str, payload: Value) -> Result<(), ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
+        self.ensure().await?;
+        self.inner.hook(point, payload).await
     }
 
     async fn pump(&self) -> Result<(), ExtensionError> {
@@ -875,7 +915,7 @@ tools = ["echo", "greet"]
         let inner = Arc::new(FlakyRuntime {
             attempts: AtomicU32::new(0),
         });
-        let runtime = LazyRuntime::new(inner.clone());
+        let runtime = LazyRuntime::new("com.example.flaky", inner.clone());
         assert!(runtime.activate().await.is_err());
         assert!(runtime.activate().await.is_err());
         runtime.activate().await.expect("third attempt succeeds");
@@ -923,7 +963,7 @@ tools = ["echo", "greet"]
             activations: AtomicU32::new(0),
             deactivations: AtomicU32::new(0),
         });
-        let runtime = LazyRuntime::new(inner.clone());
+        let runtime = LazyRuntime::new("com.example.counting", inner.clone());
         runtime.activate().await.expect("first activation");
         runtime.activate().await.expect("cached activation");
         assert_eq!(inner.activations.load(Ordering::Relaxed), 1);
@@ -931,5 +971,110 @@ tools = ["echo", "greet"]
         assert_eq!(inner.deactivations.load(Ordering::Relaxed), 1);
         runtime.activate().await.expect("reactivation");
         assert_eq!(inner.activations.load(Ordering::Relaxed), 2);
+    }
+
+    /// A runtime that records the seams the wrapper must not swallow.
+    struct Forwarding {
+        hooks: AtomicU32,
+    }
+
+    #[async_trait]
+    impl Runtime for Forwarding {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        fn declarative(&self) -> crate::declarative::DeclarativeContributions {
+            crate::declarative::DeclarativeContributions {
+                commands: vec![crate::declarative::CommandContribution {
+                    id: ContributionId::parse("greet").expect("contribution id"),
+                    description: "Greet".to_string(),
+                    template: "hello".to_string(),
+                }],
+                ..Default::default()
+            }
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+
+        async fn hook(&self, point: &str, _payload: Value) -> Result<(), ExtensionError> {
+            assert_eq!(point, "model.request");
+            self.hooks.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// The wrapper must forward every seam the host drives.
+    ///
+    /// The host only sees factory-wrapped runtimes, so a method the wrapper
+    /// answers with the trait default is a method no package can receive: the
+    /// observe worker got "not implemented" for every batch and a package that
+    /// declared `http.exchange` captured nothing while its panel and tools
+    /// worked.
+    #[tokio::test]
+    async fn a_lazy_wrapper_forwards_hooks_and_declarative_contributions() {
+        let inner = Arc::new(Forwarding {
+            hooks: AtomicU32::new(0),
+        });
+        let runtime = LazyRuntime::new("com.example.observers", inner.clone());
+        runtime
+            .hook(
+                "model.request",
+                serde_json::json!({"point": "model.request", "batch": []}),
+            )
+            .await
+            .expect("the hook reaches the wrapped runtime");
+        assert_eq!(inner.hooks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            runtime.declarative().commands.len(),
+            1,
+            "the wrapper forwards what the runtime discovered"
+        );
+    }
+
+    /// A shut-down wrapper is terminal and names its extension.
+    ///
+    /// A mounted panel keeps this handle across a host rebuild, so the message
+    /// it shows is the whole diagnosis: `lazy` is the adapter and names
+    /// nothing a reader can act on, while the package id does.
+    #[tokio::test]
+    async fn a_shut_down_lazy_wrapper_names_its_extension_and_never_revives() {
+        let inner = Arc::new(CountingRuntime {
+            activations: AtomicU32::new(0),
+            deactivations: AtomicU32::new(0),
+        });
+        let runtime = LazyRuntime::new("com.example.panels", inner.clone());
+        assert!(!runtime.is_shutdown());
+        runtime.activate().await.expect("activation");
+        runtime.shutdown().await.expect("shutdown");
+        assert!(runtime.is_shutdown(), "shutdown is observable to a holder");
+        let error = runtime
+            .panel("overview")
+            .await
+            .expect_err("a shut-down wrapper serves nothing");
+        assert_eq!(
+            error.to_string(),
+            "extension com.example.panels runtime error: runtime is shut down"
+        );
+        assert!(
+            runtime.activate().await.is_err(),
+            "activation cannot reopen a shut-down wrapper"
+        );
+        assert_eq!(
+            inner.activations.load(Ordering::Relaxed),
+            1,
+            "the refused activation never reached the inner runtime"
+        );
     }
 }

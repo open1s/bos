@@ -373,6 +373,15 @@ impl Runtime for WorkflowRuntime {
         self.inner.panel(id).await
     }
 
+    /// Deliver an observe-hook batch to the wrapped runtime.
+    ///
+    /// This wrapper sits between the factory's `LazyRuntime` and the package
+    /// runtime, so a batch it answers with the trait default never reaches a
+    /// package that also ships workflows.
+    async fn hook(&self, point: &str, payload: Value) -> Result<(), ExtensionError> {
+        self.inner.hook(point, payload).await
+    }
+
     async fn pump(&self) -> Result<(), ExtensionError> {
         self.inner.pump().await
     }
@@ -387,6 +396,7 @@ mod tests {
 
     struct Counting {
         calls: AtomicUsize,
+        hooks: AtomicUsize,
         capabilities: Vec<Capability>,
     }
 
@@ -411,6 +421,11 @@ mod tests {
         ) -> Result<Value, ExtensionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(arguments)
+        }
+
+        async fn hook(&self, _point: &str, _payload: Value) -> Result<(), ExtensionError> {
+            self.hooks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -449,6 +464,7 @@ mod tests {
         let extension = "com.example.workflow";
         let inner = Arc::new(Counting {
             calls: AtomicUsize::new(0),
+            hooks: AtomicUsize::new(0),
             capabilities: vec![Capability::NetworkHttp],
         });
         let tools = inner.tools().await.expect("tools");
@@ -549,6 +565,7 @@ mod tests {
         .expect("workflow");
         let inner = Arc::new(Counting {
             calls: AtomicUsize::new(0),
+            hooks: AtomicUsize::new(0),
             capabilities: Vec::new(),
         });
         let tools = inner.tools().await.expect("tools");
@@ -584,6 +601,48 @@ mod tests {
             .expect("workflow");
         assert_eq!(result["steps"]["echo"]["who"], "bos");
         assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A workflow wrapper must forward observe hooks: the host holds this
+    /// wrapper, not the package runtime, for a package that also ships
+    /// workflows, so a default answer here drops every batch.
+    #[tokio::test]
+    async fn a_workflow_wrapper_forwards_observe_hooks() {
+        let scratch =
+            std::env::temp_dir().join(format!("bsh-workflow-hook-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let inner = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+            hooks: AtomicUsize::new(0),
+            capabilities: Vec::new(),
+        });
+        let tools = inner.tools().await.expect("tools");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                ferris_core::capability::PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        let runtime = WorkflowRuntime::new(
+            inner.clone(),
+            &[],
+            &tools,
+            policy,
+            TrustLevel::Local,
+            1_000_000,
+        )
+        .expect("runtime");
+        runtime
+            .hook(
+                "http.exchange",
+                json!({"point": "http.exchange", "batch": []}),
+            )
+            .await
+            .expect("the hook reaches the wrapped runtime");
+        assert_eq!(inner.hooks.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }

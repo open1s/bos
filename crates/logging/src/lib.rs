@@ -158,8 +158,13 @@ pub fn auto_init_tracing_in(log_dir: impl AsRef<Path>, basename: &str) {
     // `ui` is the GUI's decision trail (webview lines and backend choices
     // alike); it stays at info so the trail survives an error-level default,
     // and matches no target in non-GUI processes.
+    //
+    // `bsh` and `ferris_runtime` are the extension platform: its warnings are
+    // the only record of a hook that failed to reach a package or a runtime the
+    // host could not stop, so leaving them out of the filter made a silent
+    // failure look like a healthy package.
     let level = format!(
-        "bus={level},agent={level},react={level},nbos={level},resource={level},ui=info,zenoh=off,h2=off,rustls=off"
+        "bus={level},agent={level},react={level},nbos={level},resource={level},bsh={level},ferris_runtime={level},ui=info,zenoh=off,h2=off,rustls=off"
     );
 
     let file_spec = FileSpec::default().directory(logdir).basename(basename);

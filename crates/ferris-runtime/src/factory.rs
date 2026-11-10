@@ -57,6 +57,7 @@ pub fn build(
             let tools = runtime.descriptors();
             let contributions = runtime.contributions().clone();
             finish(
+                manifest.id().as_str(),
                 Arc::new(runtime),
                 tools,
                 contributions,
@@ -74,6 +75,7 @@ pub fn build(
             let tools = runtime.descriptors();
             let contributions = declarative::load_contributions(root, manifest)?;
             finish(
+                manifest.id().as_str(),
                 Arc::new(runtime),
                 tools,
                 contributions,
@@ -95,6 +97,7 @@ pub fn build(
             let tools = runtime.descriptors()?;
             let contributions = declarative::load_contributions(root, manifest)?;
             finish(
+                manifest.id().as_str(),
                 Arc::new(runtime),
                 tools,
                 contributions,
@@ -120,6 +123,7 @@ pub fn build(
                 (runtime.descriptors()?, runtime.contributions()?)
             };
             finish(
+                manifest.id().as_str(),
                 Arc::new(runtime),
                 tools,
                 contributions,
@@ -141,6 +145,7 @@ pub fn build(
             let tools = runtime.descriptors()?;
             let contributions = declarative::load_contributions(root, manifest)?;
             finish(
+                manifest.id().as_str(),
                 Arc::new(runtime),
                 tools,
                 contributions,
@@ -162,6 +167,7 @@ pub fn build(
             let tools = runtime.descriptors()?;
             let contributions = declarative::load_contributions(root, manifest)?;
             finish(
+                manifest.id().as_str(),
                 Arc::new(runtime),
                 tools,
                 contributions,
@@ -178,13 +184,14 @@ pub fn build(
 }
 
 fn finish(
+    id: &str,
     runtime: Arc<dyn Runtime>,
     tools: Vec<ToolDescriptor>,
     contributions: DeclarativeContributions,
     ports: &RuntimePorts,
     max_output_bytes: u64,
 ) -> Result<BuiltRuntime, ExtensionError> {
-    let runtime: Arc<dyn Runtime> = Arc::new(LazyRuntime::new(runtime));
+    let runtime: Arc<dyn Runtime> = Arc::new(LazyRuntime::new(id, runtime));
     if contributions.workflows.is_empty() {
         return Ok(BuiltRuntime {
             runtime,
@@ -202,7 +209,7 @@ fn finish(
     )?;
     let tools = wrapped.descriptors();
     Ok(BuiltRuntime {
-        runtime: Arc::new(LazyRuntime::new(Arc::new(wrapped))),
+        runtime: Arc::new(LazyRuntime::new(id, Arc::new(wrapped))),
         tools,
         contributions,
     })
@@ -251,6 +258,76 @@ mod tests {
         let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
         let built = build(&manifest, &root, ports(&root)).expect("factory");
         assert!(built.tools.iter().any(|tool| tool.id.as_str() == "echo"));
+    }
+
+    /// The production path is `build`, whose runtime is wrapped in
+    /// `LazyRuntime`. A hook handed to that wrapper has to reach the guest: the
+    /// host's observe worker holds the wrapped handle, so anything the wrapper
+    /// answers with the trait default never arrives.
+    #[tokio::test]
+    async fn a_factory_runtime_delivers_hook_batches_to_the_guest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/extism-hook")
+            .canonicalize()
+            .expect("the hook example exists");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
+        let scratch =
+            std::env::temp_dir().join(format!("ferris-factory-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("data")).expect("data");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        for capability in [
+            ferris_core::capability::Capability::HooksObserve,
+            ferris_core::capability::Capability::ExtensionStorage,
+            ferris_core::capability::Capability::AgentToolsRegister,
+            ferris_core::capability::Capability::UiPanels,
+        ] {
+            policy
+                .grant(
+                    "com.example.extism-hook",
+                    capability,
+                    ferris_core::capability::GrantScope::Any,
+                    None,
+                )
+                .expect("grant");
+        }
+        let built = build(
+            &manifest,
+            &root,
+            RuntimePorts {
+                policy,
+                events: EventBus::new(),
+                workspace: None,
+                data_root: scratch.join("data"),
+                config: "{}".to_string(),
+                trust: TrustLevel::Local,
+                terminal: None,
+            },
+        )
+        .expect("factory runtime");
+        built
+            .runtime
+            .hook(
+                "model.request",
+                serde_json::json!({"point": "model.request", "batch": [{}, {}]}),
+            )
+            .await
+            .expect("the hook reaches the guest");
+        let panel = built.runtime.panel("inspector").await.expect("panel");
+        let rendered = panel.to_string();
+        assert!(
+            rendered.contains("model.request: 2"),
+            "the guest counted the batch: {rendered}"
+        );
+        built.runtime.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[tokio::test]
