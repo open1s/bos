@@ -33,6 +33,7 @@ uuid = { workspace = true }
 async-stream = { workspace = true }
 toml = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = "0.11.1"
 dashmap = { workspace = true }
 tempfile = "3.8"
 dirs = "7.0.0"

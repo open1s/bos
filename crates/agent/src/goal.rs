@@ -16,9 +16,91 @@
 //! goal loaded from disk starts disarmed and only an explicit resume arms it.
 
 use serde::{Deserialize, Deserializer, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Cap on an objective's length, in characters.
 pub const MAX_OBJECTIVE: usize = 2000;
+
+/// Why an objective was refused before it could reach durable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalObjectiveError {
+    /// The text trims to nothing.
+    Blank,
+    /// The trimmed text is longer than MAX_OBJECTIVE characters.
+    TooLong {
+        /// The configured limit, in characters.
+        limit: usize,
+        /// The trimmed objective's length, in characters.
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for GoalObjectiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Blank => write!(f, "the goal objective is blank"),
+            Self::TooLong { limit, actual } => write!(
+                f,
+                "the goal objective is {actual} characters; the limit is {limit}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GoalObjectiveError {}
+
+/// Validate one objective without mutating anything.
+///
+/// Command paths call this BEFORE they touch durable state, so an over-limit
+/// objective is refused rather than trimmed. Goal::sanitize still clamps
+/// values that arrive from an older persisted file; that normalization is a
+/// legacy-load concern, not a command-time behavior.
+pub fn validate_objective(objective: &str) -> Result<String, GoalObjectiveError> {
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return Err(GoalObjectiveError::Blank);
+    }
+    let actual = objective.chars().count();
+    if actual > MAX_OBJECTIVE {
+        return Err(GoalObjectiveError::TooLong {
+            limit: MAX_OBJECTIVE,
+            actual,
+        });
+    }
+    Ok(objective.to_string())
+}
+
+/// A process-local nonce so ids minted in the same millisecond differ.
+static GOAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Mint a stable identity for a newly created goal.
+///
+/// Identity is durable: it survives a save/load, so a round that started for
+/// one goal can be recognized as stale after that goal is edited or replaced.
+fn fresh_goal_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    format!(
+        "goal-{millis:x}-{:x}",
+        GOAL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// The identity and revision a round was started under.
+///
+/// A GoalStore captures this when it is seeded for a round. A settlement is
+/// applied only while the durable goal still carries the same fence, so a late
+/// completion or failure from an older goal cannot mutate a newer one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalFence {
+    /// The goal's stable identity.
+    pub id: String,
+    /// The identity's revision at the time the round started.
+    pub revision: u64,
+}
 /// Cap on a blocked reason's explanation, in characters.
 pub const MAX_REASON: usize = 500;
 
@@ -159,6 +241,20 @@ fn valid_code(code: &str) -> bool {
 /// every other host can render.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Goal {
+    /// Stable identity, minted at creation and preserved by an edit.
+    ///
+    /// A goal replaced after completion or a clear gets a fresh identity, so a
+    /// round that started for the old goal is recognizably stale. Older files
+    /// without this field mint one when they are read.
+    #[serde(default = "fresh_goal_id")]
+    pub id: String,
+    /// Monotonic revision of this identity.
+    ///
+    /// Every operator mutation (edit, pause, resume, clear-side changes and
+    /// policy blocks) bumps it. A round captures the revision it started under
+    /// and may settle only while the durable goal still carries it.
+    #[serde(default)]
+    pub revision: u64,
     /// What the work is for, as one statement.
     pub objective: String,
     /// Where the goal stands.
@@ -233,8 +329,15 @@ impl Goal {
     /// resolves to the deployment default (DEFAULT_MAX_ROUNDS) rather than
     /// meaning "unbounded".
     pub fn new(objective: impl Into<String>, max_rounds: Option<u32>) -> Option<Self> {
+        let objective = objective.into();
+        // A command path validates before it calls this; an over-limit value
+        // is refused here too rather than silently trimmed. A persisted file
+        // is normalized by sanitize instead, where clamping is explicit.
+        let objective = validate_objective(&objective).ok()?;
         let mut goal = Self {
-            objective: objective.into(),
+            id: fresh_goal_id(),
+            revision: 0,
+            objective,
             state: GoalState::Active,
             rounds: 0,
             max_rounds: max_rounds
@@ -252,7 +355,14 @@ impl Goal {
 
     /// Trim and clamp the free text, and keep the fields consistent with the
     /// state: a goal that is not blocked does not carry a reason.
+    ///
+    /// The clamp of an over-long objective is a LEGACY LOAD concern: command
+    /// paths validate first and refuse instead of reaching here. A goal read
+    /// from an older file is normalized once, visibly, on the way in.
     pub fn sanitize(&mut self) {
+        if self.id.is_empty() {
+            self.id = fresh_goal_id();
+        }
         self.objective = self.objective.trim().to_string();
         if self.objective.chars().count() > MAX_OBJECTIVE {
             self.objective = self.objective.chars().take(MAX_OBJECTIVE).collect();
@@ -268,6 +378,24 @@ impl Goal {
         if !matches!(self.state, GoalState::Blocked) {
             self.blocked_reason = None;
         }
+    }
+
+    /// The fence a round captures before it starts.
+    pub fn fence(&self) -> GoalFence {
+        GoalFence {
+            id: self.id.clone(),
+            revision: self.revision,
+        }
+    }
+
+    /// Whether this goal still stands at the fence a round started under.
+    pub fn is_current(&self, fence: &GoalFence) -> bool {
+        self.id == fence.id && self.revision == fence.revision
+    }
+
+    /// Invalidate every round that captured the previous revision.
+    pub fn bump_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
     }
 
     /// Whether another round may be counted right now: the goal is active,
@@ -304,6 +432,7 @@ impl Goal {
         }
         self.state = GoalState::Paused;
         self.activation = GoalActivation::Disarmed;
+        self.bump_revision();
         true
     }
 
@@ -323,6 +452,7 @@ impl Goal {
         self.state = GoalState::Active;
         self.activation = GoalActivation::Armed;
         self.blocked_reason = None;
+        self.bump_revision();
         true
     }
 
@@ -335,6 +465,7 @@ impl Goal {
         self.state = GoalState::Completed;
         self.activation = GoalActivation::Disarmed;
         self.blocked_reason = None;
+        self.bump_revision();
         true
     }
 
@@ -350,13 +481,17 @@ impl Goal {
         self.state = GoalState::Blocked;
         self.activation = GoalActivation::Disarmed;
         self.blocked_reason = Some(reason);
+        self.bump_revision();
         true
     }
 
     /// Drop continuation authority without changing the durable phase, which is
     /// the reference's disarm().
     pub fn disarm(&mut self) {
-        self.activation = GoalActivation::Disarmed;
+        if self.activation.is_armed() {
+            self.activation = GoalActivation::Disarmed;
+            self.bump_revision();
+        }
     }
 
     /// Arm continuation without changing the durable phase. Only a goal that can
@@ -365,7 +500,10 @@ impl Goal {
         if !self.state.is_open() || self.exhausted() {
             return false;
         }
-        self.activation = GoalActivation::Armed;
+        if !self.activation.is_armed() {
+            self.activation = GoalActivation::Armed;
+            self.bump_revision();
+        }
         true
     }
 }
@@ -518,7 +656,11 @@ mod tests {
 
     #[test]
     fn sanitize_clamps_and_keeps_state_consistent() {
-        let mut goal = Goal::new("x".repeat(MAX_OBJECTIVE + 50), None).expect("goal");
+        // Command-time creation refuses an over-limit objective; sanitize's
+        // clamp is the legacy-load path, proven here on a restored value.
+        let mut goal = Goal::new("short", None).expect("goal");
+        goal.objective = "x".repeat(MAX_OBJECTIVE + 50);
+        goal.sanitize();
         assert_eq!(goal.objective.chars().count(), MAX_OBJECTIVE);
 
         goal.blocked_reason = BlockedReason::new(MODEL_REPORTED, "y".repeat(MAX_REASON + 10));
@@ -560,10 +702,78 @@ mod tests {
         assert_eq!(back.max_rounds, goal.max_rounds);
     }
 
+    /// Objective validation happens before durable state exists. The limit is
+    /// counted in characters, not bytes, so a multibyte objective exactly at
+    /// the boundary is accepted and one character more is refused.
+    #[test]
+    fn an_overlength_objective_is_refused_not_truncated() {
+        assert_eq!(validate_objective("   "), Err(GoalObjectiveError::Blank));
+        let exact = "é".repeat(MAX_OBJECTIVE);
+        assert_eq!(
+            validate_objective(&exact)
+                .expect("exactly at the limit")
+                .chars()
+                .count(),
+            MAX_OBJECTIVE
+        );
+        let over = "é".repeat(MAX_OBJECTIVE + 1);
+        assert_eq!(
+            validate_objective(&over),
+            Err(GoalObjectiveError::TooLong {
+                limit: MAX_OBJECTIVE,
+                actual: MAX_OBJECTIVE + 1,
+            })
+        );
+        assert!(
+            Goal::new(over, None).is_none(),
+            "creation refuses rather than truncating"
+        );
+    }
+
+    /// Identity plus revision is the fence a running round carries. Editing or
+    /// any operator transition moves the revision, so the round that started
+    /// earlier is stale even though the identity survives.
+    #[test]
+    fn identity_and_revision_fence_stale_rounds() {
+        let mut goal = Goal::new("ship it", None).expect("goal");
+        let fence = goal.fence();
+        assert_eq!(fence.id, goal.id);
+        assert!(goal.is_current(&fence));
+        assert!(!goal.id.is_empty(), "creation mints a stable identity");
+
+        goal.bump_revision();
+        assert!(
+            !goal.is_current(&fence),
+            "an edit bumps the revision and stales the round"
+        );
+        assert_eq!(goal.id, fence.id, "an edit preserves the identity");
+
+        let paused = goal.fence();
+        assert!(goal.pause());
+        assert!(!goal.is_current(&paused), "pause stales the round");
+        let resumed = goal.fence();
+        assert!(goal.resume());
+        assert!(!goal.is_current(&resumed), "resume stales the round");
+        let blocked = goal.fence();
+        assert!(goal.block("round-limit", "no rounds"));
+        assert!(!goal.is_current(&blocked), "a block stales the round");
+
+        // A replacement is a fresh identity, so even a same-numbered revision
+        // cannot match.
+        let fresh = Goal::new("another", None).expect("goal");
+        assert_ne!(fresh.id, goal.id);
+        assert!(!fresh.is_current(&fence));
+    }
+
     #[test]
     fn older_files_load_with_the_default_cap_and_the_legacy_blocker() {
         let legacy: Goal = serde_json::from_str(r#"{"objective":"old"}"#).expect("legacy");
         assert_eq!(legacy.state, GoalState::Active);
+        assert!(
+            !legacy.id.is_empty(),
+            "an older file without identity mints one on load"
+        );
+        assert_eq!(legacy.revision, 0);
         assert_eq!(legacy.rounds, 0);
         assert_eq!(legacy.max_rounds, DEFAULT_MAX_ROUNDS);
         assert_eq!(legacy.activation, GoalActivation::Disarmed);

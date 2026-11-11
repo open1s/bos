@@ -95,6 +95,8 @@
 "goal.needObjective": "Goal editing requires a replacement objective.\n{usage}"
 "goal.attachmentsOnly": "Attachments only accompany a goal objective: /goal <objective> or /goal edit <objective>."
 "goal.invalid": "The goal command is not valid for the current state. Run /goal to view available commands."
+"goal.roundLimit": "Goal reached its configured limit of {cap} rounds."
+"goal.objectiveTooLong": "The goal objective is {actual} characters; the limit is {limit}. Shorten it and try again."
 "input.plan": "Plan"
 "slash.feedback": "Feedback"
 "slash.feedbackDetail": "Record feedback about this session"

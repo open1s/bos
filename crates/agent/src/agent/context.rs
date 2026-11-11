@@ -1016,6 +1016,31 @@ impl AgentReactContext {
         self.skills = skills;
         self
     }
+
+    /// Replace this task's activated-skill instruction block.
+    ///
+    /// Only one dynamic skill block exists per task: the runtime composes the
+    /// selected set (dependency-first, deduplicated, within budget) and the
+    /// block is replaced rather than appended. Static instructions are never
+    /// touched.
+    pub fn set_skill_instructions(&mut self, instructions: String) {
+        self.clear_skill_instructions();
+        if instructions.trim().is_empty() {
+            return;
+        }
+        self.instructions.push(Instruction {
+            instruction: instructions,
+            description: "Activated skill instructions for this task".to_string(),
+            name: "skill:active".to_string(),
+            dependon: None,
+        });
+    }
+
+    /// Drop the task's activated-skill block.
+    pub fn clear_skill_instructions(&mut self) {
+        self.instructions
+            .retain(|instruction| !instruction.name.starts_with("skill:"));
+    }
 }
 
 impl ReactContext for AgentReactContext {
@@ -1466,8 +1491,39 @@ impl ReActApp for AgentReActApp {
         result: &mut Result<JsonValue, ReactError>,
         call_id: &str,
         _session: &mut Self::Session,
-        _context: &mut Self::Context,
+        context: &mut Self::Context,
     ) -> impl Future<Output = react::runtime::HookDecision> + Send {
+        // A successful skill load already went through the task-scoped
+        // runtime, which planned, verified and composed the selected set. The
+        // block belongs in the request's instruction section, not in the
+        // transcript: a later task must not inherit it. The tool result keeps
+        // a short acknowledgement so the call still has an answer.
+        if tool_name == "load_skill" {
+            if let Ok(value) = result {
+                if value.get("error").is_none() {
+                    if let Some(instructions) =
+                        value.get("instructions").and_then(|text| text.as_str())
+                    {
+                        let instructions = instructions.to_string();
+                        if !instructions.is_empty() {
+                            context.set_skill_instructions(instructions);
+                            if let Some(object) = value.as_object_mut() {
+                                object.insert(
+                                    "instructions".to_string(),
+                                    serde_json::json!(
+                                        "The skill instructions are in the system prompt for this task."
+                                    ),
+                                );
+                                object.insert(
+                                    "instructions_in_context".to_string(),
+                                    serde_json::json!(true),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let agent_name = self.agent_name.clone();
         let hooks = self.hooks.clone();
         let tool_name = tool_name.to_string();
@@ -1534,8 +1590,12 @@ impl ReActApp for AgentReActApp {
         &self,
         answer: &str,
         _session: &mut Self::Session,
-        _context: &mut Self::Context,
+        context: &mut Self::Context,
     ) -> impl Future<Output = ()> + Send {
+        // A finished task releases its skill block. The runtime is reset at
+        // the next run as well, so a cancellation that never reaches this hook
+        // cannot leak into a later task.
+        context.clear_skill_instructions();
         let agent_name = self.agent_name.clone();
         let hooks = self.hooks.clone();
         let answer = answer.to_string();

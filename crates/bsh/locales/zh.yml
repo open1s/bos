@@ -95,6 +95,8 @@
 "goal.needObjective": "修改目标需要提供替换目标。\n{usage}"
 "goal.attachmentsOnly": "附件只能随目标一起提交：/goal <目标> 或 /goal edit <目标>。"
 "goal.invalid": "该目标指令不适用于当前状态。运行 /goal 查看可用指令。"
+"goal.roundLimit": "目标已达到配置的 {cap} 轮上限。"
+"goal.objectiveTooLong": "目标内容为 {actual} 个字符，上限为 {limit} 个字符。请缩短后重试。"
 "input.plan": "计划"
 "slash.feedback": "反馈"
 "slash.feedbackDetail": "发送关于当前会话的反馈"

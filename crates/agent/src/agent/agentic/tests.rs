@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use react::llm::vendor::{
     ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall, Usage,
 };
-use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, ReactSession, StreamToken};
+use react::llm::{LlmClient, LlmError, LlmRequest, LlmResponse, StreamToken};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1298,6 +1298,7 @@ impl LlmClient<AgentSession, AgentReactContext> for SkillSearchLlm {
         session: &mut AgentSession,
         context: &mut AgentReactContext,
     ) -> Result<LlmResponse, LlmError> {
+        let _ = &session;
         if self.step.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             *self.advertised.lock().unwrap() =
                 context.tools.iter().map(|tool| tool.name.clone()).collect();
@@ -1307,15 +1308,10 @@ impl LlmClient<AgentSession, AgentReactContext> for SkillSearchLlm {
             0 => make_tool_call_response("find_skill", "{\"query\":\"package instructions\"}"),
             1 => make_tool_call_response("load_skill", "{\"name\":\"extension-skill\"}"),
             _ => {
-                let seen = session.history().is_some_and(|history| {
-                    history.iter().any(|message| {
-                        matches!(
-                            message,
-                            react::llm::LlmMessage::ToolResult { content, .. }
-                                if content.contains("PACKAGE INSTRUCTIONS")
-                        )
-                    })
-                });
+                let seen = context
+                    .instructions
+                    .iter()
+                    .any(|instruction| instruction.instruction.contains("PACKAGE INSTRUCTIONS"));
                 self.saw_instructions
                     .store(seen, std::sync::atomic::Ordering::SeqCst);
                 make_text_response("Final Answer: followed the skill".to_string())
@@ -1386,6 +1382,27 @@ async fn a_skill_is_found_then_loaded_through_the_agent() {
     assert!(
         seen.iter().any(|name| name == "load_skill"),
         "load_skill is advertised beside the search: {seen:?}"
+    );
+    assert_eq!(
+        agent.active_skills(),
+        vec!["extension-skill"],
+        "the production load path activated the selected skill"
+    );
+    let events = agent.drain_skill_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            crate::skills::SkillEvent::Activated { skill, .. } if skill == "extension-skill"
+        )),
+        "the runtime recorded the activation: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            crate::skills::SkillEvent::Composed { skills, .. }
+                if skills == &vec!["extension-skill".to_string()]
+        )),
+        "the runtime recorded the composed block: {events:?}"
     );
 }
 
@@ -1567,7 +1584,7 @@ impl LlmClient<AgentSession, AgentReactContext> for LoaderLlm {
         _persona: Option<String>,
         _req: LlmRequest,
         session: &mut AgentSession,
-        _context: &mut AgentReactContext,
+        context: &mut AgentReactContext,
     ) -> Result<LlmResponse, LlmError> {
         if self
             .calls
@@ -1579,15 +1596,11 @@ impl LlmClient<AgentSession, AgentReactContext> for LoaderLlm {
                 r#"{"name":"extension-skill"}"#,
             ));
         }
-        let seen = session.history().is_some_and(|history| {
-            history.iter().any(|message| {
-                matches!(
-                    message,
-                    react::llm::LlmMessage::ToolResult { content, .. }
-                        if content.contains("PACKAGE INSTRUCTIONS")
-                )
-            })
-        });
+        let _ = &session;
+        let seen = context
+            .instructions
+            .iter()
+            .any(|instruction| instruction.instruction.contains("PACKAGE INSTRUCTIONS"));
         self.saw_instructions
             .store(seen, std::sync::atomic::Ordering::Relaxed);
         Ok(make_text_response("final".to_string()))
@@ -2123,8 +2136,9 @@ async fn the_loader_refuses_a_skill_reserved_from_the_model() {
     let _ = agent.react("load the open one".to_string()).await;
     let loaded = loaded.lock().unwrap().clone().expect("the loader answered");
     assert!(
-        loaded.contains("OPEN BODY"),
-        "an ordinary skill still loads: {loaded}"
+        loaded.contains("\"instructions_in_context\":true")
+            && loaded.contains("\"skills\":[\"open\"]"),
+        "an ordinary skill still activates and hands its block to the context: {loaded}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

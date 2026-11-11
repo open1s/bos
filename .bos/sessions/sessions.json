@@ -1,0 +1,13 @@
+{
+  "sessions": [
+    {
+      "id": "session_1794382971953_6g4r2n",
+      "title": "New Chat",
+      "createdAt": 1794382971953,
+      "updatedAt": 1794382971953,
+      "messageCount": 0,
+      "isCompacted": false
+    }
+  ],
+  "activeSessionId": "session_1794382971953_6g4r2n"
+}

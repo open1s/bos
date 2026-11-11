@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ::capability::{
-    CancelToken, CapabilityDescriptor, CapabilityError, CapabilityId, InvocationContext,
+    Binding, CancelToken, CapabilityDescriptor, CapabilityError, CapabilityId, InvocationContext,
     InvocationId, Principal, WorkspaceRuntime,
 };
 use async_trait::async_trait;
@@ -60,6 +60,9 @@ pub struct CapabilityTool {
     calls: Mutex<HashMap<String, CancelToken>>,
     facts: ToolFacts,
     proxy: Option<ProxySource>,
+    /// Discovery metadata derived from the descriptor and the binding, so the
+    /// model-facing surface name reports the authoritative capability identity.
+    metadata: ToolMetadata,
 }
 
 impl CapabilityTool {
@@ -75,6 +78,26 @@ impl CapabilityTool {
             .into_iter()
             .find(|descriptor| &descriptor.id == capability)
             .cloned()?;
+        let provider = match runtime.binding(capability) {
+            Some(Binding::Local { provider }) => Some(provider.to_string()),
+            Some(Binding::Remote { node, .. }) => Some(format!("remote:{node}")),
+            None => None,
+        };
+        let mut metadata = ToolMetadata::new()
+            .with_version(descriptor.version.to_string())
+            .with_capability(descriptor.id.to_string(), descriptor.version.to_string())
+            .with_risk(descriptor.risk.as_str())
+            .with_category(descriptor.kind.as_str())
+            .with_side_effects(descriptor.side_effects.iter().map(|effect| effect.as_str()))
+            .with_permissions(
+                descriptor
+                    .permissions
+                    .iter()
+                    .map(|permission| permission.as_str().to_string()),
+            );
+        if let Some(provider) = provider {
+            metadata = metadata.with_provider(provider);
+        }
         Some(Self {
             runtime,
             capability: capability.clone(),
@@ -84,6 +107,7 @@ impl CapabilityTool {
             calls: Mutex::new(HashMap::new()),
             facts: ToolFacts::default(),
             proxy: None,
+            metadata,
         })
     }
 
@@ -140,7 +164,7 @@ impl AsyncTool for CapabilityTool {
     }
 
     fn metadata(&self) -> Option<&ToolMetadata> {
-        None
+        Some(&self.metadata)
     }
 
     fn is_cancelable(&self) -> bool {

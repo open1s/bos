@@ -25,11 +25,16 @@ use uuid::Uuid;
 mod builder;
 mod error;
 mod llm_calls;
+mod schema_budget;
 mod skill_cache;
 mod tool_calls;
 mod tool_run;
 
 pub use error::{BuilderError, ReactError};
+pub use schema_budget::{
+    SchemaAccount, SchemaBudget, SchemaRejection, SchemaRevision, DEFAULT_PER_TOOL_BUDGET,
+    DEFAULT_SCHEMA_BUDGET,
+};
 pub use skill_cache::{CachedSkill, SkillCache};
 pub use tool_run::{ToolCallEvent, ToolRunManager};
 
@@ -237,7 +242,9 @@ pub struct ReActEngine<A: ReActApp> {
     token_counter: TokenCounter,
     react_app: A,
     resilience: Option<ReActResilience>,
-    skill_cache: SkillCache,
+    /// Cumulative tool-schema budget for the CURRENT turn. Reset at the start
+    /// of every run; discovery accounts each definition before it is added.
+    schema_budget: SchemaBudget,
     tool_call_count: AtomicU64,
     tool_time_nanos: AtomicU64,
     stop_flag: Arc<AtomicBool>,
@@ -257,12 +264,24 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     llm_timeout_secs: u64,
     model: String,
     token_counter: TokenCounter,
-    skill_cache: SkillCache,
+    schema_budget: SchemaBudget,
     react_app: Option<A>,
     bus: Option<Bus>,
     agent_name: String,
     _phantom: std::marker::PhantomData<A>,
 }
+/// What one discovery did to the live tool array.
+struct SchemaReveal {
+    /// The model-facing note when anything was refused.
+    note: Option<String>,
+    /// Definitions the result offered.
+    candidates: usize,
+    /// Definitions added to the next request.
+    revealed: usize,
+    /// Definitions refused by the budget.
+    rejected: usize,
+}
+
 impl<A: ReActApp> ReActEngine<A> {
     /// Start configuring an engine.
     pub fn builder() -> ReActEngineBuilder<A> {
@@ -310,7 +329,11 @@ impl<A: ReActApp> ReActEngine<A> {
     /// live context, so the next model step can call them by name. The definitions
     /// carry the same name/description/schema the search reported; the search's
     /// names-only listing intentionally reveals nothing until a name is asked for.
-    fn reveal_tools<C: ReactContext>(result: &Value, context: &mut C) {
+    fn reveal_tools<C: ReactContext>(
+        result: &Value,
+        context: &mut C,
+        budget: &mut SchemaBudget,
+    ) -> SchemaReveal {
         let mut entries: Vec<&Value> = Vec::new();
         if let Some(tools) = result.get("tools").and_then(Value::as_array) {
             entries.extend(tools);
@@ -318,6 +341,9 @@ impl<A: ReActApp> ReActEngine<A> {
         if result.get("name").is_some() && result.get("parameters").is_some() {
             entries.push(result);
         }
+        let candidates = entries.len();
+        let mut skipped: Vec<SchemaRejection> = Vec::new();
+        let mut revealed = 0usize;
         for entry in entries {
             let Some(name) = entry.get("name").and_then(Value::as_str) else {
                 continue;
@@ -329,11 +355,60 @@ impl<A: ReActApp> ReActEngine<A> {
                 .get("description")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            context.add_tool(crate::llm::types::LlmTool::function(
-                name,
-                description,
-                parameters.clone(),
-            ));
+            let schema_json = parameters.to_string();
+            let bytes = name.len() + description.len() + schema_json.len();
+            let revision =
+                SchemaRevision::of(entry.get("version").and_then(Value::as_str), &schema_json);
+            match budget.account(name, revision, bytes) {
+                Ok(SchemaAccount::Added { .. }) => {
+                    context.add_tool(crate::llm::types::LlmTool::function(
+                        name,
+                        description,
+                        parameters.clone(),
+                    ));
+                    revealed += 1;
+                }
+                Ok(SchemaAccount::AlreadyRevealed) => {}
+                Err(rejection) => skipped.push(rejection),
+            }
+        }
+        if skipped.is_empty() {
+            return SchemaReveal {
+                note: None,
+                candidates,
+                revealed,
+                rejected: 0,
+            };
+        }
+        let rejected = skipped.len();
+        let mut note = format!(
+            "Schema budget reached: {} definition(s) were NOT added this turn ({} of {} bytes spent).",
+            skipped.len(),
+            budget.spent(),
+            budget.limit()
+        );
+        for rejection in skipped {
+            match rejection {
+                SchemaRejection::ToolTooLarge { name, bytes, limit } => {
+                    note.push_str(&format!(
+                        " {name} alone is {bytes} bytes, over the per-tool limit of {limit}."
+                    ));
+                }
+                SchemaRejection::BudgetExhausted { name, bytes, .. } => {
+                    note.push_str(&format!(
+                        " {name} would add {bytes} bytes past the turn budget."
+                    ));
+                }
+            }
+        }
+        note.push_str(
+            " Continue with the tools already in your list, or ask for a narrower query.",
+        );
+        SchemaReveal {
+            note: Some(note),
+            candidates,
+            revealed,
+            rejected,
         }
     }
 
@@ -462,30 +537,6 @@ impl<A: ReActApp> ReActEngine<A> {
                                 let mut args: serde_json::Value = serde_json::from_str(&args_str)
                                     .unwrap_or(serde_json::json!({}));
 
-                                if name == "load_skill" {
-                                    let skill_name =
-                                        args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                    if let Some(cached_skill) = self.skill_cache.get(skill_name) {
-                                        session.push(LlmMessage::AssistantToolCall {
-                                            tool_call_id: call_id.clone(),
-                                            name: name.clone(),
-                                            args: Self::strip_call_id(&args),
-                                        });
-                                        session.push(LlmMessage::ToolResult {
-                                            tool_call_id: call_id,
-                                            content: format!(
-                                                "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.
-
-skill_dir: {}
-
-{}",
-                                                skill_name, cached_skill.skill_dir, cached_skill.instructions
-                                            ),
-                                        });
-                                        continue;
-                                    }
-                                }
-
                                 self.inject_call_id(&mut args, &call_id);
 
                                 let (hook_name, mut hook_args) = self.call_identity(&name, &args);
@@ -573,8 +624,26 @@ skill_dir: {}
                                 // live context, so the next model step can call
                                 // those tools directly by name.
                                 if name == "find_tool" {
-                                    if let Ok(reported) = &result {
-                                        Self::reveal_tools(reported, context);
+                                    if let Ok(reported) = &mut result {
+                                        let reveal = Self::reveal_tools(
+                                            reported,
+                                            context,
+                                            &mut self.schema_budget,
+                                        );
+                                        self.telemetry.emit(&TelemetryEvent::ToolDiscovery {
+                                            candidates: reveal.candidates,
+                                            revealed: reveal.revealed,
+                                            rejected: reveal.rejected,
+                                            spent_bytes: self.schema_budget.spent(),
+                                        });
+                                        if let Some(note) = reveal.note {
+                                            if let Some(object) = reported.as_object_mut() {
+                                                object.insert(
+                                                    "budget".to_string(),
+                                                    Value::String(note),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                                 // What the call actually was, when the tool that
@@ -615,26 +684,6 @@ skill_dir: {}
                                 );
 
                                 if let Ok(ret) = &result {
-                                    if name == "load_skill" {
-                                        let skill_name =
-                                            args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                        let instructions = ret
-                                            .get("instructions")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        let skill_dir = ret
-                                            .get("skill_dir")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        if !instructions.is_empty() {
-                                            self.skill_cache.get_or_insert(
-                                                skill_name,
-                                                instructions.to_string(),
-                                                skill_dir.to_string(),
-                                            );
-                                        }
-                                    }
-
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
                                         tool: observed.clone(),
                                         input: args.clone(),
@@ -752,26 +801,6 @@ skill_dir: {}
                                 let mut args: Value = serde_json::from_str(arguments)
                                     .unwrap_or(serde_json::json!({}));
 
-                                if name == "load_skill" {
-                                    let skill_name =
-                                        args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                    if let Some(cached_skill) = self.skill_cache.get(skill_name) {
-                                        session.push(LlmMessage::AssistantToolCall {
-                                            tool_call_id: call_id.clone(),
-                                            name: name.clone(),
-                                            args: Self::strip_call_id(&args),
-                                        });
-                                        session.push(LlmMessage::ToolResult {
-                                            tool_call_id: call_id,
-                                            content: format!(
-                                                "Skill '{}' is already loaded. DO NOT call load_skill again. Use the skill instructions below to answer the user's question directly.\n\nskill_dir: {}\n\n{}",
-                                                skill_name, cached_skill.skill_dir, cached_skill.instructions
-                                            ),
-                                        });
-                                        continue;
-                                    }
-                                }
-
                                 self.inject_call_id(&mut args, &call_id);
 
                                 // A dispatcher reports the tool it forwarded to;
@@ -816,8 +845,26 @@ skill_dir: {}
                                 // the next request so the model can call them
                                 // directly.
                                 if name == "find_tool" {
-                                    if let Ok(reported) = &result {
-                                        Self::reveal_tools(reported, context);
+                                    if let Ok(reported) = &mut result {
+                                        let reveal = Self::reveal_tools(
+                                            reported,
+                                            context,
+                                            &mut self.schema_budget,
+                                        );
+                                        self.telemetry.emit(&TelemetryEvent::ToolDiscovery {
+                                            candidates: reveal.candidates,
+                                            revealed: reveal.revealed,
+                                            rejected: reveal.rejected,
+                                            spent_bytes: self.schema_budget.spent(),
+                                        });
+                                        if let Some(note) = reveal.note {
+                                            if let Some(object) = reported.as_object_mut() {
+                                                object.insert(
+                                                    "budget".to_string(),
+                                                    Value::String(note),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
 
@@ -855,26 +902,6 @@ skill_dir: {}
                                 );
 
                                 if let Ok(ret) = &result {
-                                    if name == "load_skill" {
-                                        let skill_name =
-                                            args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                        let instructions = ret
-                                            .get("instructions")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        let skill_dir = ret
-                                            .get("skill_dir")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        if !instructions.is_empty() {
-                                            self.skill_cache.get_or_insert(
-                                                skill_name,
-                                                instructions.to_string(),
-                                                skill_dir.to_string(),
-                                            );
-                                        }
-                                    }
-
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
                                         tool: observed.clone(),
                                         input: args.clone(),
@@ -965,6 +992,8 @@ skill_dir: {}
             self.model.clone_from(&request.model);
         }
 
+        // Each turn gets a fresh cumulative schema budget.
+        self.schema_budget.reset();
         context.add_tool(load_skill_tool());
 
         let result = self.react_loop(persona, request, session, context).await?;
@@ -985,6 +1014,8 @@ skill_dir: {}
         A::Context: ReactContext,
     {
         self.set_stop_flag(false);
+        // Each turn gets a fresh cumulative schema budget.
+        self.schema_budget.reset();
 
         session.push(LlmMessage::user(request.input.clone()));
 
@@ -1166,8 +1197,23 @@ skill_dir: {}
                             // A discovery reveals the reported schemas to the
                             // next request so the model can call them directly.
                             if name == "find_tool" {
-                                if let Ok(reported) = &result {
-                                    Self::reveal_tools(reported, context);
+                                if let Ok(reported) = &mut result {
+                                    let reveal = Self::reveal_tools(
+                                        reported,
+                                        context,
+                                        &mut self.schema_budget,
+                                    );
+                                    self.telemetry.emit(&TelemetryEvent::ToolDiscovery {
+                                        candidates: reveal.candidates,
+                                        revealed: reveal.revealed,
+                                        rejected: reveal.rejected,
+                                        spent_bytes: self.schema_budget.spent(),
+                                    });
+                                    if let Some(note) = reveal.note {
+                                        if let Some(object) = reported.as_object_mut() {
+                                            object.insert("budget".to_string(), Value::String(note));
+                                        }
+                                    }
                                 }
                             }
 

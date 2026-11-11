@@ -41,6 +41,20 @@ pub enum TelemetryEvent {
         /// The final answer text.
         answer: String,
     },
+    /// One on-demand discovery changed the live tool array.
+    ///
+    /// Counts only: the query text, tool arguments and results are not
+    /// recorded here, which is the privacy default for this evaluation loop.
+    ToolDiscovery {
+        /// Definitions the result offered.
+        candidates: usize,
+        /// Definitions added to the next request.
+        revealed: usize,
+        /// Definitions refused by the schema budget.
+        rejected: usize,
+        /// Cumulative schema bytes spent this turn.
+        spent_bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +94,20 @@ impl Telemetry {
                 }
                 TelemetryEvent::FinalAnswer { answer } => {
                     log::debug!("Final answer: {}", answer);
+                }
+                TelemetryEvent::ToolDiscovery {
+                    candidates,
+                    revealed,
+                    rejected,
+                    spent_bytes,
+                } => {
+                    log::debug!(
+                        "Tool discovery: candidates={}, revealed={}, rejected={}, spent={} bytes",
+                        candidates,
+                        revealed,
+                        rejected,
+                        spent_bytes
+                    );
                 }
             }
         }

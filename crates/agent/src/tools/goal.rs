@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use react::tool::{Tool, ToolError};
 use serde_json::{json, Value};
 
-use crate::goal::{Goal, MODEL_REPORTED};
+use crate::goal::{Goal, GoalFence, MODEL_REPORTED};
 
 /// A settle transition the model asked for during a turn.
 ///
@@ -49,6 +49,10 @@ pub struct GoalStore {
 struct GoalStoreInner {
     /// The goal as the model sees it, transitions applied.
     goal: Goal,
+    /// The identity/revision this round started under. It never changes while
+    /// the round runs, even when the local snapshot transitions; the host
+    /// compares it with the durable goal before applying the settlement.
+    fence: GoalFence,
     /// The transition the host still has to settle onto the durable goal.
     settle: Option<GoalSettle>,
 }
@@ -56,9 +60,27 @@ struct GoalStoreInner {
 impl GoalStore {
     /// Seed a store with the session's current goal.
     pub fn new(goal: Goal) -> Self {
+        let fence = goal.fence();
         Self {
-            inner: Arc::new(Mutex::new(GoalStoreInner { goal, settle: None })),
+            inner: Arc::new(Mutex::new(GoalStoreInner {
+                goal,
+                fence,
+                settle: None,
+            })),
         }
+    }
+
+    /// The identity/revision this round captured when it was seeded.
+    pub fn fence(&self) -> Option<GoalFence> {
+        self.inner.lock().ok().map(|guard| guard.fence.clone())
+    }
+
+    /// Whether the durable goal still stands at this round's fence.
+    pub fn is_current(&self, goal: &Goal) -> bool {
+        self.inner
+            .lock()
+            .map(|guard| goal.is_current(&guard.fence))
+            .unwrap_or(false)
     }
 
     /// The goal as the model sees it now.

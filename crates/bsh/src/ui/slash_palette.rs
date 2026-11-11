@@ -1617,6 +1617,11 @@ impl Shell {
                     "goal.already",
                     &[("phase", goal_phase_label(lang, state))],
                 )),
+                Err(GoalRefusal::ObjectiveTooLong { limit, actual }) => Some(crate::i18n::tr_args(
+                    lang,
+                    "goal.objectiveTooLong",
+                    &[("limit", limit.to_string()), ("actual", actual.to_string())],
+                )),
                 Err(_) => Some(lang.tr("goal.invalid")),
             },
             GoalRequest::Edit(objective) => match self.state.edit_goal(&id, &objective) {
@@ -1634,6 +1639,11 @@ impl Shell {
                     lang,
                     "goal.needObjective",
                     &[("usage", usage)],
+                )),
+                Err(GoalRefusal::ObjectiveTooLong { limit, actual }) => Some(crate::i18n::tr_args(
+                    lang,
+                    "goal.objectiveTooLong",
+                    &[("limit", limit.to_string()), ("actual", actual.to_string())],
                 )),
                 Err(_) => Some(lang.tr("goal.invalid")),
             },
@@ -1759,9 +1769,15 @@ impl Shell {
         // left is BLOCKED with the stable code round-limit, not left active and
         // silently stalled.
         if goal.state.is_open() && goal.activation.is_armed() && goal.exhausted() {
-            let message = format!(
-                "Goal reached its configured limit of {} rounds.",
-                goal.max_rounds
+            // The blocker CODE is the stable, locale-independent contract; the
+            // message is localized in the locale active when the block is
+            // created and persisted with it. A later locale switch does not
+            // rewrite stored history, so the code remains what policy and
+            // tests route on.
+            let message = crate::i18n::tr_args(
+                self.state.lang,
+                "goal.roundLimit",
+                &[("cap", goal.max_rounds.to_string())],
             );
             if self.state.block_goal(id, "round-limit", &message) {
                 cx.notify();

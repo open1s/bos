@@ -146,8 +146,7 @@ pub fn find_skill_schema() -> Value {
 
 /// One skill a search can offer: what the catalogue used to carry inline.
 struct SkillEntry {
-    name: String,
-    description: String,
+    metadata: crate::skills::SkillMetadata,
     dir: String,
 }
 
@@ -183,23 +182,25 @@ fn skill_entries(
             continue;
         }
         entries.push(SkillEntry {
-            name: skill.metadata.name.clone(),
-            description: skill.metadata.description.clone(),
+            metadata: skill.metadata.clone(),
             dir: skill.skill_dir.to_string_lossy().to_string(),
         });
     }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    entries.dedup_by(|a, b| a.name == b.name);
+    entries.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+    entries.dedup_by(|a, b| a.metadata.name == b.metadata.name);
     entries
 }
 
 /// One skill search: an exact name, a ranked query, or every name.
 fn search_skills(entries: &[SkillEntry], args: &Value) -> Value {
     if let Some(name) = args.get("name").and_then(Value::as_str) {
-        return match entries.iter().find(|entry| entry.name == name) {
+        return match entries.iter().find(|entry| entry.metadata.name == name) {
             Some(entry) => json!({
-                "name": entry.name,
-                "description": entry.description,
+                "name": entry.metadata.name,
+                "description": entry.metadata.description,
+                "version": entry.metadata.version.display(),
+                "category": entry.metadata.category.as_str(),
+                "tags": entry.metadata.tags,
                 "skill_dir": entry.dir,
                 "hint": "Call load_skill with this name to read its instructions.",
             }),
@@ -213,7 +214,7 @@ fn search_skills(entries: &[SkillEntry], args: &Value) -> Value {
     if query.trim().is_empty() {
         let names: Vec<&str> = entries
             .iter()
-            .map(|entry| entry.name.as_str())
+            .map(|entry| entry.metadata.name.as_str())
             .take(FIND_SKILL_NAMES)
             .collect();
         return json!({
@@ -223,24 +224,37 @@ fn search_skills(entries: &[SkillEntry], args: &Value) -> Value {
         });
     }
 
-    let words = words(query);
+    // Ranking uses the Skill metadata-aware scorer, which weighs category
+    // and tags and normalizes Unicode; it returns a deterministic name
+    // tiebreak. Results stay metadata-only.
     let mut ranked: Vec<(i64, &SkillEntry)> = entries
         .iter()
-        .map(|entry| (score_text(&words, &entry.name, &entry.description), entry))
+        .map(|entry| {
+            (
+                crate::skills::index::score_metadata(query, &entry.metadata),
+                entry,
+            )
+        })
         .filter(|(score, _)| *score > 0)
         .collect();
-    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.metadata.name.cmp(&b.1.metadata.name))
+    });
 
     let mut described = Vec::new();
     let mut spent = 0usize;
     for (_, entry) in ranked.iter().take(FIND_SKILL_DESCRIBED) {
-        spent += entry.name.len() + entry.description.len();
+        spent += entry.metadata.name.len() + entry.metadata.description.len();
         if spent > FIND_SKILL_BUDGET && !described.is_empty() {
             break;
         }
         described.push(json!({
-            "name": entry.name,
-            "description": clip(&entry.description, FIND_DESCRIPTION_CHARS),
+            "name": entry.metadata.name,
+            "description": clip(&entry.metadata.description, FIND_DESCRIPTION_CHARS),
+            "version": entry.metadata.version.display(),
+            "category": entry.metadata.category.as_str(),
+            "tags": entry.metadata.tags,
         }));
     }
     let described_names: Vec<String> = described
@@ -250,7 +264,7 @@ fn search_skills(entries: &[SkillEntry], args: &Value) -> Value {
         .collect();
     let names_only: Vec<&str> = ranked
         .iter()
-        .map(|(_, entry)| entry.name.as_str())
+        .map(|(_, entry)| entry.metadata.name.as_str())
         .filter(|name| !described_names.iter().any(|described| described == name))
         .take(FIND_SKILL_NAMES)
         .collect();
@@ -318,26 +332,36 @@ impl Catalogue<'_> {
         deferred || mcp || self.withheld.matches(name)
     }
 
-    fn entries(&self) -> Vec<(String, String, Value)> {
-        let mut out: Vec<(String, String, Value)> = Vec::new();
+    fn entries(&self) -> Vec<ToolEntry> {
+        let mut out: Vec<ToolEntry> = Vec::new();
         for registry in [self.registry, self.live].into_iter().flatten() {
             for (name, tool) in registry.iter() {
                 if !self.is_withheld(name, tool.deferred(), registry.is_mcp_tool(name)) {
                     continue;
                 }
-                out.push((name.clone(), tool.description(), tool.json_schema()));
+                out.push(ToolEntry {
+                    name: name.clone(),
+                    description: tool.description(),
+                    schema: tool.json_schema(),
+                    metadata: tool.metadata().cloned().unwrap_or_default(),
+                });
             }
             for name in registry.async_tool_names() {
                 if let Some(tool) = registry.get_async(&name) {
                     if !self.is_withheld(&name, tool.deferred(), registry.is_mcp_tool(&name)) {
                         continue;
                     }
-                    out.push((name.clone(), tool.description(), tool.json_schema()));
+                    out.push(ToolEntry {
+                        name: name.clone(),
+                        description: tool.description(),
+                        schema: tool.json_schema(),
+                        metadata: tool.metadata().cloned().unwrap_or_default(),
+                    });
                 }
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out.dedup_by(|a, b| a.0 == b.0);
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.dedup_by(|a, b| a.name == b.name);
         out
     }
 
@@ -426,6 +450,7 @@ impl Catalogue<'_> {
 pub fn find_tool(
     registry: Option<Arc<ToolRegistry>>,
     live: Arc<RwLock<ToolRegistry>>,
+    view: Arc<RwLock<Option<Arc<ToolRegistry>>>>,
     withheld: Withheld,
 ) -> FunctionTool {
     FunctionTool::new(
@@ -434,8 +459,15 @@ pub fn find_tool(
         find_tool_schema(),
         move |args: &Value| {
             let guard = live.read().ok();
+            // The authoritative registry is the one the agent currently runs,
+            // not the one captured when the engine was built. A host that
+            // replaces the registry through the capability composition (the
+            // workspace view) publishes it here, so a search cannot offer a
+            // tool the view no longer admits.
+            let current = view.read().ok().and_then(|view| view.clone());
+            let base = current.as_deref().or(registry.as_deref());
             let catalogue = Catalogue {
-                registry: registry.as_deref(),
+                registry: base,
                 live: guard.as_deref(),
                 withheld: withheld.clone(),
             };
@@ -511,7 +543,7 @@ fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
         // needs: every tool's name, nothing else.
         let names: Vec<&str> = entries
             .iter()
-            .map(|entry| entry.0.as_str())
+            .map(|entry| entry.name.as_str())
             .take(FIND_NAMES)
             .collect();
         return json!({
@@ -521,28 +553,35 @@ fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
         });
     }
 
-    let words = words(query);
-    let mut ranked: Vec<(i64, &(String, String, Value))> = entries
+    let mut ranked: Vec<(i64, &ToolEntry)> = entries
         .iter()
-        .map(|entry| (score(&words, entry), entry))
+        .map(|entry| (score(query, entry), entry))
         .filter(|(score, _)| *score > 0)
         .collect();
-    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1 .0.cmp(&b.1 .0)));
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
 
     let mut described = Vec::new();
     let mut spent = 0usize;
-    for (_, (name, description, schema)) in ranked.iter().take(limit) {
+    for (_, entry) in ranked.iter().take(limit) {
         // Price the schema itself, not a rendering of it: the JSON below is
         // what the model reads, and parameter definitions are the reason it
         // asked.
-        spent += name.len() + description.len() + schema.to_string().len();
+        spent += entry.name.len() + entry.description.len() + entry.schema.to_string().len();
         if spent > FIND_BUDGET && !described.is_empty() {
             break;
         }
         described.push(json!({
-            "name": name,
-            "description": clip(description, FIND_DESCRIPTION_CHARS),
-            "parameters": schema,
+            "name": entry.name,
+            "description": clip(&entry.description, FIND_DESCRIPTION_CHARS),
+            "parameters": entry.schema,
+            // A declared version is the schema's revision, so a changed
+            // definition is priced again rather than reusing a stale one.
+            "version": entry.metadata.version,
+            // The model keeps calling the surface name; these carry the
+            // authoritative runtime identity alongside it.
+            "capability_id": entry.metadata.capability_id,
+            "capability_version": entry.metadata.capability_version,
+            "provider": entry.metadata.provider,
         }));
     }
 
@@ -553,7 +592,7 @@ fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
         .collect();
     let names_only: Vec<&str> = ranked
         .iter()
-        .map(|(_, entry)| entry.0.as_str())
+        .map(|(_, entry)| entry.name.as_str())
         .filter(|name| !described_names.iter().any(|described| described == name))
         .take(FIND_NAMES)
         .collect();
@@ -582,45 +621,89 @@ fn clip(text: &str, limit: usize) -> String {
     out
 }
 
-/// The words a query is asking with.
-fn words(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| word.len() > 2)
-        .map(|word| word.to_ascii_lowercase())
-        .collect()
+/// One withheld tool as discovery sees it.
+struct ToolEntry {
+    name: String,
+    description: String,
+    schema: Value,
+    metadata: react::tool::ToolMetadata,
 }
 
-/// How well one tool answers the query. A name match counts double: the model
-/// usually knows roughly what it wants to do, and a tool whose NAME says so is
-/// the better answer than one whose long description happens to mention it.
-fn score(words: &[String], entry: &(String, String, Value)) -> i64 {
-    score_text(words, &entry.0, &entry.1)
-}
-
-/// The scoring rule both searches share: a name match counts double, because a
-/// tool or skill whose NAME says it is the better answer than one whose long
-/// description happens to mention the word.
-fn score_text(words: &[String], name: &str, description: &str) -> i64 {
-    let name = name.to_ascii_lowercase();
-    let description = description.to_ascii_lowercase();
-    words.iter().fold(0, |total, word| {
-        total
-            + i64::from(name.contains(word.as_str())) * 2
-            + i64::from(description.contains(word.as_str()))
-    })
+/// How well one tool answers the query.
+///
+/// A name match outranks metadata, which outranks a description mention. The
+/// weights are the documented contract: exact name 120, name prefix 60, name
+/// term 25, tag 18, intent 18, category 12, description 6.
+fn score(query: &str, entry: &ToolEntry) -> i64 {
+    let normalized = query.trim().to_lowercase();
+    if normalized.is_empty() {
+        return 0;
+    }
+    let name = entry.name.to_lowercase();
+    let description = entry.description.to_lowercase();
+    let category = entry
+        .metadata
+        .category
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    let tags: Vec<String> = entry
+        .metadata
+        .tags
+        .iter()
+        .map(|tag| tag.to_lowercase())
+        .collect();
+    let intents: Vec<String> = entry
+        .metadata
+        .intents
+        .iter()
+        .map(|intent| intent.to_lowercase())
+        .collect();
+    let mut total = 0i64;
+    if name == normalized {
+        total += 120;
+    } else if name.starts_with(&normalized) {
+        total += 60;
+    }
+    for term in crate::skills::index::terms(query) {
+        if name.contains(&term) {
+            total += 25;
+        }
+        if tags.iter().any(|tag| tag.contains(&term)) {
+            total += 18;
+        }
+        if intents.iter().any(|intent| intent.contains(&term)) {
+            total += 18;
+        }
+        if category.contains(&term) {
+            total += 12;
+        }
+        if description.contains(&term) {
+            total += 6;
+        }
+    }
+    total
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn entry(name: &str, description: &str) -> (String, String, Value) {
-        (
-            name.to_string(),
-            description.to_string(),
-            json!({"type": "object", "properties": {"x": {"type": "string"}}}),
-        )
+    fn entry(name: &str, description: &str) -> ToolEntry {
+        entry_with_metadata(name, description, react::tool::ToolMetadata::default())
+    }
+
+    fn entry_with_metadata(
+        name: &str,
+        description: &str,
+        metadata: react::tool::ToolMetadata,
+    ) -> ToolEntry {
+        ToolEntry {
+            name: name.to_string(),
+            description: description.to_string(),
+            schema: json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+            metadata,
+        }
     }
 
     fn registry_with(tools: &[(&str, &str)]) -> ToolRegistry {
@@ -724,6 +807,23 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_search_uses_tags_and_category_metadata() {
+        let mut tagged = skill("release", "Publish a build", false);
+        tagged.metadata.tags = vec!["deploy".to_string()];
+        let mut categorised = skill("ops", "Run a job", false);
+        categorised.metadata.category = crate::skills::SkillCategory::Data;
+        let entries = skill_entries(&[tagged, categorised], None);
+
+        let tagged_results = search_skills(&entries, &json!({"query": "deploy"}));
+        assert_eq!(tagged_results["skills"][0]["name"], "release");
+        assert_eq!(tagged_results["skills"][0]["tags"][0], "deploy");
+        assert_eq!(tagged_results["skills"][0]["version"], "1.0.0");
+
+        let category_results = search_skills(&entries, &json!({"query": "data"}));
+        assert_eq!(category_results["skills"][0]["name"], "ops");
+    }
+
+    #[test]
     fn a_skill_search_without_words_lists_every_name() {
         let entries = skill_entries(
             &[
@@ -782,8 +882,22 @@ mod tests {
     fn a_name_match_beats_a_description_match() {
         let named = entry("create_issue", "does tracker work");
         let described = entry("zeta", "create an issue in the tracker");
-        let query = words("create issue");
-        assert!(score(&query, &named) > score(&query, &described));
+        assert!(score("create issue", &named) > score("create issue", &described));
+    }
+
+    #[test]
+    fn tool_metadata_can_find_a_tool_whose_description_uses_other_words() {
+        let tagged = entry_with_metadata(
+            "deploy",
+            "Publish a build",
+            react::tool::ToolMetadata::default()
+                .with_tags(["ship", "release"])
+                .with_category("operations"),
+        );
+        let unrelated = entry("cooking", "Bake bread");
+        assert!(score("ship the release", &tagged) > 0);
+        assert_eq!(score("ship the release", &unrelated), 0);
+        assert!(score("operations", &tagged) > 0, "category is searchable");
     }
 
     #[test]
@@ -818,6 +932,119 @@ mod tests {
     /// tools a search describes in full - and not semantic understanding. The
     /// point is to keep a query a reader would plausibly type from missing the
     /// obvious tool, because a miss costs a second search and possibly the turn.
+
+    /// A measured baseline for tool retrieval. Assertions pin recall and rank
+    /// so a scoring change that loses a synonym fails the suite.
+    #[test]
+    fn the_tool_retrieval_corpus_reports_precision_recall_and_mrr() {
+        let registry = registry_with(&[
+            ("git_commit", "Create a git commit"),
+            ("git_push", "Push commits to a remote"),
+            ("deploy", "Ship a build"),
+            ("read_file", "Read a file from the workspace"),
+            ("notify", "Send a notification"),
+            ("query_db", "Run a SQL query"),
+        ]);
+        let catalogue = Catalogue {
+            registry: Some(&registry),
+            live: None,
+            withheld: Withheld::default(),
+        };
+        let entries = catalogue.entries();
+        let cases: [(&str, &str); 5] = [
+            ("commit changes", "git_commit"),
+            ("push commits", "git_push"),
+            ("ship a build", "deploy"),
+            ("send a notification", "notify"),
+            ("sql query", "query_db"),
+        ];
+        let mut precision = 0.0;
+        let mut recall = 0.0;
+        let mut mrr = 0.0;
+        for (query, expected) in cases {
+            let mut ranked: Vec<(i64, &str)> = entries
+                .iter()
+                .map(|entry| (score(query, entry), entry.name.as_str()))
+                .filter(|(value, _)| *value > 0)
+                .collect();
+            ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(right.1)));
+            let names: Vec<String> = ranked
+                .iter()
+                .take(3)
+                .map(|(_, name)| name.to_string())
+                .collect();
+            let relevant = std::collections::BTreeSet::from([expected.to_string()]);
+            let metrics = crate::skills::runtime::retrieval_metrics(&names, &relevant, 3);
+            eprintln!(
+                "query={query:?} ranked={names:?} P@3={:.2} R@3={:.2} RR={:.2}",
+                metrics.precision_at_k, metrics.recall_at_k, metrics.reciprocal_rank
+            );
+            assert!(metrics.recall_at_k > 0.0, "missed {expected} for {query:?}");
+            precision += metrics.precision_at_k;
+            recall += metrics.recall_at_k;
+            mrr += metrics.reciprocal_rank;
+        }
+        let count = cases.len() as f64;
+        eprintln!(
+            "macro P@3={:.2} R@3={:.2} MRR={:.2}",
+            precision / count,
+            recall / count,
+            mrr / count
+        );
+        assert!(precision / count >= 0.33, "precision regressed");
+        assert!(recall / count >= 0.99, "recall regressed");
+        assert!(mrr / count >= 0.8, "rank regressed");
+    }
+
+    #[test]
+    fn a_capability_shim_reports_its_runtime_identity() {
+        let metadata = react::tool::ToolMetadata::default()
+            .with_capability("extdev/design", "2.1.0")
+            .with_provider("builtin");
+        let mut registry = ToolRegistry::new();
+        let tool = FunctionTool::new(
+            "design",
+            "Design a service",
+            json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+            |_| Ok(json!({"ok": true})),
+        )
+        .with_metadata(metadata);
+        registry.register(Arc::new(tool)).expect("register");
+        registry.mark_mcp_tool("design");
+        let catalogue = Catalogue {
+            registry: Some(&registry),
+            live: None,
+            withheld: Withheld::default(),
+        };
+        let result = search(&catalogue, &json!({"query": "design"}));
+        assert_eq!(result["tools"][0]["capability_id"], "extdev/design");
+        assert_eq!(result["tools"][0]["capability_version"], "2.1.0");
+        assert_eq!(result["tools"][0]["provider"], "builtin");
+    }
+
+    #[test]
+    fn discovery_reads_the_current_registry_view_not_the_build_snapshot() {
+        use crate::tools::Tool as _;
+        let built = Arc::new(registry_with(&[("stale", "a tool the view dropped")]));
+        let current = Arc::new(registry_with(&[("fresh", "a tool the view admits")]));
+        let view = Arc::new(RwLock::new(Some(current)));
+        let find = find_tool(
+            Some(built),
+            Arc::new(RwLock::new(ToolRegistry::new())),
+            view,
+            Withheld::default(),
+        );
+        let listed = find.run(&json!({})).expect("the search runs");
+        let names: Vec<&str> = listed["names"]
+            .as_array()
+            .expect("names")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(names.contains(&"fresh"), "{listed}");
+        assert!(!names.contains(&"stale"), "{listed}");
+    }
+
     #[test]
     fn a_search_shortlists_the_tool_a_query_means() {
         let registry = registry_with(&[

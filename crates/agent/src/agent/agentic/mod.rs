@@ -275,6 +275,16 @@ pub struct Agent {
     llm: Arc<LlmProvider>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     registry: Option<Arc<ToolRegistry>>,
+    /// The registry a turn currently runs, published when a capability
+    /// composition replaces the raw one. Discovery reads this at call time so
+    /// it cannot offer a capability the current workspace view dropped.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    registry_view: Arc<std::sync::RwLock<Option<Arc<ToolRegistry>>>>,
+    /// Task-scoped Skill activation, composition and telemetry for this agent.
+    /// One agent serves one session, so the runtime's task key is the session
+    /// turn; it is reset at the start of every run.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    skill_runtime: Arc<std::sync::Mutex<crate::skills::SkillRuntime>>,
     /// Extension tools that can be added or removed while the agent is shared.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     live_tools: Arc<std::sync::RwLock<ToolRegistry>>,
@@ -363,6 +373,22 @@ impl Agent {
             context_budget: 0,
             llm,
             registry: Some(Arc::new(ToolRegistry::new())),
+            registry_view: Arc::new(std::sync::RwLock::new(None)),
+            skill_runtime: Arc::new(std::sync::Mutex::new(crate::skills::SkillRuntime::new(
+                Arc::new(crate::skills::SkillIndex::from_metadata(Vec::new())),
+                crate::skills::TrustPolicy {
+                    allowed_sources: [
+                        crate::skills::SkillSource::User,
+                        crate::skills::SkillSource::Builtin,
+                        crate::skills::SkillSource::ThirdParty,
+                        crate::skills::SkillSource::Federated,
+                    ]
+                    .into_iter()
+                    .collect(),
+                    require_publisher: true,
+                },
+                crate::skills::SkillLimits::default(),
+            ))),
             live_tools: Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
             live_prompts: Arc::new(std::sync::RwLock::new(Vec::new())),
             live_skills: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -1388,7 +1414,11 @@ impl Agent {
     /// registry itself; this swaps it in and drops the cached engine and
     /// context snapshots, so the next turn sees exactly the composed set.
     pub fn set_registry(&mut self, registry: ToolRegistry) {
-        self.registry = Some(Arc::new(registry));
+        let registry = Arc::new(registry);
+        if let Ok(mut view) = self.registry_view.write() {
+            *view = Some(Arc::clone(&registry));
+        }
+        self.registry = Some(registry);
         self.engine_cache.lock().unwrap().take();
         self.context_cache.lock().unwrap().take();
     }
@@ -1456,6 +1486,26 @@ impl Agent {
             .iter()
             .map(|skill| (skill.metadata.name.as_str(), skill.instructions.as_str()))
             .collect()
+    }
+
+    /// Take this agent's structured Skill runtime events.
+    ///
+    /// Events carry names, counts and outcomes only; instruction bodies and
+    /// prompts never enter them. A host that evaluates Skill effectiveness
+    /// drains these after a turn.
+    pub fn drain_skill_events(&self) -> Vec<crate::skills::SkillEvent> {
+        self.skill_runtime
+            .lock()
+            .map(|mut runtime| runtime.drain_events())
+            .unwrap_or_default()
+    }
+
+    /// Skills active for the current turn, in composition order.
+    pub fn active_skills(&self) -> Vec<String> {
+        self.skill_runtime
+            .lock()
+            .map(|runtime| runtime.active("session"))
+            .unwrap_or_default()
     }
 
     /// The registered skill with this name, if one is registered.
@@ -1774,6 +1824,8 @@ impl Clone for Agent {
             context_budget: self.context_budget,
             llm: self.llm.clone(),
             registry: self.registry.clone(),
+            registry_view: Arc::clone(&self.registry_view),
+            skill_runtime: Arc::clone(&self.skill_runtime),
             live_tools: Arc::clone(&self.live_tools),
             live_prompts: Arc::clone(&self.live_prompts),
             live_skills: Arc::clone(&self.live_skills),

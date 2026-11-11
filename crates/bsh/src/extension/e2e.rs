@@ -865,8 +865,8 @@ impl agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContex
         &self,
         _persona: Option<String>,
         _req: react::llm::LlmRequest,
-        session: &mut agent::agent::AgentSession,
-        _context: &mut agent::agent::AgentReactContext,
+        _session: &mut agent::agent::AgentSession,
+        context: &mut agent::agent::AgentReactContext,
     ) -> react::llm::LlmResponseResult {
         if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
             return Ok(e2e_tool_call(
@@ -874,13 +874,10 @@ impl agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContex
                 &format!(r#"{{"name":"{}"}}"#, self.skill),
             ));
         }
-        let seen = session.messages().iter().any(|message| {
-            matches!(
-                message,
-                react::llm::LlmMessage::ToolResult { content, .. }
-                    if content.contains(self.body)
-            )
-        });
+        let seen = context
+            .instructions
+            .iter()
+            .any(|instruction| instruction.instruction.contains(self.body));
         self.saw.store(seen, Ordering::Relaxed);
         Ok(e2e_text("done"))
     }

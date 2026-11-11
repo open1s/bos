@@ -18,7 +18,7 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             llm_timeout_secs: 120,
             model: String::new(),
             token_counter: TokenCounter::with_default(),
-            skill_cache: SkillCache::new(Duration::from_secs(300)), // 5 min TTL
+            schema_budget: SchemaBudget::default(),
             react_app: None,
             bus: None,
             agent_name: String::new(),
@@ -71,6 +71,20 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
     /// reads obeys the same cap its UI does instead of an engine constant.
     pub fn tool_result_cap(mut self, cap: usize) -> Self {
         self.tool_result_cap = if cap == 0 { TOOL_RESULT_CAP } else { cap };
+        self
+    }
+
+    /// Set the cumulative tool-schema byte budget for one turn. Zero selects
+    /// the engine default; a per-tool limit is set separately.
+    pub fn schema_budget(mut self, bytes: usize) -> Self {
+        self.schema_budget = SchemaBudget::new(bytes, self.schema_budget.per_tool());
+        self
+    }
+
+    /// Set the byte ceiling for one revealed tool schema. Zero selects the
+    /// engine default.
+    pub fn schema_per_tool(mut self, bytes: usize) -> Self {
+        self.schema_budget = SchemaBudget::new(self.schema_budget.limit(), bytes);
         self
     }
 
@@ -177,7 +191,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             token_counter: self.token_counter,
             react_app: self.react_app.unwrap_or_default(),
             resilience: self.resilience,
-            skill_cache: self.skill_cache,
+            schema_budget: self.schema_budget,
             tool_call_count: AtomicU64::new(0),
             tool_time_nanos: AtomicU64::new(0),
             stop_flag: Arc::new(AtomicBool::new(false)),

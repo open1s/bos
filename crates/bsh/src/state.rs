@@ -719,6 +719,25 @@ pub(crate) enum GoalRefusal {
     InvalidTransition,
     /// The objective trims to nothing.
     InvalidObjective,
+    /// The objective exceeds the goal domain's character limit. Nothing was
+    /// written; an edit keeps the previous objective.
+    ObjectiveTooLong {
+        /// The configured limit, in characters.
+        limit: usize,
+        /// The submitted length, in characters.
+        actual: usize,
+    },
+}
+
+/// Validate a command objective before any durable mutation.
+fn goal_objective(objective: &str) -> Result<String, GoalRefusal> {
+    match agent::goal::validate_objective(objective) {
+        Ok(text) => Ok(text),
+        Err(agent::goal::GoalObjectiveError::Blank) => Err(GoalRefusal::InvalidObjective),
+        Err(agent::goal::GoalObjectiveError::TooLong { limit, actual }) => {
+            Err(GoalRefusal::ObjectiveTooLong { limit, actual })
+        }
+    }
 }
 
 /// Which goal mutation a verb performed.
@@ -2771,10 +2790,9 @@ impl AppState {
         id: &str,
         objective: &str,
     ) -> Result<GoalChange, GoalRefusal> {
-        let objective = objective.trim();
-        if objective.is_empty() {
-            return Err(GoalRefusal::InvalidObjective);
-        }
+        // Validate BEFORE the session is borrowed mutably: a refusal must not
+        // leave a half-mutated session behind.
+        let objective = goal_objective(objective)?;
         let replaced = {
             let Some(session) = self.store.session_mut(id) else {
                 return Err(GoalRefusal::Missing);
@@ -2803,15 +2821,18 @@ impl AppState {
     /// Rewrite a goal's objective without changing its phase, activation or
     /// round count. A COMPLETED goal is replaced by a fresh one, which is the
     /// reference's rule for /goal edit <objective>.
+    ///
+    /// The identity is preserved and the revision is bumped, so a round that
+    /// started under the old objective may finish but its settlement is stale
+    /// and the edited goal is left exactly as the operator wrote it.
     pub(crate) fn edit_goal(
         &mut self,
         id: &str,
         objective: &str,
     ) -> Result<GoalChange, GoalRefusal> {
-        let objective = objective.trim();
-        if objective.is_empty() {
-            return Err(GoalRefusal::InvalidObjective);
-        }
+        // An overlength edit is refused before the session is touched, so the
+        // previous objective survives a rejected command.
+        let objective = goal_objective(objective)?;
         let replaced = {
             let Some(session) = self.store.session_mut(id) else {
                 return Err(GoalRefusal::Missing);
@@ -2829,7 +2850,11 @@ impl AppState {
                 let Some(goal) = session.goal.as_mut() else {
                     return Err(GoalRefusal::Missing);
                 };
-                goal.objective = objective.to_string();
+                goal.objective = objective;
+                // Editing preserves the identity but invalidates every round
+                // that captured the previous revision: its late completion or
+                // blocker must not settle onto the rewritten goal.
+                goal.bump_revision();
                 goal.sanitize();
             }
             session.updated_at = now();
@@ -2863,6 +2888,12 @@ impl AppState {
     }
 
     /// Pause an active goal and disarm it, keeping the durable phase.
+    ///
+    /// In-flight policy (issue #289): a round already streaming is allowed to
+    /// finish, but pausing bumps the goal revision, so that round's
+    /// completion or blocker is discarded at settlement and it can neither
+    /// re-arm nor continue the goal. Pausing is therefore effective
+    /// immediately even though the model request itself is not cancelled.
     pub(crate) fn pause_goal(&mut self, id: &str) -> Result<(), GoalRefusal> {
         {
             let Some(session) = self.store.session_mut(id) else {
@@ -2881,7 +2912,11 @@ impl AppState {
     }
 
     /// Resume a paused, blocked or disarmed goal and arm it, provided its round
-    /// cap still has room. Resuming an active ARMED goal is refused, which is
+    /// cap still has room.
+    ///
+    /// Resuming bumps the revision as well: only a round started after this
+    /// call can settle, so a disarmed round's late result cannot become the
+    /// resumed goal's outcome. Resuming an active ARMED goal is refused, which is
     /// the reference's already-active-and-armed rejection.
     pub(crate) fn resume_goal(&mut self, id: &str) -> Result<(), GoalRefusal> {
         {
@@ -2904,6 +2939,11 @@ impl AppState {
     /// or cancelled round leaves the goal where it is and disarms it, which is
     /// the reference driver's rule; the reader resumes explicitly.
     pub(crate) fn disarm_goal(&mut self, id: &str) -> bool {
+        // A failure callback belongs to the round that was running. If an
+        // operator has paused, edited, cleared or resumed since that round
+        // started, its fence is stale and its failure must not disarm the
+        // replacement goal.
+        let round_fence = self.goals.get(id).and_then(GoalStore::fence);
         let changed = {
             let Some(session) = self.store.session_mut(id) else {
                 return false;
@@ -2911,6 +2951,11 @@ impl AppState {
             let Some(goal) = session.goal.as_mut() else {
                 return false;
             };
+            if let Some(fence) = round_fence {
+                if !goal.is_current(&fence) {
+                    return false;
+                }
+            }
             let was_armed = goal.activation.is_armed();
             goal.disarm();
             if was_armed {
@@ -2960,13 +3005,19 @@ impl AppState {
     pub(crate) fn settle_goal(&mut self, id: &str) -> Option<GoalSettle> {
         let store = self.goals.remove(id)?;
         let settle = store.take_settle()?;
+        // Fence the settlement by the identity/revision the round started
+        // under. Pause, edit, clear or resume while the round was running
+        // bumps the durable revision (or replaces the identity), so a late
+        // completion or blocker is discarded here instead of mutating a goal
+        // the operator has since changed. None means "not applied".
+        let fence = store.fence()?;
         let changed = {
-            let Some(session) = self.store.session_mut(id) else {
-                return Some(settle);
-            };
-            let Some(goal) = session.goal.as_mut() else {
-                return Some(settle);
-            };
+            let session = self.store.session_mut(id)?;
+            let goal = session.goal.as_mut()?;
+            if !goal.is_current(&fence) {
+                log::debug!("goal settlement discarded: round fence is stale");
+                return None;
+            }
             let changed = match &settle {
                 GoalSettle::Complete => goal.complete(),
                 GoalSettle::Blocked { code, message } => goal.block(code, message),
@@ -2983,6 +3034,12 @@ impl AppState {
     }
 
     /// Remove the current goal while retaining the session's history.
+    ///
+    /// A round already running keeps its store until it ends, but the durable
+    /// goal it would settle onto is gone; a goal created afterwards has a fresh
+    /// identity, so the old round's fence cannot match it and its late
+    /// completion, blocker or failure callback is discarded rather than
+    /// applied to the replacement.
     pub(crate) fn clear_goal(&mut self, id: &str) -> bool {
         let Some(session) = self.store.session_mut(id) else {
             return false;
@@ -6183,6 +6240,124 @@ mod tests {
         let state = super::AppState::with_store(crate::store::Store::open_at(dir));
         let id = state.active_id.clone().expect("a session");
         (state, id)
+    }
+
+    /// An objective over the character limit is refused before durable state
+    /// is touched. Creation leaves no goal, and a rejected edit keeps the
+    /// previous objective exactly as it was.
+    #[test]
+    fn an_overlength_objective_is_refused_and_an_edit_keeps_the_old_text() {
+        use super::GoalRefusal;
+        let (mut state, id) = goal_state("overlong");
+        let limit = agent::goal::MAX_OBJECTIVE;
+        let long = "x".repeat(limit + 1);
+        assert_eq!(
+            state.create_goal(&id, &long),
+            Err(GoalRefusal::ObjectiveTooLong {
+                limit,
+                actual: limit + 1,
+            })
+        );
+        assert!(state.goal(&id).is_none(), "a refused create writes nothing");
+
+        state.create_goal(&id, "keep me").expect("the goal");
+        let before = state.goal(&id).expect("the goal");
+        assert_eq!(
+            state.edit_goal(&id, &long),
+            Err(GoalRefusal::ObjectiveTooLong {
+                limit,
+                actual: limit + 1,
+            })
+        );
+        let after = state.goal(&id).expect("the goal");
+        assert_eq!(after.objective, "keep me");
+        assert_eq!(after.revision, before.revision, "a refusal bumps nothing");
+
+        // Exactly at the limit is accepted, counted in characters.
+        let exact = "é".repeat(limit);
+        assert!(state.edit_goal(&id, &exact).is_ok());
+        assert_eq!(
+            state.goal(&id).expect("the goal").objective.chars().count(),
+            limit
+        );
+    }
+
+    /// A round captures the identity/revision it started under. Editing the
+    /// objective while that round runs makes its completion stale: the edit
+    /// survives and the goal stays active.
+    #[test]
+    fn a_stale_completion_cannot_settle_an_edited_goal() {
+        use agent::goal::GoalState;
+        use agent::tools::GoalStore;
+        let (mut state, id) = goal_state("fence-edit");
+        state.create_goal(&id, "goal A").expect("the goal");
+        let store = GoalStore::new(state.goal(&id).expect("the goal"));
+        state.attach_goal(&id, store.clone());
+        assert!(store.complete(), "the round for A reports completion");
+
+        assert_eq!(
+            state.edit_goal(&id, "goal B"),
+            Ok(super::GoalChange::Updated)
+        );
+        assert_eq!(
+            state.settle_goal(&id),
+            None,
+            "A's completion is stale after the edit"
+        );
+        let goal = state.goal(&id).expect("the goal");
+        assert_eq!(goal.objective, "goal B");
+        assert_eq!(goal.state, GoalState::Active, "B was not completed by A");
+        assert!(goal.activation.is_armed());
+    }
+
+    /// A round that started for a cleared goal cannot touch the goal created
+    /// afterwards: the fresh identity does not match the old fence, and the
+    /// failure callback does not disarm it either.
+    #[test]
+    fn a_stale_round_cannot_mutate_or_disarm_a_replacement_goal() {
+        use agent::goal::GoalState;
+        use agent::tools::GoalStore;
+        let (mut state, id) = goal_state("fence-replace");
+        state.create_goal(&id, "goal A").expect("the goal");
+        let store = GoalStore::new(state.goal(&id).expect("the goal"));
+        state.attach_goal(&id, store.clone());
+
+        assert!(state.clear_goal(&id));
+        state.create_goal(&id, "goal B").expect("the goal");
+        assert!(store.block(agent::goal::MODEL_REPORTED, "A failed"));
+        assert_eq!(state.settle_goal(&id), None, "A's blocker is stale");
+        let goal = state.goal(&id).expect("the goal");
+        assert_eq!(goal.objective, "goal B");
+        assert_eq!(goal.state, GoalState::Active);
+        assert_eq!(goal.blocked_reason, None);
+
+        // A late failure callback for A must not disarm B either.
+        let store = GoalStore::new(state.goal(&id).expect("the goal"));
+        state.attach_goal(&id, store);
+        assert!(state.edit_goal(&id, "goal C").is_ok());
+        assert!(
+            !state.disarm_goal(&id),
+            "a stale round's failure cannot disarm the edited goal"
+        );
+        assert!(state.goal(&id).expect("the goal").activation.is_armed());
+    }
+
+    /// Pausing bumps the revision, so the round that was running can finish
+    /// but its settlement is discarded.
+    #[test]
+    fn pause_discards_the_running_rounds_settlement() {
+        use agent::goal::GoalState;
+        use agent::tools::GoalStore;
+        let (mut state, id) = goal_state("fence-pause");
+        state.create_goal(&id, "goal A").expect("the goal");
+        let store = GoalStore::new(state.goal(&id).expect("the goal"));
+        state.attach_goal(&id, store.clone());
+        assert!(store.complete());
+        assert_eq!(state.pause_goal(&id), Ok(()));
+        assert_eq!(state.settle_goal(&id), None);
+        let goal = state.goal(&id).expect("the goal");
+        assert_eq!(goal.state, GoalState::Paused, "pause wins over the round");
+        assert!(!goal.activation.is_armed());
     }
 
     /// A model completion settles onto the durable goal and the loop refuses

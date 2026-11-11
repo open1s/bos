@@ -96,6 +96,78 @@ fn push_paragraph(base: &mut String, text: &str) {
     base.push_str(text);
 }
 
+/// The runtime task key for one agent turn.
+///
+/// One agent serves one session. Every run clears this task's activation, so
+/// the scope is a turn: a skill selected for one task does not leak into the
+/// next task on the same session.
+const SKILL_TASK: &str = "session";
+
+/// Resolve and compose a model-selected Skill through the task-scoped runtime.
+///
+/// The runtime plans dependencies, activates only the selected set under trust
+/// and budget checks, and returns the composed instruction block. A body the
+/// index cannot read (an extension overlay with no readable manifest) is taken
+/// from the in-memory registration, but a manifest whose digest changed is
+/// still refused.
+fn compose_skill_load(
+    base: &[crate::skills::SkillContent],
+    live: &[crate::skills::SkillContent],
+    name: &str,
+    runtime: &std::sync::Arc<std::sync::Mutex<crate::skills::SkillRuntime>>,
+) -> Result<crate::skills::ComposedSkills, String> {
+    use crate::skills::{SkillContent, SkillIndex, SkillLoadError, SkillPermission};
+
+    let all: Vec<&SkillContent> = base.iter().chain(live.iter()).collect();
+    let index = SkillIndex::from_metadata(all.iter().map(|skill| skill.metadata.clone()));
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| "skill runtime lock is poisoned".to_string())?;
+    runtime.replace_index(index);
+    let plan = runtime
+        .plan(SKILL_TASK, &[name.to_string()])
+        .map_err(|error| error.to_string())?;
+
+    for planned in &plan.order {
+        let Some(registered) = all
+            .iter()
+            .find(|skill| &skill.metadata.name == planned)
+            .copied()
+        else {
+            return Err(format!(
+                "the activation plan names '{planned}', but no such skill is registered"
+            ));
+        };
+        let instructions = if registered.metadata.digest.is_empty() {
+            registered.instructions.clone()
+        } else {
+            match runtime.index().load(planned) {
+                Ok(loaded) => loaded.instructions,
+                Err(SkillLoadError::Stale {
+                    expected, actual, ..
+                }) => {
+                    return Err(format!(
+                        "Skill '{planned}' changed after it was indexed (expected digest {expected}, found {actual}); reload the catalogue and try again"
+                    ));
+                }
+                Err(_) => registered.instructions.clone(),
+            }
+        };
+        let body = SkillContent {
+            metadata: registered.metadata.clone(),
+            instructions,
+            skill_dir: registered.skill_dir.clone(),
+        };
+        runtime
+            .activate_with_body(SKILL_TASK, &body, SkillPermission::Model)
+            .map_err(|error| error.to_string())?;
+    }
+
+    runtime
+        .compose(SKILL_TASK)
+        .map_err(|error| error.to_string())
+}
+
 impl Agent {
     /// Prepare context with tools and skills populated from the agent's state.
     /// Shared by react() and stream() to avoid code duplication.
@@ -240,6 +312,7 @@ impl Agent {
             let find = super::discovery::find_tool(
                 self.registry.clone(),
                 Arc::clone(&self.live_tools),
+                Arc::clone(&self.registry_view),
                 withheld,
             );
             builder = builder.with_tool(ToolVariant::Sync(Box::new(ExtensibleToolAdapter::new(
@@ -303,6 +376,7 @@ impl Agent {
                     // keep opening one whose package was switched off.
                     let base = self.skills.clone();
                     let live = Arc::clone(&self.live_skills);
+                    let runtime = Arc::clone(&self.skill_runtime);
                     move |args: &serde_json::Value| {
                         let name = args
                             .get("name")
@@ -312,11 +386,33 @@ impl Agent {
                         let live = live.as_deref().map(Vec::as_slice).unwrap_or(&[]);
                         match crate::skills::lookup_for_model_in(&base, live, name) {
                             crate::skills::ModelSkillLookup::Found(skill) => {
+                                // The runtime plans dependencies, activates
+                                // only the selected set under trust and budget
+                                // checks, verifies any readable manifest's
+                                // digest and composes one instruction block.
+                                // The task scope is this turn, reset when the
+                                // run starts.
+                                let composed = match compose_skill_load(&base, live, name, &runtime)
+                                {
+                                    Ok(composed) => composed,
+                                    Err(error) => {
+                                        return Ok(serde_json::json!({ "error": error }));
+                                    }
+                                };
                                 Ok(serde_json::json!({
                                     "name": skill.metadata.name,
                                     "description": skill.metadata.description,
-                                    "instructions": skill.instructions,
-                                    "skill_dir": skill.skill_dir.to_string_lossy()
+                                    "instructions": composed.text,
+                                    "skills": composed.skills,
+                                    "instruction_bytes": composed.bytes,
+                                    "deduplicated": composed.deduplicated,
+                                    "skill_dir": skill.skill_dir.to_string_lossy(),
+                                    "version": skill.metadata.version.display(),
+                                    "category": skill.metadata.category.as_str(),
+                                    "tags": skill.metadata.tags,
+                                    "source": skill.metadata.source.as_str(),
+                                    "publisher": skill.metadata.publisher,
+                                    "digest": skill.metadata.digest,
                                 }))
                             }
                             // The reference's refusal, verbatim in shape: the name
@@ -392,6 +488,7 @@ impl Agent {
     /// - `Content::text("string")` for simple text
     /// - `Content::parts([ContentPart::text(...), ContentPart::image(...)])` for multimodal
     pub async fn react(&self, task: impl Into<Content>) -> Result<String, AgentError> {
+        self.reset_skill_runtime();
         let task_content = task.into();
         let wall_start = std::time::Instant::now();
         let turn_start = crate::agent::TurnStartWrapper::new(
@@ -578,6 +675,21 @@ impl Agent {
     /// Run the agent (delegates to react with session + hooks via AgentReActApp).
     pub async fn run_simple(&self, task: impl Into<Content>) -> Result<String, AgentError> {
         self.react(task).await
+    }
+
+    /// Drop the previous turn's Skill activations and composed context.
+    fn reset_skill_runtime(&self) {
+        if let Ok(mut runtime) = self.skill_runtime.lock() {
+            runtime.finish(SKILL_TASK);
+        }
+        // A cached context can carry the previous task's skill block (an
+        // aborted run never reached on_final_answer), so the reset clears it
+        // as well as the runtime.
+        if let Ok(mut cache) = self.context_cache.lock() {
+            if let Some(context) = cache.as_mut() {
+                context.clear_skill_instructions();
+            }
+        }
     }
 
     /// Condense the session's older history into a model-written checkpoint.
@@ -780,6 +892,7 @@ impl Agent {
         task: impl Into<Content>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamToken, AgentError>> + Send + '_>> {
         let task_content = task.into();
+        self.reset_skill_runtime();
 
         let cached_engine = {
             let mut cache = self.engine_cache.lock().unwrap();
@@ -1065,5 +1178,93 @@ mod failure_tests {
     fn a_hook_abort_stays_a_session_failure() {
         let error = react_failure(react::engine::ReactError::HookAbort("stopped".to_string()));
         assert_eq!(error.to_string(), "Session error: Hook abort: stopped");
+    }
+
+    fn host_skill_policy() -> crate::skills::TrustPolicy {
+        crate::skills::TrustPolicy {
+            allowed_sources: [
+                crate::skills::SkillSource::User,
+                crate::skills::SkillSource::Builtin,
+                crate::skills::SkillSource::ThirdParty,
+                crate::skills::SkillSource::Federated,
+            ]
+            .into_iter()
+            .collect(),
+            require_publisher: true,
+        }
+    }
+
+    fn write_runtime_skill(dir: &std::path::Path, name: &str, body: &str, extra: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).expect("dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name} skill\n{extra}---\n{body}"),
+        )
+        .expect("write");
+    }
+
+    #[test]
+    fn the_runtime_composes_dependency_first_and_refuses_stale_content() {
+        use crate::skills::{SkillIndex, SkillLimits, SkillRuntime};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_runtime_skill(dir.path(), "base", "BASE", "");
+        write_runtime_skill(dir.path(), "app", "APP", "dependencies:\n  - name: base\n");
+        let mut loader = crate::skills::SkillLoader::new(dir.path().to_path_buf());
+        loader.discover().expect("discover");
+        let app = loader.load("app").expect("app");
+        let base = loader.load("base").expect("base");
+        let runtime = Arc::new(Mutex::new(SkillRuntime::new(
+            Arc::new(SkillIndex::from_metadata(Vec::new())),
+            host_skill_policy(),
+            SkillLimits::default(),
+        )));
+
+        let composed =
+            super::compose_skill_load(&[app.clone(), base.clone()], &[], "app", &runtime)
+                .expect("compose");
+        assert_eq!(composed.skills, vec!["base", "app"]);
+        let base_at = composed.text.find("BASE").expect("base body");
+        let app_at = composed.text.find("APP").expect("app body");
+        assert!(base_at < app_at, "{}", composed.text);
+
+        // A manifest edited after discovery is refused, not served stale.
+        std::fs::write(
+            dir.path().join("app").join("SKILL.md"),
+            "---\nname: app\ndescription: app\ndependencies:\n  - name: base\n---\nCHANGED",
+        )
+        .expect("rewrite");
+        let error = super::compose_skill_load(&[app, base], &[], "app", &runtime)
+            .expect_err("stale content is refused");
+        assert!(error.contains("changed"), "{error}");
+    }
+
+    #[test]
+    fn the_runtime_refuses_an_unpublished_third_party_skill() {
+        use crate::skills::{SkillIndex, SkillLimits, SkillRuntime};
+        use std::sync::{Arc, Mutex};
+
+        let mut metadata = crate::skills::SkillMetadata::new(
+            "pkg".to_string(),
+            "a package skill".to_string(),
+            std::path::PathBuf::from("/nowhere/SKILL.md"),
+        );
+        metadata.source = crate::skills::SkillSource::ThirdParty;
+        metadata.digest = String::new();
+        let content = crate::skills::SkillContent {
+            metadata,
+            instructions: "PACKAGE".to_string(),
+            skill_dir: std::path::PathBuf::from("/nowhere"),
+        };
+        let runtime = Arc::new(Mutex::new(SkillRuntime::new(
+            Arc::new(SkillIndex::from_metadata(Vec::new())),
+            host_skill_policy(),
+            SkillLimits::default(),
+        )));
+        let error = super::compose_skill_load(&[content], &[], "pkg", &runtime)
+            .expect_err("trust policy refuses it");
+        assert!(error.contains("publisher"), "{error}");
     }
 }
