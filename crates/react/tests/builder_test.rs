@@ -351,6 +351,7 @@ fn test_react_with_request() {
         reasoning_effort: None,
         api_mode: react::llm::ApiMode::Chat,
         request_id: None,
+        intent: Default::default(),
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();

@@ -288,6 +288,13 @@ impl Runner {
             // restored BEFORE the shell starts the next turn from the queue.
             let mut terminal_event = None;
             {
+                // What this turn asks for, decided once from the reader's own
+                // words before the stream opens. The engine uses it for the
+                // action contract (one corrective retry when an actionable turn
+                // is answered with prose only) and reports it on the turn
+                // outcome; it is never serialized to the provider.
+                let intent = crate::intent::classify(input.as_text().unwrap_or_default());
+                agent.set_action_intent(intent);
                 let mut stream = agent.stream(input);
                 while let Some(item) = stream.next().await {
                     if stop_task.load(Ordering::SeqCst) {

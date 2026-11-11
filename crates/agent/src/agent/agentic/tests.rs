@@ -1234,6 +1234,262 @@ fn the_admitted_array_is_stable_across_registration_order() {
 }
 
 // =========================================================================
+// Action-first turns (issue #293)
+// =========================================================================
+
+/// One scripted model step.
+enum Step {
+    /// A prose reply with no tool call.
+    Text(&'static str),
+    /// One tool call.
+    Tool(&'static str, &'static str),
+}
+
+/// A model that plays a fixed script and records the user messages the engine
+/// appends, so a test can see the corrective action note rather than infer it.
+struct ActionLlm {
+    step: std::sync::atomic::AtomicUsize,
+    script: Vec<Step>,
+    seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+impl ActionLlm {
+    fn next(&self, session: &AgentSession) -> Option<&Step> {
+        self.seen.lock().unwrap().push(user_turns(session));
+        let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.script.get(step)
+    }
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for ActionLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        Ok(match self.next(session) {
+            Some(Step::Text(text)) => make_text_response((*text).to_string()),
+            Some(Step::Tool(name, args)) => make_tool_call_response(name, args),
+            None => make_text_response("Final Answer: script exhausted".to_string()),
+        })
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        let tokens: Vec<Result<StreamToken, LlmError>> = match self.next(session) {
+            Some(Step::Text(text)) => vec![
+                Ok(StreamToken::Text((*text).to_string())),
+                Ok(StreamToken::Done),
+            ],
+            Some(Step::Tool(name, args)) => vec![
+                Ok(StreamToken::ToolCall {
+                    name: (*name).to_string(),
+                    args: serde_json::from_str(args).unwrap_or(serde_json::json!({})),
+                    id: Some(format!(
+                        "action-{}",
+                        self.step.load(std::sync::atomic::Ordering::SeqCst)
+                    )),
+                }),
+                Ok(StreamToken::Done),
+            ],
+            None => vec![
+                Ok(StreamToken::Text("script exhausted".to_string())),
+                Ok(StreamToken::Done),
+            ],
+        };
+        Ok(Box::pin(futures::stream::iter(tokens)))
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "action-mock"
+    }
+}
+
+/// An agent with the scripted model and, when asked, one workspace-shaped tool.
+fn action_agent(
+    script: Vec<Step>,
+    with_tool: bool,
+) -> (Agent, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(ActionLlm {
+            step: std::sync::atomic::AtomicUsize::new(0),
+            script,
+            seen: seen.clone(),
+        }),
+    );
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    if with_tool {
+        agent.add_tool(Arc::new(FunctionTool::new(
+            "read_file",
+            "read a file",
+            serde_json::json!({"type": "object"}),
+            |_args| Ok(serde_json::json!({"content": "ok"})),
+        )));
+    }
+    (agent, seen)
+}
+
+/// How many action notes the LAST model call saw in its session.
+///
+/// The mock records the session at every call, so this reads what the engine
+/// actually sent rather than the post-run transcript.
+fn action_notes(seen: &Arc<std::sync::Mutex<Vec<Vec<String>>>>) -> usize {
+    seen.lock()
+        .unwrap()
+        .last()
+        .map(|turns| {
+            turns
+                .iter()
+                .filter(|text| text.as_str() == react::engine::ACTION_NOTE)
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// An actionable turn answered with prose only is sent back to work once: the
+/// next step calls a tool, and the turn ends with the work done.
+#[tokio::test]
+async fn an_action_turn_is_sent_back_to_work_after_a_prose_only_reply() {
+    let (agent, seen) = action_agent(
+        vec![
+            Step::Text("Here is how I would fix it: open the file and change the guard."),
+            Step::Tool("read_file", "{}"),
+            Step::Text("Final Answer: fixed the guard and read the file to verify."),
+        ],
+        true,
+    );
+    agent.set_action_intent(ActionIntent::Action);
+    let answer = agent
+        .react("fix the failing guard")
+        .await
+        .expect("the turn");
+
+    assert!(
+        answer.contains("fixed the guard"),
+        "the real answer closes the turn: {answer}"
+    );
+    assert_eq!(
+        action_notes(&seen),
+        1,
+        "the engine asked once for work, not a plan"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        3,
+        "step two acts, step three reports"
+    );
+}
+
+/// The nudge is spent once: a model that keeps explaining is allowed to close
+/// the turn with its second answer rather than looping.
+#[tokio::test]
+async fn the_action_nudge_is_spent_once() {
+    let (agent, seen) = action_agent(
+        vec![
+            Step::Text("I would start by reading the parser."),
+            Step::Text("Final Answer: still a plan."),
+            Step::Text("Final Answer: never reached."),
+        ],
+        true,
+    );
+    agent.set_action_intent(ActionIntent::Action);
+    let answer = agent.react("fix the parser").await.expect("the turn");
+
+    assert!(
+        answer.contains("still a plan"),
+        "the second answer closes the turn: {answer}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2, "one retry, not a loop");
+    assert_eq!(action_notes(&seen), 1, "the note was sent exactly once");
+}
+
+/// An explanation turn never pays for the action policy: prose is the
+/// deliverable, so a talk-only reply is the answer.
+#[tokio::test]
+async fn an_explanation_turn_is_not_nudged() {
+    let (agent, seen) = action_agent(vec![Step::Text("Final Answer: it works by caching.")], true);
+    agent.set_action_intent(ActionIntent::Explanation);
+    let answer = agent
+        .react("explain how the cache works")
+        .await
+        .expect("the turn");
+
+    assert!(answer.contains("caching"), "{answer}");
+    assert_eq!(action_notes(&seen), 0);
+    assert_eq!(seen.lock().unwrap().len(), 1, "one request, no retry");
+}
+
+/// A turn with no callable workspace tool cannot act, so the engine does not
+/// spend a retry asking it to.
+#[tokio::test]
+async fn an_action_turn_without_tools_is_not_nudged() {
+    let (agent, seen) = action_agent(
+        vec![Step::Text("Final Answer: no tool is available.")],
+        false,
+    );
+    agent.set_action_intent(ActionIntent::Action);
+    let answer = agent.react("fix the guard").await.expect("the turn");
+
+    assert!(answer.contains("no tool is available"), "{answer}");
+    assert_eq!(action_notes(&seen), 0);
+}
+
+/// A reply that ends in a question is the contract's "ask once when the request
+/// is too vague" arm, not a dodge.
+#[tokio::test]
+async fn a_question_reply_to_an_action_turn_is_not_nudged() {
+    let (agent, seen) = action_agent(vec![Step::Text("Which file should I change?")], true);
+    agent.set_action_intent(ActionIntent::Action);
+    let answer = agent.react("make it better").await.expect("the turn");
+
+    assert!(answer.contains("Which file"), "{answer}");
+    assert_eq!(action_notes(&seen), 0);
+}
+
+/// The streaming path applies the same contract: a prose-only step is held open
+/// with the note, and the next step's tool call runs.
+#[tokio::test]
+async fn an_action_turn_is_sent_back_to_work_on_the_streaming_path() {
+    use futures::StreamExt;
+
+    let (agent, seen) = action_agent(
+        vec![
+            Step::Text("I would inspect the file first."),
+            Step::Tool("read_file", "{}"),
+            Step::Text("Final Answer: inspected it."),
+        ],
+        true,
+    );
+    agent.set_action_intent(ActionIntent::Action);
+
+    let mut stream = agent.stream("fix the guard");
+    let mut answer = String::new();
+    while let Some(item) = stream.next().await {
+        if let Ok(StreamToken::Text(text)) = item {
+            answer.push_str(&text);
+        }
+    }
+    assert!(answer.contains("inspected it"), "{answer}");
+    assert_eq!(action_notes(&seen), 1);
+    assert_eq!(seen.lock().unwrap().len(), 3);
+}
+
+// =========================================================================
 // Deferred tools end to end
 // =========================================================================
 

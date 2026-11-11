@@ -1191,6 +1191,7 @@ mod tests {
             reasoning_effort: Some(crate::llm::ReasoningEffort::High),
             api_mode: crate::llm::ApiMode::Responses,
             request_id: None,
+            intent: Default::default(),
         };
 
         let built = build_request(None, &req, &session, &context, false);

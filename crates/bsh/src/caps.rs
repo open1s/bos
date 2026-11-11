@@ -828,6 +828,16 @@ fn build_agent_for_session_inner(
     // empty persona under `complete` falls back to the default composition,
     // because an empty system prompt is never what a persona meant.
     let persona_complete = eff.persona_complete && !eff.llm_system_prompt().trim().is_empty();
+    // A complete persona is the reference's escape hatch: the configured text
+    // is the WHOLE prompt, so the harness identity, the workflow contract and
+    // every per-tool section are omitted. That materially changes whether the
+    // model acts before it talks, so it is named in the log instead of being
+    // inferred later from a talk-only turn.
+    if persona_complete {
+        log::warn!(
+            "persona complete: the configured persona replaces the BSH execution contract for session {session}; the workflow rules and tool guidance are omitted"
+        );
+    }
     let mut config = AgentConfig {
         name: "bsh".to_string(),
         model,
@@ -1735,6 +1745,11 @@ fn build_agent_for_session_inner(
             "skills": agent.all_skills().len(),
             "schema_chars": schema_chars,
             "withheld_chars": withheld_chars,
+            // Which contract this build actually carries: a diagnostics pane
+            // can tell a talk-only turn caused by a complete persona from one
+            // caused by the model, the tools or the provider.
+            "persona_complete": persona_complete,
+            "workflow_contract": !persona_complete,
             "capabilities": snapshot
                 .as_ref()
                 .map_or(0, |snapshot| snapshot.capabilities.len()),

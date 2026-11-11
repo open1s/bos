@@ -218,6 +218,37 @@ impl Content {
     }
 }
 
+/// What the reader asked the agent to deliver, as the host classified it.
+///
+/// A turn's DELIVERABLE and its METHOD are different questions. "Why does the
+/// build fail?" delivers an explanation, but in an active workspace it is
+/// produced by inspecting the code and running the failing command; a
+/// conceptual question is produced by answering. The host classifies the
+/// request (see BSH's `intent` module) and the engine uses the answer to
+/// notice a prose-only reply that dodged an actionable turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionIntent {
+    /// A change or investigation in the workspace: gather evidence first.
+    Action,
+    /// An explanation or conceptual question: prose is the deliverable.
+    Explanation,
+    /// The host did not classify the turn, so the engine applies no policy.
+    #[default]
+    Unknown,
+}
+
+impl ActionIntent {
+    /// The wire/debug name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Action => "action",
+            Self::Explanation => "explanation",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Callback invoked with each streamed chunk of text, when one is installed.
 pub type ChunkCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -804,6 +835,13 @@ pub struct LlmRequest {
     /// observation and the `http.exchange` for the same send can be joined.
     #[serde(skip)]
     pub request_id: Option<String>,
+    /// What the host classified this request as asking for.
+    ///
+    /// Not serialized: the provider never sees it. The engine uses it to decide
+    /// whether a prose-only reply answers the turn or dodges it (see
+    /// [`ActionIntent`]).
+    #[serde(skip)]
+    pub intent: ActionIntent,
 }
 
 /// Selects the protocol used for a single LLM request.
@@ -884,6 +922,7 @@ impl LlmRequest {
             reasoning_effort: None,
             api_mode: ApiMode::Chat,
             request_id: None,
+            intent: ActionIntent::Unknown,
         }
     }
 

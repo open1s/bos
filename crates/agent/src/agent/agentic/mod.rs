@@ -23,7 +23,7 @@ use react::llm::vendor::{
     AnthropicVendor, DeepSeekVendor, LlmRouter, NvidiaVendor, OpenAiClient, OpenRouterVendor,
 };
 use react::llm::{
-    Content, LlmError as ReactLlmError, LlmResponse as ReactLlmResponse,
+    ActionIntent, Content, LlmError as ReactLlmError, LlmResponse as ReactLlmResponse,
     TokenStream as ReactTokenStream, TokenStream,
 };
 use react::tool::registry::{AsyncTool, ToolVariant};
@@ -271,6 +271,14 @@ pub struct Agent {
     /// archived: a host sets it from its own context resolution.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     context_budget: usize,
+    /// What the host classified the current turn as asking for.
+    ///
+    /// Interior mutability because the runner holds the built agent as an
+    /// `Arc` and classifies the reader's message at send time, after the
+    /// build. The engine reads it through `LlmRequest::intent` and applies the
+    /// action contract; `Unknown` leaves the behaviour unchanged.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    action_intent: std::sync::Mutex<ActionIntent>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     llm: Arc<LlmProvider>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
@@ -395,6 +403,7 @@ impl Agent {
         Self {
             config,
             context_budget: 0,
+            action_intent: std::sync::Mutex::new(ActionIntent::Unknown),
             llm,
             registry: Some(Arc::new(ToolRegistry::new())),
             registry_view: Arc::new(std::sync::RwLock::new(None)),
@@ -476,6 +485,27 @@ impl Agent {
             llm.register_fallback(provider.model.clone(), vendor);
         }
         Self::new(config, Arc::new(llm))
+    }
+
+    /// Classify the current turn for the engine's action contract.
+    ///
+    /// The host calls this at send time, after the build, so the same agent
+    /// can serve an explanation turn and an implementation turn. `Action`
+    /// lets the engine spend one directed retry when a reply answers with
+    /// prose and no tool ran; `Explanation` and `Unknown` apply no policy.
+    /// The classification is never serialized to the provider.
+    pub fn set_action_intent(&self, intent: ActionIntent) {
+        if let Ok(mut slot) = self.action_intent.lock() {
+            *slot = intent;
+        }
+    }
+
+    /// The intent currently applied to a turn; `Unknown` applies no policy.
+    pub fn action_intent(&self) -> ActionIntent {
+        self.action_intent
+            .lock()
+            .map(|intent| *intent)
+            .unwrap_or_default()
     }
 
     /// Set the send-side history ceiling for mid-turn compaction.
@@ -1967,6 +1997,7 @@ impl Clone for Agent {
         Self {
             config: self.config.clone(),
             context_budget: self.context_budget,
+            action_intent: std::sync::Mutex::new(self.action_intent()),
             llm: self.llm.clone(),
             registry: self.registry.clone(),
             registry_view: Arc::clone(&self.registry_view),

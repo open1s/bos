@@ -571,6 +571,9 @@ impl Agent {
                 .as_deref()
                 .map(react::llm::ReasoningEffort::from_name),
             api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
+            // What the host classified this turn as: the engine applies the
+            // action contract from it, and never sends it to the provider.
+            intent: self.action_intent(),
             ..Default::default()
         };
 
@@ -981,6 +984,7 @@ impl Agent {
                     .as_deref()
                     .map(react::llm::ReasoningEffort::from_name),
                 api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
+                intent: self.action_intent(),
                 ..Default::default()
             };
 

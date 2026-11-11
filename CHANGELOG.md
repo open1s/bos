@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **Action-first coding turns** (issue #293): the workflow contract now
+  separates the requested deliverable from the method that produces it - a
+  repository-specific "why does X fail?" gathers evidence with tools before it
+  explains - and carries an explicit route for diagnose, fix/implement, review
+  and explain/teach, with the first move for concrete coding work being a tool
+  call rather than a narration. The runtime enforces the contract: BSH
+  classifies each turn's ask (`crates/bsh/src/intent.rs`, bilingual, lexical,
+  leading 400 characters) into action/explanation/unknown, the engine reads it
+  from `LlmRequest::intent` and spends ONE corrective retry (`ACTION_NOTE`)
+  when an action turn is answered with prose and no tool ran - skipped when no
+  acting tool is available or the reply asks the reader a question, and never
+  applied to explanation turns. Each turn closes with
+  `TelemetryEvent::TurnOutcome` (intent, tools available, tool calls, first
+  tool step, requests, whether the retry was spent, answer bytes) and a
+  `turn outcome:` log line. A `complete: true` persona now logs a warning and
+  publishes `persona_complete`/`workflow_contract` on `instruction.build`,
+  so a talk-only turn caused by the configuration is identifiable. Behaviour is
+  covered by scripted-provider tests for the blocking and streaming paths,
+  including the negative cases (explanation turns, no tools, a question reply,
+  one-retry bound). Documented in `docs/bsh-prompts.md` sections 4 and 9.
+
 - **Bounded initial tool schemas** (issue #292): the tool array a request
   starts with is now accounted under one explicit per-turn budget instead of
   being assembled separately from the `find_tool` discovery budget. A new

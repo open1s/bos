@@ -25,5 +25,7 @@ pub use crate::skills::{SkillContent, SkillError, SkillLoader, SkillMetadata};
 pub use crate::tools::bash::BashExecutionResult;
 pub use crate::tools::{AsyncFunctionTool, AsyncTool, BashTool, Tool, ToolRegistry};
 pub use react::llm::vendor::OpenAiVendor;
-pub use react::llm::{LlmClient, LlmMessage, LlmRequest, LlmResponse, OpenAiMessage, StreamToken};
+pub use react::llm::{
+    ActionIntent, LlmClient, LlmMessage, LlmRequest, LlmResponse, OpenAiMessage, StreamToken,
+};
 pub use react::{CircuitBreakerConfig, RateLimiterConfig};

@@ -31,6 +31,7 @@ pub(crate) mod history;
 pub(crate) mod i18n;
 pub(crate) mod installed;
 pub(crate) mod instructions;
+pub(crate) mod intent;
 pub(crate) mod market;
 pub(crate) mod mcp;
 pub(crate) mod model;

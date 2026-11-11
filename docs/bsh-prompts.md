@@ -21,8 +21,10 @@ A prompt cannot enumerate every case, and a list of virtues ("infer the goal",
 "think briefly", "be careful") does not change a choice. The strategy here is a
 decision procedure with five questions, in the order a turn runs:
 
-1. **What is being asked?** Judge the verb, not the punctuation: a question, a
-   defect report, an instruction, or a goal with no target.
+1. **What is being asked, and what does answering it require?** Separate the
+   deliverable from the method: a question, a defect report, an instruction, or
+   a goal with no target - and, for a repository question, the evidence the
+   answer has to be built from.
 2. **Is it concrete enough to act on?** Name the object, the change and the
    done condition. If neither the request nor the workspace supplies them, the
    request is too vague; ask, do not guess.
@@ -171,8 +173,11 @@ it should have. Three failure modes:
 - **No concreteness gate.** "Ask when vague" was a feeling; nothing defined
   vague, so a request like "make it better" had no decision attached to it.
 
-The current contract is 2,485 bytes: 17% shorter than that revision, with the
-concreteness gate and stop condition it lacked. Design rules for a clause:
+The contract that replaced it was 2,485 bytes: 17% shorter than that revision,
+with the concreteness gate and stop condition it lacked. It is 3,555 bytes now:
+the decision procedure plus a 1,070-byte `## Route` section and the reworded
+first-move rules (section 9 records why those bytes are bought). Design rules
+for a clause:
 
 1. It must name a choice or a contrast ("A question ends without an edit"),
    never a virtue ("Be careful", "Think deeply").
@@ -191,14 +196,15 @@ concreteness gate and stop condition it lacked. Design rules for a clause:
 
 | Decision | Clause | Why it is there |
 |---|---|---|
-| What kind of request is this? | "Judge the verb, not the punctuation: 'why does X fail?' asks for an explanation, 'can you fix X?' asks for a change. A defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target ('make it faster') is measured before it is changed." | The four readings that most often pick the wrong first action. |
+| What kind of request is this? | "Separate the deliverable from the method: 'why does X fail?' delivers an explanation, but in this workspace it is produced from evidence - inspect the relevant files, logs and failing command before you explain. ..." | The four readings that most often pick the wrong first action, and the method each one needs. |
+| Does answering require the workspace? | "Diagnose: inspect ... then explain the cause with that evidence." / "Explain or teach: answer directly. Open the workspace only when the question is about this repository's code or behavior." | Forces evidence for a repository question without forcing tools on a concept. |
 | Is it concrete enough? | "Name the object (what file, screen or behavior), the change (what about it) and the done condition (what proves it) before you act. If the request and the workspace cannot supply them, it is too vague to act on: ask one short question, in the reader's terms, that offers the two or three readings you can see, best first, and says what you will do by default; then stop." | Vagueness is missing information, not a tone; the question must be answerable in one line, with options. |
 | What shape does the answer take? | "A question ends without an edit; a change request ends with the change made, not instructions for making it." | The two symmetric failures: editing on a question, and explaining instead of doing. |
 | Which instruction wins? | "When instructions conflict, obey the reader's latest explicit instruction, then a correction they accepted, then workspace instructions and loaded skills, then this contract." | A general rule never overrides a specific request; a correction outranks the original, and a skill ranks with the workspace. |
 | Act or ask? | "If the request is concrete but two readings remain, take the one that acts on the workspace when a wrong guess is cheap to undo; ask when it would delete, publish or spend something the reader owns, or when a wrong guess means substantial rework." | Cheap ambiguity should not cost a turn; destructive or wasteful ambiguity should not be guessed. |
 | When is a question allowed? | "Never ask for a fact the workspace can answer, and never ask twice for what the session already authorized." | Removes the two question classes that waste the reader's time. |
 | What does a later message mean? | "A later message corrects the current task; it replaces the task only when it cancels it or asks for something incompatible." | Steering, not silent replacement. |
-| How does work start? | "Start now once the request is concrete: batch independent calls, and never spend a turn narrating the next step." | The narration failure costs a whole turn; the concreteness gate comes first. |
+| How does work start? | "Make the first move a tool call when the request is concrete coding work: inspect, run or edit before you describe what you plan to do. Batch independent calls, and never spend a turn narrating the next step or restating the request." | The narration failure costs a whole turn; the concreteness gate comes first, and the first move is the tool call rather than a plan. |
 | How large is a change? | "Read before you edit; make the smallest change that satisfies the request; follow the workspace's existing patterns." | Convention drift and scope creep are the common review rejections. |
 | How is done proved? | "Prove it with the command that checks it, or say what you could not check. After two identical failures, stop and report the error and what must change in the environment." | Evidence closes the turn; a retry loop is not progress, and a repeated failure is usually an environment fact. |
 | When does the turn end? | "Stop when the request is answered or the change is verified. Do not refactor, commit, push or open a pull request unless asked." | The stop condition the first revision lacked. |
@@ -243,17 +249,18 @@ per-request cost. Bytes:
 
 | Layer | Bytes |
 |---|---|
-| `DEFAULT_SYSTEM_PROMPT` (identity + persona + contract) | 2,627 |
+| `DEFAULT_SYSTEM_PROMPT` (identity + persona + contract) | 3,697 |
 | `HARNESS_CONTEXT` | 1,421 |
 | Tool sections (bare build) | 5,690 |
-| Built prompt | 9,738 |
+| Built prompt | 10,808 |
 
 The sed tool's section adds 547 bytes (545 of guidance plus its separator) to
 both rows, on top of the 2026-11-09 measurement.
 
-The first contract revision measured 3,001 bytes and a 9,909-byte built prompt;
-this one is 17% shorter in the contract and 7.2% shorter overall, with the
-concreteness gate, precedence, question and stop rules it lacked.
+The first contract revision measured 3,001 bytes and a 9,909-byte built prompt.
+The decision-procedure revision before the routing rules was 2,485 bytes and
+9,738 built; the routing rules and first-move wording add 1,070 bytes in both
+rows, which the 12,000-byte cap still accommodates with ~1.2 KB of headroom.
 
 `the_system_prompt_stays_within_its_budget` in `crates/bsh/src/caps.rs` caps
 the built prompt at 12,000 bytes; `the_framework_prompt_stays_small` caps the
@@ -345,10 +352,12 @@ call or the reply, before any correction from the reader.
 
 | Reader message | Context | First move | Clause that decides it |
 |---|---|---|---|
-| "why does login fail?" | repo open | read the auth path and answer; no edit | Judge the verb; a question ends without an edit |
+| "why does login fail?" | repo open | read the auth path, run the failing command, explain the cause with that evidence; no edit | Separate the deliverable from the method; the diagnose route |
 | "login is broken" | repo open | reproduce, fix, verify | A defect report is reproduced, fixed and verified |
 | "can you fix the retry?" | repo open | read the call site, change it, test it | "can you fix X?" asks for a change |
 | "make it faster" | no metric | measure or profile first, then change | A goal with no target is measured first |
+| "fix the failing test" | repo open | inspect the failing test, edit, run it, report the result | Fix route; the first move is a tool call |
+| "explain how the cache works" | repo open | answer directly from general knowledge; open the cache file only if the question is about this implementation | Explain route; no unnecessary workspace calls |
 | "make it better" | file open | ask: faster, simpler or more correct, and which screen or file; offer those options, best first | Name the object, change and done condition before acting |
 | "fix the app" | no file, no symptom | ask which screen and what happened; do not open a random file | Too vague to act on; ask, do not guess |
 | "fix this" + button screenshot | app | ask: bug report or code change? | Product context: a screenshot is evidence, not a task |
@@ -379,7 +388,50 @@ final answer is right: the reader paid for the wrong step.
 6. If a clause was copied from a reference, record the exact source here. If it
    states a BSH fact, say which fact and where it is enforced.
 
-## 9. Sources
+## 9. Action-first execution
+
+The contract says what to do; the runtime notices when a turn that should have
+acted only talked. Three pieces, plus the configuration diagnostic:
+
+**Intent classification.** `crates/bsh/src/intent.rs` classifies the reader's
+ask deterministically, before the stream opens, into `Action`, `Explanation` or
+`Unknown`. It reads the leading 400 characters only and uses ordered rules: an
+explicit explanation ask wins; a diagnostic question with a defect word is
+action; an imperative change verb is action. It never calls a model, reads the
+workspace, or reaches the provider - it only decides whether the engine may
+spend a retry.
+
+**One corrective retry.** `LlmRequest::intent` carries the classification to
+the engine. When the first reply to an `Action` turn is prose and no tool ran,
+the engine appends `ACTION_NOTE` to the session and runs one more step. The
+retry is bounded: it is spent once per turn, it is skipped when the request
+carries no tools that can act (the skill loaders do not count), and it is
+skipped when the reply ends in a question, because the contract allows one
+short question for a vague request. An `Explanation` or `Unknown` turn is
+never nudged.
+
+**Turn-outcome telemetry.** `TelemetryEvent::TurnOutcome` closes every turn
+that reaches an answer (an aborted or errored turn reports through the error
+path) with counts only: the intent, how many definitions were available, how many
+tool calls ran, the step of the first call, the number of requests, whether the
+retry was spent, and the answer's byte length. The log line
+`turn outcome: turn=... intent=... tool_calls=... first_tool_step=...` is what
+distinguishes prompt interpretation from a missing tool, a preset problem or an
+execution failure.
+
+**Complete-persona diagnostics.** A persona with `complete: true` replaces the
+whole prompt, so the workflow contract and the per-tool rules are absent. The
+build logs a warning naming the session and publishes `persona_complete` /
+`workflow_contract` on `instruction.build`, so a talk-only turn can be
+attributed to the configuration rather than guessed at. The UI does not yet
+draw a badge for this state; the log and the build event are the surface.
+
+Residual gap, stated rather than implied: the intent classifier is a lexical
+heuristic, not a model. A request phrased without any listed verb classifies as
+`Unknown` and keeps the prompt's behaviour only; the retry improves the first
+move without guaranteeing that the tool succeeds.
+
+## 10. Sources
 
 - Codex: `openai/codex`, `codex-rs/core/prompt.md` and
   `gpt_5_codex_prompt.md`; measured from the desktop build's base

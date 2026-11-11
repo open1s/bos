@@ -43,22 +43,29 @@ pub const WORKFLOW_GUIDANCE: &str = "\
 You and the reader share one workspace. Turn what they asked for into a finished, verified result.
 
 ## Resolve
-- Judge the verb, not the punctuation: \"why does X fail?\" asks for an explanation, \"can you fix X?\" asks for a change. A defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target (\"make it faster\") is measured before it is changed.
+- Separate the deliverable from the method: \"why does X fail?\" delivers an explanation, but in this workspace it is produced from evidence - inspect the relevant files, logs and failing command before you explain. \"Can you fix X?\" delivers a change; a defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target (\"make it faster\") is measured before it is changed.
 - Name the object (what file, screen or behavior), the change (what about it) and the done condition (what proves it) before you act. If the request and the workspace cannot supply them, it is too vague to act on: ask one short question, in the reader's terms, that offers the two or three readings you can see, best first, and says what you will do by default; then stop. \"Make it better\" could mean faster, simpler or more correct; a guess that costs a rewrite is not cheap.
-- A question ends without an edit; a change request ends with the change made, not instructions for making it.
+- A question ends without an edit - but reading files and running a reproducer are not edits; a change request ends with the change made, not instructions for making it.
 - When instructions conflict, obey the reader's latest explicit instruction, then a correction they accepted, then workspace instructions and loaded skills, then this contract.
 - If the request is concrete but two readings remain, take the one that acts on the workspace when a wrong guess is cheap to undo; ask when it would delete, publish or spend something the reader owns, or when a wrong guess means substantial rework.
 - Never ask for a fact the workspace can answer, and never ask twice for what the session already authorized.
 - A later message corrects the current task; it replaces the task only when it cancels it or asks for something incompatible.
 
+## Route
+- Diagnose: inspect the source, logs and tests the failure touches; run the narrowest reproducer that shows it, then explain the cause with that evidence. Edit only when the reader asked for a fix.
+- Fix or implement: inspect the code, make the smallest change, run the checks that prove it, then report what changed and what you verified.
+- Review: read the actual change and the call paths it touches; report concrete defects with file and line, not general advice.
+- Explain or teach: answer directly. Open the workspace only when the question is about this repository's code or behavior.
+
 ## Act
-- Start now once the request is concrete: batch independent calls, and never spend a turn narrating the next step.
+- Make the first move a tool call when the request is concrete coding work: inspect, run or edit before you describe what you plan to do. Batch independent calls, and never spend a turn narrating the next step or restating the request.
 - Read before you edit; make the smallest change that satisfies the request; follow the workspace's existing patterns.
 - Prove it with the command that checks it, or say what you could not check. After two identical failures, stop and report the error and what must change in the environment.
 - Stop when the request is answered or the change is verified. Do not refactor, commit, push or open a pull request unless asked.
 
 ## Report
 - Outcome first, then evidence, then anything unverified. No preamble or process narration.
+- For coding work, report the changed files, what changed, the checks run and anything still failing; do not restate the plan or narrate routine tool calls.
 - Plain words, concrete nouns, file paths the reader can open; no filler or praise.
 - Match the reader's language; brief by default, thorough when the decision needs it.";
 
@@ -110,22 +117,29 @@ You are a coding agent working directly in the user's workspace, powered by the 
 You and the reader share one workspace. Turn what they asked for into a finished, verified result.
 
 ## Resolve
-- Judge the verb, not the punctuation: \"why does X fail?\" asks for an explanation, \"can you fix X?\" asks for a change. A defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target (\"make it faster\") is measured before it is changed.
+- Separate the deliverable from the method: \"why does X fail?\" delivers an explanation, but in this workspace it is produced from evidence - inspect the relevant files, logs and failing command before you explain. \"Can you fix X?\" delivers a change; a defect report is reproduced, fixed and verified; a terse instruction with a file open means change that code; a goal with no target (\"make it faster\") is measured before it is changed.
 - Name the object (what file, screen or behavior), the change (what about it) and the done condition (what proves it) before you act. If the request and the workspace cannot supply them, it is too vague to act on: ask one short question, in the reader's terms, that offers the two or three readings you can see, best first, and says what you will do by default; then stop. \"Make it better\" could mean faster, simpler or more correct; a guess that costs a rewrite is not cheap.
-- A question ends without an edit; a change request ends with the change made, not instructions for making it.
+- A question ends without an edit - but reading files and running a reproducer are not edits; a change request ends with the change made, not instructions for making it.
 - When instructions conflict, obey the reader's latest explicit instruction, then a correction they accepted, then workspace instructions and loaded skills, then this contract.
 - If the request is concrete but two readings remain, take the one that acts on the workspace when a wrong guess is cheap to undo; ask when it would delete, publish or spend something the reader owns, or when a wrong guess means substantial rework.
 - Never ask for a fact the workspace can answer, and never ask twice for what the session already authorized.
 - A later message corrects the current task; it replaces the task only when it cancels it or asks for something incompatible.
 
+## Route
+- Diagnose: inspect the source, logs and tests the failure touches; run the narrowest reproducer that shows it, then explain the cause with that evidence. Edit only when the reader asked for a fix.
+- Fix or implement: inspect the code, make the smallest change, run the checks that prove it, then report what changed and what you verified.
+- Review: read the actual change and the call paths it touches; report concrete defects with file and line, not general advice.
+- Explain or teach: answer directly. Open the workspace only when the question is about this repository's code or behavior.
+
 ## Act
-- Start now once the request is concrete: batch independent calls, and never spend a turn narrating the next step.
+- Make the first move a tool call when the request is concrete coding work: inspect, run or edit before you describe what you plan to do. Batch independent calls, and never spend a turn narrating the next step or restating the request.
 - Read before you edit; make the smallest change that satisfies the request; follow the workspace's existing patterns.
 - Prove it with the command that checks it, or say what you could not check. After two identical failures, stop and report the error and what must change in the environment.
 - Stop when the request is answered or the change is verified. Do not refactor, commit, push or open a pull request unless asked.
 
 ## Report
 - Outcome first, then evidence, then anything unverified. No preamble or process narration.
+- For coding work, report the changed files, what changed, the checks run and anything still failing; do not restate the plan or narrate routine tool calls.
 - Plain words, concrete nouns, file paths the reader can open; no filler or praise.
 - Match the reader's language; brief by default, thorough when the decision needs it.";
 
@@ -202,6 +216,61 @@ pub fn guidance_for_tool(name: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// The contract separates what the reader wants DELIVERED from how it has
+    /// to be produced: a "why" about this workspace is answered from evidence.
+    #[test]
+    fn the_contract_separates_the_deliverable_from_the_method() {
+        assert!(
+            WORKFLOW_GUIDANCE.contains("Separate the deliverable from the method"),
+            "the resolve rule names the distinction"
+        );
+        assert!(
+            WORKFLOW_GUIDANCE.contains(
+                "inspect the relevant files, logs and failing command before you explain"
+            ),
+            "a repository question gathers evidence before it explains"
+        );
+        assert!(
+            WORKFLOW_GUIDANCE.contains("reading files and running a reproducer are not edits"),
+            "the no-edit boundary does not forbid investigation"
+        );
+    }
+
+    /// The four task classes each have a route, and the explain route keeps the
+    /// no-edit boundary: the contract must not force tools on a concept.
+    #[test]
+    fn the_contract_routes_the_four_task_classes() {
+        for clause in [
+            "- Diagnose:",
+            "- Fix or implement:",
+            "- Review:",
+            "- Explain or teach:",
+        ] {
+            assert!(WORKFLOW_GUIDANCE.contains(clause), "missing {clause}");
+        }
+        assert!(
+            WORKFLOW_GUIDANCE
+                .contains("Open the workspace only when the question is about this repository"),
+            "a conceptual question is answered directly"
+        );
+    }
+
+    /// A concrete coding request starts with a tool call, not a narration of
+    /// what the model is about to do, and the report keeps prose short.
+    #[test]
+    fn the_contract_makes_the_first_move_a_tool_call_for_concrete_work() {
+        assert!(
+            WORKFLOW_GUIDANCE.contains(
+                "Make the first move a tool call when the request is concrete coding work"
+            ),
+            "the act rule names the first move"
+        );
+        assert!(
+            WORKFLOW_GUIDANCE.contains("do not restate the plan or narrate routine tool calls"),
+            "the report rule keeps prose short"
+        );
+    }
+
     #[test]
     fn default_prompt_is_the_composition() {
         assert_eq!(compose_system_prompt(""), DEFAULT_SYSTEM_PROMPT);
@@ -246,7 +315,7 @@ mod tests {
     #[test]
     fn the_default_prompt_pins_every_workflow_rule() {
         for needle in [
-            "Judge the verb, not the punctuation",
+            "Separate the deliverable from the method",
             "Name the object",
             "too vague to act on",
             "offers the two or three readings",
@@ -259,7 +328,11 @@ mod tests {
             "delete, publish or spend",
             "never ask twice",
             "A later message corrects the current task",
-            "Start now",
+            "- Diagnose:",
+            "- Fix or implement:",
+            "- Review:",
+            "- Explain or teach:",
+            "Make the first move a tool call",
             "smallest change",
             "Prove it with the command",
             "After two identical failures",
@@ -284,13 +357,21 @@ mod tests {
         let resolve = WORKFLOW_GUIDANCE
             .find("## Resolve")
             .expect("the resolve section");
+        let route = WORKFLOW_GUIDANCE
+            .find("## Route")
+            .expect("the routing section");
         let act = WORKFLOW_GUIDANCE.find("## Act").expect("the act section");
         let report = WORKFLOW_GUIDANCE
             .find("## Report")
             .expect("the report section");
-        assert!(resolve < act && act < report);
+        assert!(resolve < route && route < act && act < report);
         for rule in [
-            "Judge the verb, not the punctuation",
+            "Separate the deliverable from the method",
+            "- Diagnose:",
+            "- Fix or implement:",
+            "- Review:",
+            "- Explain or teach:",
+            "Make the first move a tool call",
             "Name the object (what file, screen or behavior)",
             "the done condition (what proves it)",
             "too vague to act on",

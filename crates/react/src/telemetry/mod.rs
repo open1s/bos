@@ -4,6 +4,7 @@ mod composition;
 
 pub use composition::RequestComposition;
 
+use crate::llm::ActionIntent;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -78,6 +79,29 @@ pub enum TelemetryEvent {
         schema_spent_bytes: usize,
         /// The turn's schema budget; zero when the budget is off.
         schema_limit_bytes: usize,
+    },
+    /// One turn closed, with the action-versus-talk facts.
+    ///
+    /// The counts answer the question a prompt review cannot: did an ACTION
+    /// turn act before it talked, and did an EXPLANATION turn pay for tools it
+    /// did not need? No text, arguments or prompts are recorded.
+    TurnOutcome {
+        /// The turn that closed.
+        turn: u64,
+        /// The host's classification of the request.
+        intent: ActionIntent,
+        /// Callable definitions the request carried.
+        tools_available: usize,
+        /// Tool calls the turn ran; zero is a talk-only turn.
+        tool_calls: usize,
+        /// The step (1-based request) that ran the first tool call.
+        first_tool_step: Option<usize>,
+        /// Requests the turn spent.
+        steps: usize,
+        /// Whether the engine had to ask an ACTION turn to act.
+        action_nudged: bool,
+        /// Bytes of the final answer.
+        answer_bytes: usize,
     },
     /// One tool call selected from the model's live array.
     ///
@@ -173,6 +197,30 @@ impl Telemetry {
                         composition.input_bytes,
                         schema_spent_bytes,
                         schema_limit_bytes
+                    );
+                }
+                TelemetryEvent::TurnOutcome {
+                    turn,
+                    intent,
+                    tools_available,
+                    tool_calls,
+                    first_tool_step,
+                    steps,
+                    action_nudged,
+                    answer_bytes,
+                } => {
+                    log::info!(
+                        "turn outcome: turn={} intent={} tools={} tool_calls={} first_tool_step={} steps={} nudged={} answer_bytes={}",
+                        turn,
+                        intent.as_str(),
+                        tools_available,
+                        tool_calls,
+                        first_tool_step
+                            .map(|step| step.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        steps,
+                        action_nudged,
+                        answer_bytes
                     );
                 }
                 TelemetryEvent::ToolSelection {

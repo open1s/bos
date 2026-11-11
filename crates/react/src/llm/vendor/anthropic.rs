@@ -736,6 +736,7 @@ mod tests {
             reasoning_effort: None,
             api_mode: ApiMode::Anthropic,
             request_id: None,
+            intent: Default::default(),
         }
     }
 

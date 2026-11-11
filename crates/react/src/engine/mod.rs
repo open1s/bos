@@ -2,7 +2,9 @@
 
 use crate::llm::types::{load_skill_tool, ReactContext, ReactSession};
 use crate::llm::vendor::responses::{ResponsesContentPart, ResponsesItem};
-use crate::llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, StreamToken};
+use crate::llm::{
+    ActionIntent, LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, StreamToken,
+};
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::runtime::{HookDecision, ReActApp};
 use crate::telemetry::{Telemetry, TelemetryEvent, TokenBudgetReport, TokenCounter, TokenUsage};
@@ -83,6 +85,16 @@ fn cut_short(max_tokens: Option<u32>, completion_tokens: Option<u32>) -> bool {
         _ => false,
     }
 }
+
+/// What the model is told when it answers an ACTION turn with prose only.
+///
+/// A concrete coding request has one deliverable: the work. A reply that
+/// describes what should be done instead of doing it is not a smaller answer,
+/// it is a different one, and the reader has to ask again. The engine spends
+/// one directed retry to turn that reply into a first tool call; the note names
+/// what a first step looks like and keeps the honest escape for a genuine
+/// blocker.
+pub const ACTION_NOTE: &str = "This request asks for work in the workspace, and no tool has run this turn. Do not answer with instructions, a plan or a promise. Call the tools now - inspect the relevant files, run the failing command, make the change - then report what you did and what you verified. If you genuinely cannot act, say what blocks you; never claim work you did not do.";
 
 /// What the model is told when the same tool failure repeats three times.
 ///
@@ -315,6 +327,87 @@ fn emit_request_composition<S: ReactSession, C: ReactContext>(
     });
 }
 
+/// Whether a prose-only step dodged an ACTION turn.
+///
+/// Only the host's classification makes a turn "actionable": the engine does not
+/// parse the reader's words, so a conceptual question that the host labelled
+/// `Explanation` never pays for a nudge. Two escapes are deliberate:
+///
+/// - a turn with no callable tools cannot act, and asking it to is noise;
+/// - a reply that ends in a question is the contract's own "ask once when the
+///   request is too vague" arm, not a dodge.
+fn action_reply_dodges<C: ReactContext>(
+    intent: ActionIntent,
+    context: &C,
+    closing: bool,
+    nudged: bool,
+    text: &str,
+) -> bool {
+    intent == ActionIntent::Action
+        && !closing
+        && !nudged
+        // The skill helpers are not workspace tools: an agent carrying only
+        // them cannot inspect or change anything, so the retry would be noise.
+        && context.tools().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.name != "load_skill" && tool.name != "find_skill")
+        })
+        && !text.trim().is_empty()
+        && !text.trim_end().ends_with('?')
+        && !text.trim_end().ends_with('？')
+}
+
+/// The action facts one turn accumulates for its closing telemetry event.
+struct TurnTrace {
+    intent: ActionIntent,
+    tools_available: usize,
+    tool_calls: usize,
+    first_tool_step: Option<usize>,
+    action_nudged: bool,
+}
+
+impl TurnTrace {
+    fn new<C: ReactContext>(intent: ActionIntent, context: &C) -> Self {
+        Self {
+            intent,
+            tools_available: context.tools().map_or(0, |tools| tools.len()),
+            tool_calls: 0,
+            first_tool_step: None,
+            action_nudged: false,
+        }
+    }
+
+    /// Record one executed tool call at its 1-based step.
+    fn note_tool_call(&mut self, step: usize) {
+        self.tool_calls = self.tool_calls.saturating_add(1);
+        if self.first_tool_step.is_none() {
+            self.first_tool_step = Some(step);
+        }
+    }
+}
+
+/// Report how a turn closed: did an action turn act, and did an explanation
+/// turn avoid paying for tools it did not need.
+fn emit_turn_outcome(
+    telemetry: &Telemetry,
+    turn: u64,
+    trace: &TurnTrace,
+    steps: usize,
+    answer: &str,
+) {
+    telemetry.emit(&TelemetryEvent::TurnOutcome {
+        turn,
+        intent: trace.intent,
+        tools_available: trace.tools_available,
+        tool_calls: trace.tool_calls,
+        first_tool_step: trace.first_tool_step,
+        steps,
+        action_nudged: trace.action_nudged,
+        answer_bytes: answer.len(),
+    });
+}
+
 /// What one discovery did to the live tool array.
 struct SchemaReveal {
     /// The model-facing note when anything was refused.
@@ -487,6 +580,10 @@ impl<A: ReActApp> ReActEngine<A> {
         // TRUNCATED_NOTE); a turn that only ever thinks stays bounded.
         let mut truncations = 0usize;
         let mut repeated = RepeatedFailure::default();
+        // What the host said this turn asks for, and what the turn actually
+        // did: reported when it closes and used to notice a talk-only action
+        // turn before it is accepted as an answer.
+        let mut trace = TurnTrace::new(request.intent, &*context);
         'turn: loop {
             if self.max_steps.is_some_and(|bound| steps >= bound) {
                 if closing {
@@ -626,6 +723,9 @@ impl<A: ReActApp> ReActEngine<A> {
 
                                 hook_names.insert(call_id.clone(), hook_name);
                                 batch.push((name, call_id, args));
+                            }
+                            for _ in 0..batch.len() {
+                                trace.note_tool_call(steps);
                             }
 
                             // The calls of one response do not depend on each
@@ -811,6 +911,22 @@ impl<A: ReActApp> ReActEngine<A> {
                             session.push(LlmMessage::user_text(TRUNCATED_NOTE));
                             continue 'turn;
                         }
+                        // An ACTION turn answered with prose only has not done
+                        // the work yet: spend one directed retry before the
+                        // reply is accepted as the answer.
+                        if !found_tool_call
+                            && action_reply_dodges(
+                                request.intent,
+                                &*context,
+                                closing,
+                                trace.action_nudged,
+                                &thought,
+                            )
+                        {
+                            trace.action_nudged = true;
+                            session.push(LlmMessage::user_text(ACTION_NOTE));
+                            continue 'turn;
+                        }
                         if finish.is_some() && finish != Some("tool_calls") {
                             if !recorded {
                                 session.push(LlmMessage::assistant(thought.clone()));
@@ -822,6 +938,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 turn,
                                 answer: thought.clone(),
                             });
+                            emit_turn_outcome(&self.telemetry, turn, &trace, steps, &thought);
                             return Ok(thought);
                         }
                         if !found_tool_call {
@@ -835,6 +952,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 turn,
                                 answer: thought.clone(),
                             });
+                            emit_turn_outcome(&self.telemetry, turn, &trace, steps, &thought);
                             return Ok(thought);
                         }
                     }
@@ -1022,6 +1140,20 @@ impl<A: ReActApp> ReActEngine<A> {
                             self.react_app.on_thought(&thought, session, context).await;
                             session.push(LlmMessage::assistant(thought.clone()));
                         }
+                        // The same action contract the OpenAI arm applies:
+                        // one directed retry when an actionable turn came back
+                        // as prose only.
+                        if action_reply_dodges(
+                            request.intent,
+                            &*context,
+                            closing,
+                            trace.action_nudged,
+                            &thought,
+                        ) {
+                            trace.action_nudged = true;
+                            session.push(LlmMessage::user_text(ACTION_NOTE));
+                            continue 'turn;
+                        }
                         self.react_app
                             .on_final_answer(&thought, session, context)
                             .await;
@@ -1029,6 +1161,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             turn,
                             answer: thought.clone(),
                         });
+                        emit_turn_outcome(&self.telemetry, turn, &trace, steps, &thought);
                         return Ok(thought);
                     }
                 }
@@ -1043,6 +1176,7 @@ impl<A: ReActApp> ReActEngine<A> {
             turn,
             answer: thought.clone(),
         });
+        emit_turn_outcome(&self.telemetry, turn, &trace, steps, &thought);
         Ok(thought)
     }
 
@@ -1112,6 +1246,7 @@ impl<A: ReActApp> ReActEngine<A> {
 
             context.add_tool(load_skill_tool());
             price_initial_tools(&mut self.schema_budget, &*context);
+            let mut trace = TurnTrace::new(request.intent, &*context);
 
             loop {
                 if self.stop_flag.load(Ordering::SeqCst) {
@@ -1221,6 +1356,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 continue;
                             }
                             saw_tool_call = true;
+                            trace.note_tool_call(steps);
                             // Keep the words that introduced the call: the
                             // transcript is the model's own context, so a dropped
                             // preamble is context it has to rebuild on the next
@@ -1444,11 +1580,25 @@ impl<A: ReActApp> ReActEngine<A> {
                     if self.react_app.has_pending_step_input() {
                         continue;
                     }
+                    // An ACTION turn answered with prose only has not done the
+                    // work yet: spend one directed retry before closing.
+                    if action_reply_dodges(
+                        request.intent,
+                        &*context,
+                        closing,
+                        trace.action_nudged,
+                        &full_response,
+                    ) {
+                        trace.action_nudged = true;
+                        session.push(LlmMessage::user_text(ACTION_NOTE));
+                        continue;
+                    }
                     self.react_app.on_final_answer(&full_response, session, context).await;
                     self.telemetry.emit(&TelemetryEvent::FinalAnswer {
                         turn,
                         answer: full_response.clone(),
                     });
+                    emit_turn_outcome(&self.telemetry, turn, &trace, steps, &full_response);
                     yield Ok(StreamToken::Done);
                     break;
                 }
