@@ -22,6 +22,8 @@ use wasmtime::component::{bindgen, Component, HasSelf, Linker};
 use wasmtime::{
     Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline,
 };
+use wasmtime_wasi::p2::add_to_linker_sync as add_wasi_to_linker;
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use ferris_core::capability::{CallScope, Capability, GrantScope, PolicyEngine};
@@ -196,6 +198,34 @@ struct HostState {
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
     progress: Option<tokio::sync::mpsc::Sender<Value>>,
+    /// WASI preview 2 state. Clock and random are available to a guest that
+    /// imports the standard interfaces; the filesystem and environment are
+    /// empty, no socket permission is granted, and stdin is closed. The host's
+    /// own imports remain the only route to the workspace and network.
+    wasi: WasiCtx,
+    table: wasmtime::component::ResourceTable,
+}
+
+impl WasiView for HostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+/// The WASI context every guest gets: clock and random, inherited stdout and
+/// stderr, no stdin, an empty filesystem and environment, and no socket
+/// permission.
+fn wasi_context() -> (WasiCtx, wasmtime::component::ResourceTable) {
+    (
+        WasiCtxBuilder::new()
+            .inherit_stdout()
+            .inherit_stderr()
+            .build(),
+        wasmtime::component::ResourceTable::new(),
+    )
 }
 
 /// Map a guest-reported host error back onto the platform error.
@@ -1042,6 +1072,7 @@ impl WasmRuntime {
             .memory_size((self.resources.memory_mb() * 1024 * 1024) as usize)
             .table_elements(self.resources.table_elements() as usize)
             .build();
+        let (wasi, table) = wasi_context();
         let state = HostState {
             extension: self.extension.clone(),
             trust: self.trust,
@@ -1061,6 +1092,8 @@ impl WasmRuntime {
             deadline: Instant::now() + Duration::from_millis(self.resources.execution_ms()),
             cancelled: Arc::clone(&self.cancelled),
             progress: None,
+            wasi,
+            table,
         };
         let mut store = Store::new(engine, state);
         store.limiter(|state| &mut state.limits);
@@ -1084,6 +1117,10 @@ impl WasmRuntime {
         });
         store.set_epoch_deadline(1);
         let mut linker = Linker::new(engine);
+        add_wasi_to_linker(&mut linker).map_err(|error| ExtensionError::Runtime {
+            extension: self.extension.to_string(),
+            message: format!("the WASI preview 2 interfaces do not link: {error}"),
+        })?;
         BshExtension::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state).map_err(
             |error| ExtensionError::Runtime {
                 extension: self.extension.to_string(),
@@ -1744,6 +1781,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// A component that imports a standard WASI interface resolves against
+    /// the host: clock and random come from the linker, not a guest-side shim.
+    /// The set is the one `add_to_linker_sync` provides: an empty filesystem
+    /// and environment, and no socket permission.
+    #[test]
+    fn a_component_links_wasi_preview2() {
+        let workspace = scratch("wasi");
+        let mut store = Store::new(engine(), host_state(&workspace, &[]));
+        let mut linker = Linker::new(engine());
+        add_wasi_to_linker(&mut linker).expect("the WASI interfaces link");
+        let wat = r#"
+            (component
+              (import "wasi:random/random@0.2.0"
+                (instance (export "get-random-u64" (func (result u64)))))
+            )
+        "#;
+        let component = Component::new(engine(), wat).expect("the fixture component parses");
+        linker
+            .instantiate(&mut store, &component)
+            .expect("the WASI import resolves");
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     fn host_state(workspace: &Path, grants: &[(Capability, GrantScope)]) -> HostState {
         let id = ExtensionId::parse("com.example.wasm-host").expect("id");
         let policy = PolicyEngine::open(
@@ -1776,6 +1836,8 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(5),
             cancelled: Arc::new(AtomicBool::new(false)),
             progress: None,
+            wasi: wasi_context().0,
+            table: wasi_context().1,
         }
     }
 

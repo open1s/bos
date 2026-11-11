@@ -180,6 +180,12 @@ startup values are on-startup, on-demand, on-workspace-open and manual. The defa
 is on-demand. runtime.config is opaque to the manifest parser and validated by the
 runtime adapter.
 
+A `wasm-component` guest also gets WASI preview 2's standard **clock and random**
+interfaces, so `std::time` and `getrandom` work without the host bridge. Its
+stdout/stderr are inherited. The filesystem, environment, sockets and stdin are
+not provided, and no socket permission is granted: workspace and network
+access stay behind the `bsh:extension/host` imports and their capability checks.
+
 ### 3.5 Capabilities
 
 Capabilities are required-only declarations. Declaring a capability does not grant
@@ -395,8 +401,11 @@ second contract and an existing component still loads. Only the `extism` and
 Scope of the coverage, stated rather than implied:
 
 - An MCP **tool call** is a tool call: it arrives at `tool.before`/`tool.after`
-  with a namespaced `tool_name`. The MCP **wire** (initialize, tools/list, the
-  JSON-RPC frames) is not observed yet.
+  with a namespaced `tool_name`. When the MCP gateway is in use (more than 12
+  tools on one turn), the observed call is the gateway itself — `tool_name = "mcp"`
+  and `tool_args` carries `{server, tool, arguments}` — so the inner call is
+  visible in the envelope rather than as its own pair. The MCP **wire**
+  (initialize, tools/list, the JSON-RPC frames) is not observed yet.
 - Network activity is observed where the host mediates it: LLM vendors, the
   extism/process HTTP bridge, and anything that goes through the tap. A shell
   command's own sockets are outside the host and are not visible.

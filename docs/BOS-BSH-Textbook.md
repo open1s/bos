@@ -1725,9 +1725,16 @@ Limits: `max_memory_mb` via StoreLimits, `max_execution_ms` via fuel/epoch,
 call; a pure-compute guest may run to its fuel deadline because the host cannot
 set an epoch while the synchronous store is held.
 
-A WASM package cannot receive observe hooks in this build. It can still *cause*
-`http.exchange` by calling `fetch`; an Extism observer can consume that.
-Declaring `contributes.hooks` on a WASM package is refused at validation.
+WASI preview 2 supplies the standard clock and random interfaces, plus inherited
+stdout/stderr, so `std::time` and `getrandom` work. stdin, the filesystem and
+the environment are not provided, and no socket permission is granted; the
+`bsh:extension/host` imports remain the only route to the workspace and the
+network.
+
+A wasm component may declare `contributes.hooks` (with `hooks.observe`); the
+host delivers each batch through `on-event` as an event with
+`event-type = "hook"` and the `{point, batch}` payload. It can also *cause*
+`http.exchange` by calling `fetch`; an observer can consume that.
 
 ## 11.5 WASM checklist
 
@@ -1742,8 +1749,9 @@ Declaring `contributes.hooks` on a WASM package is refused at validation.
 # 12. The Extism runtime
 
 Extism is the pragmatic plugin runtime: many languages, a small host bridge,
-and — uniquely in this build — the ability to receive observe hooks. The price
-is a JSON bridge with a specific envelope, and WASI disabled.
+and observe hooks (the wasm-component runtime receives the same batches through
+`on-event`). The price is a JSON bridge with a specific envelope, and WASI
+disabled.
 
 ## 12.1 Exports
 
