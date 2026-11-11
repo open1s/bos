@@ -123,6 +123,11 @@ impl SchemaBudget {
         self.per_tool
     }
 
+    /// Whether discovery revealed this tool in the current turn.
+    pub fn was_revealed(&self, name: &str) -> bool {
+        self.revealed.contains_key(name)
+    }
+
     /// Account one definition, or refuse it.
     ///
     /// Re-accounting the same name with the SAME revision is idempotent and

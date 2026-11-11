@@ -38,6 +38,8 @@ pub enum TelemetryEvent {
     },
     /// The run produced a final answer.
     FinalAnswer {
+        /// The turn this answer closes.
+        turn: u64,
         /// The final answer text.
         answer: String,
     },
@@ -46,6 +48,8 @@ pub enum TelemetryEvent {
     /// Counts only: the query text, tool arguments and results are not
     /// recorded here, which is the privacy default for this evaluation loop.
     ToolDiscovery {
+        /// The turn this discovery belongs to.
+        turn: u64,
         /// Definitions the result offered.
         candidates: usize,
         /// Definitions added to the next request.
@@ -54,6 +58,19 @@ pub enum TelemetryEvent {
         rejected: usize,
         /// Cumulative schema bytes spent this turn.
         spent_bytes: usize,
+    },
+    /// One tool call selected from the model's live array.
+    ///
+    /// `discovered` distinguishes a tool that entered through find_tool from
+    /// one that was advertised from the start, which is the selection signal
+    /// the effectiveness loop correlates with the turn's discovery events.
+    ToolSelection {
+        /// The turn this selection belongs to.
+        turn: u64,
+        /// The tool the model called.
+        tool: String,
+        /// Whether the schema was revealed by discovery this turn.
+        discovered: bool,
     },
 }
 
@@ -92,21 +109,35 @@ impl Telemetry {
                 } => {
                     log::debug!("Tool: {} input={} output={}", tool, input, output);
                 }
-                TelemetryEvent::FinalAnswer { answer } => {
-                    log::debug!("Final answer: {}", answer);
+                TelemetryEvent::FinalAnswer { turn, answer } => {
+                    log::debug!("Final answer: turn={}, {}", turn, answer);
                 }
                 TelemetryEvent::ToolDiscovery {
+                    turn,
                     candidates,
                     revealed,
                     rejected,
                     spent_bytes,
                 } => {
                     log::debug!(
-                        "Tool discovery: candidates={}, revealed={}, rejected={}, spent={} bytes",
+                        "Tool discovery: turn={}, candidates={}, revealed={}, rejected={}, spent={} bytes",
+                        turn,
                         candidates,
                         revealed,
                         rejected,
                         spent_bytes
+                    );
+                }
+                TelemetryEvent::ToolSelection {
+                    turn,
+                    tool,
+                    discovered,
+                } => {
+                    log::debug!(
+                        "Tool selection: turn={}, tool={}, discovered={}",
+                        turn,
+                        tool,
+                        discovered
                     );
                 }
             }
@@ -117,6 +148,182 @@ impl Telemetry {
 impl Default for Telemetry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Aggregate figures for the tool-selection lifecycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolEffectivenessReport {
+    /// Distinct turns observed.
+    pub turns: usize,
+    /// Turns that reached a final answer.
+    pub completed_turns: usize,
+    /// Discovery calls.
+    pub discoveries: usize,
+    /// Candidate definitions offered across discoveries.
+    pub candidates: usize,
+    /// Definitions added to a request.
+    pub revealed: usize,
+    /// Definitions refused by the schema budget.
+    pub rejected: usize,
+    /// Tool calls made.
+    pub selections: usize,
+    /// Tool calls whose tool was revealed by discovery this turn.
+    pub discovered_selections: usize,
+    /// Cumulative schema bytes spent.
+    pub schema_bytes: usize,
+}
+
+impl ToolEffectivenessReport {
+    /// Share of selections that used a discovered tool. Zero when nothing was
+    /// called.
+    pub fn discovery_use_rate(&self) -> f64 {
+        if self.selections == 0 {
+            0.0
+        } else {
+            self.discovered_selections as f64 / self.selections as f64
+        }
+    }
+
+    /// Share of offered definitions that were refused by the budget.
+    pub fn rejection_rate(&self) -> f64 {
+        let offered = self.revealed + self.rejected;
+        if offered == 0 {
+            0.0
+        } else {
+            self.rejected as f64 / offered as f64
+        }
+    }
+
+    /// Mean candidates per discovery.
+    pub fn mean_candidates(&self) -> f64 {
+        if self.discoveries == 0 {
+            0.0
+        } else {
+            self.candidates as f64 / self.discoveries as f64
+        }
+    }
+}
+
+/// Accumulates correlated tool events for one host.
+///
+/// The accumulator is fed the same `TelemetryEvent` stream the engine emits, so
+/// a host can build an offline report without parsing logs.
+#[derive(Debug, Clone, Default)]
+pub struct ToolEffectiveness {
+    turns: std::collections::BTreeSet<u64>,
+    completed_turns: usize,
+    discoveries: usize,
+    candidates: usize,
+    revealed: usize,
+    rejected: usize,
+    selections: usize,
+    discovered_selections: usize,
+    schema_bytes: usize,
+}
+
+impl ToolEffectiveness {
+    /// Record one event.
+    pub fn record(&mut self, event: &TelemetryEvent) {
+        match event {
+            TelemetryEvent::ToolDiscovery {
+                turn,
+                candidates,
+                revealed,
+                rejected,
+                spent_bytes,
+            } => {
+                self.turns.insert(*turn);
+                self.discoveries += 1;
+                self.candidates += candidates;
+                self.revealed += revealed;
+                self.rejected += rejected;
+                self.schema_bytes += spent_bytes;
+            }
+            TelemetryEvent::ToolSelection {
+                turn, discovered, ..
+            } => {
+                self.turns.insert(*turn);
+                self.selections += 1;
+                if *discovered {
+                    self.discovered_selections += 1;
+                }
+            }
+            TelemetryEvent::FinalAnswer { turn, .. } => {
+                self.turns.insert(*turn);
+                self.completed_turns += 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// The current report.
+    pub fn report(&self) -> ToolEffectivenessReport {
+        ToolEffectivenessReport {
+            turns: self.turns.len(),
+            completed_turns: self.completed_turns,
+            discoveries: self.discoveries,
+            candidates: self.candidates,
+            revealed: self.revealed,
+            rejected: self.rejected,
+            selections: self.selections,
+            discovered_selections: self.discovered_selections,
+            schema_bytes: self.schema_bytes,
+        }
+    }
+}
+
+#[cfg(test)]
+mod effectiveness_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_selection_and_outcome_correlate_by_turn() {
+        let mut effectiveness = ToolEffectiveness::default();
+        effectiveness.record(&TelemetryEvent::ToolDiscovery {
+            turn: 1,
+            candidates: 3,
+            revealed: 2,
+            rejected: 1,
+            spent_bytes: 1200,
+        });
+        effectiveness.record(&TelemetryEvent::ToolSelection {
+            turn: 1,
+            tool: "deploy".to_string(),
+            discovered: true,
+        });
+        effectiveness.record(&TelemetryEvent::ToolSelection {
+            turn: 1,
+            tool: "bash".to_string(),
+            discovered: false,
+        });
+        effectiveness.record(&TelemetryEvent::FinalAnswer {
+            turn: 1,
+            answer: "done".to_string(),
+        });
+        effectiveness.record(&TelemetryEvent::ToolDiscovery {
+            turn: 2,
+            candidates: 1,
+            revealed: 1,
+            rejected: 0,
+            spent_bytes: 200,
+        });
+        effectiveness.record(&TelemetryEvent::FinalAnswer {
+            turn: 2,
+            answer: "done".to_string(),
+        });
+
+        let report = effectiveness.report();
+        assert_eq!(report.turns, 2);
+        assert_eq!(report.completed_turns, 2);
+        assert_eq!(report.discoveries, 2);
+        assert_eq!(report.revealed, 3);
+        assert_eq!(report.rejected, 1);
+        assert_eq!(report.selections, 2);
+        assert_eq!(report.discovered_selections, 1);
+        assert!((report.discovery_use_rate() - 0.5).abs() < f64::EPSILON);
+        assert!((report.rejection_rate() - 0.25).abs() < f64::EPSILON);
+        assert!((report.mean_candidates() - 2.0).abs() < f64::EPSILON);
     }
 }
 

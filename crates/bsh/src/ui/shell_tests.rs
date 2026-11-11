@@ -34136,24 +34136,34 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
         button: gpui_kit::MouseButton::Left,
         click_count: 1,
     });
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let state = cx
-        .update(|_, cx| {
-            shell
-                .read(cx)
-                .state
-                .browser
-                .engine()
-                .expect("the engine is ready")
-                .evaluate(
-                    "JSON.stringify({selected: String(window.getSelection()), drags: window.__drag})",
-                )
-                .expect("the page selection reads")
-        })
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let state: serde_json::Value = serde_json::from_str(&state).expect("the selection JSON parses");
+    // The selection is applied asynchronously by the page; under a loaded
+    // suite a single 200ms read flakes even when the drag itself landed. Poll
+    // the page's own selection for a bounded window instead. The window is
+    // generous because the full suite runs this next to browser-heavy tests.
+    let mut state = serde_json::Value::Null;
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let raw = cx
+            .update(|_, cx| {
+                shell
+                    .read(cx)
+                    .state
+                    .browser
+                    .engine()
+                    .expect("the engine is ready")
+                    .evaluate(
+                        "JSON.stringify({selected: String(window.getSelection()), drags: window.__drag})",
+                    )
+                    .expect("the page selection reads")
+            })
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        state = serde_json::from_str(&raw).expect("the selection JSON parses");
+        if state["selected"].as_str().unwrap_or_default().contains("alpha") {
+            break;
+        }
+    }
     assert!(
         state["drags"].as_u64().unwrap_or(0) >= 1,
         "the page must see a move with the left button held: {state}"

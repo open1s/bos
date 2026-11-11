@@ -193,6 +193,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             resilience: self.resilience,
             schema_budget: self.schema_budget,
             tool_call_count: AtomicU64::new(0),
+            turn: AtomicU64::new(0),
             tool_time_nanos: AtomicU64::new(0),
             stop_flag: Arc::new(AtomicBool::new(false)),
             run_manager,

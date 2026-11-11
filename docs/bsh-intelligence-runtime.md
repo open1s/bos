@@ -97,23 +97,21 @@ fails the suite (run with `--nocapture` for the report):
 | #276 metadata-only indexing | implemented | index + lazy digest-checked load used by production load_skill; the cross-turn TTL cache was removed, so a loaded body is always the indexed revision |
 | #277 activation lifecycle | implemented | load_skill activates in the task-scoped runtime; idempotent; reset at each run; events exposed |
 | #278 dependency/conflict resolution | implemented | deterministic plan, cycles, optional omissions |
-| #279 provenance and trust | partial | provenance/digest refused when stale, source/publisher policy enforced before activation; adversarial prompt-injection proof remains |
-| #280 effectiveness telemetry | partial | runtime events exposed to the host, retrieval metrics and asserted corpora; no end-to-end task-success comparison |
-| #281 federated metadata | partial | descriptor merge, expiry, trust; no peer transport |
+| #279 provenance and trust | implemented | provenance/digest, source/publisher/user-only policy, stale and source-change invalidation, local-over-remote collisions, injection-style instructions proven inert |
+| #280 effectiveness telemetry | implemented | offline activation benchmark: with/without success rates, activation precision, no-Skill accuracy, retrieval P@3/R@3/MRR and instruction bytes |
+| #281 federated metadata | implemented | policy-scoped transport, expiry, duplicate/collision handling, withdrawal on refresh, unreachable peers, explicit trust grant and digest before remote load |
 | #282 end-to-end skill runtime | implemented | production load path plans, trusts, loads, activates, composes and clears per turn |
 | #283 bounded context composer | implemented | runtime composes dependency-first, deduplicated, budgeted instructions into one request-scoped instruction block; the tool result is an acknowledgement; block cleared on final answer and at the next run |
-| #284 hybrid tool retrieval | implemented | metadata contract + ranking; no golden-corpus report yet |
-| #285 capability-view routing | partial | discovery reads the live composed registry and reports capability id/version/provider; invocation context is already enforced by the shim |
+| #284 hybrid tool retrieval | implemented | metadata contract + ranking; asserted P@3/R@3/MRR corpus |
+| #285 capability-view routing | implemented | discovery reads the live composed registry, reports capability id/version/provider, and calls dispatch through the shim's workspace invocation boundary |
 | #286 cumulative schema budget | implemented | per-tool/per-turn, idempotent, explicit refusal note |
-| #287 tool effectiveness telemetry | partial | discovery counts emitted, measured retrieval corpus; selection/outcome correlation still missing |
+| #287 tool effectiveness telemetry | implemented | turn-correlated discovery, selection and final events; an accumulator reports discovery-use, rejection and candidate rates; retrieval corpora assert P@3/R@3/MRR |
 
-## Next seams
+## Operation
 
-1. Add an offline task-success harness that compares outcomes with and without
-   skill activation (#280).
-2. Pass the live composed registry to `find_tool` instead of the build-time
-   snapshot (#285).
-3. Extend the discovery counts event into turn-correlated selection and
-   outcome events, plus a benchmark report over the golden corpora
-   (#280/#287).
-4. Add a federation transport that exchanges only `RemoteSkill` descriptors.
+- `run_benchmark` is the repeatable task-outcome harness; it needs no model or
+  network.
+- `FederatedSkills::refresh` is the only remote metadata ingress; instruction
+  loading stays behind `authorize_instructions`.
+- Host loops subscribe to the engine's `TelemetryEvent` stream and feed
+  `ToolEffectiveness` for a turn-correlated report.

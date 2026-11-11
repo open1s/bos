@@ -246,6 +246,9 @@ pub struct ReActEngine<A: ReActApp> {
     /// of every run; discovery accounts each definition before it is added.
     schema_budget: SchemaBudget,
     tool_call_count: AtomicU64,
+    /// Sequence id for the current run, correlating discovery, selection and
+    /// outcome events for one turn.
+    turn: AtomicU64,
     tool_time_nanos: AtomicU64,
     stop_flag: Arc<AtomicBool>,
     run_manager: Arc<ToolRunManager>,
@@ -421,6 +424,7 @@ impl<A: ReActApp> ReActEngine<A> {
         mut request: LlmRequest,
         session: &mut A::Session,
         context: &mut A::Context,
+        turn: u64,
     ) -> Result<String, ReactError>
     where
         A::Session: ReactSession,
@@ -631,6 +635,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                             &mut self.schema_budget,
                                         );
                                         self.telemetry.emit(&TelemetryEvent::ToolDiscovery {
+                                            turn,
                                             candidates: reveal.candidates,
                                             revealed: reveal.revealed,
                                             rejected: reveal.rejected,
@@ -688,6 +693,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                         tool: observed.clone(),
                                         input: args.clone(),
                                         output: ret.clone(),
+                                    });
+                                    self.telemetry.emit(&TelemetryEvent::ToolSelection {
+                                        turn,
+                                        tool: observed.clone(),
+                                        discovered: self.schema_budget.was_revealed(&observed),
                                     });
 
                                     session.push(LlmMessage::AssistantToolCall {
@@ -760,6 +770,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 .on_final_answer(&thought, session, context)
                                 .await;
                             self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+                                turn,
                                 answer: thought.clone(),
                             });
                             return Ok(thought);
@@ -772,6 +783,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 .on_final_answer(&thought, session, context)
                                 .await;
                             self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+                                turn,
                                 answer: thought.clone(),
                             });
                             return Ok(thought);
@@ -852,6 +864,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                             &mut self.schema_budget,
                                         );
                                         self.telemetry.emit(&TelemetryEvent::ToolDiscovery {
+                                            turn,
                                             candidates: reveal.candidates,
                                             revealed: reveal.revealed,
                                             rejected: reveal.rejected,
@@ -907,6 +920,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                         input: args.clone(),
                                         output: ret.clone(),
                                     });
+                                    self.telemetry.emit(&TelemetryEvent::ToolSelection {
+                                        turn,
+                                        tool: observed.clone(),
+                                        discovered: self.schema_budget.was_revealed(&observed),
+                                    });
 
                                     session.push(LlmMessage::AssistantToolCall {
                                         tool_call_id: call_id.clone(),
@@ -959,6 +977,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             .on_final_answer(&thought, session, context)
                             .await;
                         self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+                            turn,
                             answer: thought.clone(),
                         });
                         return Ok(thought);
@@ -972,6 +991,7 @@ impl<A: ReActApp> ReActEngine<A> {
             .on_final_answer(&thought, session, context)
             .await;
         self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+            turn,
             answer: thought.clone(),
         });
         Ok(thought)
@@ -994,9 +1014,12 @@ impl<A: ReActApp> ReActEngine<A> {
 
         // Each turn gets a fresh cumulative schema budget.
         self.schema_budget.reset();
+        let turn = self.turn.fetch_add(1, Ordering::Relaxed) + 1;
         context.add_tool(load_skill_tool());
 
-        let result = self.react_loop(persona, request, session, context).await?;
+        let result = self
+            .react_loop(persona, request, session, context, turn)
+            .await?;
 
         Ok(result)
     }
@@ -1016,6 +1039,7 @@ impl<A: ReActApp> ReActEngine<A> {
         self.set_stop_flag(false);
         // Each turn gets a fresh cumulative schema budget.
         self.schema_budget.reset();
+        let turn = self.turn.fetch_add(1, Ordering::Relaxed) + 1;
 
         session.push(LlmMessage::user(request.input.clone()));
 
@@ -1204,6 +1228,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                         &mut self.schema_budget,
                                     );
                                     self.telemetry.emit(&TelemetryEvent::ToolDiscovery {
+                                        turn,
                                         candidates: reveal.candidates,
                                         revealed: reveal.revealed,
                                         rejected: reveal.rejected,
@@ -1254,6 +1279,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                         tool: observed.clone(),
                                         input: args.clone(),
                                         output: ret.clone(),
+                                    });
+                                    self.telemetry.emit(&TelemetryEvent::ToolSelection {
+                                        turn,
+                                        tool: observed.clone(),
+                                        discovered: self.schema_budget.was_revealed(&observed),
                                     });
                                     ret.to_string()
                                 }
@@ -1354,6 +1384,7 @@ impl<A: ReActApp> ReActEngine<A> {
                     }
                     self.react_app.on_final_answer(&full_response, session, context).await;
                     self.telemetry.emit(&TelemetryEvent::FinalAnswer {
+                        turn,
                         answer: full_response.clone(),
                     });
                     yield Ok(StreamToken::Done);

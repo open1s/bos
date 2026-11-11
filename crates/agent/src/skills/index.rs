@@ -42,6 +42,11 @@ impl SkillIndex {
         self.entries.insert(metadata.name.clone(), metadata);
     }
 
+    /// Remove one entry, returning it when it was present.
+    pub fn remove(&mut self, name: &str) -> Option<SkillMetadata> {
+        self.entries.remove(name)
+    }
+
     /// One entry by exact name.
     pub fn get(&self, name: &str) -> Option<&SkillMetadata> {
         self.entries.get(name)

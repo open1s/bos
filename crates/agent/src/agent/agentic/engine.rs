@@ -124,8 +124,15 @@ fn compose_skill_load(
         .lock()
         .map_err(|_| "skill runtime lock is poisoned".to_string())?;
     runtime.replace_index(index);
+    // The plan covers every Skill already active for this task plus the new
+    // selection. Planning from the new name alone would leave an earlier
+    // activation outside the plan while composition still included it.
+    let mut roots = runtime.active(SKILL_TASK);
+    roots.push(name.to_string());
+    roots.sort();
+    roots.dedup();
     let plan = runtime
-        .plan(SKILL_TASK, &[name.to_string()])
+        .plan(SKILL_TASK, &roots)
         .map_err(|error| error.to_string())?;
 
     for planned in &plan.order {
@@ -1239,6 +1246,43 @@ mod failure_tests {
         let error = super::compose_skill_load(&[app, base], &[], "app", &runtime)
             .expect_err("stale content is refused");
         assert!(error.contains("changed"), "{error}");
+    }
+
+
+    #[test]
+    fn loading_a_second_skill_keeps_the_first_in_the_plan() {
+        use crate::skills::{SkillIndex, SkillLimits, SkillRuntime};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_runtime_skill(dir.path(), "base", "BASE", "");
+        write_runtime_skill(
+            dir.path(),
+            "app",
+            "APP",
+            "dependencies:\n  - name: base\n",
+        );
+        let mut loader = crate::skills::SkillLoader::new(dir.path().to_path_buf());
+        loader.discover().expect("discover");
+        let app = loader.load("app").expect("app");
+        let base = loader.load("base").expect("base");
+        let runtime = Arc::new(Mutex::new(SkillRuntime::new(
+            Arc::new(SkillIndex::from_metadata(Vec::new())),
+            host_skill_policy(),
+            SkillLimits::default(),
+        )));
+
+        let first = super::compose_skill_load(&[app.clone(), base.clone()], &[], "app", &runtime)
+            .expect("first");
+        assert_eq!(first.skills, vec!["base", "app"]);
+
+        // Loading the dependency directly must not drop the earlier root or
+        // duplicate its body: the plan is recomputed over the active set.
+        let second =
+            super::compose_skill_load(&[app, base], &[], "base", &runtime).expect("second");
+        assert_eq!(second.skills, vec!["base", "app"]);
+        assert_eq!(second.text.matches("APP").count(), 1);
+        assert_eq!(second.text.matches("BASE").count(), 1);
     }
 
     #[test]

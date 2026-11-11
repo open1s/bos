@@ -11,6 +11,16 @@ pub mod session;
 /// Task-scoped Skill runtime: plan, activate, compose and observe.
 pub mod runtime;
 
+/// Offline Skill retrieval and activation benchmark.
+pub mod benchmark;
+
+/// Governed federated Skill metadata discovery.
+pub mod federation;
+
+pub use benchmark::{run_benchmark, BenchmarkCase, BenchmarkReport, CaseOutcome};
+pub use federation::{
+    FederatedSkills, FederationError, FederationPolicy, RefreshReport, SkillMetadataTransport,
+};
 pub use index::{
     SemanticError, SemanticIndex, SkillIndex, SkillLoadError, SkillMatch, SkillPermission,
     SkillPlan, SkillPlanError, TrustError, TrustPolicy,
