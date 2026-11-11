@@ -374,6 +374,20 @@ pub(crate) enum RightTab {
 }
 
 impl RightTab {
+    /// Parse the CLI spelling of a pane, for the launch deep link.
+    pub(crate) fn from_cli(name: &str) -> Option<Self> {
+        match name {
+            "files" => Some(Self::Files),
+            "terminal" => Some(Self::Terminal),
+            "diff" => Some(Self::Diff),
+            "browser" => Some(Self::Browser),
+            "extensions" | "plugins" => Some(Self::Extensions),
+            "federation" => Some(Self::Federation),
+            "tasks" => Some(Self::Tasks),
+            _ => None,
+        }
+    }
+
     /// The tab's label key in the string table.
     pub(crate) fn key(self) -> &'static str {
         match self {

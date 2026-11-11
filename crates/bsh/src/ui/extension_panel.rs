@@ -21,7 +21,7 @@ use gpui_kit::component::IndexPath;
 use gpui_kit::*;
 
 use crate::extension::host::PanelSurface;
-use crate::i18n::{tr, Lang};
+use crate::i18n::{tr, tr_args, Lang};
 use crate::theme;
 use ferris_sdk::host_runtime::CallContext;
 use ferris_sdk::types::ExtensionError;
@@ -30,7 +30,7 @@ use ferris_sdk::ui::{
     UiNode, UiSession,
 };
 
-use super::{icon, txt, IconName};
+use super::{hairline_bottom, icon, txt, IconName};
 
 /// The host palette with a panel's theme tokens layered over it.
 struct Palette {
@@ -148,6 +148,12 @@ pub(crate) struct ExtensionPanelView {
     /// Dropping this unsubscribes the picker, and a chosen row would then stop
     /// switching panels, so the view holds it for its whole life.
     picker_subscription: Option<Subscription>,
+    /// Whether the runtime's live card has been requested for this selection.
+    ///
+    /// A panel that ships a declared view shows it on the first frame, but that
+    /// view is a placeholder: the runtime may serve a live card for the same
+    /// panel, and it is fetched once per selection (and on Refresh).
+    attempted: bool,
     /// How the view finds a panel's surface in the current host generation.
     ///
     /// The surfaces a view is built with name the runtimes of the generation
@@ -185,6 +191,7 @@ impl ExtensionPanelView {
             lang,
             picker: None,
             picker_subscription: None,
+            attempted: false,
             surface_resolver: Arc::new(crate::extension::live_panel),
         };
         if let Some(panel) = view.panels.get(selected) {
@@ -211,6 +218,7 @@ impl ExtensionPanelView {
         self.error = None;
         self.message = None;
         self.loading = false;
+        self.attempted = false;
         self.panel_root = Some(self.panels[index].root.clone());
         let theme = self.panels[index].theme.as_ref();
         self.palette = Palette::new(theme);
@@ -273,8 +281,51 @@ impl ExtensionPanelView {
     }
 
     fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
-        if self.document.is_none() && !self.loading && self.error.is_none() {
+        if self.should_fetch() {
             self.load(cx);
+        }
+    }
+
+    /// Whether this frame should request the runtime's card.
+    ///
+    /// A declared view counts as a placeholder, not an answer: the live card is
+    /// still fetched once, so a package that ships both does not freeze on the
+    /// static copy.
+    fn should_fetch(&self) -> bool {
+        !self.attempted && !self.loading
+    }
+
+    /// Fetch the runtime's live card again.
+    ///
+    /// A panel's data (a capture store, a job list) moves after the first
+    /// frame; without this the only way to see new rows was to switch panels or
+    /// reopen the pane.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.loading {
+            return;
+        }
+        self.attempted = false;
+        self.error = None;
+        self.message = None;
+        self.load(cx);
+    }
+
+    /// Report a failed live fetch.
+    ///
+    /// A panel that ships a declared view keeps it on screen: a runtime without
+    /// a live card is a note under the declared view, not an empty pane. A
+    /// panel with nothing to show still reports the error where the card would
+    /// be.
+    fn live_failure(&mut self, error: String) {
+        if self.document.is_some() {
+            self.message = Some(tr_args(
+                self.lang,
+                "right.extensions.liveFailed",
+                &[("error", error)],
+            ));
+            self.error = None;
+        } else {
+            self.error = Some(error);
         }
     }
 
@@ -297,6 +348,7 @@ impl ExtensionPanelView {
             return;
         };
         self.loading = true;
+        self.attempted = true;
         self.error = None;
         self.message = None;
         let resolve = Arc::clone(&self.surface_resolver);
@@ -318,14 +370,15 @@ impl ExtensionPanelView {
                                 this.document = Some(session.document().clone());
                                 this.session = Some(session);
                                 this.error = None;
+                                this.message = None;
                             }
-                            Err(error) => this.error = Some(error.to_string()),
+                            Err(error) => this.live_failure(error.to_string()),
                         },
                         Err(error) => {
-                            this.error = Some(format!("panel document is not valid: {error}"))
+                            this.live_failure(format!("panel document is not valid: {error}"))
                         }
                     },
-                    Err(error) => this.error = Some(error.to_string()),
+                    Err(error) => this.live_failure(error.to_string()),
                 }
                 cx.notify();
             });
@@ -663,18 +716,22 @@ impl ExtensionPanelView {
                 list.into_any_element()
             }
             UiNode::Table { columns, rows } => {
-                let mut table = div().flex().flex_col().gap(px(2.0)).w_full();
-                let mut header = div().flex().flex_row().gap(px(8.0)).w_full();
+                // A table is a grid, not a wall of text: the header is quieter
+                // and every row is ruled off, so a twelve-row capture table can
+                // be read across without losing the row.
+                let mut table = div().flex().flex_col().w_full();
+                let mut header = div().flex().flex_row().gap(px(8.0)).w_full().pb(px(3.0));
                 for column in columns {
                     header = header.child(div().flex_1().child(txt(
                         column.clone(),
-                        12.0,
+                        11.0,
                         self.palette.muted,
                     )));
                 }
-                table = table.child(header);
+                table = table
+                    .child(hairline_bottom(header).border_color(rgb(self.palette.border_soft)));
                 for row in rows {
-                    let mut line = div().flex().flex_row().gap(px(8.0)).w_full();
+                    let mut line = div().flex().flex_row().gap(px(8.0)).w_full().py(px(3.0));
                     for cell in row {
                         line = line.child(div().flex_1().child(txt(
                             cell.clone(),
@@ -682,7 +739,8 @@ impl ExtensionPanelView {
                             self.palette.text,
                         )));
                     }
-                    table = table.child(line);
+                    table = table
+                        .child(hairline_bottom(line).border_color(rgb(self.palette.border_soft)));
                 }
                 table.into_any_element()
             }
@@ -779,8 +837,12 @@ impl ExtensionPanelView {
                 if !language.is_empty() {
                     code = code.child(txt(language.clone(), 11.0, self.palette.faint));
                 }
-                code.child(txt(value.clone(), 12.0, self.palette.text))
-                    .into_any_element()
+                code.child(
+                    txt(value.clone(), 11.5, self.palette.text)
+                        .font_family(theme::CODE_FONT)
+                        .line_height(px(16.0)),
+                )
+                .into_any_element()
             }
             UiNode::Image { src, alt } => {
                 if let Some(asset) = src.strip_prefix("asset/") {
@@ -932,13 +994,38 @@ impl Render for ExtensionPanelView {
                     ),
             );
         }
+        chooser = chooser.child(
+            Button::new("extension-panel-refresh")
+                .debug_selector(|| "extension-panel-refresh".to_string())
+                .accessibility_label(tr(self.lang, "right.extensions.refresh"))
+                .px(px(10.0))
+                .h(px(30.0))
+                .rounded(px(8.0))
+                .bg(rgb(self.palette.new_session_fill))
+                .border_1()
+                .border_color(rgb(self.palette.border_soft))
+                .child(txt(
+                    tr(self.lang, "right.extensions.refresh"),
+                    12.0,
+                    self.palette.text,
+                ))
+                .on_click(cx.listener(|this, _event, _window, cx| this.refresh(cx))),
+        );
         root = root.child(chooser);
         if self.loading {
-            root = root.child(txt("Loading panel…", 12.0, self.palette.muted));
+            root = root.child(txt(
+                tr(self.lang, "right.extensions.loading"),
+                12.0,
+                self.palette.muted,
+            ));
         }
         if let Some(error) = &self.error {
             root = root.child(txt(
-                format!("Panel error: {error}"),
+                tr_args(
+                    self.lang,
+                    "right.extensions.panelError",
+                    &[("error", error.clone())],
+                ),
                 12.0,
                 self.palette.error,
             ));
@@ -1146,6 +1233,55 @@ mod tests {
         assert_eq!(items[0].title().to_string(), "Greeting · right");
         assert_eq!(items[1].value(), &1);
         assert_eq!(items[1].title().to_string(), "Second · left");
+    }
+
+    /// A declared view must not stop the runtime's live card from loading: it
+    /// is the placeholder, not the answer. A package that ships both used to
+    /// freeze on the static copy and never show the live one.
+    #[test]
+    fn a_declared_view_still_fetches_the_live_card() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "revision": 1,
+            "root": {"type": "text", "text": "declared"}
+        }))
+        .expect("document");
+        let mut view = ExtensionPanelView::new(vec![panel(document)], Lang::En);
+        assert!(
+            view.document.is_some(),
+            "the declared view is shown at once"
+        );
+        assert!(view.should_fetch(), "and the live card is fetched next");
+        view.attempted = true;
+        assert!(!view.should_fetch(), "one fetch per selection");
+    }
+
+    /// A live card that fails must not blank a declared view; the note says why
+    /// while the declared content stays. A panel with nothing to show reports
+    /// the error instead, because an empty pane would hide the failure.
+    #[test]
+    fn a_failed_live_card_keeps_a_declared_view_on_screen() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "revision": 1,
+            "root": {"type": "text", "text": "declared"}
+        }))
+        .expect("document");
+        let mut view = ExtensionPanelView::new(vec![panel(document)], Lang::En);
+        view.live_failure("boom".to_string());
+        assert!(view.document.is_some());
+        assert!(view.error.is_none());
+        assert!(view
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("boom")));
+
+        let mut bare = ExtensionPanelView::new(vec![surface_with(Arc::new(Noop), None)], Lang::En);
+        bare.live_failure("boom".to_string());
+        assert!(bare
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("boom")));
     }
 
     /// A pane that outlived a host rebuild must ask the new runtime, not the

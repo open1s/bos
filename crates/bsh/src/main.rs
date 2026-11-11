@@ -102,7 +102,9 @@ fn main() {
     // --help is answered here so it works without opening a window.
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]] [--browser=URL] [--federation-profile=NAME]\n       bsh ext <command> [options]\n       bsh federation [--profile NAME] <command> [options]\n\n  --settings  open the settings dialog on launch\n  SECTION     a rail cell - account | vault | general | models | web-search |\n              extensions | agent-presets - or a hosted view: tools |\n              plugin-inventory | shell | agent-loop | mcp | archived-sessions |\n              workspaces | context | plugins | automation | policy | extensions\n              (default: account)\n  --browser   open the Browser pane on URL (http or https)
+            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]] [--panel=PANE] [--browser=URL] [--federation-profile=NAME]\n       bsh ext <command> [options]\n       bsh federation [--profile NAME] <command> [options]\n\n  --settings  open the settings dialog on launch\n  SECTION     a rail cell - account | vault | general | models | web-search |\n              extensions | agent-presets - or a hosted view: tools |\n              plugin-inventory | shell | agent-loop | mcp | archived-sessions |\n              workspaces | context | plugins | automation | policy | extensions\n              (default: account)\n  --panel     open a right-hand pane on launch: files | terminal | diff |
+              browser | extensions | federation | tasks
+  --browser   open the Browser pane on URL (http or https)
   --federation-profile NAME
               run this instance's federation node under NAME, so several BSH
               instances on one machine are several nodes\n  ext         run the extension developer CLI; bsh ext help for the commands

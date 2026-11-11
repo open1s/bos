@@ -251,6 +251,9 @@ pub(crate) struct Startup {
     /// Open the Browser pane on this URL. A deep link, so a reader (or a
     /// capture) can land on a page without typing into the address bar.
     pub(crate) browser: Option<String>,
+    /// Open this right-hand pane on launch. A deep link to a pane that would
+    /// otherwise need a click: an extension panel, a terminal, a diff.
+    pub(crate) panel: Option<String>,
 }
 
 impl Startup {
@@ -266,6 +269,11 @@ impl Startup {
                 let url = value.trim();
                 if !url.is_empty() {
                     startup.browser = Some(url.to_string());
+                }
+            } else if let Some(value) = arg.strip_prefix("--panel=") {
+                let name = value.trim();
+                if !name.is_empty() {
+                    startup.panel = Some(name.to_string());
                 }
             }
         }
@@ -363,6 +371,17 @@ pub(crate) fn run(startup: Startup) {
                             true
                         }
                     });
+                    if let Some(tab) = startup
+                        .panel
+                        .as_deref()
+                        .and_then(right_panel::RightTab::from_cli)
+                    {
+                        // The pane deep link: a capture (or a reader) lands on
+                        // the pane without clicking through the shell.
+                        shell.update(cx, |shell, cx| {
+                            shell.open_right_tab(tab, window, cx);
+                        });
+                    }
                     if let Some(url) = browser {
                         // The deep link lands on the pane it names, with the
                         // same navigation a press of Go performs.
