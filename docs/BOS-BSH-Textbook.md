@@ -2548,7 +2548,7 @@ Try each failure:
 
 1. `hooks = ["model.telepathy"]` → unknown point.
 2. `hooks = ["model.request", "model.request"]` → duplicate.
-3. `kind = "process"` + hooks → "delivered by the extism runtime".
+3. `kind = "process"` + hooks → "delivered by the extism runtime"; a `wasm-component` package receives the same batch through its `on-event` export as `event-type = "hook"`.
 4. valid hooks but no `hooks.observe` in `required` → capability error.
 5. `hooks.observe` in `optional` only → still an error; required is the rule.
 

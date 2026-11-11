@@ -13,7 +13,7 @@ builtin = []
 declarative = []
 process = []
 workflow = []
-wasm = ["dep:wasmtime"]
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 extism = ["dep:extism"]
 mcp = []
 cordis = []
@@ -41,3 +41,4 @@ extism = { version = "1.41.0", default-features = false, optional = true }
 wasmtime = { version = "50.0.1", default-features = false, features = [
     "component-model", "cranelift", "parallel-compilation", "runtime", "std", "wat"
 ], optional = true }
+wasmtime-wasi = { version = "50.0.1", optional = true }

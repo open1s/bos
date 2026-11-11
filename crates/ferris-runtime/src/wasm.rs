@@ -61,6 +61,54 @@ const EPOCH_TICK_MS: u64 = 10;
 
 /// The process-wide engine. Compiling it is expensive, so every extension
 /// shares one; per-extension limits live on its Store.
+/// The identity of a component file: path, modified time and size.
+type ComponentKey = (PathBuf, u64, u64);
+
+/// Compiled components, keyed by file identity.
+type ComponentCache = Mutex<BTreeMap<ComponentKey, Arc<Component>>>;
+
+/// Compiled components, keyed by file identity (path, mtime, size).
+///
+/// A host rebuild creates a new runtime per package; recompiling an unchanged
+/// component on every activation costs far more than the call itself. A file
+/// that changed on disk has a new key, so an upgrade recompiles instead of
+/// running stale code.
+fn components() -> &'static ComponentCache {
+    static COMPONENTS: OnceLock<ComponentCache> = OnceLock::new();
+    COMPONENTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// The compiled form of one component file, shared across runtimes.
+fn compiled(path: &Path) -> Result<Arc<Component>, wasmtime::Error> {
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or_default();
+    let key = (path.to_path_buf(), modified, metadata.len());
+    if let Ok(cache) = components().lock() {
+        if let Some(component) = cache.get(&key) {
+            return Ok(Arc::clone(component));
+        }
+    }
+    let component = Arc::new(Component::from_file(engine(), path)?);
+    if let Ok(mut cache) = components().lock() {
+        // The cache is a convenience, not an archive: a process that installs
+        // many versions should not hold every compiled body forever. Evict one
+        // entry rather than clearing, so a busy suite does not drop every
+        // warm component at once.
+        if cache.len() >= 32 {
+            if let Some(oldest) = cache.keys().next().cloned() {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(key, Arc::clone(&component));
+    }
+    Ok(component)
+}
+
 fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
@@ -985,12 +1033,11 @@ impl WasmRuntime {
             return Ok(());
         }
         let engine = engine();
-        let component = Component::from_file(engine, &self.component).map_err(|error| {
-            ExtensionError::Runtime {
-                extension: self.extension.to_string(),
-                message: error.to_string(),
-            }
+        let component = compiled(&self.component).map_err(|error| ExtensionError::Runtime {
+            extension: self.extension.to_string(),
+            message: error.to_string(),
         })?;
+        let component = component.as_ref();
         let limits = StoreLimitsBuilder::new()
             .memory_size((self.resources.memory_mb() * 1024 * 1024) as usize)
             .table_elements(self.resources.table_elements() as usize)
@@ -1044,7 +1091,7 @@ impl WasmRuntime {
             },
         )?;
         let bindings =
-            BshExtension::instantiate(&mut store, &component, &linker).map_err(|error| {
+            BshExtension::instantiate(&mut store, component, &linker).map_err(|error| {
                 ExtensionError::Runtime {
                     extension: self.extension.to_string(),
                     message: error.to_string(),
@@ -1486,6 +1533,48 @@ impl Runtime for WasmRuntime {
         })
     }
 
+    /// Deliver one observe-hook batch as a host event.
+    ///
+    /// The WIT world already has an event envelope and `on-event` export, so a
+    /// component observes hooks without a second contract: the batch arrives as
+    /// `event-type = "hook"` with the worker's `{point, batch}` payload. A
+    /// component that cannot take it reports a runtime error and the observe
+    /// worker logs it, exactly as an extism guest would.
+    async fn hook(&self, point: &str, payload: Value) -> Result<(), ExtensionError> {
+        off_worker(|| {
+            self.ensure_instance()?;
+            let mut guard = self.instance.lock().map_err(|_| ExtensionError::Corrupt {
+                path: self.component.clone(),
+                message: "wasm instance lock is poisoned".to_string(),
+            })?;
+            self.ensure_running()?;
+            let instance = guard.as_mut().expect("instance");
+            self.prepare_call(instance, self.resources.execution_ms())?;
+            let event = self::bsh::extension::types::Event {
+                id: format!("hook-{point}"),
+                source: "bsh".to_string(),
+                event_type: "hook".to_string(),
+                schema_version: "1.0".to_string(),
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as u64)
+                    .unwrap_or_default(),
+                correlation_id: None,
+                payload: payload.to_string(),
+            };
+            instance
+                .bindings
+                .bsh_extension_extension()
+                .call_on_event(&mut instance.store, &event)
+                .map_err(|error| ExtensionError::Runtime {
+                    extension: self.extension.to_string(),
+                    message: error.to_string(),
+                })?;
+            self.record_fuel(&instance.store);
+            Ok(())
+        })
+    }
+
     async fn pump(&self) -> Result<(), ExtensionError> {
         off_worker(|| {
             if self.stopped.load(Ordering::SeqCst) {
@@ -1597,6 +1686,61 @@ mod tests {
             runtime.instance.lock().expect("instance lock").is_none(),
             "post-shutdown entry points must not recreate the component"
         );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_compiled_component_is_reused_across_runtimes() {
+        // A private copy: another test compiling its own fixtures must not be
+        // able to evict this entry between the two calls.
+        let scratch = scratch("cache");
+        let path = scratch.join("extension.wasm");
+        std::fs::copy(example_root().join("wasm/extension.wasm"), &path).expect("copy");
+        let first = compiled(&path).expect("compiled");
+        let second = compiled(&path).expect("compiled");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the cache answers with the same compiled body"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn a_component_receives_observe_hooks_through_on_event() {
+        let root = example_root();
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
+        let scratch = scratch("hooks");
+        let policy = Arc::new(
+            PolicyEngine::open(
+                scratch.join("grants.toml"),
+                scratch.join("audit.jsonl"),
+                PolicyMode::Enforce,
+            )
+            .expect("policy"),
+        );
+        let runtime = WasmRuntime::new(
+            &manifest,
+            &root,
+            &scratch.join("data"),
+            policy,
+            EventBus::new(),
+            None,
+            "{}".to_string(),
+            TestTrust::Local,
+        )
+        .expect("runtime");
+        runtime
+            .hook(
+                "model.request",
+                serde_json::json!({"point": "model.request", "batch": []}),
+            )
+            .await
+            .expect("the guest's on-event accepts the hook envelope");
+        assert!(
+            runtime.fuel_used().unwrap_or(0) > 0,
+            "the delivery is metered"
+        );
+        runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

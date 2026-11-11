@@ -703,10 +703,13 @@ impl Manifest {
             }
         }
         if !self.contributes.hooks.is_empty() {
-            if self.runtime.kind != RuntimeKind::Extism {
+            if !matches!(
+                self.runtime.kind,
+                RuntimeKind::Extism | RuntimeKind::WasmComponent
+            ) {
                 report.error(
                     "contributes.hooks",
-                    "observe hooks are delivered by the extism runtime in this build",
+                    "observe hooks are delivered by the extism and wasm-component runtimes in this build",
                 );
             }
             if !self
@@ -1289,6 +1292,24 @@ provides = [
             2,
             "runtime and capability are both refused: {report:?}"
         );
+    }
+
+    /// A wasm component can observe hooks; the runtime delivers the batch
+    /// through its own `on-event` export, so the same capability governs it.
+    #[test]
+    fn a_wasm_component_may_observe_hooks() {
+        let text = sample()
+            .replace(
+                "kind = \"declarative\"\nstartup = \"on-demand\"",
+                "kind = \"wasm-component\"\nentry = \"plugin.wasm\"\nstartup = \"on-demand\"",
+            )
+            .replace(
+                "required = [\"agent.tools.register\", \"workspace.read\"]",
+                "required = [\"agent.tools.register\", \"workspace.read\", \"hooks.observe\"]",
+            )
+            .replace("[contributes]", "[contributes]\nhooks = [\"turn.start\"]");
+        let report = parse(&text).validate();
+        assert!(report.is_valid(), "{report:?}");
     }
 
     #[test]

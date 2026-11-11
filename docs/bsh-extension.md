@@ -385,6 +385,13 @@ Hooks are observe-only: a guest cannot deny or replace the call.
 | `skill.load` | a skill body is attached to a turn's prompt | `skill, bytes` |
 | `http.exchange` | every LLM vendor call, and every HTTP fetch a sandboxed runtime makes through its bridge | metadata, masked headers and bounded bodies (see the tap's caps) |
 
+A guest receives the batch through its own export: an extism package through
+`bsh_hook`, a wasm component through `on-event` — the batch is an event with
+`event-type = "hook"` and the `{point, batch}` payload, so a component needs no
+second contract and an existing component still loads. Only the `extism` and
+`wasm-component` runtimes may declare hooks, and the manifest requires
+`hooks.observe`.
+
 Scope of the coverage, stated rather than implied:
 
 - An MCP **tool call** is a tool call: it arrives at `tool.before`/`tool.after`
