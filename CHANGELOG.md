@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v4.1.6 (2026-11-11)
 
 - **sed tool**: the files bundle now carries a first-class `sed` tool built on
   uutils sed 0.3.0 (the `sed` crate). One program processes a private copy of a
@@ -15,10 +15,9 @@
   carries a bounded line diff, so the transcript's changed-files card and Diff
   pane preview a sed step's real changed lines instead of omitting it. The
   engine's compile-time sandbox is always on, refusing `e`, `r`, `R`, `w` and
-  `W`. The
-  tool honors the workspace ignore file, the permission matrix and the per-file
-  lock, declares `fs.write:workspace` capability metadata, and records its edit
-  in Intelligent Review.
+  `W`. The tool honors the workspace ignore file, the permission matrix and the
+  per-file lock, declares `fs.write:workspace` capability metadata, and records
+  its edit in Intelligent Review.
 
 - **Unified intelligence runtimes**: goals now carry a durable identity and
   revision that fence late round settlements, refuse overlength objectives
