@@ -349,6 +349,14 @@ pub(crate) fn installed() -> &'static [App] {
 }
 
 /// The catalog's installed rows, in menu order.
+///
+/// Off macOS the catalog is the file manager alone and every row is the
+/// shell's own open verb, so the closure can never filter and the roots have
+/// nothing to answer for. The platform split is the reason, not a leftover.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(unused_variables, clippy::unnecessary_filter_map)
+)]
 fn installed_in(roots: &[PathBuf]) -> Vec<App> {
     CATALOG
         .iter()
@@ -472,7 +480,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::{installed_in, preferred_index};
     use super::{open_command, Entry, Label};
-    use std::path::{Path, PathBuf};
+    // Path is the argument of the bundle probe, which only macOS has.
+    #[cfg(target_os = "macos")]
+    use std::path::Path;
+    use std::path::PathBuf;
 
     /// A scratch directory tree that lives only for one test.
     #[cfg(target_os = "macos")]
