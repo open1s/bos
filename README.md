@@ -158,6 +158,22 @@ Within one BSH node, the platform is organized around distinct responsibilities:
 | **Policy and Audit** | Applies current authorization and execution controls; the unified composition-wide policy/audit model is a target |
 | **Bus and Adapters** | Provides messaging and integration seams for local and external systems |
 
+### Agent Intelligence Runtime
+
+BSH treats **Skill Intelligence** and **Tool Intelligence** as sibling subsystems under the Agent Runtime. They solve different problems and should coordinate through shared task intent and governance rather than being collapsed into one catalogue:
+
+- **Skill Intelligence — what expertise and procedures should guide the task?** It discovers and ranks Skills, resolves dependencies, validates provenance and trust, loads selected instructions on demand, activates them within the task/session scope, and composes their instructions into bounded model context.
+- **Tool Intelligence — what operations can safely advance the task?** It discovers and ranks tools/capabilities, filters candidates against the current workspace view, plans capability use, exposes only the necessary schemas, invokes through the authorized runtime, and evaluates results.
+- **Shared task intent — why and under what constraints?** Intent, conversation context, workspace, constraints and context budget guide both subsystems. Either subsystem must be able to decide that no Skill or no Tool is needed.
+- **Unified Capability & Security Runtime — what is actually allowed to happen?** Composition, authorization, provider resolution, lifecycle, cancellation and audit remain authoritative runtime responsibilities. Discovery relevance or Skill activation never grants execution permission.
+- **Execution Layer — where does the operation run?** Local tools, MCP adapters, Ferris providers, WASM components and remote BSH nodes execute behind explicit provider and trust boundaries.
+
+<p align="center"><img src="docs/assets/diagrams/bsh-agent-intelligence-runtime.svg" alt="BSH Agent Intelligence Runtime: shared task intent coordinates sibling Skill Intelligence and Tool Intelligence subsystems, which use a unified capability and security runtime before execution." width="100%"></p>
+
+The intended lifecycle is **Task Intent → Discover → Plan → Validate → Load / Expose → Activate / Invoke → Observe → Evaluate → Cleanup**. Skill instructions and tool schemas are loaded progressively and only when needed; the full Skill and Tool catalogues should not be injected into every model request. Task-scoped state, context budgets and provenance must remain isolated across concurrent tasks and delegated agents.
+
+**Implementation status:** BOS already has the `find_skill` / `load_skill` and `find_tool` discovery primitives, deferred tool-schema exposure, and important capability-runtime foundations. The diagram describes the target integrated architecture; end-to-end orchestration, workspace-authoritative tool discovery, bounded cumulative schema composition and unified effectiveness evaluation are still being evolved. Track the requirements in [Skill Intelligence issues #273–#283](https://github.com/open1s/bos/issues?q=is%3Aissue+is%3Aopen+Skill+Intelligence) and [Tool Intelligence issues #284–#287](https://github.com/open1s/bos/issues?q=is%3Aissue+is%3Aopen+Tool+Intelligence).
+
 ### Federation architecture
 
 Federation connects nodes; it does not merge them.
