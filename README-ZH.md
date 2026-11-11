@@ -158,6 +158,22 @@ BOS 将共享执行基础、本地组合和跨节点协作分离。
 | **Policy & Audit** | 执行现有授权与运行控制；统一的组合级策略和审计模型仍是目标 |
 | **Bus & Adapters** | 为本地组件和外部系统提供消息通信与集成边界 |
 
+### Agent Intelligence Runtime
+
+BSH 将 **Skill Intelligence** 与 **Tool Intelligence** 作为 Agent Runtime 下两个平级、协同工作的智能子系统。它们解决不同问题，应通过统一的任务意图和治理机制协作，而不是合并成一个大目录：
+
+- **Skill Intelligence —— 当前任务需要什么专业知识和操作方法？** 负责发现与排序 Skill、解析依赖、验证来源和信任、按需加载选中的指令、在 Task/Session 范围内激活，并将指令组合进有预算约束的模型上下文。
+- **Tool Intelligence —— 哪些操作能力可以安全地推进任务？** 负责发现与排序 Tool/Capability、依据当前 Workspace Capability View 过滤候选项、规划能力使用、按需暴露 Schema、通过受授权的 Runtime 调用，并评估执行结果。
+- **统一任务意图 —— 为什么执行，以及有哪些约束？** 任务意图、对话上下文、Workspace、约束条件和上下文预算共同指导两个子系统。两个子系统都必须能够判断当前任务不需要 Skill 或 Tool。
+- **统一 Capability 与 Security Runtime —— 哪些操作真正被允许？** Composition、Authorization、Provider Resolution、Lifecycle、Cancellation 和 Audit 仍由权威 Runtime 负责。发现结果的相关性和 Skill 激活都不能授予执行权限。
+- **Execution Layer —— 操作在哪里执行？** 本地工具、MCP Adapter、Ferris Provider、WASM Component 和远程 BSH 节点都必须处于明确的 Provider 与信任边界之后。
+
+<p align="center"><img src="docs/assets/diagrams/bsh-agent-intelligence-runtime.svg" alt="BSH Agent Intelligence Runtime：统一任务意图协调 Skill Intelligence 和 Tool Intelligence 两个平级子系统，经统一 Capability 与 Security Runtime 后进入执行层。" width="100%"></p>
+
+目标生命周期为：**Task Intent → Discover → Plan → Validate → Load / Expose → Activate / Invoke → Observe → Evaluate → Cleanup**。Skill 指令和 Tool Schema 应渐进式、按需加载；不应在每次模型请求中注入完整 Skill 与 Tool 目录。并发任务和委派 Agent 之间必须隔离任务级状态、上下文预算和来源信息。
+
+**实现状态：** BOS 已有 `find_skill` / `load_skill` 和 `find_tool` 发现原语、Deferred Tool Schema 暴露机制，以及重要的 Capability Runtime 基础。上图描述的是目标集成架构；端到端编排、以 Workspace 为权威的工具发现、累计 Schema 上下文预算，以及统一效果评估仍在持续演进。需求跟踪见 [Skill Intelligence Issues #273–#283](https://github.com/open1s/bos/issues?q=is%3Aissue+is%3Aopen+Skill+Intelligence) 和 [Tool Intelligence Issues #284–#287](https://github.com/open1s/bos/issues?q=is%3Aissue+is%3Aopen+Tool+Intelligence)。
+
 ### Federation 架构
 
 Federation 连接节点，但不合并节点。
