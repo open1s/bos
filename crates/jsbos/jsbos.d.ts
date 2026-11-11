@@ -21,6 +21,10 @@ export declare class Agent {
   config(): any
   /** List registered tool names. */
   listTools(): Array<string>
+  /** Every registered tool as a full definition, including live and MCP tools. */
+  toolDefinitions(): any
+  /** The tool array the model is actually offered, as full definitions. */
+  modelToolDefinitions(): any
   /** List registered async tool names. */
   listAsyncTools(): Array<string>
   /** Snapshot the agent's working plan as `{ text, status }` items. */
@@ -51,6 +55,8 @@ export declare class Agent {
   hasDeferredTools(): boolean
   /** Remove asynchronous tools by name; returns how many were removed. */
   removeTools(names: Array<string>): number
+  /** Remove live extension tools by name. */
+  removeLiveTools(names: Array<string>): number
   /** Append a live extension prompt fragment. */
   addLivePromptSection(section: string): void
   /** Remove one live extension prompt fragment. */
@@ -84,7 +90,7 @@ export declare class Agent {
   /** Register `hook` for `event`. */
   registerHook(event: HookEvent, callback: ((err: Error | null, arg: HookContextData) => unknown)): void
   /** Register `plugin` with the agent. */
-  registerPlugin(name: string, onLlmRequest?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onLlmResponse?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onToolCall?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onToolResult?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null): void
+  registerPlugin(name: string, onLlmRequest?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onLlmResponse?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onToolCall?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onToolResult?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onStreamToken?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onTurnStart?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onTurnEnd?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null): void
   /** Close the agent and release resources. */
   close(): void
   /** Stop the running agent. */
@@ -92,7 +98,9 @@ export declare class Agent {
   /** Whether the agent is running. */
   isRunning(): boolean
   /** Register a tool implemented in JavaScript. */
-  addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => unknown), cancelable: boolean, cancelCallback?: (((err: Error | null, arg: string) => unknown)) | undefined | null): Promise<string>
+  addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => unknown), cancelable: boolean, cancelCallback?: (((err: Error | null, arg: string) => unknown)) | undefined | null, metadata?: string | undefined | null): Promise<string>
+  /** Register a tool that a running turn can see immediately. */
+  addLiveTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => unknown), cancelable: boolean, cancelCallback?: (((err: Error | null, arg: string) => unknown)) | undefined | null, metadata?: string | undefined | null): Promise<string>
   /**
    * Register a sandboxed bash tool.
    *
@@ -102,6 +110,14 @@ export declare class Agent {
   addBashTool(name: string, workspaceRoot?: string | undefined | null, jobs?: JobRegistry | undefined | null, session?: string | undefined | null): Promise<void>
   /** Register skills discovered in `dir_path`. */
   registerSkillsFromDir(dirPath: string): Promise<void>
+  /** Register an inline skill that a running turn can see immediately. */
+  addLiveSkill(name: string, description: string, instructions: string, path?: string | undefined | null): void
+  /** Load every skill in dirPath into the live extension overlay. */
+  addLiveSkillsFromDir(dirPath: string): number
+  /** Remove live skills whose directory is one of the given paths. */
+  removeLiveSkillsByPaths(paths: Array<string>): number
+  /** Every skill in the live extension overlay. */
+  liveSkills(): any
   /** Add a stdio MCP server. */
   addMcpServer(namespace: string, command: string, args: Array<string>): Promise<void>
   /** Add an HTTP MCP server under `namespace`. */
@@ -138,7 +154,14 @@ export declare class Agent {
   setSessionContext(context: any): void
   /** Reset the opaque session context to null. */
   clearSessionContext(): void
-  /** Compact the session, keeping recent turns. */
+  /**
+   * Ask the model to compact the session into a checkpoint now.
+   *
+   * Resolves to null when there is nothing worth folding, or to an object
+   * with replaced/before_tokens/after_tokens/summary when a checkpoint landed.
+   */
+  compactNow(retainTokens: number): Promise<any | null>
+  /** Compact the session mechanically without a model call. */
   compactSession(keepRecent: number, maxSummaryChars: number): void
   /** Persist the agent's conversation to a file path. */
   saveMessageLog(path: string): void
@@ -447,6 +470,14 @@ export declare class McpClient {
   listResources(): Promise<Array<any>>
   /** Read a resource by URI. */
   readResource(uri: string): Promise<any>
+  /** Fetch one prompt by name, with optional JSON arguments. */
+  getPrompt(name: string, arguments?: string | undefined | null): Promise<any>
+  /** The capabilities the server reported during initialization. */
+  getCapabilities(): Promise<any | null>
+  /** Restart the MCP connection and return the new server capabilities. */
+  restart(): Promise<any>
+  /** Detailed health status of the MCP connection. */
+  healthStatus(): any
 }
 
 /**

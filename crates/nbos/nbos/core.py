@@ -196,6 +196,8 @@ class AgentBuilder:
         opts = options or {}
         self._memory = opts.get("memory")
         self._recall_limit = opts.get("memory_recall_limit", 5)
+        self._memory_metadata = opts.get("memory_metadata")
+        self._auto_remember = opts.get("auto_remember", False)
         self._config = PyAgentConfig()
         self._config.name = opts.get("name", "assistant")
         self._config.model = opts.get("model", DEFAULT_MODEL)
@@ -350,10 +352,18 @@ class AgentBuilder:
         self._deferred_prefixes.append(prefix)
         return self
 
-    def with_memory(self, memory: Memory, limit: int = 5) -> "AgentBuilder":
+    def with_memory(
+        self,
+        memory: Memory,
+        limit: int = 5,
+        metadata: dict[str, Any] | None = None,
+        auto_remember: bool = False,
+    ) -> "AgentBuilder":
         """Recall up to ``limit`` matches from ``memory`` on each text run."""
         self._memory = memory
         self._recall_limit = limit
+        self._memory_metadata = metadata
+        self._auto_remember = auto_remember
         return self
 
     def with_tools(self, *tools: ToolDef) -> "AgentBuilder":
@@ -540,6 +550,7 @@ class AgentBuilder:
                 parameters=json.dumps(td.parameters),
                 schema=json.dumps(td.schema),
                 callback=td.callback,
+                metadata=json.dumps(td.metadata) if td.metadata else None,
             )
             await self._inner.add_tool(py_tool)
 
@@ -562,6 +573,9 @@ class AgentBuilder:
                 on_llm_response=p.get("on_llm_response"),
                 on_tool_call=p.get("on_tool_call"),
                 on_tool_result=p.get("on_tool_result"),
+                on_stream_token=p.get("on_stream_token"),
+                on_turn_start=p.get("on_turn_start"),
+                on_turn_end=p.get("on_turn_end"),
             )
             self._inner.register_plugin(plugin_obj)
 
@@ -591,7 +605,14 @@ class AgentBuilder:
             else:
                 await self._inner.add_mcp_server_http(m["namespace"], m["url"])
 
-        return Agent(self._inner, self._tools, self._memory, self._recall_limit)
+        return Agent(
+            self._inner,
+            self._tools,
+            self._memory,
+            self._recall_limit,
+            self._memory_metadata,
+            self._auto_remember,
+        )
 
     def _resolve_content(self, input_val: str | NbosContent) -> str:
         """Convert input to string for Rust backend.
@@ -606,7 +627,14 @@ class AgentBuilder:
     async def ask(self, prompt: str | NbosContent) -> str:
         if not self._inner:
             await self.start()
-        return await Agent(self._inner, self._tools, self._memory, self._recall_limit).ask(prompt)
+        return await Agent(
+            self._inner,
+            self._tools,
+            self._memory,
+            self._recall_limit,
+            self._memory_metadata,
+            self._auto_remember,
+        ).ask(prompt)
 
     async def chat(self, message: str | NbosContent) -> str:
         return await self.ask(message)
@@ -614,12 +642,26 @@ class AgentBuilder:
     async def react(self, task: str | NbosContent) -> str:
         if not self._inner:
             await self.start()
-        return await Agent(self._inner, self._tools, self._memory, self._recall_limit).react(task)
+        return await Agent(
+            self._inner,
+            self._tools,
+            self._memory,
+            self._recall_limit,
+            self._memory_metadata,
+            self._auto_remember,
+        ).react(task)
 
     async def stream(self, task: str | NbosContent):
         if not self._inner:
             await self.start()
-        return await Agent(self._inner, self._tools, self._memory, self._recall_limit).stream(task)
+        return await Agent(
+            self._inner,
+            self._tools,
+            self._memory,
+            self._recall_limit,
+            self._memory_metadata,
+            self._auto_remember,
+        ).stream(task)
 
 
 class Agent:
@@ -634,11 +676,15 @@ class Agent:
         tools: ToolRegistry,
         memory: Memory | None = None,
         recall_limit: int = 5,
+        memory_metadata: dict[str, Any] | None = None,
+        auto_remember: bool = False,
     ) -> None:
         self._inner = inner
         self._tools = tools
         self._memory = memory
         self._recall_limit = recall_limit
+        self._memory_metadata = memory_metadata
+        self._auto_remember = auto_remember
 
     def _resolve_content(self, input_val: str | NbosContent) -> str:
         """Convert input to string for Rust backend.
@@ -654,18 +700,73 @@ class Agent:
         """Prepend recalled memory to text prompts; leave multimodal untouched."""
         if self._memory is None or isinstance(prompt, NbosContent):
             return content
-        block = self._memory.recall_block(prompt, self._recall_limit)
+        block = self._memory.recall_block(
+            prompt, self._recall_limit, self._memory_metadata
+        )
         return f"{block}\n\n{content}" if block else content
 
-    def with_memory(self, memory: Memory, limit: int = 5) -> "Agent":
+    def _remember_exchange(self, prompt: str | NbosContent, reply: str) -> None:
+        if (
+            not self._auto_remember
+            or self._memory is None
+            or not isinstance(prompt, str)
+            or not prompt.strip()
+            or not reply.strip()
+        ):
+            return
+        note = f"User: {prompt.strip()}\nAssistant: {reply.strip()[:4000]}"
+        self._memory.add(note)
+
+    def with_memory(
+        self,
+        memory: Memory,
+        limit: int = 5,
+        metadata: dict[str, Any] | None = None,
+        auto_remember: bool = False,
+    ) -> "Agent":
         """Attach a store that recalls up to ``limit`` items per text run."""
         self._memory = memory
         self._recall_limit = limit
+        self._memory_metadata = metadata
+        self._auto_remember = auto_remember
         return self
+
+    def remember(self, content: str, metadata: Any = None) -> dict:
+        """Store one memory and return the stored item."""
+        if self._memory is None:
+            raise RuntimeError("no memory store is attached")
+        return self._memory.add(content, metadata)
+
+    def forget(self, item_id: str) -> bool:
+        """Remove one memory item by id."""
+        return self._memory.remove(item_id) if self._memory is not None else False
+
+    def forget_all(self) -> bool:
+        """Clear the attached memory store."""
+        if self._memory is None:
+            return False
+        had_items = not self._memory.is_empty()
+        self._memory.clear()
+        return had_items
+
+    def recall(self, query: str, limit: int = 5) -> list[dict]:
+        """Recall items relevant to ``query``, honouring the metadata filter."""
+        if self._memory is None:
+            return []
+        return self._memory.search(query, limit, self._memory_metadata)
+
+    def recalled_context(self, query: str, limit: int = 5) -> str | None:
+        """Recall matching items formatted for a prompt, or None."""
+        if self._memory is None:
+            return None
+        block = self._memory.recall_block(query, limit, self._memory_metadata)
+        return block or None
 
     async def ask(self, prompt: str | NbosContent) -> str:
         content = self._resolve_content(prompt)
-        return await self._inner.run_simple(self._with_memory(prompt, content))
+        reply = await self._inner.run_simple(self._with_memory(prompt, content))
+        self._remember_exchange(prompt, reply)
+        return reply
 
     async def run_simple(self, message: str | NbosContent) -> str:
         return await self.ask(message)
@@ -675,7 +776,9 @@ class Agent:
 
     async def react(self, task: str | NbosContent) -> str:
         content = self._resolve_content(task)
-        return await self._inner.react(self._with_memory(task, content))
+        reply = await self._inner.react(self._with_memory(task, content))
+        self._remember_exchange(task, reply)
+        return reply
 
     async def stream(self, task: str | NbosContent):
         content = self._resolve_content(task)
@@ -692,6 +795,14 @@ class Agent:
     def stop(self, clear_session: bool = False) -> bool:
         """Cooperatively stop the agent; suppresses the next run."""
         return self._inner.stop(clear_session)
+
+    def close(self) -> None:
+        """Release runtime extensions and stop the agent."""
+        self._inner.close()
+
+    async def compact_now(self, retain_tokens: int = 0) -> dict | None:
+        """Ask the model to compact the session into a checkpoint now."""
+        return await self._inner.compact_now(retain_tokens)
 
     @property
     def is_running(self) -> bool:
@@ -789,6 +900,32 @@ class Agent:
         """Remove asynchronous tools by name; returns how many were removed."""
         return self._inner.remove_tools(names)
 
+    async def add_live_tool(self, tool: ToolDef) -> "Agent":
+        """Register a tool that a running turn can see immediately."""
+        py_tool = PythonTool(
+            name=tool.name,
+            description=tool.description,
+            parameters=json.dumps(tool.parameters),
+            schema=json.dumps(tool.schema),
+            callback=tool.callback,
+            metadata=json.dumps(tool.metadata) if tool.metadata else None,
+        )
+        await self._inner.add_live_tool(py_tool)
+        self._tools.add(tool)
+        return self
+
+    def remove_live_tools(self, names: list[str]) -> int:
+        """Remove live extension tools by name."""
+        return self._inner.remove_live_tools(names)
+
+    def tool_definitions(self) -> list[dict]:
+        """Every registered tool as a full definition, including live/MCP tools."""
+        return self._inner.tool_definitions()
+
+    def model_tool_definitions(self) -> list[dict]:
+        """The tool array the model is actually offered, as full definitions."""
+        return self._inner.model_tool_definitions()
+
     def add_live_prompt_section(self, section: str) -> "Agent":
         """Append a live extension prompt fragment."""
         self._inner.add_live_prompt_section(section)
@@ -808,6 +945,29 @@ class Agent:
         """Register an inline skill (no SKILL.md file needed)."""
         self._inner.register_skill(name, description, content, path)
         return self
+
+    def add_live_skill(
+        self,
+        name: str,
+        description: str,
+        content: str,
+        path: str | None = None,
+    ) -> "Agent":
+        """Register an inline skill that a running turn can see immediately."""
+        self._inner.add_live_skill(name, description, content, path)
+        return self
+
+    async def add_live_skills_from_dir(self, dir_path: str) -> int:
+        """Load every skill in a directory into the live extension overlay."""
+        return await self._inner.add_live_skills_from_dir(dir_path)
+
+    def remove_live_skills_by_paths(self, paths: list[str]) -> int:
+        """Remove live skills whose directory is one of the given paths."""
+        return self._inner.remove_live_skills_by_paths(paths)
+
+    def live_skills(self) -> list[dict]:
+        """Every skill in the live extension overlay."""
+        return self._inner.live_skills()
 
     def remove_skills_by_names(self, names: list[str]) -> int:
         """Remove skills by name from the build's list and the live overlay."""

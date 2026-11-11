@@ -1,7 +1,9 @@
 use agent::agent::plugin::{
     AgentPlugin as InnerPlugin, LlmRequestWrapper as InnerLlmRequest,
     LlmResponseWrapper as InnerLlmResponse, PluginRegistry as InnerRegistry,
-    ToolCallWrapper as InnerToolCall, ToolResultWrapper as InnerToolResult,
+    StreamTokenWrapper as InnerStreamToken, ToolCallWrapper as InnerToolCall,
+    ToolResultWrapper as InnerToolResult, TurnEndWrapper as InnerTurnEnd,
+    TurnStartWrapper as InnerTurnStart,
 };
 use async_trait::async_trait;
 use pyo3::prelude::*;
@@ -346,12 +348,227 @@ impl From<PyToolResultWrapper> for InnerToolResult {
     }
 }
 
+#[pyclass(name = "StreamTokenWrapper", from_py_object)]
+#[derive(Clone, Debug)]
+/// View of one stream token.
+pub struct PyStreamTokenWrapper {
+    /// Token kind: Text, ReasoningContent, ToolCall, ToolResult, Usage, Done, Stopped.
+    #[pyo3(get, set)]
+    pub token_type: String,
+    /// Text payload for Text/ReasoningContent.
+    #[pyo3(get, set)]
+    pub text: Option<String>,
+    /// Tool name for ToolCall/ToolResult.
+    #[pyo3(get, set)]
+    pub name: Option<String>,
+    /// JSON-encoded tool arguments for ToolCall.
+    #[pyo3(get, set)]
+    pub args: Option<String>,
+    /// Provider call id for ToolCall.
+    #[pyo3(get, set)]
+    pub id: Option<String>,
+    /// Tool output text for ToolResult.
+    #[pyo3(get, set)]
+    pub output: Option<String>,
+    /// Tool duration in milliseconds for ToolResult.
+    #[pyo3(get, set)]
+    pub ms: Option<u64>,
+    /// JSON-encoded token usage for Usage.
+    #[pyo3(get, set)]
+    pub usage: Option<String>,
+}
+
+impl From<&InnerStreamToken> for PyStreamTokenWrapper {
+    fn from(token: &InnerStreamToken) -> Self {
+        match token {
+            InnerStreamToken::Text(text) => Self {
+                token_type: "Text".to_string(),
+                text: Some(text.clone()),
+                name: None,
+                args: None,
+                id: None,
+                output: None,
+                ms: None,
+                usage: None,
+            },
+            InnerStreamToken::ReasoningContent(text) => Self {
+                token_type: "ReasoningContent".to_string(),
+                text: Some(text.clone()),
+                name: None,
+                args: None,
+                id: None,
+                output: None,
+                ms: None,
+                usage: None,
+            },
+            InnerStreamToken::ToolCall { name, args, id } => Self {
+                token_type: "ToolCall".to_string(),
+                text: None,
+                name: Some(name.clone()),
+                args: Some(args.to_string()),
+                id: id.clone(),
+                output: None,
+                ms: None,
+                usage: None,
+            },
+            InnerStreamToken::ToolResult { name, output, ms } => Self {
+                token_type: "ToolResult".to_string(),
+                text: None,
+                name: Some(name.clone()),
+                args: None,
+                id: None,
+                output: Some(output.clone()),
+                ms: Some(*ms),
+                usage: None,
+            },
+            InnerStreamToken::Usage(usage) => Self {
+                token_type: "Usage".to_string(),
+                text: None,
+                name: None,
+                args: None,
+                id: None,
+                output: None,
+                ms: None,
+                usage: serde_json::to_string(usage).ok(),
+            },
+            InnerStreamToken::Done => Self {
+                token_type: "Done".to_string(),
+                text: None,
+                name: None,
+                args: None,
+                id: None,
+                output: None,
+                ms: None,
+                usage: None,
+            },
+            InnerStreamToken::Stopped => Self {
+                token_type: "Stopped".to_string(),
+                text: None,
+                name: None,
+                args: None,
+                id: None,
+                output: None,
+                ms: None,
+                usage: None,
+            },
+        }
+    }
+}
+
+impl From<PyStreamTokenWrapper> for InnerStreamToken {
+    fn from(token: PyStreamTokenWrapper) -> Self {
+        match token.token_type.as_str() {
+            "Text" => InnerStreamToken::Text(token.text.unwrap_or_default()),
+            "ReasoningContent" => {
+                InnerStreamToken::ReasoningContent(token.text.unwrap_or_default())
+            }
+            "ToolCall" => InnerStreamToken::ToolCall {
+                name: token.name.unwrap_or_default(),
+                args: token
+                    .args
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or_else(|| serde_json::json!({})),
+                id: token.id,
+            },
+            "ToolResult" => InnerStreamToken::ToolResult {
+                name: token.name.unwrap_or_default(),
+                output: token.output.unwrap_or_default(),
+                ms: token.ms.unwrap_or_default(),
+            },
+            "Usage" => InnerStreamToken::Usage(
+                token
+                    .usage
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or(react::llm::vendor::openaicompatible::Usage {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        prompt_tokens_details: None,
+                    }),
+            ),
+            "Stopped" => InnerStreamToken::Stopped,
+            _ => InnerStreamToken::Done,
+        }
+    }
+}
+
+#[pyclass(name = "TurnStartWrapper", from_py_object)]
+#[derive(Clone, Debug)]
+/// View of a turn that is about to start.
+pub struct PyTurnStartWrapper {
+    /// Agent name.
+    #[pyo3(get, set)]
+    pub agent: String,
+    /// Text input for the turn.
+    #[pyo3(get, set)]
+    pub input: String,
+    /// Free-form metadata.
+    #[pyo3(get, set)]
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+impl From<&InnerTurnStart> for PyTurnStartWrapper {
+    fn from(turn: &InnerTurnStart) -> Self {
+        Self {
+            agent: turn.agent.clone(),
+            input: turn.input.clone(),
+            metadata: turn.metadata.clone(),
+        }
+    }
+}
+
+impl From<PyTurnStartWrapper> for InnerTurnStart {
+    fn from(turn: PyTurnStartWrapper) -> Self {
+        let mut inner = InnerTurnStart::new(turn.agent, turn.input);
+        inner.metadata = turn.metadata;
+        inner
+    }
+}
+
+#[pyclass(name = "TurnEndWrapper", from_py_object)]
+#[derive(Clone, Debug)]
+/// View of a finished turn.
+pub struct PyTurnEndWrapper {
+    /// Agent name.
+    #[pyo3(get, set)]
+    pub agent: String,
+    /// Final text when the turn succeeded.
+    #[pyo3(get, set)]
+    pub output: Option<String>,
+    /// Error text when the turn failed.
+    #[pyo3(get, set)]
+    pub error: Option<String>,
+}
+
+impl From<&InnerTurnEnd> for PyTurnEndWrapper {
+    fn from(turn: &InnerTurnEnd) -> Self {
+        Self {
+            agent: turn.agent.clone(),
+            output: turn.output.clone(),
+            error: turn.error.clone(),
+        }
+    }
+}
+
+impl From<PyTurnEndWrapper> for InnerTurnEnd {
+    fn from(turn: PyTurnEndWrapper) -> Self {
+        InnerTurnEnd {
+            agent: turn.agent,
+            output: turn.output,
+            error: turn.error,
+        }
+    }
+}
+
 struct PythonPlugin {
     name: String,
     on_llm_request: Option<Arc<Py<PyAny>>>,
     on_llm_response: Option<Arc<Py<PyAny>>>,
     on_tool_call: Option<Arc<Py<PyAny>>>,
     on_tool_result: Option<Arc<Py<PyAny>>>,
+    on_stream_token: Option<Arc<Py<PyAny>>>,
+    on_turn_start: Option<Arc<Py<PyAny>>>,
+    on_turn_end: Option<Arc<Py<PyAny>>>,
 }
 
 /// Helper: call callback, await if coroutine, return Option<T>
@@ -383,7 +600,9 @@ impl InnerPlugin for PythonPlugin {
     }
 
     async fn on_llm_request(&self, request: InnerLlmRequest) -> Option<InnerLlmRequest> {
-        let callback = self.on_llm_request.as_ref()?;
+        let Some(callback) = self.on_llm_request.as_ref() else {
+            return Some(request);
+        };
         let request_clone = request.clone();
 
         call_plugin_callback(
@@ -417,7 +636,9 @@ impl InnerPlugin for PythonPlugin {
     }
 
     async fn on_llm_response(&self, response: InnerLlmResponse) -> Option<InnerLlmResponse> {
-        let callback = self.on_llm_response.as_ref()?;
+        let Some(callback) = self.on_llm_response.as_ref() else {
+            return Some(response);
+        };
         let response_clone = response.clone();
 
         call_plugin_callback(
@@ -434,7 +655,9 @@ impl InnerPlugin for PythonPlugin {
     }
 
     async fn on_tool_call(&self, tool_call: InnerToolCall) -> Option<InnerToolCall> {
-        let callback = self.on_tool_call.as_ref()?;
+        let Some(callback) = self.on_tool_call.as_ref() else {
+            return Some(tool_call);
+        };
         let tool_call_clone = tool_call.clone();
 
         call_plugin_callback(
@@ -451,7 +674,9 @@ impl InnerPlugin for PythonPlugin {
     }
 
     async fn on_tool_result(&self, tool_result: InnerToolResult) -> Option<InnerToolResult> {
-        let callback = self.on_tool_result.as_ref()?;
+        let Some(callback) = self.on_tool_result.as_ref() else {
+            return Some(tool_result);
+        };
         let tool_result_clone = tool_result.clone();
 
         call_plugin_callback(
@@ -462,6 +687,63 @@ impl InnerPlugin for PythonPlugin {
                     return None;
                 }
                 val.extract::<PyToolResultWrapper>().ok().map(|r| r.into())
+            },
+        )
+        .await
+    }
+
+    async fn on_stream_token(&self, token: InnerStreamToken) -> Option<InnerStreamToken> {
+        let Some(callback) = self.on_stream_token.as_ref() else {
+            return Some(token);
+        };
+        let token_clone = token.clone();
+
+        call_plugin_callback(
+            callback,
+            |py| PyStreamTokenWrapper::from(&token_clone).into_py_any(py),
+            |val| {
+                if val.is_none() {
+                    return None;
+                }
+                val.extract::<PyStreamTokenWrapper>().ok().map(|r| r.into())
+            },
+        )
+        .await
+    }
+
+    async fn on_turn_start(&self, turn: InnerTurnStart) -> Option<InnerTurnStart> {
+        let Some(callback) = self.on_turn_start.as_ref() else {
+            return Some(turn);
+        };
+        let turn_clone = turn.clone();
+
+        call_plugin_callback(
+            callback,
+            |py| PyTurnStartWrapper::from(&turn_clone).into_py_any(py),
+            |val| {
+                if val.is_none() {
+                    return None;
+                }
+                val.extract::<PyTurnStartWrapper>().ok().map(|r| r.into())
+            },
+        )
+        .await
+    }
+
+    async fn on_turn_end(&self, turn: InnerTurnEnd) -> Option<InnerTurnEnd> {
+        let Some(callback) = self.on_turn_end.as_ref() else {
+            return Some(turn);
+        };
+        let turn_clone = turn.clone();
+
+        call_plugin_callback(
+            callback,
+            |py| PyTurnEndWrapper::from(&turn_clone).into_py_any(py),
+            |val| {
+                if val.is_none() {
+                    return None;
+                }
+                val.extract::<PyTurnEndWrapper>().ok().map(|r| r.into())
             },
         )
         .await
@@ -483,7 +765,10 @@ impl PyAgentPlugin {
         on_llm_request = None,
         on_llm_response = None,
         on_tool_call = None,
-        on_tool_result = None
+        on_tool_result = None,
+        on_stream_token = None,
+        on_turn_start = None,
+        on_turn_end = None
     ))]
     fn new(
         name: String,
@@ -491,6 +776,9 @@ impl PyAgentPlugin {
         on_llm_response: Option<Py<PyAny>>,
         on_tool_call: Option<Py<PyAny>>,
         on_tool_result: Option<Py<PyAny>>,
+        on_stream_token: Option<Py<PyAny>>,
+        on_turn_start: Option<Py<PyAny>>,
+        on_turn_end: Option<Py<PyAny>>,
     ) -> Self {
         let plugin = PythonPlugin {
             name,
@@ -498,6 +786,9 @@ impl PyAgentPlugin {
             on_llm_response: on_llm_response.map(Arc::new),
             on_tool_call: on_tool_call.map(Arc::new),
             on_tool_result: on_tool_result.map(Arc::new),
+            on_stream_token: on_stream_token.map(Arc::new),
+            on_turn_start: on_turn_start.map(Arc::new),
+            on_turn_end: on_turn_end.map(Arc::new),
         };
         Self {
             inner: Arc::new(plugin),

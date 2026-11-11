@@ -52,8 +52,9 @@ pub use llm_usage::{
 };
 pub use mcp::PyMcpClient;
 pub use plugin::{
-    PyAgentPlugin, PyLlmRequestWrapper, PyLlmResponseWrapper, PyPluginRegistry, PyToolCallWrapper,
-    PyToolResultWrapper,
+    PyAgentPlugin, PyLlmRequestWrapper, PyLlmResponseWrapper, PyPluginRegistry,
+    PyStreamTokenWrapper, PyToolCallWrapper, PyToolResultWrapper, PyTurnEndWrapper,
+    PyTurnStartWrapper,
 };
 pub use publisher::PyPublisher;
 pub use query::{PyQuery, PyQueryStreamIterator, PyQueryable, PyStreamSender};
@@ -89,6 +90,9 @@ fn nbos_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLlmResponseWrapper>()?;
     m.add_class::<PyToolCallWrapper>()?;
     m.add_class::<PyToolResultWrapper>()?;
+    m.add_class::<PyStreamTokenWrapper>()?;
+    m.add_class::<PyTurnStartWrapper>()?;
+    m.add_class::<PyTurnEndWrapper>()?;
     m.add_class::<PyLlmUsage>()?;
     m.add_class::<PyPromptTokensDetails>()?;
     m.add_class::<PyTokenUsage>()?;

@@ -761,7 +761,11 @@ const tools = await client.listTools();
 | `listTools()` | List available tools |
 | `callTool(name, argsJson)` | Call a tool with JSON string args |
 | `listPrompts()` | List available prompts |
+| `getPrompt(name, arguments)` | Fetch one prompt by name |
+| `getCapabilities()` | Server capabilities from initialization |
 | `listResources()` | List available resources |
+| `restart()` | Restart and re-initialize the connection |
+| `healthStatus()` | Connection health snapshot |
 | `readResource(uri)` | Read a resource by URI |
 
 ---
@@ -908,19 +912,29 @@ await jobs.wait(id, 5000);
 jobs.kill(id);
 ```
 
-### Deferred tools, live skills and prompt sections
+### Deferred tools, live tools, live skills and prompt sections
 
 `deferTool(name)` / `deferToolPrefix(prefix)` keep a tool out of the advertised
 array while keeping it discoverable through `find_tool`; the reported tool is
 called directly by name on the next step.
-`registerSkill` adds an inline skill with no `SKILL.md` file, and
-`addLivePromptSection` appends a host-owned prompt fragment.
+
+`registerSkill` / `skillsDir` change the build's own set. To add a tool or skill
+while a turn is running, use the live overlay; the running turn sees it on its
+next step and the change survives the run.
 
 ```javascript
 agent.deferTool('mcp_search').deferToolPrefix('mcp_');
 agent.registerSkill('reviewer', 'Review code', 'Read the diff first.');
 agent.addLivePromptSection('Stay terse.');
 agent.listSkills();
+
+await agent.addLiveTool(new ToolDef('lookup', 'Look up a record', lookup, {}, lookupSchema));
+agent.addLiveSkill('reviewer', 'Review code', 'Read the diff first.');
+await agent.addLiveSkillsFromDir('./extra-skills');
+agent.removeLiveTools(['lookup']);
+agent.removeLiveSkillsByPaths(['./extra-skills/reviewer']);
+agent.toolDefinitions();      // full descriptions/schemas, incl. MCP/live tools
+agent.modelToolDefinitions();
 ```
 
 ### Prompt templates
@@ -1302,7 +1316,11 @@ MCP (Model Context Protocol) client for connecting to external tools and service
 | `listTools()` | List available tools |
 | `callTool(name, argsJson)` | Call a tool with JSON string args |
 | `listPrompts()` | List available prompts |
+| `getPrompt(name, arguments)` | Fetch one prompt by name |
+| `getCapabilities()` | Server capabilities from initialization |
 | `listResources()` | List available resources |
+| `restart()` | Restart and re-initialize the connection |
+| `healthStatus()` | Connection health snapshot |
 | `readResource(uri)` | Read a resource by URI |
 
 ---
@@ -1656,7 +1674,8 @@ main().catch(console.error);
 | `restore(path)` | Restore the conversation from a file |
 | `saveFull(path)` | Save the full session (messages + context) to a file |
 | `restoreFull(path)` | Restore the full session from a file |
-| `compact(keepRecent?, maxSummaryChars?)` | Summarize older messages (defaults 10 / 2000) |
+| `compact(keepRecent?, maxSummaryChars?)` | Summarize older messages mechanically (defaults 10 / 2000) |
+| `agent.compactNow(retainTokens?)` | Ask the model to write a checkpoint summary now |
 | `clear()` | Drop every non-system message and reset the context |
 | `export()` | Return the session snapshot as an object |
 | `exportJson()` | Return the session snapshot as a JSON string |

@@ -2,7 +2,7 @@
 
 use agent::agent::plugin::{
   AgentPlugin, LlmRequestWrapper, LlmResponseWrapper, PluginRegistry as InnerPluginRegistry,
-  ToolCallWrapper, ToolResultWrapper,
+  StreamTokenWrapper, ToolCallWrapper, ToolResultWrapper, TurnEndWrapper, TurnStartWrapper,
 };
 use async_trait::async_trait;
 use napi::bindgen_prelude::*;
@@ -318,6 +318,150 @@ impl From<ToolResultWrapper> for PluginToolResult {
   }
 }
 
+fn stream_token_to_json(token: &StreamTokenWrapper) -> serde_json::Value {
+  match token {
+    StreamTokenWrapper::Text(text) => serde_json::json!({"type": "Text", "text": text}),
+    StreamTokenWrapper::ReasoningContent(text) => {
+      serde_json::json!({"type": "ReasoningContent", "text": text})
+    }
+    StreamTokenWrapper::ToolCall { name, args, id } => serde_json::json!({
+        "type": "ToolCall",
+        "name": name,
+        "args": args,
+        "id": id,
+    }),
+    StreamTokenWrapper::ToolResult { name, output, ms } => serde_json::json!({
+        "type": "ToolResult",
+        "name": name,
+        "output": output,
+        "ms": ms,
+    }),
+    StreamTokenWrapper::Usage(usage) => serde_json::json!({
+        "type": "Usage",
+        "usage": usage,
+    }),
+    StreamTokenWrapper::Done => serde_json::json!({"type": "Done"}),
+    StreamTokenWrapper::Stopped => serde_json::json!({"type": "Stopped"}),
+  }
+}
+
+fn stream_token_from_json(value: &serde_json::Value) -> Option<StreamTokenWrapper> {
+  let token_type = value
+    .get("type")
+    .or_else(|| value.get("token_type"))
+    .and_then(|v| v.as_str())?;
+  Some(match token_type {
+    "Text" => StreamTokenWrapper::Text(
+      value
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string(),
+    ),
+    "ReasoningContent" => StreamTokenWrapper::ReasoningContent(
+      value
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string(),
+    ),
+    "ToolCall" => StreamTokenWrapper::ToolCall {
+      name: value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string(),
+      args: value
+        .get("args")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({})),
+      id: value.get("id").and_then(|v| v.as_str()).map(str::to_string),
+    },
+    "ToolResult" => StreamTokenWrapper::ToolResult {
+      name: value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string(),
+      output: value
+        .get("output")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string(),
+      ms: value.get("ms").and_then(|v| v.as_u64()).unwrap_or_default(),
+    },
+    "Usage" => StreamTokenWrapper::Usage(
+      value
+        .get("usage")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or(react::llm::vendor::openaicompatible::Usage {
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0,
+          prompt_tokens_details: None,
+        }),
+    ),
+    "Stopped" => StreamTokenWrapper::Stopped,
+    _ => StreamTokenWrapper::Done,
+  })
+}
+
+fn turn_start_to_json(turn: &TurnStartWrapper) -> serde_json::Value {
+  serde_json::json!({
+      "agent": turn.agent,
+      "input": turn.input,
+      "metadata": turn.metadata,
+  })
+}
+
+fn turn_start_from_json(value: &serde_json::Value, fallback: TurnStartWrapper) -> TurnStartWrapper {
+  let mut turn = TurnStartWrapper::new(
+    value
+      .get("agent")
+      .and_then(|v| v.as_str())
+      .unwrap_or(&fallback.agent),
+    value
+      .get("input")
+      .and_then(|v| v.as_str())
+      .unwrap_or(&fallback.input),
+  );
+  if let Some(metadata) = value.get("metadata").and_then(|v| v.as_object()) {
+    turn.metadata = metadata
+      .iter()
+      .filter_map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())))
+      .collect();
+  }
+  turn
+}
+
+fn turn_end_to_json(turn: &TurnEndWrapper) -> serde_json::Value {
+  serde_json::json!({
+      "agent": turn.agent,
+      "output": turn.output,
+      "error": turn.error,
+  })
+}
+
+fn turn_end_from_json(value: &serde_json::Value, fallback: TurnEndWrapper) -> TurnEndWrapper {
+  TurnEndWrapper {
+    agent: value
+      .get("agent")
+      .and_then(|v| v.as_str())
+      .unwrap_or(&fallback.agent)
+      .to_string(),
+    output: value
+      .get("output")
+      .and_then(|v| v.as_str())
+      .map(str::to_string)
+      .or(fallback.output),
+    error: value
+      .get("error")
+      .and_then(|v| v.as_str())
+      .map(str::to_string)
+      .or(fallback.error),
+  }
+}
+
 pub(crate) struct JSPlugin {
   name: String,
   // Weak so a registered plugin does not pin the Node event loop after the run.
@@ -329,9 +473,16 @@ pub(crate) struct JSPlugin {
     Option<Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>>,
   on_tool_result_cb:
     Option<Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>>,
+  on_stream_token_cb:
+    Option<Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>>,
+  on_turn_start_cb:
+    Option<Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>>,
+  on_turn_end_cb:
+    Option<Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>>,
 }
 
 impl JSPlugin {
+  #[allow(clippy::too_many_arguments)]
   pub fn new(
     name: String,
     on_llm_request: Option<
@@ -346,6 +497,15 @@ impl JSPlugin {
     on_tool_result: Option<
       ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
     >,
+    on_stream_token: Option<
+      ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    >,
+    on_turn_start: Option<
+      ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    >,
+    on_turn_end: Option<
+      ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    >,
   ) -> Self {
     Self {
       name,
@@ -353,6 +513,9 @@ impl JSPlugin {
       on_llm_response_cb: on_llm_response.map(Arc::new),
       on_tool_call_cb: on_tool_call.map(Arc::new),
       on_tool_result_cb: on_tool_result.map(Arc::new),
+      on_stream_token_cb: on_stream_token.map(Arc::new),
+      on_turn_start_cb: on_turn_start.map(Arc::new),
+      on_turn_end_cb: on_turn_end.map(Arc::new),
     }
   }
 
@@ -362,6 +525,19 @@ impl JSPlugin {
     >,
     input: serde_json::Value,
   ) -> Option<serde_json::Value> {
+    fn json_from_unknown(value: Unknown<'_>) -> Option<serde_json::Value> {
+      use napi::bindgen_prelude::FromNapiValue;
+      let raw = value.value();
+      let parsed = unsafe { serde_json::Value::from_napi_value(raw.env, raw.value).ok() }?;
+      match parsed {
+        // Preserve the old contract for a callback that returns a JSON string.
+        serde_json::Value::String(text) => serde_json::from_str(&text)
+          .ok()
+          .or(Some(serde_json::Value::String(text))),
+        other => Some(other),
+      }
+    }
+
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<serde_json::Value>>();
     let callback = callback.clone();
 
@@ -379,38 +555,14 @@ impl JSPlugin {
               let promise_raw = PromiseRaw::<Unknown<'_>>::new(raw_env, raw_val);
               let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
               let _ = promise_raw.then(move |ctx: CallbackContext<Unknown<'_>>| {
-                let json_val = ctx
-                  .value
-                  .coerce_to_string()
-                  .and_then(|s| s.into_utf8())
-                  .and_then(|u| u.as_str().map(|s| s.to_string()))
-                  .ok()
-                  .and_then(|s| {
-                    if s == "null" || s == "undefined" || s.is_empty() {
-                      None
-                    } else {
-                      serde_json::from_str(&s).ok()
-                    }
-                  });
+                let json_val = json_from_unknown(ctx.value);
                 if let Some(tx) = crate::lock_recover(&tx).take() {
                   let _ = tx.send(json_val);
                 }
                 Ok(())
               });
             } else {
-              let json_val = val
-                .coerce_to_string()
-                .and_then(|s| s.into_utf8())
-                .and_then(|u| u.as_str().map(|s| s.to_string()))
-                .ok()
-                .and_then(|s| {
-                  if s == "null" || s == "undefined" || s.is_empty() {
-                    None
-                  } else {
-                    serde_json::from_str(&s).ok()
-                  }
-                });
-              let _ = tx.send(json_val);
+              let _ = tx.send(json_from_unknown(val));
             }
           }
           Err(_) => {
@@ -654,6 +806,44 @@ impl AgentPlugin for JSPlugin {
       modified.error = error.as_str().map(|s| s.to_string());
     }
     Some(modified)
+  }
+
+  async fn on_stream_token(&self, token: StreamTokenWrapper) -> Option<StreamTokenWrapper> {
+    let callback = match self.on_stream_token_cb.as_ref() {
+      Some(cb) => cb,
+      None => return Some(token),
+    };
+    let input = stream_token_to_json(&token);
+    let Some(result) = Self::call_js_callback(callback, input).await else {
+      return Some(token);
+    };
+    stream_token_from_json(&result).or(Some(token))
+  }
+
+  async fn on_turn_start(&self, turn: TurnStartWrapper) -> Option<TurnStartWrapper> {
+    let callback = match self.on_turn_start_cb.as_ref() {
+      Some(cb) => cb,
+      None => return Some(turn),
+    };
+    let input = turn_start_to_json(&turn);
+    let fallback = turn.clone();
+    let Some(result) = Self::call_js_callback(callback, input).await else {
+      return Some(turn);
+    };
+    Some(turn_start_from_json(&result, fallback))
+  }
+
+  async fn on_turn_end(&self, turn: TurnEndWrapper) -> Option<TurnEndWrapper> {
+    let callback = match self.on_turn_end_cb.as_ref() {
+      Some(cb) => cb,
+      None => return Some(turn),
+    };
+    let input = turn_end_to_json(&turn);
+    let fallback = turn.clone();
+    let Some(result) = Self::call_js_callback(callback, input).await else {
+      return Some(turn);
+    };
+    Some(turn_end_from_json(&result, fallback))
   }
 }
 

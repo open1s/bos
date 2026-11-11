@@ -723,7 +723,8 @@ asyncio.run(main())
 | `restore_full(path)` | Restore the full session from file |
 | `add_message(role, content)` | Add message to conversation |
 | `get_messages()` | Get conversation messages |
-| `compact(keep_recent=10, max_summary_chars=2000)` | Compact long conversation logs |
+| `compact(keep_recent=10, max_summary_chars=2000)` | Compact long conversation logs mechanically |
+| `agent.compact_now(retain_tokens=0)` | Ask the model to write a checkpoint summary now (returns the outcome or `None`) |
 | `clear()` | Drop every non-system message and reset the context |
 | `export()` | Return the session state as a dict |
 | `export_json()` | Return the session state as a JSON string |
@@ -831,17 +832,27 @@ shell tool.
     jobs.wait(job_id, 5000)
     jobs.kill(job_id)
 
-### Deferred tools, live skills and prompt sections
+### Deferred tools, live tools, live skills and prompt sections
 
 defer_tool(name) / defer_tool_prefix(prefix) keep a tool out of the advertised
 array while keeping it discoverable through find_tool; the reported tool is
 called directly by name on the next step.
-register_skill adds an inline skill with no SKILL.md file, and
-add_live_prompt_section appends a host-owned prompt fragment.
+
+register_skill and register_skills_from_dir change the build's own set. To add
+a tool or skill while a turn is running, use the live overlay; the running turn
+sees it on its next step and the change survives the run.
 
     agent.defer_tool("mcp_search").defer_tool_prefix("mcp_")
     agent.register_skill("reviewer", "Review code", "Read the diff first.")
     agent.add_live_prompt_section("Stay terse.")
+
+    await agent.add_live_tool(ToolDef("lookup", "Look up a record", lookup, schema=lookup_schema))
+    agent.add_live_skill("reviewer", "Review code", "Read the diff first.")
+    await agent.add_live_skills_from_dir("./extra-skills")
+    agent.remove_live_tools(["lookup"])
+    agent.remove_live_skills_by_paths(["./extra-skills/reviewer"])
+    agent.tool_definitions()      # full descriptions/schemas, incl. MCP/live tools
+    agent.model_tool_definitions()
     agent.list_skills()
 
 ### Prompt templates

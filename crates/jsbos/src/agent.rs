@@ -15,6 +15,112 @@ use agent::BashTool;
 use react::llm::{Content, ContentPart};
 use react::tool::registry::AsyncTool;
 
+fn parse_tool_metadata(json: Option<String>) -> napi::Result<Option<react::tool::ToolMetadata>> {
+  let Some(json) = json else {
+    return Ok(None);
+  };
+  let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
+    napi::Error::new(
+      napi::Status::InvalidArg,
+      format!("invalid tool metadata JSON: {e}"),
+    )
+  })?;
+  let object = value.as_object().ok_or_else(|| {
+    napi::Error::new(
+      napi::Status::InvalidArg,
+      "tool metadata must be a JSON object",
+    )
+  })?;
+  let mut metadata = react::tool::ToolMetadata::new();
+  if let Some(version) = object.get("version").and_then(|v| v.as_str()) {
+    metadata = metadata.with_version(version);
+  }
+  if let Some(risk) = object.get("risk").and_then(|v| v.as_str()) {
+    metadata = metadata.with_risk(risk);
+  }
+  if let Some(effects) = object.get("side_effects").and_then(|v| v.as_array()) {
+    metadata = metadata.with_side_effects(
+      effects
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string)),
+    );
+  }
+  if let Some(permissions) = object.get("permissions").and_then(|v| v.as_array()) {
+    metadata = metadata.with_permissions(
+      permissions
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string)),
+    );
+  }
+  if let Some(timeout) = object.get("timeout_ms").and_then(|v| v.as_u64()) {
+    metadata = metadata.with_timeout_ms(timeout);
+  }
+  if let Some(cap) = object.get("max_output_bytes").and_then(|v| v.as_u64()) {
+    metadata = metadata.with_max_output_bytes(cap);
+  }
+  Ok(Some(metadata))
+}
+
+fn skill_json(skill: agent::skills::SkillContent) -> serde_json::Value {
+  serde_json::json!({
+      "name": skill.metadata.name,
+      "description": skill.metadata.description,
+      "category": skill.metadata.category.as_str(),
+      "version": skill.metadata.version.display(),
+      "tags": skill.metadata.tags,
+      "path": skill.metadata.path.to_string_lossy(),
+      "directory": skill.skill_dir.to_string_lossy(),
+      "user_only": skill.metadata.user_only,
+      "instructions": skill.instructions,
+  })
+}
+
+fn tool_metadata_json(metadata: &react::tool::ToolMetadata) -> serde_json::Value {
+  serde_json::json!({
+      "version": metadata.version,
+      "risk": metadata.risk,
+      "side_effects": metadata.side_effects,
+      "permissions": metadata.permissions,
+      "timeout_ms": metadata.timeout_ms,
+      "max_output_bytes": metadata.max_output_bytes,
+  })
+}
+
+fn tool_metadata_map(
+  agent: &agent::Agent,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+  let mut map = std::collections::BTreeMap::new();
+  if let Some(registry) = agent.registry() {
+    for (name, tool) in registry.iter() {
+      if let Some(metadata) = tool.metadata() {
+        map.insert(name.clone(), tool_metadata_json(metadata));
+      }
+    }
+    for name in registry.async_tool_names() {
+      if let Some(tool) = registry.get_async(&name) {
+        if let Some(metadata) = tool.metadata() {
+          map.insert(name, tool_metadata_json(metadata));
+        }
+      }
+    }
+  }
+  if let Ok(live) = agent.live_tools().read() {
+    for (name, tool) in live.iter() {
+      if let Some(metadata) = tool.metadata() {
+        map.insert(name.clone(), tool_metadata_json(metadata));
+      }
+    }
+    for name in live.async_tool_names() {
+      if let Some(tool) = live.get_async(&name) {
+        if let Some(metadata) = tool.metadata() {
+          map.insert(name, tool_metadata_json(metadata));
+        }
+      }
+    }
+  }
+  map
+}
+
 fn extract_json_value(val: Unknown<'_>) -> napi::Result<serde_json::Value> {
   let raw = val.value();
   unsafe {
@@ -69,6 +175,7 @@ struct JSTool {
   description: String,
   schema: serde_json::Value,
   cancelable: bool,
+  metadata: Option<react::tool::ToolMetadata>,
   // Weak threadsafe functions so a registered tool does not pin the Node
   // event loop: a script that only registers tools must still be able to exit.
   callback: Arc<ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>>,
@@ -89,6 +196,10 @@ impl AsyncTool for JSTool {
 
   fn json_schema(&self) -> serde_json::Value {
     self.schema.clone()
+  }
+
+  fn metadata(&self) -> Option<&react::tool::ToolMetadata> {
+    self.metadata.as_ref()
   }
 
   fn is_cancelable(&self) -> bool {
@@ -620,19 +731,50 @@ impl Agent {
   /// List registered tool names.
   pub fn list_tools(&self) -> Result<Vec<String>> {
     let guard = self.inner.blocking_read();
-    if let Some(registry) = guard.registry() {
-      // Tools added through the bindings are registered as async tools, so a
-      // sync-only listing would hide every JS-registered tool.
-      let mut names: Vec<String> = registry.iter().map(|(name, _)| name.clone()).collect();
-      for name in registry.async_tool_names() {
-        if !names.contains(&name) {
-          names.push(name);
+    // all_tools includes the build registry and the live extension overlay,
+    // so a tool added during a run shows up here immediately.
+    Ok(
+      guard
+        .all_tools()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect(),
+    )
+  }
+
+  #[napi]
+  /// Every registered tool as a full definition, including live and MCP tools.
+  pub fn tool_definitions(&self) -> serde_json::Value {
+    let guard = self.inner.blocking_read();
+    let metadata = tool_metadata_map(&guard);
+    let tools: Vec<serde_json::Value> = guard
+      .all_tools()
+      .into_iter()
+      .map(|tool| {
+        let deferred = guard.is_deferred_tool(&tool.name);
+        let mut value = serde_json::to_value(&tool).unwrap_or_default();
+        if let Some(object) = value.as_object_mut() {
+          object.insert("deferred".to_string(), serde_json::Value::Bool(deferred));
+          if let Some(entry) = metadata.get(&tool.name) {
+            object.insert("metadata".to_string(), entry.clone());
+          }
         }
-      }
-      Ok(names)
-    } else {
-      Ok(Vec::new())
-    }
+        value
+      })
+      .collect();
+    serde_json::Value::Array(tools)
+  }
+
+  #[napi]
+  /// The tool array the model is actually offered, as full definitions.
+  pub fn model_tool_definitions(&self) -> serde_json::Value {
+    let guard = self.inner.blocking_read();
+    let tools: Vec<serde_json::Value> = guard
+      .model_tools()
+      .into_iter()
+      .map(|tool| serde_json::to_value(&tool).unwrap_or_default())
+      .collect();
+    serde_json::Value::Array(tools)
   }
 
   #[napi]
@@ -763,6 +905,13 @@ impl Agent {
   }
 
   #[napi]
+  /// Remove live extension tools by name.
+  pub fn remove_live_tools(&self, names: Vec<String>) -> u32 {
+    let guard = self.inner.blocking_read();
+    guard.remove_live_async_tools(&names).min(u32::MAX as usize) as u32
+  }
+
+  #[napi]
   /// Append a live extension prompt fragment.
   pub fn add_live_prompt_section(&self, section: String) {
     self.inner.blocking_read().add_live_prompt_section(section);
@@ -814,21 +963,7 @@ impl Agent {
   /// Snapshot every registered skill as JSON.
   pub fn list_skills(&self) -> serde_json::Value {
     let guard = self.inner.blocking_read();
-    let skills: Vec<serde_json::Value> = guard
-      .all_skills()
-      .into_iter()
-      .map(|skill| {
-        serde_json::json!({
-            "name": skill.metadata.name,
-            "description": skill.metadata.description,
-            "category": skill.metadata.category.as_str(),
-            "path": skill.metadata.path.to_string_lossy(),
-            "directory": skill.skill_dir.to_string_lossy(),
-            "user_only": skill.metadata.user_only,
-            "instructions": skill.instructions,
-        })
-      })
-      .collect();
+    let skills: Vec<serde_json::Value> = guard.all_skills().into_iter().map(skill_json).collect();
     serde_json::Value::Array(skills)
   }
 
@@ -955,6 +1090,7 @@ impl Agent {
     Ok(())
   }
 
+  #[allow(clippy::too_many_arguments)]
   #[napi]
   /// Register `plugin` with the agent.
   pub fn register_plugin(
@@ -972,6 +1108,15 @@ impl Agent {
     on_tool_result: Option<
       ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
     >,
+    on_stream_token: Option<
+      ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    >,
+    on_turn_start: Option<
+      ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    >,
+    on_turn_end: Option<
+      ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    >,
   ) -> Result<()> {
     let js_plugin = crate::plugin::JSPlugin::new(
       name,
@@ -979,6 +1124,9 @@ impl Agent {
       on_llm_response,
       on_tool_call,
       on_tool_result,
+      on_stream_token,
+      on_turn_start,
+      on_turn_end,
     );
     let plugin_arc: std::sync::Arc<dyn agent::agent::plugin::AgentPlugin> =
       std::sync::Arc::new(js_plugin);
@@ -1053,6 +1201,7 @@ impl Agent {
     cancel_callback: Option<
       ThreadsafeFunction<String, napi::Unknown<'static>, String, napi::Status, true, true>,
     >,
+    metadata: Option<String>,
   ) -> Result<String> {
     let schema: serde_json::Value = serde_json::from_str(&schema).map_err(|e| {
       Error::new(
@@ -1060,17 +1209,58 @@ impl Agent {
         format!("invalid tool schema JSON: {e}"),
       )
     })?;
+    let metadata = parse_tool_metadata(metadata)?;
     let tool = JSTool {
       name: name.clone(),
       description,
       schema,
       cancelable,
+      metadata,
       callback: callback.into(),
       cancel_callback: cancel_callback.map(Arc::new),
     };
     let mut guard = self.inner.write().await;
     guard
       .try_add_async_tool(std::sync::Arc::new(tool))
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    Ok(name)
+  }
+
+  #[allow(clippy::too_many_arguments)] // positional JS arguments; a struct would change the JS API
+  #[napi]
+  /// Register a tool that a running turn can see immediately.
+  pub async fn add_live_tool(
+    &self,
+    name: String,
+    description: String,
+    _parameters: String,
+    schema: String,
+    callback: ThreadsafeFunction<JSAny, napi::Unknown<'static>, JSAny, napi::Status, true, true>,
+    cancelable: bool,
+    cancel_callback: Option<
+      ThreadsafeFunction<String, napi::Unknown<'static>, String, napi::Status, true, true>,
+    >,
+    metadata: Option<String>,
+  ) -> Result<String> {
+    let schema: serde_json::Value = serde_json::from_str(&schema).map_err(|e| {
+      Error::new(
+        napi::Status::InvalidArg,
+        format!("invalid tool schema JSON: {e}"),
+      )
+    })?;
+    let metadata = parse_tool_metadata(metadata)?;
+    let tool = JSTool {
+      name: name.clone(),
+      description,
+      schema,
+      cancelable,
+      metadata,
+      callback: callback.into(),
+      cancel_callback: cancel_callback.map(Arc::new),
+    };
+    let guard = self.inner.read().await;
+    guard
+      .add_live_async_tool(std::sync::Arc::new(tool))
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
     Ok(name)
   }
@@ -1110,6 +1300,53 @@ impl Agent {
     guard
       .register_skills_from_dir(std::path::PathBuf::from(dir_path))
       .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
+
+  #[napi]
+  /// Register an inline skill that a running turn can see immediately.
+  pub fn add_live_skill(
+    &self,
+    name: String,
+    description: String,
+    instructions: String,
+    path: Option<String>,
+  ) -> Result<()> {
+    let directory = std::path::PathBuf::from(path.unwrap_or_else(|| format!(".bos/skills/{name}")));
+    let skill = agent::skills::SkillContent {
+      metadata: agent::skills::SkillMetadata::new(name, description, directory.join("SKILL.md")),
+      instructions,
+      skill_dir: directory,
+    };
+    self.inner.blocking_read().add_live_skill(skill);
+    Ok(())
+  }
+
+  #[napi]
+  /// Load every skill in dirPath into the live extension overlay.
+  pub fn add_live_skills_from_dir(&self, dir_path: String) -> Result<u32> {
+    let guard = self.inner.blocking_read();
+    let added = guard
+      .add_live_skills_from_dir(std::path::PathBuf::from(dir_path))
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    Ok(added.min(u32::MAX as usize) as u32)
+  }
+
+  #[napi]
+  /// Remove live skills whose directory is one of the given paths.
+  pub fn remove_live_skills_by_paths(&self, paths: Vec<String>) -> u32 {
+    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+    let guard = self.inner.blocking_read();
+    guard
+      .remove_live_skills_by_paths(&paths)
+      .min(u32::MAX as usize) as u32
+  }
+
+  #[napi]
+  /// Every skill in the live extension overlay.
+  pub fn live_skills(&self) -> serde_json::Value {
+    let guard = self.inner.blocking_read();
+    let skills: Vec<serde_json::Value> = guard.live_skills().into_iter().map(skill_json).collect();
+    serde_json::Value::Array(skills)
   }
 
   #[napi]
@@ -1481,8 +1718,43 @@ impl Agent {
     Ok(())
   }
 
+  /// Ask the model to compact the session into a checkpoint now.
+  ///
+  /// Resolves to null when there is nothing worth folding, or to an object
+  /// with replaced/before_tokens/after_tokens/summary when a checkpoint landed.
   #[napi]
-  /// Compact the session, keeping recent turns.
+  pub async fn compact_now(&self, retain_tokens: i64) -> Result<Option<serde_json::Value>> {
+    if self.is_running.load(Ordering::SeqCst) {
+      return Err(Error::new(
+        napi::Status::GenericFailure,
+        "Agent is already running".to_string(),
+      ));
+    }
+    let retain_tokens = u64::try_from(retain_tokens).map_err(|_| {
+      Error::new(
+        napi::Status::InvalidArg,
+        "retain_tokens must be non-negative",
+      )
+    })? as usize;
+    let signal = AtomicBool::new(false);
+    let guard = self.inner.read().await;
+    let outcome = guard
+      .compact_now(retain_tokens, &signal)
+      .await
+      .map_err(|e| Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    Ok(outcome.map(|outcome| {
+      serde_json::json!({
+          "replaced": outcome.replaced,
+          "before_tokens": outcome.before_tokens,
+          "after_tokens": outcome.after_tokens,
+          "freed_tokens": outcome.freed_tokens(),
+          "summary": outcome.summary,
+      })
+    }))
+  }
+
+  #[napi]
+  /// Compact the session mechanically without a model call.
   pub fn compact_session(&self, keep_recent: u32, max_summary_chars: u32) -> Result<()> {
     let mut guard = self
       .inner

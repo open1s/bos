@@ -22,6 +22,8 @@ JavaScript and the app. This release tracks BSH 4.1.1; the binding API is unchan
 - **MCP Client** — Connect to [Model Context Protocol](https://modelcontextprotocol.io/) servers
 - **Python Tools** — Register Python functions as agent tools
 - **Skills** — Register capabilities from directory files or inline
+- **Live Tool and Skill Updates** — Add tools/skills to a running turn without rebuilding the agent
+- **Compaction** — Mechanical history compaction plus model-written checkpoints via `compact_now`
 - **Plans and Goals** — A shared working plan, durable goals, and the `update_plan`/`get_goal` tools
 - **Background Jobs** — A `JobRegistry` plus `job_output`/`job_kill` for detached processes
 - **Steering** — Queue a message into the running turn's next step

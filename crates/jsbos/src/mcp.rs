@@ -136,4 +136,71 @@ impl McpClient {
       .collect();
     Ok(serde_json::json!({ "contents": contents_json }))
   }
+
+  #[napi]
+  /// Fetch one prompt by name, with optional JSON arguments.
+  pub async fn get_prompt(
+    &self,
+    name: String,
+    arguments: Option<String>,
+  ) -> Result<serde_json::Value> {
+    let arguments = arguments
+      .map(|text| {
+        serde_json::from_str::<serde_json::Value>(&text)
+          .map_err(|e| napi::Error::new(napi::Status::InvalidArg, e.to_string()))
+      })
+      .transpose()?;
+    let result = self
+      .inner
+      .get_prompt(&name, arguments)
+      .await
+      .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    serde_json::to_value(&result)
+      .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
+
+  #[napi]
+  /// The capabilities the server reported during initialization.
+  pub async fn get_capabilities(&self) -> Result<Option<serde_json::Value>> {
+    match self.inner.get_capabilities().await {
+      Some(capabilities) => serde_json::to_value(&capabilities)
+        .map(Some)
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string())),
+      None => Ok(None),
+    }
+  }
+
+  #[napi]
+  /// Restart the MCP connection and return the new server capabilities.
+  pub async fn restart(&self) -> Result<serde_json::Value> {
+    let capabilities = self
+      .inner
+      .restart()
+      .await
+      .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    serde_json::to_value(&capabilities)
+      .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+  }
+
+  #[napi]
+  /// Detailed health status of the MCP connection.
+  pub fn health_status(&self) -> serde_json::Value {
+    let status = self.inner.health_status();
+    let (state, error) = match status.state {
+      agent::mcp::client::ConnectionState::Disconnected => ("disconnected", None),
+      agent::mcp::client::ConnectionState::Connecting => ("connecting", None),
+      agent::mcp::client::ConnectionState::Connected => ("connected", None),
+      agent::mcp::client::ConnectionState::Reconnecting => ("reconnecting", None),
+      agent::mcp::client::ConnectionState::Failed(ref message) => ("failed", Some(message.clone())),
+    };
+    serde_json::json!({
+        "state": state,
+        "error": error,
+        "initialized": status.initialized,
+        "last_ping": status.last_ping.map(|i| i.elapsed().as_secs_f64()),
+        "last_error": status.last_error,
+        "restart_count": status.restart_count,
+        "idle_duration": status.idle_duration.map(|d| d.as_secs_f64()),
+    })
+  }
 }

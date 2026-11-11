@@ -116,7 +116,7 @@ AgentBuilder(bus, options=None)
 | `with_mcp(ns, cmd, args)` | Add MCP server (process) | `AgentBuilder` |
 | `with_mcp_http(ns, url)` | Add MCP server (HTTP) | `AgentBuilder` |
 | `with_bash(name, workspace_root, jobs=None, session=None)` | Add bash tool, optionally routing background jobs | `AgentBuilder` |
-| `with_memory(memory, limit=5)` | Recall up to `limit` items from a `Memory` store on each text run | `AgentBuilder` |
+| `with_memory(memory, limit=5, metadata=None, auto_remember=False)` | Recall from a `Memory` store; optionally scope and auto-remember exchanges | `AgentBuilder` |
 | `with_max_steps(steps)` | Set the maximum ReAct steps | `AgentBuilder` |
 | `with_persona_complete(complete=True)` | Use the system prompt as the whole prompt | `AgentBuilder` |
 | `with_compaction_input_tokens(tokens)` | Cap one compaction request's input | `AgentBuilder` |
@@ -168,7 +168,12 @@ High-level agent wrapper with fluent API. Created via `BrainOS.agent()` or `Agen
 |--------|-------------|---------|
 | `ask(prompt)` | Run simple task | `str` |
 | `run_simple(message)` | Alias for `ask` | `str` |
-| `with_memory(memory, limit=5)` | Attach a store that recalls up to `limit` items per text run | `Agent` |
+| `with_memory(memory, limit=5, metadata=None, auto_remember=False)` | Attach a store; optionally scope recall and remember completed exchanges | `Agent` |
+| `remember(content, metadata=None)` | Store one memory item | `dict` |
+| `forget(item_id)` | Remove one memory item | `bool` |
+| `forget_all()` | Clear the attached store | `bool` |
+| `recall(query, limit=5)` | Recall items, honouring the metadata filter | `list[dict]` |
+| `recalled_context(query, limit=5)` | Recall items formatted for a prompt | `str \| None` |
 | `chat(message)` | Alias for `ask` | `str` |
 | `react(task)` | Run with ReAct reasoning | `str` |
 | `stream(task)` | Stream response tokens | `AsyncIterator` |
@@ -185,9 +190,17 @@ High-level agent wrapper with fluent API. Created via `BrainOS.agent()` or `Agen
 | `is_deferred_tool(name)` | Whether a tool is withheld from the advertised array | `bool` |
 | `has_deferred_tools()` | Whether any registered tool is withheld | `bool` |
 | `remove_tools(names)` | Remove asynchronous tools by name | `int` |
+| `add_live_tool(tool)` | Register a tool a running turn sees immediately | `Agent` |
+| `remove_live_tools(names)` | Remove live extension tools by name | `int` |
+| `tool_definitions()` | Every registered tool as a full definition, incl. live/MCP tools | `list[dict]` |
+| `model_tool_definitions()` | The tool array the model is actually offered | `list[dict]` |
 | `add_live_prompt_section(section)` | Append a live extension prompt fragment | `Agent` |
 | `remove_live_prompt_section(section)` | Remove one live extension prompt fragment | `bool` |
 | `register_skill(name, description, content, path=None)` | Register an inline skill | `Agent` |
+| `add_live_skill(name, description, content, path=None)` | Register a skill a running turn sees immediately | `Agent` |
+| `add_live_skills_from_dir(dir_path)` | Load a directory into the live skill overlay | `int` |
+| `remove_live_skills_by_paths(paths)` | Remove live skills by directory | `int` |
+| `live_skills()` | Every skill in the live overlay | `list[dict]` |
 | `remove_skills_by_names(names)` | Remove skills by name | `int` |
 | `list_skills()` | Snapshot every registered skill | `list[dict]` |
 | `context_budget(tokens=None)` | Read or set the send-side context budget | `int \| Agent` |
@@ -197,6 +210,8 @@ High-level agent wrapper with fluent API. Created via `BrainOS.agent()` or `Agen
 | `add_goal_tools(store)` | Register `get_goal`/`update_goal` against a `GoalStore` | `int` |
 | `add_job_tools(jobs, session="default")` | Register `job_output`/`job_kill` against a `JobRegistry` | `int` |
 | `add_bash_tool(name="bash", workspace_root=None, jobs=None, session=None)` | Register a sandboxed bash tool | `Agent` |
+| `compact_now(retain_tokens=0)` | Ask the model to write a context checkpoint now | `dict \| None` |
+| `close()` | Release runtime extensions and stop the agent | `None` |
 
 #### Properties
 
@@ -291,6 +306,7 @@ multiply = ToolDef(
     callback=lambda args: args["a"] * args["b"],
     parameters={"a": {"type": "number"}, "b": {"type": "number"}},
     schema={"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}},
+    metadata={"risk": "low", "side_effects": ["read"], "permissions": ["math"]},
 )
 
 # Async callback (auto-detected via inspect.iscoroutinefunction)
@@ -662,8 +678,12 @@ await client.initialize()
 | `list_tools()` | List available tools |
 | `call_tool(name, args_json)` | Call a tool |
 | `list_prompts()` | List prompts |
+| `get_prompt(name, arguments=None)` | Fetch one prompt, with optional JSON arguments |
+| `get_capabilities()` | Server capabilities reported at initialization |
 | `list_resources()` | List resources |
 | `read_resource(uri)` | Read resource by URI |
+| `restart()` | Restart and re-initialize the connection |
+| `health_status()` | Connection health snapshot |
 
 ---
 
@@ -779,6 +799,13 @@ agent = brain.agent("assistant").with_plugins(plugin)
 | `LlmResponseWrapper` | LLM response interceptor - fields: `response_type`, `content`, `tool_name`, `tool_args`, `tool_id` |
 | `ToolCallWrapper` | Tool call interceptor - fields: `name`, `args`, `id` |
 | `ToolResultWrapper` | Tool result interceptor - fields: `result`, `success`, `error` |
+| `StreamTokenWrapper` | Stream token interceptor - fields: `token_type`, `text`, `name`, `args`, `id`, `output`, `ms`, `usage` |
+| `TurnStartWrapper` | Turn-start interceptor - fields: `agent`, `input`, `metadata` |
+| `TurnEndWrapper` | Turn-end interceptor - fields: `agent`, `output`, `error` |
+
+Plugins may also define `on_stream_token(token)`, `on_turn_start(turn)` and
+`on_turn_end(turn)`. A callback may mutate and return the wrapper; returning
+`None` vetoes that step, matching the existing hooks.
 
 ---
 

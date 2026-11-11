@@ -7,6 +7,7 @@ import {
   Goal,
   GoalStore,
   JobRegistry,
+  ToolDef,
   renderTemplate,
   withMemory,
   estimateTokens,
@@ -188,10 +189,61 @@ test('job roster is empty and bounded', async (t) => {
 test('prompt-template helpers mirror the Rust template module', (t) => {
   t.is(renderTemplate('Hello {{ name }}!', { name: 'BOS' }), 'Hello BOS!')
   t.throws(() => renderTemplate('Hello {{name}}!', {}))
-  t.is(
-    withMemory('You are {{role}}.\n\n{{memory}}', 'Remember: tea.'),
-    'You are {{role}}.\n\nRemember: tea.',
-  )
+  t.is(withMemory('You are {{role}}.\n\n{{memory}}', 'Remember: tea.'), 'You are {{role}}.\n\nRemember: tea.')
   t.is(withMemory('base', 'Remember: tea.'), 'base\n\nRemember: tea.')
   t.true(estimateTokens('one two three') > 0)
+})
+
+test('skill metadata reports version and tags', async (t) => {
+  const agent = await started()
+  agent.registerSkill('reviewer', 'Review code', 'Read the diff first.')
+  const reviewer = agent.listSkills().find((skill) => skill.name === 'reviewer')
+  t.is(reviewer.version, '1.0.0')
+  t.deepEqual(reviewer.tags, [])
+})
+
+test('live skills are visible without restarting the agent', async (t) => {
+  const agent = await started()
+  agent.addLiveSkill('live', 'Live skill', 'Act now.')
+  t.true(agent.liveSkills().some((skill) => skill.name === 'live'))
+  t.true(agent.listSkills().some((skill) => skill.name === 'live'))
+
+  t.is(agent.removeLiveSkillsByPaths(['.bos/skills/live']), 1)
+  t.false(agent.liveSkills().some((skill) => skill.name === 'live'))
+})
+
+test('live tools appear in full definitions with metadata', async (t) => {
+  const agent = await started()
+  const tool = new ToolDef(
+    'lookup',
+    'Look up a record',
+    (args) => ({ ok: true }),
+    {},
+    { type: 'object', properties: {} },
+    null,
+    { risk: 'low', side_effects: ['read'], permissions: ['read'] },
+  )
+  t.is(await agent.addLiveTool(tool), agent)
+  t.true(agent.toolNames.includes('lookup'))
+
+  const lookup = agent.toolDefinitions().find((item) => item.name === 'lookup')
+  t.is(lookup.description, 'Look up a record')
+  t.is(lookup.metadata.risk, 'low')
+  t.deepEqual(lookup.metadata.permissions, ['read'])
+
+  t.is(agent.removeLiveTools(['lookup']), 1)
+  t.false(agent.toolNames.includes('lookup'))
+})
+
+test('compactNow on an empty session returns null', async (t) => {
+  const agent = await started()
+  t.is(await agent.compactNow(0), null)
+})
+
+test('close releases runtime extensions', async (t) => {
+  const agent = await started()
+  agent.addPlanTool()
+  t.true(agent.toolNames.includes('update_plan'))
+  agent.close()
+  t.deepEqual(agent.toolNames, [])
 })

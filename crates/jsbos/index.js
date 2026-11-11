@@ -35,8 +35,9 @@ const DEFAULT_MODEL = 'nvidia/meta/llama-3.1-8b-instruct';
 const DEFAULT_BASE_URL = 'https://integrate.api.nvidia.com/v1';
 
 class ToolDef {
-  constructor(name, description, callback, parameters = {}, schema = {}, cancelCallback = null) {
+  constructor(name, description, callback, parameters = {}, schema = {}, cancelCallback = null, metadata = null) {
     if (typeof schema === 'function') {
+      metadata = cancelCallback;
       cancelCallback = schema;
       schema = {};
     }
@@ -46,6 +47,7 @@ class ToolDef {
     this.parameters = parameters;
     this.schema = schema;
     this.cancelCallback = cancelCallback;
+    this.metadata = metadata;
   }
 }
 
@@ -616,6 +618,8 @@ class AgentBuilder {
     this._mcpServers = [];
     this._memory = options.memory || null;
     this._recallLimit = options.memoryRecallLimit || 5;
+    this._memoryMetadata = options.memoryMetadata || null;
+    this._autoRemember = options.autoRemember || false;
     this._deferredTools = [];
     this._deferredPrefixes = [];
     this._planTool = false;
@@ -828,10 +832,39 @@ class AgentBuilder {
     return this;
   }
 
-  withMemory(memory, limit = 5) {
+  withMemory(memory, limit = 5, metadata = null, autoRemember = false) {
     this._memory = memory;
     this._recallLimit = limit;
+    this._memoryMetadata = metadata;
+    this._autoRemember = autoRemember;
     return this;
+  }
+
+  remember(content, metadata = null) {
+    if (!this._memory) throw new Error('no memory store is attached');
+    return this._memory.add(content, metadata);
+  }
+
+  forget(id) {
+    return this._memory ? this._memory.remove(id) : false;
+  }
+
+  forgetAll() {
+    if (!this._memory) return false;
+    const hadItems = !this._memory.isEmpty();
+    this._memory.clear();
+    return hadItems;
+  }
+
+  recall(query, limit = 5) {
+    if (!this._memory) return [];
+    return this._memory.search(query, limit, this._memoryMetadata);
+  }
+
+  recalledContext(query, limit = 5) {
+    if (!this._memory) return null;
+    const block = this._memory.recallBlock(query, limit, this._memoryMetadata);
+    return block || null;
   }
 
   tools(...tools) {
@@ -948,6 +981,7 @@ class AgentBuilder {
         callbackWrapper,
         !!td.cancelCallback,
         cancelWrapper,
+        td.metadata ? JSON.stringify(td.metadata) : null,
       );
     }
 
@@ -965,7 +999,16 @@ class AgentBuilder {
     }
 
     for (const p of this._plugins) {
-      this._inner.registerPlugin(p.name, p.on_llm_request || p.onLlmRequest || p.onRequest, p.on_llm_response || p.onLlmResponse || p.onResponse, p.on_tool_call || p.onToolCall, p.on_tool_result || p.onToolResult);
+      this._inner.registerPlugin(
+        p.name,
+        p.on_llm_request || p.onLlmRequest || p.onRequest,
+        p.on_llm_response || p.onLlmResponse || p.onResponse,
+        p.on_tool_call || p.onToolCall,
+        p.on_tool_result || p.onToolResult,
+        p.on_stream_token || p.onStreamToken,
+        p.on_turn_start || p.onTurnStart,
+        p.on_turn_end || p.onTurnEnd,
+      );
     }
 
     for (const s of this._skills) {
@@ -1038,7 +1081,11 @@ class AgentBuilder {
 
   _withMemory(prompt, content) {
     if (!this._memory || typeof prompt !== 'string') return content;
-    const block = this._memory.recallBlock(prompt, this._recallLimit);
+    const block = this._memory.recallBlock(
+      prompt,
+      this._recallLimit,
+      this._memoryMetadata,
+    );
     if (!block) return content;
     if (Array.isArray(content) && content.length > 0 && content[0].type === 'text') {
       return [{ ...content[0], text: block + '\n\n' + content[0].text }, ...content.slice(1)];
@@ -1046,10 +1093,21 @@ class AgentBuilder {
     return content;
   }
 
+  _rememberExchange(prompt, reply) {
+    if (!this._autoRemember || !this._memory) return;
+    if (typeof prompt !== 'string' || !prompt.trim()) return;
+    if (typeof reply !== 'string' || !reply.trim()) return;
+    this._memory.add(
+      'User: ' + prompt.trim() + '\nAssistant: ' + reply.trim().slice(0, 4000),
+    );
+  }
+
   async ask(prompt) {
     if (!this._inner) await this.start();
     const content = this._resolveContent(prompt);
-    return this._inner.runSimple(this._withMemory(prompt, content));
+    const reply = await this._inner.runSimple(this._withMemory(prompt, content));
+    this._rememberExchange(prompt, reply);
+    return reply;
   }
 
   async chat(message) {
@@ -1063,7 +1121,9 @@ class AgentBuilder {
   async react(task) {
     if (!this._inner) await this.start();
     const content = this._resolveContent(task);
-    return this._inner.react(this._withMemory(task, content));
+    const reply = await this._inner.react(this._withMemory(task, content));
+    this._rememberExchange(task, reply);
+    return reply;
   }
 
   async stream(task, onToken) {
@@ -1103,6 +1163,17 @@ class AgentBuilder {
   isRunning() {
     if (!this._inner) return false;
     return this._inner.isRunning();
+  }
+
+  close() {
+    if (!this._inner) throw new Error('Agent not started');
+    this._inner.close();
+    return this;
+  }
+
+  async compactNow(retainTokens = 0) {
+    if (!this._inner) throw new Error('Agent not started');
+    return this._inner.compactNow(retainTokens);
   }
 
   get session() {
@@ -1182,6 +1253,52 @@ class AgentBuilder {
     return this._requireAgent('removeTools()').removeTools(names);
   }
 
+  async addLiveTool(toolDef) {
+    const inner = this._requireAgent('addLiveTool()');
+    const td = toolDef instanceof ToolDef ? toolDef : new ToolDef(
+      toolDef.name,
+      toolDef.description,
+      toolDef.callback,
+      toolDef.parameters || {},
+      toolDef.schema || {},
+      toolDef.cancelCallback || null,
+      toolDef.metadata || null,
+    );
+    const callbackWrapper = async (err, args) => {
+      if (err) throw err;
+      return td.callback(args);
+    };
+    const cancelWrapper = td.cancelCallback
+      ? (err, callId) => {
+          td.cancelCallback(callId);
+        }
+      : null;
+    await inner.addLiveTool(
+      td.name,
+      td.description,
+      JSON.stringify(td.parameters),
+      JSON.stringify(td.schema),
+      callbackWrapper,
+      !!td.cancelCallback,
+      cancelWrapper,
+      td.metadata ? JSON.stringify(td.metadata) : null,
+    );
+    this._tools.add(td);
+    return this;
+  }
+
+  removeLiveTools(names) {
+    return this._requireAgent('removeLiveTools()').removeLiveTools(names);
+  }
+
+  toolDefinitions() {
+    return this._requireAgent('toolDefinitions()').toolDefinitions();
+  }
+
+  modelToolDefinitions() {
+    return this._requireAgent('modelToolDefinitions()').modelToolDefinitions();
+  }
+
   addLivePromptSection(section) {
     if (this._inner) {
       this._inner.addLivePromptSection(section);
@@ -1205,6 +1322,23 @@ class AgentBuilder {
       this._skills.push({ name, description, content, path });
     }
     return this;
+  }
+
+  addLiveSkill(name, description, content, path = null) {
+    this._requireAgent('addLiveSkill()').addLiveSkill(name, description, content, path);
+    return this;
+  }
+
+  addLiveSkillsFromDir(dirPath) {
+    return this._requireAgent('addLiveSkillsFromDir()').addLiveSkillsFromDir(dirPath);
+  }
+
+  removeLiveSkillsByPaths(paths) {
+    return this._requireAgent('removeLiveSkillsByPaths()').removeLiveSkillsByPaths(paths);
+  }
+
+  liveSkills() {
+    return this._requireAgent('liveSkills()').liveSkills();
   }
 
   removeSkillsByNames(names) {
@@ -2092,8 +2226,8 @@ class Memory {
     return this._items.length === 0;
   }
 
-  recallBlock(query, limit = 5) {
-    const hits = this.search(query, limit);
+  recallBlock(query, limit = 5, metadata = null) {
+    const hits = this.search(query, limit, metadata);
     if (hits.length === 0) return '';
     return 'Relevant memory:' + hits.map((hit) => '\n- ' + hit.content).join('');
   }

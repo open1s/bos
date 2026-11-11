@@ -19,6 +19,10 @@ export declare class Agent {
   config(): any
   /** List registered tool names. */
   listTools(): Array<string>
+  /** Every registered tool as a full definition, including live and MCP tools. */
+  toolDefinitions(): any
+  /** The tool array the model is actually offered, as full definitions. */
+  modelToolDefinitions(): any
   /** List registered async tool names. */
   listAsyncTools(): Array<string>
   /** Snapshot the agent's working plan as `{ text, status }` items. */
@@ -49,6 +53,8 @@ export declare class Agent {
   hasDeferredTools(): boolean
   /** Remove asynchronous tools by name; returns how many were removed. */
   removeTools(names: Array<string>): number
+  /** Remove live extension tools by name. */
+  removeLiveTools(names: Array<string>): number
   /** Append a live extension prompt fragment. */
   addLivePromptSection(section: string): void
   /** Remove one live extension prompt fragment. */
@@ -82,7 +88,7 @@ export declare class Agent {
   /** Register `hook` for `event`. */
   registerHook(event: HookEvent, callback: ((err: Error | null, arg: HookContextData) => unknown)): void
   /** Register `plugin` with the agent. */
-  registerPlugin(name: string, onLlmRequest?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onLlmResponse?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onToolCall?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onToolResult?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null): void
+  registerPlugin(name: string, onLlmRequest?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onLlmResponse?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onToolCall?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onToolResult?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onStreamToken?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onTurnStart?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null, onTurnEnd?: (((err: Error | null, arg: JSAny) => unknown)) | undefined | null): void
   /** Close the agent and release resources. */
   close(): void
   /** Stop the running agent. */
@@ -90,7 +96,9 @@ export declare class Agent {
   /** Whether the agent is running. */
   isRunning(): boolean
   /** Register a tool implemented in JavaScript. */
-  addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => unknown), cancelable: boolean, cancelCallback?: (((err: Error | null, arg: string) => unknown)) | undefined | null): Promise<string>
+  addTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => unknown), cancelable: boolean, cancelCallback?: (((err: Error | null, arg: string) => unknown)) | undefined | null, metadata?: string | undefined | null): Promise<string>
+  /** Register a tool that a running turn can see immediately. */
+  addLiveTool(name: string, description: string, parameters: string, schema: string, callback: ((err: Error | null, arg: JSAny) => unknown), cancelable: boolean, cancelCallback?: (((err: Error | null, arg: string) => unknown)) | undefined | null, metadata?: string | undefined | null): Promise<string>
   /**
    * Register a sandboxed bash tool.
    *
@@ -100,6 +108,14 @@ export declare class Agent {
   addBashTool(name: string, workspaceRoot?: string | undefined | null, jobs?: JobRegistry | undefined | null, session?: string | undefined | null): Promise<void>
   /** Register skills discovered in `dir_path`. */
   registerSkillsFromDir(dirPath: string): Promise<void>
+  /** Register an inline skill that a running turn can see immediately. */
+  addLiveSkill(name: string, description: string, instructions: string, path?: string | undefined | null): void
+  /** Load every skill in dirPath into the live extension overlay. */
+  addLiveSkillsFromDir(dirPath: string): number
+  /** Remove live skills whose directory is one of the given paths. */
+  removeLiveSkillsByPaths(paths: Array<string>): number
+  /** Every skill in the live extension overlay. */
+  liveSkills(): any
   /** Add a stdio MCP server. */
   addMcpServer(namespace: string, command: string, args: Array<string>): Promise<void>
   /** Add an HTTP MCP server under `namespace`. */
@@ -136,7 +152,14 @@ export declare class Agent {
   setSessionContext(context: any): void
   /** Reset the opaque session context to null. */
   clearSessionContext(): void
-  /** Compact the session, keeping recent turns. */
+  /**
+   * Ask the model to compact the session into a checkpoint now.
+   *
+   * Resolves to null when there is nothing worth folding, or to an object
+   * with replaced/before_tokens/after_tokens/summary when a checkpoint landed.
+   */
+  compactNow(retainTokens: number): Promise<any | null>
+  /** Compact the session mechanically without a model call. */
   compactSession(keepRecent: number, maxSummaryChars: number): void
   /** Persist the agent's conversation to a file path. */
   saveMessageLog(path: string): void
@@ -445,6 +468,14 @@ export declare class McpClient {
   listResources(): Promise<Array<any>>
   /** Read a resource by URI. */
   readResource(uri: string): Promise<any>
+  /** Fetch one prompt by name, with optional JSON arguments. */
+  getPrompt(name: string, arguments?: string | undefined | null): Promise<any>
+  /** The capabilities the server reported during initialization. */
+  getCapabilities(): Promise<any | null>
+  /** Restart the MCP connection and return the new server capabilities. */
+  restart(): Promise<any>
+  /** Detailed health status of the MCP connection. */
+  healthStatus(): any
 }
 
 /**
@@ -995,6 +1026,8 @@ export class AgentBuilder {
     _mcpServers: any[];
     _memory: any;
     _recallLimit: any;
+    _memoryMetadata: any;
+    _autoRemember: any;
     _deferredTools: any[];
     _deferredPrefixes: any[];
     _planTool: boolean;
@@ -1048,7 +1081,12 @@ export class AgentBuilder {
     isDeferredTool(name: any): boolean;
     hasDeferredTools(): boolean;
     planTool(enabled?: boolean): this;
-    withMemory(memory: any, limit?: number): this;
+    withMemory(memory: any, limit?: number, metadata?: null, autoRemember?: boolean): this;
+    remember(content: any, metadata?: null): any;
+    forget(id: any): any;
+    forgetAll(): boolean;
+    recall(query: any, limit?: number): any;
+    recalledContext(query: any, limit?: number): any;
     tools(...tools: any[]): this;
     register(...tools: any[]): this;
     withTools(...tools: any[]): this;
@@ -1068,6 +1106,7 @@ export class AgentBuilder {
     _contentPartsToJsContentArray(input: any): any;
     _resolveContent(input: any): any;
     _withMemory(prompt: any, content: any): any;
+    _rememberExchange(prompt: any, reply: any): void;
     ask(prompt: any): Promise<string>;
     chat(message: any): Promise<string>;
     runSimple(prompt: any): Promise<string>;
@@ -1076,6 +1115,8 @@ export class AgentBuilder {
     streamCollect(task: any): Promise<any[]>;
     stop(options?: {}): any;
     isRunning(): boolean;
+    close(): this;
+    compactNow(retainTokens?: number): Promise<any>;
     get session(): SessionManager;
     get config(): any;
     get toolNames(): any[];
@@ -1093,9 +1134,17 @@ export class AgentBuilder {
     steerDepth(): number;
     takeUndeliveredSteers(): number[];
     removeTools(names: any): number;
+    addLiveTool(toolDef: any): Promise<this>;
+    removeLiveTools(names: any): number;
+    toolDefinitions(): any;
+    modelToolDefinitions(): any;
     addLivePromptSection(section: any): this;
     removeLivePromptSection(section: any): boolean;
     registerSkill(name: any, description: any, content: any, path?: null): this;
+    addLiveSkill(name: any, description: any, content: any, path?: null): this;
+    addLiveSkillsFromDir(dirPath: any): number;
+    removeLiveSkillsByPaths(paths: any): number;
+    liveSkills(): any;
     removeSkillsByNames(names: any): number;
     listSkills(): any;
     addGoalTools(store: any): number;
@@ -1104,13 +1153,14 @@ export class AgentBuilder {
 }
 export function tool(descriptionOrOptions: any, maybeOptions?: {}): (target: any, propertyKey: any, descriptor: any) => any;
 export class ToolDef {
-    constructor(name: any, description: any, callback: any, parameters?: {}, schema?: {}, cancelCallback?: null);
+    constructor(name: any, description: any, callback: any, parameters?: {}, schema?: {}, cancelCallback?: null, metadata?: null);
     name: any;
     description: any;
     callback: any;
     parameters: {};
     schema: {};
     cancelCallback: any;
+    metadata: any;
 }
 export class ToolResult {
     static success(data: any, metadata?: {}): ToolResult;
@@ -1367,7 +1417,7 @@ export class Memory {
     save(path: any): number;
     len(): number;
     isEmpty(): boolean;
-    recallBlock(query: any, limit?: number): string;
+    recallBlock(query: any, limit?: number, metadata?: null): string;
     toJSON(): any[];
 }
 export const Goal: typeof jsbos.Goal;

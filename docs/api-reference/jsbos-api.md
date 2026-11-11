@@ -100,7 +100,11 @@ new AgentBuilder(bus, options = {})
 | `skillsDir(dirPath)` | Load skills from directory | `AgentBuilder` |
 | `mcp(ns, cmd, args)` | Add MCP server (process) | `AgentBuilder` |
 | `mcpHttp(ns, url)` | Add MCP server (HTTP) | `AgentBuilder` |
-| `withMemory(memory, limit)` | Recall up to `limit` items from a `Memory` store on each text run | `AgentBuilder` |
+| `withMemory(memory, limit, metadata, autoRemember)` | Recall from a `Memory` store; optionally scope and auto-remember exchanges | `AgentBuilder` |
+| `remember(content, metadata)` | Store one memory item | `object` |
+| `forget(id)` / `forgetAll()` | Remove one or all memory items | `boolean` |
+| `recall(query, limit)` | Recall items, honouring the metadata filter | `Array<object>` |
+| `recalledContext(query, limit)` | Recall items formatted for a prompt | `string \| null` |
 | `maxSteps(steps)` | Set the maximum ReAct steps | `AgentBuilder` |
 | `personaComplete(complete)` | Use the system prompt as the whole prompt | `AgentBuilder` |
 | `compactionInputTokens(tokens)` | Cap one compaction request's input | `AgentBuilder` |
@@ -128,9 +132,17 @@ new AgentBuilder(bus, options = {})
 | `steerDepth()` | Number of steered messages waiting | `number` |
 | `takeUndeliveredSteers()` | Take back steered messages no step delivered | `number[]` |
 | `removeTools(names)` | Remove asynchronous tools by name | `number` |
+| `addLiveTool(tool)` | Register a tool a running turn sees immediately | `Promise<AgentBuilder>` |
+| `removeLiveTools(names)` | Remove live extension tools by name | `number` |
+| `toolDefinitions()` | Every registered tool as a full definition | `Array<object>` |
+| `modelToolDefinitions()` | The tool array the model is actually offered | `Array<object>` |
 | `addLivePromptSection(section)` | Append a live extension prompt fragment | `AgentBuilder` |
 | `removeLivePromptSection(section)` | Remove one live extension prompt fragment | `boolean` |
 | `registerSkill(name, description, content, path)` | Register an inline skill | `AgentBuilder` |
+| `addLiveSkill(name, description, content, path)` | Register a skill a running turn sees immediately | `AgentBuilder` |
+| `addLiveSkillsFromDir(dirPath)` | Load a directory into the live skill overlay | `number` |
+| `removeLiveSkillsByPaths(paths)` | Remove live skills by directory | `number` |
+| `liveSkills()` | Every skill in the live overlay | `Array<object>` |
 | `removeSkillsByNames(names)` | Remove skills by name | `number` |
 | `listSkills()` | Snapshot every registered skill | `Array<object>` |
 | `addGoalTools(store)` | Register `get_goal`/`update_goal` against a `GoalStore` | `number` |
@@ -150,6 +162,8 @@ new AgentBuilder(bus, options = {})
 | `streamCollect(task)` | Collect all streaming tokens | `Promise<Array>` |
 | `stop(options)` | Stop the agent | `object` |
 | `isRunning()` | Check if agent is running | `boolean` |
+| `compactNow(retainTokens)` | Ask the model to write a context checkpoint now | `Promise<object \| null>` |
+| `close()` | Release runtime extensions and stop the agent | `AgentBuilder` |
 
 #### Properties
 
@@ -265,7 +279,7 @@ Tool definition class for creating tools. Supports both sync and async callbacks
 #### Constructor
 
 ```javascript
-new ToolDef(name, description, callback, parameters = {}, schema = {})
+new ToolDef(name, description, callback, parameters = {}, schema = {}, cancelCallback = null, metadata = null)
 ```
 
 Parameters:
@@ -273,6 +287,7 @@ Parameters:
 - `description` (string): Tool description
 - `callback` (Function): `(args) => result` — can be sync or return a Promise
 - `parameters` (object): Parameter definitions
+- `metadata` (object, optional): Capability metadata (`version`, `risk`, `side_effects`, `permissions`, `timeout_ms`, `max_output_bytes`)
 - `schema` (object): JSON Schema
 
 #### Example - Sync Tool
@@ -641,8 +656,12 @@ await client.initialize();
 | `listTools()` | List available tools | `Promise<Array>` |
 | `callTool(name, argsJson)` | Call a tool | `Promise<string>` |
 | `listPrompts()` | List prompts | `Promise<Array>` |
+| `getPrompt(name, arguments)` | Fetch one prompt, with optional JSON arguments | `Promise<object>` |
+| `getCapabilities()` | Server capabilities reported at initialization | `Promise<object \| null>` |
 | `listResources()` | List resources | `Promise<Array>` |
 | `readResource(uri)` | Read resource by URI | `Promise<string>` |
+| `restart()` | Restart and re-initialize the connection | `Promise<object>` |
+| `healthStatus()` | Connection health snapshot | `object` |
 
 ---
 
@@ -714,6 +733,26 @@ brain.agent('assistant').with_hooks({
   [HookEvent.AfterLlmCall]: asyncAfterLlmHook,
 });
 ```
+
+---
+
+## Plugins
+
+Plugins intercept LLM requests/responses, tool calls/results, stream tokens, and turn boundaries. Register handlers with `agent.plugin(name, handlers)` or `agent.plugins(...)`.
+
+| Handler | Argument | Description |
+|---------|----------|-------------|
+| `onLlmRequest` | request | Rewrite an outgoing request; return it (or `null` to keep it) |
+| `onLlmResponse` | response | Rewrite a response |
+| `onToolCall` | call | Rewrite a tool call |
+| `onToolResult` | result | Rewrite a tool result |
+| `onStreamToken` | token | Observe or rewrite one stream token |
+| `onTurnStart` | turn | Observe a turn before it starts |
+| `onTurnEnd` | turn | Observe a finished turn |
+
+`onStreamToken` receives `{ type, text?, name?, args?, id?, output?, ms?, usage? }`;
+`onTurnStart` receives `{ agent, input, metadata }`; `onTurnEnd` receives
+`{ agent, output?, error? }`. Returning `null` keeps the original value.
 
 ---
 

@@ -15,6 +15,7 @@ class ToolDef:
     callback: Callable[[dict], Any]
     parameters: dict[str, Any] = field(default_factory=dict)
     schema: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] | None = None
 
 
 class ToolResult:

@@ -196,6 +196,58 @@ impl PyMcpClient {
         })
     }
 
+    /// Fetch one prompt by name, with optional JSON arguments.
+    ///
+    /// Args:
+    ///     name: Prompt name
+    ///     arguments: Optional JSON object of prompt arguments
+    ///
+    /// Returns:
+    ///     dict with keys: description, messages
+    fn get_prompt<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        arguments: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let arguments = arguments
+            .map(|text| {
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+            })
+            .transpose()?;
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let result = client
+                .get_prompt(&name, arguments)
+                .await
+                .map_err(to_py_runtime_error)?;
+            let value = serde_json::to_value(&result)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            Python::attach(|py| json_to_py(py, &value))
+        })
+    }
+
+    /// The capabilities the server reported during initialization.
+    ///
+    /// Returns:
+    ///     dict with tools/resources/prompts, or None before initialization
+    fn get_capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            match client.get_capabilities().await {
+                Some(capabilities) => {
+                    let value = serde_json::to_value(&capabilities)
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                    Python::attach(|py| json_to_py(py, &value))
+                }
+                None => Ok(Python::attach(|py| py.None())),
+            }
+        })
+    }
+
     /// Restart the MCP client connection.
     ///
     /// This will reinitialize the connection to the MCP server,

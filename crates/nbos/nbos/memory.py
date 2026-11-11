@@ -141,9 +141,14 @@ class Memory:
         """Serialize every item to a JSON array."""
         return json.dumps(self.all())
 
-    def recall_block(self, query: str, limit: int = 5) -> str:
+    def recall_block(
+        self,
+        query: str,
+        limit: int = 5,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
         """Format up to ``limit`` relevant items as a prompt preamble."""
-        hits = self.search(query, limit)
+        hits = self.search(query, limit, metadata)
         if not hits:
             return ""
         return "Relevant memory:" + "".join("\n- " + h["content"] for h in hits)

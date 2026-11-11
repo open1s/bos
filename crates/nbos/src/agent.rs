@@ -84,6 +84,104 @@ fn content_to_py(py: Python<'_>, content: &Content) -> PyResult<Py<PyAny>> {
     json_to_py(py, &json_value)
 }
 
+fn parse_tool_metadata(json: Option<String>) -> PyResult<Option<agent::tools::ToolMetadata>> {
+    let Some(json) = json else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid tool metadata JSON: {e}"))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("tool metadata must be a JSON object")
+    })?;
+    let mut metadata = agent::tools::ToolMetadata::new();
+    if let Some(version) = object.get("version").and_then(|v| v.as_str()) {
+        metadata = metadata.with_version(version);
+    }
+    if let Some(risk) = object.get("risk").and_then(|v| v.as_str()) {
+        metadata = metadata.with_risk(risk);
+    }
+    if let Some(effects) = object.get("side_effects").and_then(|v| v.as_array()) {
+        metadata = metadata.with_side_effects(
+            effects
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string)),
+        );
+    }
+    if let Some(permissions) = object.get("permissions").and_then(|v| v.as_array()) {
+        metadata = metadata.with_permissions(
+            permissions
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string)),
+        );
+    }
+    if let Some(timeout) = object.get("timeout_ms").and_then(|v| v.as_u64()) {
+        metadata = metadata.with_timeout_ms(timeout);
+    }
+    if let Some(cap) = object.get("max_output_bytes").and_then(|v| v.as_u64()) {
+        metadata = metadata.with_max_output_bytes(cap);
+    }
+    Ok(Some(metadata))
+}
+
+fn tool_metadata_json(metadata: &agent::tools::ToolMetadata) -> serde_json::Value {
+    serde_json::json!({
+        "version": metadata.version,
+        "risk": metadata.risk,
+        "side_effects": metadata.side_effects,
+        "permissions": metadata.permissions,
+        "timeout_ms": metadata.timeout_ms,
+        "max_output_bytes": metadata.max_output_bytes,
+    })
+}
+
+fn tool_metadata_map(agent: &Agent) -> BTreeMap<String, serde_json::Value> {
+    let mut map = BTreeMap::new();
+    if let Some(registry) = agent.registry() {
+        for (name, tool) in registry.iter() {
+            if let Some(metadata) = tool.metadata() {
+                map.insert(name.clone(), tool_metadata_json(metadata));
+            }
+        }
+        for name in registry.async_tool_names() {
+            if let Some(tool) = registry.get_async(&name) {
+                if let Some(metadata) = tool.metadata() {
+                    map.insert(name, tool_metadata_json(metadata));
+                }
+            }
+        }
+    }
+    if let Ok(live) = agent.live_tools().read() {
+        for (name, tool) in live.iter() {
+            if let Some(metadata) = tool.metadata() {
+                map.insert(name.clone(), tool_metadata_json(metadata));
+            }
+        }
+        for name in live.async_tool_names() {
+            if let Some(tool) = live.get_async(&name) {
+                if let Some(metadata) = tool.metadata() {
+                    map.insert(name, tool_metadata_json(metadata));
+                }
+            }
+        }
+    }
+    map
+}
+
+fn skill_json(skill: agent::skills::SkillContent) -> serde_json::Value {
+    serde_json::json!({
+        "name": skill.metadata.name,
+        "description": skill.metadata.description,
+        "category": skill.metadata.category.as_str(),
+        "version": skill.metadata.version.display(),
+        "tags": skill.metadata.tags,
+        "path": skill.metadata.path.to_string_lossy(),
+        "directory": skill.skill_dir.to_string_lossy(),
+        "user_only": skill.metadata.user_only,
+        "instructions": skill.instructions,
+    })
+}
+
 /// Python wrapper for LlmMessage
 #[pyclass(name = "LlmMessage", skip_from_py_object)]
 pub struct PyLlmMessage {
@@ -276,12 +374,13 @@ pub struct PyPythonTool {
     cancelable: bool,
     callback: Py<PyAny>,
     cancel_callback: Option<Py<PyAny>>,
+    metadata: Option<agent::tools::ToolMetadata>,
 }
 
 #[pymethods]
 impl PyPythonTool {
     #[new]
-    #[pyo3(signature = (name, description, parameters, schema, callback, cancel_callback=None))]
+    #[pyo3(signature = (name, description, parameters, schema, callback, cancel_callback=None, metadata=None))]
     fn new(
         name: String,
         description: String,
@@ -289,6 +388,7 @@ impl PyPythonTool {
         schema: String,
         callback: Py<PyAny>,
         cancel_callback: Option<Py<PyAny>>,
+        metadata: Option<String>,
     ) -> PyResult<Self> {
         let _ = parameters;
         // A tool registered with a malformed schema would silently reach the
@@ -303,6 +403,7 @@ impl PyPythonTool {
             cancelable: false,
             callback,
             cancel_callback,
+            metadata: parse_tool_metadata(metadata)?,
         })
     }
 
@@ -343,6 +444,7 @@ struct PyPythonToolWrapper {
     name: String,
     description: String,
     schema: serde_json::Value,
+    metadata: Option<agent::tools::ToolMetadata>,
 }
 
 #[async_trait]
@@ -357,6 +459,10 @@ impl AsyncTool for PyPythonToolWrapper {
 
     fn json_schema(&self) -> serde_json::Value {
         self.schema.clone()
+    }
+
+    fn metadata(&self) -> Option<&agent::tools::ToolMetadata> {
+        self.metadata.as_ref()
     }
 
     fn is_cancelable(&self) -> bool {
@@ -1169,6 +1275,20 @@ impl PyAgent {
         Ok(self.is_running.load(std::sync::atomic::Ordering::SeqCst))
     }
 
+    /// Release runtime extensions and stop the agent.
+    fn close(&self) -> PyResult<()> {
+        use std::sync::atomic::Ordering;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.clear_runtime_extensions();
+        guard.stop();
+        self.stop_flag.store(true, Ordering::SeqCst);
+        self.is_running.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn stream<'py>(&self, py: Python<'py>, task: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
         use std::sync::atomic::Ordering;
         if self.is_running.load(Ordering::SeqCst) {
@@ -1433,19 +1553,52 @@ impl PyAgent {
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        if let Some(registry) = guard.registry() {
-            // Tools added through the bindings are registered as async tools, so
-            // a sync-only listing would hide every Python-registered tool.
-            let mut tools: Vec<String> = registry.iter().map(|(name, _)| name.clone()).collect();
-            for name in registry.async_tool_names() {
-                if !tools.contains(&name) {
-                    tools.push(name);
+        // all_tools includes the build registry and the live extension overlay,
+        // so a tool added during a run shows up here immediately.
+        Ok(guard
+            .all_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect())
+    }
+
+    /// Every registered tool as a full definition, including live and MCP tools.
+    fn tool_definitions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let metadata = tool_metadata_map(&guard);
+        let tools: Vec<serde_json::Value> = guard
+            .all_tools()
+            .into_iter()
+            .map(|tool| {
+                let deferred = guard.is_deferred_tool(&tool.name);
+                let mut value = serde_json::to_value(&tool).unwrap_or_default();
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("deferred".to_string(), serde_json::Value::Bool(deferred));
+                    if let Some(entry) = metadata.get(&tool.name) {
+                        object.insert("metadata".to_string(), entry.clone());
+                    }
                 }
-            }
-            Ok(tools)
-        } else {
-            Ok(Vec::new())
-        }
+                value
+            })
+            .collect();
+        json_to_py(py, &serde_json::Value::Array(tools))
+    }
+
+    /// The tool array the model is actually offered, as full definitions.
+    fn model_tool_definitions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let tools: Vec<serde_json::Value> = guard
+            .model_tools()
+            .into_iter()
+            .map(|tool| serde_json::to_value(&tool).unwrap_or_default())
+            .collect();
+        json_to_py(py, &serde_json::Value::Array(tools))
     }
 
     /// Snapshot the agent's working plan as `{ text, status }` items.
@@ -1670,21 +1823,8 @@ impl PyAgent {
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        let skills: Vec<serde_json::Value> = guard
-            .all_skills()
-            .into_iter()
-            .map(|skill| {
-                serde_json::json!({
-                    "name": skill.metadata.name,
-                    "description": skill.metadata.description,
-                    "category": skill.metadata.category.as_str(),
-                    "path": skill.metadata.path.to_string_lossy(),
-                    "directory": skill.skill_dir.to_string_lossy(),
-                    "user_only": skill.metadata.user_only,
-                    "instructions": skill.instructions,
-                })
-            })
-            .collect();
+        let skills: Vec<serde_json::Value> =
+            guard.all_skills().into_iter().map(skill_json).collect();
         json_to_py(py, &serde_json::Value::Array(skills))
     }
 
@@ -1842,6 +1982,77 @@ impl PyAgent {
         })
     }
 
+    /// Register an inline skill that a running turn can see immediately.
+    #[pyo3(signature = (name, description, instructions, path = None))]
+    fn add_live_skill(
+        &self,
+        name: String,
+        description: String,
+        instructions: String,
+        path: Option<String>,
+    ) -> PyResult<()> {
+        let directory =
+            std::path::PathBuf::from(path.unwrap_or_else(|| format!(".bos/skills/{name}")));
+        let skill = agent::skills::SkillContent {
+            metadata: agent::skills::SkillMetadata::new(
+                name,
+                description,
+                directory.join("SKILL.md"),
+            ),
+            instructions,
+            skill_dir: directory,
+        };
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        guard.add_live_skill(skill);
+        Ok(())
+    }
+
+    /// Load every skill in dir_path into the live extension overlay.
+    fn add_live_skills_from_dir<'py>(
+        &self,
+        py: Python<'py>,
+        dir_path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let agent = self.inner.clone();
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let guard = agent
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+            let added = guard
+                .add_live_skills_from_dir(std::path::PathBuf::from(dir_path))
+                .map_err(to_py_runtime_error)?;
+            Ok(added)
+        })
+    }
+
+    /// Remove live skills whose directory is one of the given paths.
+    fn remove_live_skills_by_paths(&self, paths: Vec<String>) -> PyResult<u32> {
+        let paths: Vec<std::path::PathBuf> =
+            paths.into_iter().map(std::path::PathBuf::from).collect();
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard
+            .remove_live_skills_by_paths(&paths)
+            .min(u32::MAX as usize) as u32)
+    }
+
+    /// Every skill in the live extension overlay.
+    fn live_skills(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        let skills: Vec<serde_json::Value> =
+            guard.live_skills().into_iter().map(skill_json).collect();
+        json_to_py(py, &serde_json::Value::Array(skills))
+    }
+
     fn add_tool<'py>(
         &self,
         py: Python<'py>,
@@ -1855,6 +2066,7 @@ impl PyAgent {
         let tool_schema: serde_json::Value = serde_json::from_str(&tool_schema).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid tool schema JSON: {e}"))
         })?;
+        let tool_metadata = py_tool.metadata.clone();
         drop(py_tool);
 
         let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
@@ -1865,6 +2077,7 @@ impl PyAgent {
                 name: tool_name,
                 description: tool_description,
                 schema: tool_schema,
+                metadata: tool_metadata,
             });
 
             let mut guard = agent
@@ -1875,6 +2088,53 @@ impl PyAgent {
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             Ok(tool_name_for_return)
         })
+    }
+
+    /// Register a tool that a running turn can see immediately.
+    #[pyo3(signature = (tool))]
+    fn add_live_tool<'py>(
+        &self,
+        py: Python<'py>,
+        tool: Py<PyPythonTool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let agent = self.inner.clone();
+        let py_tool = tool.borrow(py);
+        let tool_name = py_tool.name().to_string();
+        let tool_description = py_tool.description().to_string();
+        let tool_schema = py_tool.schema_json();
+        let tool_schema: serde_json::Value = serde_json::from_str(&tool_schema).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid tool schema JSON: {e}"))
+        })?;
+        let tool_metadata = py_tool.metadata.clone();
+        drop(py_tool);
+
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        let tool_name_for_return = tool_name.clone();
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let tool_box: Arc<dyn AsyncTool> = Arc::new(PyPythonToolWrapper {
+                inner: tool,
+                name: tool_name,
+                description: tool_description,
+                schema: tool_schema,
+                metadata: tool_metadata,
+            });
+            let guard = agent
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+            guard
+                .add_live_async_tool(tool_box)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            Ok(tool_name_for_return)
+        })
+    }
+
+    /// Remove live extension tools by name.
+    fn remove_live_tools(&self, names: Vec<String>) -> PyResult<u32> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+        Ok(guard.remove_live_async_tools(&names).min(u32::MAX as usize) as u32)
     }
 
     fn add_mcp_server<'py>(
@@ -2188,6 +2448,65 @@ impl PyAgent {
         guard
             .restore_session(&path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[pyo3(signature = (retain_tokens = 0))]
+    /// Ask the model to compact the session into a checkpoint now.
+    ///
+    /// Returns None when there is nothing worth folding, or an object with
+    /// replaced/before_tokens/after_tokens/summary when a checkpoint landed.
+    fn compact_now<'py>(
+        &self,
+        py: Python<'py>,
+        retain_tokens: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use std::sync::atomic::Ordering;
+        if self.is_running.load(Ordering::SeqCst) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Agent is already running",
+            ));
+        }
+        let inner = self.inner.clone();
+        let agent = {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
+            guard.clone()
+        };
+        let current_locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(py, current_locals, async move {
+            let signal = std::sync::atomic::AtomicBool::new(false);
+            let result = agent.compact_now(retain_tokens, &signal).await;
+            // Publish the compacted session back to the stored agent. Copying
+            // only the session keeps a cancelled future from stranding a
+            // half-swapped agent, and leaves tools/plugins untouched.
+            if matches!(&result, Ok(Some(_))) {
+                let (messages, context) = {
+                    let session = agent.session();
+                    (session.messages().to_vec(), session.session_context())
+                };
+                let mut guard = inner.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned")
+                })?;
+                guard.session_mut().restore_messages(messages);
+                guard.session_mut().set_session_context(context);
+            }
+            match result {
+                Ok(Some(outcome)) => {
+                    let value = serde_json::json!({
+                        "replaced": outcome.replaced,
+                        "before_tokens": outcome.before_tokens,
+                        "after_tokens": outcome.after_tokens,
+                        "freed_tokens": outcome.freed_tokens(),
+                        "summary": outcome.summary,
+                    });
+                    Python::attach(|py| json_to_py(py, &value)).map(Some)
+                }
+                Ok(None) => Ok(None),
+                Err(error) => Err(to_py_runtime_error(error)),
+            }
+        })
     }
 
     #[pyo3(signature = (keep_recent = 10, max_summary_chars = 2000))]
