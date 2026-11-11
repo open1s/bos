@@ -1,6 +1,6 @@
 //! Durable task records: the tasks extension's storage seam.
 //!
-//! One JSON file per task at <workspace>/.bsh/tasks/<id>.json, beside the
+//! One JSON file per task at `<workspace>/.bsh/tasks/<id>.json`, beside the
 //! sessions the tasks belong to. The directory is the database: a task that
 //! fails to parse is skipped rather than taking the board down, and a save is
 //! written to a temporary file and renamed so a crash cannot leave half a

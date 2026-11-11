@@ -290,7 +290,7 @@ impl AuditLedger {
         Ok(hash)
     }
 
-    /// Verify against a checkpoint file written by [checkpoint_to].
+    /// Verify against a checkpoint file written by [`checkpoint_to`](Self::checkpoint_to).
     pub fn verify_with_checkpoint_file(
         path: &Path,
         checkpoint_path: &Path,

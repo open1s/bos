@@ -135,9 +135,9 @@ pub struct AcceptanceReport {
 /// - non_empty: the result's text is not blank
 /// - json_object: the result is a JSON object
 /// - json_array: the result is a JSON array
-/// - contains:<text>: the result's text contains the text
-/// - equals:<text>: the result's text equals the text
-/// - sha256:<hex>: the result's text hashes to the hex digest
+/// - `contains:<text>`: the result's text contains the text
+/// - `equals:<text>`: the result's text equals the text
+/// - `sha256:<hex>`: the result's text hashes to the hex digest
 ///
 /// Anything else is rejected as malformed. A criterion that cannot be evaluated
 /// must never read as success.
