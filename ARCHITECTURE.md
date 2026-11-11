@@ -131,6 +131,109 @@ The Agent Runtime and Composition Engine solve different problems:
 
 The agent reasoning loop must not silently expand its own privileges. Tool availability is derived from the active workspace capability view and current policy grants.
 
+### 4.1 Agent Intelligence Runtime
+
+The Agent Intelligence Runtime is the task-facing intelligence layer inside the Agent Runtime. It coordinates two sibling subsystems — **Skill Intelligence** and **Tool Intelligence** — under a shared task intent. They cooperate, but they are not the same abstraction:
+
+- **Skill Intelligence** selects procedural knowledge and task guidance: what expertise, instructions and repeatable methods should shape the work?
+- **Tool Intelligence** selects operational capabilities: what authorized operations can advance the work?
+- **Unified Capability & Security Runtime** remains the authority for composition, authorization, provider resolution, invocation lifecycle and audit. It is not replaced by either intelligence subsystem.
+
+<p align="center"><img src="docs/assets/diagrams/bsh-agent-intelligence-runtime.svg" alt="BSH Agent Intelligence Runtime: task intent coordinates sibling Skill Intelligence and Tool Intelligence subsystems, which pass through unified capability and security governance before execution." width="100%"></p>
+
+#### 4.1.1 Shared task intent
+
+Both subsystems receive a common, explicit task scope rather than independently interpreting an unbounded conversation. The scope should identify:
+
+- Task and parent/delegation identities, owning agent and workspace.
+- User intent, relevant conversation/project context and expected outcome.
+- Applicable workspace policy, principal and granted resource/capability view.
+- Constraints such as allowed providers, data boundaries, deadlines and execution mode.
+- Context, schema, time and resource budgets.
+- Cancellation signal, correlation identifiers and lifecycle ownership.
+
+The runtime must be able to decide that a task needs no additional Skill and/or no additional Tool. Discovery is conditional, bounded and task-relevant; it is not a mandatory prelude to every model request.
+
+#### 4.1.2 Skill Intelligence
+
+Skill Intelligence manages expertise and procedural instructions. Its target responsibilities are:
+
+1. **Discovery and ranking:** use `find_skill` to identify candidates from compact metadata; rank by task relevance and declared metadata.
+2. **Planning:** select a compatible set, resolve required/optional dependencies and detect conflicts or cycles.
+3. **Trust validation:** verify source/provenance, version and integrity, and apply workspace/user policy before loading or activation.
+4. **Progressive loading:** use `load_skill` only for selected Skills; load referenced resources only when needed.
+5. **Task-scoped activation:** associate activation with the owning task/session and clean it up on completion, cancellation or failure.
+6. **Context composition:** inject only approved, activated instructions into the owning task's model context under deterministic ordering and explicit per-Skill/aggregate budgets.
+
+A Skill is guidance and procedural knowledge, not an execution permission. Skill instructions cannot grant tools, change a principal's authority, weaken policy or override the Capability Security boundary. A Skill may describe a tool prerequisite, but the runtime must independently resolve and authorize that capability.
+
+#### 4.1.3 Tool Intelligence
+
+Tool Intelligence manages discovery and selection of operational capabilities. Its target responsibilities are:
+
+1. **Discovery and ranking:** use `find_tool` to retrieve a bounded candidate set using exact-name, lexical and metadata-aware retrieval, with optional semantic retrieval.
+2. **Workspace filtering:** derive candidates from the current approved Workspace Capability View, not an unrestricted node-global registry.
+3. **Capability planning:** select the minimal relevant operations and resolve capability identity, version, provider and dependencies where applicable.
+4. **Schema exposure:** reveal only the selected tool definitions and schemas needed for the current task, with cumulative per-turn/task context budgets and revision-aware invalidation.
+5. **Authorized invocation:** route calls through the existing capability invocation contract, carrying workspace, principal, task/correlation, deadline, cancellation and delegation context.
+6. **Result evaluation:** distinguish successful results from denial, validation failure, timeout, cancellation, provider failure and unknown remote outcome; feed observations back into task reasoning and evaluation.
+
+A model-visible tool name or schema is an adapter surface, not the authority identity. Stable capability identity and current runtime policy govern invocation. Discovery, ranking, schema exposure and prior successful invocation do not guarantee future authorization: policy and revocation must be checked at the authoritative invocation boundary.
+
+#### 4.1.4 Shared lifecycle and control flow
+
+The intended task-scoped lifecycle is:
+
+`Task Intent → Discover → Plan → Validate → Load / Expose → Activate / Invoke → Observe → Evaluate → Cleanup`
+
+Skill and Tool branches may proceed independently or iteratively. For example, a selected Skill may identify a needed operation, after which Tool Intelligence discovers it; a Tool result may reveal that another Skill is required. The runtime coordinates these iterations under bounded planning and execution budgets.
+
+| Stage | Skill Intelligence | Tool Intelligence | Authoritative control |
+|---|---|---|---|
+| **Discover** | Find Skill metadata and candidate instructions | Find tool/capability descriptors | Bounded discovery scope and approved metadata sources |
+| **Plan** | Select Skills and resolve dependencies/conflicts | Select operations and capability composition proposals | Deterministic validation of identities, versions and compatibility |
+| **Validate** | Check provenance, integrity and Skill policy | Check Workspace Capability View and provider eligibility | Policy and authorization; model output is not authority |
+| **Load / Expose** | Load selected instructions and required resources | Expose selected schemas to the model | Task scope, context budgets and revision checks |
+| **Activate / Invoke** | Activate instructions for the owning task/session | Invoke through the capability runtime | Workspace/principal authorization, provider isolation and execution limits |
+| **Observe / Evaluate** | Record activation/use and task contribution | Record selection, invocation and result outcome | Correlated audit, telemetry and privacy/retention policy |
+| **Cleanup** | Release activation and task-scoped instruction state | Expire dynamic schemas and invocation state | Deterministic cleanup on success, failure, cancellation and session end |
+
+The lifecycle must be idempotent within its documented scope. Partial activation or composition failure must not leave a partially trusted task context. Concurrent tasks and delegated agents must not share mutable activation state, dynamically exposed schemas or unscoped instruction context.
+
+#### 4.1.5 Context and budget governance
+
+Progressive disclosure is a platform invariant, not merely a prompt optimization:
+
+- Keep global Skill and Tool catalogues out of ordinary model requests.
+- Keep discovery metadata compact; load full Skill instructions or tool schemas only after selection and validation.
+- Apply aggregate budgets across repeated discovery calls, not just a per-call result limit.
+- Account for the serialized representation actually sent to the model; make budget exhaustion explicit rather than silently truncating required instructions or schemas.
+- Deduplicate stable identities/revisions without allowing cache hits to bypass current trust, workspace, version or authorization checks.
+- Keep task context, Skill instructions, tool schemas, conversation history and untrusted tool results distinguishable and traceable by provenance.
+
+#### 4.1.6 Security, Federation and authority boundaries
+
+The intelligence subsystems do not introduce a parallel security model:
+
+- Skill trust controls whether instructions may be loaded and used; it does not grant execution permissions.
+- Tool retrieval relevance does not grant capability access. The Workspace Capability View and invocation-time authorization remain authoritative.
+- Local and remote tools use the same capability contract. Remote invocation additionally requires caller-side and provider-side authorization as defined in the Federation model.
+- Federated Skill discovery should exchange approved metadata only by default. Remote Skill bodies/resources require explicit trust and policy; remote discovery does not authorize remote execution.
+- Delegated tasks carry attenuated scope, task identity, deadline, budgets and correlation metadata. Sub-delegation is denied unless explicitly granted.
+- Revocation, policy changes, provider loss and cancellation must take effect at the relevant load/activation/invocation boundary; stale discovery results are never proof of current permission.
+
+#### 4.1.7 Observability and evaluation
+
+The runtime should correlate task intent, discovery query, candidate/rank, selected Skill or capability identity/version, activation or schema exposure, invocation, authorization decision, provider outcome and task result. Evaluation should measure at least:
+
+- Discovery quality: Precision@K, Recall@K and MRR.
+- Selection quality: activation/selection precision, unnecessary activation/invocation and no-Skill/no-Tool decision accuracy.
+- Runtime quality: discovery/activation/invocation latency, failure classes, cancellation and cleanup correctness.
+- Efficiency: instruction/schema bytes and estimated tokens, context-budget exhaustion and cache effectiveness.
+- Outcome: task success and contribution compared with a baseline without the selected Skill/Tool.
+
+Telemetry should avoid retaining full prompts, arguments, results or sensitive instruction bodies by default. Evaluation must not automatically change trust, permissions or authorization policy.
+
 ## 5. BOS implementation foundation
 
 BOS supplies the Rust-native execution foundation used by BSH and the language bindings.
@@ -205,6 +308,10 @@ The architecture is intentionally forward-looking, but documentation must not im
 | Independent Composition Engine and Workspace Capability View | Target architecture; implement in staged increments |
 | BSH node identity, federation discovery and trust enrollment | Target architecture |
 | Remote capability invocation and bounded delegation | Target architecture |
+| Skill Intelligence discovery, loading and task-scoped activation | Existing `find_skill` / `load_skill` foundations; end-to-end runtime orchestration is evolving |
+| Tool Intelligence discovery and deferred schema exposure | Existing `find_tool` and deferred-tool foundations; workspace-authoritative discovery and cumulative context budgeting are evolving |
+| Unified Agent Intelligence Runtime across Skills and Tools | Target architecture; sibling subsystems and shared task lifecycle are being integrated |
+| Skill/Tool evaluation and federated metadata discovery | Target architecture; effectiveness measurement and governed cross-node discovery remain open work |
 | Cross-node multi-agent collaboration and resource federation | Later target architecture |
 
 The architecture diagrams describe the target system shape. They are not a claim that federation, distributed scheduling or every composition lifecycle feature is already available in a released build.
@@ -226,6 +333,9 @@ The first federation milestone should remain deliberately small: two enrolled no
 - [BOS / BSH README](README.md)
 - [BSH extension platform](docs/bsh-extension.md)
 - [BSH Built-in Tools 2.0](docs/bsh-built-in-tools-2.0.md)
+- [Agent Intelligence Runtime diagram](docs/assets/diagrams/bsh-agent-intelligence-runtime.svg)
+- [Skill Intelligence requirements](https://github.com/open1s/bos/issues?q=is%3Aissue+is%3Aopen+Skill+Intelligence)
+- [Tool Intelligence requirements](https://github.com/open1s/bos/issues?q=is%3Aissue+is%3Aopen+Tool+Intelligence)
 - [BOS / BSH textbook](docs/BOS-BSH-Textbook.md)
 - [Security policy](SECURITY.md)
 - [Contributor onboarding](ONBOARDING.md)
