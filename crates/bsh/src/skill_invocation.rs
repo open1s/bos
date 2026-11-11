@@ -198,6 +198,15 @@ pub(crate) fn expand(agent: &Agent, content: Content) -> (Content, Vec<SkillInvo
             }
             let block = render_skill_content(&skill);
             blocks.push(block.clone());
+            // A skill's body is attached to this turn's prompt: that is the
+            // moment an observer should see, and it only happens here.
+            crate::extension::hooks::observe(
+                "skill.load",
+                serde_json::json!({
+                    "skill": name,
+                    "bytes": block.len(),
+                }),
+            );
             invoked.push(SkillInvocation {
                 name: name.clone(),
                 content: block,

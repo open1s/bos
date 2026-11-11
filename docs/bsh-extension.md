@@ -368,6 +368,34 @@ light/dark switch lands without rebuilding the pane.
 the runtime for its live card once per selection (and on Refresh). If the
 runtime cannot answer, the declared view stays and the panel says why.
 
+### 3.6.2 Observe hook points
+
+A `hook` contribution names one point; the host pushes a bounded batch of
+events to the guest's `bsh_hook` export, shaped `{point, batch: [event, ...]}`.
+Hooks are observe-only: a guest cannot deny or replace the call.
+
+| Point | Emitted when | Event fields |
+|---|---|---|
+| `turn.start` | a user input opened a turn | `session, agent, input_chars` |
+| `turn.end` | the turn settled (done or failed) | `session, agent, failed, events` |
+| `model.request` | before one LLM step | `agent, data: {model, request_id, request}` (`request` is serialized JSON, host-capped at 8 KiB) |
+| `model.response` | after one LLM step | `agent, data: {request_id, response_type, response}` or the stream fields |
+| `tool.before` | before every tool call, including namespaced MCP tools and `load_skill` | `agent, data: {tool_name, call_id, tool_args}` |
+| `tool.after` | after every tool call | `agent, data: {tool_name, call_id, tool_result}` |
+| `skill.load` | a skill body is attached to a turn's prompt | `skill, bytes` |
+| `http.exchange` | every LLM vendor call, and every HTTP fetch a sandboxed runtime makes through its bridge | metadata, masked headers and bounded bodies (see the tap's caps) |
+
+Scope of the coverage, stated rather than implied:
+
+- An MCP **tool call** is a tool call: it arrives at `tool.before`/`tool.after`
+  with a namespaced `tool_name`. The MCP **wire** (initialize, tools/list, the
+  JSON-RPC frames) is not observed yet.
+- Network activity is observed where the host mediates it: LLM vendors, the
+  extism/process HTTP bridge, and anything that goes through the tap. A shell
+  command's own sockets are outside the host and are not visible.
+- Skill *bodies* are observed when attached (`skill.load`); the skill catalogue
+  in the system prompt is not a per-turn event.
+
 ### 3.7 Services
 
 ~~~toml

@@ -21,12 +21,15 @@ use crate::types::{
 };
 
 /// Hook points the manifest validator accepts.
-pub const HOOK_POINTS: [&str; 5] = [
+pub const HOOK_POINTS: [&str; 8] = [
     "model.request",
     "model.response",
     "tool.before",
     "tool.after",
     "http.exchange",
+    "turn.start",
+    "turn.end",
+    "skill.load",
 ];
 
 /// The manifest file name inside a package.

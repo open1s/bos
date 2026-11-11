@@ -15,12 +15,15 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 /// The hook points this build dispatches. Adding one is a standard change.
-pub const HOOK_POINTS: [&str; 5] = [
+pub const HOOK_POINTS: [&str; 8] = [
     "model.request",
     "model.response",
     "tool.before",
     "tool.after",
     "http.exchange",
+    "turn.start",
+    "turn.end",
+    "skill.load",
 ];
 
 /// Observe queue depth. A full queue drops and counts; it never blocks.
@@ -307,11 +310,28 @@ mod tests {
         assert_eq!(redacted.chars().count(), 8 * 1024);
     }
 
+    /// The dispatcher and the manifest validator must name the same points:
+    /// a point the manifest accepts but the worker ignores looks like a hook
+    /// that silently never fires.
     #[test]
     fn every_declared_point_is_dispatchable() {
-        assert!(HOOK_POINTS.contains(&"http.exchange"));
-        assert!(HOOK_POINTS.contains(&"model.request"));
-        assert_eq!(HOOK_POINTS.len(), 5);
+        assert_eq!(
+            HOOK_POINTS,
+            ferris_core::manifest::HOOK_POINTS,
+            "the dispatcher and the manifest validator disagree"
+        );
+        for point in [
+            "http.exchange",
+            "model.request",
+            "model.response",
+            "tool.before",
+            "tool.after",
+            "turn.start",
+            "turn.end",
+            "skill.load",
+        ] {
+            assert!(HOOK_POINTS.contains(&point), "{point} is dispatched");
+        }
     }
 
     #[test]

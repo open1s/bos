@@ -4223,6 +4223,22 @@ impl Shell {
         // arrives after the reader changes the preset or permission would join
         // this baked build, so the queue compares against this record.
         self.state.record_turn_generation(&id);
+        // The turn is opening: announce it before the agent runs, so a package
+        // that declared `turn.start` sees the reader's input and the model the
+        // turn was resolved against.
+        crate::extension::hooks::observe(
+            "turn.start",
+            serde_json::json!({
+                "session": id,
+                "agent": "bsh",
+                "input_chars": transcript
+                    .iter()
+                    .rev()
+                    .find(|message| matches!(message.role, crate::model::Role::User))
+                    .map(|message| message.text.chars().count())
+                    .unwrap_or(0),
+            }),
+        );
         // A goal rides the turn's build: the model tools write through this
         // store, and the pump settles the recorded transition when the turn
         // ends, before it decides whether to continue.
@@ -5473,6 +5489,15 @@ impl Shell {
                     // update as the deltas means the settled frame is the only
                     // frame the batch asks for.
                     if let Some(failed) = terminal {
+                        crate::extension::hooks::observe(
+                            "turn.end",
+                            serde_json::json!({
+                                "session": session_id,
+                                "agent": "bsh",
+                                "failed": failed,
+                                "events": deltas,
+                            }),
+                        );
                         crate::extension::publish(
                             crate::extension::topics::MODEL_COMPLETED,
                             serde_json::json!({
