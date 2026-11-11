@@ -429,24 +429,61 @@ impl History {
 
     /// Replace the whole log with these rows: a truncation, a compaction, or a
     /// session migrated from a document that still embedded its transcript.
+    ///
+    /// The replacement is built in a sibling directory and swapped in by
+    /// renaming that directory over this one, exactly as [`Self::compact`]
+    /// does. Deleting the live directory first - what this used to do - left a
+    /// window in which a kill lost the ENTIRE conversation, not only the rows
+    /// being written. A crash now leaves either the original log or the
+    /// finished one, never neither.
     pub(crate) fn rewrite(&mut self, messages: &[ChatMessage]) -> Result<()> {
         let lock = Arc::clone(&self.lock);
         let _guard = lock
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.dir.exists() {
-            let _ = fs::remove_dir_all(&self.dir);
+        // A killed rebuild leaves a sibling nothing lists. Only an old one is
+        // debris: a live second window may be building its own right now.
+        sweep_stale_siblings(&self.dir, "rewrite-");
+        let temporary = sibling(&self.dir, &format!("rewrite-{}", std::process::id()));
+        if temporary.exists() {
+            let _ = fs::remove_dir_all(&temporary);
         }
-        Arc::make_mut(&mut self.messages).clear();
-        Arc::make_mut(&mut self.trajectory).clear();
-        self.rows = 0;
-        self.trajectory_rows = 0;
-        self.unsealed_rows = 0;
-        self.unsealed_bytes = 0;
-        self.unsealed_trajectory_rows = 0;
-        self.unsealed_trajectory_bytes = 0;
-        self.cache.borrow_mut().clear();
-        self.append_locked(messages)
+        fs::create_dir_all(&temporary)
+            .with_context(|| format!("creating {}", temporary.display()))?;
+        let wrote = (|| -> Result<()> {
+            // A fresh history over the sibling writes the replacement's
+            // segments and index; the live directory is untouched while it
+            // builds.
+            let mut fresh = History::open(temporary.clone());
+            fresh.append(messages)?;
+            fresh.write_manifest()?;
+            Ok(())
+        })();
+        if let Err(error) = wrote {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+        let had_live = self.dir.exists();
+        let backup = sibling(&self.dir, &format!("compact-backup-{}", std::process::id()));
+        if had_live && backup.exists() {
+            let _ = fs::remove_dir_all(&backup);
+        }
+        if had_live {
+            fs::rename(&self.dir, &backup)
+                .with_context(|| format!("setting {} aside", self.dir.display()))?;
+        }
+        if let Err(error) = fs::rename(&temporary, &self.dir) {
+            if had_live {
+                let _ = fs::rename(&backup, &self.dir);
+            }
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error).with_context(|| format!("installing {}", self.dir.display()));
+        }
+        if had_live {
+            let _ = fs::remove_dir_all(&backup);
+        }
+        *self = History::open(self.dir.clone());
+        Ok(())
     }
 
     /// Append the messages written since the last save, in one segment.
@@ -907,6 +944,33 @@ fn sweep_siblings(dir: &Path, suffix: &str) {
     };
     for entry in entries.flatten() {
         if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Sweep only rebuild siblings old enough to be a killed process's debris.
+///
+/// Unlike [`sweep_siblings`], a second window may be building its own
+/// replacement right now, so a young sibling is left alone.
+fn sweep_stale_siblings(dir: &Path, suffix: &str) {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.{suffix}", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let stale = fs::metadata(entry.path())
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > COMPACTION_STALE);
+        if stale {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
@@ -2238,6 +2302,66 @@ mod tests {
         assert_eq!(
             reopened.page(0).expect("first page")[0].text,
             expected[0].text
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rewrite builds its replacement beside the live log.
+    ///
+    /// The old implementation deleted the live directory first, so a kill
+    /// between the delete and the new write lost the whole conversation. A
+    /// build that cannot run must leave the original readable.
+    #[test]
+    fn a_failed_rewrite_keeps_the_live_log() {
+        let dir = scratch("rewrite-failed");
+        let mut history = History::open(dir.clone());
+        let rows: Vec<ChatMessage> = (0..6).map(message).collect();
+        history.append(&rows).expect("the original log");
+        // A file at the rebuild's sibling name makes create_dir_all fail.
+        let temporary = sibling(&dir, &format!("rewrite-{}", std::process::id()));
+        fs::write(&temporary, b"not a directory").expect("the blocker");
+        let replacement: Vec<ChatMessage> = (0..3).map(|index| message(index + 100)).collect();
+        assert!(
+            history.rewrite(&replacement).is_err(),
+            "the build cannot start over a file"
+        );
+        let reopened = History::open(dir.clone());
+        assert_eq!(reopened.len(), rows.len(), "the live log is still there");
+        assert_eq!(
+            reopened.window(0, rows.len()).expect("the original rows")[0].text,
+            rows[0].text
+        );
+        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A finished rewrite leaves no half-built sibling behind: the whole
+    /// replacement was renamed into place.
+    #[test]
+    fn a_rewrite_swaps_its_build_in_and_leaves_no_sibling() {
+        let dir = scratch("rewrite-swap");
+        let mut history = History::open(dir.clone());
+        history
+            .append(&(0..4).map(message).collect::<Vec<_>>())
+            .expect("the original log");
+        let replacement: Vec<ChatMessage> = (0..2).map(|index| message(index + 50)).collect();
+        history.rewrite(&replacement).expect("the rewrite");
+        assert_eq!(history.len(), replacement.len());
+        assert_eq!(
+            history.window(0, replacement.len()).expect("the rows")[0].text,
+            replacement[0].text
+        );
+        let parent = dir.parent().expect("the sessions directory");
+        let prefix = format!("{}.rewrite-", dir.file_name().unwrap().to_string_lossy());
+        let siblings: Vec<String> = fs::read_dir(parent)
+            .expect("the parent")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        assert!(
+            siblings.is_empty(),
+            "the build is not left behind: {siblings:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }

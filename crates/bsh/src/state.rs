@@ -54,6 +54,14 @@ fn note_first_output(message: &mut ChatMessage, at: u64) {
     message.timing_mut().first_output.get_or_insert(at);
 }
 
+/// How often a streaming turn journals its tail, at most.
+///
+/// The journal only holds the mutable tail of the current turn, so this is a
+/// few hundred bytes a second for ordinary text. A kill loses at most the
+/// tokens since the last write, while a write per delta would put disk I/O on
+/// the path every token takes.
+const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(1_000);
+
 /// Close a turn's measured span, when it has a start and no end yet.
 fn settle_ms(message: &mut ChatMessage, at: u64) {
     let Some(start) = message.timing().and_then(|timing| timing.start) else {
@@ -482,6 +490,14 @@ pub(crate) struct AppState {
     pub(crate) collapsed: BTreeSet<String>,
     /// Session id to the instant its stream started.
     pub(crate) streams: HashMap<String, u64>,
+    /// The global row each running turn's mutable tail starts at.
+    ///
+    /// The log cannot update a row in place, so a turn that streams for
+    /// minutes has to be journaled beside it. This is the first row the turn
+    /// owns; everything from here on is what a kill would otherwise lose.
+    inflight_tails: HashMap<String, usize>,
+    /// When each running turn last wrote that journal.
+    journaled_at: HashMap<String, std::time::Instant>,
     /// The live background-job roster, shared by the shell tools and the header.
     ///
     /// It is created once per app rather than per turn, so a job a previous
@@ -875,6 +891,8 @@ impl AppState {
             active_id: None,
             collapsed: BTreeSet::new(),
             streams: HashMap::new(),
+            inflight_tails: HashMap::new(),
+            journaled_at: HashMap::new(),
             jobs: Arc::new(agent::jobs::JobRegistry::new()),
             plans: HashMap::new(),
             review_runtimes: HashMap::new(),
@@ -2135,8 +2153,16 @@ impl AppState {
             return false;
         }
         self.streams.remove(id);
+        self.inflight_tails.remove(id);
+        self.journaled_at.remove(id);
         if self.streams.is_empty() {
             self.turn_started = None;
+        }
+        // A sender dropped by a failed task is a turn that ended without its
+        // terminal event. The journal already holds the tail, but this is the
+        // one moment it can still be folded into the log.
+        if let Some(session) = self.store.session(id) {
+            let _ = self.store.save(session);
         }
         true
     }
@@ -2164,6 +2190,8 @@ impl AppState {
         self.turn_agents.remove(id);
         self.restore_orphan_steers(id);
         self.finish_review(id);
+        self.inflight_tails.remove(id);
+        self.journaled_at.remove(id);
         let stopped = now_ms();
         if let Some(session) = self.store.session_mut(id) {
             if let Some(message) = session.messages.last_mut() {
@@ -2204,6 +2232,8 @@ impl AppState {
         for id in ids {
             self.save_session(&id);
         }
+        self.inflight_tails.clear();
+        self.journaled_at.clear();
         // A browser engine is a real child process. Closing the window must
         // reap it here, not leave it for the next launch's orphan scan.
         self.browser.stop_engine();
@@ -2541,15 +2571,27 @@ impl AppState {
             // session shows the same pictures and the next request replays them.
             let mut row = ChatMessage::user(prompt.to_string());
             row.images = images.to_vec();
+            row.timing_mut().start = Some(opened);
             session.messages.push(row);
-            session.messages.push(ChatMessage::assistant());
-            for message in session.messages.iter_mut().rev().take(2) {
-                message.timing_mut().start = Some(opened);
-            }
             session.updated_at = now();
         }
-        self.streams.insert(id, now());
+        // Persist the prompt BEFORE the reply row exists. The log gains the
+        // user row by an append (never a rewrite), and the document gains the
+        // title. A kill between the send and the first token then still keeps
+        // what the reader typed, and the journal below only has to carry the
+        // one row that is still changing.
+        self.save_session(&id);
+        let tail = {
+            let session = self.store.session_mut(&id)?;
+            let mut placeholder = ChatMessage::assistant();
+            placeholder.timing_mut().start = Some(opened);
+            session.messages.push(placeholder);
+            session.loaded_from + session.messages.len() - 1
+        };
+        self.inflight_tails.insert(id.clone(), tail);
+        self.streams.insert(id.clone(), now());
         self.turn_started = Some(std::time::Instant::now());
+        self.checkpoint_turn(&id, true);
         Some((transcript, budget))
     }
 
@@ -2580,21 +2622,28 @@ impl AppState {
             }
             self.request_transcript(session)
         };
-        {
+        let tail = {
             let session = self.store.session_mut(session_id)?;
             let goal = session.goal.as_mut()?;
             if !goal.advance() {
                 return None;
             }
-            session.messages.push(ChatMessage::assistant());
-            for message in session.messages.iter_mut().rev().take(1) {
-                message.timing_mut().start = Some(opened);
-            }
+            let mut placeholder = ChatMessage::assistant();
+            placeholder.timing_mut().start = Some(opened);
+            session.messages.push(placeholder);
             session.updated_at = now();
+            session.loaded_from + session.messages.len() - 1
+        };
+        // The round's advance is a document fact, so only the document is
+        // written here: writing the placeholder into the log too would make
+        // the turn's terminal save rewrite the whole log to update one row.
+        if let Some(session) = self.store.session(session_id) {
+            let _ = self.store.save_document(session);
         }
-        self.save_session(session_id);
+        self.inflight_tails.insert(session_id.to_string(), tail);
         self.streams.insert(session_id.to_string(), now());
         self.turn_started = Some(std::time::Instant::now());
+        self.checkpoint_turn(session_id, true);
         Some((transcript, budget))
     }
 
@@ -3672,6 +3721,15 @@ impl AppState {
             session.updated_at = now();
         }
         self.save_session(id);
+        // The turn now writes into a NEW assistant row. The journal's base
+        // follows it: continuing to journal the closed row would overwrite
+        // the steering row on recovery.
+        if let Some(session) = self.store.session(id) {
+            let tail = session.loaded_from + session.messages.len() - 1;
+            self.inflight_tails.insert(id.to_string(), tail);
+            self.journaled_at.remove(id);
+            self.checkpoint_turn(id, true);
+        }
     }
 
     /// Put a withdrawn steering row back where it was queued.
@@ -3711,6 +3769,12 @@ impl AppState {
             return;
         }
         let terminal = matches!(event, AgentEvent::Done | AgentEvent::Error(_));
+        // A tool call or its result is a whole step, not a delta: losing it to
+        // the throttle would drop more than the second since the last write.
+        let structural = matches!(
+            &event,
+            AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
+        );
         // One clock for the event: it stamps a call's start, the turn's first
         // output, and - on the terminal event - the turn's settled span.
         let at = now_ms();
@@ -3817,6 +3881,8 @@ impl AppState {
         }
         if terminal {
             self.streams.remove(id);
+            self.inflight_tails.remove(id);
+            self.journaled_at.remove(id);
             // The turn is over: nothing may steer it any more, and a steering
             // row it never answered for goes back to the queue.
             self.steer_mailboxes.remove(id);
@@ -3833,6 +3899,8 @@ impl AppState {
             if let Some(session) = self.store.session(id) {
                 let _ = self.store.save(session);
             }
+        } else {
+            self.checkpoint_turn(id, structural);
         }
     }
 
@@ -3874,6 +3942,36 @@ impl AppState {
             session.messages[index].skills = skills.to_vec();
         }
         self.save_session(id);
+    }
+
+    /// Journal the in-flight turn so a kill cannot take it with the process.
+    ///
+    /// A turn streams into a row the log cannot update in place, so until the
+    /// turn ends that row exists only in memory. `force` is the structural
+    /// events - a tool call, its result - whose loss is a whole step rather
+    /// than a second of text; ordinary deltas are throttled by
+    /// [`CHECKPOINT_EVERY`].
+    fn checkpoint_turn(&mut self, id: &str, force: bool) {
+        let Some(tail) = self.inflight_tails.get(id).copied() else {
+            return;
+        };
+        if !self.streams.contains_key(id) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if !force {
+            if let Some(last) = self.journaled_at.get(id) {
+                if now.duration_since(*last) < CHECKPOINT_EVERY {
+                    return;
+                }
+            }
+        }
+        if let Some(session) = self.store.session(id) {
+            if let Err(error) = self.store.checkpoint(session, tail) {
+                log::warn!("session {id}: the in-flight turn could not be journaled: {error}");
+            }
+        }
+        self.journaled_at.insert(id.to_string(), now);
     }
 
     /// Persist one session.
@@ -3944,6 +4042,11 @@ impl AppState {
             session.messages.truncate(index);
             session.updated_at = now();
         }
+        // The journal's base can now point past the transcript it described.
+        // A stale journal is worse than no journal, so tracking stops here;
+        // the save below commits what is left.
+        self.inflight_tails.remove(id);
+        self.journaled_at.remove(id);
         self.save_session(id);
     }
 
@@ -6708,6 +6811,58 @@ mod tests {
         assert!(
             texts.iter().any(|text| text.contains("half a reply")),
             "the running turn is on disk after a shutdown: {texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A turn the process dies in must survive the next launch. No shutdown
+    /// runs on a kill, so the turn is recovered from the journal written while
+    /// it streamed - and the prompt is already in the log before the first
+    /// token, because the turn-start save appends it.
+    #[test]
+    fn a_kill_mid_turn_keeps_the_turn_on_the_next_launch() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-killed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id;
+        {
+            let mut state = super::AppState::with_store(crate::store::Store::open_at(dir.clone()));
+            id = state.active_id.clone().expect("a session");
+            state.begin_turn_in(&id, "hello").expect("a turn opens");
+            // The prompt is durable before the model has answered.
+            let log = crate::history::History::open(crate::history::History::dir_for(&dir, &id));
+            let texts: Vec<String> = log
+                .page(0)
+                .expect("a page")
+                .into_iter()
+                .map(|row| row.text)
+                .collect();
+            assert_eq!(texts, ["hello"], "the prompt is on disk at once");
+            state.apply_event(&id, crate::runner::AgentEvent::Text("half a reply".into()));
+            // A structural event writes the journal at once; a text delta is
+            // throttled so the token path is not a disk write.
+            state.apply_event(
+                &id,
+                crate::runner::AgentEvent::ToolCall {
+                    name: "bash".into(),
+                    args: "{}".into(),
+                },
+            );
+            // No Done, no stop, no shutdown: the process is killed here.
+        }
+
+        let reopened = super::AppState::with_store(crate::store::Store::open_at(dir.clone()));
+        assert_eq!(reopened.active_id.as_deref(), Some(id.as_str()));
+        let session = reopened.active_session().expect("the restored session");
+        let answer = session.messages.last().expect("the assistant row");
+        assert!(
+            answer.text.contains("half a reply"),
+            "the streamed text survived the kill: {answer:?}"
+        );
+        assert!(
+            !reopened.is_streaming(&id),
+            "a recovered turn is not still running"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

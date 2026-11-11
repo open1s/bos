@@ -19498,6 +19498,94 @@ fn a_turn_diff_lists_its_files_and_their_recorded_rows(cx: &mut TestAppContext) 
     );
 }
 
+/// A line wider than the pane WRAPS, and a wrapped row has to take the room it
+/// uses. The row used to be a fixed 18px tall with wrapping text inside it, so
+/// the second visual line painted over the row below: on a narrow turn list the
+/// block read as overprinted glyphs.
+#[gpui::test]
+fn a_wrapped_turn_diff_line_takes_the_room_it_uses(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let wide = "render a wrapped row without printing over the row under it "
+        .repeat(8)
+        .trim_end()
+        .to_string();
+    let seed = wide.clone();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("turn-wrap", 1);
+        tests_pin_reference_defaults(&mut state);
+        let root = state.workspace_root().expect("a workspace root");
+        // The edit has landed, so the hunk is placed at the long line's real
+        // position and the row under it is real context rather than a synthetic
+        // header.
+        std::fs::write(
+            root.join("wide.rs"),
+            format!("fn main() {{\n{seed}\n    let after = 1;\n    let tail = 2;\n}}\n"),
+        )
+        .expect("the file");
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[1].tools.push(ToolEvent {
+                name: "edit_file".to_string(),
+                args: format!(
+                    r#"{{"path":"wide.rs","old_string":"let wide = 0;","new_string":"{seed}"}}"#
+                ),
+                output: Some("ok".to_string()),
+                ms: Some(3),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.open_diff_turn(1, cx));
+    });
+    draw_until(cx, "the turn list renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-turn-file-0").is_some()
+    });
+    let row = cx
+        .debug_bounds("diff-turn-file-0")
+        .expect("the file the turn edited");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw_until(cx, "the file's rows open", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("diff-turn-line-0-0").is_some()
+    });
+    let (index, count) = cx.update(|_, cx| {
+        let rows = shell
+            .read(cx)
+            .right
+            .diff
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.rows.get(&0))
+            .cloned()
+            .expect("the file resolved its rows");
+        (rows.iter().position(|line| line.text == wide), rows.len())
+    });
+    let index = index.expect("the long line is one of the rows");
+    assert!(
+        index + 1 < count,
+        "the fixture keeps a row under the wrapped one: {count} rows"
+    );
+    let wrapped: &'static str = Box::leak(format!("diff-turn-line-0-{index}").into_boxed_str());
+    let under: &'static str = Box::leak(format!("diff-turn-line-0-{}", index + 1).into_boxed_str());
+    let wrapped = cx.debug_bounds(wrapped).expect("the wrapped row drew");
+    let under = cx.debug_bounds(under).expect("the row under it drew");
+    assert!(
+        f32::from(wrapped.size.height) >= 36.0,
+        "a line wider than the pane takes more than one 18px line box, got {:?}",
+        wrapped.size.height
+    );
+    assert!(
+        f32::from(under.origin.y) >= f32::from(wrapped.origin.y + wrapped.size.height),
+        "the next row starts below the wrapped one instead of inside it: {:?} < {:?}",
+        under.origin.y,
+        wrapped.origin.y + wrapped.size.height
+    );
+}
+
 /// The turn's own closing card is the control that opens the pane ON THAT
 /// TURN. Two turns exist and only the second wrote anything; the pane must show
 /// the second turn's files, and a row must open that one file inside the list.
@@ -34160,7 +34248,11 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
             .unwrap_or_default()
             .to_string();
         state = serde_json::from_str(&raw).expect("the selection JSON parses");
-        if state["selected"].as_str().unwrap_or_default().contains("alpha") {
+        if state["selected"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("alpha")
+        {
             break;
         }
     }

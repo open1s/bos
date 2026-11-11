@@ -9,22 +9,60 @@
 //! The directory is the database: a session that fails to parse is skipped
 //! rather than aborting the load, so one damaged file cannot take the sidebar
 //! down with it.
+//!
+//! A turn in flight is the exception to "written whole": its reply row changes
+//! token by token and the Parquet log is append-only, so the mutable tail is
+//! journaled to `inflight.json` beside the log and folded in on the next open.
+//! The journal is only valid while its `inflight.lock` is held; the OS drops
+//! that lock when the process dies, which is how a crashed turn is told from a
+//! turn another window is still running. Both the document and the journal are
+//! replaced by rename, and a log rewrite builds its replacement in a sibling
+//! directory before swapping it in, so no kill can leave a session unreadable.
 
 use std::cell::{RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
-use std::io::BufReader;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 
 use crate::history::{History, Reader, ToolRow};
-use crate::model::{ChatMessage, Session};
+use crate::model::{ChatMessage, Role, Session};
 
 /// Messages a session keeps in memory: two pages, which is a screen of
 /// scrolling in each direction. Everything older stays in the log until the
 /// reader scrolls to it.
 pub(crate) const WINDOW: usize = 2 * crate::history::PAGE;
+
+/// The in-flight turn's journal, beside the log it belongs to.
+///
+/// The log is append-only, so a row already written cannot be updated in
+/// place. A turn streams into a row for minutes, and until this existed that
+/// row lived only in memory: a kill during the run lost the whole answer, and
+/// a kill during the save that finally wrote it could lose the log itself.
+const INFLIGHT: &str = "inflight.json";
+
+/// The lock that says a journal belongs to a LIVE turn.
+///
+/// A second launch - or a second window in another process - must not treat
+/// a running turn's journal as a crash to recover. The owner holds an OS lock
+/// for the turn's lifetime; the lock dies with the process, which is exactly
+/// the distinction a pid cannot make reliably.
+const INFLIGHT_LOCK: &str = "inflight.lock";
+
+/// The journal is written here and renamed into place, so a reader never sees
+/// half a JSON document.
+const INFLIGHT_TMP: &str = "inflight.json.tmp";
+
+/// A turn's uncommitted rows: the log already holds its first `base` rows, and
+/// these supersede everything at or after that index.
+#[derive(Debug, Serialize, Deserialize)]
+struct Inflight {
+    base: usize,
+    rows: Vec<ChatMessage>,
+}
 
 /// A chat window waiting to be read off the log.
 ///
@@ -172,6 +210,10 @@ pub(crate) struct Store {
     /// so an ordinary sentence is not mangled by a guess at what a secret looks
     /// like.
     secrets: Vec<String>,
+    /// The held lock of every journal this store owns, keyed by history
+    /// directory. Dropping the handle releases the lock, which is how a crash
+    /// becomes distinguishable from a live turn.
+    inflight_locks: RefCell<HashMap<PathBuf, File>>,
 }
 
 impl Store {
@@ -199,10 +241,12 @@ impl Store {
             sessions: Vec::new(),
             histories: RefCell::new(HashMap::new()),
             secrets: Vec::new(),
+            inflight_locks: RefCell::new(HashMap::new()),
         };
         let dirs: Vec<PathBuf> = store.roots.values().cloned().collect();
         store.read(&dirs);
         store.sort();
+        store.recover_inflight();
         store
     }
 
@@ -247,9 +291,11 @@ impl Store {
             sessions: Vec::new(),
             histories: RefCell::new(HashMap::new()),
             secrets: Vec::new(),
+            inflight_locks: RefCell::new(HashMap::new()),
         };
         store.read(&[]);
         store.sort();
+        store.recover_inflight();
         store
     }
 
@@ -544,6 +590,7 @@ impl Store {
         // back. That is why a removed chat came back after a restart.
         for dir in self.session_dirs() {
             let document = dir.join(format!("{id}.json"));
+            let _ = fs::remove_file(dir.join(format!("{id}.json.tmp")));
             if document.is_file() {
                 if let Err(error) = fs::remove_file(&document) {
                     log::warn!(
@@ -554,6 +601,9 @@ impl Store {
             }
             let history = History::dir_for(&dir, id);
             if history.is_dir() {
+                // Release the journal lock before deleting its file: a held
+                // handle keeps the lock (and on Windows the file) alive.
+                self.drop_inflight(&history);
                 let _ = fs::remove_dir_all(&history);
             }
         }
@@ -583,6 +633,7 @@ impl Store {
                 continue;
             }
             let document = dir.join(format!("{id}.json"));
+            let _ = fs::remove_file(dir.join(format!("{id}.json.tmp")));
             if document.is_file() {
                 log::warn!(
                     "dropping a stray copy of session {id} under {}",
@@ -592,6 +643,7 @@ impl Store {
             }
             let history = History::dir_for(&dir, id);
             if history.is_dir() {
+                self.drop_inflight(&history);
                 let _ = fs::remove_dir_all(&history);
             }
         }
@@ -603,7 +655,6 @@ impl Store {
         self.sessions.insert(0, session);
     }
 
-    /// Write one session to disk.
     /// Write a session: its transcript to the Parquet log, its document to JSON.
     ///
     /// The log is append-only, so a save costs the rows written since the last
@@ -613,6 +664,34 @@ impl Store {
     pub(crate) fn save(&self, session: &Session) -> anyhow::Result<()> {
         let dir = self.dir_for(session);
         fs::create_dir_all(dir)?;
+        let normalized = self.normalized(session);
+        self.write_document(&normalized, dir)?;
+        self.save_history(&normalized, dir)?;
+        // A save has just committed the rows the journal was holding, so the
+        // journal can go only when the log really covers it; a refused or
+        // partial write must leave the journal for the next launch.
+        self.release_inflight(&normalized, dir);
+        // The document just written is the authority; the same id anywhere else
+        // is a leftover that would resurrect this chat if it were deleted.
+        self.drop_strays(&normalized.id, dir);
+        Ok(())
+    }
+
+    /// Write only the session document, without touching the log.
+    ///
+    /// A turn's first act is to save its prompt this way: the document gains
+    /// the title and the updated time, and the log gains the user row through
+    /// the ordinary save. The reply itself is not written until it exists, so
+    /// this path stays cheap and leaves the in-flight journal alone.
+    pub(crate) fn save_document(&self, session: &Session) -> anyhow::Result<()> {
+        let dir = self.dir_for(session);
+        fs::create_dir_all(dir)?;
+        let normalized = self.normalized(session);
+        self.write_document(&normalized, dir)
+    }
+
+    /// Fill the metadata-only fields a save must not write back as empty.
+    fn normalized(&self, session: &Session) -> Session {
         let mut normalized = session.clone();
         if !session.loaded {
             // A metadata-only row was never fully parsed. Merge the document's
@@ -633,15 +712,23 @@ impl Store {
                 }
             }
         }
-        let mut document = normalized.clone();
+        normalized
+    }
+
+    /// Write the JSON document, which never embeds the transcript.
+    ///
+    /// The write is atomic: a kill between the old file and the new one must
+    /// leave the old document readable, because the loader silently skips a
+    /// file that does not parse and that would read as the whole session
+    /// disappearing.
+    fn write_document(&self, session: &Session, dir: &Path) -> anyhow::Result<()> {
+        let mut document = session.clone();
         document.messages.clear();
-        let path = dir.join(format!("{}.json", normalized.id));
+        let path = dir.join(format!("{}.json", session.id));
+        let temporary = path.with_extension("json.tmp");
         let text = self.redact(&serde_json::to_string_pretty(&document)?);
-        fs::write(path, text)?;
-        self.save_history(&normalized, dir)?;
-        // The document just written is the authority; the same id anywhere else
-        // is a leftover that would resurrect this chat if it were deleted.
-        self.drop_strays(&normalized.id, dir);
+        fs::write(&temporary, text)?;
+        fs::rename(&temporary, &path)?;
         Ok(())
     }
 
@@ -743,6 +830,266 @@ impl Store {
             tool.output = tool.output.as_deref().map(|text| self.redact(text));
         }
         rows
+    }
+
+    /// Journal the rows a running turn has not committed to the log yet.
+    ///
+    /// `base` is the global index the turn's mutable tail starts at. It is
+    /// clamped to the log's current length, because a save that failed between
+    /// the prompt and the first token leaves one more row to carry.
+    pub(crate) fn checkpoint(&self, session: &Session, base: usize) -> anyhow::Result<()> {
+        let len = match self.history_for(&session.id) {
+            Some(history) => history.len(),
+            None => return Ok(()),
+        };
+        let end = session.loaded_from.saturating_add(session.messages.len());
+        if len > end {
+            // The log is ahead of the loaded window. Replacing its tail from a
+            // window that never read those rows would drop them.
+            return Ok(());
+        }
+        let base = base.min(len);
+        if base < session.loaded_from {
+            return Ok(());
+        }
+        let skip = base - session.loaded_from;
+        let Some(tail) = session.messages.get(skip..) else {
+            return Ok(());
+        };
+        if tail.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<ChatMessage> = tail
+            .iter()
+            .map(|message| self.redact_message(message))
+            .collect();
+        let dir = History::dir_for(self.dir_for(session), &session.id);
+        self.lock_inflight(&dir)?;
+        let journal = Inflight { base, rows };
+        let temporary = dir.join(INFLIGHT_TMP);
+        fs::write(&temporary, serde_json::to_vec(&journal)?)?;
+        fs::rename(&temporary, dir.join(INFLIGHT))?;
+        Ok(())
+    }
+
+    /// Drop the journal once the log covers it.
+    ///
+    /// A save that refuses or only partly writes (a metadata-only row, a full
+    /// disk) must leave the journal in place: it is the only copy of the turn.
+    fn release_inflight(&self, session: &Session, dir: &Path) {
+        let history_dir = History::dir_for(dir, &session.id);
+        let bytes = match fs::read(history_dir.join(INFLIGHT)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.drop_inflight(&history_dir);
+                return;
+            }
+            Err(error) => {
+                // A journal we cannot read is not a journal we may delete:
+                // the save may not have covered it.
+                log::warn!(
+                    "session {}: the in-flight journal could not be read: {error}",
+                    session.id
+                );
+                return;
+            }
+        };
+        let Ok(journal) = serde_json::from_slice::<Inflight>(&bytes) else {
+            self.drop_inflight(&history_dir);
+            return;
+        };
+        let len = self
+            .history_for(&session.id)
+            .map(|history| history.len())
+            .unwrap_or(0);
+        if len >= journal.base.saturating_add(journal.rows.len()) {
+            self.drop_inflight(&history_dir);
+        }
+    }
+
+    /// Take the OS lock that marks a journal as a live turn's.
+    fn lock_inflight(&self, dir: &Path) -> anyhow::Result<()> {
+        let path = dir.join(INFLIGHT_LOCK);
+        let mut locks = self.inflight_locks.borrow_mut();
+        // A log rewrite swaps the whole history directory, which takes the
+        // lock file with it while this handle still points at the old inode.
+        // Re-lock the file that is on disk now instead of trusting the stale
+        // handle: otherwise a second process would see an unlocked journal.
+        if locks.contains_key(dir) && path.is_file() {
+            return Ok(());
+        }
+        locks.remove(dir);
+        fs::create_dir_all(dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        file.try_lock_exclusive()?;
+        // The pid is a diagnostic for a human reading the directory; the lock
+        // itself is the liveness test.
+        let mut handle = &file;
+        let _ = handle.write_all(std::process::id().to_string().as_bytes());
+        locks.insert(dir.to_path_buf(), file);
+        Ok(())
+    }
+
+    /// Release the lock and remove every file of one journal.
+    fn drop_inflight(&self, dir: &Path) {
+        // Dropping the handle releases the lock before the files go, which is
+        // what Windows requires and what makes the removal safe everywhere.
+        self.inflight_locks.borrow_mut().remove(dir);
+        let _ = fs::remove_file(dir.join(INFLIGHT));
+        let _ = fs::remove_file(dir.join(INFLIGHT_TMP));
+        let _ = fs::remove_file(dir.join(INFLIGHT_LOCK));
+    }
+
+    /// Recover every journal a killed process left behind.
+    ///
+    /// A journal whose lock is still held belongs to a live turn - a second
+    /// window must not append it early. The OS drops that lock when the owner
+    /// dies, which is the one signal a pid cannot give reliably.
+    fn recover_inflight(&mut self) {
+        let mut histories: Vec<PathBuf> = Vec::new();
+        for dir in self.session_dirs() {
+            let root = dir.join("history");
+            let Ok(entries) = fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    histories.push(path);
+                }
+            }
+        }
+        histories.sort();
+        histories.dedup();
+        for history_dir in histories {
+            if !history_dir.join(INFLIGHT).is_file() {
+                continue;
+            }
+            let Some(id) = history_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let lock_path = history_dir.join(INFLIGHT_LOCK);
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .ok();
+            if let Some(lock) = &lock {
+                if lock.try_lock_exclusive().is_err() {
+                    // A live process owns this turn; its own save clears it.
+                    continue;
+                }
+            }
+            if !self.sessions.iter().any(|session| session.id == id) {
+                // The document is gone: a delete that crashed before removing
+                // the log. Nothing can be recovered onto a session nobody can
+                // select.
+                let _ = fs::remove_file(history_dir.join(INFLIGHT));
+                drop(lock);
+                let _ = fs::remove_file(&lock_path);
+                continue;
+            }
+            let recovered = self.recover_turn(&history_dir, &id);
+            drop(lock);
+            if recovered {
+                let _ = fs::remove_file(history_dir.join(INFLIGHT));
+            }
+            let _ = fs::remove_file(&lock_path);
+        }
+    }
+
+    /// Fold one interrupted turn's journal into its log.
+    ///
+    /// Returns whether the journal may be removed. A failed write keeps it: a
+    /// journal that is still on disk gets another chance at the next launch,
+    /// while a removed one is gone forever.
+    fn recover_turn(&mut self, dir: &Path, id: &str) -> bool {
+        let Ok(bytes) = fs::read(dir.join(INFLIGHT)) else {
+            return true;
+        };
+        let Ok(journal) = serde_json::from_slice::<Inflight>(&bytes) else {
+            log::warn!("session {id}: an interrupted turn's journal is unreadable; dropping it");
+            return true;
+        };
+        let mut history = History::open(dir.to_path_buf());
+        let len = history.len();
+        if journal.rows.is_empty() {
+            // Only an older writer could produce this; there is nothing to
+            // place, and rewriting would truncate a log at `base`.
+            return true;
+        }
+        // The journal can never reach past the log it was written against. A
+        // base beyond the log is a journal from a directory that was replaced
+        // (a fork, a rehome, a compaction) - there is nothing to place it on.
+        if journal.base > len {
+            log::warn!(
+                "session {id}: an interrupted turn's journal starts at row {} but the log holds {len}; dropping it",
+                journal.base
+            );
+            return true;
+        }
+        // A log that moved past the journal already carries newer rows. Rewriting
+        // from the journal's base would delete them, so the log wins.
+        if len > journal.base.saturating_add(journal.rows.len()) {
+            log::info!(
+                "session {id}: an interrupted turn's journal is behind the log; dropping it"
+            );
+            return true;
+        }
+        let mut rows = journal.rows;
+        if let Some(last) = rows.last_mut() {
+            if last.role == Role::Assistant {
+                // The process died mid-turn: an answer-less row is a cancelled
+                // turn, exactly as a stop records one, so the transcript says
+                // why it ends and the next request does not replay an empty
+                // assistant message.
+                let empty = last.text.is_empty()
+                    && last.reasoning.is_empty()
+                    && last.tools.is_empty()
+                    && last.error.is_none();
+                if empty {
+                    last.meta
+                        .get_or_insert_with(crate::model::MessageMeta::default)
+                        .cancelled = true;
+                }
+            }
+        }
+        let recovered_rows = rows.len();
+        let outcome = if len == journal.base {
+            history.append(&rows)
+        } else {
+            match history.prefix(journal.base) {
+                Ok(mut all) => {
+                    all.extend(rows);
+                    history.rewrite(&all)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                self.histories.borrow_mut().remove(dir);
+                log::info!(
+                    "session {id}: recovered {recovered_rows} row(s) from a turn the process died in"
+                );
+                true
+            }
+            Err(error) => {
+                log::warn!(
+                    "session {id}: an interrupted turn could not be recovered ({error}); its journal is kept"
+                );
+                false
+            }
+        }
     }
 
     /// Drop the messages BEHIND the reader once the window grows past a ceiling.
@@ -920,7 +1267,13 @@ impl Store {
         };
         let _ = fs::create_dir_all(&to);
         for entry in entries.flatten() {
+            // The journal describes a turn still running in the SOURCE
+            // session. Copying it would make the fork's first launch append that
+            // turn a second time.
             let name = entry.file_name();
+            if name == INFLIGHT || name == INFLIGHT_LOCK || name == INFLIGHT_TMP {
+                continue;
+            }
             let _ = fs::copy(entry.path(), to.join(name));
         }
         self.histories.borrow_mut().remove(&to);
@@ -1965,6 +2318,217 @@ mod raw_tests {
             "the owning root keeps the document and every other root loses it"
         );
         assert!(super::sessions_dir(&first).join("same-id.json").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A session document is replaced atomically: a half-written temp is
+    /// ignored, so a kill during the write cannot delete the whole session.
+    #[test]
+    fn a_session_document_is_replaced_atomically() {
+        let base = journal_scratch("document-atomic");
+        let mut store = super::Store::open_at(base.clone());
+        let mut session = crate::model::Session::new("w", "atomic");
+        session.id = "atomic".to_string();
+        store.insert(session.clone());
+        store.save(&session).expect("the document");
+        let document = base.join("atomic.json");
+        let temporary = document.with_extension("json.tmp");
+        assert!(document.is_file(), "the document is installed");
+        assert!(!temporary.exists(), "and no temporary is left behind");
+
+        // A kill in the middle of the next write leaves only this.
+        std::fs::write(&temporary, "{\"id\": \"ato").expect("the torn temporary");
+        let reopened = super::Store::open_at(base.clone());
+        assert!(
+            reopened.session("atomic").is_some(),
+            "the old document still lists the session"
+        );
+        reopened.save(&session).expect("the next save");
+        assert!(
+            !temporary.exists(),
+            "the torn temporary is replaced by the next save"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A scratch directory for the journal tests, in target/.
+    fn journal_scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-journal-tests")
+            .join(format!("store-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    /// The prompt and the partial answer of a turn the process died in.
+    fn crashed_turn(store: &mut super::Store, answer: &str) -> crate::model::Session {
+        let mut session = crate::model::Session::new("w", "crashed");
+        session.id = "crashed".to_string();
+        store.insert(session.clone());
+        store.save(&session).expect("the document");
+        // The turn-start save commits the prompt by append.
+        let mut prompt = crate::model::ChatMessage::user("what happened?");
+        prompt.timing_mut().start = Some(1_000);
+        session.messages.push(prompt);
+        store.save(&session).expect("the prompt");
+        // The reply row is the part the log cannot hold until it settles.
+        let mut placeholder = crate::model::ChatMessage::assistant();
+        placeholder.timing_mut().start = Some(1_000);
+        placeholder.text = answer.to_string();
+        session.messages.push(placeholder);
+        store.checkpoint(&session, 1).expect("the journal");
+        session
+    }
+
+    /// A kill mid-turn keeps the turn: the journal is folded into the log on
+    /// the next launch, and the journal itself is gone.
+    #[test]
+    fn an_interrupted_turn_is_recovered_on_the_next_launch() {
+        let base = journal_scratch("inflight-recover");
+        let journal = {
+            let mut store = super::Store::open_at(base.clone());
+            let session = crashed_turn(&mut store, "half a reply");
+            let dir = crate::history::History::dir_for(&base, &session.id);
+            assert!(
+                dir.join(super::INFLIGHT).is_file(),
+                "the journal is written"
+            );
+            dir.join(super::INFLIGHT)
+        };
+
+        let mut reopened = super::Store::open_at(base.clone());
+        assert!(!journal.exists(), "the journal is consumed");
+        let id = "crashed".to_string();
+        reopened.rehydrate(&id);
+        let session = reopened.session(&id).expect("the session");
+        assert_eq!(session.messages.len(), 2, "the prompt and its answer");
+        assert_eq!(session.messages[0].text, "what happened?");
+        assert_eq!(session.messages[1].text, "half a reply");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A second launch must not consume a journal a LIVE turn still owns.
+    #[test]
+    fn a_live_turns_journal_is_not_recovered_by_another_store() {
+        let base = journal_scratch("inflight-live");
+        let mut store = super::Store::open_at(base.clone());
+        let session = crashed_turn(&mut store, "still streaming");
+        let dir = crate::history::History::dir_for(&base, &session.id);
+
+        let other = super::Store::open_at(base.clone());
+        assert!(
+            other.session("crashed").is_some(),
+            "the second store still sees the session"
+        );
+        assert!(
+            dir.join(super::INFLIGHT).is_file(),
+            "the live turn's journal is left alone"
+        );
+        assert_eq!(
+            crate::history::History::open(dir.clone()).len(),
+            1,
+            "and was not appended twice"
+        );
+
+        // The owner exits; the next launch is now the one that recovers it.
+        drop(store);
+        let mut reopened = super::Store::open_at(base.clone());
+        reopened.rehydrate("crashed");
+        assert_eq!(
+            reopened
+                .session("crashed")
+                .expect("the session")
+                .messages
+                .len(),
+            2,
+            "the turn lands once its owner is gone"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A completed save commits the journal and removes it; a later launch
+    /// must not append the same row a second time.
+    #[test]
+    fn a_clean_save_clears_the_journal_without_duplicating_rows() {
+        let base = journal_scratch("inflight-clean");
+        let session = {
+            let mut store = super::Store::open_at(base.clone());
+            let session = crashed_turn(&mut store, "the answer");
+            store.save(&session).expect("the settled save");
+            session
+        };
+        let dir = crate::history::History::dir_for(&base, &session.id);
+        assert!(!dir.join(super::INFLIGHT).is_file(), "the journal is gone");
+        assert_eq!(
+            crate::history::History::open(dir).len(),
+            2,
+            "the rows were written exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A turn that produced nothing is marked cancelled, exactly as a stop
+    /// records one, so the transcript does not show a silent empty reply.
+    #[test]
+    fn an_interrupted_empty_turn_is_marked_cancelled() {
+        let base = journal_scratch("inflight-cancelled");
+        {
+            let mut store = super::Store::open_at(base.clone());
+            crashed_turn(&mut store, "");
+        }
+        let mut reopened = super::Store::open_at(base.clone());
+        reopened.rehydrate("crashed");
+        let session = reopened.session("crashed").expect("the session");
+        let last = session.messages.last().expect("the interrupted row");
+        assert!(
+            last.meta.as_ref().is_some_and(|meta| meta.cancelled),
+            "the row says the turn never finished: {last:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A journal whose row count is behind the log replaces the tail, not the
+    /// rows after it: a save that already appended the placeholder is updated
+    /// in place instead of being appended twice.
+    #[test]
+    fn a_journal_on_a_saved_placeholder_replaces_it() {
+        let base = journal_scratch("inflight-replace");
+        let mut session = crate::model::Session::new("w", "crashed");
+        session.id = "crashed".to_string();
+        {
+            let mut store = super::Store::open_at(base.clone());
+            store.insert(session.clone());
+            store.save(&session).expect("the document");
+            let mut prompt = crate::model::ChatMessage::user("go");
+            prompt.timing_mut().start = Some(1);
+            session.messages.push(prompt);
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            store.save(&session).expect("the prompt and placeholder");
+        }
+
+        // A journal that carries the richer placeholder, written after the
+        // save that committed the empty one.
+        let mut settled = session.messages.last().expect("the placeholder").clone();
+        settled.text = "the rest of the answer".to_string();
+        let dir = crate::history::History::dir_for(&base, &session.id);
+        std::fs::create_dir_all(&dir).expect("the log directory");
+        std::fs::write(
+            dir.join(super::INFLIGHT),
+            serde_json::to_vec(&super::Inflight {
+                base: 1,
+                rows: vec![settled],
+            })
+            .expect("the journal"),
+        )
+        .expect("the journal file");
+
+        let mut reopened = super::Store::open_at(base.clone());
+        reopened.rehydrate(&session.id);
+        let rows = &reopened.session(&session.id).expect("the session").messages;
+        assert_eq!(rows.len(), 2, "no duplicate assistant row");
+        assert_eq!(rows[1].text, "the rest of the answer");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

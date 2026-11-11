@@ -11800,8 +11800,14 @@ impl Shell {
             .w_full()
             .flex()
             .flex_row()
-            .items_center()
-            .h(px(18.0))
+            // The gutter sits on the FIRST visual line of a wrapped row, so it
+            // measures from the top rather than centring across the wrap.
+            .items_start()
+            // A line wider than the pane WRAPS, and the row takes the room the
+            // wrap uses. A fixed `h(18)` did not clip it: the second visual
+            // line escaped the row and painted over the next row's text, which
+            // turned a narrow turn list into overprinted glyphs.
+            .min_h(px(18.0))
             .bg(rgb(fill))
             .child(
                 txt(number, 11.0, theme::faint())
