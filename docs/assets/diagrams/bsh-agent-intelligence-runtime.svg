@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1040" viewBox="0 0 1440 1040" role="img" aria-labelledby="title desc">
+<title id="title">BSH Agent Intelligence Runtime</title>
+<desc id="desc">Task intent understanding feeds sibling Skill Intelligence and Tool Intelligence subsystems. Both coordinate through a unified capability and security runtime before execution by local tools, MCP, Ferris extensions, WebAssembly and remote BSH nodes.</desc>
+<defs>
+ <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#F8FAFD"/><stop offset="1" stop-color="#EEF2F7"/></linearGradient>
+ <linearGradient id="intent" x2="0" y2="1"><stop stop-color="#EAF2FF"/><stop offset="1" stop-color="#DFEAFE"/></linearGradient>
+ <linearGradient id="skill" x2="0" y2="1"><stop stop-color="#F8F9FC"/><stop offset="1" stop-color="#F0F3F8"/></linearGradient>
+ <linearGradient id="tool" x2="0" y2="1"><stop stop-color="#F8F9FC"/><stop offset="1" stop-color="#F0F3F8"/></linearGradient>
+ <linearGradient id="security" x2="0" y2="1"><stop stop-color="#EAF7F2"/><stop offset="1" stop-color="#DFF2EA"/></linearGradient>
+ <linearGradient id="exec" x2="0" y2="1"><stop stop-color="#F0F2F5"/><stop offset="1" stop-color="#E7EBF0"/></linearGradient>
+ <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%"><feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#24364B" flood-opacity=".07"/></filter>
+ <style>
+ .title{font:700 36px Inter,Arial,sans-serif;fill:#172334}.sub{font:16px Inter,Arial,sans-serif;fill:#64748B}
+ .head{font:700 24px Inter,Arial,sans-serif;fill:#172334}.desc{font:16px Inter,Arial,sans-serif;fill:#657184}
+ .item{font:17px Inter,Arial,sans-serif;fill:#283548}.layer{font:700 23px Inter,Arial,sans-serif;fill:#172334}
+ .small{font:15px Inter,Arial,sans-serif;fill:#64748B}.rule{font:600 15px Inter,Arial,sans-serif;fill:#405166}
+ </style>
+</defs>
+<rect width="1440" height="1040" rx="26" fill="url(#bg)"/>
+<text x="64" y="72" class="title">BSH Agent Intelligence Runtime</text>
+<text x="66" y="105" class="sub">Coordinate task-specific expertise and operational capabilities without exposing the entire catalogue to every model request.</text>
+
+<rect x="44" y="142" width="1352" height="850" rx="24" fill="#FFFFFF" stroke="#D9E0E8" stroke-width="2"/>
+<text x="76" y="190" class="head">Agent Runtime</text>
+<rect x="76" y="218" width="1288" height="112" rx="18" fill="url(#intent)" stroke="#D4E2F8"/>
+<text x="720" y="263" text-anchor="middle" class="layer">Task Intent Understanding</text>
+<text x="720" y="296" text-anchor="middle" class="desc">Intent · Context · Constraints · Budget · No-skill / no-tool decision</text>
+
+<rect x="76" y="354" width="620" height="360" rx="18" fill="url(#skill)" stroke="#D9E0E8" stroke-width="2" filter="url(#shadow)"/>
+<text x="104" y="400" class="head">Skill Intelligence</text>
+<text x="104" y="431" class="desc">Expertise and procedural knowledge</text>
+<line x1="104" y1="454" x2="668" y2="454" stroke="#DCE3EB"/>
+<g class="item">
+ <circle cx="120" cy="490" r="4" fill="#64748B"/><text x="142" y="496">find_skill · Discovery &amp; Ranking</text>
+ <circle cx="120" cy="532" r="4" fill="#64748B"/><text x="142" y="538">Dependency Planning · Trust Validation</text>
+ <circle cx="120" cy="574" r="4" fill="#64748B"/><text x="142" y="580">load_skill · Lazy Instruction Loading</text>
+ <circle cx="120" cy="616" r="4" fill="#64748B"/><text x="142" y="622">Task-scoped Activation</text>
+ <circle cx="120" cy="658" r="4" fill="#64748B"/><text x="142" y="664">Context Composition</text>
+</g>
+
+<rect x="744" y="354" width="620" height="360" rx="18" fill="url(#tool)" stroke="#D9E0E8" stroke-width="2" filter="url(#shadow)"/>
+<text x="772" y="400" class="head">Tool Intelligence</text>
+<text x="772" y="431" class="desc">Operational capabilities</text>
+<line x1="772" y1="454" x2="1336" y2="454" stroke="#DCE3EB"/>
+<g class="item">
+ <circle cx="788" cy="490" r="4" fill="#64748B"/><text x="810" y="496">find_tool · Discovery &amp; Ranking</text>
+ <circle cx="788" cy="532" r="4" fill="#64748B"/><text x="810" y="538">Capability Planning · Workspace Filtering</text>
+ <circle cx="788" cy="574" r="4" fill="#64748B"/><text x="810" y="580">Schema Exposure · Context Budgeting</text>
+ <circle cx="788" cy="616" r="4" fill="#64748B"/><text x="810" y="622">Authorized Invocation</text>
+ <circle cx="788" cy="658" r="4" fill="#64748B"/><text x="810" y="664">Result Evaluation</text>
+</g>
+
+<path d="M386 714 V744 H720 V764 M1054 714 V744 H720" fill="none" stroke="#9AA8B8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M711 754 L720 766 L729 754" fill="none" stroke="#9AA8B8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+<rect x="76" y="778" width="1288" height="102" rx="18" fill="url(#security)" stroke="#CDE9DC"/>
+<text x="720" y="819" text-anchor="middle" class="layer">Unified Capability &amp; Security Runtime</text>
+<text x="720" y="850" text-anchor="middle" class="desc">Composition · Authorization · Provider Resolution · Lifecycle · Audit</text>
+
+<rect x="76" y="900" width="1288" height="66" rx="16" fill="url(#exec)" stroke="#DCE2E9"/>
+<text x="720" y="928" text-anchor="middle" class="layer">Execution Layer</text>
+<text x="720" y="951" text-anchor="middle" class="small">Local Tools · MCP · Ferris · WASM · Remote BSH Nodes</text>
+</svg>
