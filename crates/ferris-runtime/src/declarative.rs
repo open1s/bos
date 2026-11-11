@@ -72,6 +72,15 @@ pub struct PanelContribution {
     pub location: PanelLocation,
     /// Whether it starts visible.
     pub visibility: PanelVisibility,
+    /// The theme id the panel renders with, when it names one.
+    pub theme: Option<String>,
+    /// The theme id the panel renders with in dark mode, when it names one.
+    pub theme_dark: Option<String>,
+    /// How often the host re-reads a live card, when the panel declares it.
+    ///
+    /// A capture or job panel changes after the first frame; without this the
+    /// only way to see new rows was a manual refresh.
+    pub refresh_ms: Option<u64>,
     /// The validated view.
     pub view: UiDocument,
 }
@@ -359,6 +368,32 @@ pub fn load_contributions(
                 });
             }
         }
+        for (field, id) in [("theme", &file.theme), ("theme_dark", &file.theme_dark)] {
+            if let Some(id) = id {
+                if !manifest
+                    .contributes
+                    .themes
+                    .iter()
+                    .any(|theme| theme.as_str() == id)
+                {
+                    return Err(ExtensionError::Manifest {
+                        path,
+                        message: format!(
+                            "panel {field} names theme {id}, which this package does not contribute"
+                        ),
+                    });
+                }
+            }
+        }
+        let refresh_ms = match file.refresh_ms {
+            Some(ms) if !(250..=60_000).contains(&ms) => {
+                return Err(ExtensionError::Manifest {
+                    path,
+                    message: "panel refresh_ms must be between 250 and 60000".to_string(),
+                });
+            }
+            ms => ms,
+        };
         let session = UiSession::open(manifest.id().clone(), file.view)?;
         contributions.panels.push(PanelContribution {
             id: id.clone(),
@@ -366,6 +401,9 @@ pub fn load_contributions(
             icon: file.icon,
             location: file.location,
             visibility: file.visibility,
+            theme: file.theme,
+            theme_dark: file.theme_dark,
+            refresh_ms,
             view: session.document().clone(),
         });
     }
@@ -633,6 +671,15 @@ struct PanelFile {
     #[serde(default, rename = "default_visibility")]
     visibility: PanelVisibility,
     view: UiDocument,
+    /// Optional refresh interval in milliseconds (250..=60000).
+    #[serde(default)]
+    refresh_ms: Option<u64>,
+    /// Optional theme id for this panel.
+    #[serde(default)]
+    theme: Option<String>,
+    /// Optional theme id for this panel in dark mode.
+    #[serde(default)]
+    theme_dark: Option<String>,
 }
 
 /// One language descriptor file.
@@ -791,7 +838,8 @@ max_output_bytes = 4096
             UiDocument {
                 schema_version: UI_SCHEMA_VERSION.to_string(),
                 root: ferris_core::ui::UiNode::Text {
-                    text: "Ready".to_string()
+                    text: "Ready".to_string(),
+                    tone: ferris_core::ui::Tone::Neutral,
                 },
             }
             .root

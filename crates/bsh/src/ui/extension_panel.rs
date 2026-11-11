@@ -10,12 +10,15 @@
 //! installed for this mount, so the surface keeps its shape whether one package
 //! ships a panel or a dozen do.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::IndexPath;
 use gpui_kit::*;
@@ -26,7 +29,7 @@ use crate::theme;
 use ferris_sdk::host_runtime::CallContext;
 use ferris_sdk::types::ExtensionError;
 use ferris_sdk::ui::{
-    ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, UiActionRequest, UiDocument,
+    ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, Tone, UiActionRequest, UiDocument,
     UiNode, UiSession,
 };
 
@@ -154,6 +157,22 @@ pub(crate) struct ExtensionPanelView {
     /// view is a placeholder: the runtime may serve a live card for the same
     /// panel, and it is fetched once per selection (and on Refresh).
     attempted: bool,
+    /// Editable input state, keyed by node path.
+    ///
+    /// A declared input carries a starting value, not the field's life: the
+    /// state entity is kept per path so typing survives a re-render, and the
+    /// Apply action reads it back.
+    inputs: RefCell<BTreeMap<String, (String, Entity<InputState>)>>,
+    /// Section open state, keyed by node path.
+    sections: RefCell<BTreeMap<String, bool>>,
+    /// The panel's own light palette, when the package named a theme.
+    panel_theme: Option<ThemePalette>,
+    /// The panel's own dark palette, when the package named one.
+    panel_theme_dark: Option<ThemePalette>,
+    /// How often the live card should be re-read, when the package asks.
+    refresh_ms: Option<u64>,
+    /// Whether a refresh timer is already scheduled for this view.
+    refresh_pending: bool,
     /// How the view finds a panel's surface in the current host generation.
     ///
     /// The surfaces a view is built with name the runtimes of the generation
@@ -170,12 +189,13 @@ impl ExtensionPanelView {
             .iter()
             .position(|panel| matches!(panel.visibility, ferris_sdk::ui::PanelVisibility::Visible))
             .unwrap_or(0);
-        let palette = panels
+        let panel_theme = panels.get(selected).and_then(|panel| panel.theme.clone());
+        let panel_theme_dark = panels
             .get(selected)
-            .and_then(|panel| panel.theme.as_ref())
-            .map(|theme| Palette::new(Some(theme)))
-            .unwrap_or_else(|| Palette::new(None));
+            .and_then(|panel| panel.theme_dark.clone());
+        let palette = Palette::new(panel_palette(&panel_theme, &panel_theme_dark));
         let panel_root = panels.get(selected).map(|panel| panel.root.clone());
+        let refresh_ms = panels.get(selected).and_then(|panel| panel.refresh_ms);
         let mut view = Self {
             panels,
             selected,
@@ -192,6 +212,12 @@ impl ExtensionPanelView {
             picker: None,
             picker_subscription: None,
             attempted: false,
+            inputs: RefCell::new(BTreeMap::new()),
+            sections: RefCell::new(BTreeMap::new()),
+            panel_theme,
+            panel_theme_dark,
+            refresh_ms,
+            refresh_pending: false,
             surface_resolver: Arc::new(crate::extension::live_panel),
         };
         if let Some(panel) = view.panels.get(selected) {
@@ -219,9 +245,11 @@ impl ExtensionPanelView {
         self.message = None;
         self.loading = false;
         self.attempted = false;
+        self.refresh_ms = self.panels[index].refresh_ms;
         self.panel_root = Some(self.panels[index].root.clone());
-        let theme = self.panels[index].theme.as_ref();
-        self.palette = Palette::new(theme);
+        self.panel_theme = self.panels[index].theme.clone();
+        self.panel_theme_dark = self.panels[index].theme_dark.clone();
+        self.palette = Palette::new(panel_palette(&self.panel_theme, &self.panel_theme_dark));
         if let Some(document) = self.panels[index].initial.clone() {
             match UiSession::open(self.panels[index].owner.clone(), document) {
                 Ok(session) => {
@@ -308,6 +336,83 @@ impl ExtensionPanelView {
         self.error = None;
         self.message = None;
         self.load(cx);
+    }
+
+    /// Arm the next live re-read, when the package declared an interval.
+    ///
+    /// The timer is armed from a render, so a hidden pane stops refreshing by
+    /// itself: no render, no new timer. A visible pane re-arms after each tick.
+    fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(ms) = self.refresh_ms else {
+            return;
+        };
+        if self.refresh_pending {
+            return;
+        }
+        self.refresh_pending = true;
+        let interval = std::time::Duration::from_millis(ms.clamp(250, 60_000));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(interval).await;
+            let _ = this.update(cx, |this, cx| {
+                this.refresh_pending = false;
+                this.refresh(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The editable state for one input node.
+    fn input_for(
+        &self,
+        path: &str,
+        value: &str,
+        placeholder: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        let existing = self.inputs.borrow().get(path).cloned();
+        if let Some((declared, entity)) = existing {
+            if declared != value {
+                entity.update(cx, |state, cx| state.set_value(value, window, cx));
+                self.inputs
+                    .borrow_mut()
+                    .insert(path.to_string(), (value.to_string(), entity.clone()));
+            }
+            return entity;
+        }
+        let entity = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder.to_string()));
+        if !value.is_empty() {
+            entity.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+        self.inputs
+            .borrow_mut()
+            .insert(path.to_string(), (value.to_string(), entity.clone()));
+        entity
+    }
+
+    /// The text a panel input currently holds.
+    fn input_value(&self, path: &str, cx: &Context<Self>) -> String {
+        self.inputs
+            .borrow()
+            .get(path)
+            .map(|(_, entity)| entity.read(cx).value().to_string())
+            .unwrap_or_default()
+    }
+
+    /// A semantic tone from the active panel palette.
+    ///
+    /// A component names a role, never a colour, so every node follows the
+    /// package theme (when one is named) and the reader's light/dark choice.
+    fn tone_color(&self, tone: Tone) -> u32 {
+        match tone {
+            Tone::Neutral => self.palette.text,
+            Tone::Muted => self.palette.muted,
+            Tone::Faint => self.palette.faint,
+            Tone::Accent => self.palette.accent,
+            Tone::Success => self.palette.success,
+            Tone::Warning => self.palette.warn,
+            Tone::Error => self.palette.error,
+        }
     }
 
     /// Report a failed live fetch.
@@ -495,24 +600,38 @@ impl ExtensionPanelView {
         .detach();
     }
 
-    fn render_node(&self, node: &UiNode, path: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn render_node(
+        &self,
+        node: &UiNode,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match node {
             UiNode::Container { children } | UiNode::Column { children } => {
                 let mut column = div().flex().flex_col().gap(px(8.0)).w_full();
                 for (index, child) in children.iter().enumerate() {
-                    column = column.child(self.render_node(child, &format!("{path}-{index}"), cx));
+                    column = column.child(self.render_node(
+                        child,
+                        &format!("{path}-{index}"),
+                        window,
+                        cx,
+                    ));
                 }
                 column.into_any_element()
             }
             UiNode::Row { children } => {
                 let mut row = div().flex().flex_row().items_center().gap(px(8.0)).w_full();
                 for (index, child) in children.iter().enumerate() {
-                    row = row.child(self.render_node(child, &format!("{path}-{index}"), cx));
+                    row =
+                        row.child(self.render_node(child, &format!("{path}-{index}"), window, cx));
                 }
                 row.into_any_element()
             }
-            UiNode::Text { text } => txt(text.clone(), 13.0, self.palette.text).into_any_element(),
-            UiNode::Heading { text, level } => {
+            UiNode::Text { text, tone } => {
+                txt(text.clone(), 13.0, self.tone_color(*tone)).into_any_element()
+            }
+            UiNode::Heading { text, level, tone } => {
                 let size = match level {
                     1 => 21.0,
                     2 => 19.0,
@@ -520,7 +639,7 @@ impl ExtensionPanelView {
                     4 => 16.0,
                     _ => 14.0,
                 };
-                txt(text.clone(), size, self.palette.text)
+                txt(text.clone(), size, self.tone_color(*tone))
                     .font_weight(FontWeight::SEMIBOLD)
                     .into_any_element()
             }
@@ -561,7 +680,11 @@ impl ExtensionPanelView {
                 action,
             } => {
                 let action = action.clone();
-                let current = if value.is_empty() { placeholder } else { value };
+                // A declared input is a real field: the state entity keeps what
+                // the reader typed across frames, and Apply sends it as
+                // `{"value": ...}` instead of an empty payload.
+                let entity = self.input_for(path, value, placeholder, window, cx);
+                let read_path = path.to_string();
                 div()
                     .flex()
                     .flex_col()
@@ -577,14 +700,7 @@ impl ExtensionPanelView {
                                 div()
                                     .flex_1()
                                     .h(px(30.0))
-                                    .px(px(10.0))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(8.0))
-                                    .bg(rgb(self.palette.page))
-                                    .border_1()
-                                    .border_color(rgb(self.palette.border))
-                                    .child(txt(current.clone(), 13.0, self.palette.text)),
+                                    .child(Input::new(&entity).w_full()),
                             )
                             .child(
                                 Button::new(format!("extension-apply-{path}"))
@@ -596,7 +712,8 @@ impl ExtensionPanelView {
                                     .bg(rgb(self.palette.accent))
                                     .child(txt("Apply", 12.0, self.palette.page))
                                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        this.dispatch(&action, json!({}), cx)
+                                        let text = this.input_value(&read_path, cx);
+                                        this.dispatch(&action, json!({ "value": text }), cx)
                                     })),
                             ),
                     )
@@ -715,29 +832,102 @@ impl ExtensionPanelView {
                 }
                 list.into_any_element()
             }
-            UiNode::Table { columns, rows } => {
+            UiNode::Section {
+                title,
+                open,
+                children,
+            } => {
+                // The document's default is recorded the first time the node is
+                // drawn; afterwards the reader's toggle wins, including across
+                // an auto-refresh that rebuilds the document.
+                let is_open = {
+                    let mut sections = self.sections.borrow_mut();
+                    *sections.entry(path.to_string()).or_insert(*open)
+                };
+                let toggle = path.to_string();
+                let next = !is_open;
+                let mut section = div().flex().flex_col().gap(px(6.0)).w_full();
+                section = section.child(
+                    Button::new(format!("extension-section-{path}"))
+                        .debug_selector(|| format!("extension-section-{path}"))
+                        .accessibility_label(title.clone())
+                        .w_full()
+                        .px(px(2.0))
+                        .h(px(28.0))
+                        .bg(rgb(self.palette.page))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    icon(
+                                        if is_open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        },
+                                        12.0,
+                                        self.palette.muted,
+                                    )
+                                    .into_any_element(),
+                                )
+                                .child(txt(title.clone(), 13.0, self.palette.text)),
+                        )
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.sections.borrow_mut().insert(toggle.clone(), next);
+                            cx.notify();
+                        })),
+                );
+                if is_open {
+                    let mut body = div().flex().flex_col().gap(px(6.0)).w_full().pl(px(14.0));
+                    for (index, child) in children.iter().enumerate() {
+                        body = body.child(self.render_node(
+                            child,
+                            &format!("{path}-{index}"),
+                            window,
+                            cx,
+                        ));
+                    }
+                    section = section.child(body);
+                }
+                section.into_any_element()
+            }
+            UiNode::Table {
+                columns,
+                rows,
+                widths,
+            } => {
                 // A table is a grid, not a wall of text: the header is quieter
                 // and every row is ruled off, so a twelve-row capture table can
-                // be read across without losing the row.
+                // be read across without losing the row. Weights let a package
+                // say which column needs the room.
                 let mut table = div().flex().flex_col().w_full();
                 let mut header = div().flex().flex_row().gap(px(8.0)).w_full().pb(px(3.0));
-                for column in columns {
-                    header = header.child(div().flex_1().child(txt(
-                        column.clone(),
-                        11.0,
-                        self.palette.muted,
-                    )));
+                for (index, column) in columns.iter().enumerate() {
+                    let weight = widths.get(index).copied().unwrap_or(1.0).max(0.01);
+                    header = header.child(
+                        div()
+                            .flex_grow(weight)
+                            .flex_basis(px(0.0))
+                            .min_w_0()
+                            .child(txt(column.clone(), 11.0, self.palette.muted)),
+                    );
                 }
                 table = table
                     .child(hairline_bottom(header).border_color(rgb(self.palette.border_soft)));
                 for row in rows {
                     let mut line = div().flex().flex_row().gap(px(8.0)).w_full().py(px(3.0));
-                    for cell in row {
-                        line = line.child(div().flex_1().child(txt(
-                            cell.clone(),
-                            12.0,
-                            self.palette.text,
-                        )));
+                    for (index, cell) in row.iter().enumerate() {
+                        let weight = widths.get(index).copied().unwrap_or(1.0).max(0.01);
+                        line = line.child(
+                            div()
+                                .flex_grow(weight)
+                                .flex_basis(px(0.0))
+                                .min_w_0()
+                                .child(txt(cell.clone(), 12.0, self.palette.text)),
+                        );
                     }
                     table = table
                         .child(hairline_bottom(line).border_color(rgb(self.palette.border_soft)));
@@ -797,6 +987,7 @@ impl ExtensionPanelView {
                     body = body.child(self.render_node(
                         &tab.content,
                         &format!("{path}-tab-{selected}"),
+                        window,
                         cx,
                     ));
                 }
@@ -826,7 +1017,11 @@ impl ExtensionPanelView {
                     )
                     .into_any_element()
             }
-            UiNode::Code { language, value } => {
+            UiNode::Code {
+                language,
+                value,
+                tone,
+            } => {
                 let mut code = div()
                     .flex()
                     .flex_col()
@@ -838,7 +1033,7 @@ impl ExtensionPanelView {
                     code = code.child(txt(language.clone(), 11.0, self.palette.faint));
                 }
                 code.child(
-                    txt(value.clone(), 11.5, self.palette.text)
+                    txt(value.clone(), 11.5, self.tone_color(*tone))
                         .font_family(theme::CODE_FONT)
                         .line_height(px(16.0)),
                 )
@@ -917,6 +1112,19 @@ fn location_label(location: PanelLocation) -> &'static str {
     }
 }
 
+/// The palette a panel should use in the current mode: the dark variant in
+/// dark mode (falling back to the light one), the light palette otherwise.
+fn panel_palette<'a>(
+    light: &'a Option<ThemePalette>,
+    dark: &'a Option<ThemePalette>,
+) -> Option<&'a ThemePalette> {
+    if theme::is_dark() {
+        dark.as_ref().or(light.as_ref())
+    } else {
+        light.as_ref()
+    }
+}
+
 /// The surface a call must use, when the stored one has been retired.
 ///
 /// A view keeps the `PanelSurface` it was built with, and a host rebuild shuts
@@ -946,7 +1154,12 @@ fn summarize(value: &Value) -> String {
 
 impl Render for ExtensionPanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The palette is recomputed per frame so a light/dark switch lands
+        // without rebuilding the pane, and a package theme's dark variant wins
+        // in dark mode.
+        self.palette = Palette::new(panel_palette(&self.panel_theme, &self.panel_theme_dark));
         self.ensure_loaded(cx);
+        self.schedule_refresh(cx);
         self.ensure_picker(window, cx);
         // Record what this frame draws from; a click later in the frame's life
         // is an action on this revision, not on whatever replaced it since.
@@ -1041,7 +1254,7 @@ impl Render for ExtensionPanelView {
                 .gap(px(8.0))
                 .w_full()
                 .overflow_y_scroll();
-            body = body.child(self.render_node(&document.root, "root", cx));
+            body = body.child(self.render_node(&document.root, "root", window, cx));
             root = root.child(body);
         }
         root
@@ -1146,7 +1359,9 @@ mod tests {
             runtime,
             owner: ExtensionId::parse("com.example.ui").expect("id"),
             theme: None,
+            theme_dark: None,
             initial,
+            refresh_ms: None,
             policy: Arc::new(
                 ferris_sdk::capability::PolicyEngine::open(
                     std::env::temp_dir().join(format!("bsh-panel-grants-{}", std::process::id())),

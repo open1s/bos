@@ -302,6 +302,72 @@ catalogue and the `load_skill` tool read:
   when it holds a skill, and an empty directory falls back to the declared files
   so a package is never worse off for having declared them.
 
+### 3.6.1 Declarative panel documents
+
+A `panel` contribution ships `panels/<id>.json`:
+
+~~~json
+{
+  "title": "LLM Sniffer",
+  "location": "right",
+  "default_visibility": "visible",
+  "theme": "midnight",
+  "theme_dark": "midnight-dark",
+  "refresh_ms": 1500,
+  "view": { "schema_version": "1.0", "root": { "type": "column", "children": [] } }
+}
+~~~
+
+The view is validated at load: at most 1000 nodes, depth 32, 16 KiB per text leaf,
+256 KiB of text, 500 table rows, 2048 characters per cell, 1 MiB serialized. A
+component the host cannot honour is a load error, not a silent fallback.
+
+| Component | Shape |
+|---|---|
+| container, column, row | `children` |
+| text, heading | `text`, heading `level` 1-6, optional `tone` |
+| markdown | `text` (rendered as markdown) |
+| button | `label`, `action`, `style` (primary/secondary/ghost/danger) |
+| input | `label`, `value`, `placeholder`, `action` - a real editable field |
+| select | `label`, `value`, options `[{label, value}]`, `action` |
+| checkbox | `label`, `checked`, `action` |
+| list | items `[{title, detail, action?}]` |
+| table | `columns`, `rows`, optional `widths` (one relative weight per column) |
+| tree | `nodes` |
+| tabs | `tabs` `[{id, label, content}]` |
+| section | `title`, `open` (start state), `children` - collapsible, the reader's choice is kept |
+| progress | `value` 0-1, `label` |
+| code | `language`, `value`, optional `tone` |
+| image | `src` must be `asset/...`; remote URLs are refused |
+| notification | `level` (info/success/warning/error), `text` |
+| divider, spacer | - |
+
+`tone` is a semantic role, never a colour: `neutral`, `muted`, `faint`,
+`accent`, `success`, `warning`, `error`. The host resolves it against the
+panel's palette, so the same document follows the reader's light/dark choice and
+a package's own theme tokens.
+
+**Actions.** An action id is a contribution id owned by the package. A press
+calls the tool with that id, falling back to the command seam when no tool owns
+it. Inputs send their text (`{"value": ...}`), selects their option value,
+checkboxes `{"checked": bool}`. Every action carries the revision it was
+rendered from; a stale action is refused rather than applied to a newer frame. A
+handler that returns a UI document replaces the card at the next revision; any
+other JSON is shown as a message under it.
+
+**Live refresh.** `refresh_ms` (250..60000) asks the host to re-read a live card
+on that interval while the pane is visible. The timer is armed from a render, so
+a hidden pane stops refreshing by itself.
+
+**Theming.** `theme` and `theme_dark` name themes the same package contributes;
+the host picks the dark one in dark mode and falls back to the light one, and to
+the host palette when neither is named. The palette is resolved per frame, so a
+light/dark switch lands without rebuilding the pane.
+
+**A declared view is a placeholder.** The host draws it immediately, then asks
+the runtime for its live card once per selection (and on Refresh). If the
+runtime cannot answer, the declared view stays and the panel says why.
+
 ### 3.7 Services
 
 ~~~toml

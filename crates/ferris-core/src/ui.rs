@@ -86,6 +86,31 @@ impl ThemePalette {
     }
 }
 
+/// A semantic colour role the host resolves against the panel's theme.
+///
+/// A component names the role, not a colour: the same document then follows the
+/// reader's light/dark choice and a package's own theme tokens, instead of
+/// freezing one palette into the document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tone {
+    /// The panel's normal text.
+    #[default]
+    Neutral,
+    /// Secondary text.
+    Muted,
+    /// The quietest text.
+    Faint,
+    /// The theme accent.
+    Accent,
+    /// A success colour.
+    Success,
+    /// A warning colour.
+    Warning,
+    /// An error colour.
+    Error,
+}
+
 /// Where the host mounts a panel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -215,6 +240,9 @@ pub enum UiNode {
     Text {
         /// The text.
         text: String,
+        /// Semantic colour role.
+        #[serde(default)]
+        tone: Tone,
     },
     /// A section heading.
     Heading {
@@ -223,6 +251,9 @@ pub enum UiNode {
         /// Level, 1 through 6.
         #[serde(default = "default_heading_level")]
         level: u8,
+        /// Semantic colour role.
+        #[serde(default)]
+        tone: Tone,
     },
     /// Markdown text.
     Markdown {
@@ -287,6 +318,30 @@ pub enum UiNode {
         /// Rows of cells.
         #[serde(default)]
         rows: Vec<Vec<String>>,
+        /// Relative column widths, one per column.
+        ///
+        /// A missing or short list means equal columns. Layout is a view
+        /// concern, but only the package knows that a message table needs a
+        /// wide preview column and a narrow index.
+        #[serde(default)]
+        widths: Vec<f32>,
+    },
+
+    /// A collapsible section.
+    ///
+    /// The title is a disclosure header and the host remembers the reader's
+    /// choice, so a package can ship a long card without inventing its own
+    /// paging.
+    Section {
+        /// The disclosure header.
+        title: String,
+        /// Whether it starts open.
+        #[serde(default = "section_starts_open")]
+        open: bool,
+        /// The body, drawn while open. Always validated, so a hidden mistake
+        /// is still a load error rather than a surprise on the first open.
+        #[serde(default)]
+        children: Vec<UiNode>,
     },
     /// A tree.
     Tree {
@@ -315,6 +370,9 @@ pub enum UiNode {
         language: String,
         /// Source text.
         value: String,
+        /// Semantic colour role for the text.
+        #[serde(default)]
+        tone: Tone,
     },
     /// An image.
     ///
@@ -347,6 +405,11 @@ pub enum UiNode {
 
 fn default_heading_level() -> u8 {
     2
+}
+
+/// A section starts open unless the document says otherwise.
+fn section_starts_open() -> bool {
+    true
 }
 
 fn default_spacer() -> u16 {
@@ -436,10 +499,12 @@ fn walk(node: &UiNode, depth: usize, state: &mut WalkState<'_>) {
                 walk(child, depth + 1, state);
             }
         }
-        UiNode::Text { text } | UiNode::Markdown { text } | UiNode::Notification { text, .. } => {
+        UiNode::Text { text, .. }
+        | UiNode::Markdown { text }
+        | UiNode::Notification { text, .. } => {
             text_leaf("ui.text", text, state);
         }
-        UiNode::Heading { text, level } => {
+        UiNode::Heading { text, level, .. } => {
             if !(1..=6).contains(level) {
                 state
                     .report
@@ -504,7 +569,25 @@ fn walk(node: &UiNode, depth: usize, state: &mut WalkState<'_>) {
                 }
             }
         }
-        UiNode::Table { columns, rows } => {
+        UiNode::Table {
+            columns,
+            rows,
+            widths,
+        } => {
+            if !widths.is_empty() {
+                if widths.len() != columns.len() {
+                    state.report.error(
+                        "ui.table.widths",
+                        "must be empty or carry one weight per column",
+                    );
+                }
+                if widths.iter().any(|width| !(*width > 0.0 && *width <= 20.0)) {
+                    state.report.error(
+                        "ui.table.widths",
+                        "every weight must be greater than 0 and at most 20",
+                    );
+                }
+            }
             if columns.len() > state.limits.max_columns {
                 state.report.error(
                     "ui.table.columns",
@@ -543,6 +626,14 @@ fn walk(node: &UiNode, depth: usize, state: &mut WalkState<'_>) {
                 walk_tree(node, depth + 1, state);
             }
         }
+        UiNode::Section {
+            title, children, ..
+        } => {
+            text_leaf("ui.section.title", title, state);
+            for child in children {
+                walk(child, depth + 1, state);
+            }
+        }
         UiNode::Tabs { tabs } => {
             if tabs.len() > state.limits.max_tabs {
                 state.report.error(
@@ -569,7 +660,9 @@ fn walk(node: &UiNode, depth: usize, state: &mut WalkState<'_>) {
             }
             text_leaf("ui.progress.label", label, state);
         }
-        UiNode::Code { language, value } => {
+        UiNode::Code {
+            language, value, ..
+        } => {
             text_leaf("ui.code.language", language, state);
             text_leaf("ui.code.value", value, state);
         }
@@ -776,9 +869,11 @@ mod tests {
                     UiNode::Heading {
                         text: "Git Status".to_string(),
                         level: 2,
+                        tone: Tone::Neutral,
                     },
                     UiNode::Text {
                         text: "Working tree clean".to_string(),
+                        tone: Tone::Neutral,
                     },
                     UiNode::Button {
                         label: "Refresh".to_string(),
@@ -812,10 +907,71 @@ mod tests {
             .any(|issue| issue.field == "ui.button.action"));
     }
 
+    /// A collapsed section still validates its body: a hidden mistake must be
+    /// a load error, not a surprise on the first open.
+    #[test]
+    fn a_collapsed_section_still_validates_its_body() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": {
+                "type": "section",
+                "title": "Details",
+                "open": false,
+                "children": [{"type": "text", "text": "hidden body"}]
+            }
+        }))
+        .expect("document");
+        assert!(document.validate(&id()).is_valid());
+    }
+
+    /// Column weights are layout, but a wrong count is a document bug: it is
+    /// refused rather than silently ignored.
+    #[test]
+    fn a_table_weight_list_must_match_its_columns() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": {
+                "type": "table",
+                "columns": ["A", "B"],
+                "rows": [["1", "2"]],
+                "widths": [1.0]
+            }
+        }))
+        .expect("document");
+        let report = document.validate(&id());
+        assert!(!report.is_valid(), "a short weight list is a load error");
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "ui.table.widths"));
+    }
+
+    /// A tone is a named role; an unknown one is a parse error, so a document
+    /// cannot smuggle a raw colour past the theme.
+    #[test]
+    fn a_tone_is_a_named_role_not_a_colour() {
+        assert!(serde_json::from_value::<UiNode>(serde_json::json!({
+            "type": "text", "text": "hi", "tone": "chartreuse"
+        }))
+        .is_err());
+        let parsed = serde_json::from_value::<UiNode>(serde_json::json!({
+            "type": "text", "text": "hi", "tone": "error"
+        }))
+        .expect("a known tone parses");
+        assert!(matches!(
+            parsed,
+            UiNode::Text {
+                tone: Tone::Error,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn depth_is_capped() {
         let mut root = UiNode::Text {
             text: "leaf".to_string(),
+            tone: Tone::Neutral,
         };
         for _ in 0..40 {
             root = UiNode::Column {

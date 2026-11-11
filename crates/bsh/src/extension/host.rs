@@ -275,6 +275,10 @@ pub(crate) struct PanelSurface {
     pub(crate) theme: Option<ThemePalette>,
     /// A declarative view that is ready without a call, when one exists.
     pub(crate) initial: Option<UiDocument>,
+    /// The panel's own dark palette, when it names one.
+    pub(crate) theme_dark: Option<ThemePalette>,
+    /// How often the host should re-read the live card, when the panel says.
+    pub(crate) refresh_ms: Option<u64>,
     /// Policy the panel's actions are authorized against.
     pub(crate) policy: Arc<PolicyEngine>,
     /// Trust level of the owning package.
@@ -2971,7 +2975,7 @@ impl ExtensionHost {
             let Some(runtime) = &entry.runtime else {
                 continue;
             };
-            let theme = load_theme(entry);
+            let theme = load_theme(entry, None);
             let mut declared = std::collections::BTreeSet::new();
             for panel in &entry.contributions.panels {
                 declared.insert(panel.id.as_str().to_string());
@@ -2984,8 +2988,13 @@ impl ExtensionHost {
                     visibility: panel.visibility,
                     runtime: Arc::clone(runtime),
                     owner: entry.package.id().clone(),
-                    theme: theme.clone(),
+                    theme: load_theme(entry, panel.theme.as_deref()),
+                    theme_dark: panel
+                        .theme_dark
+                        .as_deref()
+                        .and_then(|id| load_theme(entry, Some(id))),
                     initial: Some(panel.view.clone()),
+                    refresh_ms: panel.refresh_ms,
                     policy: Arc::clone(&self.policy),
                     trust: entry.package.trust,
                     tools: Arc::new(entry.tools.clone()),
@@ -3007,7 +3016,9 @@ impl ExtensionHost {
                     runtime: Arc::clone(runtime),
                     owner: entry.package.id().clone(),
                     theme: theme.clone(),
+                    theme_dark: None,
                     initial: None,
+                    refresh_ms: None,
                     policy: Arc::clone(&self.policy),
                     trust: entry.package.trust,
                     tools: Arc::new(entry.tools.clone()),
@@ -3457,9 +3468,19 @@ impl ExtensionHost {
     }
 }
 
-/// The first declared theme for an extension, if it parses.
-fn load_theme(entry: &LoadedExtension) -> Option<ThemePalette> {
-    let theme = entry.contributions.themes.first()?;
+/// One declared theme for an extension, by id, or the first when none is named.
+///
+/// The panel file names its theme, so a package with a light and a dark theme
+/// (or several looks) can ship all of them and pick per panel.
+fn load_theme(entry: &LoadedExtension, id: Option<&str>) -> Option<ThemePalette> {
+    let theme = match id {
+        Some(id) => entry
+            .contributions
+            .themes
+            .iter()
+            .find(|theme| theme.id.as_str() == id)?,
+        None => entry.contributions.themes.first()?,
+    };
     let text = std::fs::read_to_string(&theme.path).ok()?;
     serde_json::from_str(&text).ok()
 }
