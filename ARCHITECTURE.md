@@ -9,6 +9,84 @@ This document explains the platform through three architecture visuals, then def
 
 ---
 
+## 0. BSH goal, product intent and architecture directives
+
+### 0.1 Product goal
+
+BSH's goal is to become a **Distributed Composable Agent & Capability Platform**, with each BSH Node acting as an **AI-Native Composable Capability Container**.
+
+BSH should let people and AI Agents assemble purpose-built work environments on demand from independently governed capabilities. A task should receive the expertise, tools, services, models, resources and collaborating agents it needs — no more and no less — within an explicit Workspace and its policy boundaries.
+
+A single BSH Node must be useful and autonomous on its own. Multiple BSH Nodes must also be able to discover one another's published capabilities, delegate bounded work and collaborate as a Federation. Federation is a core platform capability and a strategic differentiator, not merely a remote-tool transport feature. Nodes collaborate without merging their runtimes, data ownership, security kernels or trust boundaries.
+
+**Product promise:** Compose Capabilities. Empower AI.
+
+**Platform principle:** One Runtime. Composable Workspaces. Collaborative Agents. Federated Capabilities. Independent Trust Boundaries.
+
+### 0.2 What BSH is intended to deliver
+
+1. **On-demand AI workspaces:** create task- or purpose-specific Workspaces by composing only the required capabilities, context, policies and resource grants.
+2. **Composable capabilities:** make tools, Skills, extensions, services, models and resources discoverable through explicit, versioned contracts and provider boundaries.
+3. **Agent-directed composition with runtime governance:** allow Agents and planners to discover, recommend and propose compositions; deterministic runtime components validate, authorize, activate and execute them.
+4. **Multiple agents and interfaces:** support agents operating in distinct Workspaces and interfaces while reusing the same governed runtime and capability model.
+5. **Federated collaboration:** allow autonomous Nodes to publish approved metadata, discover granted remote capabilities, delegate bounded tasks and collaborate while retaining independent authority.
+6. **Secure, observable execution:** provide explicit identity, trust, authorization, isolation, budgets, cancellation, lifecycle, provenance and audit across local and remote execution.
+7. **Extensible implementation:** support native/BOS capabilities, Ferris extensions, MCP integrations, WASM and remote providers through adapters to common platform contracts rather than making any one integration protocol the platform model.
+
+### 0.3 Binding architecture directives
+
+These directives guide architecture, implementation and review. A design that conflicts with one must document the trade-off and obtain an explicit architecture decision rather than silently weakening the platform contract.
+
+| Directive | Required interpretation |
+|---|---|
+| **Runtime First** | Runtime code owns lifecycle, composition validation, authorization, execution, cancellation, recovery and audit. Prompt instructions and model output are never enforcement mechanisms. |
+| **Capability First** | A capability is the canonical unit of discoverable and governable operation. Provider implementations are replaceable behind stable, versioned contracts. |
+| **Composition over Monolith** | Build purpose-specific Workspaces from independently managed capabilities. Do not turn BSH into one fixed, globally enabled tool bundle. |
+| **AI-Native, not AI-authoritative** | AI may discover, rank, plan and propose. Deterministic runtime policy decides what is valid and permitted. |
+| **Security by Construction** | Identity, trust, least privilege, isolation, resource limits and audit are part of the composition and invocation contracts, not optional afterthoughts. |
+| **Federation without authority merger** | Nodes may collaborate and delegate, but each Node remains authoritative for its own providers, data, policy, execution and audit. Remote use requires explicit caller-side and provider-side authorization. |
+| **Progressive disclosure** | Discover from compact metadata; load Skill instructions and expose Tool schemas only when selected and validated. Never inject the entire catalogue into every model request. |
+| **Explicit ownership and contracts** | Keep Capability, Provider, Registry, Composition, Workspace, Agent, Execution Context and Federation responsibilities distinct. Avoid duplicate registries, competing authorization engines and ambiguous lifecycle ownership. |
+| **Observable and verifiable behavior** | Important lifecycle transitions and security decisions must be correlated, testable and auditable. Document target behavior separately from verified implementation. |
+
+### 0.4 Responsibility boundaries
+
+The platform is a coordinated set of components, not a monolithic application with interchangeable responsibilities:
+
+- **BSH** owns the product experience and the composition/workspace control plane: Workspaces, Agent interaction, capability views, policy integration, task orchestration and Federation participation.
+- **BOS** provides the shared Rust-native Agent and capability execution foundation: runtime primitives, providers, tool/Skill integration, messaging and language bindings.
+- **Ferris** provides the extension package and extension-runtime framework. BSH/BOS integrate extension contributions through explicit host/provider contracts.
+- **Capability Providers** implement operations. They do not independently decide the requesting Workspace's authority.
+- **Federation** connects autonomous BSH Nodes. It does not create a global registry with global execution authority or a Workspace spanning multiple Nodes.
+
+These are architectural ownership boundaries. They do not require every logical responsibility to become a separate process, crate or service immediately.
+
+### 0.5 Non-goals and prohibited shortcuts
+
+BSH is not intended to become:
+
+- A monolithic Agent application whose capabilities are hard-coded into one permanent tool list.
+- A prompt-only tool/Skill orchestration framework where model instructions enforce security.
+- A global shared runtime in which Federation peers surrender local execution or data authority.
+- An MCP-specific platform; MCP is one adapter among several.
+- A system where discovering a capability, loading a Skill, exposing a schema or receiving an advertisement automatically grants permission.
+- A platform that claims a feature is complete because a type, registry entry or happy-path API exists without lifecycle, policy, failure, recovery and integration evidence.
+
+### 0.6 Architecture decision and implementation discipline
+
+The current BSH 2.0 architecture decisions remain authoritative: **ADR-001 = hybrid, ADR-002 = independent, ADR-003 = hybrid**. New designs must preserve these decisions unless a superseding ADR is explicitly accepted.
+
+For every substantial feature:
+
+1. State the user/task outcome and which platform goal it advances.
+2. Identify the owning subsystem and its public contract.
+3. Define identity, authority, lifecycle, state ownership and failure semantics.
+4. Define local and federated behavior, including trust and revocation where applicable.
+5. Define budgets, observability, security tests and acceptance criteria.
+6. Separate implemented behavior, implementation gaps and target architecture in documentation and review reports.
+
+The architecture is successful only when a Workspace can be composed for a concrete purpose, safely used by its Agent, and — where granted — collaborate with other autonomous Nodes without bypassing the same governance guarantees.
+
 ## 1. The platform at a glance
 
 ![BSH Distributed Composable Agent and Capability Platform](docs/assets/diagrams/bsh-distributed-platform.svg)
