@@ -1046,6 +1046,194 @@ fn nothing_is_deferred_by_default() {
 }
 
 // =========================================================================
+// Initial tool-schema budget (issue #292)
+// =========================================================================
+
+/// Register `count` tools whose definitions are each about `bytes` long.
+fn register_sized_tools(agent: &mut Agent, count: usize, bytes: usize) {
+    for index in 0..count {
+        let description: &'static str = Box::leak("x".repeat(bytes).into_boxed_str());
+        let name: &'static str = Box::leak(format!("sized_{index:02}").into_boxed_str());
+        agent.add_tool(Arc::new(FunctionTool::new(
+            name,
+            description,
+            serde_json::json!({"type": "object"}),
+            move |_args| Ok(serde_json::json!("ok")),
+        )));
+    }
+}
+
+/// The initial array is bounded by the configured budget, and every definition
+/// it leaves out is named by the admission decision and reachable through the
+/// search that replaces it.
+#[test]
+fn a_large_registry_cannot_exceed_the_initial_schema_budget() {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    // 40 definitions of 2 KB each: 80 KB of schema against a 20 KB ceiling.
+    register_sized_tools(&mut agent, 40, 2_048);
+    let agent = agent.with_tool_schema_budget(20_000);
+
+    let admission = agent.tool_admission();
+    assert!(
+        admission.bytes <= admission.limit,
+        "the advertised array is bounded: {} bytes over a {} byte limit",
+        admission.bytes,
+        admission.limit
+    );
+    assert!(
+        admission.has_withheld(),
+        "the rest of the registry is withheld, not silently shipped"
+    );
+    // `find_tool` is admitted in place of the withheld definitions, so the
+    // accounting is over the REGISTRY: every registered definition is either
+    // advertised or reported, and the search is the extra entry.
+    let advertised: std::collections::HashSet<&str> = admission
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    let withheld: std::collections::HashSet<&str> = admission
+        .withheld
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    for tool in agent.all_tools() {
+        assert!(
+            advertised.contains(tool.name.as_str()) || withheld.contains(tool.name.as_str()),
+            "{} is neither advertised nor reported",
+            tool.name
+        );
+    }
+    assert!(
+        advertised.contains("find_tool"),
+        "the search is admitted in the withheld definitions' place"
+    );
+
+    let names: Vec<String> = agent.model_tools().into_iter().map(|t| t.name).collect();
+    for withheld in admission.withheld_names() {
+        assert!(
+            !names.contains(&withheld),
+            "{withheld} is withheld, so it must not be in the array: {names:?}"
+        );
+    }
+    assert!(
+        names.iter().any(|name| name == "find_tool"),
+        "the way back to a withheld definition is advertised: {names:?}"
+    );
+}
+
+/// A definition the prompt names is never withheld, even when the budget
+/// cannot afford it: the required bytes are admitted and the overdraft is
+/// reported instead of being paid for by dropping the tool.
+#[test]
+fn a_required_tool_is_admitted_even_when_the_budget_is_too_small() {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    let required: &'static str = Box::leak("r".repeat(20_000).into_boxed_str());
+    agent.add_tool(Arc::new(FunctionTool::new(
+        "read_file",
+        required,
+        serde_json::json!({"type": "object"}),
+        |_args| Ok(serde_json::json!("ok")),
+    )));
+    register_sized_tools(&mut agent, 4, 2_048);
+    let mut agent = agent.with_tool_schema_budget(8_000);
+    agent.require_tool("read_file");
+
+    let admission = agent.tool_admission();
+    assert!(
+        admission.tools.iter().any(|tool| tool.name == "read_file"),
+        "a required definition stays in the array"
+    );
+    assert!(admission.over_budget, "the overdraft is reported");
+    assert_eq!(agent.required_tools(), &["read_file".to_string()][..]);
+}
+
+/// Withholding a definition for budget keeps it callable: the search the
+/// request carries reports the full definition, so a direct call can follow.
+#[test]
+fn a_budget_withheld_tool_is_found_by_the_search() {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    register_sized_tools(&mut agent, 12, 2_048);
+    let agent = agent.with_tool_schema_budget(16_000);
+
+    let admission = agent.tool_admission();
+    let withheld = admission
+        .withheld_names()
+        .into_iter()
+        .next()
+        .expect("a 12 x 2 KB registry does not fit 16 KB");
+
+    let search = super::discovery::find_tool(
+        agent.registry().cloned(),
+        Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
+        Arc::new(std::sync::RwLock::new(None)),
+        super::discovery::Withheld::new(Vec::new(), Vec::new())
+            .with_budget(Arc::clone(&agent.schema_withheld)),
+    );
+    let reported = search
+        .run(&serde_json::json!({"name": withheld}))
+        .expect("the search answers");
+    assert_eq!(
+        reported.get("name").and_then(|name| name.as_str()),
+        Some(withheld.as_str()),
+        "the withheld definition is reported instead of 'already in your tool list': {reported}"
+    );
+    assert!(
+        reported.get("parameters").is_some(),
+        "the result carries the schema a direct call needs"
+    );
+}
+
+/// A zero configuration is not "unlimited": it selects the framework ceiling,
+/// which is the same number discovery already spends.
+#[test]
+fn a_zero_schema_budget_selects_the_framework_ceiling() {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    register_sized_tools(&mut agent, 80, 2_048);
+    let agent = agent.with_tool_schema_budget(0);
+
+    let admission = agent.tool_admission();
+    assert_eq!(agent.tool_schema_budget(), 0);
+    assert_eq!(
+        admission.limit,
+        react::engine::DEFAULT_SCHEMA_BUDGET - react::tool::admission::DEFAULT_DISCOVERY_RESERVE
+    );
+    assert!(
+        admission.bytes <= admission.limit,
+        "the default ceiling bounds the initial array"
+    );
+    assert!(admission.has_withheld(), "160 KB does not fit the default");
+}
+
+/// The cached prefix cannot depend on registration order: the same set yields
+/// the same array, whatever order the registry walks in.
+#[test]
+fn the_admitted_array_is_stable_across_registration_order() {
+    let names_of = |registration: &[&str]| {
+        let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+        for name in registration {
+            let owned = name.to_string();
+            agent.add_tool(Arc::new(FunctionTool::new(
+                name,
+                "a tool",
+                serde_json::json!({"type": "object"}),
+                move |_args| Ok(serde_json::json!(owned.clone())),
+            )));
+        }
+        let agent = agent.with_tool_schema_budget(10_000);
+        agent
+            .model_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<String>>()
+    };
+    assert_eq!(
+        names_of(&["zulu", "alpha", "mike", "bravo"]),
+        names_of(&["bravo", "mike", "alpha", "zulu"])
+    );
+}
+
+// =========================================================================
 // Deferred tools end to end
 // =========================================================================
 
@@ -1103,6 +1291,10 @@ impl AgentHook for ToolNameHook {
 struct DiscoveringLlm {
     step: std::sync::atomic::AtomicUsize,
     advertised: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The `find_tool` arguments this model sends on its first step.
+    find_args: String,
+    /// The tool it calls directly once the search reports it.
+    direct: String,
 }
 
 #[async_trait]
@@ -1122,8 +1314,8 @@ impl LlmClient<AgentSession, AgentReactContext> for DiscoveringLlm {
             *self.advertised.lock().unwrap() = names;
         }
         Ok(match step {
-            0 => make_tool_call_response("find_tool", "{\"query\":\"github issue search\"}"),
-            1 => make_tool_call_response("github_search", "{\"query\":\"bug\"}"),
+            0 => make_tool_call_response("find_tool", &self.find_args),
+            1 => make_tool_call_response(&self.direct, "{\"query\":\"bug\"}"),
             _ => make_text_response("Final Answer: found the issues".to_string()),
         })
     }
@@ -1151,12 +1343,30 @@ fn discovering_agent(
     calls: Arc<std::sync::atomic::AtomicUsize>,
     advertised: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> Agent {
+    discovering_agent_for(
+        calls,
+        advertised,
+        "{\"query\":\"github issue search\"}",
+        "github_search",
+    )
+}
+
+/// The same script, with the search arguments and the tool it reports chosen by
+/// the caller.
+fn discovering_agent_for(
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    advertised: Arc<std::sync::Mutex<Vec<String>>>,
+    find_args: &str,
+    direct: &str,
+) -> Agent {
     let mut provider = LlmProvider::new();
     provider.register_vendor(
         "mock".to_string(),
         Box::new(DiscoveringLlm {
             step: std::sync::atomic::AtomicUsize::new(0),
             advertised,
+            find_args: find_args.to_string(),
+            direct: direct.to_string(),
         }),
     );
     let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
@@ -1206,6 +1416,57 @@ async fn a_withheld_mcp_tool_is_found_and_run_through_the_agent() {
         *hook_names.lock().unwrap(),
         vec!["find_tool".to_string(), "github_search".to_string()],
         "the second hook sees the real discovered tool"
+    );
+}
+
+/// A definition withheld by the BYTE BUDGET is reachable the same way a
+/// deferred one is: the search the budget admitted reports it, the reported
+/// schema joins the next request, and the direct call runs.
+///
+/// The fixture's first withheld name is an assumption about the registry's
+/// sizes; the test asserts it, so a change in the definition size fails here
+/// with the reason instead of turning this into a green no-op.
+#[tokio::test]
+async fn a_budget_withheld_tool_is_found_and_run_after_the_initial_set_is_bounded() {
+    let direct = "sized_03";
+    let advertised = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(DiscoveringLlm {
+            step: std::sync::atomic::AtomicUsize::new(0),
+            advertised: advertised.clone(),
+            find_args: format!("{{\"name\":\"{direct}\"}}"),
+            direct: direct.to_string(),
+        }),
+    );
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    register_sized_tools(&mut agent, 12, 2_048);
+    let agent = agent.with_tool_schema_budget(16_000);
+
+    let admission = agent.tool_admission();
+    assert_eq!(
+        admission.withheld_names().first().map(String::as_str),
+        Some(direct),
+        "the fixture's direct call names the first withheld definition"
+    );
+    assert!(
+        !admission.tools.iter().any(|tool| tool.name == direct),
+        "the premise: this definition is not in the initial request"
+    );
+
+    let answer = agent
+        .react("use the sized tool".to_string())
+        .await
+        .expect("the turn completes");
+    assert!(
+        answer.contains("found the issues"),
+        "the turn ran the discovered tool and answered: {answer}"
+    );
+    let seen = advertised.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|name| name == "find_tool") && seen.iter().any(|name| name == direct),
+        "the search and the budget-withheld tool are both advertised after discovery: {seen:?}"
     );
 }
 

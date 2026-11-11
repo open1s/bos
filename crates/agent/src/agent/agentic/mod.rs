@@ -14,7 +14,7 @@ use bus::Bus;
 use futures::{Stream, StreamExt};
 use log::warn;
 use react::LlmMessage;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -310,6 +310,30 @@ pub struct Agent {
     /// Tools kept out of the advertised array by name prefix.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     deferred_prefixes: Vec<String>,
+    /// Byte ceiling for the tool definitions one request's initial array
+    /// carries. Zero selects the framework default.
+    ///
+    /// Every initial definition and every `find_tool` reveal spends this ONE
+    /// per-turn budget, so a wide registry cannot make each request pay for all
+    /// of it. A definition over budget is withheld, not dropped: it stays
+    /// registered and callable, and the search that reaches it joins the
+    /// request.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    tool_schema_budget: usize,
+    /// Names the byte budget must never withhold.
+    ///
+    /// This is the host's statement that a definition is load-bearing - a tool
+    /// the prompt names, a safety tool, the search itself - so it stays in the
+    /// array whatever it costs. See [`Agent::require_tool`].
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    required_tools: Vec<String>,
+    /// Names the byte budget withheld from the current advertisement.
+    ///
+    /// Written where the array is computed and read by `find_tool`'s
+    /// catalogue, so a definition withheld to fit the budget is offered by the
+    /// search exactly like one that withheld itself.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    schema_withheld: Arc<std::sync::RwLock<BTreeSet<String>>>,
     #[rkyv(with = qserde::rkyv::with::Map<qserde::rkyv::with::AsString>)]
     skills_dir: Option<std::path::PathBuf>,
     skills: Vec<crate::skills::SkillContent>,
@@ -395,6 +419,9 @@ impl Agent {
             skill_catalogue: false,
             deferred_tools: Vec::new(),
             deferred_prefixes: Vec::new(),
+            tool_schema_budget: 0,
+            required_tools: Vec::new(),
+            schema_withheld: Arc::new(std::sync::RwLock::new(BTreeSet::new())),
             skills_dir: None,
             skills: Vec::new(),
             resilience,
@@ -465,6 +492,55 @@ impl Agent {
     /// The send-side history ceiling this agent applies mid-turn; 0 is off.
     pub fn context_budget(&self) -> usize {
         self.context_budget
+    }
+
+    /// Cap the tool definitions one request's initial array carries.
+    ///
+    /// Zero selects [`react::engine::DEFAULT_SCHEMA_BUDGET`], which is the same
+    /// limit discovery already spends. The initial array and every later
+    /// `find_tool` reveal are priced against that one number, so a wide
+    /// registry - MCP servers, extension packages, a preset with every bundle
+    /// on - cannot make each step re-send every definition.
+    ///
+    /// A definition over the budget is withheld, never dropped: it stays
+    /// registered and callable, and the search that reaches it is admitted in
+    /// its place.
+    #[must_use]
+    pub fn with_tool_schema_budget(mut self, bytes: usize) -> Self {
+        self.tool_schema_budget = bytes;
+        // The engine registers the search from the same decision, so both
+        // caches derive from the new bound; a stale engine would advertise an
+        // array the request can no longer reach through `find_tool`.
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+        self
+    }
+
+    /// The initial-schema ceiling this agent applies; 0 means the framework
+    /// default.
+    pub fn tool_schema_budget(&self) -> usize {
+        self.tool_schema_budget
+    }
+
+    /// Never withhold `name` to fit the schema budget.
+    ///
+    /// The host names the definitions the standing prompt refers to and the
+    /// ones a turn cannot safely lose. A required definition is admitted even
+    /// when it overdraws the ceiling; the overdraft is reported by
+    /// [`Agent::tool_admission`], not paid for by dropping it.
+    pub fn require_tool(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if self.required_tools.iter().any(|required| required == &name) {
+            return;
+        }
+        self.required_tools.push(name);
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+    }
+
+    /// The names the byte budget must never withhold.
+    pub fn required_tools(&self) -> &[String] {
+        &self.required_tools
     }
 
     /// Set the bus for tool event publishing.
@@ -813,12 +889,12 @@ impl Agent {
                 .any(|prefix| name.starts_with(prefix.as_str()))
     }
 
-    /// Whether any registered tool is withheld from the advertised array.
+    /// Whether the POLICY withholds any registered tool: a tool that marks
+    /// itself deferred, an MCP tool, or a name this agent was told to defer.
     ///
-    /// False means `find_tool` has nothing to find, so it
-    /// are not advertised either: two tools that can only answer "none" are
-    /// prompt bytes for no capability.
-    pub fn has_deferred_tools(&self) -> bool {
+    /// This is the part of what the request omits that does not depend on the
+    /// byte budget; [`Agent::has_deferred_tools`] adds the budget's own answer.
+    fn has_policy_withheld_tools(&self) -> bool {
         // A host that deferred a name before the tool existed still gets the
         // way back to it: the policy is what it asked for, not what happened to
         // be registered at the instant the engine was built.
@@ -855,6 +931,118 @@ impl Agent {
             }
             Err(_) => false,
         }
+    }
+
+    /// The names the policy withholds from the advertised array.
+    ///
+    /// Read from the registries rather than from a stored list, so a package's
+    /// late tool is classified by the same rule as a built-in. A host that
+    /// deferred a name before the tool existed contributes no name here: there
+    /// is nothing to filter yet, and the engine still registers the search.
+    fn policy_withheld_names(&self) -> HashSet<String> {
+        let mut names: HashSet<String> = HashSet::new();
+        {
+            let mut take = |registry: &ToolRegistry| {
+                for (name, tool) in registry.iter() {
+                    if tool.deferred() || registry.is_mcp_tool(name) || self.is_deferred_tool(name)
+                    {
+                        names.insert(name.clone());
+                    }
+                }
+                for name in registry.async_tool_names() {
+                    let withheld = registry.is_mcp_tool(&name)
+                        || self.is_deferred_tool(&name)
+                        || registry
+                            .get_async(&name)
+                            .is_some_and(|tool| tool.deferred());
+                    if withheld {
+                        names.insert(name);
+                    }
+                }
+            };
+            if let Some(registry) = self.registry.as_deref() {
+                take(registry);
+            }
+            if let Ok(live) = self.live_tools.read() {
+                take(&live);
+            }
+        }
+        names
+    }
+
+    /// Whether anything is withheld from the advertised array, by policy or by
+    /// the byte budget.
+    ///
+    /// False means `find_tool` has nothing to find, so it is not advertised
+    /// either: two tools that can only answer "none" are prompt bytes for no
+    /// capability.
+    pub fn has_deferred_tools(&self) -> bool {
+        self.has_policy_withheld_tools() || self.tool_admission().has_withheld()
+    }
+
+    /// The admission policy the initial array is derived under.
+    fn admission_policy(&self, search: bool) -> react::tool::admission::AdmissionPolicy {
+        let budget = if self.tool_schema_budget == 0 {
+            react::engine::DEFAULT_SCHEMA_BUDGET
+        } else {
+            self.tool_schema_budget
+        };
+        let mut policy = react::tool::admission::AdmissionPolicy::new(
+            budget,
+            react::engine::DEFAULT_PER_TOOL_BUDGET,
+        );
+        for name in &self.required_tools {
+            policy.required.insert(name.clone());
+        }
+        if search {
+            policy.required.insert(discovery::FIND_TOOL.to_string());
+        }
+        policy
+    }
+
+    /// The definitions the request could carry, before the byte budget.
+    fn budget_candidates(&self, search: bool) -> Vec<react::llm::LlmTool> {
+        let withheld = self.policy_withheld_names();
+        let mut tools: Vec<react::llm::LlmTool> = self
+            .all_tools()
+            .into_iter()
+            .filter(|tool| !withheld.contains(&tool.name))
+            .collect();
+        if search {
+            tools.push(discovery::find_tool_definition());
+        }
+        tools
+    }
+
+    /// Admit the initial array under this agent's schema budget.
+    ///
+    /// Two passes in the one case that needs them: when the budget withholds a
+    /// definition and the policy withheld nothing, the search joins the array
+    /// and is priced WITH the definitions it makes reachable. The second pass
+    /// can withhold one more definition behind the search's own bytes, which is
+    /// the same trade the first pass made.
+    fn admit_model_tools(&self) -> react::tool::admission::Admission {
+        let search = self.has_policy_withheld_tools();
+        let mut policy = self.admission_policy(search);
+        let mut admission = react::tool::admission::admit(self.budget_candidates(search), &policy);
+        if !search && admission.has_withheld() {
+            policy.required.insert(discovery::FIND_TOOL.to_string());
+            admission = react::tool::admission::admit(self.budget_candidates(true), &policy);
+        }
+        admission
+    }
+
+    /// The current admission decision for the initial tool array.
+    ///
+    /// A host prices and logs the array from this one decision, so a definition
+    /// it reports as withheld is exactly one `find_tool` can offer. The
+    /// decision is also published where the search's catalogue reads it.
+    pub fn tool_admission(&self) -> react::tool::admission::Admission {
+        let admission = self.admit_model_tools();
+        if let Ok(mut set) = self.schema_withheld.write() {
+            *set = admission.withheld_set();
+        }
+        admission
     }
 
     /// Every registered tool, whether or not the request advertises it.
@@ -920,61 +1108,18 @@ impl Agent {
     /// The tool array this agent offers the model.
     ///
     /// This is [`Agent::all_tools`] minus everything withheld: a tool marked
-    /// [`react::tool::Tool::deferred`], an MCP tool (withheld by default), and
-    /// any name this agent was told to defer. The model reaches a withheld tool
-    /// through `find_tool`; the tools that search reports join the next
-    /// request, so the provider sees only the definitions the model asked for.
+    /// [`react::tool::Tool::deferred`], an MCP tool (withheld by default), any
+    /// name this agent was told to defer, and every definition the byte budget
+    /// could not admit. The model reaches a withheld tool through `find_tool`;
+    /// the tools that search reports join the next request, so the provider
+    /// sees only the definitions the model asked for.
+    ///
+    /// The array is the ONE derivation a request, a capability pane and the
+    /// host's own metering read ([`Agent::tool_admission`] carries the
+    /// decision, sizes included). It is name-sorted because it is part of the
+    /// provider's cached prompt prefix.
     pub fn model_tools(&self) -> Vec<react::llm::LlmTool> {
-        let all = self.all_tools();
-        let deferred: std::collections::HashSet<String> = self
-            .registry
-            .as_deref()
-            .map(|registry| {
-                registry
-                    .iter()
-                    .filter(|(name, tool)| {
-                        tool.deferred() || registry.is_mcp_tool(name) || self.is_deferred_tool(name)
-                    })
-                    .map(|(name, _)| name.clone())
-                    .chain(registry.async_tool_names().into_iter().filter(|name| {
-                        registry.is_mcp_tool(name)
-                            || self.is_deferred_tool(name)
-                            || registry.get_async(name).is_some_and(|tool| tool.deferred())
-                    }))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let deferred_live: std::collections::HashSet<String> = match self.live_tools.read() {
-            Ok(live) => live
-                .iter()
-                .filter(|(name, tool)| {
-                    tool.deferred() || live.is_mcp_tool(name) || self.is_deferred_tool(name)
-                })
-                .map(|(name, _)| name.clone())
-                .chain(live.async_tool_names().into_iter().filter(|name| {
-                    live.is_mcp_tool(name)
-                        || self.is_deferred_tool(name)
-                        || live.get_async(name).is_some_and(|tool| tool.deferred())
-                }))
-                .collect(),
-            Err(_) => std::collections::HashSet::new(),
-        };
-        let mut tools: Vec<react::llm::LlmTool> = all
-            .into_iter()
-            .filter(|tool| !deferred.contains(&tool.name) && !deferred_live.contains(&tool.name))
-            .collect();
-        // The search that reaches a withheld tool belongs in the SAME derivation:
-        // a host that prices or lists the array must see what the request
-        // actually carries, and a surface reading `model_tools` alone would
-        // undercount the two entries that make deferral usable.
-        // The SAME predicate the engine registers the search with: a host that
-        // deferred a name before its tool exists still gets the way back to it,
-        // and the request never advertises a tool the engine did not build.
-        if self.has_deferred_tools() {
-            tools.push(discovery::find_tool_definition());
-            tools.sort_by(|a, b| a.name.cmp(&b.name));
-        }
-        tools
+        self.tool_admission().tools
     }
 
     /// Register an extension tool without requiring a mutable Agent.
@@ -1832,6 +1977,17 @@ impl Clone for Agent {
             skill_catalogue: self.skill_catalogue,
             deferred_tools: self.deferred_tools.clone(),
             deferred_prefixes: self.deferred_prefixes.clone(),
+            tool_schema_budget: self.tool_schema_budget,
+            required_tools: self.required_tools.clone(),
+            // A clone gets its own record: the array it advertises is its own
+            // decision, and a shared set would let one agent's budget withhold
+            // a definition for the other.
+            schema_withheld: Arc::new(std::sync::RwLock::new(
+                self.schema_withheld
+                    .read()
+                    .map(|set| set.clone())
+                    .unwrap_or_default(),
+            )),
             skills_dir: self.skills_dir.clone(),
             skills: self.skills.clone(),
             resilience: self.resilience.clone(),

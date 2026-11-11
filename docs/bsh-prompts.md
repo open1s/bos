@@ -266,6 +266,77 @@ The discovery block is extra when a search is carried: the heading base
 `SKILL_DISCOVERY_GUIDANCE` (274) - 957 bytes with both, written first and
 gated on the search that makes it true.
 
+### The tool array spends the same budget as discovery
+
+The prompt is only one bucket of a request. The tool definitions are the other
+large per-step payload, and they used to have no bound at all: every registered,
+non-deferred tool rode every step, so an extension platform, an MCP gateway that
+did not defer, or a preset with every bundle on made the request grow with the
+registry. Two numbers now govern the array, and they are the same number for a
+turn.
+
+| Writer | Limit | Owner |
+|---|---|---|
+| Initial array | `DEFAULT_SCHEMA_BUDGET - DEFAULT_DISCOVERY_RESERVE` = 56 KiB | `react::tool::admission` |
+| `find_tool` reveals | `DEFAULT_SCHEMA_BUDGET` = 64 KiB | `react::engine::SchemaBudget` |
+
+The engine prices the array the host assembled (`account_initial`) before the
+first step, then prices each reveal on top of it: initial definitions plus
+revealed ones cannot exceed 64 KiB. The 8 KiB reserve is the part of the
+ceiling the initial array may not spend, which is what keeps discovery usable on
+a build that already carries most of the budget. A definition that overdraws
+the ceiling saturates the spend, so every later reveal is refused with the
+ordinary "schema budget reached" note instead of silently arriving.
+
+The rules that make the bound safe:
+
+- **Nothing is dropped silently.** `Agent::tool_admission` reports each
+  withheld definition with its bytes and reason (`TooLarge` or
+  `OverBudget`); the build logs the names and total. A withheld tool is still
+  registered and callable.
+- **The way back is in the same request.** Withholding anything admits
+  `find_tool` in its place, and the admissions decision is written into the
+  catalogue `find_tool` reads, so a withheld definition is offered with its
+  full schema exactly like a deferred one. The search's own bytes are priced
+  with the definitions it makes reachable.
+- **Required definitions are never withheld.** `Agent::require_tool` names
+  them. BSH marks every tool whose paragraph `append_tool_guidance` appended,
+  so a rule and a definition are written or omitted together rather than the
+  prompt naming a tool the request does not carry. A required definition is
+  admitted even when it overdraws the ceiling; the overdraft is logged, not paid
+  for by dropping the tool.
+- **The cached prefix stays stable.** Admission visits candidates in name order
+  and the array is name-sorted, so an unchanged registry yields a byte-identical
+  array whatever order tools were registered in.
+- **Zero is a ceiling, not a licence.** `with_tool_schema_budget(0)` selects
+  the framework ceiling. The engine default has always been 64 KiB; the new
+  part is that the initial array is now accounted under it too.
+
+The array's decision is visible in three places: `Agent::tool_admission` (the
+API a pane or a meter reads), the `build tools=... withheld_by_budget=...
+schema_budget=...` line at build time, and
+`TelemetryEvent::RequestComposition`, which reports bytes per component -
+system prompt, tool definitions (with count and the largest one), skill
+catalogue, history, input and total - plus the turn's schema spend, once per
+step before dispatch. Only counts are recorded; no message text, tool argument
+or credential is included. The provider's wire envelope is not part of the
+composition total, so the transport tap's `request_bytes` remains the ground
+truth for the bytes on the wire. Token counts are reported where they are
+reliable - the provider's own `usage` fields, accumulated by `TokenCounter`
+and surfaced in `TokenBudgetReport` - while the composition event stays in
+bytes, because no provider-independent tokenizer is available offline.
+
+Measured offline on 2026-11-11 with a synthetic registry (no model call):
+40 definitions of ~2 KiB each under a 20 KiB budget advertise 5 registry
+definitions (~10 KiB) plus the ~737-byte search, and report the other 35
+(~71 KiB) as withheld. The same registry with no budget sent all 40 definitions
+(~81 KiB) on every step.
+The regression tests pin that arithmetic rather than the constants:
+`a_registry_larger_than_the_budget_is_bounded`,
+`a_required_definition_is_never_withheld`,
+`a_budget_withheld_tool_is_found_and_run_after_the_initial_set_is_bounded` and
+`initial_definitions_spend_budget_without_counting_as_revealed`.
+
 ## 7. Scenario checks
 
 The contract is only as good as the first move it produces. These are the

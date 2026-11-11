@@ -273,6 +273,48 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     agent_name: String,
     _phantom: std::marker::PhantomData<A>,
 }
+/// Price every tool definition the request already carries.
+///
+/// The host admits the initial array under the same per-turn limit
+/// ([`crate::tool::admission`]); pricing it here is what makes the two halves
+/// one budget. A definition that overdraws the limit saturates the spend, so
+/// every later reveal is refused with the ordinary report instead of pretending
+/// there is room.
+fn price_initial_tools<C: ReactContext>(budget: &mut SchemaBudget, context: &C) {
+    for tool in context.tools().unwrap_or_default() {
+        budget.account_initial(&tool.name, tool.schema_bytes());
+    }
+}
+
+/// Report what one request is made of, before it is dispatched.
+///
+/// A provider bills and caches the whole request, so a total alone cannot say
+/// whether the prompt, the tool array or the history is the cost. Counts only:
+/// no message text, tool argument or credential leaves this function.
+fn emit_request_composition<S: ReactSession, C: ReactContext>(
+    telemetry: &Telemetry,
+    budget: &SchemaBudget,
+    turn: u64,
+    persona: Option<&str>,
+    request: &LlmRequest,
+    session: &S,
+    context: &C,
+) {
+    let composition = crate::telemetry::RequestComposition::measure(
+        persona,
+        context.tools().unwrap_or_default(),
+        context.skills(),
+        session.history(),
+        &request.input,
+    );
+    telemetry.emit(&TelemetryEvent::RequestComposition {
+        turn,
+        composition,
+        schema_spent_bytes: budget.spent(),
+        schema_limit_bytes: budget.limit(),
+    });
+}
+
 /// What one discovery did to the live tool array.
 struct SchemaReveal {
     /// The model-facing note when anything was refused.
@@ -359,16 +401,14 @@ impl<A: ReActApp> ReActEngine<A> {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let schema_json = parameters.to_string();
-            let bytes = name.len() + description.len() + schema_json.len();
+            let definition =
+                crate::llm::types::LlmTool::function(name, description, parameters.clone());
+            let bytes = definition.schema_bytes();
             let revision =
                 SchemaRevision::of(entry.get("version").and_then(Value::as_str), &schema_json);
             match budget.account(name, revision, bytes) {
                 Ok(SchemaAccount::Added { .. }) => {
-                    context.add_tool(crate::llm::types::LlmTool::function(
-                        name,
-                        description,
-                        parameters.clone(),
-                    ));
+                    context.add_tool(definition);
                     revealed += 1;
                 }
                 Ok(SchemaAccount::AlreadyRevealed) => {}
@@ -477,6 +517,15 @@ impl<A: ReActApp> ReActEngine<A> {
             }
 
             self.ensure_context_fits(session, persona.as_deref());
+            emit_request_composition(
+                &self.telemetry,
+                &self.schema_budget,
+                turn,
+                persona.as_deref(),
+                &request,
+                &*session,
+                &*context,
+            );
 
             let mut llm_response = match timeout(
                 Duration::from_secs(self.llm_timeout_secs),
@@ -1016,6 +1065,9 @@ impl<A: ReActApp> ReActEngine<A> {
         self.schema_budget.reset();
         let turn = self.turn.fetch_add(1, Ordering::Relaxed) + 1;
         context.add_tool(load_skill_tool());
+        // The array the host assembled spends the same budget a discovery
+        // does, so the two cannot add up to an unbounded request.
+        price_initial_tools(&mut self.schema_budget, &*context);
 
         let result = self
             .react_loop(persona, request, session, context, turn)
@@ -1059,6 +1111,7 @@ impl<A: ReActApp> ReActEngine<A> {
             let mut repeated = RepeatedFailure::default();
 
             context.add_tool(load_skill_tool());
+            price_initial_tools(&mut self.schema_budget, &*context);
 
             loop {
                 if self.stop_flag.load(Ordering::SeqCst) {
@@ -1097,6 +1150,15 @@ impl<A: ReActApp> ReActEngine<A> {
                 }
 
                 self.ensure_context_fits(session, persona.as_deref());
+                emit_request_composition(
+                    &self.telemetry,
+                    &self.schema_budget,
+                    turn,
+                    persona.as_deref(),
+                    &request,
+                    &*session,
+                    &*context,
+                );
 
                 let llm_stream = match self.call_llm_stream(persona.clone(),request.clone(), session, context).await {
                     Ok(s) => s,

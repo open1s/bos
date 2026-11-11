@@ -1,10 +1,16 @@
-//! A turn-scoped budget for tool schemas revealed by discovery.
+//! A turn-scoped budget for every tool definition a request carries.
 //!
-//! A single find_tool result is bounded, but a model can run several searches
-//! in one turn and grow the live tool array step by step. This budget prices
-//! every definition actually added to the next request, deduplicates a repeat
-//! of the same revision, and refuses growth with an explicit report instead of
-//! silently dropping a schema.
+//! The array the host assembled is priced first (`account_initial`), so the
+//! definitions a request starts with and the ones discovery adds spend ONE
+//! budget instead of two. A single find_tool result is also bounded, and a
+//! model can run several searches in one turn and grow the live tool array step
+//! by step; every definition actually added to the next request is priced, a
+//! repeat of the same revision is deduplicated, and growth is refused with an
+//! explicit report instead of silently dropping a schema.
+//!
+//! The initial definitions are deliberately NOT recorded as revealed: the
+//! selection telemetry distinguishes a tool the request advertised from one
+//! the model had to discover.
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -128,6 +134,21 @@ impl SchemaBudget {
         self.revealed.contains_key(name)
     }
 
+    /// Price one definition the request carries from the start.
+    ///
+    /// The initial array is admitted by the host under the same limit (see
+    /// [`crate::tool::admission`]), so the two halves cannot add up to an
+    /// unbounded request. Unlike `account`, this never refuses: a definition
+    /// already in the request cannot be withheld here, and a required one is
+    /// allowed to overdraw the limit. The spend saturates at the limit, which
+    /// leaves every later reveal refused with the ordinary exhaustion report.
+    ///
+    /// The name is NOT recorded as revealed: the per-step request already
+    /// advertises it, so calling it is not a discovery.
+    pub fn account_initial(&mut self, _name: &str, bytes: usize) {
+        self.spent = self.spent.saturating_add(bytes).min(self.limit);
+    }
+
     /// Account one definition, or refuse it.
     ///
     /// Re-accounting the same name with the SAME revision is idempotent and
@@ -241,5 +262,42 @@ mod tests {
         budget.reset();
         assert_eq!(budget.spent(), 0);
         assert!(budget.account("a", revision("a"), 30).is_ok());
+    }
+
+    /// The array a request starts with spends the same budget a discovery does,
+    /// and it is not a discovery: the selection signal must not read it as one.
+    #[test]
+    fn initial_definitions_spend_budget_without_counting_as_revealed() {
+        let mut budget = SchemaBudget::new(100, 70);
+        budget.account_initial("bash", 40);
+        assert_eq!(budget.spent(), 40);
+        assert!(
+            !budget.was_revealed("bash"),
+            "an advertised tool is not a discovered one"
+        );
+        assert_eq!(
+            budget.account("deploy", revision("deploy"), 61),
+            Err(SchemaRejection::BudgetExhausted {
+                name: "deploy".to_string(),
+                bytes: 61,
+                spent: 40,
+                limit: 100,
+            }),
+            "a reveal cannot exceed the room the initial array left"
+        );
+    }
+
+    /// A required definition may overdraw the limit; the spend saturates, so
+    /// every later reveal is refused with the ordinary report rather than
+    /// underflowing the arithmetic.
+    #[test]
+    fn an_initial_overdraft_saturates_instead_of_wrapping() {
+        let mut budget = SchemaBudget::new(50, 60);
+        budget.account_initial("huge", 80);
+        assert_eq!(budget.spent(), 50);
+        assert!(matches!(
+            budget.account("later", revision("later"), 1),
+            Err(SchemaRejection::BudgetExhausted { .. })
+        ));
     }
 }

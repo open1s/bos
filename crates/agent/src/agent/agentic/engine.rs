@@ -245,6 +245,10 @@ impl Agent {
             .llm_timeout(self.config.timeout_secs)
             .parallel_tool_calls(self.config.parallel_tool_calls)
             .context_budget(self.context_budget)
+            // ONE per-turn ceiling for the definitions a request carries: the
+            // array the host admitted and every later `find_tool` reveal are
+            // priced against this same number.
+            .schema_budget(self.tool_schema_budget)
             // The host's tool-output setting caps what one result may add to
             // the MODEL's session, not only what the UI displays; zero keeps
             // the engine default.
@@ -315,7 +319,11 @@ impl Agent {
             let withheld = super::discovery::Withheld::new(
                 self.deferred_tools.clone(),
                 self.deferred_prefixes.clone(),
-            );
+            )
+            // The budget's own answer travels the same way: a definition
+            // withheld to fit the request must be offered by the search, or the
+            // way back to it would be a name the model can never reach.
+            .with_budget(Arc::clone(&self.schema_withheld));
             let find = super::discovery::find_tool(
                 self.registry.clone(),
                 Arc::clone(&self.live_tools),
@@ -1248,7 +1256,6 @@ mod failure_tests {
         assert!(error.contains("changed"), "{error}");
     }
 
-
     #[test]
     fn loading_a_second_skill_keeps_the_first_in_the_plan() {
         use crate::skills::{SkillIndex, SkillLimits, SkillRuntime};
@@ -1256,12 +1263,7 @@ mod failure_tests {
 
         let dir = tempfile::tempdir().expect("temp dir");
         write_runtime_skill(dir.path(), "base", "BASE", "");
-        write_runtime_skill(
-            dir.path(),
-            "app",
-            "APP",
-            "dependencies:\n  - name: base\n",
-        );
+        write_runtime_skill(dir.path(), "app", "APP", "dependencies:\n  - name: base\n");
         let mut loader = crate::skills::SkillLoader::new(dir.path().to_path_buf());
         loader.discover().expect("discover");
         let app = loader.load("app").expect("app");

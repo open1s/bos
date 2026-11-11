@@ -20,6 +20,7 @@
 use crate::tools::{FunctionTool, ToolRegistry};
 use react::llm::LlmTool;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
 /// The search tool's name.
@@ -281,11 +282,17 @@ fn search_skills(entries: &[SkillEntry], args: &Value) -> Value {
 ///
 /// A tool that withholds itself (`Tool::deferred`) and an MCP tool travel with
 /// their own mark, so those are read at call time; this carries the names the
-/// host listed explicitly, which a tool cannot know about itself.
+/// host listed explicitly, which a tool cannot know about itself, and the names
+/// the byte budget withheld, which the host computes when it admits the initial
+/// array.
 #[derive(Clone, Default)]
 pub struct Withheld {
     exact: Arc<Vec<String>>,
     prefixes: Arc<Vec<String>>,
+    /// Definitions the initial request left out to stay inside the schema
+    /// budget. The host writes this where it derives the array, so the search
+    /// and the array are two readings of one decision.
+    budget: Arc<RwLock<BTreeSet<String>>>,
 }
 
 impl Withheld {
@@ -294,7 +301,14 @@ impl Withheld {
         Self {
             exact: Arc::new(exact),
             prefixes: Arc::new(prefixes),
+            budget: Arc::new(RwLock::new(BTreeSet::new())),
         }
+    }
+
+    /// Attach the set the byte budget writes its withheld names into.
+    pub fn with_budget(mut self, set: Arc<RwLock<BTreeSet<String>>>) -> Self {
+        self.budget = set;
+        self
     }
 
     fn matches(&self, name: &str) -> bool {
@@ -303,6 +317,11 @@ impl Withheld {
                 .prefixes
                 .iter()
                 .any(|prefix| name.starts_with(prefix.as_str()))
+            || self
+                .budget
+                .read()
+                .map(|set| set.contains(name))
+                .unwrap_or(false)
     }
 }
 
@@ -932,7 +951,7 @@ mod tests {
     /// tools a search describes in full - and not semantic understanding. The
     /// point is to keep a query a reader would plausibly type from missing the
     /// obvious tool, because a miss costs a second search and possibly the turn.
-
+    ///
     /// A measured baseline for tool retrieval. Assertions pin recall and rank
     /// so a scoring change that loses a synonym fails the suite.
     #[test]

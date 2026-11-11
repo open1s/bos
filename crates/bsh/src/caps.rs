@@ -1664,23 +1664,45 @@ fn build_agent_for_session_inner(
 
     // The meter's tools bucket follows the request's own tool array, so it is
     // priced from exactly that array - the build registry AND the live overlay
-    // the extension platform installs into.
-    let model_tools = agent.model_tools();
-    let schema_chars = tools_schema_chars(&model_tools);
-    // What the request no longer carries, so a build's deferral can be judged
-    // from the log instead of from a bill: every char here is one that left
-    // each step's cached prefix when MCP tools moved behind find_tool.
+    // the extension platform installs into - and from the one admission
+    // decision the request itself uses.
+    let admission = agent.tool_admission();
+    let schema_chars = tools_schema_chars(&admission.tools);
+    // What the request no longer carries, so a build's withholding can be
+    // judged from the log instead of from a bill: every char here is one that
+    // left each step's cached prefix, whether a tool withheld itself, an MCP
+    // gateway deferred it, or the byte budget could not admit it.
     let withheld_chars = tools_schema_chars(&agent.all_tools()).saturating_sub(schema_chars);
-    // A schema this large is re-sent on every step; name it at build time so a
-    // connected MCP server or a wide preset can be seen in the log instead of
-    // felt as latency.
-    let tool_count = model_tools.len();
+    let budget_withheld = admission.withheld.len();
+    let tool_count = admission.tools.len();
     // The counters diagnose a build; the session id does not belong in a
     // cleartext log line.
     log::info!(
-        "build tools={tool_count} schema_chars={schema_chars} withheld_chars={withheld_chars} mcp_tools={}",
+        "build tools={tool_count} schema_chars={schema_chars} withheld_chars={withheld_chars} withheld_by_budget={budget_withheld} schema_budget={}/{} mcp_tools={}",
+        admission.bytes,
+        admission.limit,
         mcp.tools().count()
     );
+    // A withholding is a decision, not an accident: name what left and why, so
+    // a reader can tell "the model does not need it" from "the budget was too
+    // small for the prompt's own tools".
+    if budget_withheld > 0 {
+        log::warn!(
+            "tool schema budget withheld {budget_withheld} definition(s) ({} bytes) from the initial request: {}; find_tool reaches them",
+            admission.withheld_bytes(),
+            admission.withheld_names().join(", ")
+        );
+    }
+    if admission.over_budget {
+        log::warn!(
+            "required tool definitions alone are {} bytes, over the {}-byte initial schema budget; every required tool is still sent",
+            admission.required_bytes,
+            admission.limit
+        );
+    }
+    // A schema this large is re-sent on every step; name it at build time so a
+    // connected MCP server or a wide preset can be seen in the log instead of
+    // felt as latency.
     if schema_chars > 20_000 {
         log::warn!(
             "tool schema is {schema_chars} chars; a preset allowlist or a lazy MCP gateway would cut every request"
@@ -7259,6 +7281,51 @@ mod tests {
             "the system prompt rides on every step: {} bytes",
             prompt.len()
         );
+    }
+
+    /// The bare build's tool array is admitted under the framework ceiling, and
+    /// no definition its prompt names is withheld: the paragraph and the
+    /// definition are one decision.
+    #[test]
+    fn the_tool_array_is_bounded_and_prompt_tools_survive() {
+        let built = build(&bare());
+        let admission = built.agent.tool_admission();
+        assert_eq!(
+            admission.limit,
+            react::engine::DEFAULT_SCHEMA_BUDGET
+                - react::tool::admission::DEFAULT_DISCOVERY_RESERVE,
+            "the default build admits under the framework ceiling less the reserve"
+        );
+        assert!(
+            admission.bytes <= admission.limit,
+            "admitted {} bytes over a {} byte limit",
+            admission.bytes,
+            admission.limit
+        );
+        assert!(
+            !admission.over_budget,
+            "the required tools fit the default ceiling"
+        );
+
+        let withheld: std::collections::BTreeSet<&str> = admission
+            .withheld
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        let all_tools = built.agent.all_tools();
+        let registered: std::collections::BTreeSet<&str> =
+            all_tools.iter().map(|tool| tool.name.as_str()).collect();
+        for (tool, _) in agent::prompts::TOOL_GUIDANCE
+            .iter()
+            .chain(crate::prompts::TOOL_GUIDANCE.iter())
+        {
+            if registered.contains(tool) {
+                assert!(
+                    !withheld.contains(tool),
+                    "the prompt names {tool}, so the request must carry it"
+                );
+            }
+        }
     }
 
     /// An EMPTY persona is "the framework's default", not "no persona": a

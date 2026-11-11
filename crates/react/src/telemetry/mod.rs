@@ -1,5 +1,9 @@
 //! Token budgets and lightweight telemetry events for a ReAct run.
 
+mod composition;
+
+pub use composition::RequestComposition;
+
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -58,6 +62,22 @@ pub enum TelemetryEvent {
         rejected: usize,
         /// Cumulative schema bytes spent this turn.
         spent_bytes: usize,
+    },
+    /// One request priced before it is sent.
+    ///
+    /// The parts are the ones a provider caches and bills: system prompt, tool
+    /// definitions, skill catalogue, history and input. Only counts are
+    /// recorded - no message text, tool argument or credential - so the event
+    /// can be logged as it stands.
+    RequestComposition {
+        /// The turn this request belongs to.
+        turn: u64,
+        /// The per-component byte counts.
+        composition: RequestComposition,
+        /// Schema bytes this turn has spent, initial definitions included.
+        schema_spent_bytes: usize,
+        /// The turn's schema budget; zero when the budget is off.
+        schema_limit_bytes: usize,
     },
     /// One tool call selected from the model's live array.
     ///
@@ -126,6 +146,33 @@ impl Telemetry {
                         revealed,
                         rejected,
                         spent_bytes
+                    );
+                }
+                TelemetryEvent::RequestComposition {
+                    turn,
+                    composition,
+                    schema_spent_bytes,
+                    schema_limit_bytes,
+                } => {
+                    // One line per step: a reader can attribute a captured
+                    // request to a part instead of guessing from the total.
+                    log::info!(
+                        "request: turn={} total={} bytes system={} tools={} ({} defs, largest {}:{} bytes) skills={} history={} input={} schema_budget={}/{}",
+                        turn,
+                        composition.total_bytes,
+                        composition.system_bytes,
+                        composition.tools_bytes,
+                        composition.tool_count,
+                        composition
+                            .largest_tool
+                            .as_deref()
+                            .unwrap_or("-"),
+                        composition.largest_tool_bytes,
+                        composition.skills_bytes,
+                        composition.history_bytes,
+                        composition.input_bytes,
+                        schema_spent_bytes,
+                        schema_limit_bytes
                     );
                 }
                 TelemetryEvent::ToolSelection {

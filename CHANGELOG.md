@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **Bounded initial tool schemas** (issue #292): the tool array a request
+  starts with is now accounted under one explicit per-turn budget instead of
+  being assembled separately from the `find_tool` discovery budget. A new
+  `react::tool::admission` module admits definitions by a policy - a
+  cumulative byte ceiling, a per-tool ceiling, a reserve held back for
+  discovery, and names that must never be withheld - and the engine prices the
+  admitted array (`SchemaBudget::account_initial`) before each turn, so the
+  initial definitions and every later reveal spend the same 64 KiB. A definition
+  over budget is withheld, never dropped: it stays registered and callable, the
+  search is admitted and priced in its place, and the same decision is written
+  into the catalogue `find_tool` reads. `Agent::require_tool` names the
+  definitions that must stay (BSH marks every tool its prompt guidance names),
+  `Agent::tool_admission` reports what was withheld with bytes and reason, and
+  admission is deterministic and name-sorted so the cached prompt prefix is
+  stable. Requests now report their composition per step: system prompt, tool
+  definitions (count and largest), skill catalogue, history and input bytes,
+  plus the turn's schema spend, through `TelemetryEvent::RequestComposition`
+  and the `build tools=... schema_budget=...` line. Documented in
+  `docs/bsh-prompts.md`.
+
 ## v4.1.6 (2026-11-11)
 
 - **sed tool**: the files bundle now carries a first-class `sed` tool built on

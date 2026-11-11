@@ -593,6 +593,19 @@ pub struct LlmTool {
 }
 
 impl LlmTool {
+    /// The request bytes this definition costs.
+    ///
+    /// The name, the description and the serialized argument schema are the
+    /// whole definition the provider is sent; the schema budget and the
+    /// admission bound both price a definition with this one function so the
+    /// two cannot disagree about what a tool costs.
+    pub fn schema_bytes(&self) -> usize {
+        self.name
+            .len()
+            .saturating_add(self.description.len())
+            .saturating_add(self.parameters.to_string().len())
+    }
+
     /// Create a normal function tool.
     pub fn function(
         name: impl Into<String>,

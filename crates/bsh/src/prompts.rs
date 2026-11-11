@@ -242,6 +242,12 @@ pub(crate) fn append_tool_guidance(agent: &mut Agent) {
     {
         if names.iter().any(|name| name == tool) {
             agent.append_system_prompt(text);
+            // The paragraph above NAMES this tool, so the request must carry
+            // it: a schema budget that withheld a tool the prompt refers to
+            // would leave the model reading an instruction for something it
+            // cannot call. Naming and admitting are one decision, which is why
+            // they are made in the same loop.
+            agent.require_tool(*tool);
         }
     }
 }
@@ -256,12 +262,47 @@ pub(crate) fn append_subagent_guidance(agent: &mut Agent) {
     }
     if !agent.config().system_prompt.contains(SUBAGENT_GUIDANCE) {
         agent.append_system_prompt(SUBAGENT_GUIDANCE);
+        // The rule names the tool; a budget must not take it away.
+        if agent
+            .registry()
+            .is_some_and(|registry| registry.get("subagent").is_some())
+        {
+            agent.require_tool("subagent");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool the prompt NAMES is required by the schema budget: the request
+    /// and the paragraph that refers to it cannot disagree.
+    #[test]
+    fn a_tool_the_prompt_names_is_required_by_the_schema_budget() {
+        let mut agent = Agent::from_config(agent::AgentConfig::default());
+        agent.add_tool(std::sync::Arc::new(agent::tools::FunctionTool::new(
+            "glob",
+            "find files by pattern",
+            serde_json::json!({"type": "object"}),
+            |_args| Ok(serde_json::json!("ok")),
+        )));
+
+        append_tool_guidance(&mut agent);
+
+        assert!(
+            agent.required_tools().iter().any(|name| name == "glob"),
+            "the glob paragraph was appended, so glob must stay in the array"
+        );
+        assert!(
+            agent.config().system_prompt.contains(GLOB),
+            "the premise: the prompt now names glob"
+        );
+        assert!(
+            !agent.config().system_prompt.contains(GREP),
+            "a tool that is not registered gets neither its rule nor a requirement"
+        );
+    }
 
     /// The product context carries the facts the model cannot discover from
     /// the code: the internal directory and the three ways a reader interrupts
