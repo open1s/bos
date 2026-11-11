@@ -1,5 +1,34 @@
 # Changelog
 
+## v4.1.3 (2026-11-11)
+
+- **Declarative extension panels**: a `panel` contribution ships
+  `panels/<id>.json` - title, location, default visibility, a light and a dark
+  theme, a refresh interval, and a view tree the host renders. The document is
+  validated at load with explicit ceilings (1000 nodes, depth 32, 16 KiB per
+  text leaf, 256 KiB of text, 500 table rows, 2048 characters per cell, 1 MiB
+  serialized), and a component the host cannot honour is a load error rather
+  than a silent fallback. The extension pane mounts these documents in the
+  right-hand pane.
+- **Wasm-component extensions**: a `wasm-component` guest now gets WASI preview
+  2's clock and random interfaces, so `std::time` and `getrandom` work without
+  a host bridge; stdout and stderr are inherited, while the filesystem,
+  environment, sockets and stdin stay behind the `bsh:extension/host` imports
+  and their capability checks. A wasm component can also observe hooks, which
+  the extism runtime already could, under the same `hooks.observe` capability.
+- **Hook points are explicit**: the host dispatches eight of them -
+  `model.request`, `model.response`, `tool.before`, `tool.after`,
+  `http.exchange`, `turn.start`, `turn.end` and `skill.load` - and a manifest
+  naming anything else is rejected as "not a hook point this host dispatches"
+  instead of silently never firing.
+- **An abandoned stream still reports its exchange**: a response body the caller
+  drops now reports through a drop guard that fires exactly once, so the view
+  behind the vendor tap shows a truncated stream as truncated instead of
+  showing nothing.
+- **Right-pane deep links**: `bsh --panel=<files|terminal|diff|browser|extensions|federation|tasks>`
+  opens that pane on launch, and `--browser=<url>` opens the Browser pane on a
+  URL.
+
 ## v4.1.2 (2026-11-10)
 
 - **Linux ships one AppImage**: the `.deb`, `.rpm` and portable tarball are
