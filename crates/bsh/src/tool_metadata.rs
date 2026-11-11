@@ -22,7 +22,7 @@ pub(crate) fn builtin_metadata(name: &str) -> Option<ToolMetadata> {
             .with_permissions(["proc.spawn", "fs.write:workspace", "net.egress"])
             .with_timeout_ms(600_000),
         "glob" | "grep" | "read_file" | "read_files" | "list_dir" => read_only("fs.read:workspace"),
-        "write_file" | "edit_file" | "apply_patch" => ToolMetadata::new()
+        "write_file" | "edit_file" | "apply_patch" | "sed" => ToolMetadata::new()
             .with_version("1.0.0")
             .with_risk("medium")
             .with_side_effects(["write"])
@@ -154,6 +154,7 @@ mod tests {
             "write_file",
             "edit_file",
             "apply_patch",
+            "sed",
             "list_dir",
             "update_plan",
             "get_goal",

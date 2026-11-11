@@ -188,7 +188,7 @@ pub(crate) fn turn_files(tools: &[ToolEvent]) -> Vec<TurnFile> {
     transcript::turn_changes(&normalized)
         .into_iter()
         .map(|file| {
-            let recorded = file.diff.iter().any(|(mark, _)| *mark == '-');
+            let recorded = file.recorded;
             let mut touched = false;
             let mut all_create = true;
             for (name, path) in &writing {

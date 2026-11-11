@@ -44,6 +44,7 @@ pub(crate) mod reference;
 pub(crate) mod review;
 pub(crate) mod runner;
 pub(crate) mod schedule;
+pub(crate) mod sed;
 pub(crate) mod settings;
 pub(crate) mod skill_invocation;
 pub(crate) mod state;

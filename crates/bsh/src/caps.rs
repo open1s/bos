@@ -1154,6 +1154,19 @@ fn build_agent_for_session_inner(
                 declare("edit_file"),
             )));
         }
+        if writes && !off_tool("sed") {
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(sed_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                    review.clone(),
+                )),
+                declare("sed"),
+            )));
+        }
         if writes && !off_tool("apply_patch") {
             files.push(Arc::new(DeclaredTool::new(
                 Arc::new(apply_patch_tool(
@@ -3847,9 +3860,10 @@ const MAX_BATCH_READ_BYTES: usize = 1024 * 1024;
 
 /// The largest file `edit_file` rewrites, in bytes.
 ///
-/// An edit needs the whole file in memory to prove the match is unique; past
-/// this ceiling the call is refused rather than stalling the turn.
-const MAX_EDIT_BYTES: u64 = 16 * 1024 * 1024;
+/// An edit needs the whole file in memory to prove the match is unique, and sed
+/// reads it to prove a result is a no-op; past this ceiling the call is refused
+/// rather than stalling the turn.
+pub(crate) const MAX_EDIT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The most bytes one windowed read returns.
 const MAX_WINDOW_BYTES: usize = 8 * 1024 * 1024;
@@ -5216,6 +5230,181 @@ fn edit_file_tool(
     )
 }
 
+/// sed - apply one stream-edit program to a workspace file.
+///
+/// The engine is the crate's own uutils sed (crate::sed); this builder is
+/// the policy half: the path is resolved and checked, the workspace ignore file
+/// is honored, and the same per-path lock the other write tools take is held
+/// across the read-modify-write. A dry run asks the policy for a READ, because
+/// it writes nothing.
+fn sed_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
+) -> FunctionTool {
+    FunctionTool::new(
+        "sed",
+        "Apply one sed program to a workspace file. The program processes a private copy and replaces the file by rename, so a failed script leaves the original untouched. Output is GNU's in-place output: the automatic print and p, P, =, l, F and s///p all write to the edited file, so quiet=true plus '/pattern/p' filters the file to matching lines. backup_suffix keeps the original at path + suffix, like sed -iSUFFIX. dry_run=true returns the resulting text instead of writing. The engine's sandbox is always on, so e, r, R, w and W are refused. Prefer edit_file when the exact text is known; use sed for a global, pattern-based or line-addressed change.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path of the existing text file to edit, relative to the workspace or absolute inside the allowed workspace." },
+                "script": { "type": "string", "minLength": 1, "maxLength": 8192, "description": "One sed program, such as 's/old/new/g' or '/^#/d'. Newlines and semicolons separate commands. Up to 8192 bytes." },
+                "dry_run": { "type": "boolean", "description": "Run the program over a private copy, return the resulting text, and leave the file untouched. Defaults to false (edit the file)." },
+                "extended": { "type": "boolean", "description": "Use POSIX extended regular expressions, like sed -E. Defaults to false." },
+                "posix": { "type": "boolean", "description": "Disable GNU extensions, like sed --posix. Defaults to false." },
+                "quiet": { "type": "boolean", "description": "Suppress the automatic print, like sed -n. Explicit p, P, =, l and F still write to the file, so quiet plus '/pattern/p' filters the file to matching lines. Defaults to false." },
+                "line_length": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Wrap the l command at this column, like sed -l. Defaults to GNU's 70." },
+                "backup_suffix": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Keep the original at path + this suffix before replacing the file, like sed -iSUFFIX. The suffix must not contain a path separator." }
+            },
+            "required": ["path", "script"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let raw = arg_str(args, "path")?;
+            let script = arg_str(args, "script")?;
+            let flag = |key: &str| {
+                args.get(key)
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            };
+            let dry_run = flag("dry_run");
+            let line_length = match args.get("line_length").filter(|value| !value.is_null()) {
+                Some(value) => {
+                    let Some(number) = value.as_u64() else {
+                        return Err(ToolError::InvalidInput(
+                            "line_length must be a positive integer".to_string(),
+                        ));
+                    };
+                    if !(1..=10_000).contains(&number) {
+                        return Err(ToolError::InvalidInput(
+                            "line_length must be between 1 and 10000".to_string(),
+                        ));
+                    }
+                    Some(number as usize)
+                }
+                None => None,
+            };
+            let target =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &target)?;
+            check_path(
+                &policy,
+                &session,
+                &preset,
+                "sed",
+                if dry_run { Action::Read } else { Action::Write },
+                &target,
+            )?;
+            // The backup is a second write, and the policy must see it as one:
+            // a suffix that escapes the directory is refused before anything is
+            // copied, and the resolved sibling obeys the same ignore/policy
+            // rules as the target.
+            let mut backup: Option<PathBuf> = None;
+            if let Some(suffix) = args
+                .get("backup_suffix")
+                .and_then(serde_json::Value::as_str)
+                .filter(|suffix| !suffix.trim().is_empty())
+            {
+                if dry_run {
+                    return Err(ToolError::InvalidInput(
+                        "dry_run writes nothing, so it cannot keep a backup_suffix".to_string(),
+                    ));
+                }
+                if suffix.contains(['/', '\\']) {
+                    return Err(ToolError::InvalidInput(
+                        "backup_suffix must not contain a path separator".to_string(),
+                    ));
+                }
+                if suffix.len() > 64 {
+                    return Err(ToolError::InvalidInput(
+                        "backup_suffix must be at most 64 bytes".to_string(),
+                    ));
+                }
+                let mut path = target.as_os_str().to_os_string();
+                path.push(suffix);
+                let backup_path = PathBuf::from(path);
+                refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &backup_path)?;
+                check_path(
+                    &policy,
+                    &session,
+                    &preset,
+                    "sed",
+                    Action::Write,
+                    &backup_path,
+                )?;
+                backup = Some(backup_path);
+            }
+            // A sed run is a read-modify-write, so it holds the same per-path
+            // lock edit_file does: two calls must not both start from the
+            // original bytes.
+            let lock = file_lock(&target);
+            let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = review
+                .as_ref()
+                .map(|runtime| runtime.before(&target))
+                .unwrap_or(SnapshotState::Absent);
+            let request = crate::sed::Request {
+                script: &script,
+                extended: flag("extended"),
+                posix: flag("posix"),
+                quiet: flag("quiet"),
+                line_length,
+                backup: backup.as_deref(),
+            };
+            let outcome = crate::sed::apply(&target, &request, dry_run).map_err(|error| {
+                match error {
+                    crate::sed::Error::Refused(message) => ToolError::InvalidInput(message),
+                    crate::sed::Error::Failed(message) => ToolError::Failed(message),
+                }
+            })?;
+            if !dry_run && outcome.changed {
+                if let Some(runtime) = &review {
+                    runtime.record(&target, ChangeOperation::Edit, before, "sed");
+                }
+            }
+            let mut result = serde_json::json!({
+                "path": target.display().to_string(),
+                "changed": outcome.changed,
+                "dry_run": dry_run,
+                "before_bytes": outcome.before_bytes,
+                "bytes": outcome.after_bytes,
+                "exit_code": outcome.exit_code,
+            });
+            if dry_run {
+                result["content"] = match outcome.content {
+                    Some(content) => serde_json::Value::String(content),
+                    None => serde_json::Value::Null,
+                };
+                result["truncated"] = serde_json::json!(outcome.truncated);
+                result["binary"] = serde_json::json!(outcome.binary);
+            }
+            if !dry_run {
+                result["diff"] = serde_json::json!(
+                    outcome
+                        .diff
+                        .iter()
+                        .map(|(sign, line)| serde_json::json!({
+                            "sign": sign.to_string(),
+                            "line": line,
+                        }))
+                        .collect::<Vec<_>>()
+                );
+                result["added"] = serde_json::json!(outcome.added);
+                result["deleted"] = serde_json::json!(outcome.deleted);
+                result["diff_truncated"] = serde_json::json!(outcome.diff_truncated);
+            }
+            if let Some(backup) = &backup {
+                result["backup"] = serde_json::json!(backup.display().to_string());
+            }
+            Ok(result)
+        },
+    )
+}
+
 /// list_dir - list a directory's entries.
 fn list_dir_tool(
     root: Option<PathBuf>,
@@ -6523,6 +6712,7 @@ mod tests {
             "write_file",
             "edit_file",
             "apply_patch",
+            "sed",
             "list_dir",
             "update_plan",
             "web_search",
@@ -8003,6 +8193,7 @@ mod tests {
                 "grep".to_string(),
                 "list_dir".to_string(),
                 "read_files".to_string(),
+                "sed".to_string(),
                 "write_file".to_string(),
             ]
         );
@@ -8255,6 +8446,7 @@ mod tests {
                 "schedule_delete".to_string(),
                 "schedule_edit".to_string(),
                 "schedule_list".to_string(),
+                "sed".to_string(),
                 "update_plan".to_string(),
                 "write_file".to_string(),
             ],
@@ -10113,6 +10305,130 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         );
     }
 
+    /// The sed tool is a write tool with a read-only dry run: the dry run
+    /// returns the resulting text and leaves the file alone, the edit lands
+    /// atomically, and a script whose output would be redirected into the file
+    /// is refused before anything is written.
+    #[test]
+    fn the_sed_tool_edits_and_dry_runs_under_the_policy() {
+        let root = scratch("sed-tool");
+        std::fs::write(root.join("a.txt"), "one two one\n").expect("seed");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let dry = registry
+            .execute(
+                "sed",
+                &serde_json::json!({
+                    "path": "a.txt",
+                    "script": "s/one/1/g",
+                    "dry_run": true
+                }),
+            )
+            .expect("the dry run runs");
+        assert_eq!(dry["changed"], true);
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["content"], "1 two 1\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("the original"),
+            "one two one\n",
+            "a dry run must not write"
+        );
+
+        let edited = registry
+            .execute(
+                "sed",
+                &serde_json::json!({ "path": "a.txt", "script": "s/one/1/g" }),
+            )
+            .expect("the edit runs");
+        assert_eq!(edited["changed"], true);
+        assert_eq!(edited["dry_run"], false);
+        assert_eq!(edited["added"], 1, "{edited}");
+        assert_eq!(edited["deleted"], 1, "{edited}");
+        assert_eq!(edited["diff"][0]["sign"], "-", "{edited}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("the edit"),
+            "1 two 1\n"
+        );
+
+        let again = registry
+            .execute(
+                "sed",
+                &serde_json::json!({ "path": "a.txt", "script": "s/one/1/g" }),
+            )
+            .expect("a second run is a no-op");
+        assert_eq!(again["changed"], false);
+
+        // GNU sed -i -n '/two/p' is the filter idiom: the explicit print goes
+        // to the edited file, and quiet suppresses the automatic one. The file
+        // is reset to three lines so the filter actually removes two of them.
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").expect("the filter input");
+        let filtered = registry
+            .execute(
+                "sed",
+                &serde_json::json!({ "path": "a.txt", "script": "/two/p", "quiet": true }),
+            )
+            .expect("the filter runs");
+        assert_eq!(filtered["changed"], true, "{filtered}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("the filter"),
+            "two\n"
+        );
+
+        // -iSUFFIX keeps the original beside the target, and the result names
+        // the backup.
+        let edited = registry
+            .execute(
+                "sed",
+                &serde_json::json!({
+                    "path": "a.txt",
+                    "script": "s/two/2/",
+                    "backup_suffix": ".bak"
+                }),
+            )
+            .expect("the backup edit runs");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("the edit"),
+            "2\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt.bak")).expect("the backup"),
+            "two\n"
+        );
+        assert!(
+            edited["backup"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("a.txt.bak")),
+            "{edited}"
+        );
+
+        // A suffix that could leave the directory is refused before a byte is
+        // copied.
+        let separator = registry
+            .execute(
+                "sed",
+                &serde_json::json!({
+                    "path": "a.txt",
+                    "script": "s/2/three/",
+                    "backup_suffix": "/tmp/backup"
+                }),
+            )
+            .expect_err("a separator in the suffix is refused");
+        assert!(
+            separator.to_string().contains("path separator"),
+            "{separator}"
+        );
+
+        let escaped = registry
+            .execute(
+                "sed",
+                &serde_json::json!({ "path": "../outside.txt", "script": "s/a/b/" }),
+            )
+            .expect_err("a path outside the workspace is refused");
+        assert!(escaped.to_string().contains("escapes the workspace"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A byte-identical write does not touch the file: its mtime stays put, so
     /// a build watcher is not woken, and the result says the call was a no-op.
     #[test]
@@ -10351,7 +10667,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     /// created by an earlier tool cannot make a later one pass.
     #[test]
     fn every_file_tool_creates_the_ignore_file_when_missing() {
-        let cases: [(&str, serde_json::Value); 8] = [
+        let cases: [(&str, serde_json::Value); 9] = [
             ("read_file", serde_json::json!({ "path": "a.txt" })),
             ("read_files", serde_json::json!({ "paths": ["a.txt"] })),
             (
@@ -10374,6 +10690,10 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                         "edits": [{ "old_string": "needle", "new_string": "changed" }]
                     }]
                 }),
+            ),
+            (
+                "sed",
+                serde_json::json!({ "path": "a.txt", "script": "s/needle/changed/" }),
             ),
             ("list_dir", serde_json::json!({ "path": "." })),
             ("glob", serde_json::json!({ "pattern": "*" })),
@@ -10567,6 +10887,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "write_file",
             "edit_file",
             "apply_patch",
+            "sed",
             "list_dir",
         ] {
             let tool = registry

@@ -49,6 +49,14 @@ pub(crate) const WRITE_FILE: &str =
 pub(crate) const EDIT_FILE: &str =
     "Read a file before editing it, unless you just created or edited it in this session.";
 
+/// Guidance for the stream editor.
+///
+/// The tool is a TRANSFORMER, not a reader: in-place mode points every output
+/// command at the file, so the three facts a model needs are the two refusals
+/// and the dry run.
+pub(crate) const SED: &str =
+    "Use the sed tool for a global, pattern-based or line-addressed change that would be awkward as an exact edit_file replacement. The script processes a private copy of one workspace file and replaces it only when the bytes change. Output is GNU's in-place output: p, P, =, l, F and s///p write to the edited file, so quiet=true plus '/pattern/p' filters the file to matching lines. backup_suffix keeps the original at path + suffix. e, r, R, w and W are refused by the engine's sandbox. Pass dry_run=true to see the resulting text without writing.";
+
 pub(crate) const APPLY_PATCH: &str =
     "For coordinated changes across several files, use apply_patch with grouped exact-text edits instead of separate edit_file calls. Each file is validated before its atomic write; a failed edit leaves that file unchanged. This is not a cross-file transaction, so inspect every per-file result.";
 
@@ -107,6 +115,7 @@ pub(crate) const TOOL_GUIDANCE: &[(&str, &str)] = &[
     ("read_files", READ_FILES),
     ("write_file", WRITE_FILE),
     ("edit_file", EDIT_FILE),
+    ("sed", SED),
     ("apply_patch", APPLY_PATCH),
     ("list_dir", LIST_DIR),
     ("web_search", WEB_SEARCH),
@@ -131,6 +140,7 @@ pub(crate) const KNOWN_TOOLS: &[&str] = &[
     "mcp",
     "read_file",
     "read_files",
+    "sed",
     "send_message",
     "interrupt_agent",
     "subagent",
@@ -308,6 +318,7 @@ mod tests {
             READ_FILES,
             WRITE_FILE,
             EDIT_FILE,
+            SED,
             APPLY_PATCH,
             LIST_DIR,
             WEB_SEARCH,

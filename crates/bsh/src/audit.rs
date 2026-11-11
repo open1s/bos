@@ -96,7 +96,7 @@ impl AuditCategory {
         match name.as_str() {
             "read_file" | "list_dir" | "read" | "ls" | "glob" | "grep" | "search_files"
             | "view" => AuditCategory::FileRead,
-            "write_file" | "edit_file" | "write" | "edit" | "patch" | "create_file"
+            "write_file" | "edit_file" | "sed" | "write" | "edit" | "patch" | "create_file"
             | "delete_file" | "move_file" | "rename_file" => AuditCategory::FileWrite,
             "bash" | "shell" | "run_command" | "exec" => AuditCategory::Shell,
             "subagent" => AuditCategory::Subagent,
@@ -1323,6 +1323,7 @@ mod tests {
             AuditCategory::classify("edit_file"),
             AuditCategory::FileWrite
         );
+        assert_eq!(AuditCategory::classify("sed"), AuditCategory::FileWrite);
         assert_eq!(AuditCategory::classify("bash"), AuditCategory::Shell);
         assert_eq!(AuditCategory::classify("web_fetch"), AuditCategory::Network);
         assert_eq!(

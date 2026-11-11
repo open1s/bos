@@ -1157,9 +1157,11 @@ impl TurnIndexCache {
 /// One message's changed-file summary, and the steps it was built from.
 ///
 /// A turn appends steps while it streams, so the entry is keyed on how many
-/// steps the message has and how many argument bytes they carry together -
-/// cheap to compute and enough to notice a step arriving or filling in. Without
-/// it every frame re-parsed the arguments of every visible write.
+/// steps the message has, how many argument bytes they carry and how much
+/// output has landed. The output is part of the key because sed's diff exists
+/// only after the result arrives; without it the card stayed empty for a live
+/// turn. The sum is cheap to compute and enough to notice a step or a result
+/// filling in, so no frame re-parses every visible write.
 #[derive(Default)]
 pub(crate) struct ChangesCache {
     entries: std::collections::HashMap<usize, (usize, Vec<super::transcript::ChangedFile>)>,
@@ -1172,7 +1174,13 @@ impl ChangesCache {
         message: usize,
         tools: &[crate::model::ToolEvent],
     ) -> std::rc::Rc<Vec<super::transcript::ChangedFile>> {
-        let stamp = tools.len() * 4096 + tools.iter().map(|tool| tool.args.len()).sum::<usize>();
+        let stamp = tools.len() * 4096
+            + tools.iter().map(|tool| tool.args.len()).sum::<usize>()
+            + tools
+                .iter()
+                .map(|tool| tool.output.as_deref().map_or(0, str::len))
+                .sum::<usize>()
+            + tools.iter().filter(|tool| tool.output.is_some()).count();
         let fresh = match self.entries.get(&message) {
             Some((cached, files)) if *cached == stamp => files.clone(),
             _ => {
@@ -7765,7 +7773,7 @@ mod tests {
     // Named import: a glob would pull in gpui's re-export of the test attribute
     // macro, which shadows the builtin one its own expansion emits.
     use super::selection_drag;
-    use super::{compact_error_text, compact_failure_text};
+    use super::{compact_error_text, compact_failure_text, ChangesCache};
 
     /// A delegation's terminal state maps to a task outcome; a live one maps
     /// to nothing so the record stays Running.
@@ -7879,6 +7887,36 @@ mod tests {
             "a new message recomputes the indices"
         );
         assert_eq!(*grown, vec![0, 2]);
+    }
+
+    /// A tool result lands after its call, and sed's diff lives only in that
+    /// result; the changed-files cache key must notice the output arriving or
+    /// a live turn's card stays empty.
+    #[test]
+    fn a_sed_result_rebuilds_the_changed_files_card() {
+        use crate::model::ToolEvent;
+
+        let mut cache = ChangesCache::default();
+        let mut tool = ToolEvent {
+            name: "sed".to_string(),
+            args: r#"{"path":"a.txt","script":"s/a/b/"}"#.to_string(),
+            output: None,
+            ms: None,
+            at: None,
+        };
+        assert!(
+            cache.get(0, std::slice::from_ref(&tool)).is_empty(),
+            "a running sed step has no result to preview"
+        );
+        tool.output = Some(
+            r#"{"path":"a.txt","changed":true,"dry_run":false,"added":1,"deleted":1,"diff":[{"sign":"-","line":"a"},{"sign":"+","line":"b"}]}"#
+                .to_string(),
+        );
+        assert_eq!(
+            cache.get(0, std::slice::from_ref(&tool)).len(),
+            1,
+            "the result's diff rebuilds the card"
+        );
     }
 
     /// Copy-on-selection copies on a DRAG and not on a click.

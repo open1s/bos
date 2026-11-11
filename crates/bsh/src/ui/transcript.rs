@@ -317,7 +317,7 @@ fn tool_icon(name: &str) -> IconName {
     match name {
         "bash" => IconName::SquareTerminal,
         "read_file" => IconName::FileText,
-        "write_file" => IconName::FilePen,
+        "write_file" | "sed" => IconName::FilePen,
         "list_dir" => IconName::Folder,
         "glob" | "grep" => IconName::Search,
         "load_skill" => IconName::Sparkles,
@@ -336,7 +336,7 @@ pub(crate) fn tool_kind_key(name: &str) -> &'static str {
         "bash" | "run_command" | "terminal" => "tool.kind.bash",
         "read_file" => "tool.kind.read",
         "write_file" => "tool.kind.write",
-        "edit_file" | "apply_patch" => "tool.kind.edit",
+        "edit_file" | "apply_patch" | "sed" => "tool.kind.edit",
         "list_dir" => "tool.kind.list",
         "glob" | "grep" => "tool.kind.web",
         "load_skill" => "tool.kind.skill",
@@ -359,7 +359,7 @@ fn process_kind_key(name: &str) -> &'static str {
         "bash" | "run_command" | "terminal" => "msg.process.commands",
         "read_file" => "msg.process.read",
         "write_file" => "msg.process.write",
-        "edit_file" | "apply_patch" => "msg.process.edit",
+        "edit_file" | "apply_patch" | "sed" => "msg.process.edit",
         "list_dir" | "glob" | "grep" => "msg.process.search",
         "update_plan" => "msg.process.plan",
         "web_search" => "msg.process.web",
@@ -380,7 +380,7 @@ fn process_live_key(tools: &[crate::model::ToolEvent]) -> Option<&'static str> {
         "bash" | "run_command" | "terminal" => "msg.processLive.commands",
         "read_file" => "msg.processLive.read",
         "write_file" => "msg.processLive.write",
-        "edit_file" | "apply_patch" => "msg.processLive.edit",
+        "edit_file" | "apply_patch" | "sed" => "msg.processLive.edit",
         "list_dir" | "glob" | "grep" => "msg.processLive.search",
         "update_plan" => "msg.processLive.plan",
         "web_search" => "msg.processLive.web",
@@ -594,7 +594,7 @@ fn quoted_span(text: &str) -> Option<(String, &str)> {
 pub(crate) fn code_lang(name: &str, args: &str) -> Option<&'static str> {
     match name {
         "bash" | "run_command" | "terminal" => Some("bash"),
-        "write_file" | "edit_file" | "apply_patch" | "read_file" => {
+        "write_file" | "edit_file" | "apply_patch" | "sed" | "read_file" => {
             let path = json_field(args, "path")
                 .or_else(|| json_field(args, "file_path"))
                 .unwrap_or_default();
@@ -759,27 +759,122 @@ pub(crate) fn tool_diff(name: &str, args: &str) -> Option<Vec<(char, String)>> {
         _ => None,
     }
 }
+/// The change a tool reported in its own result, when its arguments cannot say.
+///
+/// `tool_diff` reads the request; a sed substitution only exists after the
+/// engine ran, so the tool reports a bounded line diff beside `changed`. The
+/// parse is total: a truncated or older result without the fields simply yields
+/// no preview, never an error.
+fn result_change(name: &str, output: Option<&str>) -> Option<StepChange> {
+    if name != "sed" {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(output?).ok()?;
+    if value
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    if !value
+        .get("changed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let added = value
+        .get("added")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let deleted = value
+        .get("deleted")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let mut lines = Vec::new();
+    if let Some(entries) = value.get("diff").and_then(serde_json::Value::as_array) {
+        for entry in entries {
+            let Some(sign) = entry
+                .get("sign")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|sign| sign.chars().next())
+            else {
+                continue;
+            };
+            let Some(line) = entry.get("line").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            lines.push((sign, line.to_string()));
+        }
+    }
+    if lines.is_empty() && added == 0 && deleted == 0 {
+        return None;
+    }
+    Some(StepChange {
+        lines,
+        added,
+        deleted,
+        recorded: true,
+    })
+}
+
+/// One step's changed lines, with the full counts and whether the old side is
+/// a real before-image the Diff pane can compare against.
+struct StepChange {
+    lines: Vec<(char, String)>,
+    added: usize,
+    deleted: usize,
+    recorded: bool,
+}
+
+/// The change a step carried: its request when that names the text, else the
+/// change the tool reported after running.
+fn step_change(name: &str, args: &str, output: Option<&str>) -> Option<StepChange> {
+    if let Some(lines) = tool_diff(name, args) {
+        let added = lines.iter().filter(|(mark, _)| *mark == '+').count();
+        let deleted = lines.iter().filter(|(mark, _)| *mark == '-').count();
+        // A request-shaped diff is recorded only when it carries the old side;
+        // a create or a rewrite has no before-image.
+        let recorded = deleted > 0;
+        return Some(StepChange {
+            lines,
+            added,
+            deleted,
+            recorded,
+        });
+    }
+    result_change(name, output)
+}
+
 /// The file-writing tools a turn's steps can carry.
 ///
 /// The reference does not read this off the tool registry either: it asks the
 /// host for the turn's changed files so a write through any pluggable file tool
 /// or a shell command that touched a file, is the same fact. bsh has no such
-/// host record, so the honest source is the step's own request, exactly like
-/// `tool_diff`. The three names are what this crate's own tool switch already
-/// treats as a write.
+/// host record, so the honest source is the step's own request or the result it
+/// reported, exactly like `step_change`. These are the names this crate's own
+/// tool switch already treats as a write.
 pub(crate) fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
-        "write_file" | "edit_file" | "apply_patch" | "write" | "edit" | "patch" | "create_file"
+        "write_file"
+            | "edit_file"
+            | "apply_patch"
+            | "sed"
+            | "write"
+            | "edit"
+            | "patch"
+            | "create_file"
     )
 }
 
 /// One file a turn wrote, as the changed-files card reports it.
 ///
-/// `added` and `deleted` count the LINES the request carried, and `diff` is the
-/// same shape a step row shows. Both come from the arguments, so a card here is
-/// a summary of what the turn ASKED for - never a claim about what the disk
-/// held, which bsh cannot know without a before-image.
+/// `added` and `deleted` count changed lines, and `diff` is the same shape a
+/// step row shows. A request-shaped tool (write, edit, patch) contributes what
+/// it asked for; sed contributes the diff its engine reported, because its
+/// change exists only after the program ran.
 #[derive(Clone)]
 pub(crate) struct ChangedFile {
     /// The path exactly as the step named it.
@@ -790,6 +885,9 @@ pub(crate) struct ChangedFile {
     pub(crate) deleted: usize,
     /// The requested change, as `+` / `-` lines for the hover preview.
     pub(crate) diff: Vec<(char, String)>,
+    /// Whether the diff carries a real before-image (so the Diff pane can show
+    /// its rows rather than a basis note).
+    pub(crate) recorded: bool,
 }
 
 /// The files one message's own steps wrote, in the order they were touched.
@@ -804,25 +902,25 @@ pub(crate) fn turn_changes(tools: &[ToolEvent]) -> Vec<ChangedFile> {
         if !is_write_tool(&tool.name) {
             continue;
         }
-        let Some(diff) = tool_diff(&tool.name, &tool.args) else {
+        let Some(change) = step_change(&tool.name, &tool.args, tool.output.as_deref()) else {
             continue;
         };
         let Some(path) = tool_path(&tool.args) else {
             continue;
         };
-        let added = diff.iter().filter(|(mark, _)| *mark == '+').count();
-        let deleted = diff.iter().filter(|(mark, _)| *mark == '-').count();
         match files.iter_mut().find(|file| file.path == path) {
             Some(file) => {
-                file.added += added;
-                file.deleted += deleted;
-                file.diff.extend(diff);
+                file.added += change.added;
+                file.deleted += change.deleted;
+                file.diff.extend(change.lines);
+                file.recorded |= change.recorded;
             }
             None => files.push(ChangedFile {
                 path,
-                added,
-                deleted,
-                diff,
+                added: change.added,
+                deleted: change.deleted,
+                diff: change.lines,
+                recorded: change.recorded,
             }),
         }
     }
@@ -4377,7 +4475,7 @@ impl Shell {
         // fold handler is attached only when there is no link to protect.
         let opens_file = matches!(
             name.as_str(),
-            "read_file" | "write_file" | "edit_file" | "apply_patch"
+            "read_file" | "write_file" | "edit_file" | "apply_patch" | "sed"
         );
         let head = div()
             .id(SharedString::from(format!(
@@ -4535,7 +4633,8 @@ impl Shell {
         // pane. The patch is the one the REQUEST carried - bsh keeps no
         // before-image - so the pane shows what the step asked for, which is
         // the same shape the row already previews inline.
-        if let Some(lines) = tool_diff(&name, &args) {
+        if let Some(change) = step_change(&name, &args, output.as_deref()) {
+            let lines = change.lines;
             if let Some(path) = tool_path(&args) {
                 // The change has usually landed, so the hunk is LOCATED in the
                 // file as it is now: real line numbers and real context, not the
@@ -4603,7 +4702,8 @@ impl Shell {
             // The patch wins over the raw arguments when the step wrote or
             // edited: `-`/`+` lines say what changed, where the JSON would make
             // the reader diff it in their head.
-            if let Some(lines) = tool_diff(&name, &args) {
+            if let Some(change) = step_change(&name, &args, output.as_deref()) {
+                let lines = change.lines;
                 let mut diff = div()
                     .ml(px(10.0))
                     .mb(px(6.0))
@@ -4802,7 +4902,7 @@ impl Shell {
 mod tests {
     use super::{
         output_body, process_summary, single_fit, think_stream_tail, think_summary_live,
-        timeline_is_consistent,
+        timeline_is_consistent, turn_changes,
     };
     use crate::i18n::Lang;
     use crate::model::{ChatMessage, ToolEvent, TurnPart};
@@ -5060,6 +5160,32 @@ mod tests {
     fn one_kind_is_its_label_and_the_unknown_falls_back_to_tools() {
         assert_eq!(process_summary(&[step("bash")], Lang::Zh), "执行了命令");
         assert_eq!(process_summary(&[], Lang::En), "Called tools");
+    }
+
+    /// A sed step's change exists only after the engine ran, so the card takes
+    /// the bounded diff its result reported instead of reading the arguments.
+    #[test]
+    fn a_sed_step_contributes_the_diff_its_result_reported() {
+        let mut tool = step("sed");
+        tool.args = r#"{"path":"a.txt","script":"s/a/b/"}"#.to_string();
+        tool.output = Some(
+            r#"{"path":"a.txt","changed":true,"dry_run":false,"added":1,"deleted":1,"diff":[{"sign":"-","line":"a"},{"sign":"+","line":"b"}]}"#
+                .to_string(),
+        );
+        let files = turn_changes(&[tool.clone()]);
+        assert_eq!(files.len(), 1, "the sed step is a changed file");
+        assert_eq!(files[0].path, "a.txt");
+        assert_eq!(files[0].added, 1);
+        assert_eq!(files[0].deleted, 1);
+        assert_eq!(
+            files[0].diff,
+            vec![('-', "a".to_string()), ('+', "b".to_string())]
+        );
+
+        // A dry run writes nothing, and a byte-level change with no line diff
+        // is not shown as a line change.
+        tool.output = Some(r#"{"path":"a.txt","changed":true,"dry_run":true}"#.to_string());
+        assert!(turn_changes(&[tool]).is_empty());
     }
 
     /// The reference `singleFit`: long edge 240, aspect clamped to [0.25, 4],

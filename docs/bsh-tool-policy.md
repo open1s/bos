@@ -320,7 +320,7 @@ explicit empty list mounts nothing:
   means none. MCP entries are server namespaces (the name the settings entry
   or extension server registers under).
 - The tool vocabulary is `bash`, `glob`, `grep`, `read_file`, `read_files`,
-  `write_file`, `edit_file`, `apply_patch`, `list_dir`, `update_plan`,
+  `write_file`, `edit_file`, `sed`, `apply_patch`, `list_dir`, `update_plan`,
   `job_output`, `job_list`, `job_kill`, `subagent`, `send_message`,
   `interrupt_agent`, the four `schedule_*` tools and the `federation_*`
   family. `schedule_*` answers to the permission matrix (Read Only schedules
@@ -336,8 +336,9 @@ explicit empty list mounts nothing:
 
 `<workspace>/.bsh/.ignore` is not a policy module. It is a `.gitignore`-syntax
 list the file tools (`list_dir`, `read_file`, `read_files`, `write_file`,
-`edit_file`, `apply_patch`, `glob`, `grep`) consult on every call. A matched
-path is hidden from listings and searches and refused by the read/write tools;
+`edit_file`, `sed`, `apply_patch`, `glob`, `grep`) consult on every call. A
+matched path is hidden from listings and searches and refused by the read/write
+tools;
 `!` re-includes a path, and `.bsh`/`.bos` are excluded unconditionally. The
 file is created on the first file-tool call with every common tree commented
 out, so a fresh workspace filters nothing. The parsed rules are cached per

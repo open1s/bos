@@ -239,14 +239,17 @@ the directive: inspect and propose first, then wait for the reader's approval.
 ## 6. Budget
 
 The system prompt rides on every step of every turn, so its size is a
-per-request cost. Measured bytes:
+per-request cost. Bytes:
 
 | Layer | Bytes |
 |---|---|
 | `DEFAULT_SYSTEM_PROMPT` (identity + persona + contract) | 2,627 |
 | `HARNESS_CONTEXT` | 1,421 |
-| Tool sections (bare build) | 5,143 |
-| Built prompt | 9,191 |
+| Tool sections (bare build) | 5,690 |
+| Built prompt | 9,738 |
+
+The sed tool's section adds 547 bytes (545 of guidance plus its separator) to
+both rows, on top of the 2026-11-09 measurement.
 
 The first contract revision measured 3,001 bytes and a 9,909-byte built prompt;
 this one is 17% shorter in the contract and 7.2% shorter overall, with the

@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+- **sed tool**: the files bundle now carries a first-class `sed` tool built on
+  uutils sed 0.3.0 (the `sed` crate). One program processes a private copy of a
+  workspace file and replaces the file by rename only when the bytes change, so
+  a failed or no-op script leaves the original untouched and the engine's output
+  never reaches the GUI process's stdout; `dry_run` returns that copy's text
+  instead of replacing anything. Output follows GNU's in-place semantics: `p`,
+  `P`, `=`, `l`, `F` and `s///p` write to the edited file, `quiet` mirrors `-n`
+  (so `quiet` plus `/pattern/p` filters the file), `line_length` mirrors `-l`,
+  `backup_suffix` mirrors `-iSUFFIX`, and the result's `exit_code` is the status
+  `q`/`Q` set; `F` names the target rather than the private copy. The result
+  carries a bounded line diff, so the transcript's changed-files card and Diff
+  pane preview a sed step's real changed lines instead of omitting it. The
+  engine's compile-time sandbox is always on, refusing `e`, `r`, `R`, `w` and
+  `W`. The
+  tool honors the workspace ignore file, the permission matrix and the per-file
+  lock, declares `fs.write:workspace` capability metadata, and records its edit
+  in Intelligent Review.
+
+- **Unified intelligence runtimes**: goals now carry a durable identity and
+  revision that fence late round settlements, refuse overlength objectives
+  instead of truncating them, and localize the round-limit blocker while keeping
+  its stable code. Skills gain validated metadata (version, tags, dependencies,
+  conflicts, provenance, digest), a metadata-only catalogue with hybrid
+  retrieval and deterministic dependency resolution, trust policy, a task-scoped
+  runtime with context budgets, and governed federated metadata merge. Tool
+  discovery gains category/tag/intent metadata, metadata-aware ranking and a
+  cumulative per-turn schema budget that reports what it refused. The production
+  `load_skill` path now runs through the task-scoped runtime
+  (dependency-first activation, trust and budget checks, digest-refused stale
+  manifests, composed instructions injected as one request-scoped block and
+  cleared when the task ends), discovery reports capability id/version/provider,
+  and both retrieval corpora assert P@3/R@3/MRR. Added an offline
+  with/without-skill activation benchmark, governed federated metadata
+  discovery (policy-scoped peers, withdrawal, trust-gated remote loads), and
+  turn-correlated discovery/selection telemetry with an effectiveness
+  accumulator.
+
+- **Binding parity for live runtime updates**: Python and JavaScript can now
+  add/remove tools and skills while a turn is running through the shared live
+  overlay (`add_live_tool`/`addLiveTool`, `add_live_skill`/`addLiveSkill` and
+  their directory/removal counterparts). `list_tools` and the new
+  `tool_definitions`/`toolDefinitions` include live and MCP tools, and skill
+  snapshots now carry version and tags.
+- **Model-written compaction**: `Agent.compact_now`/`compactNow` exposes the
+  model checkpoint path alongside the existing mechanical session compaction.
+- **Full plugin lifecycle**: `on_stream_token`, `on_turn_start` and
+  `on_turn_end` are available in both bindings; Python plugins that omit a
+  handler no longer veto that hook.
+- **MCP prompts and health**: `get_prompt`/`getPrompt`,
+  `get_capabilities`/`getCapabilities`, plus `restart` and `health_status` on
+  the JavaScript client.
+- **Tool capability metadata**: `ToolDef` carries `version`, `risk`,
+  `side_effects`, `permissions`, `timeout_ms` and `max_output_bytes`, and the
+  full tool definitions report them.
+
 ## v4.1.3 (2026-11-11)
 
 - **Declarative extension panels**: a `panel` contribution ships

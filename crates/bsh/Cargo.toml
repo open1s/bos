@@ -95,6 +95,24 @@ regorus = { workspace = true }
 # standard library's str::matches cost about 1us a match on a 4MiB file, and an
 # edit with tens of thousands of matches spent more time searching than writing.
 memchr = "2"
+# The sed tool's engine. uutils sed is a command-line program whose CLI entry
+# (`uumain`) installs signal handlers and writes to stdout; the tool instead
+# uses the crate's public compiler and processor over an in-place context, so
+# its output never reaches this GUI process's stdout and the compile-time
+# sandbox keeps a script away from files and processes the policy never saw.
+# The crate is MIT, the same licence as this workspace, and is the reference
+# implementation named by <https://crates.io/crates/sed>.
+sed = "0.3.0"
+# GNU's q/Q commands set an exit status through uucore, the crate sed already
+# builds against; naming it directly lets the tool report that status instead
+# of dropping it. No default features: sed enables the two it needs.
+uucore = { version = "0.12.0", default-features = false }
+# The sed tool's dry run edits a private copy. The engine itself creates its
+# in-place temporary beside the copy with this crate, so naming it directly adds
+# no package; the copy needs a path that closes its handle before sed renames
+# over it, which `TempPath` guarantees.
+tempfile = "3"
+
 # The glob tool's walk and matcher are ripgrep's own ignore crate
 # (https://github.com/BurntSushi/ripgrep, crate ignore 0.4.32) - the engine
 # behind rg --files - which carries both the .gitignore/.ignore walk and the
@@ -183,7 +201,7 @@ rand = { workspace = true }
 extism = { version = "1.41.0", default-features = false }
 
 [dev-dependencies]
-tempfile = "3"
+# tempfile is a regular dependency now (the sed dry run); tests use it too.
 # The same package the kit aliases as gpui, with GPUI test hooks enabled: the
 # shell is booted headlessly and its controls are clicked by debug selector.
 gpui = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"] }
