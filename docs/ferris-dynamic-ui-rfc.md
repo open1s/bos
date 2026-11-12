@@ -1220,7 +1220,7 @@ Landed in this change, in `ferris-core` and re-exported by `ferris-sdk`:
 | Composition budget: an expanded slot tree over the node/byte ceiling keeps the panel's own document | `bsh/src/extension/surface.rs` | Implemented |
 | Surface inspector rows in the Extensions pane | `bsh/src/ui/settings.rs` | Implemented |
 
-Evidence: `cargo test -p ferris-core surface` runs 37 surface tests; the full crate is 164 passed, 1 ignored; `cargo clippy -p ferris-core --all-targets -- -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc -p ferris-core --no-deps` are clean. BSH: `cargo test -p bsh --lib extension::` is 121 passed and `cargo test -p bsh --lib ui::extension_panel` is 9 passed; `cargo clippy -p bsh --lib -- -D warnings` is clean.
+Evidence: `cargo test -p ferris-core surface` runs 37 surface tests; the full crate is 164 passed, 1 ignored; `cargo clippy -p ferris-core --all-targets -- -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc -p ferris-core --no-deps` are clean. BSH: `cargo test -p bsh --lib extension::` is 124 passed and `cargo test -p bsh --lib ui::extension_panel` is 9 passed; `cargo clippy -p bsh --lib -- -D warnings` is clean. The extension-point inventory is in §23.
 
 Still open, and the phases in §17 remain the plan:
 
@@ -1231,6 +1231,53 @@ Still open, and the phases in §17 remain the plan:
 - Frame budgets are enforced structurally (node, byte, patch and composition ceilings); per-frame timing instrumentation is not wired into the metrics yet.
 - The inspector shows each mounted surface's slot, generation, revision, state and refusal reason in the Extensions pane; a dedicated pane with per-binding decisions and a disabled-control explanation is ahead.
 - The surface grant question is settled the other way: no new UI permission kind is introduced (§10.1, decision 13).
+
+## 23. BSH UI extension points
+
+A UI extension point is two things: a **placement** (a stable region id the host draws) and a **contract** (who may put what there, what it may do, and who disposes it). A placement without a contract is a hole; a contract without a placement is dead code.
+
+Every point must declare, in one place:
+
+1. A stable **id** and occupancy rule (`single`, `stacked`, `inline`).
+2. Whether an **agent-authored** surface may mount there.
+3. Whether it is **first-party only** (host chrome cannot be filled by a package).
+4. The **profile** the host will render (`full`/`compact`/`text`/`machine`) and the limits.
+5. One **lifecycle owner**: admitted through the surface host, with a generation, a revision floor and a disposal report.
+6. The **authorization** of every action it exposes: a binding, never a raw command, and host chrome only through the reader allowlist.
+
+### 23.1 The current set
+
+| Point | Shape | State |
+|---|---|---|
+| Host slot | `HostSlot` registry: id, occupancy, agent acceptance, first-party rule | Implemented and enforced at admission (`bsh/src/extension/surface.rs`) |
+| Panel contribution | Manifest `panel` plus `panels/<id>.json`, schema 1.0 | Implemented (the shipped contract) |
+| Provider slot | A contract declares `SlotSpec`; a document mounts one through a `slot` node; the host expands it and routes its actions | Contract, expansion and action routing implemented; **package-facing declaration is missing** |
+| Surface contribution | `contributes.surfaces` plus `surfaces/<id>.json`: contract, schema 1.1 document, profiles, offered slots, actions | **Missing** — a package cannot ship a 1.1 document or declare a slot it offers |
+| Agent surface | `bos.ui/*` tools, agent limits, provenance badge, panel rendering | Implemented; actions are read-only (no binding-to-capability dispatch) |
+| Cordis JS `ctx.slots` | A bridge host API that lowers a Cordis plugin's UI registration into frames | **Missing**: `ferris-runtime/src/bridge/dsh-host-shim.js` still refuses `ctx.slots` |
+| Component ABI | `surface(id)`, `patch`, `close` beside `panel(id)` in `bsh:extension@1.1.0` | **Missing**: the WIT exports `panel(id)` only |
+| Reader host services | A small allowlist of chrome actions (focus, open settings, copy, close) a surface may request | **Missing** |
+| Composer, statusbar, palette, transcript, settings producers | Slots are declared in the registry; producers exist only through panels and agent surfaces | Partial: ids are stable, package/Cordis producer paths are not |
+
+The registry deliberately carries slots that have no producer yet — `workspace.statusbar.leading`, `workspace.statusbar.trailing`, `composer.row`, `command.palette.row`, `settings.page` — so an extension can target a stable id once its producer lands instead of guessing a region name. The two host-chrome slots are first-party only, and no slot accepts an agent surface unless the registry says so.
+
+### 23.2 Rules for adding a point
+
+1. Add the id to `HostSlot::ALL` (or declare it as a provider slot in a contract) before any consumer exists; no implicit region names.
+2. Enforce occupancy at admission, with a refusal that names the holder.
+3. Route every control through an action binding and the host pipeline; a new point does not get a private invocation path.
+4. Admit through the surface host so generation and disposal are inherited, not parallel.
+5. Ship tests for admission, occupancy refusal, missing provider, and disposal.
+
+### 23.3 What "enough" requires
+
+A package, an agent and a runtime plugin must each be able to: place UI in a declared region; offer a slot another surface can mount into; declare actions with their target capability; carry provenance; and be disposed with their owner. Today the agent path meets all five (except live actions), the package path meets placement and ownership but cannot offer slots or ship a 1.1 document, and the Cordis JS path meets none because its UI seam is refused.
+
+The next three deliveries, in dependency order:
+
+1. **Surface contribution kind.** `contributes.surfaces` with `surfaces/<id>.json` carrying the contract (profiles, slots, actions, limits) and a schema 1.1 document; the host admits it through the same `SurfaceHost` and offers its `SlotSpec`s to other surfaces.
+2. **Cordis `ctx.slots` bridge.** Replace the refusal in the DSH shim with a bounded registration call that lowers to a surface provider; the plugin does not receive a renderer, only a place to declare a surface.
+3. **ABI 1.1.** Export `surface`/`patch`/`close` in a new `bsh:extension@1.1.0` package so process and WASM guests have the same point a native plugin has.
 
 ## Appendix A - Worked example
 

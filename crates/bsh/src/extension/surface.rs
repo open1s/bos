@@ -38,6 +38,12 @@ pub(crate) enum HostSlot {
     TranscriptInline,
     /// First-run and blank-session content.
     Hero,
+    /// The leading status-bar region.
+    StatusbarLeading,
+    /// The trailing status-bar region.
+    StatusbarTrailing,
+    /// One row in the composer's control strip.
+    ComposerRow,
 }
 
 impl HostSlot {
@@ -52,14 +58,46 @@ impl HostSlot {
             Self::PaletteRow => "command.palette.row",
             Self::TranscriptInline => "transcript.inline",
             Self::Hero => "empty.hero",
+            Self::StatusbarLeading => "workspace.statusbar.leading",
+            Self::StatusbarTrailing => "workspace.statusbar.trailing",
+            Self::ComposerRow => "composer.row",
         }
+    }
+
+    /// Every host slot, in declaration order.
+    pub(crate) const ALL: [Self; 11] = [
+        Self::Main,
+        Self::Left,
+        Self::Right,
+        Self::Bottom,
+        Self::StatusbarLeading,
+        Self::StatusbarTrailing,
+        Self::TranscriptInline,
+        Self::ComposerRow,
+        Self::SettingsPage,
+        Self::PaletteRow,
+        Self::Hero,
+    ];
+
+    /// Resolve a slot by its stable id.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|slot| slot.id() == name)
+    }
+
+    /// The slot ids, for a catalogue or a test.
+    pub(crate) fn names() -> Vec<&'static str> {
+        Self::ALL.iter().map(|slot| slot.id()).collect()
     }
 
     /// How many presenters the slot admits.
     pub(crate) fn occupancy(self) -> Occupancy {
         match self {
             Self::Main | Self::SettingsPage => Occupancy::Single,
-            Self::PaletteRow | Self::TranscriptInline => Occupancy::Inline,
+            Self::PaletteRow
+            | Self::TranscriptInline
+            | Self::StatusbarLeading
+            | Self::StatusbarTrailing
+            | Self::ComposerRow => Occupancy::Inline,
             Self::Left | Self::Right | Self::Bottom | Self::Hero => Occupancy::Stacked,
         }
     }
@@ -67,6 +105,11 @@ impl HostSlot {
     /// Whether an agent-authored surface may mount here.
     pub(crate) fn accepts_agents(self) -> bool {
         matches!(self, Self::Main | Self::TranscriptInline | Self::Hero)
+    }
+
+    /// Whether an agent surface may mount here, by slot id.
+    pub(crate) fn agent_slot(name: &str) -> Option<Self> {
+        Self::from_name(name).filter(|slot| slot.accepts_agents())
     }
 
     /// Whether only first-party providers may fill the slot.
@@ -186,6 +229,18 @@ impl SurfaceHost {
             if self.mounted.contains_key(panel_id) {
                 continue;
             }
+            let slot = HostSlot::from_panel_location(admission.location);
+            if slot.occupancy() == Occupancy::Single {
+                if let Some(other) = self.occupied_by(slot, panel_id) {
+                    let error = format!(
+                        "the {} slot admits one presenter; {other} is already mounted there",
+                        slot.id()
+                    );
+                    self.refused.insert(panel_id.to_string(), error.clone());
+                    report.errors.push(format!("{panel_id}: {error}"));
+                    continue;
+                }
+            }
             match self.admit(panel_id, admission) {
                 Ok(instance) => {
                     self.mounted.insert(
@@ -211,6 +266,14 @@ impl SurfaceHost {
             }
         }
         report
+    }
+
+    /// The panel holding a single-presenter slot, if any.
+    fn occupied_by(&self, slot: HostSlot, except: &str) -> Option<&str> {
+        self.mounted
+            .iter()
+            .find(|(panel_id, panel)| panel.slot == slot && panel_id.as_str() != except)
+            .map(|(panel_id, _)| panel_id.as_str())
     }
 
     /// Replace a panel's provider generation.
@@ -498,6 +561,15 @@ impl SurfaceHost {
         location: ferris_sdk::ui::PanelLocation,
         document: SurfaceDocument,
     ) -> Result<InstanceId, String> {
+        let slot = HostSlot::from_panel_location(location);
+        if slot.occupancy() == Occupancy::Single {
+            if let Some(other) = self.occupied_by(slot, panel_id) {
+                return Err(format!(
+                    "the {} slot admits one presenter; {other} is already mounted there",
+                    slot.id()
+                ));
+            }
+        }
         let contract = self.contract_for(panel_id)?;
         let instance = self
             .engine
@@ -853,6 +925,74 @@ mod tests {
             }
             other => panic!("expected the child button, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_single_presenter_slot_refuses_a_second_panel() {
+        let mut host = SurfaceHost::new();
+        let first = view();
+        let second = view();
+        let report = host.sync(&[
+            PanelAdmission {
+                panel_id: "com.example.one",
+                location: PanelLocation::Center,
+                document: Some(&first),
+            },
+            PanelAdmission {
+                panel_id: "com.example.two",
+                location: PanelLocation::Center,
+                document: Some(&second),
+            },
+        ]);
+        assert_eq!(report.mounted, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert!(host.refusal("com.example.two").is_some());
+    }
+
+    #[test]
+    fn a_single_presenter_slot_refuses_a_second_external_surface() {
+        let mut host = SurfaceHost::new();
+        host.mount_external(
+            "com.example.one",
+            PanelLocation::Center,
+            surface_document(text("one")),
+        )
+        .expect("first");
+        assert!(host
+            .mount_external(
+                "com.example.two",
+                PanelLocation::Center,
+                surface_document(text("two")),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn the_slot_registry_names_every_region_and_agent_rules() {
+        for name in [
+            "workspace.main",
+            "workspace.left",
+            "workspace.right",
+            "workspace.bottom",
+            "workspace.statusbar.leading",
+            "workspace.statusbar.trailing",
+            "transcript.inline",
+            "composer.row",
+            "settings.page",
+            "command.palette.row",
+            "empty.hero",
+        ] {
+            assert!(HostSlot::from_name(name).is_some(), "{name}");
+        }
+        assert_eq!(
+            HostSlot::from_name("workspace.statusbar.trailing"),
+            Some(HostSlot::StatusbarTrailing)
+        );
+        assert!(HostSlot::agent_slot("workspace.main").is_some());
+        assert!(HostSlot::agent_slot("transcript.inline").is_some());
+        assert!(HostSlot::agent_slot("settings.page").is_none());
+        assert!(HostSlot::agent_slot("composer.row").is_none());
+        assert_eq!(HostSlot::names().len(), 11);
     }
 
     #[test]

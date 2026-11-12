@@ -155,6 +155,10 @@ pub(crate) struct AgentSurfaceView {
 /// The component catalogue an agent is offered.
 pub(crate) fn catalogue() -> Value {
     let limits = SurfaceLimits::agent();
+    let slots: Vec<&str> = crate::extension::surface::HostSlot::names()
+        .into_iter()
+        .filter(|name| crate::extension::surface::HostSlot::agent_slot(name).is_some())
+        .collect();
     serde_json::json!({
         "schema_version": "1.1",
         "limits": {
@@ -171,7 +175,7 @@ pub(crate) fn catalogue() -> Value {
             "interactive": "every button, input, select and checkbox carries a unique id",
             "bindings": "controls name a key in the document binding table",
         },
-        "slots": ["workspace.main", "workspace.right", "transcript.inline", "empty.hero"],
+        "slots": slots,
     })
 }
 
