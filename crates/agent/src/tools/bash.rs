@@ -689,12 +689,18 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> String {
-        let mut description =
-            "Run a shell command with `sh -c` and return its stdout, stderr and exit \
+        // The description names the dialect actually available on this host,
+        // not an assumed sh: Windows resolves Git Bash / WSL or refuses
+        // (issue #311).
+        let dialect = crate::shell_backend::resolve()
+            .map(|runtime| runtime.dialect().to_string())
+            .unwrap_or_else(|_| "no POSIX shell installed".to_string());
+        let mut description = format!(
+            "Run a shell command in the {dialect} dialect and return its stdout, stderr and exit \
              code. Pass the WHOLE command line in `command`; pipes, redirection and \
              `&&` are supported. Relative paths resolve from the workspace root when \
-             one is configured."
-                .to_string();
+             one is configured. Commands are NOT reinterpreted as CMD or PowerShell."
+        );
         if self.background {
             description.push_str(
                 " With run_in_background the call returns a job id at once instead \

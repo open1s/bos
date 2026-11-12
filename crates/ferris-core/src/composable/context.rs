@@ -82,6 +82,14 @@ impl std::error::Error for EffectError {}
 
 /// Checks whether a consumer may acquire a service. The host supplies this so
 /// service discovery never becomes authorization.
+///
+/// The authorization decision is made on `(consumer, scope, name)` alone.
+/// The isolation realm, the manifest contract id and the version requirement
+/// are NOT part of it: they are selection constraints enforced by the registry
+/// lookup itself. A realm-isolated context resolves only its own realm, and a
+/// mismatched contract or incompatible version is refused even when the
+/// authorizer allows the name. A denial is treated as absence, so the caller
+/// may still try the next scope on its path.
 pub trait ServiceAuthorizer: Send + Sync {
     /// Allow or deny one acquisition. The error is a human-readable reason.
     fn authorize(&self, consumer: &str, scope: &Scope, name: &str) -> Result<(), String>;
@@ -286,6 +294,10 @@ impl Context {
     }
 
     /// Resolve one exact contract at one exact scope, passing the authorizer.
+    ///
+    /// The context's isolation realm for `name` is part of the lookup
+    /// (issue #301): a realm-isolated context resolves only the provider
+    /// published in its realm and never falls back to the default realm.
     pub fn acquire_contract_at<T>(
         &self,
         scope: &Scope,
@@ -299,9 +311,13 @@ impl Context {
         if !self.authorized(scope, name) {
             return None;
         }
-        self.inner
-            .services
-            .acquire_contract(scope, name, contract, requirement)
+        self.inner.services.acquire_contract_in_realm(
+            scope,
+            self.realm_for(name),
+            name,
+            contract,
+            requirement,
+        )
     }
 
     /// Provide one exact contract into this context's scope.
@@ -509,6 +525,106 @@ mod tests {
         assert_eq!(*b.acquire::<u64>("clock").unwrap(), 2);
         assert!(root.acquire::<u64>("clock").is_none());
         assert_eq!(a.realm_for("clock"), Some("a"));
+    }
+
+    /// Issue #301: contract acquisition through a Context preserves the
+    /// isolation realm instead of dropping to the default realm.
+    #[tokio::test]
+    async fn contract_acquisition_preserves_the_isolation_realm() {
+        struct Search(&'static str);
+        let root = Context::root(registry(), Scope::Host);
+        let a = root.isolate("search", "a");
+        let b = root.isolate("search", "b");
+        let version = semver::Version::new(1, 2, 0);
+        let requirement = semver::VersionReq::parse("^1").expect("requirement");
+
+        // Same name, same contract, same type in two realms AND the default.
+        root.provide_contract(
+            "search",
+            "search-api",
+            version.clone(),
+            Arc::new(Search("default")),
+        );
+        a.provide_contract(
+            "search",
+            "search-api",
+            version.clone(),
+            Arc::new(Search("a")),
+        );
+        b.provide_contract("search", "search-api", version, Arc::new(Search("b")));
+
+        let scope = Scope::Host;
+        assert_eq!(
+            a.acquire_contract_at::<Search>(&scope, "search", "search-api", &requirement)
+                .expect("realm a provider")
+                .0,
+            "a"
+        );
+        assert_eq!(
+            b.acquire_contract_at::<Search>(&scope, "search", "search-api", &requirement)
+                .expect("realm b provider")
+                .0,
+            "b"
+        );
+        // A context without an isolation still resolves the default realm.
+        assert_eq!(
+            root.acquire_contract_at::<Search>(&scope, "search", "search-api", &requirement)
+                .expect("default realm provider")
+                .0,
+            "default"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_realm_isolated_context_never_falls_back_to_the_default_realm() {
+        struct Search(&'static str);
+        let root = Context::root(registry(), Scope::Host);
+        let version = semver::Version::new(1, 0, 0);
+        let requirement = semver::VersionReq::parse("^1").expect("requirement");
+        root.provide_contract("search", "search-api", version, Arc::new(Search("default")));
+
+        let isolated = root.isolate("search", "a");
+        assert!(
+            isolated
+                .acquire_contract_at::<Search>(&Scope::Host, "search", "search-api", &requirement)
+                .is_none(),
+            "the default-realm provider must not leak into an isolated realm"
+        );
+        // Once the realm publishes its own provider, it resolves.
+        isolated.provide_contract(
+            "search",
+            "search-api",
+            semver::Version::new(1, 0, 0),
+            Arc::new(Search("a")),
+        );
+        assert_eq!(
+            isolated
+                .acquire_contract_at::<Search>(&Scope::Host, "search", "search-api", &requirement)
+                .expect("realm provider")
+                .0,
+            "a"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_incompatible_contract_version_is_refused_in_a_realm() {
+        struct Search;
+        let root = Context::root(registry(), Scope::Host);
+        let isolated = root.isolate("search", "a");
+        isolated.provide_contract(
+            "search",
+            "search-api",
+            semver::Version::new(1, 2, 0),
+            Arc::new(Search),
+        );
+        let two = semver::VersionReq::parse("^2").expect("two");
+        assert!(isolated
+            .acquire_contract_at::<Search>(&Scope::Host, "search", "search-api", &two)
+            .is_none());
+        let one = semver::VersionReq::parse("^1").expect("one");
+        assert!(isolated
+            .acquire_contract_at::<Search>(&Scope::Host, "search", "search-api", &one)
+            .is_some());
     }
 
     // A Tokio test, not a plain one: dropping the Context runs async cleanup

@@ -37,6 +37,7 @@ sha2 = "0.11.1"
 dashmap = { workspace = true }
 tempfile = "3.8"
 dirs = "7.0.0"
+hostkit = { path = "../hostkit" }
 # Only the login_tty helper (src/bin/bsh-tty-exec.rs) needs it, and only on
 # Unix; declared here so the bin can call setsid/TIOCSCTTY/dup2.
 libc = "0.2"

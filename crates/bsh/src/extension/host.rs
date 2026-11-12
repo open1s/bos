@@ -118,7 +118,9 @@ pub(crate) fn extension_root(settings: &crate::settings::Settings) -> PathBuf {
         return save_root.join("extensions");
     }
     if let Some(raw) = std::env::var_os("BSH_EXTENSION_ROOT") {
-        return PathBuf::from(shellexpand::tilde(&raw.to_string_lossy()).into_owned());
+        // One resolver for GUI, CLI and host (issue #307): absolute wins,
+        // tilde expands once, relative anchors to home, native paths kept.
+        return crate::settings::resolve_root_override(Some(raw), ".bos/bsh/extensions");
     }
     #[cfg(test)]
     {
@@ -521,6 +523,11 @@ pub(crate) struct AppliedExtension {
     session_id: String,
     service_provides: Vec<ferris_sdk::core_manifest::ServiceProvideSpec>,
     service_requires: Vec<ferris_sdk::core_manifest::ServiceRequireSpec>,
+    /// Revocation tokens for shared-scope (Host/Workspace/Session) services
+    /// this activation published into the host registry (issue #302). The
+    /// registration lives in the shared registry, but unload revokes only
+    /// this provider's tokens, so a service never outlives its provider.
+    service_tokens: Vec<ferris_sdk::composable::ServiceToken>,
 }
 
 /// Host context handed to manager-owned leases at revoke time.
@@ -605,14 +612,7 @@ impl AppliedExtension {
     where
         T: std::any::Any + Send + Sync,
     {
-        // AppliedExtension is owned by one Agent build. Its Fiber cannot own a
-        // Host-, Workspace- or Session-lifetime registration: dropping this
-        // build would revoke a service still used by other builds. Until those
-        // scopes have dedicated lifecycle owners, fail closed and permit only
-        // this extension's private scope.
-        if !service_scope_is_activation_owned(&scope, &self.extension_id) {
-            return None;
-        }
+        // The manifest must declare this exact name/contract/version/scope.
         if !self.service_provides.iter().any(|declaration| {
             declaration.name == name
                 && declaration.contract == contract
@@ -627,16 +627,31 @@ impl AppliedExtension {
         }) {
             return None;
         }
-        Some(self.services.provide_owned_contract(
+        if service_scope_is_activation_owned(&scope, &self.extension_id) {
+            // The private Extension scope is owned by the activation Fiber,
+            // which revokes it on unload.
+            return Some(self.services.provide_owned_contract(
+                scope,
+                name.to_owned(),
+                contract,
+                version.clone(),
+                service,
+                &mut self.fiber,
+            ));
+        }
+        // Host/Workspace/Session scopes live in the SHARED host registry, not
+        // this build's Fiber, so other builds can resolve them (issue #302).
+        // The activation keeps the revocation token and revokes it on unload,
+        // so the service still cannot outlive its provider.
+        let token = self.services.provide_contract(
             scope,
             name.to_owned(),
             contract,
             version.clone(),
             service,
-            // The activation Fiber owns the registration and revokes it on
-            // unload, preventing service values from outliving their provider.
-            &mut self.fiber,
-        ))
+        );
+        self.service_tokens.push(token.clone());
+        Some(token)
     }
 
     /// Acquire a typed service only when this extension declared a matching
@@ -689,6 +704,11 @@ impl AppliedExtension {
         agent: &mut ::agent::Agent,
         registry: &mut ::agent::plugins::PluginRegistry,
     ) -> Result<usize, UnloadError> {
+        // Revoke this provider's shared-scope services before the Fiber goes,
+        // so no service outlives its provider (issue #302).
+        for token in self.service_tokens.drain(..) {
+            self.services.revoke(&token);
+        }
         let fiber = self.fiber.unload();
         let lease = if let Some(activation) = self.activation.take() {
             let mut host = BshLeaseHost { agent, registry };
@@ -711,6 +731,9 @@ impl AppliedExtension {
         agent: &mut ::agent::Agent,
         registry: &mut ::agent::plugins::PluginRegistry,
     ) -> Result<DisposalReport, UnloadError> {
+        for token in self.service_tokens.drain(..) {
+            self.services.revoke(&token);
+        }
         let fiber = self.fiber.dispose_async().await;
         let lease = if let Some(activation) = self.activation.take() {
             let mut host = BshLeaseHost { agent, registry };
@@ -2423,6 +2446,7 @@ impl ExtensionHost {
                 session_id: session_id.to_owned(),
                 service_provides: entry.package.manifest.services.provides.clone(),
                 service_requires: entry.package.manifest.services.requires.clone(),
+                service_tokens: Vec::new(),
             });
         }
         applied
@@ -5658,5 +5682,47 @@ tools = ["echo"]
             1,
             "the kept runtime is not stopped"
         );
+    }
+
+    /// A shared-scope service published into the host registry is resolvable
+    /// by another consumer and revoked when its provider unloads (issue #302).
+    /// This is the lifecycle-owner contract provide_service now uses for
+    /// Host/Workspace/Session scopes: the registry owns the registration, the
+    /// provider holds a revocation token.
+    #[test]
+    fn a_shared_scope_service_is_resolvable_and_revocable() {
+        use ferris_sdk::composable::{Scope, ServiceRegistry};
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct Hello;
+        impl Hello {
+            fn greet(&self) -> String {
+                "hello".to_string()
+            }
+        }
+
+        let registry = ServiceRegistry::new();
+        let version = semver::Version::new(1, 0, 0);
+        // Provider publishes at Host scope into the shared registry.
+        let token = registry.provide_contract(
+            Scope::Host,
+            "greeter",
+            "test.greeter",
+            version.clone(),
+            Arc::new(Hello),
+        );
+        // A different consumer resolves it from the same shared registry.
+        let requirement = semver::VersionReq::parse("^1").unwrap();
+        let lease = registry
+            .acquire_contract::<Hello>(&Scope::Host, "greeter", "test.greeter", &requirement)
+            .expect("a consumer resolves the shared service");
+        assert_eq!(lease.greet(), "hello");
+        drop(lease);
+        // The provider unloads: revoking its token removes the service.
+        assert!(registry.revoke(&token));
+        assert!(registry
+            .acquire_contract::<Hello>(&Scope::Host, "greeter", "test.greeter", &requirement)
+            .is_none());
     }
 }

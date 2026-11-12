@@ -1208,6 +1208,7 @@ pub(crate) fn install_with_lease(
             name: contributed.extension.as_str().to_string(),
             tools: installed_tools,
             enabled: true,
+            error: None,
         },
         lease,
     )

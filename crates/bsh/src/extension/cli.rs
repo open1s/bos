@@ -214,9 +214,8 @@ fn command_usage(command: &str) -> String {
 fn config(root: Option<PathBuf>) -> HostConfig {
     let root = root
         .or_else(|| {
-            std::env::var("BSH_EXTENSION_ROOT")
-                .ok()
-                .map(|raw| PathBuf::from(shellexpand::tilde(&raw).into_owned()))
+            std::env::var_os("BSH_EXTENSION_ROOT")
+                .map(|raw| crate::settings::resolve_root_override(Some(raw), ".bos/bsh/extensions"))
         })
         .unwrap_or_else(|| crate::settings::dir().join("extensions"));
     HostConfig {

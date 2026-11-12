@@ -277,16 +277,13 @@ impl TaskQueue {
         Ok(queue)
     }
 
-    /// Write the queue whole.
+    /// Write the queue whole, atomically and owner-only on every host
+    /// (issue #299): the queue carries peer task payloads, so it gets the
+    /// same private policy as the other federation stores.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, bytes)?;
-        std::fs::rename(temporary, path)
+        hostkit::fspriv::write_private(path, &bytes)
     }
 }
 

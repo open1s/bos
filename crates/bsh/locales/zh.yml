@@ -1091,6 +1091,8 @@
 "right.terminal.policyError": "策略错误"
 "right.terminal.unsandboxed": "未沙箱化：沙箱无法承载此面板的终端，此 Shell 仅由输入策略把关"
 "right.terminal.ptyNotHostable": "Ghostty 创建面板的 PTY，沙箱无法加入"
+"right.terminal.unconfinedRelease": "此回合处于受限模式，但终端后端无法承载沙箱化的 shell。shell 将以你的完整用户权限运行。请显式解除限制后再启动，或使用完全访问回合。"
+"right.terminal.releaseButton": "解除限制并启动 shell"
 "right.terminal.sandboxOff": "未沙箱化：某个预设关闭了沙箱，此 Shell 不受文件系统限制，并会忽略 egress 白名单；工具边界策略仍然生效"
 "right.terminal.sandboxOffSettings": "未沙箱化：设置中的沙箱开关已关闭，此 Shell 不受文件系统限制，并会忽略 egress 白名单；工具边界策略仍然生效"
 "right.terminal.sandboxTier": "沙箱: {tier}"

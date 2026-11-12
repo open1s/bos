@@ -378,6 +378,11 @@ pub type HostCallHandler =
 /// A live bridge subprocess plus its registrations and host-call handler.
 pub struct BridgeSession {
     child: Child,
+    /// The process-tree ownership boundary: a process group on Unix, a
+    /// kill-on-close Job Object on Windows. A Cordis entry can spawn its own
+    /// descendants through node:child_process, so killing only Node is not
+    /// cleanup (issue #320).
+    owner: hostkit::proc::TreeOwner,
     stdin: ChildStdin,
     stdout: Option<BufReader<ChildStdout>>,
     next_id: u64,
@@ -414,23 +419,56 @@ impl BridgeSession {
             reason: error.to_string(),
         })?;
 
-        let mut child = Command::new(&options.interpreter)
+        let mut command = Command::new(&options.interpreter);
+        command
             .arg("--no-warnings")
             .arg(&shim_path)
             .current_dir(&options.root)
             .env("NODE_ENV", "production")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| BridgeRefusal::Spawn {
-                program: options.interpreter.display().to_string(),
-                reason: error.to_string(),
-            })?;
+            .stderr(Stdio::piped());
+        // The ownership boundary exists before extension code can run: a
+        // fresh process group on Unix, a suspended-create/assign/resume Job
+        // Object on Windows (issue #320).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        #[cfg(windows)]
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+        let mut child = command.spawn().map_err(|error| BridgeRefusal::Spawn {
+            program: options.interpreter.display().to_string(),
+            reason: error.to_string(),
+        })?;
+        let owner = {
+            let pid = child.id();
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                match hostkit::proc::adopt_suspended(pid, child.as_raw_handle(), None) {
+                    Ok(owner) => owner,
+                    Err(err) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(BridgeRefusal::Spawn {
+                            program: options.interpreter.display().to_string(),
+                            reason: format!("process-tree ownership failed: {err}"),
+                        });
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                hostkit::proc::TreeOwner::from_pid(pid)
+            }
+        };
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = Some(BufReader::new(child.stdout.take().expect("piped stdout")));
         let mut session = BridgeSession {
             child,
+            owner,
             stdin,
             stdout,
             next_id: 1,
@@ -478,8 +516,8 @@ impl BridgeSession {
             "id": id,
             "method": "load",
             "params": {
-                "entry": entry.to_string_lossy(),
-                "root": self.options.root.to_string_lossy(),
+                "entry": plain_path(entry),
+                "root": plain_path(&self.options.root),
                 "config": self.options.config,
             }
         });
@@ -650,8 +688,11 @@ impl BridgeSession {
         self.kill();
     }
 
-    /// Kill the child and reap it, so no process outlives the session.
+    /// Terminate the whole process tree and reap the root, so no descendant
+    /// outlives the session. Idempotent: timeout, explicit shutdown and Drop
+    /// all route here (issue #320).
     pub fn kill(&mut self) {
+        let _ = self.owner.kill(std::time::Duration::from_millis(300));
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -791,6 +832,27 @@ pub fn bounded(text: &str, max: usize) -> String {
     format!("{}…", &text[..end])
 }
 /// Check that the entry stays inside the package root and exists.
+/// A path string Node can resolve: Windows canonicalization returns the
+/// verbatim device form (\\?\D:\...), which Node's URL conversion mangles
+/// into a drive-scheme URL (issue #304). Strip the verbatim prefix back to the
+/// ordinary drive/UNC form; containment is already proven by resolve_entry
+/// and re-checked by the shim through realpathSync.
+fn plain_path(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = text.strip_prefix(r"\?UNC") {
+            return format!(r"\{}", rest);
+        }
+        if let Some(rest) = text.strip_prefix(r"\?") {
+            return rest.to_string();
+        }
+    }
+    text
+}
+
+/// Resolve the package entry inside the canonical root, refusing traversal
+/// and symlink escapes before the bridge loads it.
 pub fn resolve_entry(root: &Path, entry: &Path) -> Result<PathBuf, BridgeRefusal> {
     // BOTH sides are canonicalised before the comparison. On macOS `/var` is a
     // symlink to `/private/var`, so a canonical entry under a non-canonical root

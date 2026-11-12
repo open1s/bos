@@ -565,19 +565,12 @@ impl DelegationStore {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    /// Write the store atomically, private to the account.
+    /// Write the store atomically, private to the account on every host
+    /// (issue #299): Unix mode 0600, Windows a protected owner-only DACL.
+    /// Delegation records carry authorization material, so a failure to
+    /// establish the private policy fails the save.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, self.to_json()?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&temp, path)
+        hostkit::fspriv::write_private(path, self.to_json()?.as_bytes())
     }
 }
 

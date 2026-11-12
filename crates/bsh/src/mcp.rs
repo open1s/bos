@@ -25,8 +25,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent::mcp::adapter::{McpCallRecord, McpGovernance};
+use agent::mcp::policy::{McpDecision, McpPolicy};
 use agent::mcp::{McpClient, McpToolAdapter};
-use agent::policy::{Action, PolicyInput, Target};
+use agent::policy::{Action, EgressGate, PolicyInput, Target};
 use react::tool::registry::AsyncTool;
 use react::tool::ToolError;
 use serde_json::{json, Value};
@@ -366,12 +368,21 @@ fn package_servers(root: &std::path::Path, plugin_id: &str) -> Vec<ExtensionMcp>
                 if let Some(declared) = manifest.get("mcpServers") {
                     match declared {
                         serde_json::Value::String(relative) => {
-                            let path = root.join(relative);
-                            match read_json_file(&path) {
-                                Ok(value) => configs.push((path, value)),
-                                Err(error) => log::warn!(
-                                    "extension '{plugin_id}' MCP config {}: {error}",
-                                    path.display()
+                            // The manifest path is untrusted package-relative
+                            // input: validate it and prove containment BEFORE
+                            // any read, so an untrusted package cannot make the
+                            // disclosure path parse an arbitrary local file
+                            // (issue #321).
+                            match hostkit::paths::resolve_within(root, relative) {
+                                Ok(path) => match read_json_file(&path) {
+                                    Ok(value) => configs.push((path, value)),
+                                    Err(error) => log::warn!(
+                                        "extension '{plugin_id}' MCP config {}: {error}",
+                                        path.display()
+                                    ),
+                                },
+                                Err(reason) => log::warn!(
+                                    "extension '{plugin_id}' MCP config path {relative:?} refused: {reason}"
                                 ),
                             }
                         }
@@ -548,6 +559,53 @@ fn schema_or_empty(schema: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Open one connection and list its tools, on the runner's runtime.
+/// Build the invocation governance from the turn's egress gate (issue #330).
+///
+/// The policy default is Ask: a call no rule explicitly allows must be
+/// approved, and the approval flow asks the SAME turn policy the spawn gate
+/// asks, so a Read Only turn (which refuses MCP egress) cannot reach a remote
+/// tool, and an explicit deny rule in the workspace policy is honored. Every
+/// decision is recorded in the audit log.
+fn governance_from_slot(slot: &agent::mcp::http_transport::EgressSlot) -> Arc<McpGovernance> {
+    // The approval flow reads the LIVE turn gate at call time, so a gate
+    // installed after the server connected still governs its calls. With no
+    // gate (outside a turn, or a trusted configured server in a test) the call
+    // is allowed; a confined turn's policy still refuses what it denies.
+    let approve_slot = slot.clone();
+    let approve = Arc::new(move |server: &str, tool: &str| {
+        let gate = approve_slot.lock().ok().and_then(|slot| slot.clone());
+        let Some(gate) = gate else {
+            return true;
+        };
+        let subject = format!("{server}_{tool}");
+        let decision = gate.policy().check(
+            &PolicyInput::new(
+                &subject,
+                Action::Capability,
+                Target::path(std::env::current_dir().unwrap_or_default()),
+            )
+            .with_session(gate.session())
+            .with_preset(gate.preset()),
+        );
+        decision.is_allowed()
+    });
+    let audit = Arc::new(|record: &McpCallRecord| {
+        log::info!(
+            target: "bsh::mcp",
+            "governance {} {}/{} approved={}",
+            record.decision,
+            record.server,
+            record.tool,
+            record.approved
+        );
+    });
+    Arc::new(McpGovernance {
+        policy: McpPolicy::with_default(McpDecision::Ask),
+        approve: Some(approve),
+        audit: Some(audit),
+    })
+}
+
 fn connect(
     rt: &tokio::runtime::Runtime,
     launch: &Launch,
@@ -560,6 +618,10 @@ fn connect(
     // contribute a server; this check lets a workspace policy deny the spawn
     // itself (and records it in the audit).
     let gate = egress.lock().ok().and_then(|slot| slot.clone());
+    // Per-server/per-tool governance, enforced before every invocation
+    // (issue #330). The adapter is the one enforcement point, so the gateway
+    // path is covered by the same decision.
+    let governance = governance_from_gate(gate.as_ref());
     if let (Some(gate), McpTransport::Stdio { .. }) = (&gate, &launch.transport) {
         let cwd = launch
             .cwd
@@ -609,13 +671,17 @@ fn connect(
                 .filter(|tool| !tool.name.trim().is_empty())
                 .map(|tool| {
                     let name = tool.name.trim().to_string();
-                    let adapter: Arc<dyn AsyncTool> = Arc::new(McpToolAdapter::new(
-                        client.clone(),
-                        format!("{namespace}_{name}"),
-                        name.clone(),
-                        tool.description.clone(),
-                        schema_or_empty(&tool.input_schema),
-                    ));
+                    let adapter: Arc<dyn AsyncTool> = Arc::new(
+                        McpToolAdapter::new(
+                            client.clone(),
+                            format!("{namespace}_{name}"),
+                            name.clone(),
+                            tool.description.clone(),
+                            schema_or_empty(&tool.input_schema),
+                        )
+                        .with_server(namespace.clone())
+                        .with_governance(governance.clone()),
+                    );
                     McpTool {
                         namespace: namespace.clone(),
                         name,

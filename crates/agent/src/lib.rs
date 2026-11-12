@@ -18,6 +18,7 @@ pub mod prelude;
 pub mod sandbox;
 pub mod security;
 pub mod session;
+pub mod shell_backend;
 mod shell_env;
 pub mod skills;
 pub mod tools;

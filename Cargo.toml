@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/config",
+    "crates/hostkit",
     "crates/bus",
     "crates/capability",
     "crates/federation",

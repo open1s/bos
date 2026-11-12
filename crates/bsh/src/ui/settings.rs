@@ -7774,7 +7774,11 @@ impl Shell {
         {
             let enabled = plugin.enabled;
             let name = plugin.name.clone();
-            let tools = if enabled {
+            // A failed installation shows its error, never a healthy roster
+            // (issue #328).
+            let tools = if let Some(error) = &plugin.error {
+                format!("installation failed: {error}")
+            } else if enabled {
                 plugin.tools.join(", ")
             } else {
                 tr(self.state.lang, "settings.pluginDisabled")

@@ -425,10 +425,14 @@ impl ServiceRegistry {
         self.acquire_with_contract::<T>(scope, realm, name, "", &semver::VersionReq::STAR)
     }
 
-    /// Acquire a provider of one named manifest contract and compatible version.
+    /// Acquire a provider of one named manifest contract and compatible version
+    /// in the default realm.
     ///
     /// A provider of the same name but a different contract is not a candidate,
     /// and an incompatible version is refused even when the Rust type matches.
+    /// This is the default-realm lookup; a caller that resolves inside an
+    /// isolation realm must use [`Self::acquire_contract_in_realm`] so the
+    /// realm is part of the lookup key (issue #301).
     pub fn acquire_contract<T>(
         &self,
         scope: &Scope,
@@ -440,6 +444,28 @@ impl ServiceRegistry {
         T: Any + Send + Sync,
     {
         self.acquire_with_contract::<T>(scope, None, name, contract, requirement)
+    }
+
+    /// Acquire a contract provider in one named isolation realm (issue #301).
+    ///
+    /// The realm is part of the service key, so this resolves ONLY a provider
+    /// published in exactly that realm: a same-name, same-contract provider in
+    /// the default realm (or in another realm) is never a silent fallback.
+    /// Contract id and version are matched exactly as in
+    /// [`Self::acquire_contract`]; an incompatible version is refused even
+    /// when the Rust type matches.
+    pub fn acquire_contract_in_realm<T>(
+        &self,
+        scope: &Scope,
+        realm: Option<&str>,
+        name: &str,
+        contract: &str,
+        requirement: &semver::VersionReq,
+    ) -> Option<ServiceLease<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        self.acquire_with_contract::<T>(scope, realm, name, contract, requirement)
     }
 
     fn acquire_with_contract<T>(
@@ -1318,6 +1344,91 @@ mod tests {
                 .is_none(),
             "a matching type does not prove a matching version"
         );
+    }
+
+    /// Issue #301: same-name/same-contract providers in two realms resolve
+    /// per realm, the default realm stays reachable, and no realm falls back
+    /// to another.
+    #[test]
+    fn contract_acquisition_is_realm_aware() {
+        struct Search(&'static str);
+        let registry = ServiceRegistry::new();
+        let scope = Scope::Host;
+        let version = semver::Version::new(1, 2, 0);
+        let requirement = semver::VersionReq::parse("^1").expect("requirement");
+        registry.provide_with_contract(
+            scope.clone(),
+            Some("a"),
+            "search",
+            "search-api",
+            version.clone(),
+            Arc::new(Search("a")),
+        );
+        registry.provide_with_contract(
+            scope.clone(),
+            Some("b"),
+            "search",
+            "search-api",
+            version.clone(),
+            Arc::new(Search("b")),
+        );
+        registry.provide_contract(
+            scope.clone(),
+            "search",
+            "search-api",
+            version,
+            Arc::new(Search("default")),
+        );
+
+        assert_eq!(
+            registry
+                .acquire_contract_in_realm::<Search>(
+                    &scope,
+                    Some("a"),
+                    "search",
+                    "search-api",
+                    &requirement
+                )
+                .expect("realm a")
+                .0,
+            "a"
+        );
+        assert_eq!(
+            registry
+                .acquire_contract_in_realm::<Search>(
+                    &scope,
+                    Some("b"),
+                    "search",
+                    "search-api",
+                    &requirement
+                )
+                .expect("realm b")
+                .0,
+            "b"
+        );
+        // The legacy default-realm lookup keeps working unchanged.
+        assert_eq!(
+            registry
+                .acquire_contract::<Search>(&scope, "search", "search-api", &requirement)
+                .expect("default realm")
+                .0,
+            "default"
+        );
+        // An unknown realm has no provider and must not fall back.
+        assert!(registry
+            .acquire_contract_in_realm::<Search>(
+                &scope,
+                Some("c"),
+                "search",
+                "search-api",
+                &requirement
+            )
+            .is_none());
+        // An incompatible version is refused inside a realm too.
+        let two = semver::VersionReq::parse("^2").expect("two");
+        assert!(registry
+            .acquire_contract_in_realm::<Search>(&scope, Some("a"), "search", "search-api", &two)
+            .is_none());
     }
 
     #[test]

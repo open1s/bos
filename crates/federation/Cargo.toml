@@ -9,6 +9,7 @@ description = "BSH federation: node identity, signed JSON envelope, and the tran
 repository = "https://github.com/open1s/bos"
 
 [dependencies]
+hostkit = { path = "../hostkit" }
 capability = { path = "../capability" }
 bus = { path = "../bus" }
 serde.workspace = true

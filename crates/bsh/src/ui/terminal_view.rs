@@ -58,6 +58,9 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<T>,
     ) -> Result<Entity<Self>, String> {
+        // Detect an unsupported platform BEFORE creating the surface, so the
+        // pane shows an actionable platform message (issues #296, #297).
+        crate::terminal::surface_support()?;
         let theme = terminal_theme();
         options.configuration = TerminalConfiguration::Custom(theme);
         options.font_size = Some(font_size);

@@ -81,6 +81,14 @@ jobs:
           xvfb-run -a cargo test --workspace --exclude jsbos --exclude nbos
           -- --skip browser::engine::tests
 
+      # The shared OS-service crate carries the Windows process/path/env/ACL
+      # code paths. Compile-verify them on every lane so a Windows-only
+      # regression cannot land silently (issues #312, #313). No link is needed.
+      - name: Cross-check hostkit for Windows
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo check -p hostkit --target x86_64-pc-windows-msvc
+
       - name: Verify all BSH extension examples
         run: |
           cargo build -p bsh --bin bsh

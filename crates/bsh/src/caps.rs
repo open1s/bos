@@ -1554,6 +1554,7 @@ fn build_agent_for_session_inner(
                 name: settings_id.clone(),
                 tools: extensions.tool_names_of(package_id),
                 enabled: true,
+                error: None,
             });
         }
         if let Err(error) = extensions.install_host_items(&mut registry) {
@@ -1634,9 +1635,16 @@ fn build_agent_for_session_inner(
     // shell's, so a call and the reader's pane show the same document; a pricing
     // build passes its own.
     //
-    // The browser asks NO egress policy (owner decision): it is direct. The
-    // policy, session and preset it once carried for its gate belong to the
-    // shell tool and the MCP transport, which still ask them.
+    // The browser asks the SAME turn egress policy the shell and the MCP
+    // transport ask (issue #329): a refused host is unreachable through the
+    // pane too, and Read Only refuses local browser egress.
+    browser.set_egress_gate(Arc::new(EgressGate::new(
+        policy.clone(),
+        Arc::new(SystemResolver),
+        session,
+        preset.clone(),
+        "browser",
+    )));
     crate::browser::attach(&mut agent, crate::browser::Tools { browser });
 
     // The local web-search tool. It asks the SAME policy the browser and the

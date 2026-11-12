@@ -432,13 +432,14 @@ enum PolicyRead {
     Broken(String),
 }
 
-/// Append one keystroke decision to /tmp/bsh-term.log.
+/// Append one keystroke decision to a native per-session trace file.
 ///
 /// Temporary diagnostics: a live "Enter does nothing" report cannot be
 /// reproduced in the harness, so the pane records what it actually saw. It is
-/// opt-in with 'BSH_TERM_TRACE=1': the pane calls this on every keystroke, and
-/// an unconditional open and append put a synchronous disk write on the input
-/// path.
+/// opt-in with 'BSH_TERM_TRACE=1'. The file lives in the platform temp
+/// directory under a per-process name (issue #324), so concurrent BSH
+/// instances never interleave traces and Windows does not fail on a Unix
+/// absolute path. A creation/write failure is reported once, not silently.
 pub(crate) fn trace_key(key: &str, bytes: Option<&[u8]>) {
     use std::io::Write as _;
     if !trace_enabled() {
@@ -448,12 +449,32 @@ pub(crate) fn trace_key(key: &str, bytes: Option<&[u8]>) {
         Some(bytes) => format!("key={key} bytes={bytes:?}\n"),
         None => format!("key={key} unmapped\n"),
     };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    let path = trace_path();
+    match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/bsh-term.log")
+        .open(&path)
     {
-        let _ = file.write_all(line.as_bytes());
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(line.as_bytes()) {
+                warn_trace_once(&format!("could not write {}: {error}", path.display()));
+            }
+        }
+        Err(error) => warn_trace_once(&format!("could not open {}: {error}", path.display())),
+    }
+}
+
+/// The per-process trace file in the platform temp directory.
+fn trace_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("bsh-term-{}.log", std::process::id()))
+}
+
+/// Report a trace failure once, so a broken diagnostics path is visible
+/// without flooding the log on every keystroke.
+fn warn_trace_once(message: &str) {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if WARNED.set(()).is_ok() {
+        log::warn!("terminal keystroke trace disabled: {message}");
     }
 }
 
@@ -731,6 +752,11 @@ pub(crate) struct Terminal {
     pub(crate) failure: Option<String>,
     /// The gate refused the start, so no process was ever created.
     pub(crate) refused: bool,
+    /// The reader explicitly released confinement for this pane (issue #323).
+    /// A confined turn whose terminal backend cannot host a sandboxed shell
+    /// refuses to spawn until this is set, so an unconfined shell never starts
+    /// silently under a confined permission tier.
+    pub(crate) unconfined_release: bool,
     /// The workspace policy's path and stamp, so a reload costs one stat.
     policy_path: PathBuf,
     policy_stamp: Option<(SystemTime, u64)>,
@@ -802,6 +828,18 @@ impl Terminal {
         self.sandbox_env
     }
 
+    /// Whether this pane must wait for an explicit confinement release before
+    /// it spawns (issue #323): the turn is confined, the backend cannot host a
+    /// sandboxed PTY, and the reader has not released it.
+    pub(crate) fn needs_unconfined_release(&self) -> bool {
+        self.sandbox_env == Some("unsupported-pty") && !self.unconfined_release
+    }
+
+    /// The reader's explicit release of confinement for this pane.
+    pub(crate) fn release_unconfined(&mut self) {
+        self.unconfined_release = true;
+    }
+
     /// Build the model, record the sandbox answer, and ask the start gate.
     fn build(
         cwd: PathBuf,
@@ -842,6 +880,7 @@ impl Terminal {
             sandbox_off,
             failure: policy_error.clone(),
             refused: policy_error.is_some(),
+            unconfined_release: false,
             policy_path: path,
             policy_stamp: stamp,
             policy_error,
@@ -1174,6 +1213,48 @@ fn shell_word(word: &str) -> String {
 
 /// The shell the terminal runs: the reader's own when it is usable, then the
 /// shells a macOS install carries, then /bin/sh as the last resort.
+/// Whether this host can create the pane's native terminal surface, with an
+/// actionable sentence when it cannot (issues #296, #297).
+///
+/// The libghostty backend is macOS (Metal) or Linux/Wayland (EGL subsurface).
+/// Windows has no native backend yet, and an X11 session has no Wayland display
+/// handle; both are detected BEFORE surface creation so the pane shows a clear
+/// platform message instead of a raw stub error.
+pub(crate) fn surface_support() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return Ok(());
+        }
+        if std::env::var_os("DISPLAY").is_some() {
+            return Err(String::from(
+                "The integrated terminal needs a Wayland session; this is an X11 session. \
+                 Run BSH under Wayland, or use the shell tool for commands.",
+            ));
+        }
+        Err(String::from(
+            "The integrated terminal needs a Wayland display; none is available in this session.",
+        ))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Err(String::from(
+            "The integrated terminal's native backend is not yet available on Windows. \
+             Use the shell tool for commands; the terminal pane requires macOS or Linux/Wayland.",
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err(String::from(
+            "The integrated terminal is not supported on this platform.",
+        ))
+    }
+}
+
 pub(crate) fn shell_program() -> PathBuf {
     let reader = std::env::var_os("SHELL")
         .or_else(|| std::env::var_os("COMSPEC"))
@@ -1569,5 +1650,47 @@ decision := {{"allow": false, "reason": "{reason}"}} if {{ input.action == "inpu
         let text = std::fs::read_to_string(root.join(".bsh/terminal-policy.rego"))
             .expect("the starter policy");
         assert_eq!(text, WORKSPACE_POLICY_TEMPLATE);
+    }
+
+    /// A confined turn whose backend cannot host a sandboxed PTY waits for an
+    /// explicit release before it spawns (issue #323).
+    #[test]
+    fn a_confined_terminal_needs_an_explicit_release() {
+        let root = scratch("confined-release");
+        let spec = agent::sandbox::SandboxSpec::workspace_write(&root);
+        let mut terminal = Terminal::new_with_sandbox(root, Lang::En, Some(&spec));
+        // The backend cannot join Ghostty's PTY, so the confined shell is
+        // unsupported-pty and must not start silently.
+        assert_eq!(terminal.sandbox_label(), Some("unsupported-pty"));
+        assert!(terminal.needs_unconfined_release());
+        terminal.release_unconfined();
+        assert!(!terminal.needs_unconfined_release());
+    }
+
+    /// An unconfined (full-access) terminal needs no release.
+    #[test]
+    fn an_unconfined_terminal_needs_no_release() {
+        let root = scratch("unconfined-no-release");
+        let terminal = Terminal::new(root, Lang::En);
+        assert!(!terminal.needs_unconfined_release());
+    }
+
+    /// The surface support answer matches the host: macOS always, Windows
+    /// never (yet), Linux only under Wayland (issues #296, #297).
+    #[test]
+    fn surface_support_matches_the_host() {
+        let answer = surface_support();
+        #[cfg(target_os = "macos")]
+        assert!(answer.is_ok());
+        #[cfg(target_os = "windows")]
+        assert!(answer.is_err());
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                assert!(answer.is_ok());
+            } else {
+                assert!(answer.is_err());
+            }
+        }
     }
 }

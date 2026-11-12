@@ -33,13 +33,15 @@
 //! element on this page and another on the next, which is exactly the silent
 //! wrong action a model must never get.
 //!
-//! # Direct, not gated
+//! # Gated by the turn egress policy
 //!
-//! A navigation is DIRECT, by the owner's decision: neither producer - the
-//! rendered engine or the text view - asks an egress policy, before or after
-//! the socket. The paths the workspace allowlist governs are the shell tool and
-//! the MCP transport. Every tool result states this reach as a fact
-//! (`"network": "direct"`), so a reader or a model never has to infer it.
+//! Every navigation - rendered engine or text view - asks the turn's egress
+//! policy BEFORE a request (issue #329), the same gate the shell tool and the
+//! MCP transport ask. A refused host names the rule and opens no socket, so a
+//! confined tier (Read Only refuses local egress) cannot be bypassed through
+//! the browser. Every tool result states its reach as a fact
+//! (`"network": "policy-gated"` when a turn gate is installed, `"direct"`
+//! otherwise), so a reader or a model never has to infer it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -131,9 +133,8 @@ impl Failure {
 
     /// The failure for a transport error, in the transport's own words.
     pub(crate) fn from_fetch(error: FetchError, url: &str) -> Self {
-        // The browser is DIRECT, so there is no policy refusal to explain:
-        // every arm is the transport's own sentence. `Refused` cannot be
-        // reached by this pane any more; the arm stays exhaustive for the type.
+        // A policy refusal carries the rule that refused; the other arms are
+        // the transport's own sentence.
         let (kind, message, rule) = match &error {
             FetchError::Scheme(_) => ("scheme", error.to_string(), None),
             FetchError::Refused(denial) => {
@@ -952,6 +953,11 @@ pub(crate) struct BrowserHandle {
     /// through it instead of starting Chromium, so one page serves the reader
     /// and the agent at the same time.
     script: Mutex<Option<Arc<dyn script::ScriptRunner>>>,
+    /// The turn's egress gate (issue #329). Every navigation asks it before a
+    /// request, so a host the workspace policy refuses is unreachable through
+    /// the browser too, and Read Only refuses local browser egress. A turn
+    /// installs its gate here; None (a pricing build, a test) is direct.
+    egress: agent::mcp::http_transport::EgressSlot,
 }
 
 impl std::fmt::Debug for BrowserHandle {
@@ -982,6 +988,14 @@ impl BrowserHandle {
             launch_flight: Mutex::new(()),
             engine_state_dir: None,
             script: Mutex::new(None),
+            egress: std::sync::Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Install the turn's egress gate, live for every later navigation.
+    pub(crate) fn set_egress_gate(&self, gate: Arc<agent::policy::EgressGate>) {
+        if let Ok(mut slot) = self.egress.lock() {
+            *slot = Some(gate);
         }
     }
 
@@ -1176,9 +1190,9 @@ impl BrowserHandle {
 /// Fetch a URL and settle the result into the browser.
 ///
 /// One place performs a navigation, so the pane's own Go control and every tool
-/// take the same path. The browser is DIRECT (owner decision): no egress policy
-/// is asked, before or after the socket, and the shell tool and the MCP
-/// transport remain the paths the workspace allowlist governs.
+/// take the same path. Every navigation asks the turn egress policy before a
+/// request (issue #329), the same gate the shell tool and the MCP transport
+/// ask.
 #[cfg(test)]
 pub(crate) fn navigate(handle: &BrowserHandle, url: &str) -> Result<(), Failure> {
     navigate_in(handle, url)
@@ -1229,6 +1243,36 @@ pub(crate) fn load(
                 url: String::new(),
             })
         };
+    }
+    // The turn's egress policy decides reachability BEFORE any request
+    // (issue #329): a refused host names the rule and opens no socket, in the
+    // rendered engine and the text view alike. The same gate the shell and the
+    // MCP transport ask, so the permission tier cannot be bypassed here.
+    if let Ok((host, port)) = agent::policy::http_host(url) {
+        let gate = handle.egress.lock().ok().and_then(|slot| slot.clone());
+        if let Some(gate) = gate {
+            if let Err(denial) = gate.authorize(&host, port) {
+                let failure = Failure {
+                    kind: "policy",
+                    message: gate.policy().refusal(&denial.decision),
+                    rule: denial.decision.rule.clone(),
+                    url: url.to_string(),
+                };
+                let applied = handle.mutate(|browser| browser.fail(seq, failure.clone()));
+                return if applied {
+                    Err(failure)
+                } else {
+                    Err(Failure {
+                        kind: "body",
+                        message: String::from(
+                            "A newer navigation replaced this one before it finished.",
+                        ),
+                        rule: None,
+                        url: String::new(),
+                    })
+                };
+            }
+        }
     }
     // The pane's own view is the page: navigate IT, so the reader and the
     // agent look at the same page and no second browser is started.
@@ -1362,11 +1406,11 @@ fn settle_fetch(
     }
 }
 
-/// Fetch one URL directly, with no egress policy.
+/// Fetch one URL for the text view.
 ///
-/// The text view is what the pane shows when the rendered engine cannot start,
-/// and it is DIRECT like the engine: the browser asks no policy, which is the
-/// owner's decision. The shell tool and the MCP transport remain the paths the
+/// The text view is what the pane shows when the rendered engine cannot start.
+/// The navigation that reaches it has already asked the turn egress policy in
+/// [`load`]; this fetch is the transport. The shell tool and the MCP transport remain the paths the
 /// workspace allowlist governs.
 ///
 /// Blocking, because its caller is: the navigation runs on a worker. The one
@@ -1530,14 +1574,19 @@ impl Tools {
     ///
     /// The audit reads these from the RESULT, so a browser call states its own
     /// reach instead of inheriting the shell tool's. There is no process
-    /// sandbox behind this pane - the request is the app's own client - and the
-    /// network fact says "direct" because no policy is consulted.
+    /// sandbox behind this pane - the request is the app's own client - but the
+    /// turn egress policy gates every navigation (issue #329).
     fn facts(&self) -> serde_json::Value {
+        let gated = self
+            .browser
+            .egress
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .is_some();
         serde_json::json!({
             "sandbox": "none",
-            // The browser asks no egress policy: state that, rather than a
-            // policy shape it does not consult.
-            "network": "direct",
+            "network": if gated { "policy-gated" } else { "direct" },
         })
     }
 
@@ -2266,9 +2315,9 @@ fn focused_payload(focused: &str) -> serde_json::Value {
 /// Register the browser's tools on an agent.
 ///
 /// Every navigation they perform goes through navigate, so the pane and the
-/// model cannot drift: one path produces both documents. The browser is direct
-/// (see the module note), so a host the turn's policy refuses is still reachable
-/// here by the owner's decision.
+/// model cannot drift: one path produces both documents. Every navigation asks
+/// the turn egress policy first (see the module note), so a host the policy
+/// refuses is unreachable here too.
 pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
     // The browser is a FAMILY of nine tools and only some turns drive a page.
     // They stay registered and callable; `find_tool` selects one, which keeps
@@ -4197,5 +4246,48 @@ mod tests {
             Some(1),
             "the page's own click handler ran through the tool path"
         );
+    }
+
+    /// A confined turn's egress policy gates browser navigation: a refused
+    /// host produces a policy failure and opens no socket (issue #329).
+    #[test]
+    fn a_confined_turn_refuses_browser_egress() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let policy = Arc::new(agent::policy::PolicySet::compile(
+            [
+                agent::policy::baseline_source(),
+                agent::policy::session_permission_source("read-only"),
+            ],
+            agent::policy::PolicyData::new(dir.path()).with_permission("read-only"),
+        ));
+        assert!(policy.error().is_none(), "{:?}", policy.error());
+        let handle = BrowserHandle::new();
+        handle.set_egress_gate(Arc::new(agent::policy::EgressGate::new(
+            policy,
+            Arc::new(agent::policy::SystemResolver),
+            "probe",
+            "read-only",
+            "browser",
+        )));
+        // .invalid never resolves (RFC 6761), so the gate refuses without any
+        // network: the refusal is the policy's, not a transport accident.
+        let failure = navigate(&handle, "https://blocked.invalid/")
+            .expect_err("a confined turn must refuse the navigation");
+        assert_eq!(failure.kind, "policy", "{failure:?}");
+        // The result facts state the gated reach.
+        let tools = Tools {
+            browser: Arc::new(handle),
+        };
+        let facts = tools.facts();
+        assert_eq!(facts["network"], "policy-gated");
+    }
+
+    /// Without a turn gate the browser is direct, and the facts say so.
+    #[test]
+    fn an_ungated_browser_reports_direct() {
+        let tools = Tools {
+            browser: Arc::new(BrowserHandle::new()),
+        };
+        assert_eq!(tools.facts()["network"], "direct");
     }
 }

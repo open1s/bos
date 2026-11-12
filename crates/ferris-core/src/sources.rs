@@ -193,6 +193,11 @@ fn split_hash(raw: &str) -> (&str, Option<&str>) {
 }
 
 /// Clone a Git repository into the cache and return its package root.
+///
+/// An optional `subpath` selects a package inside the checkout. It is
+/// untrusted (a registry index supplies it), so it is validated as a strictly
+/// relative Git package path and proven to stay inside the canonical checkout
+/// before the manifest is checked or read; see [`git_package_root`].
 pub fn fetch_git(
     repository: &str,
     revision: Option<&str>,
@@ -238,16 +243,7 @@ pub fn fetch_git(
             });
         }
     }
-    let root = match subpath {
-        Some(subpath) => destination.join(subpath),
-        None => destination,
-    };
-    if !root.join(MANIFEST_FILE).is_file() {
-        return Err(ExtensionError::Corrupt {
-            path: root,
-            message: "the Git checkout has no extension.toml".to_string(),
-        });
-    }
+    let root = git_package_root(&destination, subpath)?;
     Ok(Fetched {
         root,
         origin: ExtensionSource::Git {
@@ -255,6 +251,66 @@ pub fn fetch_git(
             revision: revision.unwrap_or("HEAD").to_string(),
         },
     })
+}
+
+/// Select the package root inside a Git checkout (issue #322).
+///
+/// The subpath comes from an untrusted registry index or a direct caller, so:
+///
+/// 1. [`hostkit::paths::validate_relative`] rejects every rooted or
+///    traversing form (absolute Unix paths, Windows drive and drive-relative
+///    paths, UNC/device namespaces, alternate data streams, `..`, reserved
+///    names) BEFORE any join. Git's forward-slash convention is preserved;
+///    validated components are joined one by one, never the raw string.
+/// 2. [`hostkit::paths::is_contained`] canonicalizes the checkout and the
+///    selected root and proves containment, so a symlinked intermediate
+///    directory cannot walk out of the checkout.
+/// 3. The manifest itself must also stay inside the checkout: a symlinked
+///    `extension.toml` pointing outside is refused before it is read.
+///
+/// Every caller of [`fetch_git`] (registry index and direct) goes through
+/// this check.
+fn git_package_root(destination: &Path, subpath: Option<&str>) -> Result<PathBuf, ExtensionError> {
+    let root = match subpath {
+        Some(subpath) => {
+            let components = hostkit::paths::validate_relative(subpath).map_err(|error| {
+                ExtensionError::Corrupt {
+                    path: destination.to_path_buf(),
+                    message: format!(
+                        "the Git package path {subpath:?} is not a safe relative path: {error}"
+                    ),
+                }
+            })?;
+            let mut root = destination.to_path_buf();
+            for component in &components {
+                root.push(component);
+            }
+            if !hostkit::paths::is_contained(destination, &root) {
+                return Err(ExtensionError::Corrupt {
+                    path: root,
+                    message: format!(
+                        "the Git package path {subpath:?} does not resolve inside the checkout"
+                    ),
+                });
+            }
+            root
+        }
+        None => destination.to_path_buf(),
+    };
+    let manifest = root.join(MANIFEST_FILE);
+    if !manifest.is_file() {
+        return Err(ExtensionError::Corrupt {
+            path: root,
+            message: "the Git checkout has no extension.toml".to_string(),
+        });
+    }
+    if !hostkit::paths::is_contained(destination, &manifest) {
+        return Err(ExtensionError::Corrupt {
+            path: manifest,
+            message: "the Git package manifest escapes the checkout".to_string(),
+        });
+    }
+    Ok(root)
 }
 
 /// Download an archive into the cache.
@@ -575,6 +631,151 @@ tools = ["echo"]
         let empty = root.join("empty");
         std::fs::create_dir_all(&empty).expect("empty");
         assert!(package_root_in(&empty).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A checkout with a legitimate nested package, for issue #322 tests.
+    fn git_checkout(label: &str) -> PathBuf {
+        let root = scratch(label);
+        let checkout = root.join("checkout");
+        package(&checkout.join("packages").join("hello"));
+        checkout
+    }
+
+    #[test]
+    fn git_subpath_escape_forms_are_refused_before_the_manifest_check() {
+        let checkout = git_checkout("git-escape");
+        for subpath in [
+            "/etc/passwd",
+            r"C:\Windows\system32",
+            "C:relative",
+            "C:",
+            r"\\server\share",
+            "//server/share",
+            r"\\.\PhysicalDrive0",
+            r"\\?\C:\",
+            "..",
+            "../outside",
+            "packages/../../outside",
+            r"packages\..\..\outside",
+            "packages/hello/extension.toml:stream",
+            "CON",
+        ] {
+            let error = git_package_root(&checkout, Some(subpath))
+                .expect_err(&format!("{subpath:?} must be refused"));
+            assert!(
+                matches!(error, ExtensionError::Corrupt { .. }),
+                "{subpath:?} must be refused as corrupt, got {error:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(checkout.parent().expect("root"));
+    }
+
+    #[test]
+    fn a_valid_nested_git_package_path_still_resolves() {
+        let checkout = git_checkout("git-nested");
+        for subpath in ["packages/hello", "./packages/hello", "packages\\hello"] {
+            let root = git_package_root(&checkout, Some(subpath)).expect("nested package");
+            assert_eq!(root, checkout.join("packages").join("hello"));
+            assert!(root.join(MANIFEST_FILE).is_file());
+        }
+        // No subpath selects the checkout root itself when it has a manifest.
+        package(&checkout);
+        let root = git_package_root(&checkout, None).expect("checkout root");
+        assert_eq!(root, checkout);
+        let _ = std::fs::remove_dir_all(checkout.parent().expect("root"));
+    }
+
+    #[test]
+    fn a_git_subpath_without_a_manifest_is_refused() {
+        let checkout = git_checkout("git-manifestless");
+        std::fs::create_dir_all(checkout.join("empty")).expect("empty dir");
+        assert!(git_package_root(&checkout, Some("empty")).is_err());
+        assert!(git_package_root(&checkout, Some("missing")).is_err());
+        let _ = std::fs::remove_dir_all(checkout.parent().expect("root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_git_subpath_cannot_escape_the_checkout() {
+        let root = scratch("git-symlink");
+        let checkout = root.join("checkout");
+        let outside = root.join("outside");
+        package(&outside.join("pkg"));
+        std::fs::create_dir_all(&checkout).expect("checkout");
+        // A symlinked intermediate directory that walks out of the checkout.
+        std::os::unix::fs::symlink(&outside, checkout.join("escape")).expect("symlink");
+        assert!(git_package_root(&checkout, Some("escape/pkg")).is_err());
+        assert!(git_package_root(&checkout, Some("escape")).is_err());
+        // A symlinked manifest pointing outside the checkout is refused too,
+        // even when the package directory itself is legitimate.
+        let inside = checkout.join("packages").join("hello");
+        std::fs::create_dir_all(&inside).expect("inside");
+        std::os::unix::fs::symlink(
+            outside.join("pkg").join(MANIFEST_FILE),
+            inside.join(MANIFEST_FILE),
+        )
+        .expect("manifest symlink");
+        assert!(git_package_root(&checkout, Some("packages/hello")).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn git_command(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// End-to-end through fetch_git: a local repository with a nested package
+    /// installs, and a traversing subpath is refused for the direct caller
+    /// exactly as it is for a registry index (both go through fetch_git).
+    #[test]
+    fn fetch_git_confines_the_package_to_the_checkout() {
+        let root = scratch("git-fetch");
+        let repo = root.join("repo");
+        package(&repo.join("packages").join("hello"));
+        git_command(&repo, &["init", "--quiet"]);
+        git_command(&repo, &["add", "."]);
+        git_command(
+            &repo,
+            &[
+                "-c",
+                "user.name=ferris-test",
+                "-c",
+                "user.email=ferris-test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "init",
+            ],
+        );
+        // An attractive target outside the checkout.
+        package(&root.join("outside"));
+
+        let cache = root.join("cache");
+        let repository = repo.to_str().expect("repo path");
+        let fetched = fetch_git(repository, None, Some("packages/hello"), &cache)
+            .expect("the nested package fetches");
+        assert!(fetched.root.ends_with("packages/hello"));
+        assert!(fetched.root.join(MANIFEST_FILE).is_file());
+        let checkout = fetched
+            .root
+            .parent()
+            .and_then(Path::parent)
+            .expect("the checkout directory");
+        assert!(hostkit::paths::is_contained(checkout, &fetched.root));
+
+        for subpath in ["../outside", "/etc", "C:relative", r"\\server\share"] {
+            assert!(
+                fetch_git(repository, None, Some(subpath), &cache).is_err(),
+                "{subpath:?} must be refused end-to-end"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }

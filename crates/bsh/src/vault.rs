@@ -66,7 +66,7 @@
 //! module, ever contains a value or a passphrase.
 
 use std::collections::BTreeMap;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -813,59 +813,14 @@ fn write_document(
     write_atomic(path, &sealed)
 }
 
-/// Restrict a newly created file to its owner, on platforms with modes.
-#[cfg(unix)]
-fn private_open_options(options: &mut std::fs::OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
-}
-
-/// No-op on a platform without unix modes.
-#[cfg(not(unix))]
-fn private_open_options(_options: &mut std::fs::OpenOptions) {}
-
-/// Reassert owner-only permissions after the file exists.
-#[cfg(unix)]
-fn private_permissions(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-}
-
-/// No-op on a platform without unix modes.
-#[cfg(not(unix))]
-fn private_permissions(_file: &std::fs::File) -> std::io::Result<()> {
-    Ok(())
-}
-
-/// Write bytes to 'path' through a 0600 temporary file and a rename.
+/// Write bytes to 'path' owner-only and atomically, on every host.
+///
+/// The shared private-file policy (issue #299): Unix mode 0600, Windows a
+/// protected owner-only DACL, applied at creation AND after the rename so a
+/// pre-existing world-readable file cannot survive the replacement. Fails
+/// closed if the policy cannot be established.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
-    let directory = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(directory).map_err(VaultError::Io)?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    let temporary = directory.join(format!(".vault-{}-{stamp}.tmp", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    private_open_options(&mut options);
-    let outcome = (|| -> Result<(), VaultError> {
-        let mut file = options.open(&temporary).map_err(VaultError::Io)?;
-        // The umask can only remove bits, but being explicit keeps the mode
-        // 0600 whatever the file was created with.
-        private_permissions(&file).map_err(VaultError::Io)?;
-        file.write_all(bytes).map_err(VaultError::Io)?;
-        file.sync_all().map_err(VaultError::Io)?;
-        drop(file);
-        std::fs::rename(&temporary, path).map_err(VaultError::Io)
-    })();
-    if outcome.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    outcome
+    hostkit::fspriv::write_private(path, bytes).map_err(VaultError::Io)
 }
 
 #[cfg(test)]

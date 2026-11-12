@@ -12,8 +12,13 @@
 //! with the key upper-cased and non-alphanumeric characters replaced by `_`.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use super::{HookContext, HookEvent};
+
+/// The default bound on one hook command. A hook that hangs must not block
+/// event dispatch indefinitely (issue #319).
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Selects the events an [`ExternalHook`] reacts to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,15 +88,35 @@ pub struct HookOutcome {
 }
 
 /// Runs external hook commands for matching events.
-#[derive(Debug, Default, Clone)]
+///
+/// Every command runs through the shared cross-platform process runtime with
+/// a bounded execution time: a hung hook is terminated together with its
+/// whole process tree, and the remaining hooks still run (issue #319).
+#[derive(Debug, Clone)]
 pub struct HookDispatcher {
     hooks: Vec<ExternalHook>,
+    timeout: Duration,
+}
+
+impl Default for HookDispatcher {
+    fn default() -> Self {
+        Self {
+            hooks: Vec::new(),
+            timeout: DEFAULT_HOOK_TIMEOUT,
+        }
+    }
 }
 
 impl HookDispatcher {
     /// Create an empty dispatcher.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the per-command execution bound.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Add a hook and return the dispatcher for chaining.
@@ -118,7 +143,7 @@ impl HookDispatcher {
     pub fn dispatch(&self, event: &HookEvent, context: &HookContext) -> Vec<HookOutcome> {
         self.matching(event)
             .into_iter()
-            .map(|hook| Self::run_with_context(&hook.argv, context))
+            .map(|hook| Self::run_bounded(&hook.argv, context, self.timeout))
             .collect()
     }
 
@@ -132,15 +157,26 @@ impl HookDispatcher {
         Self::run_with_context(argv, &HookContext::new(""))
     }
 
-    /// Spawn `argv` with `context` exported to the environment and wait for it.
+    /// Spawn argv with context exported to the environment and wait for it,
+    /// bounded by [DEFAULT_HOOK_TIMEOUT].
     pub fn run_with_context(argv: &[String], context: &HookContext) -> HookOutcome {
+        Self::run_bounded(argv, context, DEFAULT_HOOK_TIMEOUT)
+    }
+
+    /// Spawn argv through the shared process runtime and wait, bounded.
+    ///
+    /// argv semantics are preserved: the program is spawned directly, never
+    /// wrapped in a shell. The child owns its process tree, so a timeout
+    /// terminates every descendant, not just the direct child (issue #319).
+    fn run_bounded(argv: &[String], context: &HookContext, timeout: Duration) -> HookOutcome {
+        let failure = |error: String| HookOutcome {
+            argv: argv.to_vec(),
+            exit_code: None,
+            succeeded: false,
+            error: Some(error),
+        };
         let Some((program, args)) = argv.split_first() else {
-            return HookOutcome {
-                argv: argv.to_vec(),
-                exit_code: None,
-                succeeded: false,
-                error: Some("empty argv: no program to run".to_string()),
-            };
+            return failure("empty argv: no program to run".to_string());
         };
 
         let mut command = Command::new(program);
@@ -150,19 +186,37 @@ impl HookDispatcher {
             command.env(format!("BOS_HOOK_{}", env_key(key)), value);
         }
 
-        match command.status() {
-            Ok(status) => HookOutcome {
-                argv: argv.to_vec(),
-                exit_code: status.code(),
-                succeeded: status.success(),
-                error: None,
-            },
-            Err(err) => HookOutcome {
-                argv: argv.to_vec(),
-                exit_code: None,
-                succeeded: false,
-                error: Some(err.to_string()),
-            },
+        let mut child = match hostkit::proc::OwnedChild::spawn(&mut command) {
+            Ok(child) => child,
+            Err(err) => return failure(err.to_string()),
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return HookOutcome {
+                        argv: argv.to_vec(),
+                        exit_code: status.code(),
+                        succeeded: status.success(),
+                        error: None,
+                    };
+                }
+                Ok(None) => {}
+                Err(err) => return failure(err.to_string()),
+            }
+            if Instant::now() >= deadline {
+                let report = child.terminate(Duration::from_millis(500));
+                return failure(format!(
+                    "hook timed out after {}s; process tree termination {}",
+                    timeout.as_secs(),
+                    if report.confirmed() {
+                        "confirmed"
+                    } else {
+                        "could not be confirmed"
+                    }
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -325,5 +379,96 @@ mod tests {
         assert_eq!(outcome.exit_code, Some(7), "{outcome:?}");
         assert!(!outcome.succeeded);
         assert!(outcome.error.is_none());
+    }
+
+    /// A cross-platform echo argv: the tests must not assume /bin/echo.
+    fn echo_argv() -> Vec<String> {
+        if cfg!(windows) {
+            vec![
+                "cmd".to_string(),
+                "/C".to_string(),
+                "echo".to_string(),
+                "hello".to_string(),
+            ]
+        } else {
+            vec!["/bin/echo".to_string(), "hello".to_string()]
+        }
+    }
+
+    #[test]
+    fn echo_runs_on_every_platform() {
+        let outcome = HookDispatcher::run(&echo_argv());
+        assert!(outcome.succeeded, "{outcome:?}");
+        assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    #[test]
+    fn a_hung_hook_times_out_instead_of_blocking() {
+        let argv: Vec<String> = if cfg!(windows) {
+            vec![
+                "cmd".to_string(),
+                "/C".to_string(),
+                "ping -n 30 127.0.0.1 >NUL".to_string(),
+            ]
+        } else {
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ]
+        };
+        let dispatcher = HookDispatcher::new().with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let outcomes = dispatcher.dispatch_event(&HookEvent::OnMessage);
+        // The dispatcher has no hooks registered; run the bounded path direct.
+        let outcome =
+            HookDispatcher::run_bounded(&argv, &HookContext::new(""), Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a hung hook must not block"
+        );
+        assert!(!outcome.succeeded);
+        assert!(outcome.error.unwrap().contains("timed out"));
+        assert!(outcomes.is_empty());
+    }
+
+    /// A timed-out hook's descendants die with it: the boundary, not the
+    /// direct child, is what the runtime terminates.
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_the_hook_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let script = format!("sleep 30 & echo $! > {}; sleep 30", pidfile.display());
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+        let outcome =
+            HookDispatcher::run_bounded(&argv, &HookContext::new(""), Duration::from_millis(400));
+        assert!(outcome.error.unwrap().contains("timed out"));
+        // Give the kill a moment to land, then prove the descendant is gone.
+        std::thread::sleep(Duration::from_millis(300));
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the hook wrote its child pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            !crate::jobs::pid_exists(pid),
+            "the descendant must be terminated"
+        );
+    }
+
+    /// A program path containing spaces runs without shell reinterpretation.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_path_with_spaces_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = dir.path().join("a dir with spaces");
+        std::fs::create_dir_all(&spaced).unwrap();
+        let script = spaced.join("hook.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 5\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let outcome = HookDispatcher::run(&[script.to_string_lossy().into_owned()]);
+        assert_eq!(outcome.exit_code, Some(5), "{outcome:?}");
     }
 }

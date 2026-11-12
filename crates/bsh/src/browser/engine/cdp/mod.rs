@@ -237,6 +237,9 @@ pub(crate) enum EngineError {
     Closed(String),
     /// It did not answer in time.
     Timeout(String),
+    /// Chromium's own sandbox cannot initialize and no outer isolation
+    /// boundary applies, so an unsandboxed launch was refused (issue #325).
+    Sandbox(String),
 }
 
 impl EngineError {
@@ -252,6 +255,7 @@ impl EngineError {
             EngineError::Transport(_) => "transport",
             EngineError::Closed(_) => "closed",
             EngineError::Timeout(_) => "timeout",
+            EngineError::Sandbox(_) => "sandbox",
         }
     }
 
@@ -291,6 +295,7 @@ impl EngineError {
             }
             EngineError::Closed(message) => format!("The rendered view stopped: {message}"),
             EngineError::Timeout(message) => format!("The rendered view timed out: {message}"),
+            EngineError::Sandbox(message) => message.clone(),
         }
     }
 

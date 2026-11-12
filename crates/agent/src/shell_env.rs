@@ -29,6 +29,10 @@ pub(crate) fn login_environment() -> &'static HashMap<String, String> {
 }
 
 /// Merge the login shell's environment over the process's own.
+///
+/// On Windows variable names are case-insensitive: a snapshot PATH replaces
+/// an inherited Path instead of creating a duplicate the child would resolve
+/// ambiguously (issue #317).
 pub(crate) fn inherit(base: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
     let mut envs: HashMap<String, String> = base.into_iter().collect();
     for (key, value) in login_environment() {
@@ -37,6 +41,9 @@ pub(crate) fn inherit(base: impl IntoIterator<Item = (String, String)>) -> Vec<(
             .any(|skip| skip.eq_ignore_ascii_case(key))
         {
             continue;
+        }
+        if cfg!(windows) {
+            envs.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
         }
         envs.insert(key.clone(), value.clone());
     }
@@ -80,7 +87,25 @@ fn capture() -> HashMap<String, String> {
     }
     #[cfg(not(unix))]
     {
-        HashMap::new()
+        // Windows has no login shell to ask. The deterministic equivalent is
+        // the native user environment: the process environment overlaid with
+        // the persisted HKCU\Environment values, so profile-installed
+        // toolchains are visible to a desktop-launched BSH (issue #317).
+        // hostkit reads the registry through native APIs, bounded, and falls
+        // back to the process environment on failure — never an empty map
+        // that would silently strip PATH.
+        hostkit::env::user_environment()
+            .iter()
+            .map(|(key, value)| {
+                // Upper-case the names so the Unix-shaped consumers of this
+                // map (PATH lookups, the sandbox grant walk) find the Windows
+                // variables, whose native casing is Path/SystemRoot/etc.
+                (
+                    key.to_string_lossy().to_ascii_uppercase(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
     }
 }
 

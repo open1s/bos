@@ -226,6 +226,61 @@ fn integrity_denial(extension: &str, declared: &str, actual: &str) -> ExtensionE
     }
 }
 
+/// A deterministic, filesystem-safe cache name for a repository URL.
+///
+/// Normalizes away the scheme, query, fragment, trailing slashes and a `.git`
+/// suffix, keeps the last two identity segments (owner/repository) sanitized
+/// to `[A-Za-z0-9._-]`, and appends a short digest of the full normalized
+/// identity so two repositories that sanitize alike never share a checkout.
+/// No component can be `.`, `..`, empty, or carry a separator or a
+/// Windows-reserved character, so the joined path stays under the market root
+/// on every host (issue #305).
+fn cache_identity(url: &str) -> String {
+    use sha2::Digest as _;
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    let trimmed = without_query.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    // The path portion: after scheme://authority, or after the ':' of an
+    // scp-style git@host:owner/repo. A bare path is used as written.
+    let path = if let Some(rest) = trimmed.split_once("://") {
+        rest.1.split_once('/').map(|(_, p)| p).unwrap_or("")
+    } else if let Some((_, rest)) = trimmed.split_once(':') {
+        rest
+    } else {
+        trimmed
+    };
+    let segments: Vec<String> = path
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .map(|seg| {
+            seg.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+                .trim_matches('.')
+                .to_string()
+        })
+        .filter(|seg| !seg.is_empty())
+        .collect();
+    let tail: Vec<String> = segments.iter().rev().take(2).rev().cloned().collect();
+    let digest = sha2::Sha256::digest(trimmed.as_bytes());
+    let suffix: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    let base = if tail.is_empty() {
+        "market".to_string()
+    } else {
+        tail.join("-")
+    };
+    // A Windows reserved stem (CON, NUL, ...) would be unsafe as a directory
+    // name; the digest suffix already prevents a bare reserved name, but keep
+    // the base from being exactly one by construction.
+    format!("{base}-{suffix}")
+}
+
 /// A shallow checkout of one provider.
 #[derive(Debug, Clone)]
 pub(crate) struct GitMarket {
@@ -235,14 +290,14 @@ pub(crate) struct GitMarket {
 }
 
 impl GitMarket {
-    /// The checkout under `root/market/<repository name>`.
+    /// The checkout under `root/market/<repository identity>`.
+    ///
+    /// The directory name is derived from the validated repository identity,
+    /// never from a raw URL substring (issue #305): query/fragment text, dot
+    /// segments, separators and platform-reserved characters cannot become a
+    /// path component, and equivalent URLs normalize to the same name.
     pub(crate) fn open(root: &Path, url: &str) -> Self {
-        let name = url
-            .trim_end_matches(".git")
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or("market");
+        let name = cache_identity(url);
         Self {
             cache: root.join("market").join(name),
             url: url.to_string(),
@@ -288,14 +343,8 @@ impl GitMarket {
                 source,
             })?;
             let status = Command::new("git")
-                .args([
-                    "clone",
-                    "--depth",
-                    "1",
-                    "--single-branch",
-                    &self.url,
-                    &self.cache.to_string_lossy(),
-                ])
+                .args(["clone", "--depth", "1", "--single-branch", &self.url])
+                .arg(&self.cache)
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .status()
                 .map_err(|source| ExtensionError::Io {

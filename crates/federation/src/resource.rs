@@ -211,22 +211,15 @@ impl LeaseStore {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    /// Write the store atomically, private to the account.
+    /// Write the store atomically, private to the account on every host
+    /// (issue #299): Unix mode 0600, Windows a protected owner-only DACL.
+    /// Leases are authorization material, so a failure to establish the
+    /// private policy fails the save.
     pub fn save(&self) -> std::io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, self.to_json()?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&temp, path)
+        hostkit::fspriv::write_private(path, self.to_json()?.as_bytes())
     }
 
     fn persist(&self) -> Result<(), ResourceError> {
@@ -377,23 +370,18 @@ impl TransferStore {
         }
     }
 
-    /// Write the checkpoints atomically.
+    /// Write the checkpoints atomically, owner-only on every host
+    /// (issue #299). Checkpoints name the leases they run under, so they get
+    /// the same private policy as the lease store itself.
     pub fn save(&self, path: &std::path::Path) -> Result<(), ResourceError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| ResourceError::Checkpoint {
-                message: format!("{}: {error}", parent.display()),
-            })?;
-        }
         let text =
             serde_json::to_string_pretty(self).map_err(|error| ResourceError::Checkpoint {
                 message: error.to_string(),
             })?;
-        let temporary = path.with_extension("json.part");
-        std::fs::write(&temporary, text).map_err(|error| ResourceError::Checkpoint {
-            message: format!("{}: {error}", temporary.display()),
-        })?;
-        std::fs::rename(&temporary, path).map_err(|error| ResourceError::Checkpoint {
-            message: format!("{}: {error}", path.display()),
+        hostkit::fspriv::write_private(path, text.as_bytes()).map_err(|error| {
+            ResourceError::Checkpoint {
+                message: format!("{}: {error}", path.display()),
+            }
         })
     }
 

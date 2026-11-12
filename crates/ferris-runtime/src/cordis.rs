@@ -235,6 +235,22 @@ impl CordisRuntime {
             std::fs::write(directory.join("SKILL.md"), document)
                 .map_err(|error| self.error(format!("skill {}: {error}", registration.name)))?;
         }
+        // A hook registration must name a stage this host actually dispatches;
+        // refuse it at load rather than exposing a listener nothing will call
+        // (issue #300).
+        for registration in &manifest.registrations {
+            if registration.kind != BridgeKind::Hook {
+                continue;
+            }
+            for stage in &registration.stages {
+                if !cordis_stage_is_dispatchable(stage) {
+                    return Err(self.error(format!(
+                        "hook {} claims stage {stage}, which this host does not dispatch",
+                        registration.name
+                    )));
+                }
+            }
+        }
         *self.registrations.lock().expect("cordis registration lock") = manifest.registrations;
         *self.tools.lock().expect("cordis tools lock") = tools;
         *session = Some(started);
@@ -319,6 +335,69 @@ impl Runtime for CordisRuntime {
         self.invoke_async(registration, arguments, context.timeout_ms)
             .await
     }
+
+    /// Deliver one observe hook batch to the Cordis listeners that mapped onto
+    /// this BSH hook point (issue #300).
+    ///
+    /// The canonical mapping is cordis_hook_stage: a BSH point with no Cordis
+    /// event has no listeners and is a no-op, never a false success. Matching
+    /// registrations are invoked in registration order, each bounded by the
+    /// invoke timeout; a listener error propagates to the hook worker, which
+    /// logs it rather than failing the turn.
+    async fn hook(&self, point: &str, payload: Value) -> Result<(), ExtensionError> {
+        let Some(stage) = cordis_hook_stage(point) else {
+            return Ok(());
+        };
+        self.ensure()?;
+        let listeners: Vec<String> = self
+            .registrations
+            .lock()
+            .ok()
+            .map(|registrations| {
+                registrations
+                    .iter()
+                    .filter(|registration| {
+                        registration.kind == BridgeKind::Hook
+                            && registration.stages.iter().any(|s| s == stage)
+                    })
+                    .map(|registration| registration.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let timeout = self.options.invoke_timeout.as_millis() as u64;
+        for registration in listeners {
+            self.invoke_async(registration, payload.clone(), timeout)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// The canonical mapping from a BSH hook point to the Cordis stage the shim
+/// registers (issue #300).
+///
+/// Only points with a real Cordis event map; the rest return None so a hook
+/// the bridge cannot dispatch is never reported as active. The shim's
+/// HOOK_EVENTS table is the other half of this contract.
+pub fn cordis_hook_stage(point: &str) -> Option<&'static str> {
+    match point {
+        "model.request" => Some("llm_request"),
+        "model.response" => Some("llm_response"),
+        "tool.before" => Some("tool_call"),
+        "tool.after" => Some("tool_result"),
+        _ => None,
+    }
+}
+
+/// Whether a Cordis stage names a BSH hook point this host dispatches.
+///
+/// Used at load to refuse a hook registration that claims a stage nothing will
+/// ever call, rather than exposing a successful registration.
+pub fn cordis_stage_is_dispatchable(stage: &str) -> bool {
+    matches!(
+        stage,
+        "llm_request" | "llm_response" | "stream_token" | "tool_call" | "tool_result"
+    )
 }
 
 #[cfg(test)]
@@ -347,11 +426,9 @@ mod tests {
         }
     }
 
-    // The bridge cannot launch a Cordis entry on Windows yet: the shim
-    // resolves the drive-letter entry as the URL scheme "D:" and fails with
-    // "EISDIR: illegal operation on a directory, lstat 'D:'". Tracked by the
-    // Windows extension job; Linux and macOS keep this coverage.
-    #[cfg_attr(windows, ignore = "cordis bridge cannot resolve a drive-letter entry")]
+    // Runs on every host: the load frame carries an ordinary drive path (the
+    // verbatim \? prefix is stripped), which Node resolves and imports
+    // through pathToFileURL (issue #304).
     #[tokio::test]
     async fn a_real_cordis_entry_registers_and_calls_a_tool() {
         if find_interpreter().is_none() {
@@ -394,5 +471,34 @@ mod tests {
         assert_eq!(output["terminal"], "bridge-ok");
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// The canonical BSH-point to Cordis-stage mapping (issue #300).
+    #[test]
+    fn the_hook_mapping_covers_the_dispatchable_points() {
+        assert_eq!(cordis_hook_stage("model.request"), Some("llm_request"));
+        assert_eq!(cordis_hook_stage("model.response"), Some("llm_response"));
+        assert_eq!(cordis_hook_stage("tool.before"), Some("tool_call"));
+        assert_eq!(cordis_hook_stage("tool.after"), Some("tool_result"));
+        // Points with no Cordis event map to nothing.
+        assert_eq!(cordis_hook_stage("turn.start"), None);
+        assert_eq!(cordis_hook_stage("http.exchange"), None);
+        assert_eq!(cordis_hook_stage("skill.load"), None);
+    }
+
+    /// Every mapped stage is dispatchable, and an unknown stage is not.
+    #[test]
+    fn only_real_stages_are_dispatchable() {
+        for point in [
+            "model.request",
+            "model.response",
+            "tool.before",
+            "tool.after",
+        ] {
+            let stage = cordis_hook_stage(point).unwrap();
+            assert!(cordis_stage_is_dispatchable(stage));
+        }
+        assert!(cordis_stage_is_dispatchable("stream_token"));
+        assert!(!cordis_stage_is_dispatchable("made_up_event"));
     }
 }

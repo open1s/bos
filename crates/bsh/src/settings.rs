@@ -334,18 +334,74 @@ pub(crate) fn dir() -> PathBuf {
 ///
 /// `BSH_HOME` points one process at its own data directory: settings, sessions,
 /// identity, peers, logs, and browser state all follow it, so several instances
-/// can run on one host without sharing a lock. A relative path is taken as
-/// written; an empty value is ignored rather than turning into the cwd.
+/// can run on one host without sharing a lock. Resolution is OS-native and
+/// deterministic (issue #306): the default comes from the platform home
+/// directory, an absolute override wins, a `~` prefix expands once, and a
+/// relative override is anchored to the home directory — never to the launch
+/// working directory, which differs between a shell, a shortcut and a service.
 fn dir_under(override_root: Option<std::ffi::OsString>) -> PathBuf {
-    if let Some(root) = override_root {
-        if !root.is_empty() {
-            // A quoted `BSH_HOME=~/a` reaches the process with the tilde still
-            // in it; expand it here so both spellings mean the same directory.
-            let root = root.to_string_lossy();
-            return PathBuf::from(shellexpand::tilde(&root).into_owned());
+    resolve_root_override(override_root, ".bos/bsh")
+}
+
+/// Resolve a data-root override against a home-relative default.
+///
+/// Shared by the settings home and the extension root so the GUI, the CLI and
+/// the host agree on one precedence (issues #306, #307). Native OsString values
+/// are preserved; only the documented tilde compatibility goes through text.
+pub(crate) fn resolve_root_override(
+    override_root: Option<std::ffi::OsString>,
+    default_relative: &str,
+) -> PathBuf {
+    match hostkit::home::resolve_root(override_root.as_deref(), default_relative) {
+        Ok(path) => path,
+        Err(hostkit::home::RootError::Relative) => {
+            let raw = override_root.unwrap_or_default();
+            let home = hostkit::home::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            log::warn!(
+                "relative root override {:?} anchored to the home directory, not the launch working directory",
+                raw
+            );
+            home.join(raw)
+        }
+        Err(hostkit::home::RootError::NoHome) => {
+            log::warn!(
+                "the platform home directory is unknown; using the root override as written"
+            );
+            override_root
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(default_relative))
         }
     }
-    PathBuf::from(shellexpand::tilde("~/.bos/bsh").into_owned())
+}
+
+/// Write a document atomically: a sibling temp file, fsynced, renamed over
+/// the target. A crash mid-write leaves the previous document intact; the
+/// leftover temp file is harmless and named for the process that wrote it.
+fn atomic_write(path: &Path, text: &str) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| std::io::Error::other("settings path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "settings".to_string()),
+        std::process::id()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        use std::io::Write as _;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// The settings file path.
@@ -500,24 +556,46 @@ impl Settings {
         let global_path = self.writable_global_path()?;
         let root = self.active_workspace_root();
         let workspace = self.workspace.clone();
+        // Stage BOTH documents before committing either (issue #310): a
+        // validation or serialization failure on the workspace must not leave
+        // the global already changed.
         self.global.validate().map_err(as_io)?;
-        self.global.save(&global_path).map_err(as_io)?;
-        if root.is_empty() {
+        let global_text = self.global.to_toml().map_err(as_io)?;
+        let workspace_path = if root.is_empty() {
             // Nothing to place is nothing to report. Something to place with no
             // root is a loss the reader has to see: the dialog would otherwise
             // say "saved" about a document that never landed anywhere, and the
             // only copy of that workspace's configuration would be the window
             // that just closed.
             if workspace == WorkspaceSettings::default() {
-                return Ok(());
+                None
+            } else {
+                return Err(std::io::Error::other(
+                    "the active workspace has no root, so its settings were not written",
+                ));
             }
-            return Err(std::io::Error::other(
-                "the active workspace has no root, so its settings were not written",
-            ));
+        } else {
+            // Stage the workspace serialization too, so a failure here leaves
+            // the global untouched.
+            workspace.to_toml().map_err(as_io)?;
+            Some(WorkspaceSettings::path(std::path::Path::new(&root)))
+        };
+        // Commit with rollback: remember the previous global bytes, write the
+        // global atomically, then the workspace; if the workspace write fails,
+        // restore the global so Apply never leaves a mixed old/new state.
+        let previous_global = std::fs::read(&global_path).ok();
+        atomic_write(&global_path, &global_text)
+            .map_err(|e| std::io::Error::other(format!("global settings commit failed: {e}")))?;
+        if let Some(path) = workspace_path {
+            if let Err(error) = workspace.save(&path) {
+                if let Some(previous) = previous_global {
+                    let _ = atomic_write(&global_path, &String::from_utf8_lossy(&previous));
+                }
+                return Err(std::io::Error::other(format!(
+                    "workspace settings commit failed (global rolled back): {error}"
+                )));
+            }
         }
-        workspace
-            .save(&WorkspaceSettings::path(std::path::Path::new(&root)))
-            .map_err(as_io)?;
         Ok(())
     }
 
@@ -2429,5 +2507,71 @@ policy_mode = "advisory"
             );
             let _ = std::fs::remove_dir_all(&home);
         }
+    }
+
+    /// A failed workspace commit rolls the global back: Apply never leaves a
+    /// mixed old/new configuration (issue #310).
+    #[test]
+    fn a_failed_workspace_commit_rolls_back_the_global() {
+        let base = std::env::temp_dir().join(format!("bsh-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let ws_root = base.join("ws");
+        std::fs::create_dir_all(&ws_root).expect("ws root");
+        // The workspace settings path is a DIRECTORY, so its atomic rename
+        // fails at the commit stage.
+        let ws_settings = crate::settings::WorkspaceSettings::path(&ws_root);
+        std::fs::create_dir_all(&ws_settings).expect("blocking dir");
+
+        let mut settings = Settings {
+            save_root: Some(base.clone()),
+            ..Settings::default()
+        };
+        let id = settings.note_workspace("probe", &ws_root.to_string_lossy());
+        settings.global.general.active_workspace = id;
+        settings.workspace.agent.system_prompt = "workspace prompt".to_string();
+
+        // The previous valid global document, serialized so it loads cleanly.
+        let global_path = base.join("settings.toml");
+        settings.global.general.theme_mode = "light".to_string();
+        std::fs::write(&global_path, settings.global.to_toml().unwrap()).unwrap();
+        settings.global.general.theme_mode = "dark".to_string();
+
+        let error = settings.save().expect_err("the workspace commit must fail");
+        assert!(
+            error.to_string().contains("rolled back"),
+            "the error must name the rollback: {error}"
+        );
+        let global = std::fs::read_to_string(&global_path).unwrap();
+        assert!(
+            global.contains("light"),
+            "the global must keep its previous valid content: {global}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A successful Apply writes both documents.
+    #[test]
+    fn a_successful_apply_writes_both_documents() {
+        let base = std::env::temp_dir().join(format!("bsh-atomic-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let ws_root = base.join("ws");
+        std::fs::create_dir_all(&ws_root).expect("ws root");
+        let mut settings = Settings {
+            save_root: Some(base.clone()),
+            ..Settings::default()
+        };
+        let id = settings.note_workspace("probe", &ws_root.to_string_lossy());
+        settings.global.general.active_workspace = id;
+        settings.global.general.theme_mode = "dark".to_string();
+        settings.workspace.agent.system_prompt = "workspace prompt".to_string();
+        settings.save().expect("both documents commit");
+        let global = std::fs::read_to_string(base.join("settings.toml")).unwrap();
+        assert!(global.contains("dark"));
+        let ws =
+            std::fs::read_to_string(crate::settings::WorkspaceSettings::path(&ws_root)).unwrap();
+        assert!(ws.contains("workspace prompt"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

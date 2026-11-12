@@ -173,14 +173,29 @@ const TOOLCHAIN_PATHS: &[ToolchainPath] = &[
     ToolchainPath::absolute("/usr/local", true),
     ToolchainPath::absolute("/usr/share", false),
     ToolchainPath::absolute("/Library/Developer/CommandLineTools", true),
+    // Windows user toolchains live under the profile and the local app-data
+    // directory, resolved from the native environment rather than a hardcoded
+    // drive (issue #309). The same candidates resolve through the platform
+    // data directory on Unix, where they simply do not exist and are skipped.
+    ToolchainPath::local_app_data("pnpm", true),
+    ToolchainPath::local_app_data("Volta", true),
+    ToolchainPath::local_app_data("Programs/Git", true),
+    ToolchainPath::program_files("Git", true),
+    ToolchainPath::program_files("nodejs", true),
+    ToolchainPath::program_files("PowerShell", true),
 ];
 
-/// One toolchain candidate, absolute or relative to the home directory.
+/// One toolchain candidate, absolute or relative to a user directory.
 enum ToolchainPath {
     /// A path under the user's home.
     Home(&'static str, bool),
     /// An absolute path.
     Absolute(&'static str, bool),
+    /// A path under the user's local application-data directory (Windows
+    /// %LOCALAPPDATA%, the platform data-local dir elsewhere).
+    LocalAppData(&'static str, bool),
+    /// A path under the machine program-files directory (Windows only).
+    ProgramFiles(&'static str, bool),
 }
 
 impl ToolchainPath {
@@ -195,11 +210,31 @@ impl ToolchainPath {
         Self::Absolute(path, executable)
     }
 
-    /// The concrete path, or none when the home directory is unknown.
+    /// A candidate under the user's local app-data directory.
+    const fn local_app_data(path: &'static str, executable: bool) -> Self {
+        Self::LocalAppData(path, executable)
+    }
+
+    /// A candidate under the machine program-files directory.
+    const fn program_files(path: &'static str, executable: bool) -> Self {
+        Self::ProgramFiles(path, executable)
+    }
+
+    /// The concrete path, or none when the base directory is unknown.
     fn resolve(&self) -> Option<(PathBuf, bool)> {
         match self {
             Self::Home(path, executable) => Some((dirs::home_dir()?.join(path), *executable)),
             Self::Absolute(path, executable) => Some((PathBuf::from(path), *executable)),
+            Self::LocalAppData(path, executable) => {
+                let base = std::env::var_os("LOCALAPPDATA")
+                    .map(PathBuf::from)
+                    .or_else(dirs::data_local_dir)?;
+                Some((base.join(path), *executable))
+            }
+            Self::ProgramFiles(path, executable) => {
+                let base = std::env::var_os("ProgramFiles").map(PathBuf::from)?;
+                Some((base.join(path), *executable))
+            }
         }
     }
 }
@@ -1410,9 +1445,12 @@ impl SandboxSpec {
 
     /// Start the command with no sandbox at all.
     fn spawn_plain(&self, command: &str, cwd: &Path) -> Result<SandboxedChild, String> {
-        let mut process = std::process::Command::new("sh");
-        process.args(["-c", command]);
-        process.current_dir(cwd);
+        // The Bash contract is resolved, not assumed: Unix sh, or an installed
+        // Git Bash / WSL on Windows, or an actionable refusal (issue #311).
+        let runtime = crate::shell_backend::resolve()?;
+        let mut process = std::process::Command::new(runtime.program());
+        process.args(runtime.command_args(command));
+        process.current_dir(runtime.spawn_cwd(cwd));
         // Not the app's accidental environment: the reader's login shell.
         process.env_clear();
         process.envs(tool_environment());
@@ -1431,19 +1469,32 @@ impl SandboxSpec {
     /// the command it wraps - and it keeps a process's sandbox and its grants
     /// from outliving the call that made them.
     fn spawn_heel(&self, command: &str, cwd: &Path) -> Result<SandboxedChild, String> {
+        // The same resolved Bash runtime as the plain path, and a confinement
+        // refusal for a runtime the sandbox cannot wrap: a confined turn never
+        // falls back to an unconfined launch (issue #311).
+        let runtime = crate::shell_backend::resolve()?;
+        if !runtime.confinable() {
+            return Err(
+                "WSL Bash cannot be confined by the Windows sandbox backend: the Linux side runs \
+                 outside the AppContainer. Install Git for Windows for a confined Bash, or switch \
+                 the turn to an unconfined permission tier."
+                    .to_string(),
+            );
+        }
+        let program = runtime.program().to_string_lossy().into_owned();
         let engine = futures::executor::block_on(build_engine(self, false))?;
         // The interface a sandboxed process gets, minus what the sandbox owns,
         // overlayed with the reader's login shell (see shell_env).
         let envs = tool_environment();
         let child = match &engine {
             Engine::Deny(sandbox) => {
-                spawn_heel_command(sandbox.command("/bin/sh"), command, cwd, envs)
+                spawn_heel_command(sandbox.command(program.clone()), command, cwd, envs)
             }
             Engine::Rego(sandbox) => {
-                spawn_heel_command(sandbox.command("/bin/sh"), command, cwd, envs)
+                spawn_heel_command(sandbox.command(program.clone()), command, cwd, envs)
             }
             Engine::Allow(sandbox) => {
-                spawn_heel_command(sandbox.command("/bin/sh"), command, cwd, envs)
+                spawn_heel_command(sandbox.command(program.clone()), command, cwd, envs)
             }
         }?;
         Ok(SandboxedChild {

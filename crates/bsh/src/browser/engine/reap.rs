@@ -36,6 +36,7 @@
 //! skipped: "cannot identify" is never "probably ours".
 
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -82,61 +83,54 @@ pub(crate) trait ProcessTable {
     fn kill(&self, pid: u32) -> bool;
 }
 
-/// The real process table, read through `ps` and `kill`.
+/// The real process table, read through the shared cross-platform runtime.
 ///
-/// `ps` rather than libc: bsh does not depend on libc directly, and a check
-/// that runs once per launch can afford one short-lived helper per pidfile.
-/// Only pidfiles this instance's own data directory holds are ever examined, so
-/// this is not a process scan.
+/// Inspection uses native process APIs on every host (issue #314): /proc or
+/// ps on Unix, the toolhelp snapshot and PEB command-line read on Windows,
+/// where the old `ps`/`kill` helpers simply did not exist and the reaper
+/// silently skipped every orphan. Only pidfiles this instance's own data
+/// directory holds are ever examined, so this is not a process scan, and the
+/// marker + orphan identity checks in [`reap_orphans`] are unchanged.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SystemProcesses;
 
-impl SystemProcesses {
-    fn ps(pid: u32, field: &str) -> Option<String> {
-        let output = Command::new("ps")
-            .arg("-o")
-            .arg(format!("{field}="))
-            .arg("-p")
-            .arg(pid.to_string())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        (!text.is_empty()).then_some(text)
-    }
-}
-
 impl ProcessTable for SystemProcesses {
     fn ppid(&self, pid: u32) -> Option<u32> {
-        Self::ps(pid, "ppid")?.parse().ok()
+        hostkit::proc::process_info(pid)?.ppid
     }
 
     fn argv(&self, pid: u32) -> Option<String> {
-        Self::ps(pid, "command")
+        hostkit::proc::process_info(pid)?.command_line
     }
 
     fn alive(&self, pid: u32) -> bool {
-        self.ppid(pid).is_some()
+        hostkit::proc::pid_alive(pid)
     }
 
     fn terminate(&self, pid: u32) -> bool {
-        Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        #[cfg(unix)]
+        {
+            // SAFETY: a signal to a pid this instance recorded and identified.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows has no graceful stop for an arbitrary process; the
+            // adopted-pid tree termination is the stop.
+            hostkit::proc::TreeOwner::from_pid(pid).kill(std::time::Duration::from_millis(300))
+        }
     }
 
     fn kill(&self, pid: u32) -> bool {
-        Command::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        #[cfg(unix)]
+        {
+            // SAFETY: a signal to a pid this instance recorded and identified.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            hostkit::proc::TreeOwner::from_pid(pid).kill(std::time::Duration::from_millis(300))
+        }
     }
 }
 

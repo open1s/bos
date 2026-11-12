@@ -83,7 +83,11 @@ async fn a_git_market_install_reaches_the_installed_inventory() {
     // Seed the cache a successful `bsh ext market` sync leaves behind: a real
     // checkout, because the install compares the index hash with the commit,
     // not with whatever the disk holds.
-    let provider = root.join("market/provider");
+    // The cache directory is derived from the validated repository identity
+    // (issue #305), so seed where GitMarket actually looks.
+    let provider = GitMarket::open(&root, "https://example.invalid/provider")
+        .path()
+        .to_path_buf();
     std::fs::create_dir_all(provider.join("packages")).expect("provider");
     copy_dir(&examples().join("hello"), &provider.join("packages/hello"));
     std::fs::write(

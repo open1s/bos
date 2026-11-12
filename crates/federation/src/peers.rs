@@ -549,29 +549,16 @@ impl PeerStore {
     }
 
     /// Write the store atomically, creating the parent directory.
+    ///
+    /// The store carries who may invoke what; it is kept as private as the
+    /// key on every host (issue #299): Unix mode 0600, Windows a protected
+    /// owner-only DACL, applied on creation and on replacement. A failure to
+    /// establish the private policy fails the save.
     pub fn save(&self, path: &std::path::Path) -> Result<(), PeerError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| PeerError::Io {
-                path: parent.display().to_string(),
-                source,
-            })?;
-        }
         let text = self.to_json().map_err(|error| PeerError::Json {
             message: error.to_string(),
         })?;
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, text).map_err(|source| PeerError::Io {
-            path: temp.display().to_string(),
-            source,
-        })?;
-        // The store carries who may invoke what; keep it as private as the key
-        // rather than relying on the process umask.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&temp, path).map_err(|source| PeerError::Io {
+        hostkit::fspriv::write_private(path, text.as_bytes()).map_err(|source| PeerError::Io {
             path: path.display().to_string(),
             source,
         })
@@ -797,6 +784,40 @@ mod tests {
             store.resume(&peer).is_err(),
             "a revoked peer is not resumed"
         );
+    }
+
+    /// Issue #299: the authorization store is owner-only on creation, and a
+    /// replaced pre-existing world-readable file ends up hardened.
+    #[test]
+    fn the_peer_store_is_private_and_hardens_a_replaced_file() {
+        let dir =
+            std::env::temp_dir().join(format!("federation-peers-priv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("peers.json");
+        let (store, peer) = store();
+
+        store.save(&path).expect("first save");
+        let loaded = PeerStore::load(&path).expect("load");
+        assert!(loaded.is_trusted(&peer, 1_000));
+
+        // Simulate a legacy world-readable file, then replace it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        }
+        store.save(&path).expect("replacement save");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the replaced store must be owner-only");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A matching federation id is metadata: it never confers trust.

@@ -11,7 +11,6 @@
 //! passphrase; a file-backend secret is the plaintext key and must be handled
 //! accordingly.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -82,36 +81,15 @@ fn safe_name(name: &str) -> String {
     }
 }
 
+/// Store secret bytes owner-only on every host (issue #299).
+///
+/// Delegates to [`hostkit::fspriv::write_private`]: Unix mode 0600, Windows a
+/// protected owner-only DACL, atomic temp+fsync+rename replacement that also
+/// hardens a pre-existing world-readable file. Fails closed: if the private
+/// policy cannot be established, the store errors instead of silently keeping
+/// the secret readable.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), CustodyError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| CustodyError::Io {
-            path: parent.display().to_string(),
-            message: error.to_string(),
-        })?;
-    }
-    let temporary = path.with_extension("part");
-    {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary).map_err(|error| CustodyError::Io {
-            path: temporary.display().to_string(),
-            message: error.to_string(),
-        })?;
-        file.write_all(bytes).map_err(|error| CustodyError::Io {
-            path: temporary.display().to_string(),
-            message: error.to_string(),
-        })?;
-        file.flush().map_err(|error| CustodyError::Io {
-            path: temporary.display().to_string(),
-            message: error.to_string(),
-        })?;
-    }
-    std::fs::rename(&temporary, path).map_err(|error| CustodyError::Io {
+    hostkit::fspriv::write_private(path, bytes).map_err(|error| CustodyError::Io {
         path: path.display().to_string(),
         message: error.to_string(),
     })
@@ -587,6 +565,45 @@ mod tests {
         }
         custody.delete("node-a").expect("delete");
         assert!(custody.load("node-a").expect("load").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #299: replacing a pre-existing world-readable secret file must
+    /// end owner-only, for both the plaintext and the wrapped backend.
+    #[test]
+    fn a_replaced_world_readable_secret_file_is_hardened() {
+        let dir = scratch("harden");
+        let backends: Vec<(Box<dyn Custody>, &str)> = vec![
+            (Box::new(FileCustody::new(&dir)), "node-a.key"),
+            (
+                Box::new(PassphraseCustody::new(&dir, "correct horse")),
+                "node-a.custody",
+            ),
+        ];
+        for (backend, file) in backends {
+            let path = dir.join(file);
+            std::fs::write(&path, b"legacy secret").expect("legacy file");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                    .expect("chmod");
+            }
+            backend.store("node-a", b"new secret").expect("store");
+            assert_eq!(
+                backend.load("node-a").expect("load").expect("present"),
+                b"new secret"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "{file} must end owner-only");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -85,7 +85,7 @@ struct WriteRequest {
 
 /// One spawned MCP server. The runtime only needs id, piped stdio, kill and
 /// wait, all of which the standard-library child already exposes.
-struct McpChild(Child);
+struct McpChild(Child, hostkit::proc::TreeOwner);
 
 impl McpChild {
     // Read only by kill_process_group, which is unix-only: Windows has no
@@ -481,25 +481,20 @@ fn terminate_child_handle(child: &Arc<Mutex<McpChild>>) {
     child.kill();
 }
 
-/// Signal the child's process group, not just the child.
+/// Terminate the child's whole ownership boundary, not just the child.
 ///
-/// stdio limits only configure the rlimits; the process-group setup happens in
-/// the shared pre_exec hook, so a server that spawns a helper would leave the
-/// helper alive when only the leader is killed.
-#[cfg(unix)]
+/// Unix: the process group the pre_exec hook created. Windows: the
+/// kill-on-close Job Object the child was adopted into at spawn (issue #315).
+/// The old non-Unix no-op left server descendants running after shutdown.
 fn kill_process_group(child: &McpChild) {
-    let pid = child.id();
-    if pid != 0 {
-        // SAFETY: pid is the group leader configured in pre_exec; killpg on a
-        // non-leader fails with ESRCH and is harmless.
-        unsafe {
-            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-        }
+    let confirmed = child.1.kill(std::time::Duration::from_millis(200));
+    if !confirmed {
+        log::warn!(
+            target: "bsh::extension",
+            "MCP server process-tree termination could not be confirmed empty"
+        );
     }
 }
-
-#[cfg(not(unix))]
-fn kill_process_group(_child: &McpChild) {}
 
 /// The state one MCP server package owns.
 ///
@@ -816,9 +811,8 @@ impl McpCore {
         // sandbox. The process.execute grant above is the host's gate.
         let mut command = Command::new(&program);
         command.args(&self.args);
-        // Apply the same Unix RLIMIT and process-group ceilings as
-        // ProcessRuntime. Windows remains a documented limitation until
-        // Job Object enforcement is implemented.
+        // The same RLIMIT and process-group ceilings as ProcessRuntime on
+        // Unix; on Windows the ownership boundary is the Job Object below.
         crate::process::configure_std_process_limits(
             &mut command,
             self.memory_bytes,
@@ -830,18 +824,49 @@ impl McpCore {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
+        // The platform baseline, not a Unix-only allowlist: a Windows MCP
+        // server needs SystemRoot, the profile and temp variables to start
+        // (issue #318). Manifest overrides apply after it, deterministically.
+        for (key, value) in hostkit::env::EnvMap::baseline().iter() {
+            command.env(key, value);
         }
         for (key, value) in &self.env {
             command.env(key, value);
         }
-        let mut child = McpChild(command.spawn().map_err(|source| ExtensionError::Io {
+        // Windows: create SUSPENDED so the server cannot spawn a descendant
+        // before it is inside the kill-on-close job (issue #315).
+        #[cfg(windows)]
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+        let spawned = command.spawn().map_err(|source| ExtensionError::Io {
             path: program.clone(),
             source,
-        })?);
+        })?;
+        let owner = {
+            let pid = spawned.id();
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                let memory = (self.memory_bytes > 0).then_some(self.memory_bytes);
+                match hostkit::proc::adopt_suspended(pid, spawned.as_raw_handle(), memory) {
+                    Ok(owner) => owner,
+                    Err(err) => {
+                        // Fail closed: an unowned server must not run.
+                        let mut spawned = spawned;
+                        let _ = spawned.kill();
+                        let _ = spawned.wait();
+                        return Err(ExtensionError::Io {
+                            path: program.clone(),
+                            source: err,
+                        });
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                hostkit::proc::TreeOwner::from_pid(pid)
+            }
+        };
+        let mut child = McpChild(spawned, owner);
         let stdin = child.take_stdin().ok_or_else(|| ExtensionError::Protocol {
             extension: self.extension.to_string(),
             message: "MCP stdin was not piped".to_string(),
@@ -1717,7 +1742,8 @@ mod tests {
         let mut command = Command::new("sleep");
         command.arg("30");
         let child = command.spawn().expect("long-running child");
-        let child = Arc::new(Mutex::new(McpChild(child)));
+        let owner = hostkit::proc::TreeOwner::from_pid(child.id());
+        let child = Arc::new(Mutex::new(McpChild(child, owner)));
         terminate_child_handle(&child);
         // wait() blocks until the killed child is reaped; a regression that
         // failed to terminate would hang this test rather than pass it.
@@ -1856,7 +1882,10 @@ required = ["process.execute"]
         let child = command.spawn().expect("long-running child");
         assert!(cancelled_runtime
             .core
-            .register_child(McpChild(child))
+            .register_child({
+                let owner = hostkit::proc::TreeOwner::from_pid(child.id());
+                McpChild(child, owner)
+            })
             .is_err());
         assert!(
             cancelled_runtime
@@ -1891,7 +1920,10 @@ required = ["process.execute"]
         let child = command.spawn().expect("late child");
         assert!(cancelled_runtime
             .core
-            .register_child(McpChild(child))
+            .register_child({
+                let owner = hostkit::proc::TreeOwner::from_pid(child.id());
+                McpChild(child, owner)
+            })
             .is_err());
         assert!(
             cancelled_runtime

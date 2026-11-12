@@ -23,10 +23,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }
 
 [dependencies]
 ferris-core = { path = "../ferris-core" }
+hostkit = { path = "../hostkit" }
 # The surface-provider adapter. Pinned exactly: cordis-core is an execution
 # host for Rust surface providers, kept out of the contract crate.
 cordis-core = "=0.6.1"

@@ -79,12 +79,17 @@ const REPLAY_CAPACITY: usize = 4096;
 /// The key is scoped to the authenticated sender: a caller-supplied idempotency
 /// key is never trusted as globally unique. A message is remembered until the
 /// envelope that carried it expires, and the oldest entry is evicted when the
-/// bound is reached. The cache is in memory: a restart forgets it, which is safe
-/// because envelopes carry a short validity window and cannot be replayed after
-/// it.
+/// bound is reached. Without persistence a restart forgets the cache, which is
+/// safe because envelopes carry a short validity window and cannot be replayed
+/// after it; with [`FederationNode::with_replay_persistence`] the admitted
+/// identities are also committed durably before side-effectful requests run.
 #[derive(Clone)]
 struct ReplayCache {
     inner: Arc<Mutex<ReplayInner>>,
+    /// Serializes durable commits: the atomic writer's temp file is named per
+    /// process, so two overlapping saves would race on it, and a later
+    /// snapshot must never be overwritten by an earlier one (issue #303).
+    save_gate: Arc<Mutex<()>>,
 }
 
 struct ReplayInner {
@@ -104,6 +109,7 @@ impl ReplayCache {
                 seen: HashMap::new(),
                 order: std::collections::VecDeque::new(),
             })),
+            save_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -139,10 +145,18 @@ impl ReplayCache {
         Ok(cache)
     }
 
+    /// Commit the admitted identities durably.
+    ///
+    /// The store records sender identities and message/idempotency keys, so it
+    /// is written owner-only on every host (issue #299). The write is atomic —
+    /// a private temp file, fsynced, then renamed over the target — so a crash
+    /// leaves either the previous complete store or the new one, never a torn
+    /// file. Concurrent commits are serialized by `save_gate` (issue #303).
     fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let _gate = self
+            .save_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entries: Vec<(NodeId, String, u64)> = {
             let inner = self
                 .inner
@@ -156,14 +170,24 @@ impl ReplayCache {
         };
         let text = serde_json::to_string_pretty(&ReplayFile { entries })
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, text)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        hostkit::fspriv::write_private(path, text.as_bytes())
+    }
+
+    /// Undo one admission whose durable commit failed (issue #303).
+    ///
+    /// Only the exact keys of that admission are removed, so a refused request
+    /// leaves no trace: the sender may retry the same identity once storage
+    /// recovers. A duplicate that arrived while the commit was in flight was
+    /// already refused, which is the safe direction.
+    fn forget(&self, keys: &[(NodeId, String)]) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in keys {
+            inner.seen.remove(key);
         }
-        std::fs::rename(&temp, path)
+        inner.order.retain(|key| !keys.contains(key));
     }
 
     /// Return true when no key was seen before, recording all of them.
@@ -191,6 +215,44 @@ impl ReplayCache {
         }
         true
     }
+}
+
+/// Request kinds whose dispatch changes durable or external state.
+///
+/// With replay persistence configured, these are dispatched ONLY after the
+/// replay admission is durably committed (issue #303): a failed commit refuses
+/// the request instead of silently weakening replay protection to
+/// volatile-only.
+fn side_effectful_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "invoke"
+            | "delegate"
+            | "delegation_cancel"
+            | "invoke_cancel"
+            | "knowledge_publication"
+            | "artifact_cleanup"
+            | "rotation"
+            | "task_create"
+            | "task_cancel"
+            | "coordinator_register"
+    )
+}
+
+/// Request kinds that only read state.
+///
+/// A persistence failure lets these proceed in a documented degraded mode:
+/// they cannot repeat a side effect, and their in-memory replay admission
+/// still holds for the lifetime of this process (issue #303).
+fn read_only_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "delegation_status"
+            | "task_status"
+            | "discover"
+            | "knowledge_query"
+            | "coordinator_topology"
+    )
 }
 
 /// Removes one in-flight invocation when the provider returns, panics, or its
@@ -819,10 +881,26 @@ impl FederationNode {
 
     /// Load and persist the replay/idempotency cache across restarts.
     ///
-    /// Expired entries are dropped at load. A write failure is logged and the
-    /// frame is still processed: replay protection weakens after a write error,
-    /// but an authenticated request is not silently dropped because the disk
-    /// failed. The file is written only for request kinds, after admission.
+    /// Expired entries are dropped at load. The persistence-failure policy is
+    /// explicit (issue #303):
+    ///
+    /// - Side-effectful request kinds (`invoke`, `delegate`,
+    ///   `delegation_cancel`, `invoke_cancel`, `knowledge_publication`,
+    ///   `artifact_cleanup`, `rotation`, `task_create`, `task_cancel`,
+    ///   `coordinator_register`) are dispatched ONLY after the admission is
+    ///   durably committed. A failed commit rolls the admission back and
+    ///   refuses the request with a typed `Unavailable` error, so the sender
+    ///   can retry the same identity once storage recovers; the protected
+    ///   operation never runs on volatile-only protection.
+    /// - Read-only kinds (`delegation_status`, `task_status`, `discover`,
+    ///   `knowledge_query`, `coordinator_topology`) proceed in a documented
+    ///   degraded mode: the in-memory admission still deduplicates within this
+    ///   process, and a read cannot repeat a side effect.
+    /// - Resource stream frames are sequenced and lease-bound; their replay
+    ///   protection is the stream sequence window plus the in-memory cache.
+    ///
+    /// Commits are atomic (private temp file + fsync + rename), owner-only on
+    /// every host, and serialized against each other.
     pub fn with_replay_persistence(mut self, path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         match ReplayCache::load(&path) {
@@ -1262,27 +1340,48 @@ impl FederationNode {
                         }
                         continue;
                     }
-                    if matches!(
-                        envelope.kind.as_str(),
-                        "invoke"
-                            | "delegate"
-                            | "delegation_status"
-                            | "delegation_cancel"
-                            | "discover"
-                            | "invoke_cancel"
-                            | "knowledge_query"
-                            | "knowledge_publication"
-                            | "task_create"
-                            | "task_status"
-                            | "task_cancel"
-                            | "coordinator_register"
-                            | "coordinator_topology"
-                    ) {
+                    if side_effectful_kind(&envelope.kind) || read_only_kind(&envelope.kind) {
                         if let Some(path) = &replay_path {
                             if let Err(error) = replay.save(path) {
+                                if side_effectful_kind(&envelope.kind) {
+                                    // Fail closed (issue #303): the admission is
+                                    // not durable, so the protected operation
+                                    // must not run on volatile-only protection.
+                                    // Roll the admission back and refuse with a
+                                    // typed, retryable error.
+                                    replay.forget(&keys);
+                                    let reason = format!(
+                                        "the replay admission for message {} was not durably committed: {error}",
+                                        envelope.message_id
+                                    );
+                                    let refusal = CapabilityError::Unavailable {
+                                        reason: reason.clone(),
+                                    };
+                                    record(
+                                        &audit,
+                                        FederationEvent::new(
+                                            Direction::Inbound,
+                                            envelope.sender.as_str(),
+                                            envelope.kind.as_str(),
+                                            None,
+                                            error_kind(&refusal),
+                                        )
+                                        .with_subject(envelope.message_id.clone())
+                                        .with_reason(reason),
+                                    );
+                                    let reply =
+                                        seal_reply(&identity, &envelope, error_payload(refusal));
+                                    let _ = transport.send(&envelope.sender, reply).await;
+                                    continue;
+                                }
+                                // Documented degraded mode: a read-only request
+                                // cannot repeat a side effect, and its in-memory
+                                // admission still deduplicates within this
+                                // process, so it proceeds with a warning.
                                 tracing::warn!(
-                                    "federation: replay cache {} was not written: {error}",
-                                    path.display()
+                                    "federation: replay cache {} was not written: {error}; read-only {} proceeds in degraded mode",
+                                    path.display(),
+                                    envelope.kind
                                 );
                             }
                         }
@@ -2680,19 +2779,11 @@ fn persist_knowledge(service: &KnowledgeService, path: &std::path::Path) {
         tracing::warn!("federation: knowledge store did not serialize");
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let temporary = path.with_extension("json.tmp");
-    let written = std::fs::write(&temporary, text).and_then(|()| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&temporary, path)
-    });
-    if let Err(error) = written {
+    // Owner-only on every host (issue #299); the knowledge store can carry
+    // governed material, so it gets the same private policy as the other
+    // federation stores. The warn-and-continue policy for knowledge writes
+    // is unchanged: replay durability is enforced separately (issue #303).
+    if let Err(error) = hostkit::fspriv::write_private(path, text.as_bytes()) {
         tracing::warn!(
             "federation: knowledge store {} was not written: {error}",
             path.display()
@@ -4995,6 +5086,75 @@ mod admission_tests {
             "a duplicate is refused across a restart"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Issue #303: a failed durable commit rolls the admission back, so the
+    /// same identity can be retried once storage recovers.
+    #[test]
+    fn a_failed_commit_rolls_back_the_admission() {
+        let dir = std::env::temp_dir().join(format!(
+            "bos-replay-rollback-{}-{}",
+            std::process::id(),
+            capability::unix_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // The store path is a directory: the atomic rename onto it fails.
+        let path = dir.join("replay.json");
+        std::fs::create_dir_all(&path).expect("obstacle");
+
+        let cache = ReplayCache::new();
+        let sender = node(31);
+        let keys = vec![(sender, "m-rollback".to_string())];
+        let now = capability::unix_ms();
+        assert!(cache.admit(&keys, now + 60_000, now));
+        assert!(cache.save(&path).is_err(), "the commit must fail");
+        cache.forget(&keys);
+        assert!(
+            cache.admit(&keys, now + 60_000, now),
+            "a rolled-back admission may be retried"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #303: concurrent commits are serialized; every admitted identity
+    /// survives in the final durable snapshot and no save races another.
+    #[test]
+    fn concurrent_commits_are_serialized() {
+        let dir = std::env::temp_dir().join(format!(
+            "bos-replay-concurrent-{}-{}",
+            std::process::id(),
+            capability::unix_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("replay.json");
+        let cache = ReplayCache::new();
+        let now = capability::unix_ms();
+        let mut handles = Vec::new();
+        for index in 0..8u8 {
+            let cache = cache.clone();
+            let path = path.clone();
+            let sender = node(40 + index);
+            handles.push(std::thread::spawn(move || {
+                let keys = vec![(sender, format!("m-concurrent-{index}"))];
+                assert!(cache.admit(&keys, now + 60_000, now));
+                cache.save(&path)
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread").expect("save");
+        }
+        let loaded = ReplayCache::load(&path).expect("load");
+        for index in 0..8u8 {
+            assert!(
+                !loaded.admit(
+                    &[(node(40 + index), format!("m-concurrent-{index}"))],
+                    now + 60_000,
+                    now
+                ),
+                "identity {index} survived the concurrent commits"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

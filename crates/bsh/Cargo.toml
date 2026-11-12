@@ -74,6 +74,7 @@ uuid = { workspace = true, features = ["v7"] }
 shellexpand = { workspace = true }
 rust-i18n = "4.2.4"
 dirs = "7.0.0"
+hostkit = { path = "../hostkit" }
 # The terminal pane's backend. gpui-libghostty vendors Ghostty and builds its
 # static archive with Zig at build time; the pane then draws Ghostty's own Metal
 # surface instead of bsh parsing the PTY with vte into a grid. The vendored

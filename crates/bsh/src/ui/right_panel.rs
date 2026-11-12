@@ -5097,25 +5097,61 @@ impl Shell {
             .terminal_view
             .as_ref()
             .is_some_and(|view| view.read(cx).is_alive());
+        let needs_release = self
+            .right
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.needs_unconfined_release());
         if let Some((text, is_error)) = self.terminal_status_text(running) {
-            pane = pane.child(
-                div()
-                    .debug_selector(|| String::from("terminal-status"))
-                    .id("terminal-status")
-                    .flex_none()
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .bg(rgb(theme::page()))
-                    .child(txt(
-                        text,
-                        theme::CHIP_SIZE,
-                        if is_error {
-                            theme::error()
-                        } else {
-                            theme::faint()
-                        },
-                    )),
-            );
+            let mut strip = div()
+                .debug_selector(|| String::from("terminal-status"))
+                .id("terminal-status")
+                .flex_none()
+                .px(px(12.0))
+                .py(px(8.0))
+                .bg(rgb(theme::page()))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .child(txt(
+                    text,
+                    theme::CHIP_SIZE,
+                    if is_error {
+                        theme::error()
+                    } else {
+                        theme::faint()
+                    },
+                ));
+            if needs_release {
+                // The explicit release the confined launch waits for
+                // (issue #323): a deliberate press, never an automatic spawn.
+                strip = strip.child(
+                    div()
+                        .debug_selector(|| String::from("terminal-release"))
+                        .id("terminal-release")
+                        .flex_none()
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .rounded(px(8.0))
+                        .bg(rgb(theme::accent()))
+                        .cursor_pointer()
+                        .child(txt(
+                            self.state.lang.tr("right.terminal.releaseButton"),
+                            theme::CHIP_SIZE,
+                            theme::page(),
+                        ))
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            if let Some(terminal) = this.right.terminal.as_mut() {
+                                terminal.release_unconfined();
+                                terminal.failure = None;
+                            }
+                            this.ensure_terminal_view(window, cx);
+                            cx.notify();
+                        })),
+                );
+            }
+            pane = pane.child(strip);
         }
         match self.right.terminal_view.clone() {
             Some(view) => {
@@ -5338,6 +5374,17 @@ impl Shell {
             return;
         };
         if terminal.refused {
+            return;
+        }
+        // A confined turn whose backend cannot host a sandboxed shell must not
+        // start an unconfined shell silently (issue #323): wait for the
+        // reader's explicit release, which the status strip offers.
+        if terminal.needs_unconfined_release() {
+            let message = self.state.lang.tr("right.terminal.unconfinedRelease");
+            if let Some(terminal) = self.right.terminal.as_mut() {
+                terminal.failure = Some(message);
+            }
+            cx.notify();
             return;
         }
         let options = TerminalOptions::new(terminal.command(), terminal.cwd.clone());

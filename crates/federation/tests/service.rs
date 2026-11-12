@@ -1665,6 +1665,294 @@ async fn a_replayed_frame_is_not_dispatched_twice() {
     task.abort();
 }
 
+/// Issue #303: with replay persistence configured, a side-effectful request
+/// whose durable commit fails is refused with a typed error and never runs.
+/// Two real I/O failures are injected: a write-stage failure (the store's
+/// parent is a regular file) and a rename-stage failure (the store path is a
+/// directory). Once storage recovers, the rolled-back admission lets the same
+/// identity retry exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_replay_commit_refuses_a_side_effectful_request() {
+    use capability::MessageId;
+
+    for case in ["write", "rename"] {
+        let dir = std::env::temp_dir().join(format!(
+            "bos-replay-fail-{case}-{}-{}",
+            std::process::id(),
+            capability::unix_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let replay_path = dir.join("replay.json");
+        let obstacle = match case {
+            "write" => {
+                let blocker = dir.join("blocker");
+                std::fs::write(&blocker, b"not a directory").expect("blocker");
+                blocker.join("replay.json")
+            }
+            _ => {
+                std::fs::create_dir_all(&replay_path).expect("directory at the store path");
+                replay_path.clone()
+            }
+        };
+
+        let network = Arc::new(InMemoryNetwork::new());
+        let caller_identity = identity(131);
+        let provider_identity = identity(132);
+        let caller_id = caller_identity.node_id();
+        let provider_id = provider_identity.node_id();
+        let (caller_transport, mut caller_inbox) = network.join(caller_id.clone());
+        let (provider_transport, provider_inbox) = network.join(provider_id.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = FederationNode::new(provider_identity, Arc::new(provider_transport))
+            .with_runtime(runtime(descriptor("echo"), Arc::clone(&calls)))
+            .with_replay_persistence(obstacle.clone());
+        let task = provider.start(provider_inbox);
+        let now = capability::unix_ms();
+        {
+            let store = provider.peers();
+            let mut peers = store.write().expect("peers");
+            peers.enroll(caller_id.clone(), now, None);
+            peers
+                .grant(&caller_id, capability("echo"), now, None)
+                .expect("granted");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let payload = json!({ "capability": "builtin/echo", "input": { "value": 1 } });
+        let mut message =
+            FederationMessage::new("invoke", serde_json::to_vec(&payload).expect("bytes"));
+        message.id = MessageId::new("m-fail-commit");
+        let frame = federation::Envelope::seal(&message, &caller_identity, &provider_id)
+            .expect("sealed")
+            .encode()
+            .expect("encoded");
+        caller_transport
+            .send(&provider_id, frame.clone())
+            .await
+            .expect("send");
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), caller_inbox.recv())
+            .await
+            .expect("a reply arrives")
+            .expect("inbox open");
+        let envelope = federation::Envelope::decode(&reply).expect("reply envelope");
+        assert_eq!(envelope.payload["ok"], json!(false), "case {case}");
+        assert_eq!(
+            envelope.payload["error"]["kind"],
+            json!("unavailable"),
+            "case {case}: a failed commit is a typed refusal: {:?}",
+            envelope.payload
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "case {case}: the protected operation must not run"
+        );
+
+        // Repair storage and retry the SAME identity: the rolled-back
+        // admission lets it through exactly once.
+        match case {
+            "write" => std::fs::remove_file(dir.join("blocker")).expect("unblock"),
+            _ => std::fs::remove_dir_all(&replay_path).expect("unblock"),
+        }
+        caller_transport
+            .send(&provider_id, frame)
+            .await
+            .expect("retry send");
+        let reply = tokio::time::timeout(Duration::from_secs(5), caller_inbox.recv())
+            .await
+            .expect("a reply arrives")
+            .expect("inbox open");
+        let envelope = federation::Envelope::decode(&reply).expect("reply envelope");
+        assert_eq!(
+            envelope.payload["ok"],
+            json!(true),
+            "case {case}: the retry succeeds once storage recovers: {:?}",
+            envelope.payload
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "case {case}: the retry runs exactly once"
+        );
+
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Issue #303: a read-only request may proceed in the documented degraded
+/// mode when the durable commit fails; it cannot repeat a side effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_request_proceeds_in_degraded_mode() {
+    use capability::MessageId;
+
+    let dir = std::env::temp_dir().join(format!(
+        "bos-replay-degraded-{}-{}",
+        std::process::id(),
+        capability::unix_ms()
+    ));
+    std::fs::create_dir_all(&dir).expect("dir");
+    // The store path is a directory, so every commit fails at rename.
+    let replay_path = dir.join("replay.json");
+    std::fs::create_dir_all(&replay_path).expect("obstacle");
+
+    let network = Arc::new(InMemoryNetwork::new());
+    let caller_identity = identity(133);
+    let provider_identity = identity(134);
+    let caller_id = caller_identity.node_id();
+    let provider_id = provider_identity.node_id();
+    let (caller_transport, mut caller_inbox) = network.join(caller_id.clone());
+    let (provider_transport, provider_inbox) = network.join(provider_id.clone());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = FederationNode::new(provider_identity, Arc::new(provider_transport))
+        .with_runtime(runtime(descriptor("echo"), Arc::clone(&calls)))
+        .with_replay_persistence(replay_path.clone());
+    let task = provider.start(provider_inbox);
+    let now = capability::unix_ms();
+    {
+        let store = provider.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(caller_id.clone(), now, None);
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut message =
+        FederationMessage::new("discover", serde_json::to_vec(&json!({})).expect("bytes"));
+    message.id = MessageId::new("m-degraded");
+    let frame = federation::Envelope::seal(&message, &caller_identity, &provider_id)
+        .expect("sealed")
+        .encode()
+        .expect("encoded");
+    caller_transport
+        .send(&provider_id, frame)
+        .await
+        .expect("send");
+    let reply = tokio::time::timeout(Duration::from_secs(5), caller_inbox.recv())
+        .await
+        .expect("a reply arrives")
+        .expect("inbox open");
+    let envelope = federation::Envelope::decode(&reply).expect("reply envelope");
+    assert_eq!(
+        envelope.payload["ok"],
+        json!(true),
+        "a read-only request proceeds in degraded mode: {:?}",
+        envelope.payload
+    );
+
+    task.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #303: a restart before envelope expiry must not re-execute an
+/// already-committed message identity. The same signed frame is replayed
+/// against a fresh node that loads the durable replay store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_identity_cannot_execute_twice_across_a_restart() {
+    use capability::MessageId;
+
+    let dir = std::env::temp_dir().join(format!(
+        "bos-replay-restart-{}-{}",
+        std::process::id(),
+        capability::unix_ms()
+    ));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let replay_path = dir.join("replay.json");
+
+    let caller_identity = identity(141);
+    let provider_identity = identity(142);
+    let caller_id = caller_identity.node_id();
+    let provider_id = provider_identity.node_id();
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let payload = json!({ "capability": "builtin/echo", "input": { "value": 1 } });
+    let mut message =
+        FederationMessage::new("invoke", serde_json::to_vec(&payload).expect("bytes"));
+    message.id = MessageId::new("m-restart-once");
+    let frame = federation::Envelope::seal(&message, &caller_identity, &provider_id)
+        .expect("sealed")
+        .encode()
+        .expect("encoded");
+
+    // First life of the provider node.
+    let network = Arc::new(InMemoryNetwork::new());
+    let (caller_transport, mut caller_inbox) = network.join(caller_id.clone());
+    let (provider_transport, provider_inbox) = network.join(provider_id.clone());
+    let provider = FederationNode::new(provider_identity.clone(), Arc::new(provider_transport))
+        .with_runtime(runtime(descriptor("echo"), Arc::clone(&calls)))
+        .with_replay_persistence(replay_path.clone());
+    let task = provider.start(provider_inbox);
+    let now = capability::unix_ms();
+    {
+        let store = provider.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(caller_id.clone(), now, None);
+        peers
+            .grant(&caller_id, capability("echo"), now, None)
+            .expect("granted");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    caller_transport
+        .send(&provider_id, frame.clone())
+        .await
+        .expect("first send");
+    let reply = tokio::time::timeout(Duration::from_secs(5), caller_inbox.recv())
+        .await
+        .expect("a reply arrives")
+        .expect("inbox open");
+    let envelope = federation::Envelope::decode(&reply).expect("reply envelope");
+    assert_eq!(envelope.payload["ok"], json!(true));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Crash: abort the router and drop the node while the envelope is still
+    // inside its validity window.
+    task.abort();
+    drop(provider);
+    network.leave(&provider_id);
+
+    // Second life: same identity, same durable replay store, fresh state.
+    let (provider_transport, provider_inbox) = network.join(provider_id.clone());
+    let restarted = FederationNode::new(provider_identity, Arc::new(provider_transport))
+        .with_runtime(runtime(descriptor("echo"), Arc::clone(&calls)))
+        .with_replay_persistence(replay_path.clone());
+    let task = restarted.start(provider_inbox);
+    {
+        let store = restarted.peers();
+        let mut peers = store.write().expect("peers");
+        peers.enroll(caller_id.clone(), now, None);
+        peers
+            .grant(&caller_id, capability("echo"), now, None)
+            .expect("granted");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // The exact same signed frame, still valid.
+    caller_transport
+        .send(&provider_id, frame)
+        .await
+        .expect("replay send");
+    let reply = tokio::time::timeout(Duration::from_secs(5), caller_inbox.recv())
+        .await
+        .expect("a reply arrives")
+        .expect("inbox open");
+    let envelope = federation::Envelope::decode(&reply).expect("reply envelope");
+    assert_eq!(envelope.payload["ok"], json!(false));
+    assert_eq!(
+        envelope.payload["error"]["kind"],
+        json!("duplicate"),
+        "the committed identity is refused across the restart: {:?}",
+        envelope.payload
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the identity must not execute twice across the restart"
+    );
+
+    task.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A transport that remembers the last frame it sent, so a test can learn the
 /// correlation of a request that is still in flight.
 struct Capturing {

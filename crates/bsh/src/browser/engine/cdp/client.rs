@@ -315,6 +315,10 @@ pub(crate) struct Client {
     shared: Arc<Shared>,
     /// The child. Killed and reaped on drop.
     child: Mutex<Option<Child>>,
+    /// The Chromium process-tree ownership boundary (issue #327): a process
+    /// group on Unix, a kill-on-close Job Object on Windows, so renderer, GPU
+    /// and utility descendants cannot outlive the pane.
+    tree_owner: Option<hostkit::proc::TreeOwner>,
     /// The socket thread.
     thread: Mutex<Option<JoinHandle<()>>>,
     /// The ready file, removed on drop.
@@ -365,39 +369,31 @@ impl Client {
             );
         }
         let binary = discover_binary()?;
-        // The sandboxed launch first: it is the one that should guard a
-        // process rendering untrusted content. A process that already learned
-        // its environment cannot host that sandbox goes straight to the mode
-        // that works, so the reader waits once rather than on every pane.
-        let preferred = if SANDBOX_BROKEN.load(Ordering::Relaxed) {
-            SandboxMode::Relaxed
-        } else {
-            SandboxMode::Default
-        };
-        match Self::launch_once(&binary, viewport, state_dir, preferred) {
+        // The sandboxed launch is the only automatic one (issue #325). The
+        // browser is a DIRECT child of bsh, not wrapped by the turn sandbox,
+        // so there is no verified outer isolation boundary here: a relaxed
+        // (--no-sandbox) launch is never inferred from a generic failure.
+        match Self::launch_once(&binary, viewport, state_dir, SandboxMode::Default) {
             Ok(engine) => Ok(engine),
             Err(first) => {
-                // Chromium's own sandbox needs privileges a container, a CI
-                // runner or a sandboxed harness does not give it. MEASURED
-                // there: "sandbox initialization failed: Operation not
-                // permitted", the GPU process exits with code 6, and the CDP
-                // websocket is reset - so the pane would show nothing but a
-                // closed-socket sentence. Retrying without the flags keeps the
-                // pane WORKING where the outer sandbox is the boundary that
-                // already applies, instead of dying with a correct refusal.
-                eprintln!(
-                    "bsh: the browser engine did not start with its own sandbox ({}); retrying without it",
-                    first.message()
-                );
-                SANDBOX_BROKEN.store(true, Ordering::Relaxed);
-                Self::launch_once(&binary, viewport, state_dir, SandboxMode::Relaxed).inspect_err(
-                    |second| {
-                        eprintln!(
-                            "bsh: the browser engine did not start without its sandbox either ({})",
-                            second.message()
-                        );
-                    },
-                )
+                // Only a CLASSIFIED Chromium sandbox-initialization failure
+                // may even consider a downgrade, and only with the reader's
+                // explicit, recorded opt-in. A missing dependency, a profile
+                // error or a handshake failure is returned as itself.
+                if is_sandbox_failure(&first) && no_sandbox_opt_in() {
+                    eprintln!(
+                        "bsh: Chromium's sandbox cannot initialize here ({}); launching without it under BSH_BROWSER_NO_SANDBOX=1 (no outer isolation boundary applies)",
+                        first.message()
+                    );
+                    Self::launch_once(&binary, viewport, state_dir, SandboxMode::Relaxed)
+                } else if is_sandbox_failure(&first) {
+                    Err(EngineError::Sandbox(format!(
+                        "Chromium's sandbox cannot initialize in this environment ({}), and the browser is not running inside an outer isolation sandbox.                          Refusing to launch it unsandboxed. Run BSH inside a confined turn, or set BSH_BROWSER_NO_SANDBOX=1 to explicitly accept an unsandboxed browser.",
+                        first.message()
+                    )))
+                } else {
+                    Err(first)
+                }
             }
         }
     }
@@ -413,7 +409,7 @@ impl Client {
         let storage_dir = std::env::temp_dir().join(&marker);
         let ready_file = storage_dir.join("DevToolsActivePort");
         let log = Arc::new(Mutex::new(String::new()));
-        let mut child = spawn_engine(binary, &storage_dir, sandbox)?;
+        let (mut child, tree_owner) = spawn_engine(binary, &storage_dir, sandbox)?;
         // Record the child BEFORE the handshake: a crash during startup is
         // exactly the case a later pass has to be able to reap.
         let pidfile = match reap::write_pidfile(state_dir, child.id(), &marker) {
@@ -437,7 +433,13 @@ impl Client {
         let port = match wait_for_port(&mut child, &ready_file, &log, STARTUP_TIMEOUT) {
             Ok(port) => port,
             Err(error) => {
-                cleanup_failed_launch(&mut child, &ready_file, &storage_dir, pidfile.as_deref());
+                cleanup_failed_launch(
+                    &mut child,
+                    Some(&tree_owner),
+                    &ready_file,
+                    &storage_dir,
+                    pidfile.as_deref(),
+                );
                 return Err(error);
             }
         };
@@ -446,14 +448,26 @@ impl Client {
         let endpoint = match browser_endpoint(port) {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                cleanup_failed_launch(&mut child, &ready_file, &storage_dir, pidfile.as_deref());
+                cleanup_failed_launch(
+                    &mut child,
+                    Some(&tree_owner),
+                    &ready_file,
+                    &storage_dir,
+                    pidfile.as_deref(),
+                );
                 return Err(EngineError::Handshake(error));
             }
         };
         let socket = match Socket::connect(&endpoint, CALL_TIMEOUT) {
             Ok(socket) => socket,
             Err(error) => {
-                cleanup_failed_launch(&mut child, &ready_file, &storage_dir, pidfile.as_deref());
+                cleanup_failed_launch(
+                    &mut child,
+                    Some(&tree_owner),
+                    &ready_file,
+                    &storage_dir,
+                    pidfile.as_deref(),
+                );
                 return Err(EngineError::Handshake(format!(
                     "the websocket at {endpoint} could not be opened: {error}"
                 )));
@@ -468,7 +482,13 @@ impl Client {
         {
             Ok(thread) => thread,
             Err(error) => {
-                cleanup_failed_launch(&mut child, &ready_file, &storage_dir, pidfile.as_deref());
+                cleanup_failed_launch(
+                    &mut child,
+                    Some(&tree_owner),
+                    &ready_file,
+                    &storage_dir,
+                    pidfile.as_deref(),
+                );
                 return Err(EngineError::Spawn(format!(
                     "the CDP thread did not start: {error}"
                 )));
@@ -483,6 +503,7 @@ impl Client {
             alive,
             shared,
             child: Mutex::new(Some(child)),
+            tree_owner: Some(tree_owner),
             thread: Mutex::new(Some(thread)),
             ready_file,
             storage_dir,
@@ -837,19 +858,49 @@ impl Client {
     /// Close the page target, then stop everything.
     pub(crate) fn shutdown(&mut self) {
         if self.alive.swap(false, Ordering::Relaxed) {
-            // The socket thread exits on its own once the channel closes and
-            // it sees `alive` down; dropping the sender is what closes it.
-            let _ = self.call_browser("Target.closeTarget", json!({ "targetId": self.target }));
+            // Ask the BROWSER to close (issue #327), not merely the current
+            // target: Browser.close shuts down every renderer/GPU/utility
+            // process gracefully. The socket thread exits once the channel
+            // closes and it sees `alive` down.
+            let _ = self.call_browser("Browser.close", json!({}));
         }
         if let Some(thread) = self.thread.lock().ok().and_then(|mut slot| slot.take()) {
             let _ = thread.join();
         }
+        // Give the graceful close a bounded grace, then terminate the whole
+        // owned tree and reap the root. A hung Chromium cannot make this
+        // unbounded.
+        let mut tree_confirmed = false;
         if let Some(mut child) = self.child.lock().ok().and_then(|mut slot| slot.take()) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        tree_confirmed = true;
+                        break;
+                    }
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+            if let Some(owner) = &self.tree_owner {
+                let report = owner.kill(Duration::from_millis(300));
+                tree_confirmed = tree_confirmed || report;
+            }
             kill_and_wait(&mut child);
         }
         remove_file(&self.ready_file);
-        if let Some(pidfile) = &self.pidfile {
-            let _ = std::fs::remove_file(pidfile);
+        // Crash-recovery metadata is removed only once the owned tree is gone
+        // (issue #327); otherwise it stays for a later recovery pass.
+        if tree_confirmed {
+            if let Some(pidfile) = &self.pidfile {
+                let _ = std::fs::remove_file(pidfile);
+            }
         }
         let _ = std::fs::remove_dir_all(&self.storage_dir);
     }
@@ -1158,6 +1209,12 @@ pub(crate) fn discover_binary() -> Result<PathBuf, EngineError> {
             return Ok(path);
         }
     }
+    #[cfg(target_os = "windows")]
+    for path in windows_browser_candidates(&mut searched) {
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
     Err(EngineError::MissingBinary {
         searched: searched.join(", "),
         hint: format!(
@@ -1165,6 +1222,42 @@ pub(crate) fn discover_binary() -> Result<PathBuf, EngineError> {
             searched.join(", ")
         ),
     })
+}
+
+/// Windows Chrome/Chromium install locations (issue #326).
+///
+/// Per-machine and per-user roots from the native environment, with the .exe
+/// names a Windows install actually uses; PATH is searched for the same .exe
+/// names. No lossy conversion: the candidates are native PathBufs.
+#[cfg(target_os = "windows")]
+fn windows_browser_candidates(searched: &mut Vec<String>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for key in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        if let Some(root) = std::env::var_os(key) {
+            roots.push(PathBuf::from(root));
+        }
+    }
+    for root in &roots {
+        for rel in [
+            "Google/Chrome/Application/chrome.exe",
+            "Chromium/Application/chrome.exe",
+        ] {
+            let path = root.join(rel);
+            searched.push(path.display().to_string());
+            candidates.push(path);
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&paths) {
+            for name in ["chrome.exe", "chromium.exe"] {
+                let path = directory.join(name);
+                searched.push(format!("PATH:{}", path.display()));
+                candidates.push(path);
+            }
+        }
+    }
+    candidates
 }
 
 /// Start the process with the measured argument set.
@@ -1184,13 +1277,41 @@ fn scrub_sandbox_env(command: &mut Command) {
     }
 }
 
-/// Whether this process has proved Chromium's own sandbox cannot initialize.
+/// Whether a launch failure is Chromium's OWN sandbox refusing to initialize.
 ///
-/// Set by the first launch that had to fall back, so the NEXT pane in the same
-/// process does not pay the doomed attempt again: the sandboxed launch costs a
-/// failed spawn, a handshake and its cleanup (MEASURED ~1.5 s) before the retry
-/// even starts.
-static SANDBOX_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Only these signatures may even consider a downgrade (issue #325). A missing
+/// binary, a profile/permission error, an incompatible flag or a handshake
+/// failure is NOT a sandbox failure and never relaxes the launch.
+fn is_sandbox_failure(error: &EngineError) -> bool {
+    let text = match error {
+        EngineError::Startup { log, status } => format!("{status} {log}"),
+        EngineError::Spawn(message) => message.clone(),
+        _ => return false,
+    };
+    let lower = text.to_lowercase();
+    [
+        "sandbox initialization failed",
+        "no usable sandbox",
+        "failed to move to new namespace",
+        "operation not permitted",
+        "sandbox cannot",
+        "setuid sandbox",
+        "namespace sandbox",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// The reader's explicit, recorded opt-in to an unsandboxed browser.
+///
+/// There is no verified outer isolation boundary around the engine (it is a
+/// direct child of bsh), so a relaxed launch is only ever this deliberate
+/// choice, never an inference from a failure (issue #325).
+fn no_sandbox_opt_in() -> bool {
+    std::env::var_os("BSH_BROWSER_NO_SANDBOX")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
 
 /// How much of Chromium's own process sandbox to keep.
 ///
@@ -1229,7 +1350,7 @@ fn spawn_engine(
     binary: &Path,
     storage_dir: &Path,
     sandbox: SandboxMode,
-) -> Result<Child, EngineError> {
+) -> Result<(Child, hostkit::proc::TreeOwner), EngineError> {
     std::fs::create_dir_all(storage_dir).map_err(|error| {
         EngineError::Spawn(format!(
             "the engine's profile directory {} could not be created: {error}",
@@ -1259,13 +1380,17 @@ fn spawn_engine(
         .stderr(Stdio::piped());
     // No heel: not wrapped, and none of its environment either.
     scrub_sandbox_env(&mut command);
-    command.spawn().map_err(|error| {
+    // Own the whole Chromium tree from launch (issue #327): a fresh process
+    // group on Unix, a suspended-create/assign/resume Job Object on Windows,
+    // established before the browser can spawn a renderer.
+    let owned = hostkit::proc::OwnedChild::spawn(&mut command).map_err(|error| {
         let _ = std::fs::remove_dir_all(storage_dir);
         EngineError::Spawn(format!(
             "{} could not be started: {error}",
             binary.display()
         ))
-    })
+    })?;
+    Ok(owned.into_parts())
 }
 
 /// Read DevToolsActivePort until Chromium publishes its selected port.
@@ -1338,10 +1463,14 @@ fn kill_and_wait(child: &mut Child) {
 /// Remove all per-launch state after startup failed before Client owned it.
 fn cleanup_failed_launch(
     child: &mut Child,
+    tree_owner: Option<&hostkit::proc::TreeOwner>,
     ready_file: &Path,
     storage_dir: &Path,
     pidfile: Option<&Path>,
 ) {
+    if let Some(owner) = tree_owner {
+        let _ = owner.kill(Duration::from_millis(300));
+    }
     kill_and_wait(child);
     remove_file(ready_file);
     if let Some(pidfile) = pidfile {
@@ -1445,5 +1574,54 @@ mod tests {
         let second = reap::new_marker(LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed));
         assert_ne!(first, second);
         assert!(first.starts_with("bsh-browser-"));
+    }
+
+    /// A generic startup failure is NOT a sandbox failure and never relaxes
+    /// the launch (issue #325).
+    #[test]
+    fn generic_failures_are_not_sandbox_failures() {
+        let missing = EngineError::MissingBinary {
+            searched: "PATH".to_string(),
+            hint: String::new(),
+        };
+        assert!(!is_sandbox_failure(&missing));
+        let profile = EngineError::Startup {
+            status: "exit 1".to_string(),
+            log: "cannot create profile directory: permission denied".to_string(),
+        };
+        assert!(!is_sandbox_failure(&profile));
+        let handshake = EngineError::Handshake("websocket reset".to_string());
+        assert!(!is_sandbox_failure(&handshake));
+    }
+
+    /// Chromium's own sandbox signatures ARE classified.
+    #[test]
+    fn sandbox_signatures_are_classified() {
+        let sandbox = EngineError::Startup {
+            status: "exit 6".to_string(),
+            log: "sandbox initialization failed: Operation not permitted".to_string(),
+        };
+        assert!(is_sandbox_failure(&sandbox));
+        let namespace = EngineError::Startup {
+            status: "exit 1".to_string(),
+            log: "Failed to move to new namespace".to_string(),
+        };
+        assert!(is_sandbox_failure(&namespace));
+    }
+
+    /// The opt-in is explicit and off by default.
+    #[test]
+    fn no_sandbox_requires_an_explicit_opt_in() {
+        let previous = std::env::var_os("BSH_BROWSER_NO_SANDBOX");
+        std::env::remove_var("BSH_BROWSER_NO_SANDBOX");
+        assert!(!no_sandbox_opt_in());
+        std::env::set_var("BSH_BROWSER_NO_SANDBOX", "1");
+        assert!(no_sandbox_opt_in());
+        std::env::set_var("BSH_BROWSER_NO_SANDBOX", "0");
+        assert!(!no_sandbox_opt_in());
+        match previous {
+            Some(value) => std::env::set_var("BSH_BROWSER_NO_SANDBOX", value),
+            None => std::env::remove_var("BSH_BROWSER_NO_SANDBOX"),
+        }
     }
 }

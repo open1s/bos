@@ -1097,6 +1097,8 @@
 "right.terminal.policyError": "Policy error"
 "right.terminal.unsandboxed": "Not sandboxed: the sandbox cannot host the pane's terminal, so only the input policy gates this shell"
 "right.terminal.ptyNotHostable": "Ghostty creates the pane's PTY, so the sandbox cannot join it"
+"right.terminal.unconfinedRelease": "This turn is confined, but the terminal backend cannot host a sandboxed shell. The shell would run with your full user privileges. Release confinement explicitly to start it, or use a full-access turn."
+"right.terminal.releaseButton": "Release confinement and start shell"
 "right.terminal.sandboxOff": "Not sandboxed: a preset turned the sandbox off, so this shell has no filesystem confinement and ignores the egress allowlist; the tool-boundary policy still applies"
 "right.terminal.sandboxOffSettings": "Not sandboxed: the sandbox is turned off in settings, so this shell has no filesystem confinement and ignores the egress allowlist; the tool-boundary policy still applies"
 "right.terminal.sandboxTier": "sandbox: {tier}"

@@ -208,6 +208,10 @@ pub struct BackgroundJob {
     /// The status a waiter or a kill decided, held unpublished until the
     /// writers above have drained (or the drain bound has expired).
     outcome: Option<JobStatus>,
+    /// A kill owns this job's settlement: the waiter must not publish a
+    /// natural-exit status while the kill is confirming the termination,
+    /// or the race would report a kill-induced exit as a plain failure.
+    kill_requested: bool,
 }
 
 impl BackgroundJob {
@@ -394,6 +398,7 @@ impl JobRegistry {
             cwd: cwd.into(),
             writers: 0,
             outcome: None,
+            kill_requested: false,
         });
         state.version += 1;
         // The oldest job goes first. A running one is signalled after the lock
@@ -451,7 +456,7 @@ impl JobRegistry {
             return false;
         };
         let job = &mut state.jobs[index];
-        if !job.status.is_running() || job.outcome.is_some() {
+        if !job.status.is_running() || job.outcome.is_some() || job.kill_requested {
             return false;
         }
         job.outcome = Some(status);
@@ -466,22 +471,24 @@ impl JobRegistry {
         true
     }
 
-    /// Stop a running job process group and settle it as [JobStatus::Killed].
+    /// Stop a running job's process tree and settle it as [JobStatus::Killed].
     ///
     /// Returns false for an unknown or already settled job, which is also what a
-    /// second kill reports. On true the job is settled when this returns: the
-    /// kill signal goes out first, then the call waits (bounded by the module's
+    /// second kill reports. The termination runs FIRST and must be confirmed:
+    /// only a tree the host proved empty is published as Killed; a termination
+    /// that cannot be confirmed settles as [JobStatus::Failed] instead, so a
+    /// live process is never reported killed (issue #312). On true the job is
+    /// settled when this returns: the call then waits (bounded by the module's
     /// drain grace) for the pipes to drain, so the output readable under the
-    /// Killed status is the command's output up to the kill. A process that
+    /// settled status is the command's output up to the kill. A process that
     /// survives the signal, or one the command left holding the pipe, cannot
     /// make the stop spin forever: the bound settles with what was captured.
     pub fn kill(&self, id: &str) -> bool {
-        let (pid, published) = {
+        let pid = {
             let mut state = self.lock();
-            let Some(index) = state.jobs.iter().position(|job| job.id == id) else {
+            let Some(job) = state.jobs.iter_mut().find(|job| job.id == id) else {
                 return false;
             };
-            let job = &mut state.jobs[index];
             if !job.status.is_running() || job.outcome.is_some() {
                 return false;
             }
@@ -491,22 +498,40 @@ impl JobRegistry {
             let Some(pid) = job.pid else {
                 return false;
             };
-            job.outcome = Some(JobStatus::Killed);
+            job.kill_requested = true;
+            pid
+        };
+        let confirmed = kill_group(pid);
+        let outcome = if confirmed {
+            JobStatus::Killed
+        } else {
+            JobStatus::Failed { code: -1 }
+        };
+        let published = {
+            let mut state = self.lock();
+            let Some(index) = state.jobs.iter().position(|job| job.id == id) else {
+                return false;
+            };
+            let job = &mut state.jobs[index];
+            // A natural exit may have won the race while the termination ran;
+            // the first outcome still wins.
+            if !job.status.is_running() || job.outcome.is_some() {
+                return false;
+            }
+            job.outcome = Some(outcome);
             let published = job.writers == 0 && publish_settled(job);
             if published {
                 state.version += 1;
             }
-            (pid, published)
+            published
         };
         if published {
             self.settled.notify_all();
-        }
-        kill_group(pid);
-        if !published {
+        } else {
             // Output the killed command had already written may still be in a
             // pipe. Settle only after the readers appended it, or at the drain
-            // bound, so a reader that sees Killed sees the complete-to-kill
-            // capture.
+            // bound, so a reader that sees the settled status sees the
+            // complete-to-kill capture.
             self.settle_after_writers(id, DRAIN_GRACE);
         }
         true
@@ -725,53 +750,23 @@ pub fn owned_by(job: &JobSummary, session: &str) -> bool {
 
 /// Whether a process id is still alive, used by the kill probe.
 ///
-/// The check is kill -0, which asks the kernel without delivering a signal.
+/// Delegates to the shared process runtime: kill -0 on Unix, the exit-code
+/// query on Windows. The old non-Unix stub returned false unconditionally,
+/// which made a Windows kill report success without checking anything
+/// (issue #312).
 pub fn pid_exists(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        std::process::Command::new("/bin/kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    hostkit::proc::pid_alive(pid)
 }
 
-/// Signal a job process group, gracefully and then forcefully.
+/// Terminate a job's whole process tree and CONFIRM it is gone.
 ///
-/// The child is spawned as its own process group, so the negative pid reaches
-/// the shell and every command it started. A group that ignores SIGTERM is sent
-/// SIGKILL after a short grace period; the escalation runs off the caller so a
-/// kill never blocks a render or a tool call.
-fn kill_group(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("/bin/kill")
-            .args(["-TERM", &format!("-{pid}")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(2));
-            if pid_exists(pid) {
-                let _ = std::process::Command::new("/bin/kill")
-                    .args(["-KILL", &format!("-{pid}")])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-        });
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-    }
+/// The child is spawned inside its own ownership boundary (a process group
+/// on Unix, a kill-on-close Job Object on Windows), so termination reaches
+/// the shell and every command it started. Returns whether the boundary was
+/// confirmed empty: a caller must never publish "killed" on false.
+fn kill_group(pid: u32) -> bool {
+    let owner = hostkit::proc::TreeOwner::from_pid(pid);
+    owner.kill(Duration::from_millis(500))
 }
 
 /// A registry shared by a tool and the view that draws it.

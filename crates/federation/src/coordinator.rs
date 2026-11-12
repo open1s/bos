@@ -235,22 +235,15 @@ impl Coordinator {
         }
     }
 
-    /// Write the membership atomically.
+    /// Write the membership atomically, owner-only on every host
+    /// (issue #299): membership records who governs the federation, so they
+    /// get the same private policy as the peer authorization store.
     pub fn save(&self, path: &std::path::Path) -> Result<(), CoordinatorError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| CoordinatorError::Storage {
-                path: parent.display().to_string(),
+        hostkit::fspriv::write_private(path, self.to_json().as_bytes()).map_err(|error| {
+            CoordinatorError::Storage {
+                path: path.display().to_string(),
                 message: error.to_string(),
-            })?;
-        }
-        let temporary = path.with_extension("json.part");
-        std::fs::write(&temporary, self.to_json()).map_err(|error| CoordinatorError::Storage {
-            path: temporary.display().to_string(),
-            message: error.to_string(),
-        })?;
-        std::fs::rename(&temporary, path).map_err(|error| CoordinatorError::Storage {
-            path: path.display().to_string(),
-            message: error.to_string(),
+            }
         })
     }
 }

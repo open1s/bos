@@ -74,6 +74,16 @@ pub enum McpError {
     #[error("Not initialized")]
     NotInitialized,
 
+    /// The call exceeded its deadline (issue #331). The connection is
+    /// retired: a late response must not be misattributed to a later call.
+    #[error("MCP call {method} timed out after {ms}ms; the connection was retired")]
+    Timeout {
+        /// The JSON-RPC method that timed out.
+        method: String,
+        /// The deadline in milliseconds.
+        ms: u64,
+    },
+
     /// The `initialize` handshake failed.
     #[error("Initialization failed: {0}")]
     InitFailed(String),
@@ -97,6 +107,12 @@ pub struct McpClient {
     last_error: std::sync::Mutex<Option<String>>,
     restart_count: std::sync::atomic::AtomicU32,
     last_communication: std::sync::Mutex<Option<Instant>>,
+    /// The per-call deadline, including time spent waiting for the transport
+    /// lock (issue #331).
+    call_timeout: Duration,
+    /// Set when a call was abandoned at its deadline: the response stream is
+    /// ambiguous, so further calls refuse until restart() re-establishes it.
+    retired: std::sync::atomic::AtomicBool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -129,6 +145,8 @@ impl McpClient {
             last_error: std::sync::Mutex::new(None),
             restart_count: std::sync::atomic::AtomicU32::new(0),
             last_communication: std::sync::Mutex::new(None),
+            call_timeout: Duration::from_secs(60),
+            retired: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -159,10 +177,20 @@ impl McpClient {
             last_error: std::sync::Mutex::new(None),
             restart_count: std::sync::atomic::AtomicU32::new(0),
             last_communication: std::sync::Mutex::new(None),
+            call_timeout: Duration::from_secs(60),
+            retired: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Perform the MCP handshake and return the server capabilities.
+    /// Set the per-call deadline (issue #331). Applies to every call,
+    /// including the wait for the shared transport lock.
+    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
+        self
+    }
+
+    /// Run the MCP initialize handshake and cache the server capabilities.
     pub async fn initialize(&self) -> Result<ServerCapabilities, McpError> {
         if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(McpError::InitFailed("Already initialized".into()));
@@ -257,6 +285,11 @@ impl McpClient {
 
         // Reset initialized flag to allow re-initialization
         self.initialized
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // A restart re-establishes the exchange, so an abandoned request's
+        // retirement no longer applies (issue #331).
+        self.retired
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
         // Clear capabilities to force re-fetch
@@ -441,6 +474,39 @@ impl McpClient {
     }
 
     async fn call(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<JsonRpcResponse, McpError> {
+        // A retired connection's response stream is ambiguous: a late reply
+        // to the abandoned request could be misattributed to this one. Refuse
+        // until restart() re-establishes the exchange (issue #331).
+        if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(McpError::Protocol(
+                "MCP connection retired after an abandoned request; restart the server before calling again"
+                    .to_string(),
+            ));
+        }
+        match tokio::time::timeout(self.call_timeout, self.call_inner(method, params)).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                self.retired
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let message = format!(
+                    "call {method} exceeded {}ms; connection retired",
+                    self.call_timeout.as_millis()
+                );
+                *self.state.lock().unwrap() = ConnectionState::Failed(message.clone());
+                *self.last_error.lock().unwrap() = Some(message);
+                Err(McpError::Timeout {
+                    method: method.to_string(),
+                    ms: self.call_timeout.as_millis() as u64,
+                })
+            }
+        }
+    }
+
+    async fn call_inner(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
@@ -637,5 +703,32 @@ mod tests {
         let err = McpClient::parse_prompt_result(serde_json::json!({"messages": "nope"}))
             .expect_err("wrong shape refused");
         assert!(err.to_string().contains("malformed prompts/get result"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod deadline_tests {
+    use super::*;
+
+    /// A server that accepts the spawn but never answers: the call must hit
+    /// its deadline, return a typed timeout, and retire the connection so a
+    /// late response cannot be misattributed (issue #331).
+    #[tokio::test]
+    async fn a_hung_server_times_out_and_retires_the_connection() {
+        let client = McpClient::spawn_with("sh", &["-c", "sleep 30"], &[], None)
+            .await
+            .expect("spawn");
+        let client = client.with_call_timeout(Duration::from_millis(300));
+        let error = client.initialize().await.unwrap_err();
+        assert!(
+            matches!(error, McpError::Timeout { .. }),
+            "expected a typed timeout, got {error:?}"
+        );
+        // The connection is retired: the next call refuses without waiting.
+        let error = client.list_tools().await.unwrap_err();
+        assert!(
+            error.to_string().contains("retired"),
+            "expected retirement refusal, got {error:?}"
+        );
     }
 }

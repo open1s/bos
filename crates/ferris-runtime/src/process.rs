@@ -48,9 +48,10 @@ struct ProcessSession {
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     token: String,
-    /// The group id, captured while the handle exists.
-    #[cfg(unix)]
-    pid: u32,
+    /// The process-tree ownership boundary: a process group on Unix, a
+    /// kill-on-close Job Object on Windows (issue #316). Held for the
+    /// session's whole life so no descendant can outlive it.
+    owner: hostkit::proc::TreeOwner,
 }
 
 /// Kill the session child through the platform handle.
@@ -86,23 +87,18 @@ impl ProcessSession {
     /// cannot be recycled, so the group is safe to signal; once it exited, the
     /// group is signalled only when no live process owns that pid.
     fn terminate(&mut self) {
-        #[cfg(unix)]
-        if self.pid != 0 {
-            // Kill the GROUP before reaping the leader. While the leader is an
-            // unreaped zombie its pid, and therefore its pgid, cannot be
-            // recycled, so a descendant that outlived the leader is still in
-            // THIS session's group. Asking whether the leader's pid is still
-            // live answers the wrong question: the leader can be gone while the
-            // group survives.
-            //
-            // SAFETY: this session spawned the group leader.
-            unsafe {
-                libc::killpg(self.pid as libc::pid_t, libc::SIGKILL);
-            }
-            // Reap now so the zombie does not linger past the drop.
-            let _ = self.child.try_wait();
+        // One contract on every host: terminate the whole ownership boundary
+        // (group / job), bounded, then reap the root. The old Windows path
+        // killed only the direct child and left descendants running (#316).
+        let confirmed = self.owner.kill(Duration::from_millis(200));
+        if !confirmed {
+            log::warn!(
+                target: "bsh::extension",
+                "process session termination could not be confirmed empty"
+            );
         }
         start_kill(&mut self.child);
+        let _ = self.child.try_wait();
     }
 
     async fn request(
@@ -1141,18 +1137,64 @@ impl ProcessRuntime {
         if let Ok(exe) = std::env::current_exe() {
             command.env("BSH_BIN", exe);
         }
-        for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
+        // The platform baseline, not a Unix-only allowlist: Windows children
+        // need SystemRoot, the profile and temp variables to start at all.
+        for (key, value) in hostkit::env::EnvMap::baseline().iter() {
+            command.env(key, value);
         }
         for (key, value) in &self.env {
             command.env(key, value);
         }
+        // Windows: create the child SUSPENDED so it cannot spawn a descendant
+        // before it is inside the kill-on-close job; adopt_suspended assigns
+        // and resumes it, failing closed if the boundary cannot be built.
+        #[cfg(windows)]
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
         let mut child = command.spawn().map_err(|source| ExtensionError::Io {
             path: program.clone(),
             source,
         })?;
+        let owner = match child_id(&child) {
+            Some(pid) => {
+                #[cfg(windows)]
+                {
+                    let handle = child.raw_handle().ok_or_else(|| ExtensionError::Io {
+                        path: program.clone(),
+                        source: std::io::Error::other("suspended child has no process handle"),
+                    })?;
+                    let memory = (self.memory_bytes > 0).then_some(self.memory_bytes);
+                    match hostkit::proc::adopt_suspended(pid, handle, memory) {
+                        Ok(owner) => owner,
+                        Err(err) => {
+                            // Fail closed: an unowned child must not run.
+                            start_kill(&mut child);
+                            let _ = child.wait().await;
+                            return Err(ExtensionError::Io {
+                                path: program.clone(),
+                                source: err,
+                            });
+                        }
+                    }
+                }
+                #[cfg(unix)]
+                {
+                    // The pre_exec hook already called setpgid(0, 0).
+                    hostkit::proc::TreeOwner::from_pid(pid)
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    hostkit::proc::TreeOwner::from_pid(pid)
+                }
+            }
+            None => {
+                start_kill(&mut child);
+                let _ = child.wait().await;
+                return Err(ExtensionError::Io {
+                    path: program.clone(),
+                    source: std::io::Error::other("child has no pid to own"),
+                });
+            }
+        };
         if let Some(pid) = child_id(&child) {
             self.child_pid.store(pid, Ordering::Relaxed);
             #[cfg(unix)]
@@ -1207,8 +1249,7 @@ impl ProcessRuntime {
             });
         }
         let mut session = ProcessSession {
-            #[cfg(unix)]
-            pid: child_id(&child).unwrap_or(0),
+            owner,
             child,
             stdin,
             stdout: BufReader::new(stdout),

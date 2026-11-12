@@ -12,6 +12,7 @@ default = []
 tokio = ["dep:tokio"]
 
 [dependencies]
+hostkit = { path = "../hostkit" }
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true

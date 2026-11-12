@@ -217,13 +217,32 @@ impl WorkspaceSettings {
         }
     }
 
-    /// Write a workspace's settings file, creating its directory.
+    /// Write a workspace's settings file atomically, creating its directory.
+    ///
+    /// A sibling temp file is fsynced and renamed over the target, so a crash
+    /// mid-write leaves the previous document intact (issue #310).
     pub(crate) fn save(&self, path: &Path) -> Result<(), SettingsError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| SettingsError::Io(e.to_string()))?;
-        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| SettingsError::Io("settings path has no parent".to_string()))?;
+        std::fs::create_dir_all(parent).map_err(|e| SettingsError::Io(e.to_string()))?;
         let text = self.to_toml()?;
-        std::fs::write(path, text).map_err(|e| SettingsError::Io(e.to_string()))
+        let tmp = parent.join(format!(
+            ".{}.tmp-{}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "settings".to_string()),
+            std::process::id()
+        ));
+        let result = (|| -> Result<(), SettingsError> {
+            std::fs::write(&tmp, &text).map_err(|e| SettingsError::Io(e.to_string()))?;
+            std::fs::rename(&tmp, path).map_err(|e| SettingsError::Io(e.to_string()))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// Render the workspace settings as TOML.

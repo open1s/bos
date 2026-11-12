@@ -10,7 +10,7 @@
 //! [AuditLedger::checkpoint] names the latest hash, and
 //! [AuditLedger::verify_against] refuses a chain whose last hash moved.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -115,14 +115,14 @@ impl AuditLedger {
                 ));
             }
         };
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
+        // Owner-only on every host (issue #299): mode 0600 at creation on
+        // Unix, then hardened again so an existing world-readable ledger is
+        // repaired and Windows gets a protected owner-only DACL. Fail closed
+        // if the policy cannot be established.
+        let mut options = hostkit::fspriv::private_open_options();
+        options.truncate(false).append(true);
         let writer = options.open(&path)?;
+        hostkit::fspriv::private_permissions(&path)?;
         Ok(Self {
             path,
             guard: Mutex::new(LedgerState {
@@ -182,19 +182,17 @@ impl AuditLedger {
                 .with_extension(format!("{suffix}.{counter}.jsonl"));
         }
         std::fs::rename(&self.path, &archive)?;
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
+        // The fresh segment gets the same owner-only policy as open()
+        // (issue #299), on creation and before any entry is appended.
+        let mut options = hostkit::fspriv::private_open_options();
+        options.truncate(false).append(true);
         state.writer = options.open(&self.path)?;
+        hostkit::fspriv::private_permissions(&self.path)?;
         state.seq = 0;
         // The first entry of the new segment chains from the archived tail.
         state.last_hash = head.clone();
         let head_path = self.path.with_extension("head");
-        if let Err(error) = std::fs::write(&head_path, &head) {
+        if let Err(error) = hostkit::fspriv::write_private(&head_path, head.as_bytes()) {
             tracing::warn!("ledger head was not written: {error}");
         }
         Ok(archive)
@@ -263,28 +261,16 @@ impl AuditLedger {
         })
     }
 
-    /// Write the last hash to an external checkpoint file with 0600 mode.
+    /// Write the last hash to an external checkpoint file, owner-only on
+    /// every host (issue #299): Unix mode 0600, Windows a protected
+    /// owner-only DACL, atomically replacing any previous checkpoint.
     pub fn checkpoint_to(
         path: &Path,
         checkpoint_path: &Path,
     ) -> Result<Option<String>, LedgerError> {
         let hash = Self::checkpoint(path)?;
         if let Some(hash) = &hash {
-            if let Some(parent) = checkpoint_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| LedgerError::Io(error.to_string()))?;
-            }
-            let mut options = OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
-            }
-            let mut file = options
-                .open(checkpoint_path)
-                .map_err(|error| LedgerError::Io(error.to_string()))?;
-            file.write_all(hash.as_bytes())
+            hostkit::fspriv::write_private(checkpoint_path, hash.as_bytes())
                 .map_err(|error| LedgerError::Io(error.to_string()))?;
         }
         Ok(hash)

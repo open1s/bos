@@ -91,21 +91,14 @@ impl CompensationQueue {
         }
     }
 
-    /// Write the queue atomically with private permissions.
+    /// Write the queue atomically with owner-only permissions on every host
+    /// (issue #299): Unix mode 0600, Windows a protected owner-only DACL.
+    /// A failure to establish the private policy fails the save.
     pub fn save(&self) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
         let text =
             serde_json::to_string_pretty(&self.entries).map_err(|error| error.to_string())?;
-        let temporary = self.path.with_extension("json.tmp");
-        std::fs::write(&temporary, text).map_err(|error| error.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&temporary, &self.path).map_err(|error| error.to_string())
+        hostkit::fspriv::write_private(&self.path, text.as_bytes())
+            .map_err(|error| error.to_string())
     }
 
     /// The file this queue persists to.
