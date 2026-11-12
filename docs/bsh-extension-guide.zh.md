@@ -61,6 +61,7 @@
 | [bsh-subagents.md](bsh-subagents.md) | 子代理 | 设计说明 |
 | [bsh-terminal-policy.md](bsh-terminal-policy.md) | 终端策略 | 规范 |
 | [BOS-BSH-Textbook.md](BOS-BSH-Textbook.md) | 英文案例书（逐项查证） | 与本书互补 |
+| [bsh-extension-encyclopedia.zh.md](bsh-extension-encyclopedia.zh.md) | 中文查阅型大全（4.1.8，含 surface 1.1 与 4.x 新面） | 参考手册，与本书互补 |
 | [examples/extensions](../examples/extensions) | 可运行示例 | 代码 |
 
 阅读建议：先读本书建立主线，再按需查规范原文；设计文档里"计划/目标态"的

@@ -7656,6 +7656,45 @@ impl Render for Shell {
                     }
                 }),
             )
+            // The top strip is the window's title bar on the hosts that do not
+            // move a frameless window for the platform (see window_chrome).
+            // The press only ARMS the move: the strip also carries real
+            // controls, and taking the pointer on the press would turn their
+            // clicks into window drags. The first motion starts the move.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, event: &MouseDownEvent, window, _cx| {
+                    super::window_chrome::strip_pressed(event, window);
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, _cx| {
+                // A seam drag owns the pointer from its own press, and the seam
+                // handles start at y=0, inside the strip: while one is live the
+                // move belongs to the seam and never to the window.
+                let seam = this.sidebar_drag.is_some()
+                    || this.right.drag.is_some()
+                    || this.chat_drag.is_some();
+                if seam {
+                    super::window_chrome::disarm_drag();
+                } else {
+                    super::window_chrome::drag_moved(event, window);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|_this, _event: &MouseUpEvent, _window, _cx| {
+                    super::window_chrome::disarm_drag();
+                }),
+            )
+            // A release outside the window never reaches the element the press
+            // landed on; the frame still hears it, and the arm must not outlive
+            // the gesture.
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|_this, _event: &MouseUpEvent, _window, _cx| {
+                    super::window_chrome::disarm_drag();
+                }),
+            )
             // The session menu's accelerators, handled at the frame so they work
             // from wherever focus sits inside it - the composer, a field, a list
             // row. They act on the session the reader has open.
@@ -7737,6 +7776,13 @@ impl Render for Shell {
             .when_some(confirm_vault_delete, |root, confirm| root.child(confirm))
             .when_some(trash, |root, panel| root.child(panel))
             .when_some(image_lightbox, |root, lightbox| root.child(lightbox))
+            // The drawn window buttons are the last children, the way AppKit
+            // keeps its own lights above the content: a modal that dims the
+            // shell must not dim the one control that closes the window.
+            .when_some(
+                super::window_chrome::buttons(window, cx),
+                |root, buttons| root.child(buttons),
+            )
             // The frame clock: a zero-size canvas painted last, so the value it
             // records covers this frame's render, layout, prepaint and paint.
             // Appended only while the trace is open; with it off this is one

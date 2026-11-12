@@ -36938,3 +36938,112 @@ fn a_long_message_still_selects(cx: &mut TestAppContext) {
         "a message longer than the body-cache cap must still select, got {selected:?}"
     );
 }
+
+/// The window's own buttons belong to the host on macOS: AppKit draws them over
+/// the strip, so the shell must not stack a second set in the same corner.
+#[cfg(target_os = "macos")]
+#[gpui::test]
+fn macos_draws_no_window_buttons_of_its_own(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("no-drawn-buttons");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for id in [
+        "window-buttons",
+        "window-close",
+        "window-minimize",
+        "window-zoom",
+    ] {
+        assert!(
+            cx.debug_bounds(id).is_none(),
+            "the shell must not draw {id} over AppKit's own buttons"
+        );
+    }
+}
+
+/// The empty stretches of the title strip are the window's drag surface on the
+/// hosts that do not move a frameless window for us (see window_chrome). They
+/// are laid out on every host, so the rule that matters is assertable here:
+/// a grip never overlaps the buttons' corner, and it stays inside its own
+/// strip instead of leaking over the controls beside it.
+#[gpui::test]
+fn the_title_bar_grips_are_clear_of_the_window_buttons(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("titlebar-grips");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    draw_until(cx, "the title-bar grips render", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("side-titlebar-grip").is_some()
+            && cx.debug_bounds("hdr-titlebar-grip").is_some()
+            && cx.debug_bounds("hdr-tabs-grip").is_some()
+            && cx.debug_bounds("hdr-title-grip").is_some()
+    });
+
+    let inset = crate::theme::traffic_light_inset();
+    let corner = gpui_kit::Bounds::new(
+        gpui_kit::point(px(0.0), px(0.0)),
+        gpui_kit::size(px(inset.right), px(inset.bottom)),
+    );
+
+    let side = cx
+        .debug_bounds("side-titlebar-grip")
+        .expect("the sidebar strip renders");
+    assert_eq!(
+        side.origin.y,
+        px(6.0),
+        "the grip starts at the sidebar root's own top padding: {side:?}"
+    );
+    assert_eq!(
+        side.size.height,
+        px(inset.bottom - 2.0),
+        "the strip's 2px bottom pad is not title bar: {side:?}"
+    );
+    assert_eq!(
+        side.origin.x,
+        px(inset.right),
+        "the grip starts exactly where the buttons' reserve ends: {side:?}"
+    );
+    assert!(
+        !rects_overlap(side, corner),
+        "a press on the grip can never land on a window button: {side:?}"
+    );
+
+    let title = cx
+        .debug_bounds("hdr-title-grip")
+        .expect("the header's title crumb renders");
+    assert!(
+        !rects_overlap(title, corner),
+        "the title crumb is not under the window buttons: {title:?}"
+    );
+    assert_eq!(
+        title.size.height,
+        px(20.0),
+        "the grip is the crumb itself, at its measured line height: {title:?}"
+    );
+
+    let tabs = cx
+        .debug_bounds("hdr-tabs-grip")
+        .expect("the strip's stretch after the tabs renders");
+    assert!(
+        f32::from(tabs.origin.x) >= inset.right,
+        "the stretch starts right of the corner: {tabs:?}"
+    );
+
+    let fold = cx
+        .debug_bounds("side-fold")
+        .expect("the fold control still renders");
+    assert_eq!(
+        fold.size.width,
+        px(28.0),
+        "the fold keeps its measured size"
+    );
+    assert!(
+        f32::from(fold.origin.x) >= f32::from(side.origin.x) + f32::from(side.size.width),
+        "the grip ends where the fold control starts: grip {side:?}, fold {fold:?}"
+    );
+}

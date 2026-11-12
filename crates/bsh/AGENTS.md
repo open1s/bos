@@ -4179,3 +4179,63 @@ report was "BSH first click mark take time".
   next `\n    }` after a loop lands on some later block's brace, which reads as a
   2 s "skills" phase when the work is elsewhere; put the marker immediately after
   the block you mean.
+
+
+## Round 140: the window's own buttons and drag, on the hosts that lack them
+
+`ui::run` opens a frameless window so the reference's content starts at y=0 and its
+three window buttons sit in the sidebar's own 52px strip, which macOS does through
+`TitlebarOptions::traffic_light_position`. Windows and Linux have no such service: a
+transparent titlebar there is a window with no caption buttons (gpui-pre never sets
+`WS_CAPTION`, and its `WindowOptions::window_decorations` field has no consumer) and no
+region the platform will move. The reported `system buttons disappeared` and `the whole
+window cannot move` were both true, and both live in the band the layout already
+reserves (`theme::traffic_light_inset`).
+
+`ui/window_chrome.rs` owns the two missing pieces:
+
+- **The buttons.** Drawn at the measured `TRAFFIC_LIGHTS_ORIGIN`, a 20px hit cell
+  around the 12px mark, when `draws_buttons_for(host, decorations)` says the host has
+  none: Windows always (a transparent titlebar removes the caption and nothing puts it
+  back), Linux only under client-side decorations (a server-decorated window already
+  carries the window manager's buttons), macOS never (AppKit's own).
+- **The drag.** Linux has no non-client frame, so `start_window_move` is the seam, and
+  it must run on the first MOTION of a press on the strip, not on the press: the strip
+  also carries the fold control, the tabs and the header's chips, and taking the pointer
+  at press time turns each of their clicks into a window drag. Windows has no
+  `start_window_move` at all (a no-op in gpui-pre-windows); it moves a window from the
+  region under the pointer that answers `HTCAPTION`, i.e. an
+  `InteractiveElement::window_control_area(Drag)` hitbox, so every empty stretch of
+  the strip is a grip. The buttons answer `Min`/`Max`/`Close`, which the Windows
+  backend turns back into the real operations (and `WM_CLOSE`, so the
+  settle-before-exit path still runs).
+
+Measured on the running macOS build (`agent-desktop drag`, window origin read back):
+dragging the strip's empty width moves the window by the pointer delta, so the strip is
+the holding area the report marks. The Linux/Windows wiring has no local runtime; it was
+compile-checked (see the traps).
+
+Evidence: `window_chrome::tests` pins the platform matrix (`draws_buttons_for`), the
+button geometry inside the reserved zone, and the strip rule (`is_strip`);
+`shell_tests::the_title_bar_grips_are_clear_of_the_window_buttons` proves every grip is
+laid out clear of the buttons' corner and inside its own strip;
+`shell_tests::macos_draws_no_window_buttons_of_its_own` keeps the macOS build from
+stacking a second set over AppKit's.
+
+Traps worth keeping:
+
+- A `#[cfg(target_os = "linux")]` branch is not compiled on this host, so a typo there
+  survives `cargo test`. Flipping that cfg onto the host and disabling the fallback arm
+  is a two-minute compile check; both wirings passed it.
+- The two hit-test consumers order differently: a normal click goes to the topmost
+  hitbox, but `handle_hit_test_msg` walks `window_control_hitboxes` in PAINT order and
+  returns the first match, so a parent `Drag` region under a button wins over the
+  button. That is why the corner's drag band is macOS-only and the grips are empty
+  elements: a caption region swallows its children's clicks.
+- The seam handles start at y=0 inside the strip, so the frame's window-move guard has
+  to yield while `sidebar_drag`, `right.drag` or `chat_drag` is live, or a seam drag
+  also moves the window.
+- The drawn buttons are painted LAST (after the settings modal and the image lightbox),
+  the way AppKit keeps its lights above the content: a modal must not dim the one
+  control that closes the window.
+

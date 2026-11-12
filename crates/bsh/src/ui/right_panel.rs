@@ -1508,20 +1508,27 @@ impl Shell {
             .flex_none()
             .flex()
             .flex_row()
-            .child(
-                div()
+            .child({
+                let band = div()
                     .debug_selector(|| String::from("titlebar-drag"))
                     .id("titlebar-drag")
                     .w(px(zone.right))
                     .h_full()
-                    .flex_none()
-                    .on_mouse_down(MouseButton::Left, |_event, window, _cx| {
-                        // The same call AppKit's titlebar makes for a
-                        // system-dragged window: the band reads as the title
-                        // bar, not as a control.
+                    .flex_none();
+                // This band is the window's corner. macOS moves the window from
+                // a press here (the same call AppKit's titlebar makes for a
+                // system-dragged window), with the native buttons drawn over
+                // it. On the other hosts the corner carries BSH's own buttons
+                // (window_chrome), so the press must reach them, and the move
+                // belongs to the strip's own drag instead.
+                if cfg!(target_os = "macos") {
+                    band.on_mouse_down(MouseButton::Left, |_event, window, _cx| {
                         window.start_window_move();
-                    }),
-            )
+                    })
+                } else {
+                    band
+                }
+            })
             .child(self.right_panel_bar(cx, true))
     }
 
@@ -1766,7 +1773,16 @@ impl Shell {
             };
             strip = strip.child(chip);
         }
-        strip = strip.child(div().flex_1());
+        // The stretch after the last chip is the panel bar's empty width, so
+        // it drags the window like the header's does (Windows takes the move
+        // from a caption region; the other hosts already have it).
+        strip = strip.child(super::window_chrome::drag_grip(
+            div()
+                .id("right-strip-grip")
+                .debug_selector(|| String::from("right-strip-grip"))
+                .h_full()
+                .flex_1(),
+        ));
         if plan.overflow {
             strip = strip.child(self.tab_catalog(cx));
         }

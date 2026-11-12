@@ -12,6 +12,7 @@ Related documents:
 - Extension WIT contract: [../crates/bsh/wit/extension.wit](../crates/bsh/wit/extension.wit)
 - Runnable examples: [../examples/extensions](../examples/extensions)
 - Chinese course-style textbook: [bsh-extension-guide.zh.md](bsh-extension-guide.zh.md)
+- Chinese lookup reference (4.1.8, includes surface 1.1 and 4.x UI): [bsh-extension-encyclopedia.zh.md](bsh-extension-encyclopedia.zh.md)
 
 ## 1. What an extension is
 

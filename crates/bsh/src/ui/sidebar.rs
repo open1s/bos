@@ -313,6 +313,18 @@ impl Shell {
             .flex_row()
             .items_center()
             .justify_end()
+            // The empty width between the window buttons and the fold control
+            // is the strip's drag surface on Windows, which moves a frameless
+            // window from the region that answers HTCAPTION. It starts past the
+            // buttons (the row's left pad is the inset less the sidebar's own),
+            // so a press here can never land on one.
+            .child(super::window_chrome::drag_grip(
+                div()
+                    .id("side-titlebar-grip")
+                    .debug_selector(|| String::from("side-titlebar-grip"))
+                    .h_full()
+                    .flex_1(),
+            ))
             .child(
                 div()
                     .id("side-fold")

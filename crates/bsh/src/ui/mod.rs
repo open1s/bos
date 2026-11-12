@@ -38,6 +38,7 @@ pub(crate) mod terminal_view;
 pub(crate) mod todo_panel;
 pub(crate) mod trajectory;
 pub(crate) mod transcript;
+pub(crate) mod window_chrome;
 
 use gpui_kit::*;
 

@@ -579,11 +579,17 @@ impl Shell {
                 )
             })
             .child(
-                // Measured: the current crumb is 14px/20px at weight 500, label-primary.
-                txt(title, theme::BODY_SIZE, theme::text())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .line_height(px(20.0))
-                    .truncate(),
+                // Measured: the current crumb is 14px/20px at weight 500,
+                // label-primary. It is plain text, so it is also the largest
+                // empty stretch of the title row for the strip's drag.
+                super::window_chrome::drag_grip(
+                    txt(title, theme::BODY_SIZE, theme::text())
+                        .id("hdr-title-grip")
+                        .debug_selector(|| String::from("hdr-title-grip"))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .line_height(px(20.0))
+                        .truncate(),
+                ),
             )
             // DSH's header names the agent preset after the title, before the
             // background-jobs chip. The hero phase draws the same chip in its
@@ -624,7 +630,16 @@ impl Shell {
                 )
             })
             .children(self.subagent_chip(cx))
-            .child(div().flex_1())
+            // The stretch between the chips and the right-hand controls is
+            // empty, so it is part of the strip's drag surface (Windows takes
+            // the move from a caption region; the other hosts already have it).
+            .child(super::window_chrome::drag_grip(
+                div()
+                    .id("hdr-titlebar-grip")
+                    .debug_selector(|| String::from("hdr-titlebar-grip"))
+                    .h_full()
+                    .flex_1(),
+            ))
             // The reference's jobs chip lives in the session header's action
             // cluster, between the title and the right-hand controls, which is
             // why its popover hangs right-aligned under the chip.
@@ -1882,6 +1897,14 @@ impl Shell {
             // safety surface, and hiding it behind a developer preference would
             // make it unreachable exactly when a reader needs it.
             .child(entry("tab-audit", "tab.audit", Tab::Audit, cx))
+            // The rest of the strip is empty, so it drags the window too.
+            .child(super::window_chrome::drag_grip(
+                div()
+                    .id("hdr-tabs-grip")
+                    .debug_selector(|| String::from("hdr-tabs-grip"))
+                    .h_full()
+                    .flex_1(),
+            ))
     }
 
     /// A small square icon button in the title row.
