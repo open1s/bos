@@ -555,12 +555,11 @@ pub(crate) struct BuiltAgent {
     /// array, the way the reference's `contextBreakdown` follows the latest
     /// request header.
     pub(crate) tools_schema_chars: usize,
-    /// Whether this build carries a complete persona.
+    /// Whether the configuration REQUESTED a complete persona.
     ///
-    /// A complete persona replaces the harness identity, the workflow contract
-    /// and every per-tool section, so the shell draws a badge naming it: a
-    /// talk-only or off-contract turn must be attributable to the
-    /// configuration rather than guessed at.
+    /// The request is no longer obeyed - the harness layers are always
+    /// composed - so this drives one thing: the diagnostics badge that names
+    /// the legacy flag and clears it in one click.
     pub(crate) persona_complete: bool,
     /// The installed plugins, for the settings inventory.
     pub(crate) plugins: Vec<PluginInfo>,
@@ -712,6 +711,7 @@ pub(crate) fn build_agent_for_session(
         // send, and the goal tools are added only to a real turn's build.
         None,
         None,
+        ScannedSkills::Register,
     )
 }
 
@@ -795,6 +795,7 @@ pub(crate) fn build_agent_for_session_with_subagents_jobs_and_review(
         browser,
         goal,
         review,
+        ScannedSkills::Register,
     )
 }
 
@@ -810,6 +811,7 @@ fn build_agent_for_session_inner(
     browser: Arc<crate::browser::BrowserHandle>,
     goal: Option<Goal>,
     review: Option<Arc<crate::review::ReviewRuntime>>,
+    scanned_skills: ScannedSkills,
 ) -> BuiltAgent {
     let eff = settings.effective_for(choice);
     // A contributed provider may declare that it needs no credential - an open
@@ -834,16 +836,15 @@ fn build_agent_for_session_inner(
     // text is the whole prompt, so tool guidance is suppressed below too. An
     // empty persona under `complete` falls back to the default composition,
     // because an empty system prompt is never what a persona meant.
+    // A complete persona is the reader's explicit choice: it replaces the
+    // identity, the workflow and the per-tool sections, while the compact
+    // harness execution footer stays. The toggle lives in General and in the
+    // composer's permission menu, and the build reports the state so an
+    // off-contract turn is attributable to the setting.
     let persona_complete = eff.persona_complete && !eff.llm_system_prompt().trim().is_empty();
-    // A complete persona is the reference's sole-section arm: the configured
-    // text is the whole PERSONA, so the harness identity, the standing workflow
-    // and every per-tool section are omitted. BSH keeps one compact execution
-    // footer even then. The runtime action contract already applies to a
-    // complete persona, and this keeps the PROMPT from contradicting it: the
-    // reader may replace the persona, not the harness's safety and work rules.
     if persona_complete {
         log::warn!(
-            "persona complete: session {session} omits the identity, workflow and tool guidance; the harness execution footer still applies"
+            "persona complete: session {session} sends the persona plus the harness execution footer; the identity, workflow and tool guidance are omitted"
         );
     }
     let mut system_prompt =
@@ -1425,8 +1426,14 @@ fn build_agent_for_session_inner(
     // resolved catalogue rather than re-walking the directories is what makes
     // the pane's toggle and the agent's build one fact instead of two scans that
     // agree by luck.
-    for skill in eff.enabled_skills() {
-        let _ = agent.register_skill_manifest(skill.manifest.clone());
+    //
+    // A preview build skips this: registering every manifest is the expensive
+    // part of a build (2.2 s on the 121 skills measured here), and the pane
+    // lists skills from that same cached catalogue instead.
+    if scanned_skills == ScannedSkills::Register {
+        for skill in eff.enabled_skills() {
+            let _ = agent.register_skill_manifest(skill.manifest.clone());
+        }
     }
 
     // Installed extension packages named by a path in the global inventory.
@@ -1637,7 +1644,10 @@ fn build_agent_for_session_inner(
     // finished set here: without it a switched-off package skill stayed in the
     // request while a switched-off scanned skill left, and the menu could not
     // state what the model actually carried.
-    if !settings.workspace.disabled.skills.is_empty() {
+    //
+    // A preview build keeps them instead: its rows ARE the switch, so the one
+    // the reader turned off has to stay on screen to be turned back on.
+    if scanned_skills == ScannedSkills::Register && !settings.workspace.disabled.skills.is_empty() {
         agent.remove_skills_by_names(&settings.workspace.disabled.skills);
     }
     // A trusted peer's capabilities reach the model only when the reader asked
@@ -1760,9 +1770,6 @@ fn build_agent_for_session_inner(
             // caused by the model, the tools or the provider.
             "persona_complete": persona_complete,
             "workflow_contract": !persona_complete,
-            // A complete persona still carries the compact harness footer;
-            // diagnostics must not read the omitted layers as an absent
-            // contract.
             "execution_footer": persona_complete,
             "capabilities": snapshot
                 .as_ref()
@@ -2305,10 +2312,11 @@ pub(crate) fn capabilities(agent: &Agent) -> Vec<CapInfo> {
 /// made that fatal: withdrawing `update_goal` withdrew the only way a running
 /// goal could be closed.
 ///
-/// The preview therefore clears the tool and skill lists, and only those: a
-/// disabled extension still contributes nothing, and a preset still narrows the
-/// tools, because neither of those is a switch THIS pane owns. The meter and
-/// the plugin inventory are priced from the real build, not this preview.
+/// The preview therefore clears the tool switches, and only those: a disabled
+/// extension still contributes nothing, a preset still narrows the tools, and
+/// the skill switches are the catalogue's business, because none of those is a
+/// switch THIS pane owns. The meter and the plugin inventory are priced from
+/// the real build, not this preview.
 #[cfg(test)]
 pub(crate) fn preview_capabilities(
     settings: &Settings,
@@ -2320,6 +2328,13 @@ pub(crate) fn preview_capabilities(
 
 /// Build the preview agent once when a pane needs both the full capability list
 /// and the tool-schema size, instead of building twice.
+///
+/// The preview skips the reader's scanned skills. Registering every manifest in
+/// the enabled sources is the expensive half of a build - measured on this
+/// machine's 121 skills: 2.2 s of a 3.1 s build, against 10 ms warm with the
+/// loop skipped - and the pane lists skills from the resolution it already
+/// holds (the scan is cached there), so registering them again would buy
+/// nothing and cost the whole click.
 pub(crate) fn preview_build(
     settings: &Settings,
     vault: &Vault,
@@ -2327,13 +2342,36 @@ pub(crate) fn preview_build(
 ) -> BuiltAgent {
     let mut preview = settings.clone();
     preview.workspace.disabled.tools.clear();
-    preview.workspace.disabled.skills.clear();
-    build_agent(
+    // The skill switches stay as the reader set them: clearing them changes the
+    // catalogue's fingerprint, and re-scanning every manifest to learn nothing
+    // the pane does not already hold was measured at ~470 ms of the click.
+    // Package skills are kept by skipping the removal in the build instead.
+    build_agent_for_session_inner(
         &preview,
         vault,
         &crate::settings::resolve::SessionChoice::default(),
         mcp,
+        "",
+        None,
+        Arc::new(agent::jobs::JobRegistry::new()),
+        Arc::new(crate::browser::BrowserHandle::new()),
+        None,
+        None,
+        ScannedSkills::Skip,
     )
+}
+
+/// Which of the reader's scanned skills a build registers.
+///
+/// The settings pane lists skills from the cached catalogue, so a build it
+/// triggers only needs the tool roster and the package skills; a turn's build
+/// needs both halves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScannedSkills {
+    /// Register every enabled scanned skill - a turn's build.
+    Register,
+    /// Leave the scanned skills out - the settings pane's preview build.
+    Skip,
 }
 
 /// The workspace root, expanded, when one is configured.
@@ -7431,41 +7469,37 @@ mod tests {
     /// while the compact harness execution footer remains and the tool registry
     /// is untouched. Off stays the slot composition.
     #[test]
-    fn a_complete_persona_keeps_its_text_and_the_harness_footer() {
+    fn a_complete_persona_replaces_the_layers_and_keeps_the_footer() {
         let mut settings = bare();
         settings.global.default_preset = String::new();
         settings.workspace.agent.system_prompt =
             "You are a helpful software engineer assistant.".to_string();
         settings.workspace.agent.complete = true;
         let built = build(&settings);
+        let prompt = &built.agent.config().system_prompt;
         assert!(
-            built
-                .agent
-                .config()
-                .system_prompt
-                .starts_with("You are a helpful software engineer assistant."),
-            "a complete persona is the whole persona text: {}",
-            built.agent.config().system_prompt
+            prompt.starts_with("You are a helpful software engineer assistant."),
+            "the persona is the text: {prompt}"
         );
         assert!(
-            built
-                .agent
-                .config()
-                .system_prompt
-                .ends_with(crate::prompts::COMPLETE_PERSONA_CONTRACT),
-            "the harness execution footer still applies"
+            prompt.ends_with(crate::prompts::COMPLETE_PERSONA_CONTRACT),
+            "the harness execution footer remains"
         );
         assert!(
-            !built
-                .agent
-                .config()
-                .system_prompt
-                .contains(agent::HARNESS_IDENTITY),
-            "the identity layer is still omitted"
+            !prompt.contains(agent::HARNESS_IDENTITY),
+            "the identity layer is omitted"
         );
         assert!(
-            built.agent.config().persona_complete,
-            "the build records the flag it applied"
+            !prompt.contains(agent::WORKFLOW_GUIDANCE),
+            "the standing workflow is omitted"
+        );
+        assert!(
+            !prompt.contains(crate::prompts::READ_FILE),
+            "the per-tool guidance is omitted"
+        );
+        assert!(
+            built.agent.config().persona_complete && built.persona_complete,
+            "the mode is applied and reported"
         );
         // complete is a PROMPT fact, not a tool gate.
         let names = tool_names(&built);
@@ -7489,42 +7523,21 @@ mod tests {
         );
         settings.global.default_preset = "minimal".to_string();
         let built = build(&settings);
+        let prompt = &built.agent.config().system_prompt;
         assert!(
-            built
-                .agent
-                .config()
-                .system_prompt
-                .starts_with("You are terse."),
-            "the preset persona is the text"
+            prompt.starts_with("You are terse."),
+            "the preset persona is the text: {prompt}"
         );
         assert!(
-            built
-                .agent
-                .config()
-                .system_prompt
-                .ends_with(crate::prompts::COMPLETE_PERSONA_CONTRACT),
+            prompt.ends_with(crate::prompts::COMPLETE_PERSONA_CONTRACT),
             "the footer applies to a preset's complete persona too"
         );
-        assert!(!built
-            .agent
-            .config()
-            .system_prompt
-            .contains(agent::HARNESS_IDENTITY));
-        assert!(!built
-            .agent
-            .config()
-            .system_prompt
-            .contains(agent::WORKFLOW_GUIDANCE));
-        assert!(!built
-            .agent
-            .config()
-            .system_prompt
-            .contains(crate::prompts::READ_FILE));
-        assert!(!built
-            .agent
-            .config()
-            .system_prompt
-            .contains(agent::prompts::TOOL_BASH));
+        assert!(!prompt.contains(agent::HARNESS_IDENTITY));
+        assert!(!prompt.contains(agent::WORKFLOW_GUIDANCE));
+        assert!(
+            built.agent.config().persona_complete && built.persona_complete,
+            "a preset can request the mode too"
+        );
 
         // The default stays the slot: identity < persona < workflow, and tool
         // guidance still follows registration.
@@ -8521,6 +8534,45 @@ mod tests {
             eff.enabled_skills().count(),
             1,
             "and exactly one skill is buildable"
+        );
+    }
+
+    /// The preview build the settings pane triggers skips the scanned skills.
+    ///
+    /// The pane lists skills from the resolution it already holds, so a preview
+    /// that registered every manifest would buy nothing and cost the whole
+    /// click: measured on this machine's 121 skills, 2.2 s of the 2.3 s a
+    /// first Tools visit paid. The tools - the reason the preview exists at
+    /// all - are still built, so the row set cannot silently empty out.
+    #[test]
+    fn a_preview_build_skips_the_scanned_skills_and_keeps_the_tools() {
+        let root = scratch("preview-skills");
+        write_skill(&root, "alpha", "one");
+        let settings = with_one_source(&root);
+
+        assert_eq!(
+            skill_names(&build(&settings)),
+            vec!["alpha".to_string()],
+            "the premise: a turn's build registers the scanned skill"
+        );
+
+        let preview = super::preview_build(
+            &settings,
+            &Vault::disabled(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert!(
+            skill_names(&preview).is_empty(),
+            "the preview must not pay for the skill manifests"
+        );
+        let tools: Vec<String> = super::capabilities(&preview.agent)
+            .into_iter()
+            .filter(|cap| cap.category == "tool")
+            .map(|cap| cap.name)
+            .collect();
+        assert!(
+            tools.iter().any(|name| name == "read_file"),
+            "the preview still carries the tool roster: {tools:?}"
         );
     }
 

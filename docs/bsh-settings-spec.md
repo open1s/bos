@@ -76,7 +76,8 @@ name = "..."                   # optional; a shipped preset publishes none
 description = "..."            # optional
 order = 0                      # optional roster order
 system_prompt = "…"            # optional persona; unset keeps the workspace prompt
-complete = false               # true: that persona IS the whole system prompt
+complete = false               # true: the persona replaces the harness layers
+                               # (one compact execution footer stays)
 
 [[extentions]]                 # the installed inventory
 id = "shell"
@@ -91,16 +92,21 @@ updated_at = 1792158733
 
 ### The persona and its `complete` flag
 
-`system_prompt` fills the persona SLOT by default: the harness identity opens
-the prompt, the workflow guidance closes it, and per-tool rules are appended for
-the tools the build actually registers. `complete = true` is the reference's
-`minimal`-preset arm (its persona row's `complete: true`): the prompt is the
-persona text ALONE, with no identity, workflow or tool guidance. It is off by
-default, it applies only while the persona is non-empty (an empty persona under
-`complete` falls back to the default composition), and a preset's own complete
-persona outranks the workspace one. The runtime-context message is NOT
-suppressed: unlike the reference's `includeRuntimeContext: false`, BSH's
-snapshot is the model's one source of sandbox, permission and preset truth.
+`system_prompt` fills the persona SLOT: the harness identity opens the prompt,
+the workflow guidance closes it, and per-tool rules are appended for the tools
+the build actually registers.
+
+`complete = true` sends the persona in place of the harness identity, the
+workflow guidance and the per-tool sections. One compact execution footer
+(`COMPLETE_PERSONA_CONTRACT`) always follows it, so the work-first, evidence and
+verification rules survive the choice. The switch is always visible in General's
+persona row and in the composer's permission menu; the flag is written where the
+persona lives - `[agent] complete` for a workspace persona, or the preset's own
+`complete` field for a preset persona - and clicking the composer badge returns
+to the slot composition. The build reports `persona_complete` and
+`execution_footer` on `instruction.build`. The runtime-context message is never
+suppressed: BSH's snapshot is the model's one source of sandbox, permission and
+preset truth.
 
 ### Providers
 

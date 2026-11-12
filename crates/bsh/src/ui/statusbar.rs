@@ -70,6 +70,31 @@ impl Shell {
                     ),
             );
         }
+        // A recoverable failure carries the reader's own message, so the
+        // recovery is one click: resend it once the environment is fixed.
+        if let Some(prompt) = self.state.notice_retry.clone() {
+            let label: SharedString = lang.tr("turn.retry").into();
+            row = row.child(
+                div()
+                    .debug_selector(|| "status-retry".to_string())
+                    .id("status-retry")
+                    .h(px(24.0))
+                    .px(px(10.0))
+                    .rounded(px(999.0))
+                    .bg(rgb(theme::accent_soft()))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::accent_soft())))
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.state.clear_notice();
+                        this.set_composer_text(&prompt, window, cx);
+                        this.send(window, cx);
+                        cx.notify();
+                    }))
+                    .child(txt(label, theme::stat_size_at(size), theme::accent())),
+            );
+        }
         row
     }
 

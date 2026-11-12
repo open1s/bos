@@ -33,6 +33,61 @@ use react::llm::ActionIntent;
 /// the rest is usually evidence the reader pasted.
 const HEAD_CHARS: usize = 400;
 
+/// Terms that make a message about THIS workspace rather than a concept.
+///
+/// A question containing one of these is repository-specific; it is why the
+/// local classifier can route it without a keyword verb or a model.
+const WORKSPACE_REFERENCES: &[&str] = &[
+    "this file",
+    "that file",
+    "the file",
+    "this code",
+    "the code",
+    "repo",
+    "repository",
+    "workspace",
+    "build",
+    "the tests",
+    "test suite",
+    "log",
+    "stack trace",
+    "branch",
+    "commit",
+    "文件",
+    "代码",
+    "构建",
+    "测试",
+    "日志",
+    "工作区",
+];
+
+/// Names of the objects this workspace's work is made of. A statement about
+/// one of them - with no question mark - is a report or a request, not an
+/// explanation.
+const CODE_NOUNS: &[&str] = &[
+    "parser",
+    "endpoint",
+    "handler",
+    "function",
+    "module",
+    "class",
+    "schema",
+    "migration",
+    "api",
+    "cli",
+    "ui",
+    "cache",
+    "queue",
+    "worker",
+    "config",
+    "接口",
+    "函数",
+    "模块",
+    "缓存",
+    "队列",
+    "配置",
+];
+
 /// Explicit requests for an account. These win over a defect word: "explain
 /// this error" asks for a reading, not an investigation.
 const EXPLICIT_EXPLAIN: &[&str] = &[
@@ -57,6 +112,7 @@ const CONCEPT_OPENERS: &[&str] = &[
     "what are",
     "how does",
     "how did",
+    "what does",
     "是什么",
     "怎么理解",
     "是什么原理",
@@ -109,6 +165,17 @@ const WHY: &[&str] = &[
 /// Verbs that ask for work in the workspace, including review and delivery.
 const ACTION: &[&str] = &[
     "fix",
+    "check",
+    "inspect",
+    "verify",
+    "ensure",
+    "find",
+    "locate",
+    "clean",
+    "restore",
+    "handle",
+    "improve",
+    "rewrite",
     "implement",
     "add",
     "change",
@@ -167,23 +234,61 @@ pub(crate) fn classify(text: &str) -> ActionIntent {
     }
     let head = head.to_lowercase();
 
-    let head = padded(&head);
+    let lower = head.to_lowercase();
+    let head = padded(&lower);
     if matches_any(&head, EXPLICIT_EXPLAIN) {
         return ActionIntent::Explanation;
     }
     if matches_any(&head, WHY) && matches_any(&head, DEFECT) {
         return ActionIntent::Action;
     }
-    if matches_any(&head, ACTION) {
-        return ActionIntent::Action;
-    }
     if matches_any(&head, DEFECT) {
         return ActionIntent::Action;
     }
+    // A concept opener at the head of the message outranks a generic action
+    // word: "how does the build cache work?" is a question about a build,
+    // not a request to build. Diagnostic forms (why + defect) were claimed
+    // above, so "why is the build slow?" still routes to action.
     if matches_any(&head, CONCEPT_OPENERS) {
         return ActionIntent::Explanation;
     }
-    ActionIntent::Unknown
+    if matches_any(&head, ACTION) {
+        return ActionIntent::Action;
+    }
+    local_semantics(&lower, &head).unwrap_or(ActionIntent::Unknown)
+}
+
+/// The local feature classifier: the semantic fallback used when no model is
+/// reachable.
+///
+/// It is still deterministic, but it reads STRUCTURE a keyword list cannot:
+/// whether the message names this workspace's objects (a file, the build, a
+/// parser), whether it is a statement or a question, and whether it is a
+/// definition rather than a task. That is what lets a provider outage keep a
+/// routed answer instead of dropping to the raw keyword rules.
+fn local_semantics(lower: &str, padded_head: &str) -> Option<ActionIntent> {
+    let workspace = matches_any(padded_head, WORKSPACE_REFERENCES);
+    let code = matches_any(padded_head, CODE_NOUNS);
+    if !workspace && !code {
+        return None;
+    }
+    if matches_any(padded_head, WHY) || matches_any(padded_head, DEFECT) {
+        return Some(ActionIntent::Action);
+    }
+    let question = lower.trim_end().ends_with('?') || lower.trim_end().ends_with('？');
+    if question {
+        return None;
+    }
+    // A definition of a code concept is an explanation, not a task.
+    if !workspace
+        && (lower.contains(" is a ")
+            || lower.contains(" is an ")
+            || lower.contains(" are ")
+            || lower.contains("是一个"))
+    {
+        return None;
+    }
+    Some(ActionIntent::Action)
 }
 
 /// Pad a lowercase message with spaces and turn punctuation into spaces, so an
@@ -270,6 +375,29 @@ mod tests {
     fn small_talk_and_bare_questions_have_no_policy() {
         for prompt in ["hello", "thanks!", "what time is it?", ""] {
             assert_eq!(classify(prompt), ActionIntent::Unknown, "{prompt}");
+        }
+    }
+
+    /// The local feature classifier routes repository objects even without a
+    /// listed verb, and declines definitions and open questions: this is the
+    /// classifier a provider outage falls back to.
+    #[test]
+    fn the_local_classifier_routes_structural_repository_requests() {
+        for prompt in [
+            "the endpoint returns stale data",
+            "the parser no longer handles empty input",
+            "the config needs a new default",
+            "the build output looks wrong",
+        ] {
+            assert_eq!(classify(prompt), ActionIntent::Action, "{prompt}");
+        }
+        for prompt in [
+            "the cache is a map from key to value",
+            "a parser is a function that reads tokens",
+            "what does the parser do?",
+            "how does the build cache work?",
+        ] {
+            assert_ne!(classify(prompt), ActionIntent::Action, "{prompt}");
         }
     }
 

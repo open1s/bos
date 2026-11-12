@@ -4136,3 +4136,46 @@ it scrolls".
   the migration to write the log BEFORE the window is trimmed; that is a migration
   round, not a scroll fix.
 
+
+Round 192: the Tools tab's first click stopped building an agent, and the
+report was "BSH first click mark take time".
+
+- Measured first, because the cause was not where the shape of the code pointed.
+  A debug build of `caps::preview_build` with the real settings took **3.15 s**,
+  and the phase timers put **2.2-2.5 s of it in one loop**: registering the
+  reader's scanned skills (`agent.register_skill_manifest` per manifest). It was
+  not the extensions (clearing them changed nothing), not the MCP pool, not the
+  policy. `Settings::default()` paid it too, because an empty `skill_sources`
+  falls back to the executor defaults, so the scan still found 121 manifests.
+  With registration skipped the same build took **10 ms** warm, and the first
+  build in a fresh process the **0.5 s** one-time policy/tool warmup the launch
+  build has already paid by the time a reader opens Settings.
+- The pane wanted two different things from one build. TOOLS must come from the
+  agent's registry (the extensions, the preset and the permission all change
+  which tools exist, and a switched-off tool's row is the only way back on), but
+  SKILLS are already resolved: `Effective.skills` is the cached catalogue the
+  Skills pane draws, with `name`, `description` and the reader's own `enabled`
+  flag. So `caps::ScannedSkills` splits the build: a turn passes `Register`, the
+  pane's preview passes `Skip`, and `section_tools` merges the build's tool rows
+  (plus any skill a package declares) with the catalogue. A skill the PRESET
+  excludes is left out of the merge rather than drawn as on: the row's switch
+  writes the reader's disabled list and cannot express a preset.
+- `Shell::caps_ready` is now seeded from the TOOL switch alone. Switched-off
+  skills no longer make the launch seed incomplete, which is what the reported
+  settings had (114 skills off, no tools off): the launch build was already the
+  whole tool roster, and the generation check was the only thing still asking
+  for a rebuild.
+- Evidence: `caps::tests::a_preview_build_skips_the_scanned_skills_and_keeps_the_tools`
+  pins both halves (the turn build registers the skill, the preview does not, and
+  `read_file` is still in the preview's roster),
+  `ui::shell_tests::a_switched_off_skill_keeps_its_tools_row` seeds a capability
+  list with NO skill in it and still expects the switched-off catalogue row and
+  its enabled sibling, and `the_tools_preview_keeps_a_disabled_tool_listed` keeps
+  the reason the preview exists.
+- Traps worth keeping: the category sort is `skill` < `tool`, so the pane lists
+  skills BEFORE tools and a row's `cap-N` index is its position in the un-filtered
+  list (`enumerate()` runs before the `filter`) - a test that expects `cap-0` to be
+  the only match is asserting the wrong index. And a phase timer anchored on the
+  next `\n    }` after a loop lands on some later block's brace, which reads as a
+  2 s "skills" phase when the work is elsewhere; put the marker immediately after
+  the block you mean.

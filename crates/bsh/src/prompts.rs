@@ -214,15 +214,11 @@ pub(crate) fn preset_persona(body: &str) -> String {
 
 /// The execution footer a COMPLETE persona still carries.
 ///
-/// The reference's `complete: true` arm makes the persona the sole prompt
-/// section. BSH keeps that arm for the persona's own text but does not let it
-/// remove the harness's execution contract: a compact footer (the work-first
-/// stance, evidence before explanation, verification and the stop rule) is
-/// appended in the same change. The runtime action contract already applies to
-/// a complete persona; this keeps the PROMPT from contradicting it, while the
-/// persona stays the entire identity and domain text.
+/// A complete persona replaces the person's orientation and the tool guidance
+/// with its own text; this compact footer keeps the harness's work-first,
+/// evidence and verification rules in the prompt, so the setting changes the
+/// persona rather than the execution contract.
 pub(crate) const COMPLETE_PERSONA_CONTRACT: &str = "\n\n## Execution contract (harness)\nThis section belongs to the harness, not the persona: a complete persona keeps it.\n- Work first, report briefly: for a concrete coding request, inspect, run or edit before describing what you plan to do.\n- A question about this repository is answered from evidence you gathered, not from memory.\n- Prove a change with the command that checks it, or say what you could not check.\n- Stop when the request is answered; report outcome first, then evidence, then anything unverified.";
-
 /// The plan-mode directive carried in front of a turn's own text.
 ///
 /// The reference expresses plan mode as a system section that names its

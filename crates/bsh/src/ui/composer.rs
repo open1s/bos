@@ -792,34 +792,56 @@ impl Shell {
         )
     }
 
-    /// Restore the execution contract from the complete-persona badge.
+    /// Turn the complete-persona mode on or off for the persona in force.
     ///
-    /// The reader's choice is theirs to keep; this is the reversal the badge
-    /// offers, not a policy. It clears the workspace flag, saves, and rebuilds
-    /// the turn's agent so the same session immediately carries the identity,
-    /// workflow and tool sections again. When a PRESET is the cause, clearing
-    /// the workspace flag cannot help, so the notice names the preset.
-    fn restore_execution_contract(&mut self, cx: &mut Context<Self>) {
-        if !self.state.settings.workspace.agent.complete {
+    /// The flag belongs to whoever owns the persona: with a preset persona it
+    /// edits that preset's declaration (creating one for a shipped preset),
+    /// otherwise the workspace's own agent section. The settings are saved and
+    /// the session's agent is rebuilt, so the next turn carries the change.
+    pub(crate) fn set_persona_complete(&mut self, on: bool, cx: &mut Context<Self>) {
+        let eff = self.state.effective();
+        if eff.llm_system_prompt().trim().is_empty() {
             let notice =
-                crate::i18n::tr(self.state.lang, "input.personaCompletePreset").to_string();
+                crate::i18n::tr(self.state.lang, "settings.personaNeedsPrompt").to_string();
             self.state.notice(notice);
             cx.notify();
             return;
         }
-        self.state.settings.workspace.agent.complete = false;
-        let save_error = self.state.settings.save().err();
-        self.rebake_after_permission(cx);
-        let notice = if self.state.persona_complete {
-            crate::i18n::tr(self.state.lang, "input.personaCompletePreset").to_string()
+        if eff.preset_system_prompt.is_some() {
+            if !eff.preset_id.is_empty() {
+                let id = eff.preset_id.clone();
+                let mut preset = self.state.settings.global.preset(&id).unwrap_or_default();
+                if preset.system_prompt.is_some() {
+                    preset.complete = on;
+                    self.state.settings.global.presets.insert(id, preset);
+                } else {
+                    self.state.settings.workspace.agent.complete = on;
+                }
+            }
         } else {
-            crate::i18n::tr(self.state.lang, "input.personaCompleteRestored").to_string()
-        };
-        self.state.notice(notice);
-        if let Some(error) = save_error {
-            log::warn!("restoring the execution contract was not saved: {error}");
+            self.state.settings.workspace.agent.complete = on;
         }
+        if let Err(error) = self.state.settings.save() {
+            log::warn!("the complete-persona setting was not saved: {error}");
+        }
+        self.rebake_after_permission(cx);
+        let notice = crate::i18n::tr(
+            self.state.lang,
+            if on {
+                "settings.personaCompleteOn"
+            } else {
+                "settings.personaCompleteOff"
+            },
+        )
+        .to_string();
+        self.state.notice(notice);
         cx.notify();
+    }
+    /// The composer badge's reversal: the same switch, turned off.
+    pub(crate) fn restore_execution_contract(&mut self, cx: &mut Context<Self>) {
+        // The badge's click is the same operation as the General toggle: turn
+        // the mode off for whoever owns the persona (workspace or preset).
+        self.set_persona_complete(false, cx);
     }
     /// The reference's model trigger and the menu it opens.
     ///
@@ -1165,6 +1187,12 @@ impl Shell {
         // builder is `Fn`, so every capture is cloned into it anyway.
         let text = permission_chip_text(lang, &permission);
         let effective = permission.effective.clone();
+        // The persona mode rides in this menu because it changes what the next
+        // turn carries, like the permission does. It is a switch, not a fourth
+        // permission: the check shows the mode in force for the persona owner.
+        let persona_on = self.state.effective().persona_complete;
+        let persona_ready = !self.state.effective().llm_system_prompt().trim().is_empty();
+        let persona_label = lang.tr("input.completePersona").to_string();
         // Three rows, each one line: the label and a short qualifier, so the
         // modes can be compared at a glance. The check follows the mode in
         // force, and a row a preset ceiling cannot grant is disabled and states
@@ -1209,6 +1237,95 @@ impl Shell {
                             pick.update(cx, |this, cx| this.request_permission(value, cx));
                         }));
                     }
+                    let label = persona_label.clone();
+                    let desc = if persona_ready {
+                        lang.tr("input.completePersonaDesc").to_string()
+                    } else {
+                        lang.tr("input.completePersonaNeedsPrompt").to_string()
+                    };
+                    let pick = shell.clone();
+                    // A full-width rule first: the persona is a different kind of
+                    // choice from the sandbox mode, and the menu must say so.
+                    menu = menu.item(
+                        PopupMenuItem::element(|_window, _cx| {
+                            div()
+                                .h(px(9.0))
+                                .flex()
+                                .items_center()
+                                .child(div().h(px(1.0)).w_full().bg(rgb(theme::border_soft())))
+                        })
+                        .disabled(true),
+                    );
+                    menu = menu.item(
+                        // A modern toggle row, not a fourth checkmark: label and
+                        // rule on the left, the switch on the right. The rule
+                        // explains the mode; the state is the switch.
+                        PopupMenuItem::element(move |_window, _cx| {
+                            div()
+                                .debug_selector(|| "menu-persona-complete".to_string())
+                                .h(px(40.0))
+                                .px(px(8.0))
+                                .rounded(px(8.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(10.0))
+                                .when(persona_ready, |row| {
+                                    row.hover(|style| style.bg(rgb(theme::hover())))
+                                })
+                                .when(!persona_ready, |row| row.opacity(0.45))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap(px(1.0))
+                                        .child(
+                                            txt(
+                                                label.clone(),
+                                                12.5,
+                                                if persona_on {
+                                                    theme::accent()
+                                                } else {
+                                                    theme::text()
+                                                },
+                                            )
+                                            .font_weight(FontWeight::MEDIUM),
+                                        )
+                                        .child(txt(desc.clone(), 10.5, theme::faint()).truncate()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w(px(34.0))
+                                        .h(px(20.0))
+                                        .p(px(2.0))
+                                        .rounded_full()
+                                        .bg(rgb(if persona_on {
+                                            theme::accent()
+                                        } else {
+                                            theme::border_strong()
+                                        }))
+                                        .flex()
+                                        .items_center()
+                                        .when(persona_on, |track| track.justify_end())
+                                        .child(
+                                            div()
+                                                .w(px(16.0))
+                                                .h(px(16.0))
+                                                .rounded_full()
+                                                .bg(rgb(theme::page())),
+                                        ),
+                                )
+                        })
+                        .disabled(!persona_ready)
+                        .on_click(move |_, _window, cx| {
+                            pick.update(cx, |this, cx| {
+                                this.set_persona_complete(!persona_on, cx);
+                            });
+                        }),
+                    );
                     menu
                 }),
             )

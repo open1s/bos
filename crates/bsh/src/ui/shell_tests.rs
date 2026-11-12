@@ -7204,6 +7204,84 @@ fn the_policy_pane_offers_and_creates_the_starter_allowlist(cx: &mut TestAppCont
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// The complete-persona switch is shown in the rail's General pane whatever
+/// its state, and flipping it changes the persona in force and the built agent.
+#[gpui::test]
+fn the_general_pane_toggles_the_complete_persona(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = state_with_turns("persona-toggle", 1);
+        state.settings.workspace.agent.complete = false;
+        state.settings.workspace.agent.system_prompt = "You are terse.".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let toggle = cx
+        .debug_bounds("persona-complete-toggle")
+        .expect("the persona switch is always shown");
+    assert!(!cx.update(|_, cx| shell.read(cx).state.persona_complete));
+
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    draw_until(cx, "complete persona turns on", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| shell.read(cx).state.persona_complete)
+    });
+
+    let toggle = cx
+        .debug_bounds("persona-complete-toggle")
+        .expect("the switch stays drawn");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    draw_until(cx, "complete persona turns off", DRAW_UNTIL_MAX, |cx| {
+        !cx.update(|_, cx| shell.read(cx).state.persona_complete)
+    });
+}
+
+/// The complete flag is written where the persona lives: with a preset persona
+/// the switch edits that preset's declaration, never the inert workspace flag.
+#[gpui::test]
+fn the_persona_switch_edits_the_preset_that_owns_the_persona(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = state_with_turns("persona-preset-toggle", 1);
+        state.settings.global.default_preset = "ptc".to_string();
+        state.settings.workspace.agent.complete = false;
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let toggle = cx
+        .debug_bounds("persona-complete-toggle")
+        .expect("the persona switch is always shown");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the preset persona turns complete",
+        DRAW_UNTIL_MAX,
+        |cx| cx.update(|_, cx| shell.read(cx).state.persona_complete),
+    );
+    let (preset_complete, workspace_complete) = cx.update(|_, cx| {
+        let state = &shell.read(cx).state;
+        (
+            state
+                .settings
+                .global
+                .presets
+                .get("ptc")
+                .is_some_and(|preset| preset.complete),
+            state.settings.workspace.agent.complete,
+        )
+    });
+    assert!(preset_complete, "the preset declaration carries the flag");
+    assert!(
+        !workspace_complete,
+        "the workspace flag must stay untouched when a preset owns the persona"
+    );
+}
+
 /// The agent-loop switch flips the setting the next turn is built from, in both
 /// directions, so the row cannot pass by being permanently on or off.
 #[gpui::test]
@@ -27673,6 +27751,36 @@ fn goal_attachments_ride_only_an_objective(cx: &mut TestAppContext) {
     assert_eq!(last.text, GOAL_ATTACHMENT_NOTE);
 }
 
+/// A recoverable action failure offers a Retry control beside its notice, so
+/// the reader does not retype the request after fixing the environment.
+#[gpui::test]
+fn a_missed_action_offers_the_retry_control(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = state_with_turns("action-retry", 1);
+        state.notice =
+            Some("This action request ended without a successful tool call.".to_string());
+        state.notice_retry = Some("fix the parser".to_string());
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(
+        cx.debug_bounds("status-notice").is_some(),
+        "the failure notice renders"
+    );
+    assert!(
+        cx.debug_bounds("status-retry").is_some(),
+        "the retry control renders beside it"
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).state.notice_retry.clone()),
+        Some("fix the parser".to_string())
+    );
+}
+
 /// A complete persona replaces the harness identity, the workflow contract and
 /// every per-tool section, so the composer names the state: the badge is the
 /// one visible signal that an off-contract or talk-only turn is the
@@ -27717,6 +27825,44 @@ fn a_complete_persona_draws_the_contract_badge(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("composer-persona-complete").is_none(),
         "the badge leaves with the state it named"
+    );
+}
+
+/// The composer's permission menu carries the complete-persona switch, so the
+/// mode is one press away from the place a reader changes what the turn may do.
+#[gpui::test]
+fn the_permission_menu_toggles_the_complete_persona(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = state_with_turns("persona-menu", 1);
+        state.settings.workspace.agent.system_prompt = "You are terse.".to_string();
+        state.settings.workspace.agent.complete = false;
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let chip = cx
+        .debug_bounds("composer-permission")
+        .expect("the permission chip draws");
+    cx.simulate_click(chip.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the persona switch is in the menu",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("menu-persona-complete").is_some(),
+    );
+
+    let item = cx
+        .debug_bounds("menu-persona-complete")
+        .expect("the menu row has bounds");
+    cx.simulate_click(item.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the menu switch turns complete persona on",
+        DRAW_UNTIL_MAX,
+        |cx| cx.update(|_, cx| shell.read(cx).state.persona_complete),
     );
 }
 
@@ -35105,12 +35251,24 @@ fn set_tools_query(shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &str
 #[gpui::test]
 fn the_tools_tab_filters_its_rows(cx: &mut TestAppContext) {
     init_test_app(cx);
+    // The pane lists the resolved skill catalogue beside the build rows, so a
+    // test that is about ITS OWN two rows points the draft at an empty source:
+    // otherwise the machine skills join the list and the rows stop being the
+    // premise this test asserts.
+    let empty_source = skills_scratch("tools-filter-skills");
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("tools-filter"));
         let section = section_index("extensions").expect("the extensions index");
         let shell = cx.new(|cx| {
             let mut shell = Shell::build_for_test(window, Some(section), state, cx);
             shell.extensions_tab = 5;
+            shell.state.draft_mut().global.set_skill_sources(vec![
+                crate::settings::global::SkillSource {
+                    name: "Empty".to_string(),
+                    path: empty_source.to_string_lossy().to_string(),
+                    enabled: true,
+                },
+            ]);
             shell.caps = vec![
                 crate::caps::CapInfo {
                     name: "bash".to_string(),
@@ -35146,9 +35304,12 @@ fn the_tools_tab_filters_its_rows(cx: &mut TestAppContext) {
         web_row.bottom() <= field.top() && field.bottom() <= first_row.top(),
         "the filter sits between the tool master switch and the rows it narrows"
     );
+    // The list sorts by category then name and "skill" sorts before "tool", so
+    // the seeded skill is row 0 and the shell is row 1: the badge query keeps
+    // the first and hides the second.
     set_tools_query(&shell, cx, "skill");
     draw_until(cx, "the badge narrows the rows", DRAW_UNTIL_MAX, |cx| {
-        cx.debug_bounds("cap-1").is_some() && cx.debug_bounds("cap-0").is_none()
+        cx.debug_bounds("cap-0").is_some() && cx.debug_bounds("cap-1").is_none()
     });
     set_tools_query(&shell, cx, "zzz");
     draw_until(
@@ -35161,6 +35322,90 @@ fn the_tools_tab_filters_its_rows(cx: &mut TestAppContext) {
                 && cx.debug_bounds("cap-1").is_none()
         },
     );
+}
+
+/// A switched-off skill keeps its row without the build having registered it.
+///
+/// The Tools pane reads skills from the resolution the settings tree already
+/// holds, so the launch build's capability list can be TOOLS ONLY - which is
+/// what it is now, because registering every scanned manifest on the click path
+/// cost seconds on a machine with a real skill library. The seed below carries
+/// no skill at all; the row still has to appear, switched off, so the reader can
+/// switch it back on.
+#[gpui::test]
+fn a_switched_off_skill_keeps_its_tools_row(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let root = skills_scratch("tools-skills");
+    skills_write(&root, "alpha");
+    skills_write(&root, "beta");
+    let sources = vec![crate::settings::global::SkillSource {
+        name: "First".to_string(),
+        path: root.to_string_lossy().to_string(),
+        enabled: true,
+    }];
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("tools-skills"));
+        let section = section_index("extensions").expect("the extensions index");
+        let shell = cx.new(|cx| {
+            let mut shell = Shell::build_for_test(window, Some(section), state, cx);
+            shell.extensions_tab = 5;
+            shell.state.draft_mut().global.set_skill_sources(sources);
+            shell.state.draft_mut().workspace.disabled.skills = vec!["beta".to_string()];
+            // The launch seed: the tools the last build registered, with no
+            // scanned skill in it (the preview skips them).
+            shell.caps = vec![crate::caps::CapInfo {
+                name: "bash".to_string(),
+                description: "Run a shell command".to_string(),
+                category: "tool".to_string(),
+            }];
+            shell
+        });
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let catalogue = cx.update(|_, cx| {
+        let shell = harness.read(cx).shell.read(cx);
+        let eff = shell.state.draft().effective();
+        eff.skills
+            .iter()
+            .map(|skill| format!("{}:{}", skill.name, skill.enabled))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        catalogue,
+        vec!["alpha:true".to_string(), "beta:false".to_string()],
+        "the premise: the draft's catalogue holds both scratch skills"
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Both halves of the catalogue reach the pane: the switched-off skill and
+    // its enabled sibling. Neither is in the seeded capability list, so a match
+    // can only come from the catalogue. The list sorts by category then name and
+    // "skill" sorts before "tool", so the two catalogue rows lead: alpha is row
+    // 0 and beta row 1, and the seeded shell tool is row 2 under neither query.
+    for (name, row) in [("alpha", "cap-0"), ("beta", "cap-1")] {
+        set_tools_query(&shell, cx, name);
+        draw_until(cx, "the catalogue's skill row", DRAW_UNTIL_MAX, |cx| {
+            cx.debug_bounds(row).is_some()
+                && cx.debug_bounds("tools-no-matches").is_none()
+                && cx.debug_bounds("cap-2").is_none()
+        });
+    }
+
+    // The reader's switch is what the row toggles, and the draft still holds it.
+    let disabled = cx.update(|_, cx| {
+        harness
+            .read(cx)
+            .shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .disabled
+            .skills
+            .clone()
+    });
+    assert_eq!(disabled, vec!["beta".to_string()]);
 }
 
 /// The Extensions rail cell opens the extension platform inventory, not the

@@ -73,9 +73,10 @@ A subagent child inherits the parent's layers, drops the delegation tail
 gains a prefix that names its reporting contract: the parent cannot see the
 child's transcript, so the result must carry the evidence the parent needs.
 
-A `complete: true` persona replaces layers 1-5 with exactly the persona text
-(the DeepSeek Harness arm). It is deliberate, off by default, and still scanned
-for stale tool names: the escape hatch changes what is sent, not what is true.
+A `complete: true` persona replaces layers 1-5 with the persona text plus one
+compact harness execution footer (`COMPLETE_PERSONA_CONTRACT`). It is the
+reader's explicit switch - General's persona row and the composer's permission
+menu toggle it - and the composer badge names the mode (section 9).
 
 ## 3. What the reference harnesses do
 
@@ -397,9 +398,11 @@ acted only talked. Four pieces:
 `crates/bsh/src/intent.rs` classifies the reader's ask deterministically,
 before the stream opens, into `Action`, `Explanation` or `Unknown`. It reads
 the leading 400 characters and uses ordered rules: an explicit explanation ask
-wins; a diagnostic question with a defect word is action; an imperative change
-verb is action; a bare conceptual opener is an explanation. The lexical module
-never reads the workspace or reaches the provider.
+wins; a diagnostic question with a defect word is action; a bare conceptual
+opener at the head of the message outranks a generic action word ("how does the
+build cache work?" is a question about a build, not a request to build); an
+imperative change verb is action. The local stage never reads the workspace or
+reaches the provider.
 
 An `Unknown` answer is not final: when the message is longer than a greeting,
 `Agent::classify_intent_with_model` asks the configured model once with
@@ -413,7 +416,11 @@ invocation skips it too: the command block is already an explicit action, not a
 sentence to classify. A transient provider failure is retried (twice, with
 backoff, plus any registered fallback provider); the classifier's own usage is
 drained into the turn's usage report, so it is metered instead of billed
-invisibly.
+invisibly. If the provider stays unavailable, the deterministic local feature
+classifier routes the message instead of the bare keyword gate: it reads
+workspace and code-object references, statement versus question, and a
+definition guard, so a persistent outage changes the classifier's quality, not
+whether the contract is enforced.
 
 **Two corrective retries, both bounded.** `LlmRequest::intent` carries the
 classification to the engine. A prose reply earns one note, chosen by
@@ -446,19 +453,18 @@ retry was spent, and the answer's byte length. The log line
 distinguishes prompt interpretation from a missing tool, a preset problem or an
 execution failure.
 
-**Complete-persona diagnostics and reversal.** A persona with `complete: true`
-replaces the whole persona text, so the identity, workflow and per-tool sections
-are absent - but BSH appends a compact `COMPLETE_PERSONA_CONTRACT` footer (the
-work-first stance, evidence before explanation, verification and the stop rule),
-so the reader may replace the persona without removing the harness's execution
-contract. The build logs a warning naming the session, publishes
-`persona_complete` / `workflow_contract` on `instruction.build`, and the
-composer draws the `composer-persona-complete` badge ("Complete persona") in
-the mode-chip row with the measured 500ms tooltip. The badge is also the
-reversal: clicking it clears the workspace `complete` flag, saves, and rebuilds
-the turn's agent, so the same session immediately carries the identity,
-workflow and tool sections again. When an active PRESET is the cause, clearing
-the workspace flag cannot help and the notice names the preset instead.
+**Complete persona is a switch, not a hidden escape.** `complete: true` sends
+the persona as the identity, workflow and per-tool sections, with one compact
+harness footer (`COMPLETE_PERSONA_CONTRACT`, ~700 bytes) so the execution
+contract survives the choice. The switch is always drawn in General's persona
+row and in the composer's permission menu (checked when on, disabled while no
+persona is written); the composer badge names the mode and clicking it returns
+to the slot composition. The flag belongs to the persona in force: a workspace
+persona writes `[agent] complete`, a preset persona edits that preset's
+declaration, so a shipped preset can be switched without leaving an inert
+workspace flag behind. The build reports `persona_complete`,
+`workflow_contract` (its inverse) and `execution_footer` on
+`instruction.build`.
 
 **Preset personas carry the stance.** The workflow contract is a layer, and a
 preset persona is the slot closest to the model's sense of who it is, so the
@@ -467,16 +473,17 @@ three shipped personas that override it (PTC, Creator, Read-only) end with
 repository question from gathered evidence. Standard ships no persona and
 therefore inherits the framework contract unchanged.
 
-Remaining limits, stated precisely: the semantic classifier is a bounded model
-call; a persistent provider outage (after the retries and any registered
-fallback provider) still leaves the lexical answer, and its usage is now part
-of the turn's totals. No harness can make a broken environment permit a tool to
-succeed; a tool that declares read-only side effects is retried once on a
-transient failure, and a persistent failure is refused as a completion and
-surfaced in the status row. A complete persona remains a reader choice, but it
-can no longer remove the execution contract: the compact harness footer rides
-every complete build, the runtime retry applies to it, and the badge offers the
-one-click reversal.
+Boundaries, not hidden gaps: the semantic classifier is a bounded model call;
+after its retries and any registered fallback provider fail, the turn uses the
+local feature classifier instead of a provider, so a persistent outage changes
+the classifier's quality, not the contract's enforcement. No harness can make a
+broken environment permit an operation; a declared read-only tool is retried
+once on a transient failure, a persistent failure is refused as a completion
+and surfaced, and the notice carries a one-click Retry that resends the reader's
+own message once the environment is fixed. A complete persona is the reader's
+explicit switch, drawn in General and in the permission menu; the compact
+execution footer keeps the work-first contract in the prompt, and the badge
+returns to the slot composition in one click.
 
 ## 10. Sources
 

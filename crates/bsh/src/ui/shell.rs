@@ -2571,7 +2571,10 @@ impl Shell {
         // The launch build already produced the committed capability and
         // plugin lists. Seed them so the first Tools or plugin visit does not
         // pay for a second identical build; a draft that disables tools or
-        // skills needs the preview build and falls back to it.
+        // skills needs the preview and falls back to it. That preview is now
+        // tools-and-package-skills only (the scanned skills come from the
+        // catalogue), so the visit costs a frame, not the seconds the full
+        // build took.
         shell.caps = crate::caps::capabilities(&built.agent);
         shell.caps_generation = shell.state.policy_generation;
         shell.caps_ready = shell.state.settings.workspace.disabled.tools.is_empty()

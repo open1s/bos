@@ -616,6 +616,11 @@ pub(crate) struct AppState {
     pub(crate) federation_peers: Vec<FederationPeerView>,
     /// A transient line of feedback.
     pub(crate) notice: Option<String>,
+    /// The reader message a retry control in the notice bar resends.
+    ///
+    /// Only a notice that names a recoverable failure sets this; every other
+    /// notice clears it, so a stale prompt can never be resent by a stray click.
+    pub(crate) notice_retry: Option<String>,
     /// Whether the usage pill's dialog is open.
     pub(crate) stat_open: bool,
     /// Whether the context meter's panel is open.
@@ -929,6 +934,7 @@ impl AppState {
             federation_events: crate::federation_audit::subscribe(),
             federation_peers: Vec::new(),
             notice: None,
+            notice_retry: None,
             stat_open: false,
             meter_open: false,
             tools_schema_chars: 0,
@@ -2117,6 +2123,13 @@ impl AppState {
     /// A transient notice line.
     pub(crate) fn notice(&mut self, text: impl Into<String>) {
         self.notice = Some(text.into());
+        self.notice_retry = None;
+    }
+
+    /// A notice that names a recoverable failure and offers to resend `prompt`.
+    pub(crate) fn notice_with_retry(&mut self, text: impl Into<String>, prompt: impl Into<String>) {
+        self.notice = Some(text.into());
+        self.notice_retry = Some(prompt.into());
     }
 
     /// Withdraw the notice line.
@@ -2126,6 +2139,7 @@ impl AppState {
     /// state) would contradict what the bar now shows.
     pub(crate) fn clear_notice(&mut self) {
         self.notice = None;
+        self.notice_retry = None;
     }
 
     /// The active transcript as plain text, for the copy control.
@@ -3783,14 +3797,32 @@ impl AppState {
             failures,
         } = &event
         {
-            self.notice(crate::i18n::tr_args(
+            let text = crate::i18n::tr_args(
                 self.lang,
                 "turn.actionMissed",
                 &[
                     ("calls", tool_calls.to_string()),
                     ("failures", failures.to_string()),
                 ],
-            ));
+            );
+            // The reader's own words, so the retry control resends the request
+            // once the environment has been fixed instead of making them retype
+            // it. The message is the last user row, not a re-serialized prompt.
+            let prompt = self
+                .store
+                .session(id)
+                .and_then(|session| {
+                    session
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == Role::User)
+                })
+                .map(|message| message.text.clone());
+            match prompt {
+                Some(prompt) => self.notice_with_retry(text, prompt),
+                None => self.notice(text),
+            }
             return;
         }
         let terminal = matches!(event, AgentEvent::Done | AgentEvent::Error(_));
@@ -6748,6 +6780,11 @@ mod tests {
                 .contains("successful tool call"),
             "the status row names the miss: {:?}",
             state.notice
+        );
+        assert_eq!(
+            state.notice_retry.as_deref(),
+            Some("fix it"),
+            "the retry control carries the reader's own message"
         );
     }
 

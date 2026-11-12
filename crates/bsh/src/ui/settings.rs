@@ -1200,6 +1200,11 @@ impl Shell {
         // the first visit to Account paid two full builds. The Tools pane now
         // pays one preview build, the plugin inventory one normal build, and
         // every other pane pays none.
+        //
+        // The preview is TOOLS ONLY. Registering the reader's scanned skills
+        // was 2.2 s of the 2.3 s a first Tools visit paid on this machine's 121
+        // skills, and the pane lists skills from the resolution it holds, so
+        // the build skips them and the click stays a frame's work.
         let tools_tab = section == 4 || (section == 17 && self.extensions_tab == 5);
         if tools_tab && (!self.caps_ready || self.caps_generation != generation) {
             let built =
@@ -1770,6 +1775,25 @@ impl Shell {
                 ),
         )
         .into_any_element()
+    }
+
+    /// The persona row every agent-behaviour pane shares: one always-visible
+    /// switch whose help line states what "complete" does to the prompt.
+    fn persona_help_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let effective = self.state.effective();
+        let on = effective.persona_complete;
+        let enabled = !effective.llm_system_prompt().trim().is_empty();
+        vec![self.preference_row(
+            "settings.personaCompleteTitle",
+            Some("settings.personaHelp"),
+            self.switch(
+                "persona-complete-toggle",
+                on,
+                enabled,
+                |shell, next, cx| shell.set_persona_complete(next, cx),
+                cx,
+            ),
+        )]
     }
 
     /// A note under the rows.
@@ -3138,6 +3162,11 @@ impl Shell {
             self.current_version_row(),
             self.federation_row(),
         ];
+        // The persona rule, near the top of the rail's General pane: a reader
+        // who never opens the nested agent-loop pane still learns that the
+        // workspace prompt is a slot and that a legacy complete flag is
+        // ignored (with the control that clears it).
+        rows.splice(1..1, self.persona_help_rows(cx));
         if let Some(peers) = self.federation_peers_block() {
             rows.push(peers);
         }
@@ -7251,12 +7280,45 @@ impl Shell {
                 .child(Input::new(&self.tools_search).appearance(false))
                 .into_any_element(),
         );
-        let matching = self
+        // The rows come from two sources that cannot disagree about a name:
+        // the launched build's registry supplies the tools (and any skill a
+        // PACKAGE declares), and the resolved catalogue supplies the scanned
+        // skills. Reading the catalogue is what keeps a switched-off skill on
+        // screen without a build that registers every manifest - that build
+        // measured 2.2 s of the 2.3 s the pane paid on its first click.
+        let effective = self.state.draft().effective();
+        // A skill the PRESET excludes is not a capability of this build, and the
+        // row's switch cannot say so - it writes the reader's own disabled list -
+        // so the row is not listed: this pane promises what the model can call.
+        // The reader's own switch is a different fact, and a switched-off skill
+        // keeps its row because that row is the only way back on.
+        let allowed: std::collections::HashSet<&str> = effective
+            .enabled_skills()
+            .map(|skill| skill.name.as_str())
+            .collect();
+        let mut caps: Vec<crate::caps::CapInfo> = self
             .caps
             .iter()
-            .filter(|cap| cap_matches(&query, cap))
-            .count();
-        if self.caps.is_empty() {
+            .filter(|cap| {
+                cap.category == "tool"
+                    || !effective.skills.iter().any(|skill| skill.name == cap.name)
+            })
+            .cloned()
+            .collect();
+        caps.extend(
+            effective
+                .skills
+                .iter()
+                .filter(|skill| !skill.enabled || allowed.contains(skill.name.as_str()))
+                .map(|skill| crate::caps::CapInfo {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    category: "skill".to_string(),
+                }),
+        );
+        caps.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+        let matching = caps.iter().filter(|cap| cap_matches(&query, cap)).count();
+        if caps.is_empty() {
             rows.push(
                 txt(tr(lang, "settings.empty"), 13.0, theme::muted())
                     .pt(px(10.0))
@@ -7275,8 +7337,7 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        for (index, cap) in self
-            .caps
+        for (index, cap) in caps
             .iter()
             .enumerate()
             .filter(|(_, cap)| cap_matches(&query, cap))
@@ -7575,7 +7636,7 @@ impl Shell {
         &self,
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let rows = vec![
+        let mut rows = vec![
             {
                 let on = self.state.draft().workspace.agent.memory_enabled;
                 // The reference's General pane has no memory row, so this one
@@ -7628,6 +7689,8 @@ impl Shell {
                     .into_any_element()
             },
         ];
+        // The persona contract lives beside the agent-behaviour switches.
+        rows.extend(self.persona_help_rows(cx));
         ("settings.agent-loop", "settings.agentLoopHint", rows)
     }
 
