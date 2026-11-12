@@ -9,7 +9,7 @@ contributions; migrated packages validate, `bsh ext validate` reports
 effects from the 2.0 generic contribution list. The independent `ferris-smoke`
 binary parses a 2.0 manifest with no BSH dependency, and the SDK carries unit
 tests for its author runtime adapter. The author guide is
-[ferris-sdk.md](ferris-sdk.md).
+[ferris-sdk.md](ferris-sdk.md). The proposed Cordis-inspired evolution is defined in [Ferris Cordis-Inspired Evolution RFC](ferris-cordis-evolution-rfc.md); it is a target design, not a claim that the target semantics are already implemented.
 
 Python and JavaScript can author in-process extensions through the same SDK
 contract and can host packages; see [ferris-bindings.md](ferris-bindings.md).
