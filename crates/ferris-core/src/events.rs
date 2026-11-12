@@ -68,6 +68,8 @@ pub mod topics {
     pub const EXTENSION_FAILED: &str = "extension.failed";
     /// A declarative UI action was routed to its owning runtime.
     pub const UI_ACTION: &str = "ui.action";
+    /// One bounded surface message crossing the local bus.
+    pub const SURFACE: &str = "surface.message";
     /// A model request is about to be sent.
     pub const MODEL_REQUESTED: &str = "model.requested";
     /// A model request finished.

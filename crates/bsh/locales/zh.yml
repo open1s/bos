@@ -591,6 +591,7 @@
 "tool.bash.sandboxOffSettings": "说明：设置中的沙箱开关已关闭。此命令运行时没有文件系统限制，网络也不经过 .bsh/egress-allowlist。工具边界策略仍然对命令行点名的路径与端点生效；运行时拼接出来的一切不会被检查。"
 "settings.plugins": "扩展"
 "settings.extensions": "扩展"
+"settings.surfaces": "界面实例"
 "settings.extensionsHint": "已安装扩展及其能力与贡献面板"
 "settings.extensionsThemeHint": "选择已安装扩展提供的全局主题"
 "settings.themeKit": "跟随 Kit 主题"

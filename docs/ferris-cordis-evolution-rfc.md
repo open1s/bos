@@ -5,6 +5,7 @@
 - **Scope:** BOS Ferris framework (`ferris-core`, `ferris-runtime`, `ferris-sdk`, BSH host adapter)
 - **Decision class:** Architecture and migration direction; no implementation authorization is implied
 - **Related:** [BSH Extension Platform](bsh-extension.md) · [Ferris Framework](ferris-framework.md) · [Ferris SDK](ferris-sdk.md) · [BOS Architecture](../ARCHITECTURE.md)
+- **Extended by:** [Ferris Dynamic UI RFC](ferris-dynamic-ui-rfc.md) — adds the surface capability contract, composition and the GPUI presentation plane; does not change the ownership boundary in §4
 
 ## 1. Executive summary
 

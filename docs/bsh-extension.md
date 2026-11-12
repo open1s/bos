@@ -374,6 +374,12 @@ light/dark switch lands without rebuilding the pane.
 the runtime for its live card once per selection (and on Refresh). If the
 runtime cannot answer, the declared view stays and the panel says why.
 
+Panels are the shipped contract. The proposed direction that generalises them —
+surfaces as capabilities, composition by slots, agent-authored surfaces and
+remote projection — is [Ferris Dynamic UI RFC](ferris-dynamic-ui-rfc.md); it is a
+target design, and this document remains normative for what a package can ship
+today.
+
 ### 3.6.2 Observe hook points
 
 A `hook` contribution names one point; the host pushes a bounded batch of

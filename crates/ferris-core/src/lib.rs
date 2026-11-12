@@ -28,6 +28,7 @@ pub mod resolver;
 pub mod signing;
 pub mod sources;
 pub mod storage;
+pub mod surface;
 pub mod terminal;
 pub mod types;
 pub mod ui;

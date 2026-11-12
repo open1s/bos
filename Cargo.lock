@@ -2100,6 +2100,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cordis-core"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c66612b77752dc3f0bd78b0d080ffa50317b87586d4ff1673f349a2105fd195"
+dependencies = [
+ "futures",
+ "parking_lot",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3574,6 +3586,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "cordis-core",
  "extism",
  "ferris-core",
  "libc",

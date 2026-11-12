@@ -28,6 +28,12 @@ pub(crate) fn builtin_metadata(name: &str) -> Option<ToolMetadata> {
             .with_side_effects(["write"])
             .with_permissions(["fs.write:workspace"]),
         "update_plan" => local("plan.write", "low"),
+        "surface_catalogue" => read_only("surface.read"),
+        "present_surface" | "patch_surface" | "close_surface" => ToolMetadata::new()
+            .with_version("1.0.0")
+            .with_risk("medium")
+            .with_side_effects(["write"])
+            .with_permissions(["surface.write"]),
         "schedule_list" => read_only("schedule.read"),
         "schedule_create" | "schedule_edit" | "schedule_delete" => ToolMetadata::new()
             .with_version("1.0.0")

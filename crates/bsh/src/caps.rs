@@ -1279,6 +1279,23 @@ fn build_agent_for_session_inner(
         }
     }
 
+    // Agent-authored interfaces. Available whenever the turn may write, and
+    // still answerable to the reader's per-tool switches: a presented surface
+    // is a proposal the reader can close, not authority.
+    if writes {
+        let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        for tool in surface_tools() {
+            if off_tool(tool.name()) {
+                continue;
+            }
+            let metadata = declare(tool.name());
+            tools.push(Arc::new(DeclaredTool::new(tool, metadata)));
+        }
+        if !tools.is_empty() {
+            bundles.push(plugins::Bundle::new("surface", tools));
+        }
+    }
+
     // Federation is a first-class tool family, not a hidden pane action: the
     // model lists peers and delegates through the same signed node the UI uses.
     if (crate::federation_node::running().is_some() || settings.global.federation.enabled)
@@ -5546,6 +5563,117 @@ fn list_dir_tool(
 /// Scheduling is capped by the same name and prompt rules the pane enforces,
 /// and a task is always owned by the session that created it: a model cannot
 /// park work in a conversation the reader is not looking at.
+/// The model's tools for presenting an interface to the reader.
+///
+/// A presented surface is a proposal, not authority: it is validated against
+/// the agent limits, drawn read-only, and can be closed by the reader at any
+/// time. Actions inside it are not wired to the capability pipeline yet, so a
+/// control reports that it is unavailable instead of running half-authorised.
+fn surface_tools() -> Vec<Arc<dyn agent::tools::Tool>> {
+    use ferris_sdk::surface::{PatchOp, Revision, SurfaceDocument};
+    use ferris_sdk::ui::PanelLocation;
+    use serde_json::Value;
+    let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+
+    tools.push(Arc::new(FunctionTool::new(
+        "present_surface",
+        "Present a read-only interactive surface to the reader. The document is a schema 1.1 surface tree with stable ids on controls; it is validated against the agent limits before it is shown.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "Short title shown in the panel picker." },
+                "slot": {
+                    "type": "string",
+                    "enum": ["workspace.main", "workspace.right", "workspace.left", "workspace.bottom", "transcript.inline", "empty.hero"],
+                    "description": "Where the host may draw it."
+                },
+                "document": { "type": "object", "description": "The schema 1.1 surface document." }
+            },
+            "required": ["title", "document"],
+            "additionalProperties": false
+        }),
+        |args| {
+            let title = args.get("title").and_then(Value::as_str).unwrap_or("").trim();
+            if title.is_empty() {
+                return Err(ToolError::InvalidInput("title is required".to_string()));
+            }
+            let slot = args.get("slot").and_then(Value::as_str).unwrap_or("workspace.right");
+            let location = match slot {
+                "workspace.main" | "empty.hero" => PanelLocation::Center,
+                "workspace.left" => PanelLocation::Left,
+                "workspace.bottom" | "transcript.inline" => PanelLocation::Bottom,
+                _ => PanelLocation::Right,
+            };
+            let document: SurfaceDocument = serde_json::from_value(
+                args.get("document")
+                    .cloned()
+                    .ok_or_else(|| ToolError::InvalidInput("document is required".to_string()))?,
+            )
+            .map_err(|error| ToolError::InvalidInput(format!("document is not a surface: {error}")))?;
+            let id = crate::extension::agent_surface::present(title, location, document)
+                .map_err(ToolError::InvalidInput)?;
+            Ok(serde_json::json!({
+                "id": id,
+                "slot": slot,
+                "note": "the surface is drawn read-only; close_surface removes it",
+            }))
+        },
+    )));
+
+    tools.push(Arc::new(FunctionTool::new(
+        "patch_surface",
+        "Apply a base-relative patch to a surface you presented. The base revision must be current; a stale patch is refused with the current revision.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "base": { "type": "integer", "minimum": 1 },
+                "ops": { "type": "array", "items": { "type": "object" } }
+            },
+            "required": ["id", "base", "ops"],
+            "additionalProperties": false
+        }),
+        |args| {
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            let base = args.get("base").and_then(Value::as_u64).unwrap_or(0);
+            let ops: Vec<PatchOp> = serde_json::from_value(
+                args.get("ops")
+                    .cloned()
+                    .ok_or_else(|| ToolError::InvalidInput("ops is required".to_string()))?,
+            )
+            .map_err(|error| ToolError::InvalidInput(format!("ops are not valid: {error}")))?;
+            let revision = crate::extension::agent_surface::patch(id, Revision::new(base), ops)
+                .map_err(ToolError::InvalidInput)?;
+            Ok(serde_json::json!({ "id": id, "revision": revision.value() }))
+        },
+    )));
+
+    tools.push(Arc::new(FunctionTool::new(
+        "close_surface",
+        "Close a surface you presented.",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+        |args| {
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            let closed = crate::extension::agent_surface::close(id);
+            Ok(serde_json::json!({ "id": id, "closed": closed }))
+        },
+    )));
+
+    tools.push(Arc::new(FunctionTool::new(
+        "surface_catalogue",
+        "Return the surface component vocabulary, limits and slots this host accepts.",
+        serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        |_args| Ok(crate::extension::agent_surface::catalogue()),
+    )));
+
+    tools
+}
+
 fn schedule_tools(
     saved: Vec<crate::settings::global::Schedule>,
     session: &str,

@@ -24,6 +24,7 @@
 #![allow(dead_code)]
 
 mod agent;
+pub(crate) mod agent_surface;
 use std::sync::Arc;
 
 mod cli;
@@ -37,6 +38,7 @@ pub(crate) mod host;
 pub(crate) mod live;
 pub(crate) mod notes;
 pub(crate) mod runs;
+pub(crate) mod surface;
 pub(crate) mod tasks;
 pub(crate) mod terminal;
 pub(crate) use host::shutdown;

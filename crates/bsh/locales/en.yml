@@ -596,6 +596,7 @@
 "tool.bash.sandboxOffSettings": "Note: the sandbox is turned off in settings for this command. It ran WITHOUT filesystem confinement and its network bypassed the .bsh/egress-allowlist. The tool-boundary policy still applied to the paths and endpoints the command line named; everything it assembled at runtime was not checked."
 "settings.plugins": "Extensions"
 "settings.extensions": "Extensions"
+"settings.surfaces": "Surfaces"
 "settings.extensionsHint": "Installed extensions, their capabilities and contributed panels"
 "settings.extensionsThemeHint": "Choose an app-wide palette contributed by an installed extension"
 "settings.themeKit": "Kit theme"

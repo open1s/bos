@@ -23,6 +23,7 @@ pub mod hooks;
 pub mod mcp;
 #[cfg(feature = "process")]
 pub mod process;
+pub mod surface_runtime;
 #[cfg(all(test, windows))]
 mod windows_job;
 

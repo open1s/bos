@@ -17,7 +17,7 @@ pub use ferris_core::manifest as core_manifest;
 #[cfg(feature = "tokio")]
 pub use ferris_core::{
     capability, composable, config, events, lifecycle, manager, manifest_v2, package, resolver,
-    signing, sources, terminal, types, ui,
+    signing, sources, surface, terminal, types, ui,
 };
 #[cfg(feature = "tokio")]
 pub use ferris_core::{

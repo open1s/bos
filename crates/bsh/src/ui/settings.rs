@@ -8938,6 +8938,36 @@ impl Shell {
             rows.push(div().mb(px(10.0)).child(section).into_any_element());
         }
         rows.push(div().mb(px(10.0)).child(refresh).into_any_element());
+        // The surface inspector: what the extension host mounted, its
+        // generation and revision, and why a panel was refused. It is read from
+        // the same host the renderer uses, so it cannot disagree with the pane.
+        let surface_rows = crate::extension::host::surface_rows();
+        if !surface_rows.is_empty() {
+            let mut list = div().flex().flex_col().gap(px(4.0));
+            for row in surface_rows {
+                let label = format!(
+                    "{} · {} · g{} r{} · {}",
+                    row.panel_id, row.slot, row.generation, row.revision, row.state
+                );
+                list = list.child(txt(label, 12.0, theme::muted()));
+                if let Some(reason) = row.refused {
+                    list = list.child(txt(reason, 11.0, theme::error()));
+                }
+            }
+            rows.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(txt(
+                        tr(self.state.lang, "settings.surfaces"),
+                        12.0,
+                        theme::text(),
+                    ))
+                    .child(list)
+                    .into_any_element(),
+            );
+        }
         ("settings.extensions", "settings.extensionsHint", rows)
     }
 

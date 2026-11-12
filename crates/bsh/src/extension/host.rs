@@ -330,6 +330,10 @@ pub(crate) struct HostMetrics {
     pub(crate) failed: usize,
     /// Runtimes currently carrying work (applied extensions).
     pub(crate) active_tasks: usize,
+    /// Live surface instances the host owns, one per mounted panel.
+    pub(crate) surface_instances: usize,
+    /// Panels whose declared surface document was refused.
+    pub(crate) surface_refused: usize,
     /// Host open-to-ready duration in milliseconds.
     pub(crate) startup_millis: u64,
     /// Fuel consumed by the latest WASM call across runtimes.
@@ -1151,6 +1155,8 @@ pub(crate) struct ExtensionHost {
     crash_history: Vec<String>,
     languages: Vec<LanguageEntry>,
     integrations: Vec<IntegrationEntry>,
+    /// The surface instances behind the mounted panels.
+    surface_host: super::surface::SurfaceHost,
 }
 
 /// One language service contributed by an applied extension.
@@ -1295,6 +1301,7 @@ impl ExtensionHost {
             crash_history: Vec::new(),
             languages: Vec::new(),
             integrations: Vec::new(),
+            surface_host: super::surface::SurfaceHost::new(),
         };
         let terminal = Arc::new(super::terminal::TerminalHandle(Arc::new(
             super::terminal::HostTerminal,
@@ -2963,7 +2970,7 @@ impl ExtensionHost {
     }
 
     /// Every panel an applied extension offers, ready for the host UI.
-    pub(crate) fn panel_surfaces(&self) -> Vec<PanelSurface> {
+    pub(crate) fn panel_surfaces(&mut self) -> Vec<PanelSurface> {
         let mut surfaces = Vec::new();
         for entry in self.loaded.values() {
             if !entry.applied
@@ -3027,6 +3034,45 @@ impl ExtensionHost {
                 });
             }
         }
+        // Agent-authored surfaces are panels too: the same renderer, the same
+        // engine and the same disposal path, with an agent badge in the title.
+        for view in super::agent_surface::views() {
+            surfaces.push(PanelSurface {
+                panel_id: format!("bos.agent.{}", view.id),
+                contribution_id: view.id.clone(),
+                title: format!("Agent \u{b7} {}", view.title),
+                icon: None,
+                location: view.location,
+                visibility: PanelVisibility::Visible,
+                runtime: Arc::clone(&view.runtime),
+                owner: ExtensionId::parse("bos.agent").expect("a static extension id"),
+                theme: None,
+                theme_dark: None,
+                initial: Some(view.document.to_ui_document()),
+                refresh_ms: None,
+                policy: Arc::clone(&self.policy),
+                trust: TrustLevel::Local,
+                tools: Arc::new(Vec::new()),
+                workspace: self.config.workspace.clone(),
+                root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            });
+        }
+        let admissions: Vec<super::surface::PanelAdmission<'_>> = surfaces
+            .iter()
+            .map(|panel| super::surface::PanelAdmission {
+                panel_id: panel.panel_id.as_str(),
+                location: panel.location,
+                document: panel.initial.as_ref(),
+            })
+            .collect();
+        let report = self.surface_host.sync(&admissions);
+        if !report.errors.is_empty() {
+            log::warn!(
+                "surface admission refused {} panel(s): {}",
+                report.errors.len(),
+                report.errors.join("; ")
+            );
+        }
         surfaces
     }
 
@@ -3035,10 +3081,57 @@ impl ExtensionHost {
     /// A panel view is created from a snapshot and outlives the generation that
     /// made it: a rebuild shuts the old runtime down and builds a new one. This
     /// is how the view asks for the replacement without reopening the host.
-    pub(crate) fn live_panel(&self, panel_id: &str) -> Option<PanelSurface> {
+    pub(crate) fn live_panel(&mut self, panel_id: &str) -> Option<PanelSurface> {
         self.panel_surfaces()
             .into_iter()
             .find(|panel| panel.panel_id == panel_id)
+    }
+
+    /// The document and revision the surface host holds for a panel.
+    pub(crate) fn surface_view(&self, panel_id: &str) -> Option<(ferris_sdk::ui::UiDocument, u64)> {
+        let (document, revision) = self.surface_host.view(panel_id)?;
+        Some((document.to_ui_document(), revision.value()))
+    }
+
+    /// Apply a live panel card to its surface instance.
+    pub(crate) fn surface_apply(
+        &mut self,
+        panel_id: &str,
+        document: &ferris_sdk::ui::UiDocument,
+    ) -> Result<(ferris_sdk::ui::UiDocument, u64), String> {
+        let (document, revision) = self.surface_host.apply(panel_id, document)?;
+        Ok((document.to_ui_document(), revision.value()))
+    }
+
+    /// Refuse an action the surface has moved past.
+    pub(crate) fn surface_accept(&self, panel_id: &str, revision: u64) -> Result<(), String> {
+        self.surface_host.accept(panel_id, revision)
+    }
+
+    /// Apply a frame that arrived from a transport.
+    pub(crate) fn surface_frame(
+        &mut self,
+        frame: &ferris_sdk::surface::SurfaceFrame,
+    ) -> Result<ferris_sdk::surface::Revision, String> {
+        self.surface_host.apply_frame(frame)
+    }
+
+    /// The mounted surface rows, for the inspector.
+    pub(crate) fn surface_rows(&self) -> Vec<super::surface::SurfaceRow> {
+        self.surface_host.rows()
+    }
+
+    /// Dispose an instance a transport asked to close.
+    pub(crate) fn surface_close_instance(
+        &mut self,
+        instance: ferris_sdk::surface::InstanceId,
+    ) -> bool {
+        self.surface_host.close_instance(instance)
+    }
+
+    /// Replace a panel's provider generation after a runtime rebind.
+    pub(crate) fn surface_renew(&mut self, panel_id: &str) -> Result<(), String> {
+        self.surface_host.renew(panel_id)
     }
 
     /// Every theme a package contributes, keyed by a host-owned id.
@@ -3198,6 +3291,8 @@ impl ExtensionHost {
                 .filter(|entry| entry.error.is_some())
                 .count(),
             active_tasks: self.loaded.values().filter(|entry| entry.applied).count(),
+            surface_instances: self.surface_host.len(),
+            surface_refused: self.surface_host.refused_count(),
             startup_millis: self.startup_millis,
             fuel_used: self
                 .loaded
@@ -3739,7 +3834,7 @@ pub(crate) fn panels(
         }
     }
     guard
-        .as_ref()
+        .as_mut()
         .map(ExtensionHost::panel_surfaces)
         .unwrap_or_default()
 }
@@ -3751,8 +3846,117 @@ pub(crate) fn panels(
 /// opens or refreshes the host, so a panel render never pays for a store scan.
 pub(crate) fn live_panel(panel_id: &str) -> Option<PanelSurface> {
     let slot = HOST.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().ok()?;
+    guard.as_mut()?.live_panel(panel_id)
+}
+
+/// The document and revision the surface host holds for a panel.
+pub(crate) fn surface_view(panel_id: &str) -> Option<(ferris_sdk::ui::UiDocument, u64)> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
     let guard = slot.lock().ok()?;
-    guard.as_ref()?.live_panel(panel_id)
+    guard.as_ref()?.surface_view(panel_id)
+}
+
+/// Apply a live panel card to its surface instance.
+pub(crate) fn surface_apply(
+    panel_id: &str,
+    document: &ferris_sdk::ui::UiDocument,
+) -> Result<(ferris_sdk::ui::UiDocument, u64), String> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let mut guard = slot
+        .lock()
+        .map_err(|_| "the extension host lock is poisoned".to_string())?;
+    guard
+        .as_mut()
+        .ok_or_else(|| "the extension host is not open".to_string())?
+        .surface_apply(panel_id, document)
+}
+
+/// Replace a panel's provider generation after a runtime rebind.
+pub(crate) fn surface_renew(panel_id: &str) -> Result<(), String> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let mut guard = slot
+        .lock()
+        .map_err(|_| "the extension host lock is poisoned".to_string())?;
+    guard
+        .as_mut()
+        .ok_or_else(|| "the extension host is not open".to_string())?
+        .surface_renew(panel_id)
+}
+
+/// Refuse an action the surface has moved past.
+pub(crate) fn surface_accept(panel_id: &str, revision: u64) -> Result<(), String> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let guard = slot
+        .lock()
+        .map_err(|_| "the extension host lock is poisoned".to_string())?;
+    guard
+        .as_ref()
+        .ok_or_else(|| "the extension host is not open".to_string())?
+        .surface_accept(panel_id, revision)
+}
+
+/// One row per mounted surface, for the extensions pane.
+pub(crate) fn surface_rows() -> Vec<super::surface::SurfaceRow> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = slot.lock() else {
+        return Vec::new();
+    };
+    guard
+        .as_ref()
+        .map(|host| host.surface_rows())
+        .unwrap_or_default()
+}
+
+/// Publish one surface message on the local bus.
+///
+/// The payload carries the bounded, versioned bytes; a subscriber decodes them
+/// with the framework's wire limits rather than trusting the payload shape.
+pub(crate) fn surface_publish(message: &ferris_sdk::surface::SurfaceMessage) -> Result<(), String> {
+    let bytes = ferris_sdk::surface::encode(message).map_err(|error| error.to_string())?;
+    publish(
+        crate::extension::topics::SURFACE,
+        serde_json::json!({ "bytes": bytes }),
+    );
+    Ok(())
+}
+
+/// Ingest one surface message from the local bus.
+///
+/// A frame is applied to the instance it names, and a close disposes it. An
+/// action is refused here on purpose: it must pass the host's authorization
+/// pipeline, not a transport shortcut.
+pub(crate) fn surface_ingest(bytes: &[u8]) -> Result<(), String> {
+    let message = ferris_sdk::surface::decode(bytes).map_err(|error| error.to_string())?;
+    match message {
+        ferris_sdk::surface::SurfaceMessage::Frame { frame } => {
+            let slot = HOST.get_or_init(|| Mutex::new(None));
+            let mut guard = slot
+                .lock()
+                .map_err(|_| "the extension host lock is poisoned".to_string())?;
+            let host = guard
+                .as_mut()
+                .ok_or_else(|| "the extension host is not open".to_string())?;
+            host.surface_frame(&frame).map(|_| ())
+        }
+        ferris_sdk::surface::SurfaceMessage::Close { instance, .. } => {
+            let slot = HOST.get_or_init(|| Mutex::new(None));
+            let mut guard = slot
+                .lock()
+                .map_err(|_| "the extension host lock is poisoned".to_string())?;
+            let host = guard
+                .as_mut()
+                .ok_or_else(|| "the extension host is not open".to_string())?;
+            if host.surface_close_instance(instance) {
+                Ok(())
+            } else {
+                Err("the instance is not mounted".to_string())
+            }
+        }
+        ferris_sdk::surface::SurfaceMessage::Action { .. } => {
+            Err("a surface action must go through the host pipeline, not the transport".to_string())
+        }
+    }
 }
 
 /// The extension themes the current configuration offers.
@@ -4491,7 +4695,7 @@ tools = ["echo"]
             }
         }
         drop(policy);
-        let host = ExtensionHost::open(config(&root)).expect("host");
+        let mut host = ExtensionHost::open(config(&root)).expect("host");
         for id in [
             "com.example.hello",
             "com.example.process-echo",

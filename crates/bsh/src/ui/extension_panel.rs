@@ -29,8 +29,7 @@ use crate::theme;
 use ferris_sdk::host_runtime::CallContext;
 use ferris_sdk::types::ExtensionError;
 use ferris_sdk::ui::{
-    ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, Tone, UiActionRequest, UiDocument,
-    UiNode, UiSession,
+    ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, Tone, UiDocument, UiNode,
 };
 
 use super::{hairline_bottom, icon, txt, IconName};
@@ -121,11 +120,54 @@ impl SearchableListItem for PanelItem {
 /// live host offers right now — never a stored snapshot.
 type SurfaceResolver = Arc<dyn Fn(&str) -> Option<PanelSurface> + Send + Sync>;
 
+/// Where a panel's rendered document and revision come from.
+///
+/// The production store is the surface host: the renderer draws the document
+/// the host's engine validated, and the action check compares against the
+/// engine's revision. A view built without a host (a unit test) falls back to
+/// the panel's declared document, and its own revision gate.
+trait SurfaceStore: Send + Sync {
+    /// The document and revision to draw.
+    fn view(&self, panel_id: &str) -> Option<(UiDocument, u64)>;
+    /// Apply a live card as the next frame.
+    fn apply(&self, panel_id: &str, document: &UiDocument) -> Result<(UiDocument, u64), String>;
+    /// Refuse an action stamped with a revision the surface moved past.
+    fn accept(&self, panel_id: &str, revision: u64) -> Result<(), String>;
+    /// Replace the provider generation after a runtime rebind.
+    fn renew(&self, panel_id: &str) -> Result<(), String>;
+}
+
+/// The production store, backed by the open extension host.
+struct HostSurfaceStore;
+
+impl SurfaceStore for HostSurfaceStore {
+    fn view(&self, panel_id: &str) -> Option<(UiDocument, u64)> {
+        crate::extension::host::surface_view(panel_id)
+    }
+
+    fn apply(&self, panel_id: &str, document: &UiDocument) -> Result<(UiDocument, u64), String> {
+        crate::extension::host::surface_apply(panel_id, document)
+    }
+
+    fn accept(&self, panel_id: &str, revision: u64) -> Result<(), String> {
+        crate::extension::host::surface_accept(panel_id, revision)
+    }
+
+    fn renew(&self, panel_id: &str) -> Result<(), String> {
+        crate::extension::host::surface_renew(panel_id)
+    }
+}
+
 /// One extension panel surface in the settings dialog.
 pub(crate) struct ExtensionPanelView {
     panels: Vec<PanelSurface>,
     selected: usize,
-    session: Option<UiSession>,
+    /// The revision of the document on screen.
+    revision: u64,
+    /// Whether the document came from the surface host or a local fallback.
+    host_backed: bool,
+    /// Where the document and its revision come from.
+    store: Arc<dyn SurfaceStore>,
     document: Option<UiDocument>,
     loading: bool,
     error: Option<String>,
@@ -199,7 +241,9 @@ impl ExtensionPanelView {
         let mut view = Self {
             panels,
             selected,
-            session: None,
+            revision: 0,
+            host_backed: false,
+            store: Arc::new(HostSurfaceStore),
             document: None,
             loading: false,
             error: None,
@@ -220,15 +264,9 @@ impl ExtensionPanelView {
             refresh_pending: false,
             surface_resolver: Arc::new(crate::extension::live_panel),
         };
-        if let Some(panel) = view.panels.get(selected) {
-            if let Some(document) = &panel.initial {
-                match UiSession::open(panel.owner.clone(), document.clone()) {
-                    Ok(session) => {
-                        view.document = Some(session.document().clone());
-                        view.session = Some(session);
-                    }
-                    Err(error) => view.error = Some(error.to_string()),
-                }
+        if let Some(panel) = view.panels.get(selected).cloned() {
+            if let Some(document) = panel.initial.clone() {
+                view.seed(&panel, &document);
             }
         }
         view
@@ -239,7 +277,8 @@ impl ExtensionPanelView {
             return;
         }
         self.selected = index;
-        self.session = None;
+        self.revision = 0;
+        self.host_backed = false;
         self.document = None;
         self.error = None;
         self.message = None;
@@ -250,14 +289,9 @@ impl ExtensionPanelView {
         self.panel_theme = self.panels[index].theme.clone();
         self.panel_theme_dark = self.panels[index].theme_dark.clone();
         self.palette = Palette::new(panel_palette(&self.panel_theme, &self.panel_theme_dark));
-        if let Some(document) = self.panels[index].initial.clone() {
-            match UiSession::open(self.panels[index].owner.clone(), document) {
-                Ok(session) => {
-                    self.document = Some(session.document().clone());
-                    self.session = Some(session);
-                }
-                Err(error) => self.error = Some(error.to_string()),
-            }
+        let panel = self.panels[index].clone();
+        if let Some(document) = panel.initial.clone() {
+            self.seed(&panel, &document);
         } else {
             self.load(cx);
         }
@@ -373,6 +407,15 @@ impl ExtensionPanelView {
         let existing = self.inputs.borrow().get(path).cloned();
         if let Some((declared, entity)) = existing {
             if declared != value {
+                // Never overwrite the field the reader is typing in: a live
+                // card that re-sends an older value would otherwise clobber
+                // the caret and the input method's composition buffer. The
+                // cache stays at the declared value, so the update lands on
+                // the first frame after focus leaves.
+                let focused = entity.read(cx).focus_handle(cx).is_focused(window);
+                if focused {
+                    return entity;
+                }
                 entity.update(cx, |state, cx| state.set_value(value, window, cx));
                 self.inputs
                     .borrow_mut()
@@ -434,6 +477,62 @@ impl ExtensionPanelView {
         }
     }
 
+    /// Seed the view from the surface host, or from the declared view when no
+    /// host is open.
+    fn seed(&mut self, panel: &PanelSurface, document: &UiDocument) {
+        self.revision = 0;
+        self.host_backed = false;
+        if let Some((document, revision)) = self.store.view(&panel.panel_id) {
+            self.document = Some(document);
+            self.revision = revision;
+            self.host_backed = true;
+            self.error = None;
+            return;
+        }
+        let report = document.validate(&panel.owner);
+        if report.is_valid() {
+            self.document = Some(document.clone());
+            self.revision = 1;
+            self.error = None;
+        } else {
+            self.error = Some(
+                report
+                    .errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+        }
+    }
+
+    /// Apply a live card through the surface host, falling back to a local
+    /// validation when the host is not open.
+    fn apply_live(&mut self, panel: &PanelSurface, document: UiDocument) {
+        match self.store.apply(&panel.panel_id, &document) {
+            Ok((document, revision)) => {
+                self.document = Some(document);
+                self.revision = revision;
+                self.host_backed = true;
+                self.error = None;
+                self.message = None;
+            }
+            Err(error) => {
+                if !self.host_backed {
+                    let report = document.validate(&panel.owner);
+                    if report.is_valid() {
+                        self.document = Some(document);
+                        self.revision += 1;
+                        self.error = None;
+                        self.message = None;
+                        return;
+                    }
+                }
+                self.live_failure(error);
+            }
+        }
+    }
+
     /// Point the view's copy of a panel at the runtime that just answered.
     ///
     /// A panel is looked up by id, not by its row index, because the reader can
@@ -466,19 +565,12 @@ impl ExtensionPanelView {
             let _ = this.update(cx, |this, cx| {
                 if let Some(fresh) = resolved {
                     this.rebind(&fresh);
+                    let _ = this.store.renew(&fresh.panel_id);
                 }
                 this.loading = false;
                 match outcome {
                     Ok(value) => match serde_json::from_value::<UiDocument>(value) {
-                        Ok(document) => match UiSession::open(panel.owner.clone(), document) {
-                            Ok(session) => {
-                                this.document = Some(session.document().clone());
-                                this.session = Some(session);
-                                this.error = None;
-                                this.message = None;
-                            }
-                            Err(error) => this.live_failure(error.to_string()),
-                        },
+                        Ok(document) => this.apply_live(&panel, document),
                         Err(error) => {
                             this.live_failure(format!("panel document is not valid: {error}"))
                         }
@@ -492,28 +584,49 @@ impl ExtensionPanelView {
     }
 
     fn dispatch(&mut self, action: &str, payload: Value, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else {
+        let Some(mut panel) = self.panels.get(self.selected).cloned() else {
             return;
         };
-        let request = UiActionRequest {
-            action: action.to_string(),
-            revision: self.render_revision,
-            payload: payload.clone(),
+        // A composed slot prefixes its actions with the panel that owns the
+        // region. Route the press to that provider's tools and policy; the
+        // parent's revision gate still covers the frame the reader saw.
+        let mut action = action.to_string();
+        while let Some((head, rest)) = action.split_once('\u{1f}') {
+            let Some(next) = self
+                .panels
+                .iter()
+                .find(|panel| panel.panel_id == head)
+                .cloned()
+            else {
+                break;
+            };
+            panel = next;
+            action = rest.to_string();
+        }
+        // The rendered revision is the one the host's engine validated. A
+        // surface-backed panel asks the host; a locally seeded one (no open
+        // host, as in a unit test) keeps the same revision equality rule.
+        let accepted = if self.host_backed {
+            self.store.accept(&panel.panel_id, self.render_revision)
+        } else if self.render_revision == self.revision {
+            Ok(())
+        } else {
+            Err(format!(
+                "stale action at revision {}; the panel is at {}",
+                self.render_revision, self.revision
+            ))
         };
-        if let Err(error) = session.accept_action(&request) {
-            self.error = Some(error.to_string());
+        if let Err(error) = accepted {
+            self.error = Some(error);
             cx.notify();
             return;
         }
-        let Some(panel) = self.panels.get(self.selected).cloned() else {
-            return;
-        };
         // A panel action is a tool call on a surface that is not the agent, so
         // it needs the same per-call capability decision and audit line.
         if let Some(descriptor) = panel
             .tools
             .iter()
-            .find(|descriptor| descriptor.id.as_str() == action)
+            .find(|descriptor| descriptor.id.as_str() == action.as_str())
         {
             let scope = ferris_sdk::capability::call_scope(&payload, panel.workspace.as_deref());
             if let Err(error) = ferris_sdk::capability::authorize_each(
@@ -535,11 +648,10 @@ impl ExtensionPanelView {
             serde_json::json!({
                 "extension": panel.owner.as_str(),
                 "panel": panel.panel_id,
-                "action": action,
+                "action": action.clone(),
                 "revision": revision,
             }),
         );
-        let action = action.to_string();
         let resolve = Arc::clone(&self.surface_resolver);
         self.message = Some("Running…".to_string());
         cx.spawn(async move |this, cx| {
@@ -573,21 +685,13 @@ impl ExtensionPanelView {
             let _ = this.update(cx, |this, cx| {
                 if let Some(fresh) = resolved {
                     this.rebind(&fresh);
+                    let _ = this.store.renew(&fresh.panel_id);
                 }
                 this.message = None;
                 match outcome {
                     Ok(value) => {
                         if let Ok(document) = serde_json::from_value::<UiDocument>(value.clone()) {
-                            let Some(session) = this.session.as_mut() else {
-                                return;
-                            };
-                            match session.apply(document, revision + 1) {
-                                Ok(()) => {
-                                    this.document = Some(session.document().clone());
-                                    this.error = None;
-                                }
-                                Err(error) => this.error = Some(error.to_string()),
-                            }
+                            this.apply_live(&panel, document);
                         } else {
                             this.message = Some(summarize(&value));
                         }
@@ -1163,7 +1267,7 @@ impl Render for ExtensionPanelView {
         self.ensure_picker(window, cx);
         // Record what this frame draws from; a click later in the frame's life
         // is an action on this revision, not on whatever replaced it since.
-        self.render_revision = self.session.as_ref().map(UiSession::revision).unwrap_or(0);
+        self.render_revision = self.revision;
         let mut root = div()
             .debug_selector(|| "extension-panel-view".to_string())
             .flex()
@@ -1396,8 +1500,8 @@ mod tests {
         }))
         .expect("document");
         let view = ExtensionPanelView::new(vec![panel(document)], Lang::En);
-        assert!(view.session.is_some());
         assert!(view.document.is_some());
+        assert!(view.revision >= 1);
         assert!(view.error.is_none());
         assert_eq!(view.panels.len(), 1);
     }
