@@ -92,6 +92,53 @@ pub fn set_federation_profile(name: &str) -> bool {
     }
 }
 
+/// The first bare argument, when it is not a command this build handles.
+///
+/// A misspelt subcommand used to fall through to the GUI launch: the app then
+/// started a second instance with the DEFAULT federation profile, and the only
+/// visible symptom was the data-directory lock warning. A typo is a command
+/// error and must be reported as one.
+pub fn unknown_launch_command(args: &[String]) -> Option<String> {
+    let first = args.first()?;
+    if first.starts_with('-') {
+        return None;
+    }
+    if matches!(first.as_str(), "ext" | "federation" | "fed") {
+        return None;
+    }
+    Some(first.clone())
+}
+
+#[cfg(test)]
+mod launch_command_tests {
+    use super::unknown_launch_command;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn known_commands_are_not_typos() {
+        for value in ["ext", "federation", "fed"] {
+            assert_eq!(unknown_launch_command(&args(&[value])), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn flags_are_not_commands() {
+        assert_eq!(unknown_launch_command(&args(&["--settings=tools"])), None);
+        assert_eq!(unknown_launch_command(&args(&[])), None);
+    }
+
+    #[test]
+    fn a_misspelt_command_is_reported() {
+        assert_eq!(
+            unknown_launch_command(&args(&["federaton", "--profile", "work"])),
+            Some("federaton".to_string())
+        );
+    }
+}
+
 /// Run one `bsh federation` command, profile-aware.
 ///
 /// `--profile NAME` (or `-p`) selects which node's files the command reads or

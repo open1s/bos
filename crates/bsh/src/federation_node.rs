@@ -788,7 +788,12 @@ pub(crate) fn start_profile(
             true
         }
         Err(error) => {
-            log::warn!("federation node did not start: {error}");
+            let hint = if error.contains("another BSH instance") {
+                " (run this instance under its own profile with --federation-profile NAME, or manage the running node with: bsh federation --profile NAME status)"
+            } else {
+                ""
+            };
+            log::warn!("federation node did not start: {error}{hint}");
             false
         }
     }

@@ -112,5 +112,18 @@ fn main() {
         );
         return;
     }
+    // A bare word that is not a subcommand is a typo, not a launch. Without
+    // this check the app starts a second GUI with the default federation
+    // profile, and the only visible symptom is the data-directory lock warning.
+    if let Some(command) = bsh::unknown_launch_command(&args) {
+        eprintln!("bsh: unknown command '{command}'");
+        if command.starts_with("federat") {
+            eprintln!("  did you mean: bsh federation --profile NAME <status|serve|pair|profiles>");
+        } else {
+            eprintln!("  commands: bsh ext <command> | bsh federation <command>");
+        }
+        eprintln!("  run bsh --help for the launch flags");
+        std::process::exit(2);
+    }
     bsh::run();
 }
