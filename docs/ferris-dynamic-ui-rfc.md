@@ -94,7 +94,7 @@ These are not incidental; a new design that loses one of them is a regression:
 
 The surface framework **runs on cordis-rs**. Provider admission is a Cordis Plugin prepare/apply, registration is owned by the apply generation, and teardown is Fiber disposal. The dependency is pinned exactly: `cordis-core = "=0.6.1"` (MSRV 1.88; the workspace is on a newer toolchain). The version was checked by compiling the adapter and running its tests, not by reading a changelog; a bump is a deliberate change that must keep those tests green.
 
-The contract is **not** a Cordis type. A surface contract, document, frame and instance are Ferris values; Cordis types stay inside `surface::cordis` and never cross the `ferris-sdk` boundary. That split is what lets one contract hold for every provider family while one runtime owns their lifecycle:
+The contract is **not** a Cordis type. A surface contract, document, frame and instance are Ferris values; Cordis types stay inside `ferris_runtime::surface_runtime` and never cross the `ferris-sdk` boundary. That split is what lets one contract hold for every provider family while one runtime owns their lifecycle:
 
 | Surface provider family | How it reaches the runtime | Where its UI work runs |
 |---|---|---|
@@ -1204,7 +1204,7 @@ Landed in this change, in `ferris-core` and re-exported by `ferris-sdk`:
 | Catalogue, exact resolution, ambiguity, cycles and bounds | `surface/compose.rs` | Implemented |
 | Instance engine: generation, revision, refusal rules, disposal | `surface/engine.rs` | Implemented |
 | Provider seam | `surface/runtime.rs` | Implemented |
-| cordis-rs runtime: install, refresh, uninstall, generation-owned registry | `surface/cordis.rs` | Implemented |
+| cordis-rs runtime: install, refresh, uninstall, generation-owned registry | `ferris-runtime/src/surface_runtime.rs` | Implemented |
 | BSH host slot catalogue and one surface instance per mounted panel | `bsh/src/extension/surface.rs` | Implemented |
 | Panel renderer draws the surface document and revision the engine holds; live cards and action results apply through it | `bsh/src/ui/extension_panel.rs` | Implemented |
 | Generation renewal when a panel's provider is rebound | `bsh/src/extension/surface.rs` | Implemented |

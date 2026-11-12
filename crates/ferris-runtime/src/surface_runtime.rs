@@ -20,12 +20,12 @@ use std::sync::{Arc, Mutex};
 use cordis_core::lifecycle::FiberHandle;
 use cordis_core::{Context, Plugin, PreparedPlugin};
 
+use ferris_core::surface::engine::InstanceState;
 use ferris_core::surface::{
     Generation, InstanceId, Revision, SurfaceCatalog, SurfaceDisposalReport, SurfaceDocument,
     SurfaceEngine, SurfaceError, SurfaceFrame, SurfaceId, SurfaceInstance, SurfaceLimits,
     SurfaceProvider, SurfaceRequest,
 };
-use ferris_core::surface::engine::InstanceState;
 
 /// A provider installed in the Cordis runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,7 +292,7 @@ mod tests {
         fn new() -> Self {
             let contract = SurfaceContract::new(
                 SurfaceId::parse("acme.git/status").expect("id"),
-                semver::Version::new(1, 2, 3),
+                "1.2.3".parse().expect("version"),
             )
             .with_profile(Profile::Text)
             .with_action(ActionSpec {
@@ -334,7 +334,7 @@ mod tests {
                     children: vec![SurfaceNode::Text {
                         id: None,
                         text: format!("revision {}", request.revision.value()),
-                        tone: crate::ui::Tone::Neutral,
+                        tone: ferris_core::ui::Tone::Neutral,
                     }],
                 },
             })
