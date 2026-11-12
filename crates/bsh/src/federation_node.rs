@@ -1714,20 +1714,33 @@ async fn refresh(node: &Arc<FederationNode>, cache: &Arc<RwLock<BTreeMap<NodeId,
                 .collect()
         })
         .unwrap_or_default();
-    for peer in peers {
-        match node.peer_catalogue(&peer).await {
-            Ok(catalogue) => {
-                let count = catalogue.len();
-                if let Ok(mut cache) = cache.write() {
-                    cache.insert(peer.clone(), catalogue);
+    // Ask every peer at once: one unreachable peer must not delay the answer
+    // from a live one, and discovery already has a short per-peer deadline.
+    let probes = peers.into_iter().map(|peer| {
+        let node = Arc::clone(node);
+        let cache = Arc::clone(cache);
+        async move {
+            match node.peer_catalogue(&peer).await {
+                Ok(catalogue) => {
+                    let count = catalogue.len();
+                    if let Ok(mut cache) = cache.write() {
+                        cache.insert(peer.clone(), catalogue);
+                    }
+                    if count == 0 {
+                        log::debug!(
+                            "federation peer {peer} offers 0 capabilities (the peer exposes none, or has not granted this node any)"
+                        );
+                    } else {
+                        log::debug!("federation peer {peer} offers {count} capabilities");
+                    }
                 }
-                log::debug!("federation peer {peer} offers {count} capabilities");
-            }
-            Err(error) => {
-                log::debug!("federation peer {peer} did not answer discovery: {error}");
+                Err(error) => {
+                    log::debug!("federation peer {peer} did not answer discovery: {error}");
+                }
             }
         }
-    }
+    });
+    futures::future::join_all(probes).await;
 }
 
 #[cfg(test)]

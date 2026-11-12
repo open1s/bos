@@ -49,6 +49,13 @@ use crate::task::{FederatedTask, TaskCreateRequest, TaskIdRequest, TaskQueue};
 /// How long a caller waits for a result when the context has no deadline.
 pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a discovery probe waits for a peer.
+///
+/// Discovery is a best-effort catalogue refresh every 30 seconds, so it must
+/// fail fast: using the generic 30-second reply timeout made one unreachable
+/// peer stall the whole pass and push the next pass a full interval behind.
+const DISCOVERY_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How many inbound stream messages buffer ahead of the consumer.
 const RESOURCE_QUEUE: usize = 32;
 
@@ -2233,7 +2240,14 @@ impl FederationNode {
                 });
             }
         }
-        let reply = self.round_trip(peer, "discover", json!({}), None).await?;
+        let reply = self
+            .round_trip(
+                peer,
+                "discover",
+                json!({}),
+                Some(Instant::now() + DISCOVERY_REPLY_TIMEOUT),
+            )
+            .await?;
         let record = decode_discovery(&reply)?;
         if &record.node != peer {
             return Err(CapabilityError::Denied {
