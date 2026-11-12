@@ -625,6 +625,12 @@ pub(crate) struct AppState {
     /// The meter's breakdown prices the request's tool schemas from exactly this
     /// array, so its figure follows the agent the next turn will run.
     pub(crate) tools_schema_chars: usize,
+    /// Whether the last built agent carries a complete persona.
+    ///
+    /// A complete persona replaces the harness identity, the workflow contract
+    /// and every per-tool section; the composer draws a badge from this so the
+    /// reader can attribute an off-contract turn to the configuration.
+    pub(crate) persona_complete: bool,
     /// Skills the last built agent carried beyond the settings scan.
     ///
     /// A package's SKILL.md files are loaded after the build, so the settings
@@ -926,6 +932,7 @@ impl AppState {
             stat_open: false,
             meter_open: false,
             tools_schema_chars: 0,
+            persona_complete: false,
             agent_skills: Vec::new(),
             agent_skills_generation: 0,
             policy: None,
@@ -3768,6 +3775,24 @@ impl AppState {
             self.restore_steer(*ticket);
             return;
         }
+        // An action turn that produced no successful tool call is reported
+        // where the reader is looking: the status row names it instead of
+        // leaving the fact in a log the reader never opens.
+        if let AgentEvent::ActionMissed {
+            tool_calls,
+            failures,
+        } = &event
+        {
+            self.notice(crate::i18n::tr_args(
+                self.lang,
+                "turn.actionMissed",
+                &[
+                    ("calls", tool_calls.to_string()),
+                    ("failures", failures.to_string()),
+                ],
+            ));
+            return;
+        }
         let terminal = matches!(event, AgentEvent::Done | AgentEvent::Error(_));
         // A tool call or its result is a whole step, not a delta: losing it to
         // the throttle would drop more than the second since the last write.
@@ -3855,7 +3880,8 @@ impl AppState {
                 // arms exist so the match stays exhaustive by the type.
                 AgentEvent::AutoCompacted { .. }
                 | AgentEvent::Steered { .. }
-                | AgentEvent::SteerWithdrawn { .. } => {}
+                | AgentEvent::SteerWithdrawn { .. }
+                | AgentEvent::ActionMissed { .. } => {}
                 // A turn that ends with nothing to show is a failure the
                 // reader must see. A reasoning model can spend every step in
                 // `reasoning_content` and never write an answer; the engine
@@ -4111,6 +4137,11 @@ impl AppState {
     /// Record the serialized length of the tool schemas a built agent carries.
     pub(crate) fn set_tools_schema(&mut self, chars: usize) {
         self.tools_schema_chars = chars;
+    }
+
+    /// Record whether the agent the next turn runs carries a complete persona.
+    pub(crate) fn set_persona_complete(&mut self, active: bool) {
+        self.persona_complete = active;
     }
 
     /// Record the skills a built agent carries beyond the settings scan.
@@ -6689,6 +6720,35 @@ mod tests {
         assert!(state.clear_goal(&id));
         assert!(state.goal(&id).is_none());
         assert!(!state.clear_goal(&id));
+    }
+
+    /// An action turn with no successful tool call reports it in the status
+    /// row: the reader is looking at the answer, so the caveat lands there.
+    #[test]
+    fn a_missed_action_turn_sets_the_status_notice() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-action-missed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        let id = state.active_id.clone().expect("a session");
+        state.begin_turn_in(&id, "fix it").expect("a turn opens");
+        state.apply_event(
+            &id,
+            crate::runner::AgentEvent::ActionMissed {
+                tool_calls: 2,
+                failures: 2,
+            },
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("successful tool call"),
+            "the status row names the miss: {:?}",
+            state.notice
+        );
     }
 
     /// Halting a running turn must not lose what the turn already produced:

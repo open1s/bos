@@ -69,6 +69,15 @@ You and the reader share one workspace. Turn what they asked for into a finished
 - Plain words, concrete nouns, file paths the reader can open; no filler or praise.
 - Match the reader's language; brief by default, thorough when the decision needs it.";
 
+/// The system prompt for the one-shot intent classifier.
+///
+/// The host's lexical classifier is fast but has no semantics, so an UNKNOWN
+/// answer may be given to the configured model once. This prompt asks for one
+/// word and nothing else: the reply is parsed, not shown. It is a strong prompt
+/// in the same sense as the workflow contract - it names the two labels and the
+/// decision between them, not a list of verbs.
+pub const INTENT_CLASSIFIER_PROMPT: &str = "You classify one message for a coding agent that works in the user's workspace. Reply with exactly one word: ACTION or EXPLANATION.\n\nACTION: the user asks for work in their workspace - fix, implement, change, add, run, inspect to diagnose, review - or asks a why/what-is-wrong question about their own code. The deliverable may still be an explanation, but producing it needs tools.\nEXPLANATION: the user asks for an explanation, a concept, a comparison or teaching, with no workspace work expected.\n\nNever explain your answer. Reply only ACTION or EXPLANATION.";
+
 /// The heading that makes discovery the prompt's FIRST section.
 ///
 /// A withheld tool is unreachable until the model knows to look for it, and a

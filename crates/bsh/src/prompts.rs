@@ -192,6 +192,37 @@ pub(crate) const CREATOR_PERSONA: &str = "You extend this harness through conver
 /// The shipped `read-only` preset persona.
 pub(crate) const READ_ONLY_PERSONA: &str = "You are a read-only analyst: you read the workspace and the web, and you change nothing.\n\n- Ground every claim in something you read: cite file paths and source URLs; never invent an API, path or citation.\n- Search the web when the workspace cannot answer, and separate what the code does from what you infer.\n- Verify by reading more, never by running: no writes, no commands, no claims of either.\n- End concrete: findings first, then the smallest set of changes the reader could approve.";
 
+/// The action-first stance every shipped preset persona ends with.
+///
+/// The workflow contract already routes a turn, but a preset's persona is the
+/// slot closest to the model's sense of who it is. A preset that frames itself
+/// as an analyst, a batcher or a package author without saying "work first"
+/// drifts toward the narrative that identity suggests - so the shipped
+/// personas carry the same stance explicitly, in the reference's own
+/// work-first/report-briefly shape.
+pub(crate) const ACTION_FIRST_PERSONA: &str = "\n\nWork first, report briefly: for a concrete coding request, inspect, run or edit before you describe what you plan to do. A question about this repository is answered from evidence you gathered, not from memory. When you stop, name what changed, the checks you ran and anything still unverified.";
+
+/// A shipped persona with the action-first stance appended.
+///
+/// The body stays the preset's own identity; this only fixes the stance, so the
+/// catalogue, the settings card and the build all show one composed persona.
+pub(crate) fn preset_persona(body: &str) -> String {
+    let mut persona = body.trim_end().to_string();
+    persona.push_str(ACTION_FIRST_PERSONA);
+    persona
+}
+
+/// The execution footer a COMPLETE persona still carries.
+///
+/// The reference's `complete: true` arm makes the persona the sole prompt
+/// section. BSH keeps that arm for the persona's own text but does not let it
+/// remove the harness's execution contract: a compact footer (the work-first
+/// stance, evidence before explanation, verification and the stop rule) is
+/// appended in the same change. The runtime action contract already applies to
+/// a complete persona; this keeps the PROMPT from contradicting it, while the
+/// persona stays the entire identity and domain text.
+pub(crate) const COMPLETE_PERSONA_CONTRACT: &str = "\n\n## Execution contract (harness)\nThis section belongs to the harness, not the persona: a complete persona keeps it.\n- Work first, report briefly: for a concrete coding request, inspect, run or edit before describing what you plan to do.\n- A question about this repository is answered from evidence you gathered, not from memory.\n- Prove a change with the command that checks it, or say what you could not check.\n- Stop when the request is answered; report outcome first, then evidence, then anything unverified.";
+
 /// The plan-mode directive carried in front of a turn's own text.
 ///
 /// The reference expresses plan mode as a system section that names its
@@ -367,6 +398,7 @@ mod tests {
             PTC_PERSONA,
             CREATOR_PERSONA,
             READ_ONLY_PERSONA,
+            ACTION_FIRST_PERSONA,
             PLAN_DIRECTIVE,
         ];
         for text in corpus {
@@ -433,9 +465,39 @@ mod tests {
             stale_tool_reference("You are a helpful software engineer assistant."),
             None
         );
-        for persona in [PTC_PERSONA, CREATOR_PERSONA, READ_ONLY_PERSONA] {
+        for persona in [
+            PTC_PERSONA,
+            CREATOR_PERSONA,
+            READ_ONLY_PERSONA,
+            ACTION_FIRST_PERSONA,
+        ] {
             assert_eq!(stale_tool_reference(persona), None, "{persona}");
         }
+    }
+
+    /// The work-first stance is appended once, after the preset's own identity,
+    /// and Standard keeps the framework contract by shipping no persona at all.
+    #[test]
+    fn shipped_personas_end_with_the_action_first_stance() {
+        for body in [PTC_PERSONA, CREATOR_PERSONA, READ_ONLY_PERSONA] {
+            let composed = preset_persona(body);
+            assert_eq!(
+                composed,
+                format!("{}{}", body.trim_end(), ACTION_FIRST_PERSONA),
+                "the stance is appended after the pinned body"
+            );
+            assert!(composed.ends_with(ACTION_FIRST_PERSONA));
+        }
+        assert!(
+            !ACTION_FIRST_PERSONA.trim().is_empty(),
+            "the stance is not empty"
+        );
+        let standard = crate::settings::global::built_in_preset("standard")
+            .expect("the standard preset ships");
+        assert!(
+            standard.system_prompt.is_none(),
+            "Standard inherits the workspace/framework contract"
+        );
     }
 
     #[test]

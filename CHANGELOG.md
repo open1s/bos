@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Action-first hardening** (issue #293 residuals): the last limits are closed.
+  An UNCLASSIFIED turn now gets a semantic second opinion from the configured
+  model through `INTENT_CLASSIFIER_PROMPT` (one words-only completion, eight
+  tokens, 8s timeout, cached process-wide by message and model, skipped for
+  slash commands). Transient provider failures are retried twice with backoff
+  (plus any registered fallback provider), the classifier's usage is drained
+  into the turn's usage report instead of being billed invisibly, and only a
+  persistent outage keeps the lexical answer. The engine still spends the
+  bounded action retry when a promise replaces an action (an explicit
+  explanation turn is never nudged), and a new `ACTION_FAILED_NOTE` retry fires
+  when every tool call of an action turn failed. A failed call of a tool that
+  DECLARES read-only side effects is retried once when the failure is transient;
+  a write, process, network or spend tool is never replayed, and a persistent
+  failure is refused as a completion, logged through `TurnOutcome`, and
+  surfaced in the status bar by `AgentEvent::ActionMissed` with its call and
+  failure counts. The three shipped preset personas (PTC, Creator, Read-only)
+  end with an `ACTION_FIRST_PERSONA` stance. The complete-persona override can
+  no longer remove the execution contract: a compact
+  `COMPLETE_PERSONA_CONTRACT` footer rides every complete build, and the
+  composer badge both names the override and reverses it on click (clears and
+  saves `workspace.agent.complete`, rebuilds the session's agent; a preset
+  cause is named instead). Docs: `docs/bsh-prompts.md` section 9.
+
 - **Action-first coding turns** (issue #293): the workflow contract now
   separates the requested deliverable from the method that produces it - a
   repository-specific "why does X fail?" gathers evidence with tools before it

@@ -555,6 +555,13 @@ pub(crate) struct BuiltAgent {
     /// array, the way the reference's `contextBreakdown` follows the latest
     /// request header.
     pub(crate) tools_schema_chars: usize,
+    /// Whether this build carries a complete persona.
+    ///
+    /// A complete persona replaces the harness identity, the workflow contract
+    /// and every per-tool section, so the shell draws a badge naming it: a
+    /// talk-only or off-contract turn must be attributable to the
+    /// configuration rather than guessed at.
+    pub(crate) persona_complete: bool,
     /// The installed plugins, for the settings inventory.
     pub(crate) plugins: Vec<PluginInfo>,
     /// Fiber activations held for exactly as long as this build is live.
@@ -828,25 +835,28 @@ fn build_agent_for_session_inner(
     // empty persona under `complete` falls back to the default composition,
     // because an empty system prompt is never what a persona meant.
     let persona_complete = eff.persona_complete && !eff.llm_system_prompt().trim().is_empty();
-    // A complete persona is the reference's escape hatch: the configured text
-    // is the WHOLE prompt, so the harness identity, the workflow contract and
-    // every per-tool section are omitted. That materially changes whether the
-    // model acts before it talks, so it is named in the log instead of being
-    // inferred later from a talk-only turn.
+    // A complete persona is the reference's sole-section arm: the configured
+    // text is the whole PERSONA, so the harness identity, the standing workflow
+    // and every per-tool section are omitted. BSH keeps one compact execution
+    // footer even then. The runtime action contract already applies to a
+    // complete persona, and this keeps the PROMPT from contradicting it: the
+    // reader may replace the persona, not the harness's safety and work rules.
     if persona_complete {
         log::warn!(
-            "persona complete: the configured persona replaces the BSH execution contract for session {session}; the workflow rules and tool guidance are omitted"
+            "persona complete: session {session} omits the identity, workflow and tool guidance; the harness execution footer still applies"
         );
+    }
+    let mut system_prompt =
+        agent::prompts::compose_system_prompt_with(eff.llm_system_prompt(), persona_complete);
+    if persona_complete {
+        system_prompt.push_str(crate::prompts::COMPLETE_PERSONA_CONTRACT);
     }
     let mut config = AgentConfig {
         name: "bsh".to_string(),
         model,
         base_url: eff.base_url.clone(),
         api_key,
-        system_prompt: agent::prompts::compose_system_prompt_with(
-            eff.llm_system_prompt(),
-            persona_complete,
-        ),
+        system_prompt,
         persona_complete,
         temperature: eff.temperature,
         // The composer's "Off" level is stored as the literal `off` so it can
@@ -1750,6 +1760,10 @@ fn build_agent_for_session_inner(
             // caused by the model, the tools or the provider.
             "persona_complete": persona_complete,
             "workflow_contract": !persona_complete,
+            // A complete persona still carries the compact harness footer;
+            // diagnostics must not read the omitted layers as an absent
+            // contract.
+            "execution_footer": persona_complete,
             "capabilities": snapshot
                 .as_ref()
                 .map_or(0, |snapshot| snapshot.capabilities.len()),
@@ -1767,6 +1781,7 @@ fn build_agent_for_session_inner(
         extension_activations: extension_activations.into(),
         live_driver: LiveDriverGuard(None),
         tools_schema_chars: schema_chars,
+        persona_complete,
         credential_error,
         policy,
         effective: eff,
@@ -7412,20 +7427,41 @@ mod tests {
     }
 
     /// The reference's `complete: true` arm over a real build: the persona is
-    /// EXACTLY the system prompt - no identity, no workflow, no tool guidance -
-    /// while the tool registry is untouched. Off stays the slot composition.
+    /// the whole persona text and the identity/workflow/tool sections are gone,
+    /// while the compact harness execution footer remains and the tool registry
+    /// is untouched. Off stays the slot composition.
     #[test]
-    fn a_complete_persona_replaces_the_whole_prompt() {
+    fn a_complete_persona_keeps_its_text_and_the_harness_footer() {
         let mut settings = bare();
         settings.global.default_preset = String::new();
         settings.workspace.agent.system_prompt =
             "You are a helpful software engineer assistant.".to_string();
         settings.workspace.agent.complete = true;
         let built = build(&settings);
-        assert_eq!(
-            built.agent.config().system_prompt,
-            "You are a helpful software engineer assistant.",
-            "a complete persona is the whole prompt"
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .starts_with("You are a helpful software engineer assistant."),
+            "a complete persona is the whole persona text: {}",
+            built.agent.config().system_prompt
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .ends_with(crate::prompts::COMPLETE_PERSONA_CONTRACT),
+            "the harness execution footer still applies"
+        );
+        assert!(
+            !built
+                .agent
+                .config()
+                .system_prompt
+                .contains(agent::HARNESS_IDENTITY),
+            "the identity layer is still omitted"
         );
         assert!(
             built.agent.config().persona_complete,
@@ -7453,7 +7489,22 @@ mod tests {
         );
         settings.global.default_preset = "minimal".to_string();
         let built = build(&settings);
-        assert_eq!(built.agent.config().system_prompt, "You are terse.");
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .starts_with("You are terse."),
+            "the preset persona is the text"
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .ends_with(crate::prompts::COMPLETE_PERSONA_CONTRACT),
+            "the footer applies to a preset's complete persona too"
+        );
         assert!(!built
             .agent
             .config()
@@ -7636,10 +7687,15 @@ mod tests {
         ];
         for (id, persona, bullets) in roster {
             let preset = crate::settings::global::built_in_preset(id).expect("a shipped preset");
+            let composed = crate::prompts::preset_persona(persona);
             assert_eq!(
                 preset.system_prompt.as_deref(),
-                Some(persona),
-                "{id} uses the pinned persona"
+                Some(composed.as_str()),
+                "{id} uses the pinned persona with the action-first stance"
+            );
+            assert!(
+                composed.ends_with(crate::prompts::ACTION_FIRST_PERSONA),
+                "{id} ends with the work-first clause"
             );
             for bullet in bullets {
                 assert!(persona.contains(bullet), "{id} keeps: {bullet}");

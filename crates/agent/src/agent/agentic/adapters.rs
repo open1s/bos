@@ -28,6 +28,12 @@ impl ReactToolTrait for ExtensibleToolAdapter {
         self.inner.json_schema()
     }
 
+    /// The wrapped tool's own declaration: a wrapper that dropped it would
+    /// hide side effects from the retry policy and from discovery metadata.
+    fn metadata(&self) -> Option<&react::tool::ToolMetadata> {
+        self.inner.metadata()
+    }
+
     fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ReactToolError> {
         // Note: Hook triggering is handled by AgentReActApp at the agent level
         // to avoid duplicate hook firing
@@ -94,6 +100,12 @@ impl AsyncTool for AsyncExtensibleToolAdapter {
 
     fn json_schema(&self) -> serde_json::Value {
         self.inner.json_schema()
+    }
+
+    /// See [`ExtensibleToolAdapter`]: the wrapper must not answer for the tool
+    /// it wraps.
+    fn metadata(&self) -> Option<&react::tool::ToolMetadata> {
+        self.inner.metadata()
     }
 
     fn to_openai_definition(&self) -> react::tool::descriptor::ToolDefinition {

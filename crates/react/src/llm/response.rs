@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::pin::Pin;
 
 use super::types::LlmError;
+use super::vendor::responses::{ResponsesContentPart, ResponsesItem};
 
 /// Result of an LLM call.
 pub type LlmResponseResult = Result<LlmResponse, LlmError>;
@@ -25,6 +26,34 @@ pub enum LlmResponse {
 }
 
 impl LlmResponse {
+    /// The first non-empty assistant text this response carries.
+    ///
+    /// Both protocols put the words in different places; a caller that only
+    /// needs the answer (a classifier, a title, a summary) uses this instead of
+    /// matching two wire shapes.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::OpenAI(rsp) => rsp.choices.iter().find_map(|choice| {
+                choice
+                    .message
+                    .content
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            }),
+            Self::Responses(rsp) => rsp.output.iter().find_map(|item| match item {
+                ResponsesItem::Message { content, .. } => {
+                    content.iter().find_map(|part| match part {
+                        ResponsesContentPart::OutputText { text, .. } => {
+                            Some(text.as_str()).filter(|text| !text.trim().is_empty())
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            }),
+        }
+    }
+
     /// Token usage reported by the provider, if any.
     pub fn usage(&self) -> Option<TokenUsage> {
         match self {

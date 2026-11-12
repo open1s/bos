@@ -96,6 +96,48 @@ fn cut_short(max_tokens: Option<u32>, completion_tokens: Option<u32>) -> bool {
 /// blocker.
 pub const ACTION_NOTE: &str = "This request asks for work in the workspace, and no tool has run this turn. Do not answer with instructions, a plan or a promise. Call the tools now - inspect the relevant files, run the failing command, make the change - then report what you did and what you verified. If you genuinely cannot act, say what blocks you; never claim work you did not do.";
 
+/// What the model is told when every tool call of an ACTION turn failed.
+///
+/// The retry can force an attempt; it cannot make the environment succeed. What
+/// it can do is refuse a completion claim built on no successful evidence: the
+/// model is asked for the exact failure instead of a report of work it did not
+/// finish.
+pub const ACTION_FAILED_NOTE: &str = "Every tool call this turn failed, so nothing was done or verified. Do not report the work as complete. Report the exact failure, what you tried and what must change in the environment; fix the cause and retry only if you can.";
+
+/// Phrases that promise work instead of doing it.
+///
+/// Used only for an UNCLASSIFIED turn: the reader's ask was not routed, but a
+/// reply that says "I will start by..." and calls nothing is the talk-only
+/// pattern this contract exists to stop. An EXPLANATION turn never consults
+/// this list.
+const DEFERRED_ACTION: &[&str] = &[
+    "i will ",
+    "i'll ",
+    "i am going to",
+    "i'm going to",
+    "let me ",
+    "first, i",
+    "first i",
+    "next, i",
+    "here's the plan",
+    "here is the plan",
+    "i would ",
+    "we should ",
+    "step 1",
+    "我会",
+    "我来",
+    "我先",
+    "让我先",
+    "接下来我",
+];
+
+/// Whether a reply is a promise to act later rather than an answer.
+fn looks_like_deferred_action(text: &str) -> bool {
+    let text = text.to_lowercase();
+    let padded = format!(" {} ", text.replace(&['\n', '\r', '\t'][..], " "));
+    DEFERRED_ACTION.iter().any(|phrase| padded.contains(phrase))
+}
+
 /// What the model is told when the same tool failure repeats three times.
 ///
 /// A harness cannot fix an environment that keeps refusing the same call, and
@@ -327,35 +369,48 @@ fn emit_request_composition<S: ReactSession, C: ReactContext>(
     });
 }
 
-/// Whether a prose-only step dodged an ACTION turn.
+/// Whether a reply should be sent back to work.
 ///
-/// Only the host's classification makes a turn "actionable": the engine does not
-/// parse the reader's words, so a conceptual question that the host labelled
-/// `Explanation` never pays for a nudge. Two escapes are deliberate:
+/// Two signals, bounded by the same escapes:
 ///
-/// - a turn with no callable tools cannot act, and asking it to is noise;
-/// - a reply that ends in a question is the contract's own "ask once when the
-///   request is too vague" arm, not a dodge.
-fn action_reply_dodges<C: ReactContext>(
+/// - a classified ACTION turn answered with prose and no tool call;
+/// - an UNCLASSIFIED turn whose reply promises to act ("I will start by...")
+///   instead of answering. A classified EXPLANATION turn is never nudged.
+///
+/// The escapes are deliberate: a turn with no acting tools cannot act, a turn
+/// that already attempted a tool is handled by the failure path instead, and a
+/// reply that ends in a question is the contract's own "ask once when the
+/// request is too vague" arm.
+fn action_nudge_due<C: ReactContext>(
     intent: ActionIntent,
     context: &C,
     closing: bool,
-    nudged: bool,
+    trace: &TurnTrace,
     text: &str,
 ) -> bool {
-    intent == ActionIntent::Action
-        && !closing
-        && !nudged
-        // The skill helpers are not workspace tools: an agent carrying only
-        // them cannot inspect or change anything, so the retry would be noise.
-        && context.tools().is_some_and(|tools| {
-            tools
-                .iter()
-                .any(|tool| tool.name != "load_skill" && tool.name != "find_skill")
-        })
-        && !text.trim().is_empty()
-        && !text.trim_end().ends_with('?')
-        && !text.trim_end().ends_with('？')
+    if closing || trace.action_nudged || trace.tool_calls > 0 || !can_act(context) {
+        return false;
+    }
+    if text.trim().is_empty() {
+        return false;
+    }
+    if text.trim_end().ends_with('?') || text.trim_end().ends_with('？') {
+        return false;
+    }
+    match intent {
+        ActionIntent::Action => true,
+        ActionIntent::Unknown => looks_like_deferred_action(text),
+        ActionIntent::Explanation => false,
+    }
+}
+
+/// Whether the request carries a tool that can act on the workspace.
+fn can_act<C: ReactContext>(context: &C) -> bool {
+    context.tools().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool.name != "load_skill" && tool.name != "find_skill")
+    })
 }
 
 /// The action facts one turn accumulates for its closing telemetry event.
@@ -363,8 +418,11 @@ struct TurnTrace {
     intent: ActionIntent,
     tools_available: usize,
     tool_calls: usize,
+    successful_tool_calls: usize,
+    tool_failures: usize,
     first_tool_step: Option<usize>,
     action_nudged: bool,
+    action_failed_nudged: bool,
 }
 
 impl TurnTrace {
@@ -373,8 +431,11 @@ impl TurnTrace {
             intent,
             tools_available: context.tools().map_or(0, |tools| tools.len()),
             tool_calls: 0,
+            successful_tool_calls: 0,
+            tool_failures: 0,
             first_tool_step: None,
             action_nudged: false,
+            action_failed_nudged: false,
         }
     }
 
@@ -385,6 +446,47 @@ impl TurnTrace {
             self.first_tool_step = Some(step);
         }
     }
+
+    /// Record whether one executed tool call succeeded.
+    fn note_tool_result(&mut self, ok: bool) {
+        if ok {
+            self.successful_tool_calls = self.successful_tool_calls.saturating_add(1);
+        } else {
+            self.tool_failures = self.tool_failures.saturating_add(1);
+        }
+    }
+}
+
+/// Whether an ACTION turn attempted work and every attempt failed.
+fn failed_action_nudge_due(intent: ActionIntent, closing: bool, trace: &TurnTrace) -> bool {
+    intent == ActionIntent::Action
+        && !closing
+        && !trace.action_failed_nudged
+        && trace.tool_calls > 0
+        && trace.successful_tool_calls == 0
+}
+
+/// Pick the one corrective note a reply earns, and mark it spent.
+///
+/// The order is the diagnosis order: a reply with no attempt gets "act", and
+/// only an attempt whose every call failed gets "report the failure instead of
+/// claiming success".
+fn action_retry_note<C: ReactContext>(
+    intent: ActionIntent,
+    context: &C,
+    closing: bool,
+    trace: &mut TurnTrace,
+    text: &str,
+) -> Option<&'static str> {
+    if action_nudge_due(intent, context, closing, trace, text) {
+        trace.action_nudged = true;
+        return Some(ACTION_NOTE);
+    }
+    if failed_action_nudge_due(intent, closing, trace) {
+        trace.action_failed_nudged = true;
+        return Some(ACTION_FAILED_NOTE);
+    }
+    None
 }
 
 /// Report how a turn closed: did an action turn act, and did an explanation
@@ -396,14 +498,29 @@ fn emit_turn_outcome(
     steps: usize,
     answer: &str,
 ) {
+    if trace.intent == ActionIntent::Action
+        && trace.successful_tool_calls == 0
+        && !answer.is_empty()
+    {
+        log::warn!(
+            "action turn closed without a successful tool call: turn={turn} tool_calls={} failures={} nudged={} answered={}",
+            trace.tool_calls,
+            trace.tool_failures,
+            trace.action_nudged,
+            answer.len()
+        );
+    }
     telemetry.emit(&TelemetryEvent::TurnOutcome {
         turn,
         intent: trace.intent,
         tools_available: trace.tools_available,
         tool_calls: trace.tool_calls,
+        successful_tool_calls: trace.successful_tool_calls,
+        tool_failures: trace.tool_failures,
         first_tool_step: trace.first_tool_step,
         steps,
         action_nudged: trace.action_nudged,
+        action_failed_nudged: trace.action_failed_nudged,
         answer_bytes: answer.len(),
     });
 }
@@ -741,7 +858,9 @@ impl<A: ReActApp> ReActEngine<A> {
                                         |entry: &mut (String, String, serde_json::Value)| {
                                             let (name, call_id, args) =
                                                 (&entry.0, &entry.1, &mut entry.2);
-                                            async move { this.run_tool(name, args, call_id).await }
+                                            async move {
+                                                this.run_tool_resilient(name, args, call_id).await
+                                            }
                                         },
                                     ))
                                     .await;
@@ -756,7 +875,8 @@ impl<A: ReActApp> ReActEngine<A> {
                                     let mut out = Vec::with_capacity(batch.len());
                                     for (name, call_id, args) in batch.iter_mut() {
                                         let tool_started = Instant::now();
-                                        let result = self.run_tool(name, args, call_id).await;
+                                        let result =
+                                            self.run_tool_resilient(name, args, call_id).await;
                                         self.tool_call_count.fetch_add(1, Ordering::Relaxed);
                                         self.tool_time_nanos.fetch_add(
                                             tool_started.elapsed().as_nanos() as u64,
@@ -836,6 +956,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                     },
                                     self.tool_result_cap,
                                 );
+                                trace.note_tool_result(result.is_ok());
 
                                 if let Ok(ret) = &result {
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
@@ -914,18 +1035,17 @@ impl<A: ReActApp> ReActEngine<A> {
                         // An ACTION turn answered with prose only has not done
                         // the work yet: spend one directed retry before the
                         // reply is accepted as the answer.
-                        if !found_tool_call
-                            && action_reply_dodges(
+                        if !found_tool_call {
+                            if let Some(note) = action_retry_note(
                                 request.intent,
                                 &*context,
                                 closing,
-                                trace.action_nudged,
+                                &mut trace,
                                 &thought,
-                            )
-                        {
-                            trace.action_nudged = true;
-                            session.push(LlmMessage::user_text(ACTION_NOTE));
-                            continue 'turn;
+                            ) {
+                                session.push(LlmMessage::user_text(note));
+                                continue 'turn;
+                            }
                         }
                         if finish.is_some() && finish != Some("tool_calls") {
                             if !recorded {
@@ -1013,7 +1133,8 @@ impl<A: ReActApp> ReActEngine<A> {
                                 }
 
                                 let tool_started = Instant::now();
-                                let mut result = self.run_tool(&name, &mut args, &call_id).await;
+                                let mut result =
+                                    self.run_tool_resilient(&name, &mut args, &call_id).await;
                                 self.tool_call_count.fetch_add(1, Ordering::Relaxed);
                                 self.tool_time_nanos.fetch_add(
                                     tool_started.elapsed().as_nanos() as u64,
@@ -1080,6 +1201,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                     },
                                     self.tool_result_cap,
                                 );
+                                trace.note_tool_result(result.is_ok());
 
                                 if let Ok(ret) = &result {
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
@@ -1143,16 +1265,17 @@ impl<A: ReActApp> ReActEngine<A> {
                         // The same action contract the OpenAI arm applies:
                         // one directed retry when an actionable turn came back
                         // as prose only.
-                        if action_reply_dodges(
-                            request.intent,
-                            &*context,
-                            closing,
-                            trace.action_nudged,
-                            &thought,
-                        ) {
-                            trace.action_nudged = true;
-                            session.push(LlmMessage::user_text(ACTION_NOTE));
-                            continue 'turn;
+                        if !found_tool_call {
+                            if let Some(note) = action_retry_note(
+                                request.intent,
+                                &*context,
+                                closing,
+                                &mut trace,
+                                &thought,
+                            ) {
+                                session.push(LlmMessage::user_text(note));
+                                continue 'turn;
+                            }
                         }
                         self.react_app
                             .on_final_answer(&thought, session, context)
@@ -1407,10 +1530,10 @@ impl<A: ReActApp> ReActEngine<A> {
                                         "cached": true
                                     }))
                                 } else {
-                                    self.run_tool(&name, &mut args, &call_id).await
+                                    self.run_tool_resilient(&name, &mut args, &call_id).await
                                 }
                             } else {
-                                self.run_tool(&name, &mut args, &call_id).await
+                                self.run_tool_resilient(&name, &mut args, &call_id).await
                             };
                             self.tool_call_count.fetch_add(1, Ordering::Relaxed);
                             self.tool_time_nanos
@@ -1488,6 +1611,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 Err(ref e) => format!("Error: {}", e),
                             };
                             let result_text = cap_tool_result(&result_text, self.tool_result_cap);
+                            trace.note_tool_result(result.is_ok());
 
                             // A failed call is the one line the log was
                             // missing: policy refusals, broken environments and
@@ -1582,15 +1706,14 @@ impl<A: ReActApp> ReActEngine<A> {
                     }
                     // An ACTION turn answered with prose only has not done the
                     // work yet: spend one directed retry before closing.
-                    if action_reply_dodges(
+                    if let Some(note) = action_retry_note(
                         request.intent,
                         &*context,
                         closing,
-                        trace.action_nudged,
+                        &mut trace,
                         &full_response,
                     ) {
-                        trace.action_nudged = true;
-                        session.push(LlmMessage::user_text(ACTION_NOTE));
+                        session.push(LlmMessage::user_text(note));
                         continue;
                     }
                     self.react_app.on_final_answer(&full_response, session, context).await;

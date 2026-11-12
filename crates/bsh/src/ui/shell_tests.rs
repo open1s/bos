@@ -27673,6 +27673,72 @@ fn goal_attachments_ride_only_an_objective(cx: &mut TestAppContext) {
     assert_eq!(last.text, GOAL_ATTACHMENT_NOTE);
 }
 
+/// A complete persona replaces the harness identity, the workflow contract and
+/// every per-tool section, so the composer names the state: the badge is the
+/// one visible signal that an off-contract or talk-only turn is the
+/// configuration, not the model.
+#[gpui::test]
+fn a_complete_persona_draws_the_contract_badge(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = state_with_turns("persona-complete-badge", 1);
+        state.settings.workspace.agent.system_prompt = "You are terse.".to_string();
+        state.settings.workspace.agent.complete = true;
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    draw_until(
+        cx,
+        "the complete-persona badge draws",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("composer-persona-complete").is_some(),
+    );
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.persona_complete),
+        "the build reports the complete persona"
+    );
+
+    // The badge is the reversal, not only a label: clicking it clears the
+    // reader's complete flag, saves it and rebuilds the same session's agent,
+    // so the contract is back without a trip through a settings file.
+    let badge = cx
+        .debug_bounds("composer-persona-complete")
+        .expect("the badge has bounds");
+    cx.simulate_click(badge.center(), Modifiers::default());
+    draw_until(cx, "the contract is restored", DRAW_UNTIL_MAX, |cx| {
+        !cx.update(|_, cx| shell.read(cx).state.persona_complete)
+    });
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).state.settings.workspace.agent.complete),
+        "the persisted flag is cleared"
+    );
+    assert!(
+        cx.debug_bounds("composer-persona-complete").is_none(),
+        "the badge leaves with the state it named"
+    );
+}
+
+/// The badge is not decoration: an ordinary persona draws nothing, so the
+/// signal only appears when the contract is really bypassed.
+#[gpui::test]
+fn an_ordinary_persona_draws_no_contract_badge(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let state = state_with_turns("persona-ordinary-badge", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(!cx.update(|_, cx| shell.read(cx).state.persona_complete));
+    assert!(
+        cx.debug_bounds("composer-persona-complete").is_none(),
+        "the badge belongs to the complete-persona arm only"
+    );
+}
+
 /// Plan mode is a session fact with the reference's command grammar: the Plan
 /// row claims the composer with the task hint, bare `/plan` enters, `/plan
 /// off` leaves, `/plan <task>` enters and submits the task, and the chip (a

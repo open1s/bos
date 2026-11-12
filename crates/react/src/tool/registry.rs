@@ -204,6 +204,14 @@ impl ToolVariant {
         }
     }
 
+    /// The static capability metadata the wrapped tool declares, if any.
+    pub fn metadata(&self) -> Option<&crate::tool::metadata::ToolMetadata> {
+        match self {
+            Self::Sync(tool) => tool.metadata(),
+            Self::Async(tool) => tool.metadata(),
+        }
+    }
+
     /// Whether the model is told this tool exists without its definition.
     pub fn deferred(&self) -> bool {
         match self {
@@ -312,6 +320,17 @@ impl ToolRegistry {
     /// Borrow a tool by name.
     pub fn get(&self, name: &str) -> Option<dashmap::mapref::one::Ref<'_, String, ToolVariant>> {
         self.tools.get(name)
+    }
+
+    /// The metadata a registered tool declares, if any.
+    ///
+    /// A missing tool and a tool that declares nothing both return None, which
+    /// is the conservative answer: a retry policy must not treat undeclared as
+    /// side-effect free.
+    pub fn metadata(&self, name: &str) -> Option<crate::tool::metadata::ToolMetadata> {
+        self.tools
+            .get(name)
+            .and_then(|tool| tool.metadata().cloned())
     }
 
     /// Names of every registered tool.

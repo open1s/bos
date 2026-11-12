@@ -1917,7 +1917,7 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
             // inheriting the workspace allowlist and narrows nothing.
             web_search: Some(true),
             parallel_tool_calls: Some(true),
-            system_prompt: Some(crate::prompts::PTC_PERSONA.to_string()),
+            system_prompt: Some(crate::prompts::preset_persona(crate::prompts::PTC_PERSONA)),
             order: Some(20),
             ..Preset::default()
         }),
@@ -1930,7 +1930,9 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
             // packages through the shell, so it needs the workspace's reach and
             // inherits it.
             web_search: Some(true),
-            system_prompt: Some(crate::prompts::CREATOR_PERSONA.to_string()),
+            system_prompt: Some(crate::prompts::preset_persona(
+                crate::prompts::CREATOR_PERSONA,
+            )),
             order: Some(40),
             ..Preset::default()
         }),
@@ -1970,7 +1972,9 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
                 "no-egress".to_string(),
             ],
             policy_mode: Some(PolicyMode::Required),
-            system_prompt: Some(crate::prompts::READ_ONLY_PERSONA.to_string()),
+            system_prompt: Some(crate::prompts::preset_persona(
+                crate::prompts::READ_ONLY_PERSONA,
+            )),
             order: Some(50),
             ..Preset::default()
         }),

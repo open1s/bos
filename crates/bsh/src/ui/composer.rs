@@ -366,6 +366,7 @@ impl Shell {
             &self.state.mcp,
         );
         self.state.set_tools_schema(built.tools_schema_chars);
+        self.state.set_persona_complete(built.persona_complete);
         self.state.set_policy(built.policy.clone());
         cx.notify();
     }
@@ -635,7 +636,11 @@ impl Shell {
                                     ))
                                     .when_some(self.plan_chip(lang, cx), |row, chip| {
                                         row.child(chip)
-                                    }),
+                                    })
+                                    .when_some(
+                                        self.persona_complete_chip(lang, cx),
+                                        |row, chip| row.child(chip),
+                                    ),
                             )
                             .child(
                                 div()
@@ -746,6 +751,76 @@ impl Shell {
             }))
     }
 
+    /// The complete-persona badge.
+    ///
+    /// A complete persona replaces the harness identity, the workflow contract
+    /// and every per-tool section, so the composer names the state where the
+    /// mode chips live: the plan chip's 28px metrics, the warning tint, and the
+    /// measured 500ms tooltip. It is a diagnostic, not a control - the persona
+    /// is edited in Settings or the settings file.
+    fn persona_complete_chip(
+        &self,
+        lang: crate::i18n::Lang,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.state.persona_complete {
+            return None;
+        }
+        let label: SharedString = lang.tr("input.personaComplete").into();
+        let hint: SharedString = lang.tr("input.personaCompleteHint").into();
+        Some(
+            div()
+                .debug_selector(|| String::from("composer-persona-complete"))
+                .id("composer-persona-complete")
+                .h(px(28.0))
+                .px(px(8.0))
+                .rounded(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .bg(rgb(theme::soft(theme::warn())))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::soft(theme::warn()))))
+                .tooltip_show_delay(std::time::Duration::from_millis(500))
+                .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+                .child(icon(IconName::Info, 14.0, theme::warn()))
+                .child(txt(label, 13.0, theme::warn()))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.restore_execution_contract(cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// Restore the execution contract from the complete-persona badge.
+    ///
+    /// The reader's choice is theirs to keep; this is the reversal the badge
+    /// offers, not a policy. It clears the workspace flag, saves, and rebuilds
+    /// the turn's agent so the same session immediately carries the identity,
+    /// workflow and tool sections again. When a PRESET is the cause, clearing
+    /// the workspace flag cannot help, so the notice names the preset.
+    fn restore_execution_contract(&mut self, cx: &mut Context<Self>) {
+        if !self.state.settings.workspace.agent.complete {
+            let notice =
+                crate::i18n::tr(self.state.lang, "input.personaCompletePreset").to_string();
+            self.state.notice(notice);
+            cx.notify();
+            return;
+        }
+        self.state.settings.workspace.agent.complete = false;
+        let save_error = self.state.settings.save().err();
+        self.rebake_after_permission(cx);
+        let notice = if self.state.persona_complete {
+            crate::i18n::tr(self.state.lang, "input.personaCompletePreset").to_string()
+        } else {
+            crate::i18n::tr(self.state.lang, "input.personaCompleteRestored").to_string()
+        };
+        self.state.notice(notice);
+        if let Some(error) = save_error {
+            log::warn!("restoring the execution contract was not saved: {error}");
+        }
+        cx.notify();
+    }
     /// The reference's model trigger and the menu it opens.
     ///
     /// Its JSX is \`[triggerIcon?] [triggerLabel] [triggerEffort?] [dot|chevron]\`,

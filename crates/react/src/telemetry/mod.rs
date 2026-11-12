@@ -94,12 +94,18 @@ pub enum TelemetryEvent {
         tools_available: usize,
         /// Tool calls the turn ran; zero is a talk-only turn.
         tool_calls: usize,
+        /// Tool calls that returned a success.
+        successful_tool_calls: usize,
+        /// Tool calls that returned an error.
+        tool_failures: usize,
         /// The step (1-based request) that ran the first tool call.
         first_tool_step: Option<usize>,
         /// Requests the turn spent.
         steps: usize,
         /// Whether the engine had to ask an ACTION turn to act.
         action_nudged: bool,
+        /// Whether the engine had to ask for an honest failure report.
+        action_failed_nudged: bool,
         /// Bytes of the final answer.
         answer_bytes: usize,
     },
@@ -204,22 +210,28 @@ impl Telemetry {
                     intent,
                     tools_available,
                     tool_calls,
+                    successful_tool_calls,
+                    tool_failures,
                     first_tool_step,
                     steps,
                     action_nudged,
+                    action_failed_nudged,
                     answer_bytes,
                 } => {
                     log::info!(
-                        "turn outcome: turn={} intent={} tools={} tool_calls={} first_tool_step={} steps={} nudged={} answer_bytes={}",
+                        "turn outcome: turn={} intent={} tools={} tool_calls={} ok_calls={} failed_calls={} first_tool_step={} steps={} nudged={} failure_nudged={} answer_bytes={}",
                         turn,
                         intent.as_str(),
                         tools_available,
                         tool_calls,
+                        successful_tool_calls,
+                        tool_failures,
                         first_tool_step
                             .map(|step| step.to_string())
                             .unwrap_or_else(|| "-".to_string()),
                         steps,
                         action_nudged,
+                        action_failed_nudged,
                         answer_bytes
                     );
                 }

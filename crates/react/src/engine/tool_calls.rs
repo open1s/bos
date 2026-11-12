@@ -1,6 +1,73 @@
 use super::*;
 
 impl<A: ReActApp> ReActEngine<A> {
+    /// How many extra attempts a read-only tool gets after a transient failure.
+    const TRANSIENT_TOOL_RETRIES: usize = 1;
+
+    /// Failure text a retry can plausibly clear. Anything else is the
+    /// environment or the request refusing, and a retry would only repeat it.
+    const TRANSIENT_FAILURES: &'static [&'static str] = &[
+        "timed out",
+        "timeout",
+        "connection",
+        "temporarily",
+        "429",
+        "502",
+        "503",
+        "504",
+        "reset",
+        "broken pipe",
+        "try again",
+        "network error",
+    ];
+
+    /// Whether a failed call may be retried without risking a side effect.
+    ///
+    /// Two conditions, both conservative: the failure names a transient cause,
+    /// and the tool DECLARES read-only side effects. An undeclared tool, or one
+    /// declaring write/process/network/spend/auth, keeps the single attempt it
+    /// has always had: a retried edit is a second edit.
+    fn retryable_tool_failure(&self, name: &str, error: &ReactError) -> bool {
+        if Self::TRANSIENT_TOOL_RETRIES == 0 {
+            return false;
+        }
+        let text = error.to_string().to_lowercase();
+        if !Self::TRANSIENT_FAILURES
+            .iter()
+            .any(|needle| text.contains(needle))
+        {
+            return false;
+        }
+        self.tools.metadata(name).is_some_and(|metadata| {
+            !metadata.side_effects.is_empty()
+                && metadata.side_effects.iter().all(|effect| effect == "read")
+        })
+    }
+
+    /// Run a tool, retrying a declared read-only tool once after a transient
+    /// failure.
+    ///
+    /// A broken environment cannot be made to allow the work, but a timeout or
+    /// a reset connection is often gone on the next attempt. The retry is
+    /// deliberately narrow so it can never duplicate a side effect, and the
+    /// attempt is logged so a host can see it.
+    pub async fn run_tool_resilient(
+        &self,
+        name: &str,
+        input: &mut Value,
+        call_id: &str,
+    ) -> Result<Value, ReactError> {
+        let result = self.run_tool(name, input, call_id).await;
+        if let Err(error) = &result {
+            if self.retryable_tool_failure(name, error) {
+                log::warn!("retrying read-only tool {name} after a transient failure: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                return self.run_tool(name, input, call_id).await;
+            }
+        }
+        result
+    }
+
     /// Call tool - no resilience wrapper (only LLM calls need rate limiting)
     pub async fn run_tool(
         &self,

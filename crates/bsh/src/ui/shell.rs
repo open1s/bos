@@ -1367,6 +1367,7 @@ impl Shell {
             .unwrap_or_default();
         let built = crate::caps::build_agent(&state.settings, &state.vault, &choice, &state.mcp);
         state.set_tools_schema(built.tools_schema_chars);
+        state.set_persona_complete(built.persona_complete);
         state.set_policy(built.policy.clone());
         // The menu is read before any turn exists, so the launch build is what
         // seeds the package skills it offers.
@@ -4218,6 +4219,7 @@ impl Shell {
             return None;
         }
         self.state.set_tools_schema(built.tools_schema_chars);
+        self.state.set_persona_complete(built.persona_complete);
         self.state.set_policy(built.policy.clone());
         // The turn's build is the authoritative skill set: an extension that
         // was switched on since the last turn lands in the menu here.

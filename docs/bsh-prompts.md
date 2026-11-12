@@ -391,24 +391,51 @@ final answer is right: the reader paid for the wrong step.
 ## 9. Action-first execution
 
 The contract says what to do; the runtime notices when a turn that should have
-acted only talked. Three pieces, plus the configuration diagnostic:
+acted only talked. Four pieces:
 
-**Intent classification.** `crates/bsh/src/intent.rs` classifies the reader's
-ask deterministically, before the stream opens, into `Action`, `Explanation` or
-`Unknown`. It reads the leading 400 characters only and uses ordered rules: an
-explicit explanation ask wins; a diagnostic question with a defect word is
-action; an imperative change verb is action. It never calls a model, reads the
-workspace, or reaches the provider - it only decides whether the engine may
-spend a retry.
+**Intent classification, lexical first and semantic second.**
+`crates/bsh/src/intent.rs` classifies the reader's ask deterministically,
+before the stream opens, into `Action`, `Explanation` or `Unknown`. It reads
+the leading 400 characters and uses ordered rules: an explicit explanation ask
+wins; a diagnostic question with a defect word is action; an imperative change
+verb is action; a bare conceptual opener is an explanation. The lexical module
+never reads the workspace or reaches the provider.
 
-**One corrective retry.** `LlmRequest::intent` carries the classification to
-the engine. When the first reply to an `Action` turn is prose and no tool ran,
-the engine appends `ACTION_NOTE` to the session and runs one more step. The
-retry is bounded: it is spent once per turn, it is skipped when the request
-carries no tools that can act (the skill loaders do not count), and it is
-skipped when the reply ends in a question, because the contract allows one
-short question for a vague request. An `Explanation` or `Unknown` turn is
-never nudged.
+An `Unknown` answer is not final: when the message is longer than a greeting,
+`Agent::classify_intent_with_model` asks the configured model once with
+`INTENT_CLASSIFIER_PROMPT` - two labels, one word, eight output tokens,
+temperature 0, 8-second timeout. The answer is cached process-wide by message
+and model - the shell builds an agent per turn, so a per-agent cache would
+repay it - and a repeated message is served from that cache. A failure, a
+timeout or an unparseable reply keeps the lexical answer instead of losing the
+turn. Messages shorter than a greeting skip the call, and a slash-command
+invocation skips it too: the command block is already an explicit action, not a
+sentence to classify. A transient provider failure is retried (twice, with
+backoff, plus any registered fallback provider); the classifier's own usage is
+drained into the turn's usage report, so it is metered instead of billed
+invisibly.
+
+**Two corrective retries, both bounded.** `LlmRequest::intent` carries the
+classification to the engine. A prose reply earns one note, chosen by
+diagnosis:
+
+- `ACTION_NOTE` when the turn was classified `Action` and no tool ran, **and**
+  when an UNCLASSIFIED turn answered with a promise to act ("I will start
+  by...") instead of an answer. The second arm is what keeps an unclassified
+  turn from falling back to prompt-only behaviour; an explicit `Explanation`
+  turn is never nudged, and a reply ending in a question is the contract's own
+  ask-once arm.
+- `ACTION_FAILED_NOTE` when the turn did call tools and every call failed. The
+  retry cannot make an environment succeed, but it refuses a completion claim
+  built on no successful evidence and asks for the exact failure instead.
+
+Each retry is spent once per turn; a turn with no acting tools (the skill
+loaders do not count) is never nudged. The turn outcome records successful and
+failed call counts, and an `Action` turn that closes with no successful call
+logs a warning even when the retry was spent. The runner repeats that fact
+where the reader is looking: `AgentEvent::ActionMissed` sets the status-bar
+notice ("... {calls} calls, {failures} failed ...") before the terminal
+event, so a prose-only or all-failed action turn is never silently accepted.
 
 **Turn-outcome telemetry.** `TelemetryEvent::TurnOutcome` closes every turn
 that reaches an answer (an aborted or errored turn reports through the error
@@ -419,17 +446,37 @@ retry was spent, and the answer's byte length. The log line
 distinguishes prompt interpretation from a missing tool, a preset problem or an
 execution failure.
 
-**Complete-persona diagnostics.** A persona with `complete: true` replaces the
-whole prompt, so the workflow contract and the per-tool rules are absent. The
-build logs a warning naming the session and publishes `persona_complete` /
-`workflow_contract` on `instruction.build`, so a talk-only turn can be
-attributed to the configuration rather than guessed at. The UI does not yet
-draw a badge for this state; the log and the build event are the surface.
+**Complete-persona diagnostics and reversal.** A persona with `complete: true`
+replaces the whole persona text, so the identity, workflow and per-tool sections
+are absent - but BSH appends a compact `COMPLETE_PERSONA_CONTRACT` footer (the
+work-first stance, evidence before explanation, verification and the stop rule),
+so the reader may replace the persona without removing the harness's execution
+contract. The build logs a warning naming the session, publishes
+`persona_complete` / `workflow_contract` on `instruction.build`, and the
+composer draws the `composer-persona-complete` badge ("Complete persona") in
+the mode-chip row with the measured 500ms tooltip. The badge is also the
+reversal: clicking it clears the workspace `complete` flag, saves, and rebuilds
+the turn's agent, so the same session immediately carries the identity,
+workflow and tool sections again. When an active PRESET is the cause, clearing
+the workspace flag cannot help and the notice names the preset instead.
 
-Residual gap, stated rather than implied: the intent classifier is a lexical
-heuristic, not a model. A request phrased without any listed verb classifies as
-`Unknown` and keeps the prompt's behaviour only; the retry improves the first
-move without guaranteeing that the tool succeeds.
+**Preset personas carry the stance.** The workflow contract is a layer, and a
+preset persona is the slot closest to the model's sense of who it is, so the
+three shipped personas that override it (PTC, Creator, Read-only) end with
+`ACTION_FIRST_PERSONA` (~330 bytes): work first, report briefly, answer a
+repository question from gathered evidence. Standard ships no persona and
+therefore inherits the framework contract unchanged.
+
+Remaining limits, stated precisely: the semantic classifier is a bounded model
+call; a persistent provider outage (after the retries and any registered
+fallback provider) still leaves the lexical answer, and its usage is now part
+of the turn's totals. No harness can make a broken environment permit a tool to
+succeed; a tool that declares read-only side effects is retried once on a
+transient failure, and a persistent failure is refused as a completion and
+surfaced in the status row. A complete persona remains a reader choice, but it
+can no longer remove the execution contract: the compact harness footer rides
+every complete build, the runtime retry applies to it, and the badge offers the
+one-click reversal.
 
 ## 10. Sources
 

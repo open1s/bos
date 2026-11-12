@@ -11,11 +11,20 @@ use std::sync::Arc;
 
 use agent::{Agent, StreamToken};
 use futures::StreamExt;
-use react::llm::Content;
+use react::llm::{ActionIntent, Content};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use crate::model::{ChatMessage, Role};
+
+/// Whether one streamed tool result reports a failure.
+///
+/// The engine's own failure guard uses this shape: a tool that returns a value
+/// starting with "Error:" or a payload carrying "success": false did not do the
+/// work, whatever its prose says.
+fn tool_result_failed(output: &str) -> bool {
+    output.starts_with("Error:") || output.contains("\"success\":false")
+}
 
 /// Cap the transcript-facing tool result by UTF-8 bytes, not Unicode scalar count.
 fn cap_display_tool_output(output: &str, cap_bytes: usize) -> String {
@@ -58,6 +67,17 @@ pub(crate) enum AgentEvent {
         output: String,
         /// Milliseconds spent.
         ms: u64,
+    },
+    /// An action turn ended without a successful tool call.
+    ///
+    /// The engine already refuses a completion claim after a failed attempt and
+    /// reports the outcome; this event carries the same fact to the shell so
+    /// the reader sees it in the status row instead of only in a log.
+    ActionMissed {
+        /// Tool calls the turn attempted.
+        tool_calls: usize,
+        /// Calls that returned a failure.
+        failures: usize,
     },
     /// Provider-reported token usage for the turn.
     Usage {
@@ -283,6 +303,41 @@ impl Runner {
             let context = crate::context::TurnContext::from_facts(&facts, false);
             context.inject(&agent);
 
+            // What this turn asks for, decided once from the reader's own
+            // words before the stream opens. The engine uses it for the action
+            // contract (one corrective retry when an actionable turn is
+            // answered with prose only) and reports it on the turn outcome; it
+            // is never serialized to the provider.
+            let text = input.as_text().unwrap_or_default();
+            let mut intent = crate::intent::classify(text);
+            // The lexical classifier is fast but has no semantics; an
+            // unclassified message gets one semantic second opinion from the
+            // configured model (bounded, cached, and abandoned on any error).
+            // Very short messages are greetings and skip the call.
+            // A slash-command invocation is already an explicit action; its
+            // composed block is not a message to classify semantically.
+            if intent == ActionIntent::Unknown
+                && text.trim().chars().count() >= 12
+                && !text.contains("<extension_command")
+            {
+                if let Some(classified) = agent.classify_intent_with_model(text).await {
+                    intent = classified;
+                }
+            }
+            agent.set_action_intent(intent);
+            // The classifier is a provider request too: its usage joins the
+            // turn's totals instead of being billed invisibly.
+            if let Some(usage) = agent.take_auxiliary_usage() {
+                let _ = tx.send_blocking(AgentEvent::Usage {
+                    prompt: u64::from(usage.prompt_tokens),
+                    completion: u64::from(usage.completion_tokens),
+                    cached: u64::from(usage.cached_tokens),
+                });
+            }
+            let mut tool_calls = 0usize;
+            let mut tool_failures = 0usize;
+            let mut tool_successes = 0usize;
+
             // The terminal event is held back until the mailbox has been handed
             // back: a steer the turn never reached another step for must be
             // restored BEFORE the shell starts the next turn from the queue.
@@ -293,8 +348,6 @@ impl Runner {
                 // action contract (one corrective retry when an actionable turn
                 // is answered with prose only) and reports it on the turn
                 // outcome; it is never serialized to the provider.
-                let intent = crate::intent::classify(input.as_text().unwrap_or_default());
-                agent.set_action_intent(intent);
                 let mut stream = agent.stream(input);
                 while let Some(item) = stream.next().await {
                     if stop_task.load(Ordering::SeqCst) {
@@ -305,11 +358,19 @@ impl Runner {
                     let event = match item {
                         Ok(StreamToken::Text(text)) => AgentEvent::Text(text),
                         Ok(StreamToken::ReasoningContent(text)) => AgentEvent::Reasoning(text),
-                        Ok(StreamToken::ToolCall { name, args, .. }) => AgentEvent::ToolCall {
-                            name,
-                            args: args.to_string(),
-                        },
+                        Ok(StreamToken::ToolCall { name, args, .. }) => {
+                            tool_calls += 1;
+                            AgentEvent::ToolCall {
+                                name,
+                                args: args.to_string(),
+                            }
+                        }
                         Ok(StreamToken::ToolResult { name, output, ms }) => {
+                            if tool_result_failed(&output) {
+                                tool_failures += 1;
+                            } else {
+                                tool_successes += 1;
+                            }
                             let output = cap_display_tool_output(&output, tool_output_cap);
                             AgentEvent::ToolResult { name, output, ms }
                         }
@@ -346,6 +407,19 @@ impl Runner {
                     break;
                 }
             }
+            // An action turn that called no tool, or whose every call failed,
+            // ends on prose the reader cannot trust as work. The engine refuses
+            // the completion claim and logs it; this carries the same fact to
+            // the status row so it is visible where the answer is read.
+            if matches!(terminal_event, Some(AgentEvent::Done))
+                && intent == ActionIntent::Action
+                && tool_successes == 0
+            {
+                let _ = tx.send_blocking(AgentEvent::ActionMissed {
+                    tool_calls,
+                    failures: tool_failures,
+                });
+            }
             if let Some(event) = terminal_event {
                 let _ = tx.send_blocking(event);
             }
@@ -369,6 +443,16 @@ mod tests {
         assert!(capped.len() <= 64, "the cap is in bytes: {}", capped.len());
         assert!(capped.is_char_boundary(capped.len()));
         assert!(capped.contains("[output truncated for display]"));
+    }
+
+    #[test]
+    fn a_failed_tool_result_is_recognised() {
+        assert!(tool_result_failed("Error: permission denied"));
+        assert!(tool_result_failed(
+            "{\"success\":false,\"stderr\":\"boom\"}"
+        ));
+        assert!(!tool_result_failed("{\"success\":true}"));
+        assert!(!tool_result_failed("plain output"));
     }
 
     #[test]

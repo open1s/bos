@@ -1489,6 +1489,314 @@ async fn an_action_turn_is_sent_back_to_work_on_the_streaming_path() {
     assert_eq!(seen.lock().unwrap().len(), 3);
 }
 
+/// A classifier vendor: answers ACTION and counts how many requests it served.
+struct ClassifyLlm {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for ClassifyLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(make_text_response("ACTION".to_string()))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "classify-mock"
+    }
+}
+
+/// A vendor whose classifier request fails.
+struct OfflineLlm;
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for OfflineLlm {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        Err(LlmError::Other("offline".to_string()))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "offline-mock"
+    }
+}
+
+/// The semantic second opinion answers an unknown turn, and a repeat of the
+/// same message is served from the cache instead of paying another completion.
+#[tokio::test]
+async fn the_model_classifier_answers_unknown_turns_and_caches() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(ClassifyLlm {
+            calls: calls.clone(),
+        }),
+    );
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+
+    assert_eq!(
+        agent
+            .classify_intent_with_model("the parser gives a confusing error")
+            .await,
+        Some(ActionIntent::Action)
+    );
+    assert_eq!(
+        agent
+            .classify_intent_with_model("the parser gives a confusing error")
+            .await,
+        Some(ActionIntent::Action)
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the second identical message is cached"
+    );
+    let usage = agent
+        .take_auxiliary_usage()
+        .expect("the classifier's usage is accounted");
+    assert_eq!(usage.prompt_tokens, 10, "the mock's prompt tokens");
+    assert_eq!(usage.completion_tokens, 20, "the mock's completion tokens");
+    assert!(
+        agent.take_auxiliary_usage().is_none(),
+        "draining is one-shot"
+    );
+}
+
+/// A classifier failure is not a turn failure: the caller keeps its lexical
+/// answer instead of losing the message to an unavailable vendor.
+#[tokio::test]
+async fn a_classifier_failure_keeps_the_lexical_answer() {
+    let mut provider = LlmProvider::new();
+    provider.register_vendor("mock".to_string(), Box::new(OfflineLlm));
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    assert_eq!(
+        agent
+            .classify_intent_with_model("the parser gives a confusing error")
+            .await,
+        None
+    );
+}
+
+/// An agent with the scripted model and one tool that always fails.
+fn action_agent_with_failing_tool(
+    script: Vec<Step>,
+) -> (Agent, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(ActionLlm {
+            step: std::sync::atomic::AtomicUsize::new(0),
+            script,
+            seen: seen.clone(),
+        }),
+    );
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    agent.add_tool(Arc::new(FunctionTool::new(
+        "read_file",
+        "read a file",
+        serde_json::json!({"type": "object"}),
+        |_args| {
+            Err::<serde_json::Value, react::tool::ToolError>(react::tool::ToolError::Failed(
+                "permission denied".to_string(),
+            ))
+        },
+    )));
+    (agent, seen)
+}
+
+/// An unclassified turn that promises to act instead of acting still gets the
+/// one retry: the classifier is conservative, but the talk-only shape is not.
+#[tokio::test]
+async fn an_unclassified_turn_that_promises_to_act_is_nudged() {
+    let (agent, seen) = action_agent(
+        vec![
+            Step::Text("I will start by reading the parser."),
+            Step::Tool("read_file", "{}"),
+            Step::Text("Final Answer: read the parser."),
+        ],
+        true,
+    );
+    // Unknown is the default; the promise is what earns the retry.
+    agent.set_action_intent(ActionIntent::Unknown);
+    let answer = agent
+        .react("the parser is confusing")
+        .await
+        .expect("the turn");
+
+    assert!(answer.contains("read the parser"), "{answer}");
+    assert_eq!(action_notes(&seen), 1);
+    assert_eq!(seen.lock().unwrap().len(), 3);
+}
+
+/// The promise guard does not override an explicit explanation request: an
+/// explanation may say "first, I will explain..." and must not be sent to act.
+#[tokio::test]
+async fn an_explanation_turn_that_promises_to_explain_is_not_nudged() {
+    let (agent, seen) = action_agent(
+        vec![Step::Text(
+            "First, I will explain how the cache works: it stores...",
+        )],
+        true,
+    );
+    agent.set_action_intent(ActionIntent::Explanation);
+    let answer = agent.react("explain the cache").await.expect("the turn");
+
+    assert!(answer.contains("stores"), "{answer}");
+    assert_eq!(action_notes(&seen), 0);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// When an ACTION turn attempted work and every call failed, the engine refuses
+/// a completion claim and asks for the exact failure instead - once.
+#[tokio::test]
+async fn a_failed_action_attempt_is_sent_back_to_report_the_failure() {
+    let (agent, seen) = action_agent_with_failing_tool(vec![
+        Step::Tool("read_file", "{}"),
+        Step::Text("Final Answer: done, the file is fixed."),
+        Step::Text("Final Answer: the read was refused with permission denied."),
+    ]);
+    agent.set_action_intent(ActionIntent::Action);
+    let answer = agent.react("fix the parser").await.expect("the turn");
+
+    assert!(
+        answer.contains("permission denied"),
+        "the honest failure report closes the turn: {answer}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 3, "one failure retry");
+    let notes = seen.lock().unwrap().last().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|text| text == react::engine::ACTION_FAILED_NOTE),
+        "the failed-attempt note was sent: {notes:?}"
+    );
+}
+
+// =========================================================================
+// Transient read-only tool retry
+// =========================================================================
+
+/// A read-only tool that fails once with a transient error.
+fn flaky_tool(
+    name: &'static str,
+    effects: &[&str],
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> FunctionTool {
+    let metadata = react::tool::ToolMetadata::new()
+        .with_side_effects(effects.iter().map(|effect| effect.to_string()));
+    FunctionTool::new(
+        name,
+        "a probe",
+        serde_json::json!({"type": "object"}),
+        move |_args| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Err(react::tool::ToolError::Failed(
+                    "connection reset by peer".to_string(),
+                ))
+            } else {
+                Ok(serde_json::json!({"ok": true}))
+            }
+        },
+    )
+    .with_metadata(metadata)
+}
+
+/// A transient failure of a tool that declares read-only side effects is
+/// retried once: the environment was briefly unavailable, and repeating a read
+/// cannot duplicate a side effect.
+#[tokio::test]
+async fn a_transient_read_only_failure_is_retried_once() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut agent, seen) = action_agent(
+        vec![
+            Step::Tool("probe", "{}"),
+            Step::Text("Final Answer: read it."),
+        ],
+        false,
+    );
+    agent.add_tool(Arc::new(flaky_tool("probe", &["read"], calls.clone())));
+    agent.set_action_intent(ActionIntent::Action);
+    let answer = agent.react("inspect the probe").await.expect("the turn");
+
+    assert!(answer.contains("read it"), "{answer}");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one transient retry ran the tool again"
+    );
+    assert_eq!(
+        action_notes(&seen),
+        0,
+        "the retry did not need a model nudge"
+    );
+}
+
+/// A tool that declares a write is never retried by the harness: a second edit
+/// is a second edit, whatever the failure text says.
+#[tokio::test]
+async fn a_declared_write_tool_is_not_retried() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut agent, _seen) = action_agent(
+        vec![
+            Step::Tool("probe", "{}"),
+            Step::Text("Final Answer: failed."),
+        ],
+        false,
+    );
+    agent.add_tool(Arc::new(flaky_tool("probe", &["write"], calls.clone())));
+    agent.set_action_intent(ActionIntent::Unknown);
+    let answer = agent.react("edit the probe").await.expect("the turn");
+
+    assert!(answer.contains("failed"), "{answer}");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a write is not replayed"
+    );
+}
+
 // =========================================================================
 // Deferred tools end to end
 // =========================================================================

@@ -46,6 +46,20 @@ pub use llm::{build_vendor, LlmProvider};
 /// is attached with [`Agent::with_memory`].
 pub const DEFAULT_MEMORY_RECALL_LIMIT: usize = 5;
 
+/// Process-wide answers from the model-assisted intent classifier.
+///
+/// The shell builds an agent per turn, so a per-agent cache would pay a
+/// classification completion again on every repeated message. The map is keyed
+/// by a hash of (model, message) - no message text is stored - is bounded, and
+/// is cleared wholesale when full rather than growing with a conversation.
+static INTENT_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, ActionIntent>>,
+> = std::sync::OnceLock::new();
+
+fn intent_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u64, ActionIntent>> {
+    INTENT_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// One alternate LLM endpoint tried when the primary provider fails.
 ///
 /// A fallback carries its own endpoint, key and model, so one session can
@@ -279,6 +293,15 @@ pub struct Agent {
     /// action contract; `Unknown` leaves the behaviour unchanged.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     action_intent: std::sync::Mutex<ActionIntent>,
+    /// Token usage from auxiliary requests this agent made on the host's
+    /// behalf (the model-assisted intent classifier).
+    ///
+    /// The turn's usage report is assembled from provider streams the engine
+    /// sees; an auxiliary request made before the stream would otherwise be
+    /// billed but missing from the meter. The runner drains this into the
+    /// turn's first usage event.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    auxiliary_usage: std::sync::Mutex<react::telemetry::TokenUsage>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     llm: Arc<LlmProvider>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
@@ -404,6 +427,7 @@ impl Agent {
             config,
             context_budget: 0,
             action_intent: std::sync::Mutex::new(ActionIntent::Unknown),
+            auxiliary_usage: std::sync::Mutex::new(react::telemetry::TokenUsage::default()),
             llm,
             registry: Some(Arc::new(ToolRegistry::new())),
             registry_view: Arc::new(std::sync::RwLock::new(None)),
@@ -508,6 +532,114 @@ impl Agent {
             .unwrap_or_default()
     }
 
+    /// Ask the configured model to classify one reader message.
+    ///
+    /// The host's lexical classifier runs first; this is the fallback that
+    /// gives an UNKNOWN turn a semantic second opinion. Errors, a timeout and a
+    /// reply that names neither label return None, so the caller keeps the
+    /// lexical answer instead of losing the turn. The request is bounded to
+    /// two thousand characters and eight output tokens - the classifier is a
+    /// label, not a turn - and the answer is cached by message so a repeated
+    /// message pays one completion, not one per turn.
+    pub async fn classify_intent_with_model(&self, text: &str) -> Option<ActionIntent> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut hasher);
+            self.config.model.hash(&mut hasher);
+            hasher.finish()
+        };
+        if let Ok(cache) = intent_cache().lock() {
+            if let Some(hit) = cache.get(&key) {
+                return Some(*hit);
+            }
+        }
+        let bounded: String = text.chars().take(2_000).collect();
+        let request = LlmRequest {
+            model: self.config.model.clone(),
+            input: Content::text(format!("User message:\n{bounded}")),
+            temperature: Some(0.0),
+            max_tokens: Some(8),
+            api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
+            ..Default::default()
+        };
+        // One retry for a transient provider failure, so a brief outage does
+        // not immediately drop the semantic opinion; a persistent failure
+        // keeps the lexical answer instead of failing the turn.
+        let mut transient_attempts = 0u32;
+        let response = loop {
+            let mut session = AgentSession::new();
+            let mut context = AgentReactContext::new("intent-classifier".to_string());
+            let attempt = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                self.llm.complete(
+                    Some(crate::agent::prompts::INTENT_CLASSIFIER_PROMPT.to_string()),
+                    request.clone(),
+                    &mut session,
+                    &mut context,
+                ),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(response)) => break response,
+                Ok(Err(error)) if transient_attempts < 2 && error.is_retryable() => {
+                    transient_attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        200u64 << (transient_attempts - 1),
+                    ))
+                    .await;
+                }
+                Err(_) if transient_attempts < 1 => {
+                    transient_attempts += 1;
+                }
+                _ => return None,
+            }
+        };
+        if let Some(usage) = response.usage() {
+            if let Ok(mut slot) = self.auxiliary_usage.lock() {
+                slot.prompt_tokens = slot.prompt_tokens.saturating_add(usage.prompt_tokens);
+                slot.completion_tokens = slot
+                    .completion_tokens
+                    .saturating_add(usage.completion_tokens);
+                slot.total_tokens = slot.total_tokens.saturating_add(usage.total_tokens);
+                slot.cached_tokens = slot.cached_tokens.saturating_add(usage.cached_tokens);
+            }
+        }
+        let answer = response.text()?.to_lowercase();
+        let intent = if answer.contains("action") {
+            ActionIntent::Action
+        } else if answer.contains("explanation") || answer.contains("explain") {
+            ActionIntent::Explanation
+        } else {
+            return None;
+        };
+        if let Ok(mut cache) = intent_cache().lock() {
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(key, intent);
+        }
+        Some(intent)
+    }
+
+    /// Drain the usage of auxiliary requests this agent made on the host's
+    /// behalf (the model-assisted intent classifier).
+    ///
+    /// The runner adds it to the turn's usage report, so a classification
+    /// completion is billed and metered like the rest of the turn.
+    pub fn take_auxiliary_usage(&self) -> Option<react::telemetry::TokenUsage> {
+        let mut slot = self.auxiliary_usage.lock().ok()?;
+        if slot.total_tokens == 0 && slot.prompt_tokens == 0 && slot.completion_tokens == 0 {
+            return None;
+        }
+        let usage = slot.clone();
+        *slot = react::telemetry::TokenUsage::default();
+        Some(usage)
+    }
     /// Set the send-side history ceiling for mid-turn compaction.
     ///
     /// Zero disables it. The host passes the same resolved window it prices a
@@ -1998,6 +2130,7 @@ impl Clone for Agent {
             config: self.config.clone(),
             context_budget: self.context_budget,
             action_intent: std::sync::Mutex::new(self.action_intent()),
+            auxiliary_usage: std::sync::Mutex::new(react::telemetry::TokenUsage::default()),
             llm: self.llm.clone(),
             registry: self.registry.clone(),
             registry_view: Arc::clone(&self.registry_view),

@@ -1209,6 +1209,7 @@ impl Shell {
             // back on.
             self.caps = crate::caps::capabilities(&built.agent);
             self.state.set_tools_schema(built.tools_schema_chars);
+            self.state.set_persona_complete(built.persona_complete);
             self.caps_generation = generation;
             self.caps_ready = true;
         }
@@ -1221,6 +1222,7 @@ impl Shell {
             );
             self.plugins = built.plugins;
             self.state.set_tools_schema(built.tools_schema_chars);
+            self.state.set_persona_complete(built.persona_complete);
             self.plugins_generation = generation;
             self.plugins_ready = true;
         }
