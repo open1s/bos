@@ -414,7 +414,7 @@ sensitive credentials in its encrypted vault.
 | [Rust user guide](docs/rust-user-guide.md) | Embed and use BOS from Rust |
 | [Python user guide](docs/python-user-guide.md) | Use BOS from Python |
 | [JavaScript user guide](docs/javascript-user-guide.md) | Use BOS from Node.js and JavaScript |
-| [BSH extension platform](docs/bsh-extension.md) | Manifest, providers, lifecycle, capabilities, CLI and security |
+| [BSH extension platform](docs/bsh-extension.md) | Manifest, providers, lifecycle, capabilities, CLI and security |\n| [Ferris Cordis-inspired evolution RFC](docs/ferris-cordis-evolution-rfc.md) | Target composition, activation generations, services, events, effects, provider lifecycle and migration plan |
 | [BSH Built-in Tools 2.0](docs/bsh-built-in-tools-2.0.md) | LLM-oriented tool contracts, batch file operations, output budgets and benchmark plan |
 | [Contributor onboarding](ONBOARDING.md) | Set up a development environment |
 | [Settings](docs/bsh-settings-spec.md) · [Terminal policy](docs/bsh-terminal-policy.md) · [Hooks](docs/bsh-hook-system.md) | Subsystem specifications |
