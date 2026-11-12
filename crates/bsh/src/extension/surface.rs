@@ -145,8 +145,10 @@ pub(crate) struct PanelAdmission<'a> {
     pub(crate) panel_id: &'a str,
     /// Where the panel asked to be mounted.
     pub(crate) location: ferris_sdk::ui::PanelLocation,
-    /// The declared view, when the panel shipped one.
+    /// The lowered view, when the panel shipped one.
     pub(crate) document: Option<&'a ferris_sdk::ui::UiDocument>,
+    /// The schema 1.1 surface, when the panel shipped one.
+    pub(crate) surface: Option<&'a SurfaceDocument>,
 }
 
 /// What one synchronisation did.
@@ -327,6 +329,17 @@ impl SurfaceHost {
                 }
             })
             .collect()
+    }
+
+    /// The binding a control names, from the mounted surface document.
+    pub(crate) fn binding(
+        &self,
+        panel_id: &str,
+        key: &str,
+    ) -> Option<ferris_sdk::surface::ActionBinding> {
+        let mounted = self.mounted.get(panel_id)?;
+        let instance = self.engine.instance(mounted.instance).ok()?;
+        instance.document()?.binding(key).cloned()
     }
 
     /// Apply a frame that arrived from a transport.
@@ -570,7 +583,7 @@ impl SurfaceHost {
                 ));
             }
         }
-        let contract = self.contract_for(panel_id)?;
+        let contract = self.contract_for_surface(panel_id, Some(&document))?;
         let instance = self
             .engine
             .admit(contract.clone())
@@ -593,13 +606,38 @@ impl SurfaceHost {
     }
 
     fn contract_for(&self, panel_id: &str) -> Result<SurfaceContract, String> {
-        let surface =
+        self.contract_for_surface(panel_id, None)
+    }
+
+    /// The contract a panel is admitted under.
+    ///
+    /// A schema 1.1 panel declares its own binding table, so the contract
+    /// advertises exactly those actions. A 1.0 panel has no table, and its
+    /// controls carry contribution ids that the legacy dispatch path handles.
+    fn contract_for_surface(
+        &self,
+        panel_id: &str,
+        surface: Option<&SurfaceDocument>,
+    ) -> Result<SurfaceContract, String> {
+        let id =
             SurfaceId::new("bsh.panel", panel_id.to_string()).map_err(|error| error.to_string())?;
-        Ok(SurfaceContract::new(surface, Version::new(1, 0, 0))
+        let mut contract = SurfaceContract::new(id, Version::new(1, 0, 0))
             .with_profile(Profile::Full)
             .with_profile(Profile::Text)
             .with_state(StateModel::OnDemand)
-            .with_isolation(IsolationClass::InProcess))
+            .with_isolation(IsolationClass::InProcess);
+        if let Some(document) = surface {
+            for (key, binding) in &document.bindings {
+                contract = contract.with_action(ferris_sdk::surface::ActionSpec {
+                    id: key.clone(),
+                    label: String::new(),
+                    capability: binding.capability.clone(),
+                    risk: ferris_sdk::Risk::Medium,
+                    confirmation: ferris_sdk::surface::Confirmation::Inherit,
+                });
+            }
+        }
+        Ok(contract)
     }
 
     fn admit(
@@ -607,10 +645,13 @@ impl SurfaceHost {
         panel_id: &str,
         admission: &PanelAdmission<'_>,
     ) -> Result<InstanceId, String> {
-        let contract = self.contract_for(panel_id)?;
-        let document = match admission.document {
-            Some(view) => SurfaceDocument::from_ui(view.clone()),
-            None => empty_document(),
+        let contract = self.contract_for_surface(panel_id, admission.surface)?;
+        let document = match admission.surface {
+            Some(surface) => surface.clone(),
+            None => match admission.document {
+                Some(view) => SurfaceDocument::from_ui(view.clone()),
+                None => empty_document(),
+            },
         };
         let instance = self
             .engine
@@ -691,11 +732,13 @@ mod tests {
                 panel_id: "com.example.right",
                 location: PanelLocation::Right,
                 document: Some(&right),
+                surface: None,
             },
             PanelAdmission {
                 panel_id: "com.example.bottom",
                 location: PanelLocation::Bottom,
                 document: Some(&bottom),
+                surface: None,
             },
         ]);
         assert_eq!(report.mounted, 2);
@@ -717,6 +760,7 @@ mod tests {
             panel_id: "com.example.right",
             location: PanelLocation::Right,
             document: Some(&right),
+            surface: None,
         }]);
         let report = host.sync(&[]);
         assert_eq!(report.disposed, 1);
@@ -742,11 +786,13 @@ mod tests {
                 panel_id: "com.example.bad",
                 location: PanelLocation::Right,
                 document: Some(&bad),
+                surface: None,
             },
             PanelAdmission {
                 panel_id: "com.example.good",
                 location: PanelLocation::Left,
                 document: Some(&good),
+                surface: None,
             },
         ]);
         assert_eq!(report.mounted, 1);
@@ -764,6 +810,7 @@ mod tests {
             panel_id: "com.example.right",
             location: PanelLocation::Right,
             document: Some(&view),
+            surface: None,
         }]);
         assert_eq!(host.generation_of("com.example.right"), Some(1));
         host.renew("com.example.right").expect("renew");
@@ -937,11 +984,13 @@ mod tests {
                 panel_id: "com.example.one",
                 location: PanelLocation::Center,
                 document: Some(&first),
+                surface: None,
             },
             PanelAdmission {
                 panel_id: "com.example.two",
                 location: PanelLocation::Center,
                 document: Some(&second),
+                surface: None,
             },
         ]);
         assert_eq!(report.mounted, 1);
@@ -993,6 +1042,100 @@ mod tests {
         assert!(HostSlot::agent_slot("settings.page").is_none());
         assert!(HostSlot::agent_slot("composer.row").is_none());
         assert_eq!(HostSlot::names().len(), 11);
+    }
+
+    #[test]
+    fn a_surface_panel_composes_through_an_admission() {
+        let mut host = SurfaceHost::new();
+        let child = surface_document(text("surface child"));
+        let parent = surface_document(SurfaceNode::Column {
+            id: None,
+            children: vec![slot("bsh.panel/com.example.child", text("fallback"))],
+        });
+        let child_view = child.to_ui_document();
+        let parent_view = parent.to_ui_document();
+        let report = host.sync(&[
+            PanelAdmission {
+                panel_id: "com.example.child",
+                location: PanelLocation::Right,
+                document: Some(&child_view),
+                surface: Some(&child),
+            },
+            PanelAdmission {
+                panel_id: "com.example.parent",
+                location: PanelLocation::Left,
+                document: Some(&parent_view),
+                surface: Some(&parent),
+            },
+        ]);
+        assert_eq!(report.mounted, 2);
+        assert!(rendered(&host, "com.example.parent").contains("surface child"));
+    }
+
+    #[test]
+    fn a_surface_panel_advertises_its_bindings_as_actions() {
+        use ferris_sdk::surface::{ActionBinding, ActionMode, DispatchPrincipal};
+        let mut host = SurfaceHost::new();
+        let mut document = surface_document(SurfaceNode::Button {
+            id: "go".to_string(),
+            label: "Go".to_string(),
+            action: "go".to_string(),
+            style: ferris_sdk::ui::ButtonStyle::Primary,
+        });
+        document.bindings.insert(
+            "go".to_string(),
+            ActionBinding {
+                capability: "acme.demo/go".to_string(),
+                operation: None,
+                input: serde_json::Value::Null,
+                principal: DispatchPrincipal::Producer,
+                required: true,
+                mode: ActionMode::Once,
+                debounce_ms: 0,
+            },
+        );
+        let view = document.to_ui_document();
+        host.sync(&[PanelAdmission {
+            panel_id: "com.example.demo",
+            location: PanelLocation::Right,
+            document: Some(&view),
+            surface: Some(&document),
+        }]);
+        let instance = host
+            .engine()
+            .instance(host.instance_of("com.example.demo").expect("instance"))
+            .expect("instance");
+        assert!(instance.contract().action("go").is_some());
+    }
+
+    #[test]
+    fn the_host_exposes_the_binding_table_for_dispatch() {
+        use ferris_sdk::surface::{ActionBinding, ActionMode, DispatchPrincipal};
+        let mut host = SurfaceHost::new();
+        let mut document = surface_document(SurfaceNode::Text {
+            id: Some("body".to_string()),
+            text: "x".to_string(),
+            tone: ferris_sdk::ui::Tone::Neutral,
+        });
+        document.bindings.insert(
+            "go".to_string(),
+            ActionBinding {
+                capability: "acme.demo/go".to_string(),
+                operation: None,
+                input: serde_json::Value::Null,
+                principal: DispatchPrincipal::Producer,
+                required: true,
+                mode: ActionMode::Once,
+                debounce_ms: 0,
+            },
+        );
+        host.mount_external("com.example.demo", PanelLocation::Right, document)
+            .expect("mount");
+        let binding = host
+            .binding("com.example.demo", "go")
+            .expect("the table is exposed");
+        assert_eq!(binding.capability, "acme.demo/go");
+        assert!(host.binding("com.example.demo", "missing").is_none());
     }
 
     #[test]

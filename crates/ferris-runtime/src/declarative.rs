@@ -20,6 +20,7 @@ use crate::contract::{
     load_tool_descriptors, CallContext, Implementation, Runtime, ToolDescriptor, ToolFile,
 };
 use ferris_core::manifest::{validate_relative_path, Manifest};
+use ferris_core::surface::{SurfaceDocument, SurfaceLimits};
 use ferris_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind};
 use ferris_core::ui::{PanelLocation, PanelVisibility, UiDocument, UiSession};
 
@@ -81,8 +82,14 @@ pub struct PanelContribution {
     /// A capture or job panel changes after the first frame; without this the
     /// only way to see new rows was a manual refresh.
     pub refresh_ms: Option<u64>,
-    /// The validated view.
+    /// The validated view, lowered for the 1.0 renderer.
     pub view: UiDocument,
+    /// The schema 1.1 surface, when the panel shipped one.
+    ///
+    /// A 1.1 panel keeps its binding table and slot nodes; `view` is the same
+    /// tree lowered for the renderer. The host mounts `surface` so actions and
+    /// composition are preserved, and draws `view`.
+    pub surface: Option<SurfaceDocument>,
 }
 
 /// A raw file contribution the host records but does not execute yet.
@@ -394,7 +401,48 @@ pub fn load_contributions(
             }
             ms => ms,
         };
-        let session = UiSession::open(manifest.id().clone(), file.view)?;
+        let surface = if file.view.get("schema_version").and_then(Value::as_str) == Some("1.1") {
+            let document: SurfaceDocument =
+                serde_json::from_value(file.view.clone()).map_err(|error| {
+                    ExtensionError::Json {
+                        path: path.clone(),
+                        message: format!("panel {id}: {error}"),
+                    }
+                })?;
+            let report = document.validate_with(&SurfaceLimits::default());
+            if !report.is_valid() {
+                return Err(ExtensionError::Manifest {
+                    path,
+                    message: format!(
+                        "panel {id}: {}",
+                        report
+                            .errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                });
+            }
+            Some(document)
+        } else {
+            None
+        };
+        let view = match &surface {
+            Some(surface) => surface.to_ui_document(),
+            None => {
+                let document: UiDocument =
+                    serde_json::from_value(file.view.clone()).map_err(|error| {
+                        ExtensionError::Json {
+                            path: path.clone(),
+                            message: format!("panel {id}: {error}"),
+                        }
+                    })?;
+                UiSession::open(manifest.id().clone(), document)?
+                    .document()
+                    .clone()
+            }
+        };
         contributions.panels.push(PanelContribution {
             id: id.clone(),
             title: file.title,
@@ -404,7 +452,8 @@ pub fn load_contributions(
             theme: file.theme,
             theme_dark: file.theme_dark,
             refresh_ms,
-            view: session.document().clone(),
+            view,
+            surface,
         });
     }
     for id in &manifest.contributes.workflows {
@@ -670,7 +719,7 @@ struct PanelFile {
     location: PanelLocation,
     #[serde(default, rename = "default_visibility")]
     visibility: PanelVisibility,
-    view: UiDocument,
+    view: Value,
     /// Optional refresh interval in milliseconds (250..=60000).
     #[serde(default)]
     refresh_ms: Option<u64>,
@@ -844,6 +893,39 @@ max_output_bytes = 4096
             }
             .root
         );
+    }
+
+    #[test]
+    fn a_panel_may_ship_a_schema_1_1_surface() {
+        let scratch = Scratch::new("surface-panel");
+        write_fixture(&scratch);
+        std::fs::write(
+            scratch.0.join("panels/status.json"),
+            r#"{
+                "title": "Surface",
+                "view": {
+                    "schema_version": "1.1",
+                    "bindings": {
+                        "refresh": { "capability": "acme.demo/refresh" }
+                    },
+                    "root": {
+                        "type": "column",
+                        "children": [
+                            { "type": "button", "id": "refresh", "label": "Refresh", "action": "refresh" },
+                            { "type": "slot", "surface": "bsh.panel/com.example.other", "required": true,
+                              "fallback": { "type": "text", "text": "waiting" } }
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .expect("panel");
+        let runtime = DeclarativeRuntime::new(&scratch.0, &manifest()).expect("runtime");
+        let panel = &runtime.contributions().panels[0];
+        assert!(panel.surface.is_some(), "the 1.1 tree is kept");
+        assert_eq!(panel.view.schema_version, "1.0", "the renderer gets 1.0");
+        let lowered = serde_json::to_string(&panel.view.root).expect("json");
+        assert!(lowered.contains("waiting"), "{lowered}");
     }
 
     #[tokio::test]

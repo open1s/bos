@@ -133,6 +133,8 @@ trait SurfaceStore: Send + Sync {
     fn apply(&self, panel_id: &str, document: &UiDocument) -> Result<(UiDocument, u64), String>;
     /// Refuse an action stamped with a revision the surface moved past.
     fn accept(&self, panel_id: &str, revision: u64) -> Result<(), String>;
+    /// The binding a control names, when the panel ships a binding table.
+    fn binding(&self, panel_id: &str, key: &str) -> Option<ferris_sdk::surface::ActionBinding>;
     /// Replace the provider generation after a runtime rebind.
     fn renew(&self, panel_id: &str) -> Result<(), String>;
 }
@@ -151,6 +153,10 @@ impl SurfaceStore for HostSurfaceStore {
 
     fn accept(&self, panel_id: &str, revision: u64) -> Result<(), String> {
         crate::extension::host::surface_accept(panel_id, revision)
+    }
+
+    fn binding(&self, panel_id: &str, key: &str) -> Option<ferris_sdk::surface::ActionBinding> {
+        crate::extension::host::surface_binding(panel_id, key)
     }
 
     fn renew(&self, panel_id: &str) -> Result<(), String> {
@@ -623,11 +629,47 @@ impl ExtensionPanelView {
         }
         // A panel action is a tool call on a surface that is not the agent, so
         // it needs the same per-call capability decision and audit line.
-        if let Some(descriptor) = panel
+        //
+        // A schema 1.1 panel names a binding, not a tool. Resolve the binding's
+        // capability to the tool that implements it: an exact id, or the local
+        // name after the provider slash (optionally namespaced). A binding with
+        // no tool behind it is refused with the capability named, never sent to
+        // the command seam as if it were a contribution id.
+        let mut call_name = action.clone();
+        let mut descriptor = panel
             .tools
             .iter()
             .find(|descriptor| descriptor.id.as_str() == action.as_str())
-        {
+            .cloned();
+        if descriptor.is_none() {
+            if let Some(binding) = self.store.binding(&panel.panel_id, &action) {
+                let local = binding.capability.rsplit('/').next().unwrap_or_default();
+                match panel
+                    .tools
+                    .iter()
+                    .find(|descriptor| {
+                        descriptor.id.as_str() == local
+                            || descriptor.id.as_str() == binding.capability
+                            || descriptor.id.as_str().ends_with(&format!("__{local}"))
+                    })
+                    .cloned()
+                {
+                    Some(found) => {
+                        call_name = found.id.as_str().to_string();
+                        descriptor = Some(found);
+                    }
+                    None => {
+                        self.error = Some(format!(
+                            "binding {action:?} names {}, which has no tool in this panel",
+                            binding.capability
+                        ));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(descriptor) = &descriptor {
             let scope = ferris_sdk::capability::call_scope(&payload, panel.workspace.as_deref());
             if let Err(error) = ferris_sdk::capability::authorize_each(
                 &panel.policy,
@@ -655,7 +697,7 @@ impl ExtensionPanelView {
         let resolve = Arc::clone(&self.surface_resolver);
         self.message = Some("Running…".to_string());
         cx.spawn(async move |this, cx| {
-            let action_for_call = action.clone();
+            let action_for_call = call_name;
             // The card may have outlived the generation that served it; asking
             // the retired handle would only report that it is gone.
             let resolved = live_surface(&panel, &*resolve);
@@ -1465,6 +1507,7 @@ mod tests {
             theme: None,
             theme_dark: None,
             initial,
+            surface: None,
             refresh_ms: None,
             policy: Arc::new(
                 ferris_sdk::capability::PolicyEngine::open(

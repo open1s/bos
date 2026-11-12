@@ -1207,6 +1207,8 @@ Landed in this change, in `ferris-core` and re-exported by `ferris-sdk`:
 | cordis-rs runtime: install, refresh, uninstall, generation-owned registry | `ferris-runtime/src/surface_runtime.rs` | Implemented |
 | BSH host slot catalogue and one surface instance per mounted panel | `bsh/src/extension/surface.rs` | Implemented |
 | Panel renderer draws the surface document and revision the engine holds; live cards and action results apply through it | `bsh/src/ui/extension_panel.rs` | Implemented |
+| Package panels may ship a schema 1.1 surface: bindings, slots and limits are validated, actions derived into the contract, and the lowered 1.0 tree keeps drawing | `ferris-runtime/src/declarative.rs`, `bsh/src/extension/surface.rs` | Implemented |
+| A 1.1 panel control resolves its binding's capability to the tool that implements it; no tool means a named refusal, not an inert control | `bsh/src/ui/extension_panel.rs` | Implemented |
 | Generation renewal when a panel's provider is rebound | `bsh/src/extension/surface.rs` | Implemented |
 | Bounded, versioned wire envelope for frames, patches, actions and close | `surface/wire.rs` | Implemented |
 | Remote-binding refusal: a remote frame may bind only its own node | `surface/document.rs` | Implemented |
@@ -1220,7 +1222,7 @@ Landed in this change, in `ferris-core` and re-exported by `ferris-sdk`:
 | Composition budget: an expanded slot tree over the node/byte ceiling keeps the panel's own document | `bsh/src/extension/surface.rs` | Implemented |
 | Surface inspector rows in the Extensions pane | `bsh/src/ui/settings.rs` | Implemented |
 
-Evidence: `cargo test -p ferris-core surface` runs 37 surface tests; the full crate is 164 passed, 1 ignored; `cargo clippy -p ferris-core --all-targets -- -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc -p ferris-core --no-deps` are clean. BSH: `cargo test -p bsh --lib extension::` is 124 passed and `cargo test -p bsh --lib ui::extension_panel` is 9 passed; `cargo clippy -p bsh --lib -- -D warnings` is clean. The extension-point inventory is in §23.
+Evidence: `cargo test -p ferris-core surface` runs 37 surface tests; the full crate is 164 passed, 1 ignored; `cargo clippy -p ferris-core --all-targets -- -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc -p ferris-core --no-deps` are clean. BSH: `cargo test -p bsh --lib extension::` is 127 passed and `cargo test -p bsh --lib ui::extension_panel` is 9 passed; `cargo clippy -p bsh --lib -- -D warnings` is clean. `cargo test -p ferris-runtime` is 58 passed. The extension-point inventory is in §23.
 
 Still open, and the phases in §17 remain the plan:
 
@@ -1251,8 +1253,8 @@ Every point must declare, in one place:
 |---|---|---|
 | Host slot | `HostSlot` registry: id, occupancy, agent acceptance, first-party rule | Implemented and enforced at admission (`bsh/src/extension/surface.rs`) |
 | Panel contribution | Manifest `panel` plus `panels/<id>.json`, schema 1.0 | Implemented (the shipped contract) |
-| Provider slot | A contract declares `SlotSpec`; a document mounts one through a `slot` node; the host expands it and routes its actions | Contract, expansion and action routing implemented; **package-facing declaration is missing** |
-| Surface contribution | `contributes.surfaces` plus `surfaces/<id>.json`: contract, schema 1.1 document, profiles, offered slots, actions | **Missing** — a package cannot ship a 1.1 document or declare a slot it offers |
+| Provider slot | A document mounts a child through a `slot` node; the host expands it and routes its actions | Implemented for mounting and routing. A package can be the *target* (`bsh.panel/<panel id>`) but cannot yet declare a named sub-slot another surface mounts into |
+| Surface contribution | A panel file's `view` may be schema 1.1, carrying a binding table and slot nodes; the host mounts the surface and the renderer draws its lowered 1.0 form | **Implemented** through `panels/<id>.json` (no separate `surfaces/` kind yet) |
 | Agent surface | `bos.ui/*` tools, agent limits, provenance badge, panel rendering | Implemented; actions are read-only (no binding-to-capability dispatch) |
 | Cordis JS `ctx.slots` | A bridge host API that lowers a Cordis plugin's UI registration into frames | **Missing**: `ferris-runtime/src/bridge/dsh-host-shim.js` still refuses `ctx.slots` |
 | Component ABI | `surface(id)`, `patch`, `close` beside `panel(id)` in `bsh:extension@1.1.0` | **Missing**: the WIT exports `panel(id)` only |
@@ -1272,6 +1274,8 @@ The registry deliberately carries slots that have no producer yet — `workspace
 ### 23.3 What "enough" requires
 
 A package, an agent and a runtime plugin must each be able to: place UI in a declared region; offer a slot another surface can mount into; declare actions with their target capability; carry provenance; and be disposed with their owner. Today the agent path meets all five (except live actions), the package path meets placement and ownership but cannot offer slots or ship a 1.1 document, and the Cordis JS path meets none because its UI seam is refused.
+
+A package can now ship a 1.1 surface, and its controls resolve a binding to the tool whose id is the capability's local name (or its namespaced form). A binding with no tool behind it is refused with the capability named. The remaining difference from the agent path is that an agent surface has no tool registry of its own to resolve against.
 
 The next three deliveries, in dependency order:
 

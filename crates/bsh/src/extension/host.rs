@@ -275,6 +275,8 @@ pub(crate) struct PanelSurface {
     pub(crate) theme: Option<ThemePalette>,
     /// A declarative view that is ready without a call, when one exists.
     pub(crate) initial: Option<UiDocument>,
+    /// The schema 1.1 surface, when the panel shipped one.
+    pub(crate) surface: Option<ferris_sdk::surface::SurfaceDocument>,
     /// The panel's own dark palette, when it names one.
     pub(crate) theme_dark: Option<ThemePalette>,
     /// How often the host should re-read the live card, when the panel says.
@@ -3001,6 +3003,7 @@ impl ExtensionHost {
                         .as_deref()
                         .and_then(|id| load_theme(entry, Some(id))),
                     initial: Some(panel.view.clone()),
+                    surface: panel.surface.clone(),
                     refresh_ms: panel.refresh_ms,
                     policy: Arc::clone(&self.policy),
                     trust: entry.package.trust,
@@ -3025,6 +3028,7 @@ impl ExtensionHost {
                     theme: theme.clone(),
                     theme_dark: None,
                     initial: None,
+                    surface: None,
                     refresh_ms: None,
                     policy: Arc::clone(&self.policy),
                     trust: entry.package.trust,
@@ -3049,6 +3053,7 @@ impl ExtensionHost {
                 theme: None,
                 theme_dark: None,
                 initial: Some(view.document.to_ui_document()),
+                surface: Some(view.document.clone()),
                 refresh_ms: None,
                 policy: Arc::clone(&self.policy),
                 trust: TrustLevel::Local,
@@ -3063,6 +3068,7 @@ impl ExtensionHost {
                 panel_id: panel.panel_id.as_str(),
                 location: panel.location,
                 document: panel.initial.as_ref(),
+                surface: panel.surface.as_ref(),
             })
             .collect();
         let report = self.surface_host.sync(&admissions);
@@ -3085,6 +3091,15 @@ impl ExtensionHost {
         self.panel_surfaces()
             .into_iter()
             .find(|panel| panel.panel_id == panel_id)
+    }
+
+    /// The binding a panel control names, when the panel ships one.
+    pub(crate) fn surface_binding(
+        &self,
+        panel_id: &str,
+        key: &str,
+    ) -> Option<ferris_sdk::surface::ActionBinding> {
+        self.surface_host.binding(panel_id, key)
     }
 
     /// The document and revision the surface host holds for a panel.
@@ -3851,6 +3866,15 @@ pub(crate) fn live_panel(panel_id: &str) -> Option<PanelSurface> {
 }
 
 /// The document and revision the surface host holds for a panel.
+pub(crate) fn surface_binding(
+    panel_id: &str,
+    key: &str,
+) -> Option<ferris_sdk::surface::ActionBinding> {
+    let slot = HOST.get_or_init(|| Mutex::new(None));
+    let guard = slot.lock().ok()?;
+    guard.as_ref()?.surface_binding(panel_id, key)
+}
+
 pub(crate) fn surface_view(panel_id: &str) -> Option<(ferris_sdk::ui::UiDocument, u64)> {
     let slot = HOST.get_or_init(|| Mutex::new(None));
     let guard = slot.lock().ok()?;
