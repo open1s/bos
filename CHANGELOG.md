@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v4.1.8 (2026-11-12)
 
 - **Action-first hardening** (issue #293 residuals): the last limits are closed.
   An UNCLASSIFIED turn gets a semantic second opinion from the configured model

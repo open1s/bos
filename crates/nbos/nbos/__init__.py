@@ -251,4 +251,4 @@ __all__ = [
     "estimate_tokens",
 ]
 # Keep in sync with pyproject.toml; tests/test_public_api.py enforces this.
-__version__ = "4.1.6"
+__version__ = "4.1.8"
