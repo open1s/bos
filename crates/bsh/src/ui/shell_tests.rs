@@ -2348,6 +2348,16 @@ fn review_tab_renders_a_captured_changeset(cx: &mut TestAppContext) {
     let view = cx.update(|_, cx| harness.read(cx).shell.read(cx).review_view());
     assert!(view.is_some(), "the shell can read the review view");
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    // A repaint shares one snapshot: the frame clones a pointer, not the
+    // changeset's whole manifest (every change, revision and finding).
+    let after_draw = cx.update(|_, cx| harness.read(cx).shell.read(cx).review_view());
+    assert!(
+        std::rc::Rc::ptr_eq(
+            view.as_ref().expect("the snapshot"),
+            after_draw.as_ref().expect("the snapshot after a repaint")
+        ),
+        "a repaint rebuilt the review snapshot instead of sharing it"
+    );
     assert!(
         cx.debug_bounds("review-actions").is_some(),
         "the Review tab body is mounted"
@@ -2368,7 +2378,7 @@ fn review_tab_renders_a_captured_changeset(cx: &mut TestAppContext) {
     // A selected change hands its snapshots to the full Diff pane, so split
     // view, syntax highlighting and the rest of that surface are reachable.
     let row = cx
-        .debug_bounds("review-change-row")
+        .debug_bounds("review-change-row-0")
         .expect("the change row is painted");
     cx.simulate_click(row.center(), Modifiers::default());
     draw_until(cx, "the selected diff detail", 20, |cx| {
@@ -2381,25 +2391,94 @@ fn review_tab_renders_a_captured_changeset(cx: &mut TestAppContext) {
     draw_until(cx, "the full Diff pane", 20, |cx| {
         cx.debug_bounds("diff-pane").is_some()
     });
+}
 
-    // The Audit tab joins every decision, in the order it happened.
+/// A changeset with hundreds of files paints the viewport's rows, not one
+/// element per file, and its thumb still spans the whole list.
+#[gpui::test]
+fn a_large_changeset_only_builds_the_rows_near_the_viewport(cx: &mut TestAppContext) {
+    use crate::review::domain::ChangeOperation;
+    use crate::ui::review::{review_rows_built, REVIEW_ROW_H};
+
+    /// Enough files that an unwindowed list is several viewports long.
+    const FILES: usize = 200;
+
+    init_test_app(cx);
+    let mut state = AppState::with_store(scratch_store("review-window"));
+    let session = state.new_session().expect("a session");
+    state.settings.global.general.active_session = session.clone();
+    if let Some(workspace) = state
+        .store
+        .session(&session)
+        .map(|session| session.workspace.clone())
+    {
+        state.settings.global.general.active_workspace = workspace;
+    }
+    let root = state.workspace_root().expect("a workspace root");
+    std::fs::create_dir_all(root.join("src")).expect("src");
+    let runtime = state.begin_review(&session).expect("a runtime");
+    for index in 0..FILES {
+        let path = root.join("src").join(format!("f{index}.rs"));
+        std::fs::write(&path, "fn old() {}\n").expect("old");
+        let before = runtime.before(&path);
+        std::fs::write(&path, "fn new() {}\n").expect("new");
+        runtime.record(&path, ChangeOperation::Edit, before, "edit_file");
+    }
+    state.finish_review(&session);
+
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     cx.update(|_, cx| {
-        harness.update(cx, |harness, cx| {
-            harness.shell.update(cx, |shell, cx| {
-                shell.state.tab = Tab::Audit;
-                cx.notify();
-            });
-        });
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Review;
+            cx.notify();
+        })
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    let snapshot = cx
+        .update(|_, cx| shell.read(cx).review_view())
+        .expect("the review");
+    assert_eq!(snapshot.changeset.changes.len(), FILES);
+
+    // The build is bounded by the viewport band, not by the changeset.
+    let before = review_rows_built();
+    for _ in 0..5 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let built = (review_rows_built() - before) as f64 / 5.0;
+    eprintln!("REVIEW WINDOW files={FILES} built={built:.1}/frame");
     assert!(
-        cx.debug_bounds("audit-review-decisions").is_some(),
-        "the Audit tab shows the decision timeline"
+        built < 80.0,
+        "a {FILES}-file review built {built:.0} rows a frame: the list is not windowed"
+    );
+
+    // The scroller's geometry is the whole list's: scrolling to the tail builds
+    // the last row and turns the first into a spacer.
+    let total = FILES as f32 * REVIEW_ROW_H;
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.review_scroll.set_offset(gpui_kit::point(
+                gpui_kit::px(0.0),
+                gpui_kit::px(-(total - 300.0)),
+            ));
+        })
+    });
+    for _ in 0..3 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let last_selector: &'static str =
+        Box::leak(format!("review-change-row-{}", FILES - 1).into_boxed_str());
+    let first_selector: &'static str = "review-change-row-0";
+    assert!(
+        cx.debug_bounds(last_selector).is_some(),
+        "the last change is built at the tail"
     );
     assert!(
-        cx.debug_bounds("audit-decision-0").is_some()
-            && cx.debug_bounds("audit-decision-1").is_some(),
-        "both changesets' decisions are listed"
+        cx.debug_bounds(first_selector).is_none(),
+        "the first change is a spacer while the reader is at the tail"
     );
 }
 
@@ -2645,8 +2724,7 @@ fn the_transcript_takes_the_measured_chrome(cx: &mut TestAppContext) {
     let shell = cx.update(|_, cx| _harness.read(cx).shell.clone());
     cx.update(|_, cx| {
         shell.update(cx, |shell, _| {
-            shell.following_tail = false;
-            shell.transcript_scroll.scroll_to_top_of_item(0);
+            shell.scroll_transcript_to_row(0);
         });
     });
     draw_until(
@@ -2702,8 +2780,7 @@ fn the_compaction_marker_expands_to_the_checkpoint(cx: &mut TestAppContext) {
     // Scroll to the top so the marker is inside the windowed transcript.
     cx.update(|_, cx| {
         shell.update(cx, |shell, _| {
-            shell.following_tail = false;
-            shell.transcript_scroll.scroll_to_top_of_item(0);
+            shell.scroll_transcript_to_row(0);
         });
     });
     draw_until(cx, "the compaction marker renders", DRAW_UNTIL_MAX, |cx| {
@@ -2713,7 +2790,7 @@ fn the_compaction_marker_expands_to_the_checkpoint(cx: &mut TestAppContext) {
     // six turns of history is below the fold.
     cx.update(|_, cx| {
         shell.update(cx, |shell, _| {
-            shell.transcript_scroll.scroll_to_top_of_item(0);
+            shell.scroll_transcript_to_row(0);
         });
     });
     // The reference anchors the marker at the checkpoint event, which is
@@ -2737,9 +2814,9 @@ fn the_compaction_marker_expands_to_the_checkpoint(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         shell.update(cx, |shell, _| {
-            shell
-                .transcript_scroll
-                .scroll_to_top_of_item(checkpoint_child);
+            // The marker sits after the whole retained tail, so the last
+            // message row goes to the top and the marker follows it in view.
+            shell.scroll_transcript_to_row(checkpoint_child);
         });
     });
     draw_until(cx, "the marker is in view", DRAW_UNTIL_MAX, |cx| {
@@ -3002,10 +3079,9 @@ fn the_compaction_rows_scroll_with_the_transcript(cx: &mut TestAppContext) {
             .map(|session| session.messages.len())
             .expect("a session")
     });
-    // Child 0 is the timestamp; one child per message; the marker at after=2
-    // lands before message 2; the command row is the last child.
+    // Row 0 is the timestamp; one row per message; the marker at after=2 lands
+    // before message 2 (row 3); the command row is the last child.
     let marker_child = 3usize;
-    let command_child = 1 + messages + 1;
     // First position: scroll the row two children ABOVE the marker to the top so
     // the rows above the marker are BUILT and measured, then settle.
     cx.update(|_, cx| {
@@ -3015,8 +3091,7 @@ fn the_compaction_rows_scroll_with_the_transcript(cx: &mut TestAppContext) {
             // re-engaging on the frame the scroll request lands: its growth
             // check would otherwise see the OLD at-the-end offset and snap back.
             this.tail_max = None;
-            this.transcript_scroll
-                .scroll_to_top_of_item(marker_child - 2);
+            this.scroll_transcript_to_row(marker_child - 2);
         });
     });
     let (offset_before, marker_y_before) = draw_until_row_is_stable(
@@ -3031,7 +3106,7 @@ fn the_compaction_rows_scroll_with_the_transcript(cx: &mut TestAppContext) {
         shell.update(cx, |this, _| {
             this.following_tail = false;
             this.tail_max = None;
-            this.transcript_scroll.scroll_to_top_of_item(marker_child);
+            this.scroll_transcript_to_row(marker_child);
         });
     });
     let (offset_after, marker_y_after) = draw_until_row_is_stable(
@@ -3083,13 +3158,17 @@ fn the_compaction_rows_scroll_with_the_transcript(cx: &mut TestAppContext) {
     let command_before = cx
         .debug_bounds("compact-command-row")
         .expect("the command row is visible above the pending rows");
-    let (command_layout_before, offset_before) = cx.update(|_, cx| {
-        let handle = &shell.read(cx).transcript_scroll;
+    // The scroller's children are the window's rows plus spacers, so a row is
+    // addressed by the PAINTED box and the offset, not by a child index. The
+    // content-space end of the message rows is what the command row follows, so
+    // its delta is the layout half of the painted movement.
+    let (offset_before, end_before) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
         (
-            handle
-                .bounds_for_item(command_child)
-                .expect("the scroller records the command child"),
-            f32::from(handle.offset().y),
+            f32::from(shell.transcript_scroll.offset().y),
+            shell
+                .transcript_row_span(1 + messages)
+                .map_or(0.0, |(top, _)| top),
         )
     });
     let body = cx.debug_bounds("transcript").expect("the transcript");
@@ -3114,16 +3193,17 @@ fn the_compaction_rows_scroll_with_the_transcript(cx: &mut TestAppContext) {
     let command_after = cx
         .debug_bounds("compact-command-row")
         .expect("the command row still paints");
-    let (command_layout_after, offset_after) = cx.update(|_, cx| {
-        let handle = &shell.read(cx).transcript_scroll;
+    let (offset_after, end_after) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
         (
-            handle
-                .bounds_for_item(command_child)
-                .expect("the scroller still records the command child"),
-            f32::from(handle.offset().y),
+            f32::from(shell.transcript_scroll.offset().y),
+            shell
+                .transcript_row_span(1 + messages)
+                .map_or(0.0, |(top, _)| top),
         )
     });
     let scrolled = offset_after - offset_before;
+    let layout_delta = end_after - end_before;
     assert!(
         scrolled >= 20.0,
         "the premise: the wheel really scrolled N pixels: {scrolled}"
@@ -3133,14 +3213,13 @@ fn the_compaction_rows_scroll_with_the_transcript(cx: &mut TestAppContext) {
         command_shift > px(0.0),
         "the command row moved DOWN with the upward scroll: {command_before:?} -> {command_after:?}"
     );
-    // The geometry identity of a scroller child: painted = laid out + offset.
-    // The row's laid-out slot may grow when a row above it is first measured,
-    // so the delta is split into that remeasure and the scroll; a fixed footer
-    // has no laid-out child at all and cannot satisfy this.
-    let layout_delta = command_layout_after.origin.y - command_layout_before.origin.y;
+    // The row's painted position is its laid-out slot plus the scroll offset:
+    // the slot may grow when a row above it is first measured, so the movement
+    // splits into that remeasure and the scroll. A fixed footer has no laid-out
+    // slot at all and cannot satisfy this.
     assert!(
-        (command_shift - (layout_delta + px(scrolled))).abs() <= px(1.5),
-        "the command row's painted y is its laid-out child plus the scroll offset: shift={command_shift:?} layout_delta={layout_delta:?} scrolled={scrolled}"
+        (command_shift - px(scrolled + layout_delta)).abs() <= px(1.5),
+        "the command row moves with the content: shift={command_shift:?} scrolled={scrolled} layout_delta={layout_delta}"
     );
 }
 
@@ -18260,8 +18339,7 @@ fn the_newest_mark_reengages_the_tail(cx: &mut TestAppContext) {
     // Leave the tail the way a reader does, then press the newest mark.
     cx.update(|_, cx| {
         shell.update(cx, |this, _| {
-            this.following_tail = false;
-            this.transcript_scroll.scroll_to_top_of_item(0);
+            this.scroll_transcript_to_row(0);
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -18325,8 +18403,7 @@ fn the_rail_highlights_the_newest_mark_at_the_tail(cx: &mut TestAppContext) {
     // Scrolled to the top, the active mark is the first one again.
     cx.update(|_, cx| {
         shell.update(cx, |this, _| {
-            this.following_tail = false;
-            this.transcript_scroll.scroll_to_top_of_item(0);
+            this.scroll_transcript_to_row(0);
         });
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -21856,10 +21933,11 @@ fn scrolling_a_long_chat_never_blanks_a_visible_row(cx: &mut TestAppContext) {
                 let view_bottom = view_top + f32::from(scroll.bounds().size.height);
                 (0..TURNS)
                     .filter(|turn| {
-                        scroll.bounds_for_item(1 + turn * 2).is_some_and(|item| {
-                            f32::from(item.top()) >= view_top + 24.0
-                                && f32::from(item.bottom()) <= view_bottom - 16.0
-                        })
+                        shell
+                            .transcript_row_span(1 + turn * 2)
+                            .is_some_and(|(top, height)| {
+                                top >= view_top + 24.0 && top + height <= view_bottom - 16.0
+                            })
                     })
                     .collect()
             });
@@ -22629,7 +22707,10 @@ fn a_branch_adopts_the_layout_it_was_cut_from(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
     let resets_before = crate::ui::transcript::transcript_layout_resets();
-    let built_before = crate::ui::transcript::transcript_rows_built();
+    // The plan's own size is the fact: the cumulative row count spans every
+    // render the click and the branch settle run, which says nothing about one
+    // frame's window.
+    crate::ui::transcript::reset_transcript_plan_builds();
 
     let last: &str = Box::leak(String::from("branch-59").into_boxed_str());
     let bounds = cx
@@ -22650,10 +22731,10 @@ fn a_branch_adopts_the_layout_it_was_cut_from(cx: &mut TestAppContext) {
         resets_before,
         "a branch re-measured the whole transcript instead of adopting its rows"
     );
-    let built = crate::ui::transcript::transcript_rows_built() - built_before;
+    let (_, worst) = crate::ui::transcript::transcript_plan_builds();
     assert!(
-        built < 45,
-        "the first frame after a branch built {built} of 60 rows; it must build the viewport"
+        worst <= 45,
+        "a frame after a branch built {worst} of 60 rows; it must build the viewport"
     );
 }
 /// A prompt carries its own footer: the time it was sent, then copy - right
@@ -23944,6 +24025,99 @@ fn the_files_pane_lists_the_workspace_and_opens_a_file(cx: &mut TestAppContext) 
     assert!(
         cx.debug_bounds("file-row-README.md").is_none(),
         "the tree steps aside while a document is open"
+    );
+}
+
+/// A fully expanded workspace paints the tree rows around the viewport, not
+/// one row element per visible entry.
+#[gpui::test]
+fn a_large_workspace_only_builds_the_tree_rows_near_the_viewport(cx: &mut TestAppContext) {
+    use crate::ui::right_panel::{files_rows_built, FILES_ROW_H};
+
+    /// Enough files that an unwindowed tree is several viewports long.
+    const FILES: usize = 300;
+    /// The expanded `src` row plus its entries.
+    const ROWS: usize = FILES + 1;
+
+    init_test_app(cx);
+    let label = "right-files-window";
+    let root = workspace_tree_root(label);
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).expect("src");
+    // Zero-padded so the listing's order is the numeric order: the last entry
+    // is then f299.rs, which the tail assertion names.
+    for index in 0..FILES {
+        std::fs::write(
+            root.join("src").join(format!("f{index:03}.rs")),
+            b"fn x() {}\n",
+        )
+        .expect("a file");
+    }
+    let mut state = AppState::with_store(scratch_store(label));
+    state.settings.global.general.active_workspace = label.to_string();
+    state
+        .settings
+        .global
+        .workspaces
+        .push(crate::settings::global::WorkspaceRef {
+            id: label.to_string(),
+            name: label.to_string(),
+            root: root.to_string_lossy().to_string(),
+            created_at: 0,
+            updated_at: 0,
+        });
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Files, window, cx);
+        })
+    });
+    draw_until(cx, "the src row renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("file-row-src").is_some()
+    });
+    let src = cx.debug_bounds("file-row-src").expect("the src row");
+    cx.simulate_click(src.center(), Modifiers::default());
+    draw_until(cx, "the branch lists", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("file-row-f000.rs").is_some()
+    });
+
+    let before = files_rows_built();
+    for _ in 0..5 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let built = (files_rows_built() - before) as f64 / 5.0;
+    eprintln!("FILES WINDOW files={FILES} built={built:.1}/frame");
+    assert!(
+        built < 150.0,
+        "a {FILES}-entry tree built {built:.0} rows a frame: the tree is not windowed"
+    );
+
+    // The scroller still spans the whole listing: the tail row is built once the
+    // reader is there, and the first entry is then a spacer.
+    let total = ROWS as f32 * FILES_ROW_H + 8.0;
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.files.scroll.set_offset(gpui_kit::point(
+                gpui_kit::px(0.0),
+                gpui_kit::px(-(total - 300.0)),
+            ));
+        })
+    });
+    for _ in 0..3 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    assert!(
+        cx.debug_bounds("file-row-f299.rs").is_some(),
+        "the last entry is built at the tail"
+    );
+    assert!(
+        cx.debug_bounds("file-row-f000.rs").is_none(),
+        "the first entry is a spacer while the reader is at the tail"
     );
 }
 
@@ -29515,9 +29689,9 @@ fn a_long_transcript_only_builds_the_rows_near_the_viewport(cx: &mut TestAppCont
     const FRAME_CEILING: Duration = Duration::from_millis(120);
 
     init_test_app(cx);
-    // Counted from BEFORE the shell is built: opening a chat draws it, and that
-    // opening draw is the one that used to lay out the whole history.
-    let opening_before = crate::ui::transcript::transcript_rows_built();
+    // The plan-size pin is this test's own: the counter is thread-local and a
+    // previous case on the same thread must not set the ceiling.
+    crate::ui::transcript::reset_transcript_plan_builds();
     let state = state_with_turns("transcript-window", TURNS);
     // A second, short chat, so the switch path can be proved as well.
     let other = "transcript-window-other";
@@ -29541,13 +29715,15 @@ fn a_long_transcript_only_builds_the_rows_near_the_viewport(cx: &mut TestAppCont
     // Only the prefetch band and the newest few are built now.
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let opening = crate::ui::transcript::transcript_rows_built() - opening_before;
-    // The old path built every row here (measured: 456 with 400 messages). The
-    // band may be drawn a few times while the shell settles, so the ceiling is a
-    // few bands wide - row counts do not depend on the machine's speed.
+    // The opening draw repaints several times while the tail settles, so the
+    // cumulative count is not the fact that matters: NO single plan may lay out
+    // the history. The old path's first plan built every row (456 at 400
+    // messages); the window builds the band, the prefetch rows and the tail.
+    let (_, worst) = crate::ui::transcript::transcript_plan_builds();
     assert!(
-        opening <= 120,
-        "opening a 400-message chat built {opening} rows; it must build the prefetch band"
+        worst <= 60,
+        "a plan built {worst} of {} rows; the window must only build the viewport's share",
+        TURNS * 2
     );
 
     let before = crate::ui::transcript::transcript_rows_built();
@@ -29565,8 +29741,12 @@ fn a_long_transcript_only_builds_the_rows_near_the_viewport(cx: &mut TestAppCont
     );
 
     assert!(built > 0, "the premise: the transcript renders");
+    // The band covers the viewport plus TRANSCRIPT_OVERDRAW on both sides, and
+    // the prefetch rows and the tail are built on top of it; with the measured
+    // ~80px rows that is about forty-five. The pin is that the count does not
+    // follow the history (400 rows exist; the unwindowed path built every one).
     assert!(
-        per_frame <= 40,
+        per_frame <= 60,
         "a frame built {per_frame} of {} message rows; it must build only the viewport's share",
         TURNS * 2
     );
@@ -29602,7 +29782,7 @@ fn a_long_transcript_only_builds_the_rows_near_the_viewport(cx: &mut TestAppCont
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let returned = crate::ui::transcript::transcript_rows_built() - before;
     assert!(
-        returned <= 40,
+        returned <= 60,
         "switching back built {returned} of {} message rows; a remembered layout must only paint its window",
         TURNS * 2
     );
@@ -29615,8 +29795,7 @@ fn a_long_transcript_only_builds_the_rows_near_the_viewport(cx: &mut TestAppCont
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.update(|_, cx| {
         shell.update(cx, |shell, _| {
-            shell.following_tail = false;
-            shell.transcript_scroll.scroll_to_top_of_item(0);
+            shell.scroll_transcript_to_row(0);
         });
     });
     draw_until(
@@ -29835,8 +30014,7 @@ fn the_audit_tab_sits_beside_chat_and_keeps_the_chat_position(cx: &mut TestAppCo
     );
     cx.update(|_, cx| {
         shell.update(cx, |this, _| {
-            this.following_tail = false;
-            this.transcript_scroll.scroll_to_top_of_item(2);
+            this.scroll_transcript_to_row(2);
         });
     });
     draw_until(

@@ -67,6 +67,69 @@ const SELF_DOUBLE_MS: u64 = 400;
 /// spot; a press on the far side of the blank area is a different intention.
 const SELF_DOUBLE_PX: f32 = 6.0;
 
+/// A tree row's exact height: the measured 13px/1.5 line box (19.5) over the
+/// row's padding, rounded to the device pixel the row paints at. Exactness is
+/// what lets the tree place a row it does not build.
+pub(crate) const FILES_ROW_H: f32 = 30.0;
+/// Rows this close to the viewport are built too, so a small scroll never
+/// reveals an empty frame.
+const FILES_OVERDRAW: f32 = 320.0;
+/// What the first frame assumes the tree can show, before it is measured.
+const FILES_FIRST_VIEWPORT: f32 = 600.0;
+/// The listing's own top padding, which the window's arithmetic starts after.
+const FILES_LIST_PAD_Y: f32 = 8.0;
+
+/// The band of the tree, and the exact height of the rows on either side.
+///
+/// Pure, so the window's arithmetic can be pinned without a frame.
+fn files_band(rows: usize, view_top: f32, view_h: f32) -> (usize, usize, f32, f32) {
+    let band_top = view_top - FILES_OVERDRAW;
+    let band_bottom = view_top + view_h + FILES_OVERDRAW;
+    let mut top = FILES_LIST_PAD_Y;
+    let mut first: Option<usize> = None;
+    let mut end = 0usize;
+    for index in 0..rows {
+        if first.is_none() && top + FILES_ROW_H > band_top {
+            first = Some(index);
+        }
+        if first.is_some() && top < band_bottom {
+            end = index + 1;
+        }
+        top += FILES_ROW_H;
+    }
+    let first = first.unwrap_or(rows);
+    // A view past the end keeps the list's height in one leading spacer.
+    let end = end.max(first);
+    (
+        first,
+        end,
+        first as f32 * FILES_ROW_H,
+        (rows - end) as f32 * FILES_ROW_H,
+    )
+}
+
+/// A row kept at its exact height without building its contents.
+fn files_spacer(height: f32) -> AnyElement {
+    div()
+        .flex_none()
+        .flex_shrink_0()
+        .w_full()
+        .h(px(height.max(0.0)))
+        .into_any_element()
+}
+
+// How many tree rows the last frame actually built, for the performance test.
+#[cfg(test)]
+thread_local! {
+    static FILES_ROWS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The tree rows built so far on this thread.
+#[cfg(test)]
+pub(crate) fn files_rows_built() -> usize {
+    FILES_ROWS_BUILT.with(|built| built.get())
+}
+
 /// The top-left a document-anchored overlay sits at, in the editor's own
 /// coordinates.
 ///
@@ -509,7 +572,12 @@ pub(crate) struct RightPanel {
     pub(crate) federation: FederationPane,
     /// The Tasks board's records, read once per open so a frame never touches
     /// the store.
-    pub(crate) tasks: std::cell::RefCell<Option<Vec<crate::extension::tasks::Task>>>,
+    ///
+    /// Shared behind an `Rc`: the three task views used to clone the whole list
+    /// out of this cell on every repaint (the tasks are owned rows, so that is a
+    /// deep copy of every task), which is the one per-frame copy a long-lived
+    /// board paid forever.
+    pub(crate) tasks: std::cell::RefCell<Option<std::rc::Rc<Vec<crate::extension::tasks::Task>>>>,
     /// Task rows whose detail is expanded.
     pub(crate) expanded: std::collections::BTreeSet<String>,
     /// Whether the History section shows its rows.
@@ -751,6 +819,11 @@ pub(crate) struct FilesPane {
     pub(crate) thread_quote: Option<(PathBuf, usize, String)>,
     /// The note being typed into the drawer's field.
     pub(crate) note_text: Entity<TextareaState>,
+    /// The tree's scroll position, so its window can follow the reader.
+    ///
+    /// A workspace with a fully expanded tree built one row element per visible
+    /// entry on every repaint, however little of it the column could show.
+    pub(crate) scroll: ScrollHandle,
 }
 
 /// One file open in the editor area, as the tab strip carries it.
@@ -839,6 +912,7 @@ impl FilesPane {
             focus_note: None,
             thread_quote: None,
             note_text,
+            scroll: ScrollHandle::new(),
         }
     }
 
@@ -2833,27 +2907,28 @@ impl Shell {
         use crate::ui::task_graph::{GraphStatus, NodeKind};
         let lang = self.state.lang;
         let session = self.state.active_id.clone().unwrap_or_default();
-        let title = self
+        // The newest prompt, cut to the header's 64 chars: taking the slice
+        // BEFORE the copy keeps a frame from duplicating a whole pasted prompt
+        // (and the second store lookup) just to throw all but its first line
+        // away.
+        let title: String = self
             .state
             .store
             .session(&session)
-            .and_then(|session| {
-                session
+            .map(|session| {
+                let prompt = session
                     .messages
                     .iter()
                     .rev()
                     .find(|message| message.role == crate::model::Role::User)
-                    .map(|message| message.text.clone())
+                    .map(|message| message.text.as_str())
+                    .filter(|text| !text.trim().is_empty());
+                match prompt {
+                    Some(prompt) => prompt.chars().take(64).collect(),
+                    None => session.title.chars().take(64).collect(),
+                }
             })
-            .filter(|text| !text.trim().is_empty())
-            .unwrap_or_else(|| {
-                self.state
-                    .store
-                    .session(&session)
-                    .map(|session| session.title.clone())
-                    .unwrap_or_default()
-            });
-        let title: String = title.chars().take(64).collect();
+            .unwrap_or_default();
         let status = if self.state.streams.contains_key(&session) {
             GraphStatus::Running
         } else {
@@ -2865,11 +2940,11 @@ impl Shell {
             use crate::extension::tasks::TasksStore as _;
             let mut cache = self.right.tasks.borrow_mut();
             if cache.is_none() {
-                *cache = Some(
+                *cache = Some(std::rc::Rc::new(
                     crate::extension::tasks::FileTasksStore
                         .list(&workspace)
                         .unwrap_or_default(),
-                );
+                ));
             }
             cache.clone().unwrap_or_default()
         };
@@ -3074,27 +3149,28 @@ impl Shell {
     fn task_graph_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let session = self.state.active_id.clone().unwrap_or_default();
-        let title = self
+        // The newest prompt, cut to the header's 64 chars: taking the slice
+        // BEFORE the copy keeps a frame from duplicating a whole pasted prompt
+        // (and the second store lookup) just to throw all but its first line
+        // away.
+        let title: String = self
             .state
             .store
             .session(&session)
-            .and_then(|session| {
-                session
+            .map(|session| {
+                let prompt = session
                     .messages
                     .iter()
                     .rev()
                     .find(|message| message.role == crate::model::Role::User)
-                    .map(|message| message.text.clone())
+                    .map(|message| message.text.as_str())
+                    .filter(|text| !text.trim().is_empty());
+                match prompt {
+                    Some(prompt) => prompt.chars().take(64).collect(),
+                    None => session.title.chars().take(64).collect(),
+                }
             })
-            .filter(|text| !text.trim().is_empty())
-            .unwrap_or_else(|| {
-                self.state
-                    .store
-                    .session(&session)
-                    .map(|session| session.title.clone())
-                    .unwrap_or_default()
-            });
-        let title: String = title.chars().take(64).collect();
+            .unwrap_or_default();
         let status = if self.state.streams.contains_key(&session) {
             crate::ui::task_graph::GraphStatus::Running
         } else {
@@ -3109,11 +3185,11 @@ impl Shell {
             use crate::extension::tasks::TasksStore as _;
             let mut cache = self.right.tasks.borrow_mut();
             if cache.is_none() {
-                *cache = Some(
+                *cache = Some(std::rc::Rc::new(
                     crate::extension::tasks::FileTasksStore
                         .list(&workspace)
                         .unwrap_or_default(),
-                );
+                ));
             }
             cache.clone().unwrap_or_default()
         };
@@ -3829,7 +3905,9 @@ impl Shell {
         let tasks = {
             let mut cache = self.right.tasks.borrow_mut();
             if cache.is_none() {
-                *cache = Some(FileTasksStore.list(&root).unwrap_or_default());
+                *cache = Some(std::rc::Rc::new(
+                    FileTasksStore.list(&root).unwrap_or_default(),
+                ));
             }
             cache.clone().unwrap_or_default()
         };
@@ -6444,6 +6522,7 @@ impl Shell {
             .flex_1()
             .min_h(px(0.0))
             .overflow_y_scroll()
+            .track_scroll(&self.files.scroll)
             .w_full()
             .flex()
             .flex_col();
@@ -6456,6 +6535,9 @@ impl Shell {
                 theme::faint(),
             )));
         }
+        // The visible entries are resolved FIRST, because the window needs their
+        // count and their positions before it can decide which rows to build.
+        let mut entries: Vec<(&files::Row, PathBuf, usize)> = Vec::new();
         let mut stack: Vec<(&files::Row, PathBuf, usize)> = self
             .files
             .roots
@@ -6466,7 +6548,7 @@ impl Shell {
         stack.reverse();
         while let Some((row, parent, depth)) = stack.pop() {
             let rel = parent.join(&row.name);
-            list = list.child(self.files_tree_row(row, &rel, depth, cx));
+            entries.push((row, rel.clone(), depth));
             if row.dir {
                 let expanded = self.files.expanded.iter().any(|p| p == &rel);
                 if expanded {
@@ -6477,6 +6559,27 @@ impl Shell {
                     }
                 }
             }
+        }
+        // Every row is exactly FILES_ROW_H tall, so the tree paints the band
+        // around the viewport and stands the rest in two spacers: a fully
+        // expanded workspace used to build one row element per visible entry on
+        // every repaint, however little of it the column could show.
+        let view_h = f32::from(self.files.scroll.bounds().size.height);
+        let view_h = if view_h > 0.0 {
+            view_h
+        } else {
+            FILES_FIRST_VIEWPORT
+        };
+        let view_top = -f32::from(self.files.scroll.offset().y);
+        let (first, end, leading, trailing) = files_band(entries.len(), view_top, view_h);
+        if leading > 0.0 {
+            list = list.child(files_spacer(leading));
+        }
+        for (row, rel, depth) in &entries[first..end] {
+            list = list.child(self.files_tree_row(row, rel, *depth, cx));
+        }
+        if trailing > 0.0 {
+            list = list.child(files_spacer(trailing));
         }
         // A double-click on the space below the last row asks for a new file
         // there. gpui exposes no on_double_click, and its ClickEvent's
@@ -6542,6 +6645,8 @@ impl Shell {
         depth: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        #[cfg(test)]
+        FILES_ROWS_BUILT.with(|built| built.set(built.get() + 1));
         let name = row.name.clone();
         let dir = row.dir;
         let rel_click = rel.to_path_buf();
@@ -6578,7 +6683,11 @@ impl Shell {
             .rounded(px(theme::RADIUS_SM))
             .pl(px(10.0 + 18.0 * depth as f32))
             .pr(px(10.0))
-            .py(px(5.0))
+            // Exact by construction: the tree's window places a row it does not
+            // build by this stride, so the row may not take its height from the
+            // line box.
+            .h(px(FILES_ROW_H))
+            .flex_none()
             .flex()
             .flex_row()
             .items_center()
@@ -13032,5 +13141,41 @@ mod federation_pane_tests {
             .node_id()
             .to_string();
         assert!(revoke_peer_action(&mut store, &stranger, "stranger").is_err());
+    }
+}
+
+#[cfg(test)]
+mod files_window_tests {
+    use super::{files_band, FILES_LIST_PAD_Y, FILES_ROW_H};
+
+    /// The tree's rows are one exact height, so the built band and the two
+    /// spacers must reproduce the whole listing's height.
+    #[test]
+    fn the_tree_band_spans_the_whole_listing() {
+        for (view_top, view_h, first, end) in [
+            (0.0f32, 300.0f32, 0usize, 21usize),
+            (1_500.0, 300.0, 39, 71),
+            (2_900.0, 300.0, 85, 100),
+        ] {
+            let (got_first, got_end, leading, trailing) = files_band(100, view_top, view_h);
+            assert_eq!(
+                (got_first, got_end),
+                (first, end),
+                "the band for a view at {view_top}"
+            );
+            assert_eq!(leading, first as f32 * FILES_ROW_H);
+            assert_eq!(trailing, (100 - end) as f32 * FILES_ROW_H);
+            let built = (got_end - got_first) as f32 * FILES_ROW_H;
+            assert_eq!(
+                FILES_LIST_PAD_Y + leading + built + trailing,
+                8.0 + 3_000.0,
+                "the spacers keep the whole listing's height"
+            );
+        }
+        // A view past the end keeps the listing's height in one leading spacer.
+        assert_eq!(files_band(100, 10_000.0, 300.0), (100, 100, 3_000.0, 0.0));
+        // A view above the top builds nothing and leaves one trailing spacer.
+        assert_eq!(files_band(100, -10_000.0, 300.0), (0, 0, 0.0, 3_000.0));
+        assert_eq!(files_band(0, 0.0, 300.0), (0, 0, 0.0, 0.0));
     }
 }

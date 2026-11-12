@@ -7,10 +7,14 @@
 //! measured track width at layout time; the tests multiply the fractions by the
 //! measured track to pin the pixel geometry.
 //!
-//! A block is never dropped: an event without a start is placed at the nearest
+//! A record is never dropped: an event without a start is placed at the nearest
 //! known instant in its lane, and an event without a duration keeps the
 //! renderer's two-pixel floor. Those two fallbacks are the only cases where the
 //! geometry is an approximation, and they are marked where they are applied.
+//! Against a very long log, adjacent records merge into one block that spans
+//! them ("decimate"): the strip is 50px tall, so past a few hundred blocks it
+//! can only paint density, and one element per record made every frame cost the
+//! whole history.
 //!
 //! A fraction alone cannot tell whether the pixel floor still fits before the
 //! end of the track, so the renderer measures the track once per layout pass and
@@ -154,6 +158,78 @@ pub(crate) fn time_lane(lane: &[LaneRecord], axis: TimeAxis) -> Vec<LaneBlock> {
         .collect()
 }
 
+/// The most blocks one lane draws.
+///
+/// The strip is 50px tall and a few hundred pixels wide, so a lane cannot show
+/// more than this many distinct marks; every element past the cap was a div the
+/// reader could not tell apart from its neighbour, paid on every repaint.
+pub(crate) const MAX_LANE_BLOCKS: usize = 480;
+
+/// Merge adjacent records until a lane fits MAX_LANE_BLOCKS.
+///
+/// Each output record stands for a contiguous slice of the input: it keeps the
+/// slice's FIRST index, the earliest start and the end of the latest finisher,
+/// so the merged block spans exactly the instants its records did and the lane
+/// still covers the same axis. Merging is a PAINT decision only: the lane
+/// resolves a press against the full projection ([lane_hit]), so every record in
+/// a merged block is still reachable. A lane at or under the cap is returned
+/// unchanged, which is every ordinary session.
+pub(crate) fn decimate(lane: &[LaneRecord]) -> std::borrow::Cow<'_, [LaneRecord]> {
+    if lane.len() <= MAX_LANE_BLOCKS {
+        return std::borrow::Cow::Borrowed(lane);
+    }
+    let mut out = Vec::with_capacity(MAX_LANE_BLOCKS);
+    for bucket in 0..MAX_LANE_BLOCKS {
+        // Integer boundaries: the last bucket ends at lane.len() exactly, so no
+        // record is lost between buckets.
+        let first = bucket * lane.len() / MAX_LANE_BLOCKS;
+        let end = (bucket + 1) * lane.len() / MAX_LANE_BLOCKS;
+        let slice = &lane[first..end];
+        let mut start: Option<u64> = None;
+        let mut finish: Option<u64> = None;
+        for record in slice {
+            let Some(at) = record.start else {
+                continue;
+            };
+            start = Some(start.map_or(at, |current| current.min(at)));
+            let ended = at.saturating_add(record.duration_ms.unwrap_or(0));
+            finish = Some(finish.map_or(ended, |current| current.max(ended)));
+        }
+        out.push(LaneRecord {
+            index: slice[0].index,
+            turn: slice[0].turn,
+            start,
+            duration_ms: start
+                .zip(finish)
+                .map(|(start, finish)| finish.saturating_sub(start)),
+        });
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The record a press at `fraction` selects from one lane's blocks.
+///
+/// The strip paints decimated buckets, but a press must reach every record, so
+/// the caller passes the FULL projection. Blocks overlap when events overlap; a
+/// later block is a later child and paints over the earlier one, so the last
+/// match wins. A press in a gap (an idle stretch, or between two tiny blocks)
+/// lands on the nearest block rather than on nothing, and `floor` is the
+/// renderer's pixel floor as a fraction, so a zero-duration block is still
+/// pressable.
+pub(crate) fn lane_hit(blocks: &[LaneBlock], fraction: f32, floor: f32) -> Option<usize> {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let inside = blocks.iter().rev().find(|block| {
+        let end = (block.x + block.width.max(floor)).min(1.0);
+        fraction >= block.x && fraction <= end
+    });
+    let nearest = || {
+        blocks
+            .iter()
+            .min_by(|a, b| (fraction - a.x).abs().total_cmp(&(fraction - b.x).abs()))
+    };
+    inside.or_else(nearest).map(|block| block.index)
+}
+
 /// One block's final pixel box inside a lane track.
 ///
 /// Both fields are pixels from the track's content left edge. The renderer
@@ -230,7 +306,10 @@ pub(crate) fn equal_lane(lane: &[LaneRecord]) -> Vec<LaneBlock> {
 
 #[cfg(test)]
 mod tests {
-    use super::{block_box, equal_lane, fixed_box, time_lane, LaneRecord, TimeAxis};
+    use super::{
+        block_box, decimate, equal_lane, fixed_box, lane_hit, time_lane, LaneBlock, LaneRecord,
+        TimeAxis, MAX_LANE_BLOCKS,
+    };
 
     fn record(index: usize, start: Option<u64>, duration_ms: Option<u64>) -> LaneRecord {
         LaneRecord {
@@ -459,5 +538,107 @@ mod tests {
         let block = fixed_box(1.0, 8.0, 5.0);
         assert_eq!(block.x, 0.0);
         assert_eq!(block.width, 5.0);
+    }
+
+    /// A lane an ordinary session produces is drawn record for record: the
+    /// cap is a long-log guard, not a change to the normal strip.
+    #[test]
+    fn a_lane_under_the_cap_is_unchanged() {
+        let lane: Vec<LaneRecord> = (0..MAX_LANE_BLOCKS)
+            .map(|index| record(index, Some(index as u64 * 1_000), Some(500)))
+            .collect();
+        let drawn = decimate(&lane);
+        assert!(matches!(drawn, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(drawn.as_ref(), lane.as_slice());
+    }
+
+    /// A press resolves to the record under the pointer: every block is a
+    /// candidate, so a merged bucket is not the only reachable row.
+    #[test]
+    fn a_press_picks_the_record_under_the_pointer() {
+        let blocks = [
+            LaneBlock {
+                index: 10,
+                turn: 1,
+                x: 0.1,
+                width: 0.2,
+            },
+            LaneBlock {
+                index: 11,
+                turn: 1,
+                x: 0.5,
+                width: 0.1,
+            },
+        ];
+        assert_eq!(lane_hit(&blocks, 0.15, 0.0), Some(10));
+        assert_eq!(lane_hit(&blocks, 0.55, 0.0), Some(11));
+        // A press in a gap lands on the nearest block, not on nothing.
+        assert_eq!(lane_hit(&blocks, 0.05, 0.0), Some(10));
+        assert_eq!(lane_hit(&blocks, 0.9, 0.0), Some(11));
+    }
+
+    /// Overlapping blocks resolve by paint order: the later child is on top.
+    #[test]
+    fn an_overlap_picks_the_block_painted_last() {
+        let blocks = [
+            LaneBlock {
+                index: 3,
+                turn: 1,
+                x: 0.2,
+                width: 0.6,
+            },
+            LaneBlock {
+                index: 4,
+                turn: 1,
+                x: 0.3,
+                width: 0.05,
+            },
+        ];
+        assert_eq!(lane_hit(&blocks, 0.32, 0.0), Some(4));
+        assert_eq!(lane_hit(&blocks, 0.7, 0.0), Some(3));
+    }
+
+    /// An instant keeps the renderer's pixel floor as a hit target.
+    #[test]
+    fn an_instant_is_still_pressable() {
+        let blocks = [LaneBlock {
+            index: 7,
+            turn: 1,
+            x: 0.5,
+            width: 0.0,
+        }];
+        assert_eq!(lane_hit(&blocks, 0.5, 0.0), Some(7));
+        assert_eq!(
+            lane_hit(&blocks, 0.52, 0.01),
+            Some(7),
+            "the floor extends the target"
+        );
+        assert_eq!(lane_hit(&blocks, 0.6, 0.01), Some(7), "nearest fallback");
+    }
+
+    /// A dense lane merges adjacent records: every bucket keeps the first real
+    /// row, and the union of the merged spans is the union of the original ones,
+    /// so the axis (and therefore every other lane) does not move.
+    #[test]
+    fn a_dense_lane_merges_records_and_keeps_its_span() {
+        let lane: Vec<LaneRecord> = (0..5_000)
+            .map(|index| record(index, Some(index as u64 * 1_000), Some(400)))
+            .collect();
+        let drawn = decimate(&lane);
+        assert_eq!(drawn.len(), MAX_LANE_BLOCKS);
+        assert_eq!(
+            drawn[0].index, 0,
+            "the first bucket starts at the first row"
+        );
+        assert_eq!(drawn[0].start, lane[0].start);
+        // The last bucket is the final slice, so its span reaches the last
+        // record's end.
+        let original = TimeAxis::across(&[&lane]).expect("a clock");
+        let merged = TimeAxis::across(&[drawn.as_ref()]).expect("a clock");
+        assert_eq!(merged, original, "merging preserves the axis");
+        // Indices strictly increase, and every block names a row that exists.
+        for pair in drawn.windows(2) {
+            assert!(pair[0].index < pair[1].index);
+        }
     }
 }

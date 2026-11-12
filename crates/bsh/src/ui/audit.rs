@@ -35,7 +35,6 @@ use crate::audit::{
     AuditTurn, AuditView,
 };
 use crate::i18n::tr_args;
-use crate::review::domain::{Decision, DecisionEvent};
 use crate::state::Tab;
 use crate::theme;
 
@@ -66,6 +65,12 @@ struct AuditKey {
     policy: AuditPolicy,
     /// The MCP namespaces, which decide a tools's category.
     mcp: Vec<String>,
+    /// The language the page's own row labels are written in.
+    ///
+    /// The flat table's actor and type cells carry translated words, so a
+    /// language switch rebuilds those rows with the rest of the model rather
+    /// than leaving one page in the old language.
+    lang: crate::i18n::Lang,
 }
 
 /// The audit page's built view model, kept between frames.
@@ -73,8 +78,61 @@ struct AuditKey {
 pub(crate) struct AuditCache {
     key: Option<AuditKey>,
     view: std::rc::Rc<AuditView>,
-    review_key: Option<(String, u64)>,
-    review_decisions: std::rc::Rc<Vec<DecisionEvent>>,
+    /// The flat event table's rows, derived from `view` in the same build.
+    ///
+    /// The table mixes turns, calls and refusals into one sortable list; building
+    /// it walked the whole page, cloned every target and preview string and
+    /// sorted the result, so a repaint of a long session paid that walk again
+    /// for a table whose rows had not changed. It is now as cached as the view
+    /// model it comes from.
+    flat: std::rc::Rc<Vec<FlatEvent>>,
+    /// The counts the summary strip prints, built with the model.
+    stats: FlatStats,
+    /// The filter the table last narrowed the model with, and the row indices
+    /// it admitted. An active search or category used to rescan every event on
+    /// every repaint; typing one word made the cost follow the history.
+    filter: Option<FlatFilterKey>,
+    filtered: std::rc::Rc<Vec<usize>>,
+}
+
+/// The summary strip's four counts, derived once per model build.
+#[derive(Clone, Copy, Default)]
+struct FlatStats {
+    total: usize,
+    succeeded: usize,
+    denied: usize,
+    failed: usize,
+}
+
+/// The filter state the flat table is narrowed by.
+///
+/// PartialEq is implemented by hand because the model is an `Rc`: comparing two
+/// keys by value would compare every event, which is the cost the cache exists
+/// to remove. Pointer identity is exactly right here - the cache rebuilds the
+/// rows in place, so a new pointer means new content.
+#[derive(Clone)]
+struct FlatFilterKey {
+    flat: std::rc::Rc<Vec<FlatEvent>>,
+    query: String,
+    category: Option<AuditCategory>,
+    result: usize,
+    range: usize,
+    /// The clock the 24-hour window is measured against. Minutes, so a repaint
+    /// on the same minute reuses the rows while the window still moves.
+    minute: u64,
+    lang: crate::i18n::Lang,
+}
+
+impl FlatFilterKey {
+    fn same(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.flat, &other.flat)
+            && self.query == other.query
+            && self.category == other.category
+            && self.result == other.result
+            && self.range == other.range
+            && self.minute == other.minute
+            && self.lang == other.lang
+    }
 }
 
 /// One flat event the table shows, built from the audit view's turns,
@@ -176,6 +234,7 @@ impl Shell {
                 .map_or(0, |audit| audit.denials_total),
             policy: self.audit_policy(),
             mcp: mcp.clone(),
+            lang: self.state.lang,
         };
         let mut cache = self.audit_cache.borrow_mut();
         if cache.key.as_ref() != Some(&key) {
@@ -185,29 +244,108 @@ impl Shell {
             // here would make "refusals" mean two different things on one page.
             let denials = self.blocking_denials();
             let view = AuditView::build(session, &denials, &mcp).with_policy(self.audit_policy());
+            let rows = Self::flat_events(&view, key.lang);
+            cache.stats = FlatStats {
+                total: rows.len(),
+                succeeded: rows.iter().filter(|event| event.ok).count(),
+                denied: rows.iter().filter(|event| event.denied).count(),
+                failed: rows
+                    .iter()
+                    .filter(|event| !event.ok && !event.denied)
+                    .count(),
+            };
+            cache.flat = std::rc::Rc::new(rows);
             cache.key = Some(key);
             cache.view = std::rc::Rc::new(view);
         }
         cache.view.clone()
     }
 
-    /// Every review decision for the active session, kept until a decision lands.
-    fn audit_decisions(&self) -> std::rc::Rc<Vec<DecisionEvent>> {
-        let Some(session) = self.state.active_session() else {
-            return std::rc::Rc::new(Vec::new());
+    /// The flat table's rows, derived with (and cached beside) the view model.
+    ///
+    /// `audit_view` reconciles the cache, so this is a pointer clone in the frame
+    /// that just asked for the view.
+    fn audit_flat(&self) -> std::rc::Rc<Vec<FlatEvent>> {
+        self.audit_cache.borrow().flat.clone()
+    }
+
+    /// The summary counts, built with the model.
+    fn audit_stats(&self) -> FlatStats {
+        self.audit_cache.borrow().stats
+    }
+
+    /// The row indices the current search, category, result and range admit.
+    ///
+    /// The scan runs once per filter change, not once per repaint: a reader who
+    /// typed a query into a long session used to pay the whole walk on every
+    /// frame the page painted, with allocations for the lowercased cells.
+    fn audit_filtered(&self, all: &std::rc::Rc<Vec<FlatEvent>>) -> std::rc::Rc<Vec<usize>> {
+        let key = FlatFilterKey {
+            flat: std::rc::Rc::clone(all),
+            query: self.audit_query.trim().to_lowercase(),
+            category: self.audit_category,
+            result: self.audit_result,
+            range: self.audit_range,
+            // Only the 24-hour window depends on the clock; pinning it to zero
+            // for the other ranges is what keeps a repaint from rebuilding the
+            // rows at a minute boundary for no reason.
+            minute: if self.audit_range == 1 {
+                crate::state::now_ms() / 60_000
+            } else {
+                0
+            },
+            lang: self.state.lang,
         };
-        let key = (session.id.clone(), self.state.review_epoch);
-        let stale = {
-            let cache = self.audit_cache.borrow();
-            cache.review_key.as_ref() != Some(&key)
-        };
+        let mut cache = self.audit_cache.borrow_mut();
+        let stale = cache
+            .filter
+            .as_ref()
+            .is_none_or(|current| !current.same(&key));
         if stale {
-            let decisions = self.state.review_decisions(&key.0);
-            let mut cache = self.audit_cache.borrow_mut();
-            cache.review_decisions = std::rc::Rc::new(decisions);
-            cache.review_key = Some(key);
+            #[cfg(test)]
+            AUDIT_FILTER_BUILDS.with(|builds| builds.set(builds.get() + 1));
+            let query = &key.query;
+            let rows: Vec<usize> = all
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    if let Some(category) = key.category {
+                        if !matches!(event.kind, FlatKind::Call(call) if call == category) {
+                            return false;
+                        }
+                    }
+                    match key.result {
+                        1 if !event.ok => return false,
+                        2 if event.ok => return false,
+                        _ => {}
+                    }
+                    if key.range == 1 {
+                        let cutoff = key.minute.saturating_mul(60_000).saturating_sub(86_400_000);
+                        if let Some(at) = event.at {
+                            if at < cutoff {
+                                return false;
+                            }
+                        }
+                    }
+                    if query.is_empty() {
+                        return true;
+                    }
+                    let label = event.kind.label(key.lang).to_lowercase();
+                    label.contains(query)
+                        || event.actor.to_lowercase().contains(query)
+                        || event.target.to_lowercase().contains(query)
+                        || event.tool.to_lowercase().contains(query)
+                        || event
+                            .rule
+                            .as_deref()
+                            .is_some_and(|rule| rule.to_lowercase().contains(query))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            cache.filtered = std::rc::Rc::new(rows);
+            cache.filter = Some(key);
         }
-        self.audit_cache.borrow().review_decisions.clone()
+        cache.filtered.clone()
     }
 
     /// The live MCP namespaces, sorted and deduped: the classifier's own input.
@@ -451,6 +589,9 @@ impl Shell {
     /// The turn row's own height: exact, which is what lets the window place a
     /// row it does not build.
     pub(crate) const TURN_ROW_H: f32 = 38.0;
+    /// The flat table's row height: exact for the same reason. The row draws its
+    /// separator inside this box, so the measurement is the constant.
+    pub(crate) const FLAT_ROW_H: f32 = 46.0;
     /// The width the flat table's own columns need before its detail card
     /// stops being parked beside it.
     ///
@@ -464,8 +605,11 @@ impl Shell {
     const MEASURE_H: f32 = 5.0;
     /// The flat event list the table filters: one row per turn opening, tool
     /// call and policy refusal, newest first.
-    fn audit_flat_events(&self, view: &AuditView) -> Vec<FlatEvent> {
-        let lang = self.state.lang;
+    ///
+    /// Built with the cached view model, never per frame: every cell is owned so
+    /// sorting and filtering never touch the page, which is exactly why the walk
+    /// must not run on the paint path.
+    fn flat_events(view: &AuditView, lang: crate::i18n::Lang) -> Vec<FlatEvent> {
         let mut rows = Vec::new();
         for turn in &view.turns {
             rows.push(FlatEvent {
@@ -535,51 +679,19 @@ impl Shell {
                 .into_any_element();
         };
         let view = self.audit_view();
-        let all = self.audit_flat_events(&view);
-        let total = all.len();
-        let succeeded = all.iter().filter(|event| event.ok).count();
-        let denied = all.iter().filter(|event| event.denied).count();
-        let failed = all
-            .iter()
-            .filter(|event| !event.ok && !event.denied)
-            .count();
+        // The rows are the cached model's: filtering borrows them, so a repaint
+        // of an unchanged page copies no event, no target and no preview.
+        let all = self.audit_flat();
+        let stats = self.audit_stats();
+        let total = stats.total;
+        let succeeded = stats.succeeded;
+        let denied = stats.denied;
+        let failed = stats.failed;
         let security = denied;
-        let now = crate::state::now_ms();
-        let query = self.audit_query.trim().to_lowercase();
-        let filtered: Vec<FlatEvent> = all
-            .into_iter()
-            .filter(|event| {
-                if let Some(category) = self.audit_category {
-                    if !matches!(event.kind, FlatKind::Call(call) if call == category) {
-                        return false;
-                    }
-                }
-                match self.audit_result {
-                    1 if !event.ok => return false,
-                    2 if event.ok => return false,
-                    _ => {}
-                }
-                if self.audit_range == 1 {
-                    if let Some(at) = event.at {
-                        if at + 86_400_000 < now {
-                            return false;
-                        }
-                    }
-                }
-                if query.is_empty() {
-                    return true;
-                }
-                let label = event.kind.label(lang).to_lowercase();
-                label.contains(&query)
-                    || event.actor.to_lowercase().contains(&query)
-                    || event.target.to_lowercase().contains(&query)
-                    || event.tool.to_lowercase().contains(&query)
-                    || event
-                        .rule
-                        .as_deref()
-                        .is_some_and(|rule| rule.to_lowercase().contains(&query))
-            })
-            .collect();
+        // The admitted row indices are cached: the scan above runs on a change
+        // to the query, the category, the result or the 24-hour window, not on
+        // every repaint.
+        let filtered = self.audit_filtered(&all);
         let selected = self.audit_event.filter(|index| *index < filtered.len());
 
         // The table and its detail card share the pane, and an expanded right
@@ -775,101 +887,42 @@ impl Shell {
                 },
             ));
 
-        let mut table_rows = div().flex().flex_col();
-        for (index, event) in filtered.iter().enumerate() {
-            let active = selected == Some(index);
-            let ink = if event.denied {
-                theme::error()
-            } else if event.ok {
-                theme::success()
-            } else {
-                theme::warn()
-            };
-            let status = if event.denied {
-                lang.tr("audit.denied")
-            } else if event.ok {
-                lang.tr("audit.success")
-            } else {
-                lang.tr("audit.outcome.failed")
-            };
-            let time = event
-                .at
-                .map(|at| {
-                    format!(
-                        "{}:{:02}",
-                        crate::state::clock_at(at / 1000, lang),
-                        (at / 1000) % 60
-                    )
-                })
-                .unwrap_or_else(|| "\u{2014}".to_string());
-            table_rows = table_rows.child(
-                div()
-                    .id(SharedString::from(format!("audit-event-{index}")))
-                    .debug_selector(move || format!("audit-event-{index}"))
-                    .h(px(46.0))
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .border_b_1()
-                    .border_color(rgb(theme::border_soft()))
-                    .when(active, |row| row.bg(rgb(theme::soft(theme::accent()))))
-                    .when(!active, |row| row.hover(|s| s.bg(rgb(theme::hover()))))
-                    .cursor_pointer()
-                    .child(txt(time, 11.0, theme::faint()).w(px(86.0)).flex_none())
-                    .child(
-                        txt(event.kind.label(lang), 11.5, theme::text())
-                            .w(px(132.0))
-                            .flex_none()
-                            .truncate(),
-                    )
-                    .child(
-                        txt(event.actor.clone(), 11.5, theme::muted())
-                            .w(px(104.0))
-                            .flex_none()
-                            .truncate(),
-                    )
-                    .child(
-                        txt(
-                            if event.target.is_empty() {
-                                event.tool.clone()
-                            } else {
-                                event.target.clone()
-                            },
-                            11.5,
-                            theme::text(),
-                        )
-                        .flex_1()
-                        .min_w_0()
-                        .truncate(),
-                    )
-                    .child(
-                        div().w(px(76.0)).flex_none().flex().justify_end().child(
-                            div()
-                                .h(px(20.0))
-                                .px(px(8.0))
-                                .rounded(px(999.0))
-                                .bg(rgb(theme::soft(ink)))
-                                .flex()
-                                .items_center()
-                                .child(txt(status, 10.0, ink).whitespace_nowrap()),
-                        ),
-                    )
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.audit_event = Some(index);
-                        cx.notify();
-                    })),
-            );
-        }
+        // The table paints a band around the viewport; the rows outside it are
+        // two spacers of exactly their height, because a flat row is exactly
+        // FLAT_ROW_H. A five-hundred-call session used to build five hundred
+        // row elements (each with an id, a hover group and a click handler) on
+        // every repaint, whatever the pane could show.
+        let view_h = f32::from(self.audit_scroll.bounds().size.height);
+        let view_h = if view_h > 0.0 {
+            view_h
+        } else {
+            AUDIT_FIRST_VIEWPORT
+        };
+        let view_top = -f32::from(self.audit_scroll.offset().y);
+        let mut table_rows: Vec<AnyElement> = Vec::new();
         if filtered.is_empty() {
-            table_rows = table_rows.child(
+            table_rows.push(
                 div()
                     .h(px(120.0))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(txt(lang.tr("audit.empty"), 11.5, theme::muted())),
+                    .child(txt(lang.tr("audit.empty"), 11.5, theme::muted()))
+                    .into_any_element(),
             );
+        } else {
+            let (first, end, leading, trailing) =
+                audit_band_from(filtered.len(), Self::FLAT_ROW_H, 0.0, view_top, view_h);
+            if leading > 0.0 {
+                table_rows.push(audit_spacer(leading));
+            }
+            for (index, row) in filtered.iter().enumerate().take(end).skip(first) {
+                let event = &all[*row];
+                table_rows.push(self.audit_flat_row(index, event, lang, cx));
+            }
+            if trailing > 0.0 {
+                table_rows.push(audit_spacer(trailing));
+            }
         }
 
         let table = div()
@@ -941,7 +994,9 @@ impl Shell {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.audit_scroll)
-                    .child(table_rows),
+                    .flex()
+                    .flex_col()
+                    .children(table_rows),
             )
             .child(
                 div()
@@ -955,7 +1010,7 @@ impl Shell {
             );
 
         let inspector = if let Some(index) = selected {
-            let event = &filtered[index];
+            let event = &all[filtered[index]];
             let ink = if event.denied {
                 theme::error()
             } else if event.ok {
@@ -1291,10 +1346,7 @@ impl Shell {
                                     })),
                             ),
                     )
-                    .child(stats)
-                    .when_some(self.audit_review_strip(cx), |header, strip| {
-                        header.child(strip)
-                    }),
+                    .child(stats),
             )
             .child({
                 // Parked while the table keeps its measured columns, floated
@@ -1327,6 +1379,113 @@ impl Shell {
                     body
                 }
             })
+            .into_any_element()
+    }
+
+    /// One row of the flat event table.
+    ///
+    /// The height is exact by construction: the separator is drawn inside the
+    /// 46px box rather than as a bottom border, which would have grown the box a
+    /// pixel and put every spacer one pixel per row out of step.
+    fn audit_flat_row(
+        &self,
+        index: usize,
+        event: &FlatEvent,
+        lang: crate::i18n::Lang,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        #[cfg(test)]
+        AUDIT_FLAT_ROWS_BUILT.with(|built| built.set(built.get() + 1));
+        let active = self.audit_event == Some(index);
+        let ink = if event.denied {
+            theme::error()
+        } else if event.ok {
+            theme::success()
+        } else {
+            theme::warn()
+        };
+        let status = if event.denied {
+            lang.tr("audit.denied")
+        } else if event.ok {
+            lang.tr("audit.success")
+        } else {
+            lang.tr("audit.outcome.failed")
+        };
+        let time = event
+            .at
+            .map(|at| {
+                format!(
+                    "{}:{:02}",
+                    crate::state::clock_at(at / 1000, lang),
+                    (at / 1000) % 60
+                )
+            })
+            .unwrap_or_else(|| "\u{2014}".to_string());
+        div()
+            .id(SharedString::from(format!("audit-event-{index}")))
+            .debug_selector(move || format!("audit-event-{index}"))
+            .relative()
+            .h(px(Self::FLAT_ROW_H))
+            .flex_none()
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .when(active, |row| row.bg(rgb(theme::soft(theme::accent()))))
+            .when(!active, |row| row.hover(|s| s.bg(rgb(theme::hover()))))
+            .cursor_pointer()
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(1.0))
+                    .bg(rgb(theme::border_soft())),
+            )
+            .child(txt(time, 11.0, theme::faint()).w(px(86.0)).flex_none())
+            .child(
+                txt(event.kind.label(lang), 11.5, theme::text())
+                    .w(px(132.0))
+                    .flex_none()
+                    .truncate(),
+            )
+            .child(
+                txt(event.actor.clone(), 11.5, theme::muted())
+                    .w(px(104.0))
+                    .flex_none()
+                    .truncate(),
+            )
+            .child(
+                txt(
+                    if event.target.is_empty() {
+                        event.tool.clone()
+                    } else {
+                        event.target.clone()
+                    },
+                    11.5,
+                    theme::text(),
+                )
+                .flex_1()
+                .min_w_0()
+                .truncate(),
+            )
+            .child(
+                div().w(px(76.0)).flex_none().flex().justify_end().child(
+                    div()
+                        .h(px(20.0))
+                        .px(px(8.0))
+                        .rounded(px(999.0))
+                        .bg(rgb(theme::soft(ink)))
+                        .flex()
+                        .items_center()
+                        .child(txt(status, 10.0, ink).whitespace_nowrap()),
+                ),
+            )
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.audit_event = Some(index);
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -1521,102 +1680,6 @@ impl Shell {
                         this.export_audit(window, cx);
                     })),
             )
-    }
-
-    /// The latest review's decision history, as a strip inside Audit.
-    ///
-    /// The change review is a separate aggregate, so this strip is a join at
-    /// the surface: it reads the same ReviewSnapshot the Review tab reads and
-    /// opens that exact changeset when clicked.
-    fn audit_review_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let decisions = self.audit_decisions();
-        if decisions.is_empty() {
-            return None;
-        }
-        let lang = self.state.lang;
-        let count = tr_args(
-            lang,
-            "audit.review.count",
-            &[("count", decisions.len().to_string())],
-        );
-        let mut timeline = div()
-            .id("audit-review-timeline")
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .max_h(px(132.0))
-            .overflow_y_scroll();
-        for (index, event) in decisions.iter().rev().enumerate() {
-            let (label, color) = match event.decision {
-                Decision::Approve => (lang.tr("review.decision.approve"), theme::success()),
-                Decision::Reject => (lang.tr("review.decision.reject"), theme::error()),
-                Decision::RequestChanges => {
-                    (lang.tr("review.decision.requestChanges"), theme::warn())
-                }
-            };
-            let rationale = if event.rationale.trim().is_empty() {
-                lang.tr("audit.review.noReason")
-            } else {
-                event.rationale.chars().take(100).collect()
-            };
-            let when = crate::state::local_stamp(event.at_ms / 1_000);
-            let change_set = event.change_set.chars().take(8).collect::<String>();
-            let target = event.change_set.clone();
-            let row_id = format!("audit-decision-{index}");
-            timeline = timeline.child(
-                div()
-                    .id(SharedString::from(row_id.clone()))
-                    .debug_selector(move || row_id.clone())
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(4.0))
-                    .py(px(4.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .hover(|row| row.bg(rgb(theme::hover())))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.review_requested = Some(target.clone());
-                        this.review_selected = None;
-                        this.state.tab = Tab::Review;
-                        cx.notify();
-                    }))
-                    .child(txt(when, 10.0, theme::faint()).flex_none().w(px(104.0)))
-                    .child(txt(label, 10.5, color).flex_none().w(px(88.0)))
-                    .child(
-                        txt(format!("#{change_set}"), 10.0, theme::faint())
-                            .font_family(theme::CODE_FONT)
-                            .flex_none(),
-                    )
-                    .child(
-                        txt(rationale, 10.5, theme::muted())
-                            .min_w_0()
-                            .text_ellipsis(),
-                    ),
-            );
-        }
-        Some(
-            div()
-                .debug_selector(|| "audit-review-decisions".to_string())
-                .id("audit-review-decisions")
-                .flex()
-                .flex_col()
-                .gap(px(4.0))
-                .px(px(4.0))
-                .py(px(6.0))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(txt(lang.tr("audit.review.title"), 11.0, theme::faint()))
-                        .child(txt(count, 10.5, theme::faint())),
-                )
-                .child(timeline)
-                .into_any_element(),
-        )
     }
 
     /// The deterministic summary line: every figure is a count over the records.
@@ -2652,9 +2715,6 @@ impl Shell {
             .min_w_0()
             .child(self.audit_toolbar(cx))
             .child(self.audit_summary(&view))
-            .when_some(self.audit_review_strip(cx), |column, strip| {
-                column.child(strip)
-            })
             .child(self.audit_policy_strip(&view))
             .child(
                 div()
@@ -2906,9 +2966,25 @@ const AUDIT_CALLS_PER_TURN: usize = 50;
 /// Pure so the geometry the spacers stand in at can be pinned without a frame.
 /// `rows` is the number of turn rows, each exactly `row_h` tall.
 fn audit_band(rows: usize, row_h: f32, view_top: f32, view_h: f32) -> (usize, usize, f32, f32) {
+    audit_band_from(rows, row_h, AUDIT_LIST_PAD_Y, view_top, view_h)
+}
+
+/// The same band over a list that starts at `pad_y` instead of the turn list's
+/// own padding.
+///
+/// The flat table has no vertical padding of its own, so it asks for zero; the
+/// turn page keeps the measured 4. Leading and trailing heights are the spacers'
+/// own, and the padding lives on the scroller either way.
+fn audit_band_from(
+    rows: usize,
+    row_h: f32,
+    pad_y: f32,
+    view_top: f32,
+    view_h: f32,
+) -> (usize, usize, f32, f32) {
     let band_top = view_top - AUDIT_OVERDRAW;
     let band_bottom = view_top + view_h + AUDIT_OVERDRAW;
-    let mut top = AUDIT_LIST_PAD_Y;
+    let mut top = pad_y;
     let mut first: Option<usize> = None;
     let mut end = 0usize;
     for index in 0..rows {
@@ -2953,6 +3029,32 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn audit_rows_built() -> usize {
     AUDIT_ROWS_BUILT.with(|built| built.get())
+}
+
+// How many flat table rows the last frame actually built, for the performance
+// test: the table must window like the turn page, not paint the whole history.
+#[cfg(test)]
+thread_local! {
+    static AUDIT_FLAT_ROWS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The flat table rows built so far on this thread.
+#[cfg(test)]
+pub(crate) fn audit_flat_rows_built() -> usize {
+    AUDIT_FLAT_ROWS_BUILT.with(|built| built.get())
+}
+
+// How many times the flat table's filter scan ran on this thread, for the
+// performance test: a repaint and a scroll must reuse the admitted indices.
+#[cfg(test)]
+thread_local! {
+    static AUDIT_FILTER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the flat filter scan ran.
+#[cfg(test)]
+pub(crate) fn audit_filter_builds() -> usize {
+    AUDIT_FILTER_BUILDS.with(|builds| builds.get())
 }
 
 #[cfg(test)]
@@ -3177,6 +3279,128 @@ mod tests {
             crate::audit::audit_builds(),
             builds_before,
             "scrolling must not rebuild the view model"
+        );
+    }
+
+    /// The flat event table windows like the turn page: a long session builds
+    /// the viewport's rows and reuses the flat model, instead of cloning every
+    /// call and rebuilding one element per recorded event on every repaint.
+    #[gpui::test]
+    fn a_long_flat_table_paints_a_bounded_window(cx: &mut TestAppContext) {
+        /// 400 turns, each with one call: the table holds 800 events.
+        const EVENTS: usize = 800;
+
+        let (shell, cx) = boot(cx, "flat-small", 4);
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.audit_table = true;
+                this.audit_event = None;
+                cx.notify();
+            })
+        });
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let small_ms = median_frame(cx, 12);
+
+        let (shell, cx) = boot(cx, "flat-long", 400);
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.audit_table = true;
+                this.audit_event = None;
+                cx.notify();
+            })
+        });
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        // `audit_builds` counts the view-model build, and the flat rows are
+        // built in the same pass: a repaint that leaves it alone rebuilt neither.
+        let builds_before = crate::audit::audit_builds();
+        let rows_before = super::audit_flat_rows_built();
+        let long_ms = median_frame(cx, 12);
+        let built = (super::audit_flat_rows_built() - rows_before) as f64 / 12.0;
+        eprintln!("AUDIT FLAT small={small_ms:.2}ms long={long_ms:.2}ms built={built:.1}/frame");
+        assert!(
+            built < 80.0,
+            "an {EVENTS}-event table built {built:.0} rows a frame: the table is not windowed"
+        );
+        assert_eq!(
+            crate::audit::audit_builds(),
+            builds_before,
+            "a repaint that changes nothing must reuse the flat model"
+        );
+        assert!(
+            long_ms <= small_ms * 3.0 + 20.0,
+            "an {EVENTS}-event table painted {long_ms:.2}ms a frame against {small_ms:.2}ms for eight"
+        );
+
+        // The scroller's thumb still spans the whole table: the newest row is at
+        // the top and the oldest is 799 rows down at the exact FLAT_ROW_H stride.
+        let full = EVENTS as f32 * Shell::FLAT_ROW_H;
+        assert!(
+            cx.debug_bounds("audit-event-0").is_some(),
+            "the newest event is built at the top"
+        );
+        let oldest: &'static str =
+            Box::leak(format!("audit-event-{}", EVENTS - 1).into_boxed_str());
+        assert!(
+            cx.debug_bounds(oldest).is_none(),
+            "the oldest event is far below the viewport"
+        );
+        cx.update(|_, cx| {
+            shell.update(cx, |this, _| {
+                this.audit_scroll
+                    .set_offset(gpui_kit::point(gpui_kit::px(0.0), gpui_kit::px(-full)));
+            })
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert!(
+            cx.debug_bounds(oldest).is_some(),
+            "the oldest event is built at the tail"
+        );
+        assert!(
+            cx.debug_bounds("audit-event-0").is_none(),
+            "the top of the table is a spacer while the reader is at the tail"
+        );
+        assert_eq!(
+            crate::audit::audit_builds(),
+            builds_before,
+            "scrolling must not rebuild the flat model"
+        );
+
+        // An active search reuses its admitted rows: one query change rebuilds
+        // the scan once, and repainting or scrolling does not.
+        let filters_before = super::audit_filter_builds();
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.audit_query = "bash".to_string();
+                cx.notify();
+            })
+        });
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert_eq!(
+            super::audit_filter_builds(),
+            filters_before + 1,
+            "one query change rescanned the filter more than once"
+        );
+        cx.update(|_, cx| {
+            shell.update(cx, |this, _| {
+                this.audit_scroll
+                    .set_offset(gpui_kit::point(gpui_kit::px(0.0), gpui_kit::px(0.0)));
+            })
+        });
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert_eq!(
+            super::audit_filter_builds(),
+            filters_before + 1,
+            "a repaint or a scroll rescanned the filter"
         );
     }
 }

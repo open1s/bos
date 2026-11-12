@@ -49,8 +49,9 @@ strip.
 - **Full Diff** (`ui/diff_pane.rs`): the kit's own comparison surface. It is the
   one place for split/unified, syntax, line wrapping, conflict resolution and
   saving; Review hands it the snapshots as a patch instead of reimplementing it.
-- **Audit** (`ui/audit.rs`): the cross-changeset decision timeline, one row per
-  decision.
+- **Audit** (`ui/audit.rs`): the deterministic turn/call/refusal timeline and
+  the policy denials. Review decisions are NOT drawn here - they belong to the
+  Review tab's own surface, and a duplicated decision strip only cost height.
 
 ## 2. Feature matrix
 
@@ -72,7 +73,7 @@ strip.
 | Verification producer | Missing | section renders "No verification recorded"; no command/test evidence is captured yet |
 | Decision rationale input | Missing | model/audit carries `rationale`; Review buttons submit an empty one |
 | Digest-bound approve / request changes | Done | `ReviewStore::decide`; stale digest refuses |
-| Cross-changeset decision timeline | Done | `audit.jsonl` + `decisions_for_session` |
+| Cross-changeset decision timeline | Removed | decisions live in the Review tab (`Review.decisions`); `audit.jsonl` stays the durable log with no page reader |
 | Open selected change in full Diff | Done | unified patch -> `open_diff_text`; split/unified, syntax, wrapping |
 | Diff pane: patch, conflict, unchanged | Done | `diff_pane.rs` loader + kit `DiffState` |
 | Diff pane: save resolved merge | Done | `DiffSource::Merge` + resolved-text path |

@@ -31,7 +31,7 @@
 | P1 digest-bound Approve / Request changes | 已实现 | ReviewStore::decide |
 | P1 Task attempt -> change set | 已实现 | Attempt.change_set_id |
 | P1 Task / Audit -> Review 链接 | 已实现（Task 精确到 attempt；Audit 打开当前会话最新 Review） | right_panel.rs / audit.rs |
-| P1 Audit 显示 review decisions | 已实现 | audit.rs 的跨 changeset decision timeline |
+| P1 Audit 显示 review decisions | 已移除 | 决定由 Review tab 承载；Audit 的决策 strip 占高度过多，已删 |
 | P2 验证证据生产（测试/命令 -> Verification） | 未实现 | 目前只有验证区与空状态，没有写入者 |
 | P2 decision rationale 输入 | 未实现 | 模型/审计已有 rationale；Review 按钮仍写空字符串 |
 | P2 shell observed capture | 未实现 | 仍为 Unattributed |
@@ -40,7 +40,7 @@
 | P2 extension host review service | 未实现 | 后续 |
 | P2 tamper-evident audit chain | 未实现 | 后续 |
 
-验证：review 模块 13 个单测（含 created patch header、method parent）、write_file 精确捕获集成测试、state 生命周期与任务链接测试、Review tab 点击/渲染测试、Review -> full Diff 测试、跨 changeset Audit decision timeline 测试均通过；详见下面的验收标准。
+验证：review 模块 13 个单测（含 created patch header、method parent）、write_file 精确捕获集成测试、state 生命周期与任务链接测试、Review tab 点击/渲染测试、Review -> full Diff 测试均通过；详见下面的验收标准。
 
 Diff/Review 架构与 feature matrix 的逐项审计见 [bsh-diff-architecture-audit.md](bsh-diff-architecture-audit.md)。
 

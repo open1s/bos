@@ -728,8 +728,18 @@ pub(crate) struct Shell {
     pub(crate) review_requested: Option<String>,
     /// The change whose prepared diff is selected, if any.
     pub(crate) review_selected: Option<String>,
+    /// The Review tab's change list, so its window can follow the reader.
+    ///
+    /// The list is windowed by exact row heights: a changeset that touched
+    /// hundreds of files used to build a row element for every one of them on
+    /// every repaint, although the column can show a dozen.
+    pub(crate) review_scroll: ScrollHandle,
     /// The selected change's prepared diff, built on click rather than per frame.
-    pub(crate) review_diff: std::cell::RefCell<Option<(String, crate::review::domain::FileDiff)>>,
+    ///
+    /// Shared behind an `Rc`: a diff can hold 1 200 code lines, so handing it to
+    /// the frame by value copied the whole hunk list on every repaint.
+    pub(crate) review_diff:
+        std::cell::RefCell<Option<(String, std::rc::Rc<crate::review::domain::FileDiff>)>>,
     /// The sidebar tree's scroll position, so the wheel, the keys and a test can
     /// all address the same offset.
     pub(crate) side_scroll: ScrollHandle,
@@ -2244,6 +2254,7 @@ impl Shell {
             review_cache: std::cell::RefCell::new(super::review::ReviewCache::default()),
             review_requested: None,
             review_selected: None,
+            review_scroll: ScrollHandle::new(),
             review_diff: std::cell::RefCell::new(None),
             side_scroll: ScrollHandle::new(),
             side_focus: cx.focus_handle(),
@@ -5823,14 +5834,42 @@ impl Shell {
     /// The newest mark is the way back to the live end: it re-engages the tail, so
     /// the chat follows again from anywhere. Every other mark leaves the tail,
     /// because a jump up the transcript must not be undone by the next frame.
-    pub(crate) fn jump_to_turn(&mut self, child: usize, newest: bool) {
+    pub(crate) fn jump_to_turn(&mut self, row: usize, newest: bool) {
         if newest {
             self.following_tail = true;
             self.transcript_scroll.scroll_to_bottom();
         } else {
-            self.following_tail = false;
-            self.transcript_scroll.scroll_to_top_of_item(child);
+            self.scroll_transcript_to_row(row);
         }
+    }
+
+    /// Put one transcript row at the top of the viewport.
+    ///
+    /// The jump is arithmetic, not a child index: culled rows share one spacer
+    /// per run, so the scroller's children no longer name rows. The row tops
+    /// come from the same cached heights the plan placed the rows with, so the
+    /// two always agree.
+    pub(crate) fn scroll_transcript_to_row(&mut self, row: usize) {
+        let Some(session) = self.state.active_session() else {
+            return;
+        };
+        let rows = 1 + session.messages.len();
+        let top = self.transcript_layout.borrow().row_top(rows, row);
+        self.following_tail = false;
+        // The jump request lands at PREPAINT, after this frame's tail decision.
+        // With `tail_max` cleared, the growth check cannot mistake the still-at-the-end
+        // offset for a reader who is following and pin the transcript back down.
+        self.tail_max = None;
+        // The wheel handler reads the scroller's own move and takes it back to
+        // `chat_last_offset` before easing, so a PROGRAMMATIC move must record
+        // itself as the last offset (and aim the easing at it). Without this the
+        // next scroll event undid every jump on the frame it painted.
+        let max = f32::from(self.transcript_scroll.max_offset().y);
+        let target = (-top).clamp(-max, 0.0);
+        self.transcript_scroll
+            .set_offset(point(px(0.0), px(target)));
+        self.chat_last_offset = target;
+        self.chat_smooth.aim(target);
     }
 
     /// Page in the window of messages above the transcript when the reader
@@ -5843,7 +5882,7 @@ impl Shell {
     /// later frame, so the message they were looking at stays where it was.
     pub(crate) fn page_older_at_the_top(&mut self, cx: &mut Context<Self>) -> bool {
         if let Some(anchor) = self.older_anchor.take() {
-            self.transcript_scroll.scroll_to_top_of_item(anchor);
+            self.scroll_transcript_to_row(anchor);
             cx.notify();
             return false;
         }
@@ -7021,12 +7060,33 @@ impl Shell {
         }
         self.rail_active = active;
         if self.rail_hover.is_none() {
-            // The handle counts the scroller's children, i.e. marks.
             if let Some(index) = active.and_then(|turn| turns.iter().position(|item| *item == turn))
             {
-                self.rail_scroll.scroll_to_item(index);
+                self.rail_scroll_to(index);
             }
         }
+    }
+
+    /// Keep one rail mark inside the frame, centred when it is out of view.
+    ///
+    /// The marks sit on a uniform pitch and the frame only builds the marks it
+    /// can show, so the target is arithmetic; there is no child index to scroll
+    /// to any more.
+    fn rail_scroll_to(&self, ordinal: usize) {
+        let pitch = crate::theme::TURN_PITCH;
+        let inset = crate::theme::TURN_RAIL_INSET;
+        let view = f32::from(self.rail_scroll.bounds().size.height);
+        if view <= 0.0 {
+            return;
+        }
+        let top = inset + pitch * ordinal as f32;
+        let offset = -f32::from(self.rail_scroll.offset().y);
+        if top >= offset && top + pitch <= offset + view {
+            return;
+        }
+        let content = inset * 2.0 + pitch * self.turn_indices().len() as f32;
+        let target = (top - (view - pitch) / 2.0).clamp(0.0, (content - view).max(0.0));
+        self.rail_scroll.set_offset(point(px(0.0), px(-target)));
     }
 }
 
@@ -7359,9 +7419,9 @@ impl Render for Shell {
         // unmounted element; asking on this frame gives prepaint real bounds.
         if self.state.tab == crate::state::Tab::Chat {
             match self.audit_jump_to {
-                Some((child, 0)) => {
+                Some((row, 0)) => {
                     self.audit_jump_to = None;
-                    self.transcript_scroll.scroll_to_top_of_item(child);
+                    self.scroll_transcript_to_row(row);
                 }
                 Some((child, wait)) => self.audit_jump_to = Some((child, wait - 1)),
                 None => {}
@@ -7370,6 +7430,7 @@ impl Render for Shell {
         let scroll = &self.transcript_scroll;
         let offset = scroll.offset().y;
         let max = scroll.max_offset().y;
+
         let was_at_end = self
             .tail_max
             .is_none_or(|previous| previous + offset <= px(TAIL_EPSILON));

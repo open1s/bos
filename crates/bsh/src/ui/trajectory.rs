@@ -19,7 +19,9 @@ use super::todo_panel::spinner;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::text::TextView;
 
-use super::lane::{block_box, equal_lane, fixed_box, time_lane, LaneRecord, TimeAxis};
+use super::lane::{
+    block_box, decimate, equal_lane, fixed_box, lane_hit, time_lane, LaneRecord, TimeAxis,
+};
 use super::{icon, txt, DivExt, IconName};
 use crate::i18n::Lang;
 use crate::model::{ChatMessage, MessageTiming, Session};
@@ -595,6 +597,55 @@ impl EventsKey {
 pub(crate) struct EventsCache {
     key: Option<EventsKey>,
     events: std::rc::Rc<Vec<Event>>,
+    /// The rows the view draws from `events`.
+    plan: PlanCache,
+}
+
+/// The facts that decide which rows a log draws: the log itself, the search, the
+/// two fold switches and the language its fold labels are written in.
+///
+/// The log is compared by POINTER, not by value: it is an `Rc` the cache above
+/// rebuilds only when the session moved, so identity is exactly "same log" while
+/// a value comparison would walk every event.
+struct PlanKey {
+    log: std::rc::Rc<Vec<Event>>,
+    query: String,
+    turns: bool,
+    calls: bool,
+    lang: Lang,
+}
+
+impl PlanKey {
+    fn same(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.log, &other.log)
+            && self.query == other.query
+            && self.turns == other.turns
+            && self.calls == other.calls
+            && self.lang == other.lang
+    }
+}
+
+/// The visible rows, the turn boundaries and the fold plan, kept between frames.
+///
+/// The three passes walk the whole log, and none of them depends on the scroll
+/// position: keyed on the log and the view's own switches, a repaint reuses them
+/// instead of re-filtering and re-folding the history on every frame.
+#[derive(Default)]
+struct PlanCache {
+    key: Option<PlanKey>,
+    rows: std::rc::Rc<Vec<TrajRow>>,
+}
+
+/// One row of the log view: event index, whether it opens its turn, and the
+/// collapsed summary when the row stands in for a folded turn.
+type TrajRow = (usize, bool, Option<String>);
+
+/// What one frame of the trajectory view draws, shared rather than copied.
+pub(crate) struct TrajFrame {
+    /// The flattened log.
+    pub(crate) events: std::rc::Rc<Vec<Event>>,
+    /// The rows the search and the fold switches draw.
+    pub(crate) rows: std::rc::Rc<Vec<TrajRow>>,
 }
 
 impl EventsCache {
@@ -615,6 +666,46 @@ impl EventsCache {
             self.events = std::rc::Rc::new(events);
         }
         self.events.clone()
+    }
+
+    /// The log, its visible rows and its fold plan for this frame.
+    fn frame(&mut self, shell: &Shell) -> TrajFrame {
+        let events = self.get(shell);
+        let key = PlanKey {
+            log: events.clone(),
+            query: shell.traj_query.clone(),
+            turns: shell.traj_turns_collapsed,
+            calls: shell.traj_calls_collapsed,
+            lang: shell.state.lang,
+        };
+        let stale = self
+            .plan
+            .key
+            .as_ref()
+            .is_none_or(|current| !current.same(&key));
+        if stale {
+            #[cfg(test)]
+            TRAJ_PLAN_BUILDS.with(|builds| builds.set(builds.get() + 1));
+            // The search needle is lowered ONCE per query, not once per event:
+            // the filter used to allocate four lowercase strings for every row
+            // of the log on every frame.
+            let needle = key.query.trim().to_lowercase();
+            let visible_refs: Vec<(usize, &Event)> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| matches_lowered(event, &needle))
+                .collect();
+            let opens = Shell::traj_opens(&visible_refs);
+            let rows = shell.traj_plan(&visible_refs, &opens);
+            self.plan = PlanCache {
+                key: Some(key),
+                rows: std::rc::Rc::new(rows),
+            };
+        }
+        TrajFrame {
+            events,
+            rows: self.plan.rows.clone(),
+        }
     }
 }
 
@@ -877,15 +968,18 @@ pub(crate) fn tool_event(shell: &Shell, message: usize, tool: usize) -> Option<u
         .position(|event| event.message == message && event.tool == tool)
 }
 
-/// Does an event answer the search field?
-pub(crate) fn matches(event: &Event, query: &str) -> bool {
-    if query.trim().is_empty() {
+/// Does an event answer the search field, against a needle the caller lowered
+/// once?
+///
+/// The filter runs over the whole log whenever the query or the log changes, so
+/// lowering the query per event allocated a string for every row for no reason.
+fn matches_lowered(event: &Event, needle: &str) -> bool {
+    if needle.is_empty() {
         return true;
     }
-    let needle = query.to_lowercase();
-    event.title.to_lowercase().contains(&needle)
-        || event.outcome.to_lowercase().contains(&needle)
-        || event.source.to_lowercase().contains(&needle)
+    event.title.to_lowercase().contains(needle)
+        || event.outcome.to_lowercase().contains(needle)
+        || event.source.to_lowercase().contains(needle)
 }
 
 /// The scroller's vertical padding: the window's arithmetic and the list's own
@@ -915,17 +1009,22 @@ fn traj_row_height(summary: bool) -> f32 {
 /// The window's band, and the exact height of the rows on either side.
 ///
 /// Pure so the geometry the two spacers stand in at can be pinned without a
-/// frame: `heights` is one row height per row, and the result is
-/// `(first, end, leading, trailing)` - the rows `[first, end)` are built, and
-/// `leading`/`trailing` are the summed heights of the rows before and after
-/// them, which is exactly what the spacers must occupy.
-fn traj_band(heights: &[f32], view_top: f32, view_h: f32) -> (usize, usize, f32, f32) {
+/// frame: the result is `(first, end, leading, trailing)` - the rows
+/// `[first, end)` are built, and `leading`/`trailing` are the summed heights
+/// of the rows before and after them, which is exactly what the spacers must
+/// occupy.
+///
+/// The same arithmetic as [traj_band], without the per-row height table: the
+/// frame used to allocate one f32 per row of the log just to sum two spacers,
+/// which a long session paid on every repaint.
+fn traj_band_of(plan: &[TrajRow], view_top: f32, view_h: f32) -> (usize, usize, f32, f32) {
     let band_top = view_top - TRAJ_OVERDRAW;
     let band_bottom = view_top + view_h + TRAJ_OVERDRAW;
     let mut top = TRAJ_LIST_PAD_Y;
     let mut first: Option<usize> = None;
     let mut end = 0usize;
-    for (position, height) in heights.iter().enumerate() {
+    for (position, row) in plan.iter().enumerate() {
+        let height = traj_row_height(row.2.is_some());
         if first.is_none() && top + height > band_top {
             first = Some(position);
         }
@@ -934,14 +1033,17 @@ fn traj_band(heights: &[f32], view_top: f32, view_h: f32) -> (usize, usize, f32,
         }
         top += height;
     }
-    let first = first.unwrap_or(heights.len());
-    // A view past the end of the log (a search just shrunk it while the reader
-    // was scrolled down) has no row in its band: hand every row to the leading
-    // spacer so the frame paints the list's full height instead of an empty
-    // slice, and the layout pass clamps the offset.
+    let first = first.unwrap_or(plan.len());
+    // A view past the end of the log keeps the list's height with one spacer.
     let end = end.max(first);
-    let leading: f32 = heights[..first].iter().sum();
-    let trailing: f32 = heights[end..].iter().sum();
+    let leading: f32 = plan[..first]
+        .iter()
+        .map(|row| traj_row_height(row.2.is_some()))
+        .sum();
+    let trailing: f32 = plan[end..]
+        .iter()
+        .map(|row| traj_row_height(row.2.is_some()))
+        .sum();
     (first, end, leading, trailing)
 }
 
@@ -980,6 +1082,32 @@ pub(crate) fn traj_flattens() -> usize {
     TRAJ_FLATTENS.with(|flat| flat.get())
 }
 
+// How many times the search filter and the fold plan were rebuilt, for the
+// performance test: a repaint that changes nothing must reuse both.
+#[cfg(test)]
+thread_local! {
+    static TRAJ_PLAN_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the visible rows and the fold plan were rebuilt.
+#[cfg(test)]
+pub(crate) fn traj_plan_builds() -> usize {
+    TRAJ_PLAN_BUILDS.with(|builds| builds.get())
+}
+
+// How many strip blocks the last frame built, for the performance test: the
+// three lanes must not cost one element per event of a long log.
+#[cfg(test)]
+thread_local! {
+    static TRAJ_CELLS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many timeline cells have been built on this thread.
+#[cfg(test)]
+pub(crate) fn traj_cells_built() -> usize {
+    TRAJ_CELLS_BUILT.with(|cells| cells.get())
+}
+
 impl Shell {
     /// The trajectory log this frame draws, shared rather than copied.
     ///
@@ -987,6 +1115,12 @@ impl Shell {
     /// change in its shape (see [`EventsKey`]) rebuilds it.
     pub(crate) fn traj_log(&self) -> std::rc::Rc<Vec<Event>> {
         self.traj_events.borrow_mut().get(self)
+    }
+
+    /// The log and the rows this frame draws, filtered and folded once per
+    /// change instead of once per repaint.
+    pub(crate) fn traj_frame(&self) -> TrajFrame {
+        self.traj_events.borrow_mut().frame(self)
     }
 
     /// Open a chat row's file in the right panel's editor.
@@ -2056,6 +2190,16 @@ impl Shell {
             })
             .collect();
         let axis = TimeAxis::across(&records.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        // The axis is built from the WHOLE log (merging preserves each bucket's
+        // span), but the strip draws a bounded number of blocks: past the cap a
+        // lane is density, so its element count stops following the history.
+        // The click resolves against EVERY record, not the drawn buckets, so a
+        // merged block still lands on the record under the pointer. Sharing the
+        // whole lane behind an Rc is what keeps that resolution off the paint
+        // path: the blocks are projected only when a press happens.
+        let all = std::rc::Rc::new(records);
+        let dense: Vec<std::borrow::Cow<'_, [LaneRecord]>> =
+            all.iter().map(|lane| decimate(lane)).collect();
         let projection = self.traj_projection();
         // EVERY timed projection is placed on the shared clock, including the
         // equal-width ones. A block's LEFT EDGE always comes from when its
@@ -2123,11 +2267,16 @@ impl Shell {
                     .into_iter()
                     .enumerate()
                     .map(|(lane_index, (key, kind, lane_id))| {
-                        let lane = &records[lane_index];
+                        let lane: &[LaneRecord] = &dense[lane_index];
                         // The last prepaint's track width, shared by all three
                         // lanes. Each track sets it; they are the same width
                         // because they are the same row minus the same label.
                         let lane_width = self.traj_lane_w.clone();
+                        // The track's own box, recorded by the sentinel: a
+                        // press is resolved to a record by its x inside it.
+                        let track_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>> =
+                            std::rc::Rc::new(std::cell::Cell::new(None));
+                        let bounds_for_prepaint = std::rc::Rc::clone(&track_bounds);
                         let track = div()
                             .debug_selector(move || format!("traj-lane-{lane_id}"))
                             .flex_1()
@@ -2155,8 +2304,62 @@ impl Shell {
                             .on_children_prepainted(move |children, _window, _cx| {
                                 if let Some(bounds) = children.first() {
                                     lane_width.set(Some(f32::from(bounds.size.width)));
+                                    bounds_for_prepaint.set(Some(*bounds));
                                 }
                             });
+                        // A press anywhere on the lane lands on the record under
+                        // the pointer: the buckets are only the paint, the FULL
+                        // lane is what resolves the click, so a merged block
+                        // still reaches every one of its records.
+                        let track = track
+                            .id(SharedString::from(format!("traj-lane-track-{lane_id}")))
+                            .cursor_pointer()
+                            .on_click(cx.listener({
+                                let all = std::rc::Rc::clone(&all);
+                                let bounds = track_bounds;
+                                move |this, event: &gpui::ClickEvent, _window, cx| {
+                                    let gpui::ClickEvent::Mouse(mouse) = event else {
+                                        return;
+                                    };
+                                    let Some(track) = bounds.get() else {
+                                        return;
+                                    };
+                                    let width = f32::from(track.size.width);
+                                    if width <= 0.0 {
+                                        return;
+                                    }
+                                    let position = mouse.up.position;
+                                    let fraction = ((f32::from(position.x)
+                                        - f32::from(track.origin.x))
+                                        / width)
+                                        .clamp(0.0, 1.0);
+                                    let lane = &all[lane_index];
+                                    // The projection is rebuilt HERE, not per
+                                    // frame: it is arithmetic, but the log can be
+                                    // long and a click is rare.
+                                    let blocks = if real_time {
+                                        match axis {
+                                            Some(axis) => time_lane(lane, axis),
+                                            None => equal_lane(lane),
+                                        }
+                                    } else {
+                                        equal_lane(lane)
+                                    };
+                                    let floor = MIN_BLOCK_W / width;
+                                    let Some(index) = lane_hit(&blocks, fraction, floor) else {
+                                        return;
+                                    };
+                                    // The block IS the record: pressing it selects
+                                    // that row and opens its detail panel, which is
+                                    // the reference's own `onRecordSelect`.
+                                    this.traj_select = Some(index);
+                                    this.traj_tab = 0;
+                                    if let Some(offset) = this.traj_offset_of_event(index, false) {
+                                        this.traj_scroll.set_offset(point(px(0.0), px(-offset)));
+                                    }
+                                    cx.notify();
+                                }
+                            }));
                         let track = if real_time {
                             // One common axis, absolute fractions: x is the event's
                             // instant and width its duration, so a pause stays empty
@@ -2187,7 +2390,6 @@ impl Shell {
                                     block.index,
                                     self.traj_select == Some(block.index),
                                     width,
-                                    cx,
                                 )
                             }))
                         } else {
@@ -2235,7 +2437,6 @@ impl Shell {
                                             } else {
                                                 BlockWidth::Share(span.width / domain)
                                             },
-                                            cx,
                                         ));
                                         cursor = cursor.max(span.start + span.width);
                                     }
@@ -2299,8 +2500,9 @@ impl Shell {
         index: usize,
         selected: bool,
         width: BlockWidth,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
+        #[cfg(test)]
+        TRAJ_CELLS_BUILT.with(|cells| cells.set(cells.get() + 1));
         let ink = kind.ink();
         let ring = theme::accent();
         // A fixed width is a real pixel box; a share is a flex weight. Keeping
@@ -2358,20 +2560,9 @@ impl Shell {
                     .w(px(EQUAL_BLOCK_W)),
             },
         };
+        // The block is painted only; the LANE resolves presses against every
+        // record, so a merged bucket is not the only reachable row.
         cell.debug_selector(move || format!("traj-cell-hit-{}", index))
-            .id(SharedString::from(format!("traj-cell-{}", index)))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                // The block IS the record: pressing it selects that row and
-                // opens its detail panel, which is the reference's own
-                // `onRecordSelect`.
-                this.traj_select = Some(index);
-                this.traj_tab = 0;
-                if let Some(offset) = this.traj_offset_of_event(index, false) {
-                    this.traj_scroll.set_offset(point(px(0.0), px(-offset)));
-                }
-                cx.notify();
-            }))
             .into_any_element()
     }
 
@@ -2884,11 +3075,7 @@ impl Shell {
     /// A row is `(event index, opens the turn, collapsed summary)`. The summary
     /// form is one of the fold actions' synthetic row, the only row that is not
     /// an event of its own.
-    fn traj_plan(
-        &self,
-        visible: &[(usize, &Event)],
-        opens: &[bool],
-    ) -> Vec<(usize, bool, Option<String>)> {
+    fn traj_plan(&self, visible: &[(usize, &Event)], opens: &[bool]) -> Vec<TrajRow> {
         if self.traj_turns_collapsed {
             collapse_turns(visible, opens, self.state.lang)
         } else if self.traj_calls_collapsed {
@@ -2918,7 +3105,7 @@ impl Shell {
     /// indices still name rows.
     fn traj_window(
         &self,
-        plan: &[(usize, bool, Option<String>)],
+        plan: &[TrajRow],
         events: &[Event],
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
@@ -2932,12 +3119,10 @@ impl Shell {
             TRAJ_FIRST_VIEWPORT
         };
         let view_top = -f32::from(self.traj_scroll.offset().y);
-        // The band, and the exact height of the rows on either side of it.
-        let heights: Vec<f32> = plan
-            .iter()
-            .map(|(_, _, summary)| traj_row_height(summary.is_some()))
-            .collect();
-        let (first, end, leading, trailing) = traj_band(&heights, view_top, view_h);
+        // The band, and the exact height of the rows on either side of it. The
+        // rows' heights are derived as the band walks them, so a frame allocates
+        // no per-row height table just to sum it.
+        let (first, end, leading, trailing) = traj_band_of(plan, view_top, view_h);
         let mut rows: Vec<AnyElement> = Vec::with_capacity(2 + end.saturating_sub(first));
         if leading > 0.0 {
             rows.push(traj_spacer(leading));
@@ -2966,17 +3151,10 @@ impl Shell {
     /// block or a collapsed summary row scrolls by this exact offset rather than
     /// to a child index that no longer names the row.
     pub(crate) fn traj_offset_of_event(&self, event: usize, summary: bool) -> Option<f32> {
-        let events = self.traj_log();
-        let query = self.traj_query.clone();
-        let visible: Vec<(usize, &Event)> = events
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| matches(item, &query))
-            .collect();
-        let opens = Self::traj_opens(&visible);
+        let frame = self.traj_frame();
         let mut top = TRAJ_LIST_PAD_Y;
-        for (index, _, folded) in self.traj_plan(&visible, &opens) {
-            if index == event && folded.is_some() == summary {
+        for (index, _, folded) in frame.rows.iter() {
+            if *index == event && folded.is_some() == summary {
                 return Some(top);
             }
             top += traj_row_height(folded.is_some());
@@ -2989,26 +3167,16 @@ impl Shell {
         if self.traj_runs {
             return self.render_trajectory_runs(cx);
         }
-        let events = self.traj_log();
-        let query = self.traj_query.clone();
-        let visible: Vec<(usize, &Event)> = events
-            .iter()
-            .enumerate()
-            .filter(|(_, event)| matches(event, &query))
-            .collect();
+        // The log, its visible rows and its fold plan are cached together: the
+        // frame pays for what the viewport shows, not for re-filtering and
+        // re-folding the whole history on every repaint.
+        let frame = self.traj_frame();
+        let events = &frame.events;
         let detail = self
             .traj_select
             .and_then(|index| events.get(index))
             .map(|event| self.traj_detail(event, cx));
-        // Which lines open a turn: the first one whose turn differs from the
-        // line above, computed before the rows so no closure has to carry it.
-        let opens = Self::traj_opens(&visible);
-        // The collapse actions fold ROWS, not the strip: the picture of the run
-        // never lies about what happened, which is the reference's own rule.
-        // `Calls` folds a turn to its prompt plus one summary row; `Turns`
-        // removes the steps inside a turn without adding a summary line.
-        let plan = self.traj_plan(&visible, &opens);
-        let rows = self.traj_window(&plan, &events, cx);
+        let rows = self.traj_window(&frame.rows, events, cx);
         div()
             .debug_selector(|| "trajectory".to_string())
             .id("trajectory")
@@ -3566,22 +3734,22 @@ mod tests {
     /// thumb) is the one the whole log would have.
     #[test]
     fn the_window_band_and_spacers_reproduce_the_whole_log() {
-        let heights = vec![super::TRAJ_ROW_H; 100];
+        let plan: Vec<super::TrajRow> = (0..100).map(|index| (index, false, None)).collect();
         for (view_top, view_h, first, end) in [
             (0.0f32, 300.0f32, 0usize, 26usize),
             (1500.0, 300.0, 33, 76),
             (2700.0, 300.0, 73, 100),
         ] {
             let (got_first, got_end, leading, trailing) =
-                super::traj_band(&heights, view_top, view_h);
+                super::traj_band_of(&plan, view_top, view_h);
             assert_eq!(
                 (got_first, got_end),
                 (first, end),
                 "the band for a view at {view_top}"
             );
-            assert_eq!(leading, heights[..got_first].iter().sum::<f32>());
-            assert_eq!(trailing, heights[got_end..].iter().sum::<f32>());
-            let built: f32 = heights[got_first..got_end].iter().sum();
+            assert_eq!(leading, got_first as f32 * super::TRAJ_ROW_H);
+            assert_eq!(trailing, (100 - got_end) as f32 * super::TRAJ_ROW_H);
+            let built = (got_end - got_first) as f32 * super::TRAJ_ROW_H;
             assert_eq!(
                 leading + built + trailing,
                 3000.0,
@@ -3596,23 +3764,29 @@ mod tests {
     fn the_window_counts_a_summary_row_at_its_own_height() {
         assert_eq!(super::traj_row_height(false), 30.0);
         assert_eq!(super::traj_row_height(true), 20.0);
-        let heights = vec![30.0, 20.0, 30.0, 20.0];
+        let plan: Vec<super::TrajRow> = vec![
+            (0, false, None),
+            (1, false, Some("summary".to_string())),
+            (2, false, None),
+            (3, false, Some("summary".to_string())),
+        ];
         assert_eq!(
-            super::traj_band(&heights, 0.0, 10_000.0),
+            super::traj_band_of(&plan, 0.0, 10_000.0),
             (0, 4, 0.0, 0.0),
             "a view taller than the log keeps every row"
         );
         // An empty log has no band and no spacers.
-        assert_eq!(super::traj_band(&[], 0.0, 300.0), (0, 0, 0.0, 0.0));
+        assert_eq!(super::traj_band_of(&[], 0.0, 300.0), (0, 0, 0.0, 0.0));
         // A view past the end (a search just shrank the log under a scrolled
         // reader) has no row in its band: one leading spacer holds the height.
+        let ten: Vec<super::TrajRow> = (0..10).map(|index| (index, false, None)).collect();
         assert_eq!(
-            super::traj_band(&[30.0; 10], 10_000.0, 300.0),
+            super::traj_band_of(&ten, 10_000.0, 300.0),
             (10, 10, 300.0, 0.0)
         );
         // A view above the log builds nothing and leaves one trailing spacer.
         assert_eq!(
-            super::traj_band(&[30.0; 10], -10_000.0, 300.0),
+            super::traj_band_of(&ten, -10_000.0, 300.0),
             (0, 0, 0.0, 300.0)
         );
     }
@@ -3789,6 +3963,94 @@ mod tests {
         assert!(
             cx.debug_bounds("traj-row-0").is_none(),
             "the top of the log is a spacer while the reader is at the tail"
+        );
+    }
+
+    /// The strip's block count is bounded: a lane denser than the strip can
+    /// resolve draws one block per bucket, not one element per event.
+    ///
+    /// The lanes are painted outside the list's window, so before the cap a
+    /// 3 600-event log built 3 600 absolutely-positioned cells on every frame
+    /// and its cost followed the history rather than the window.
+    #[gpui::test]
+    fn a_dense_strip_draws_a_bounded_number_of_blocks(cx: &mut TestAppContext) {
+        // 1 200 turns: 1 200 input rows, 1 200 model rows and 1 200 calls.
+        let (_, cx) = boot(cx, "strip-small", 4);
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let small_ms = median_frame(cx, 8);
+
+        let (_, cx) = boot(cx, "strip-long", 1_200);
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let before = super::traj_cells_built();
+        let long_ms = median_frame(cx, 8);
+        let per_frame = (super::traj_cells_built() - before) as f64 / 8.0;
+        let cap = (3 * crate::ui::lane::MAX_LANE_BLOCKS) as f64;
+        eprintln!(
+            "TRAJ STRIP small={small_ms:.2}ms long={long_ms:.2}ms cells={per_frame:.1}/frame cap={cap}"
+        );
+        assert!(
+            per_frame <= cap,
+            "a 3 600-event strip built {per_frame:.0} blocks a frame; the lanes are not bounded by {cap}"
+        );
+        assert!(
+            long_ms <= small_ms * 4.0 + 30.0,
+            "a 3 600-event strip painted {long_ms:.2}ms a frame against {small_ms:.2}ms for twelve"
+        );
+    }
+
+    /// A repaint reuses the filtered, folded plan; only a real change rebuilds
+    /// it. The walk was once per frame, and a long log paid it for every
+    /// painted frame although nothing had changed.
+    #[gpui::test]
+    fn a_repaint_reuses_the_folded_plan(cx: &mut TestAppContext) {
+        let (shell, cx) = boot(cx, "plan-cache", 300);
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let before = super::traj_plan_builds();
+        for _ in 0..12 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert_eq!(
+            super::traj_plan_builds(),
+            before,
+            "a repaint that changes nothing re-filtered or re-folded the log"
+        );
+
+        // A search is a real change: it rebuilds once, not once per frame.
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.traj_query = "cargo".to_string();
+                cx.notify();
+            })
+        });
+        for _ in 0..6 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert_eq!(
+            super::traj_plan_builds(),
+            before + 1,
+            "one query change rebuilt the plan more than once"
+        );
+
+        // Folding the calls is another real change, and only one rebuild.
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.traj_calls_collapsed = true;
+                cx.notify();
+            })
+        });
+        for _ in 0..6 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert_eq!(
+            super::traj_plan_builds(),
+            before + 2,
+            "one fold change rebuilt the plan more than once"
         );
     }
 

@@ -720,30 +720,6 @@ pub(crate) struct ReviewDecision {
     pub(crate) at_ms: u64,
 }
 
-/// One durable review decision, as audit.jsonl carries it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct DecisionEvent {
-    /// The session the changeset belongs to; empty on older events.
-    #[serde(default)]
-    pub(crate) session: String,
-    /// The decided changeset.
-    pub(crate) change_set: String,
-    /// The review id.
-    pub(crate) review: String,
-    /// The decision.
-    pub(crate) decision: Decision,
-    /// Who decided.
-    #[serde(default)]
-    pub(crate) actor: String,
-    /// Why.
-    #[serde(default)]
-    pub(crate) rationale: String,
-    /// The digest the decision was made against.
-    pub(crate) digest: String,
-    /// When.
-    pub(crate) at_ms: u64,
-}
-
 /// The review aggregate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Review {

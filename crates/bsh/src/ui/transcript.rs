@@ -999,21 +999,20 @@ pub(crate) fn traj_wheel(
 
 /// One transcript row's measured height, kept between frames.
 ///
-/// The transcript is a flex column inside a `ScrollHandle` scroller whose child
-/// indices ARE the rows (child 0 is the timestamp, then one per message), so a
-/// row the viewport does not need is replaced by a spacer of its measured
-/// height. Every consumer that addresses a child - the rail's
-/// `scroll_to_top_of_item`, the paging probe, the tests - keeps working, while a
-/// frame BUILDS only the rows near the viewport instead of the whole
-/// conversation. A 400-message chat therefore costs its viewport, not the
-/// transcript, on every repaint.
+/// The transcript is a flex column inside a `ScrollHandle` scroller, and a frame
+/// builds only the rows the viewport needs: every run of culled rows becomes ONE
+/// spacer of their summed height, so the child list costs the viewport plus the
+/// handful of runs around a compaction marker, not one element per message.
+/// Rows are addressed by their index in the layout - a jump computes the row's
+/// content-space top from these heights - because a child index no longer names
+/// a row once runs share a spacer.
 #[derive(Default)]
 pub(crate) struct TranscriptLayout {
     /// The session shape the cached heights belong to.
     shape: Option<TranscriptShape>,
     /// Where `heights[1]` (the first loaded message) sits in the session.
     loaded_from: usize,
-    /// One measured height per row, in scroller-child order.
+    /// One measured height per row, in row order (row 0 is the timestamp).
     heights: Vec<Option<f32>>,
     /// Recently laid-out sessions, so switching back is a paint, not a
     /// measure. Newest first, capped at `SAVED_LAYOUTS`.
@@ -1026,12 +1025,20 @@ pub(crate) struct TranscriptLayout {
     /// anywhere above it moves every row below, so this is the fact the offset
     /// is corrected by; see [TranscriptLayout::anchor_delta].
     anchor: Option<Anchor>,
+    /// Which scroller children were ROWS in the frame that last painted, as
+    /// (row index, child index).
+    ///
+    /// The transcript no longer gives every row a child of its own - culled
+    /// rows share one spacer per run - so a row's painted height can only be
+    /// read back through this map. Only built rows can change height, which is
+    /// exactly what the map names.
+    built: Vec<(usize, usize)>,
 }
 
 /// One row the reader is looking at, at one content-space position.
 #[derive(Clone, Copy, Debug)]
 struct Anchor {
-    /// The scroller child index of the row crossing the viewport's top edge.
+    /// The row index of the row crossing the viewport's top edge.
     index: usize,
     /// Its content-space top in the layout the last frame painted.
     top: f32,
@@ -1053,6 +1060,14 @@ struct TranscriptShape {
     /// The whole transcript policy: fold, step grouping and the live-process
     /// rules all change how tall a turn draws.
     policy: TranscriptPolicy,
+    /// Extra children interleaved with the rows: compaction markers, the
+    /// `/compact` card and pending steers.
+    ///
+    /// They are not rows of the plan, so adding one shifts the CHILD index of
+    /// every row after it. The built-row map is keyed by child, so a change here
+    /// must retire the cache and re-measure once rather than assign a
+    /// neighbour's height to a row.
+    extras: usize,
     compact: bool,
 }
 
@@ -1069,6 +1084,7 @@ impl TranscriptShape {
         self.content_size == other.content_size
             && self.lang == other.lang
             && self.policy == other.policy
+            && self.extras == other.extras
             && self.compact == other.compact
     }
 }
@@ -1200,16 +1216,47 @@ impl TranscriptLayout {
 
     /// Take the heights the last painted frame measured.
     ///
-    /// Every child is a row, and a spacer is only ever given a height that was
-    /// already MEASURED (an unmeasured row is built instead), so reading the
-    /// spacers back is a no-op and reading the built rows is the new
-    /// measurement.
+    /// Only rows the last frame BUILT can have changed height, and the built
+    /// map names their children; a culled row is inside a run spacer whose
+    /// height is the arithmetic, not a measurement. Reading back every row's
+    /// child - the old shape - walked the whole transcript on every frame.
     pub(crate) fn observe(&mut self, scroll: &ScrollHandle) {
-        for (index, height) in self.heights.iter_mut().enumerate() {
-            if let Some(bounds) = scroll.bounds_for_item(index) {
-                *height = Some(bounds.size.height.as_f32());
+        let built = std::mem::take(&mut self.built);
+        for &(row, child) in &built {
+            if let Some(bounds) = scroll.bounds_for_item(child) {
+                if let Some(height) = self.heights.get_mut(row) {
+                    *height = Some(bounds.size.height.as_f32());
+                }
             }
         }
+        self.built = built;
+    }
+
+    /// Record where this frame put the rows it built.
+    pub(crate) fn record_built(&mut self, built: Vec<(usize, usize)>) {
+        self.built = built;
+    }
+
+    /// The row indices the last frame built.
+    pub(crate) fn built_rows(&self) -> std::collections::HashSet<usize> {
+        self.built.iter().map(|(row, _)| *row).collect()
+    }
+
+    /// The content-space top of one row, by the plan's own arithmetic.
+    ///
+    /// A jump asks for this instead of a child index: with culled rows sharing a
+    /// spacer, child indices no longer name rows.
+    pub(crate) fn row_top(&self, rows: usize, row: usize) -> f32 {
+        let estimate = self.estimate();
+        let mut top = TRANSCRIPT_PAD_Y;
+        for index in 0..row.min(rows) {
+            let row_h = self
+                .height(index)
+                .filter(|height| *height >= 8.0)
+                .unwrap_or(estimate);
+            top += row_h + TRANSCRIPT_GAP;
+        }
+        top
     }
 
     /// How far the layout moved the anchored row since the last plan.
@@ -1336,6 +1383,40 @@ fn has_images(session: &Session, index: usize) -> bool {
             .is_some_and(|message| !message.images.is_empty())
 }
 
+/// The marks a rail frame builds, as `(first, end)` over the turn ordinals.
+///
+/// The marks sit on a uniform pitch, so the window is arithmetic rather than a
+/// scan: three marks of overdraw on each side keep a small scroll from revealing
+/// a gap, and the two spacers around the band keep the track's full height.
+fn rail_marks_window(count: usize, top: f32, view: f32, overflow: bool) -> (usize, usize) {
+    if !overflow || view <= 0.0 {
+        return (0, count);
+    }
+    let pitch = theme::TURN_PITCH;
+    let inset = theme::TURN_RAIL_INSET;
+    let lead = 3.0;
+    let first = (((top - inset) / pitch).floor() - lead).max(0.0) as usize;
+    let end = (((top + view - inset) / pitch).ceil() + lead + 1.0).max(0.0) as usize;
+    let first = first.min(count);
+    (first, end.min(count).max(first))
+}
+
+/// Push the run of culled rows accumulated so far as one spacer.
+///
+/// A run always sits between two built rows (the timestamp row and the tail are
+/// always built), so the original layout spent `len + 1` flex gaps around it
+/// while the spacer spends two. The spacer therefore carries the rows' heights
+/// plus `len - 1` gaps; counting one gap per row overcounted the transcript by
+/// one gap per run.
+fn flush_run(children: &mut Vec<AnyElement>, height: &mut f32, rows: &mut usize) {
+    if *rows > 0 {
+        let run = *height + TRANSCRIPT_GAP * rows.saturating_sub(1) as f32;
+        children.push(transcript_spacer(run.max(0.0)));
+        *height = 0.0;
+        *rows = 0;
+    }
+}
+
 /// A row kept at its measured height without building its contents.
 fn transcript_spacer(height: f32) -> AnyElement {
     div()
@@ -1367,6 +1448,12 @@ const TRANSCRIPT_TAIL_BUILT: usize = 4;
 /// never painted the estimate is all there is, so a pixel band alone lets a row
 /// reach the viewport before it has ever been measured.
 const TRANSCRIPT_PREFETCH_ROWS: usize = 10;
+/// How far from the viewport a row the last paint built is kept built.
+///
+/// The painted set is the drift backstop for the estimated band: keeping all of
+/// it rebuilt a band the reader had already scrolled away from, so it is bounded
+/// to a few prefetch widths.
+const TRANSCRIPT_PAINTED_ROWS: usize = 40;
 
 // How many message rows the last frame actually built, for the performance
 // test. Per-thread, because tests run in parallel inside one process.
@@ -1376,6 +1463,12 @@ thread_local! {
     /// Frames that had to re-measure the whole transcript. A paged read or a
     /// switch back must not add one.
     static LAYOUT_RESETS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The rows the LAST plan built, and the worst plan so far. The opening
+    /// draw repaints several times while the tail settles, so the cumulative
+    /// row count says little; the plan's own size is the fact that must stay
+    /// bounded.
+    static PLAN_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PLAN_BUILDS_MAX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The message rows built so far on this thread.
@@ -1388,6 +1481,21 @@ pub(crate) fn transcript_rows_built() -> usize {
 #[cfg(test)]
 pub(crate) fn transcript_layout_resets() -> usize {
     LAYOUT_RESETS.with(|resets| resets.get())
+}
+
+/// Start the largest-plan counter over, for a test that pins its own window.
+#[cfg(test)]
+pub(crate) fn reset_transcript_plan_builds() {
+    PLAN_BUILDS_MAX.with(|builds| builds.set(0));
+}
+
+/// The rows the last plan built, and the largest plan seen on this thread.
+#[cfg(test)]
+pub(crate) fn transcript_plan_builds() -> (usize, usize) {
+    (
+        PLAN_BUILDS.with(|builds| builds.get()),
+        PLAN_BUILDS_MAX.with(|builds| builds.get()),
+    )
 }
 
 /// The presentation facts every row of one frame shares.
@@ -1529,6 +1637,9 @@ impl Shell {
                 content_size,
                 lang: self.state.lang,
                 policy,
+                extras: session.compactions.len()
+                    + usize::from(session.compact_command.is_some())
+                    + self.state.pending_steers(&session.id).len(),
                 compact,
             },
             session.loaded_from,
@@ -1545,14 +1656,18 @@ impl Shell {
         let view_h = f32::from(view.size.height);
         let view_top = -f32::from(self.transcript_scroll.offset().y);
         let estimate = layout.estimate();
-        // The bounds the last paint recorded are the only positions that are
-        // TRUE: `top` below is arithmetic over cached heights, and a row that was
-        // never measured is placed by the average. A row the last paint put near
-        // the viewport is therefore built whatever the arithmetic says, which is
-        // what stops a visible row from blinking into a blank spacer while the
-        // reader scrolls. Stale bounds address the wrong rows, so only the exact
-        // case uses them.
+        // The rows the last paint BUILT are the only ones whose position was
+        // TRUE: `top` below is arithmetic over cached heights, and a row that
+        // was never measured is placed by the average. Those rows are built
+        // again whatever the arithmetic says, which is what stops a visible row
+        // from blinking into a blank spacer while the reader scrolls. A stale
+        // plan's map names rows that moved, so only the exact case uses it.
         let painted = matches!(prepared, Prepared::Exact);
+        let painted_before = if painted {
+            layout.built_rows()
+        } else {
+            std::collections::HashSet::new()
+        };
         // The rows the reader is at, and a fixed number of rows on each side of
         // them, built whatever the estimates say: the first paint of a row is its
         // first measurement, and measuring it while it is on screen moves every
@@ -1569,15 +1684,11 @@ impl Shell {
             let in_band = view_h > 0.0
                 && top + row_h > view_top - TRANSCRIPT_OVERDRAW
                 && top < view_top + view_h + TRANSCRIPT_OVERDRAW;
-            let painted_near = painted
-                && view_h > 0.0
-                && self
-                    .transcript_scroll
-                    .bounds_for_item(index)
-                    .is_some_and(|bounds| {
-                        f32::from(bounds.bottom()) > view_top - TRANSCRIPT_OVERDRAW
-                            && f32::from(bounds.top()) < view_top + view_h + TRANSCRIPT_OVERDRAW
-                    });
+            // A row the last paint BUILT is kept only while it is still near
+            // the viewport in row terms: keeping every previously built row
+            // rebuilt the band the tail jump left behind.
+            let painted_near = painted_before.contains(&index)
+                && index.abs_diff(nearest) <= TRANSCRIPT_PAINTED_ROWS;
             // An image row keeps building: its gallery can grow when a data URL
             // finishes decoding, so a spacer would go stale.
             let build =
@@ -1596,6 +1707,12 @@ impl Shell {
             top += row_h + TRANSCRIPT_GAP;
         }
         layout.anchor = anchor;
+        #[cfg(test)]
+        {
+            let builds = plans.iter().filter(|plan| plan.is_none()).count();
+            PLAN_BUILDS.with(|last| last.set(builds));
+            PLAN_BUILDS_MAX.with(|worst| worst.set(worst.get().max(builds)));
+        }
         plans
     }
 
@@ -1691,9 +1808,16 @@ impl Shell {
             chrome.compact_usage,
             chrome.policy,
         );
-        rows.reserve(
-            rows_len + session.compactions.len() + usize::from(session.compact_command.is_some()),
-        );
+        // The scroller's children are now the BUILT rows plus one spacer per
+        // run of culled rows, so a frame costs the viewport rather than the
+        // history. The timestamp row (child 0) is always painted; its row is
+        // recorded so its height is still measured.
+        let mut children = rows;
+        let mut built: Vec<(usize, usize)> = vec![(0, 0)];
+        // A run's heights and row count are accumulated here; flush_run turns
+        // them into one spacer whose height is exact (see its own note).
+        let mut spacer = 0.0f32;
+        let mut spacer_rows = 0usize;
         let last = session.messages.len().saturating_sub(1);
         // Where the reference anchors a compaction marker: at the checkpoint
         // EVENT's sequence, which is appended after the shadowed span and the
@@ -1734,16 +1858,21 @@ impl Shell {
                 .peek()
                 .is_some_and(|(position, _, _)| *position <= index)
             {
+                flush_run(&mut children, &mut spacer, &mut spacer_rows);
                 let (_, marker, record) = pending.next().expect("the marker just peeked");
-                rows.push(
+                children.push(
                     self.compaction_row(record, marker, &chrome, cx)
                         .into_any_element(),
                 );
             }
             if let Some(height) = plans.get(index + 1).copied().flatten() {
-                rows.push(transcript_spacer(height));
+                // A culled row joins the run being accumulated; the gap
+                // arithmetic is finished at the flush.
+                spacer += height;
+                spacer_rows += 1;
                 continue;
             }
+            flush_run(&mut children, &mut spacer, &mut spacer_rows);
             let settled = folded && !(live && index == last);
             // ONE running indicator per turn: after a steer the turn holds two
             // assistant rows, and both would otherwise report "Running…" while
@@ -1752,7 +1881,8 @@ impl Shell {
                 settled,
                 writing: live && index == last,
             };
-            rows.push(
+            built.push((index + 1, children.len()));
+            children.push(
                 self.message_row(
                     MessageSlot {
                         session: &session.id,
@@ -1771,7 +1901,8 @@ impl Shell {
         // Markers committed at (or beyond) the current end, and legacy records,
         // still read after the last message.
         for (_, marker, record) in pending {
-            rows.push(
+            flush_run(&mut children, &mut spacer, &mut spacer_rows);
+            children.push(
                 self.compaction_row(record, marker, &chrome, cx)
                     .into_any_element(),
             );
@@ -1781,7 +1912,8 @@ impl Shell {
         // the running label, or the outcome text. A landed checkpoint clears
         // it and the marker above takes its place.
         if let Some(command) = &session.compact_command {
-            rows.push(
+            flush_run(&mut children, &mut spacer, &mut spacer_rows);
+            children.push(
                 self.compact_command_row(command, &chrome)
                     .into_any_element(),
             );
@@ -1792,11 +1924,18 @@ impl Shell {
         // sees their interjection land. The durable row replaces it when the
         // `Steered` delivery arrives.
         for queued in self.state.pending_steers(&session.id) {
-            rows.push(
+            flush_run(&mut children, &mut spacer, &mut spacer_rows);
+            children.push(
                 self.pending_steer_row(&session.id, queued, cx)
                     .into_any_element(),
             );
         }
+        // A run that ends the list is complete: the trailing rows are always
+        // built, so this only closes a transcript shorter than the tail window.
+        flush_run(&mut children, &mut spacer, &mut spacer_rows);
+        // The next frame's measurements read back through this map: only built
+        // rows have a child, and only built rows can change height.
+        self.transcript_layout.borrow_mut().record_built(built);
         // The reference puts a turn-jump rail down the transcript's right edge.
         // The scroll handle records each child's painted bounds, so a tick can jump
         // to a measured row without knowing any row's height up front.
@@ -1828,14 +1967,11 @@ impl Shell {
         let rail_overflow = marks_h > theme::TURN_RAIL_MAX_H;
         let rail_view_h = f32::from(self.rail_scroll.bounds().size.height);
         let rail_top = -f32::from(self.rail_scroll.offset().y);
-        let rail_window = |turn: usize| -> bool {
-            if !rail_overflow || rail_view_h <= 0.0 {
-                return true;
-            }
-            let y = theme::TURN_RAIL_INSET + theme::TURN_PITCH * turn as f32;
-            y + theme::TURN_PITCH > rail_top - theme::TURN_PITCH * 3.0
-                && y < rail_top + rail_view_h + theme::TURN_PITCH * 3.0
-        };
+        // The marks are a uniform pitch, so the visible window is arithmetic:
+        // the frame used to build a same-sized blank for every mark outside it,
+        // which still cost one element per turn.
+        let (rail_first, rail_end) =
+            rail_marks_window(turns.len(), rail_top, rail_view_h, rail_overflow);
         let track = div()
             .debug_selector(|| "turn-rail-track".to_string())
             .id("turn-rail-track")
@@ -1848,66 +1984,82 @@ impl Shell {
             .flex()
             .flex_col()
             .items_end()
-            .children(turns.iter().enumerate().map(|(turn, index)| {
-                if !rail_window(turn) {
-                    // A same-sized blank keeps the track's scroll height and
-                    // every child index, so a jump and the tail bias still
-                    // address the mark they mean.
-                    return div()
-                        .flex_shrink_0()
-                        .w(px(theme::TURN_RAIL_W))
-                        .h(px(theme::TURN_PITCH))
-                        .into_any_element();
-                }
-                let child = 1 + index; // child 0 is the timestamp and copy row
-                let on = active == Some(turn);
-                let group = SharedString::from(format!("turn-{turn}"));
-                let bar_group = group.clone();
-                let is_last = turn == last_ordinal;
-                div()
-                    .debug_selector(|| format!("turn-tick-{turn}"))
-                    .id(SharedString::from(format!("turn-tick-{turn}")))
-                    .group(group)
-                    // The reference positions its marks absolutely; in a flex
-                    // column with 1 as the default shrink they would squeeze to
-                    // fit the 420 cap instead of overflowing into the scroller.
-                    .flex_shrink_0()
-                    .w(px(theme::TURN_RAIL_W))
-                    .h(px(theme::TURN_PITCH))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .cursor_pointer()
-                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                        // `TurnMark` previews on pointer move and the frame
-                        // clears it on leave; a mark's own leave is the same
-                        // observable here.
-                        if *hovered {
-                            this.rail_hover = Some(turn);
-                        } else if this.rail_hover == Some(turn) {
-                            this.rail_hover = None;
-                        }
-                        cx.notify();
-                    }))
-                    .child(
+            .children({
+                let mut marks: Vec<AnyElement> = Vec::new();
+                // A run of marks outside the window shares one spacer, which
+                // keeps the track's scroll height: the pitch is uniform, so the
+                // jump below addresses a mark by arithmetic, not by child index.
+                if rail_first > 0 {
+                    marks.push(
                         div()
-                            .debug_selector(|| format!("turn-bar-{turn}"))
-                            .h(px(2.0))
-                            .w(px(if on { 20.0 } else { 12.0 }))
-                            .rounded(px(2.0))
-                            .bg(rgb(if on { theme::text() } else { theme::border() }))
-                            .when(!on, |bar| {
-                                bar.group_hover(bar_group, |s| {
-                                    s.w(px(18.0)).bg(rgb(theme::faint()))
-                                })
-                            }),
-                    )
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.jump_to_turn(child, is_last);
-                        cx.notify();
-                    }))
-                    .into_any_element()
-            }));
+                            .flex_shrink_0()
+                            .w(px(theme::TURN_RAIL_W))
+                            .h(px(theme::TURN_PITCH * rail_first as f32))
+                            .into_any_element(),
+                    );
+                }
+                for (turn, _index) in turns.iter().enumerate().take(rail_end).skip(rail_first) {
+                    let on = active == Some(turn);
+                    let group = SharedString::from(format!("turn-{turn}"));
+                    let bar_group = group.clone();
+                    let is_last = turn == last_ordinal;
+                    marks.push(
+                        div()
+                            .debug_selector(|| format!("turn-tick-{turn}"))
+                            .id(SharedString::from(format!("turn-tick-{turn}")))
+                            .group(group)
+                            // The reference positions its marks absolutely; in a flex
+                            // column with 1 as the default shrink they would squeeze to
+                            // fit the 420 cap instead of overflowing into the scroller.
+                            .flex_shrink_0()
+                            .w(px(theme::TURN_RAIL_W))
+                            .h(px(theme::TURN_PITCH))
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .cursor_pointer()
+                            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                                // `TurnMark` previews on pointer move and the frame
+                                // clears it on leave; a mark's own leave is the same
+                                // observable here.
+                                if *hovered {
+                                    this.rail_hover = Some(turn);
+                                } else if this.rail_hover == Some(turn) {
+                                    this.rail_hover = None;
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .debug_selector(|| format!("turn-bar-{turn}"))
+                                    .h(px(2.0))
+                                    .w(px(if on { 20.0 } else { 12.0 }))
+                                    .rounded(px(2.0))
+                                    .bg(rgb(if on { theme::text() } else { theme::border() }))
+                                    .when(!on, |bar| {
+                                        bar.group_hover(bar_group, |s| {
+                                            s.w(px(18.0)).bg(rgb(theme::faint()))
+                                        })
+                                    }),
+                            )
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.jump_to_turn(turn, is_last);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if rail_end < turns.len() {
+                    marks.push(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(theme::TURN_RAIL_W))
+                            .h(px(theme::TURN_PITCH * (turns.len() - rail_end) as f32))
+                            .into_any_element(),
+                    );
+                }
+                marks
+            });
         // Measured: the navigator overlays the column at `right: 12px`, so the
         // transcript keeps its full width underneath it. The frame is the
         // positioned box the marks scroll in and the preview card hangs off;
@@ -2007,7 +2159,7 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(TRANSCRIPT_GAP))
-                    .children(rows),
+                    .children(children),
             )
             .children(rail)
             // The hover preview lives in this relative frame, not inside the
@@ -2016,8 +2168,8 @@ impl Shell {
             .children(self.changes_preview_overlay(cx))
             // While a window of older rows is loading, the pane shows the
             // shared busy mark rather than a frame that looks idle. It is an
-            // overlay, so it adds no child and the turn rail's child indices
-            // keep naming the messages while it shows.
+            // overlay, so it adds no child and the transcript's row arithmetic
+            // is unchanged while it shows.
             .when(self.older.is_busy(), |frame| {
                 frame.child(
                     div()
@@ -2150,24 +2302,37 @@ impl Shell {
                 return Some(turns.len() - 1);
             }
         }
-        let viewport = self.transcript_scroll.bounds();
-        let offset = self.transcript_scroll.offset().y;
-        let mut visible = None;
-        for (turn, index) in turns.iter().enumerate() {
-            let Some(child) = self.transcript_scroll.bounds_for_item(1 + index) else {
-                continue;
-            };
-            if child.top() + offset <= viewport.top() + px(8.0) {
-                visible = Some(turn);
-            } else {
-                // Rows are laid out in order, so the first one whose top is
-                // below the viewport's top ends the search: every later turn is
-                // below it too. Without this the rail scanned the whole
-                // transcript once per frame.
-                break;
-            }
+        // The row at the viewport's top comes from the SAME cached heights the
+        // plan placed the rows with; a child lookup cannot answer it any more,
+        // because culled rows share a spacer. A turn's row is 1 + its message
+        // index, and the turns ascend, so the answer is a partition point.
+        let Some(session) = self.state.active_session() else {
+            return turns.first().map(|_| 0);
+        };
+        let rows = 1 + session.messages.len();
+        let view_top = -f32::from(self.transcript_scroll.offset().y);
+        let top_row = self.transcript_layout.borrow().row_at(rows, view_top);
+        let position = turns.partition_point(|index| *index < top_row);
+        if position == 0 {
+            turns.first().map(|_| 0)
+        } else {
+            Some(position - 1)
         }
-        visible.or_else(|| turns.first().map(|_| 0))
+    }
+
+    /// One transcript row's laid-out top and height, by the plan's arithmetic.
+    ///
+    /// The window builds only the rows the viewport shows, so a test (or a jump)
+    /// asks the layout where a row IS rather than looking for a child index that
+    /// no longer names it.
+    #[cfg(test)]
+    pub(crate) fn transcript_row_span(&self, row: usize) -> Option<(f32, f32)> {
+        let session = self.state.active_session()?;
+        let rows = 1 + session.messages.len();
+        let layout = self.transcript_layout.borrow();
+        let top = layout.row_top(rows, row);
+        let next = layout.row_top(rows, row + 1);
+        Some((top, (next - top - TRANSCRIPT_GAP).max(0.0)))
     }
 
     /// The plan and tool trajectory for the active session.

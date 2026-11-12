@@ -1,7 +1,7 @@
 //! Content-addressed snapshot storage and the per-turn capture runtime.
 
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -9,9 +9,8 @@ use sha2::{Digest, Sha256};
 
 use super::domain::{
     hex_lower, local_actor, new_id, now_ms, review_root, ChangeOperation, ChangeSet,
-    ChangeSetStatus, Decision, DecisionEvent, ResourceFamily, ResourcePath, Review, ReviewSnapshot,
-    SnapshotRef, SnapshotSource, SnapshotState, ToolRef, UnavailableReason, MAX_BINARY_BYTES,
-    MAX_TEXT_BYTES,
+    ChangeSetStatus, Decision, ResourceFamily, ResourcePath, Review, ReviewSnapshot, SnapshotRef,
+    SnapshotSource, SnapshotState, ToolRef, UnavailableReason, MAX_BINARY_BYTES, MAX_TEXT_BYTES,
 };
 
 /// A workspace-scoped review store.
@@ -313,31 +312,6 @@ impl ReviewStore {
         });
         let _ = self.append_audit(&event);
         Ok(review)
-    }
-
-    /// Every recorded decision for one session, oldest first.
-    pub(crate) fn decisions_for_session(&self, session: &str) -> Vec<DecisionEvent> {
-        let path = self.root.join("audit.jsonl");
-        let Ok(file) = fs::File::open(path) else {
-            return Vec::new();
-        };
-        let mut decisions = Vec::new();
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(event) = serde_json::from_str::<DecisionEvent>(&line) else {
-                continue;
-            };
-            let belongs = if event.session.is_empty() {
-                self.load_changeset(&event.change_set)
-                    .is_some_and(|set| set.session == session)
-            } else {
-                event.session == session
-            };
-            if belongs {
-                decisions.push(event);
-            }
-        }
-        decisions.sort_by_key(|event| event.at_ms);
-        decisions
     }
 
     fn append_audit(&self, event: &serde_json::Value) -> io::Result<()> {

@@ -26,6 +26,75 @@ const REVIEW_DIFF_MIN: f32 = 360.0;
 const REVIEW_PANE_CHROME: f32 = 48.0;
 /// The narrowest the change list goes before the diff takes the squeeze.
 const REVIEW_LIST_MIN: f32 = 210.0;
+/// A change row's exact height: a 15px path line, a 13px chip line, their 2px
+/// gap and the row's own 7px top pad.
+pub(crate) const REVIEW_ROW_H: f32 = 44.0;
+/// A renamed change's height: the same plus one 13px line and a 2px gap.
+const REVIEW_ROW_RENAMED_H: f32 = 56.0;
+/// Rows this close to the viewport are built too.
+const REVIEW_OVERDRAW: f32 = 320.0;
+/// What the first frame assumes the list can show, before it is measured.
+const REVIEW_FIRST_VIEWPORT: f32 = 600.0;
+
+/// A change row's height: exact by construction, which is what lets the list
+/// place a row it does not build.
+fn review_row_height(change: &Change) -> f32 {
+    if matches!(change.kind, ChangeKind::Renamed { .. }) {
+        REVIEW_ROW_RENAMED_H
+    } else {
+        REVIEW_ROW_H
+    }
+}
+
+/// The rows the list builds, and the exact height of the rows on either side.
+///
+/// Pure, so the window's arithmetic can be pinned without a frame.
+fn review_band(heights: &[f32], view_top: f32, view_h: f32) -> (usize, usize, f32, f32) {
+    let band_top = view_top - REVIEW_OVERDRAW;
+    let band_bottom = view_top + view_h + REVIEW_OVERDRAW;
+    let mut top = 0.0f32;
+    let mut first: Option<usize> = None;
+    let mut end = 0usize;
+    for (position, height) in heights.iter().enumerate() {
+        if first.is_none() && top + height > band_top {
+            first = Some(position);
+        }
+        if first.is_some() && top < band_bottom {
+            end = position + 1;
+        }
+        top += height;
+    }
+    let first = first.unwrap_or(heights.len());
+    let end = end.max(first);
+    (
+        first,
+        end,
+        heights[..first].iter().sum(),
+        heights[end..].iter().sum(),
+    )
+}
+
+/// A row kept at its exact height without building its contents.
+fn review_spacer(height: f32) -> AnyElement {
+    div()
+        .flex_none()
+        .flex_shrink_0()
+        .w_full()
+        .h(px(height.max(0.0)))
+        .into_any_element()
+}
+
+// How many change rows the last frame actually built, for the performance test.
+#[cfg(test)]
+thread_local! {
+    static REVIEW_ROWS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The change rows built so far on this thread.
+#[cfg(test)]
+pub(crate) fn review_rows_built() -> usize {
+    REVIEW_ROWS_BUILT.with(|built| built.get())
+}
 
 /// The Review tab's cache key.
 #[derive(Clone, PartialEq, Eq)]
@@ -36,15 +105,20 @@ struct ReviewKey {
 }
 
 /// The latest snapshot, kept until the session or review epoch changes.
+///
+/// The snapshot is shared behind an `Rc`, not handed out by value: it owns every
+/// change, revision and finding of the changeset, so cloning it per frame made a
+/// large review copy its whole manifest on every repaint. A frame now clones one
+/// pointer, and the click handlers share the same value.
 #[derive(Default)]
 pub(crate) struct ReviewCache {
     key: Option<ReviewKey>,
-    snapshot: Option<ReviewSnapshot>,
+    snapshot: Option<std::rc::Rc<ReviewSnapshot>>,
 }
 
 impl Shell {
     /// The active session's newest review, read on a cache miss only.
-    pub(crate) fn review_view(&self) -> Option<ReviewSnapshot> {
+    pub(crate) fn review_view(&self) -> Option<std::rc::Rc<ReviewSnapshot>> {
         let session = self.state.active_id.clone()?;
         let key = ReviewKey {
             session: session.clone(),
@@ -61,7 +135,7 @@ impl Shell {
                 None => self.state.review_snapshot(&session),
             };
             let mut cache = self.review_cache.borrow_mut();
-            cache.snapshot = snapshot;
+            cache.snapshot = snapshot.map(std::rc::Rc::new);
             cache.key = Some(key);
         }
         self.review_cache.borrow().snapshot.clone()
@@ -87,20 +161,21 @@ impl Shell {
         };
         let changeset = &snapshot.changeset;
         let review = &snapshot.review;
-        let selected = self
+        // One scan resolves the selection: the id names a change only when the
+        // changeset still holds it, and that same change is what the row and the
+        // detail card draw. The old shape proved the id and then searched for it
+        // again, twice per frame over every file in the review.
+        let selected_index = self
             .review_selected
             .as_ref()
-            .filter(|id| changeset.changes.iter().any(|change| &change.id == *id))
-            .cloned();
-        let selected_change = selected
-            .as_ref()
-            .and_then(|id| changeset.changes.iter().find(|change| &change.id == id));
+            .and_then(|id| changeset.changes.iter().position(|change| &change.id == id));
+        let selected = selected_index.map(|index| changeset.changes[index].id.clone());
         let diff = selected.as_ref().and_then(|id| {
             let guard = self.review_diff.borrow();
             guard
                 .as_ref()
                 .filter(|(cached, _)| cached == id)
-                .map(|(_, diff)| diff.clone())
+                .map(|(_, diff)| std::rc::Rc::clone(diff))
         });
         let counts = tr_args(
             lang,
@@ -224,6 +299,20 @@ impl Shell {
         } else {
             330.0
         };
+        // Every row is one of two exact heights (a rename adds a line), so the
+        // list paints the band around the viewport and stands the rest in two
+        // spacers: a changeset that touched hundreds of files used to build a
+        // row element (id, hover, click) for every one of them on every repaint,
+        // although the column can show a dozen.
+        let heights: Vec<f32> = changeset.changes.iter().map(review_row_height).collect();
+        let view_h = f32::from(self.review_scroll.bounds().size.height);
+        let view_h = if view_h > 0.0 {
+            view_h
+        } else {
+            REVIEW_FIRST_VIEWPORT
+        };
+        let view_top = -f32::from(self.review_scroll.offset().y);
+        let (first, end, leading, trailing) = review_band(&heights, view_top, view_h);
         let mut changes = div()
             .debug_selector(|| "review-change-list".to_string())
             .id("review-change-list")
@@ -232,14 +321,23 @@ impl Shell {
             .flex_none()
             .flex()
             .flex_col()
-            .gap(px(3.0))
             .overflow_y_scroll()
+            .track_scroll(&self.review_scroll)
             .border_r_1()
             .border_color(rgb(theme::border_soft()))
             .pr(px(10.0));
-        for change in &changeset.changes {
-            let active = selected.as_deref() == Some(change.id.as_str());
-            let change_clone = change.clone();
+        if leading > 0.0 {
+            changes = changes.child(review_spacer(leading));
+        }
+        for row_index in first..end {
+            #[cfg(test)]
+            REVIEW_ROWS_BUILT.with(|built| built.set(built.get() + 1));
+            let change = &changeset.changes[row_index];
+            let active = selected_index == Some(row_index);
+            // The click shares the frame's snapshot and names its row by index,
+            // so a row costs no copy of the change (and of every revision's two
+            // snapshots) until it is actually pressed.
+            let snapshot_for_row = std::rc::Rc::clone(&snapshot);
             let mut tools: Vec<&str> = Vec::new();
             for revision in &change.revisions {
                 if let Some(tool) = &revision.tool {
@@ -258,24 +356,32 @@ impl Shell {
             changes = changes.child(
                 div()
                     .id(format!("review-change-{}", change.id))
-                    .debug_selector(|| "review-change-row".to_string())
+                    // The row index is the test address: the change id is
+                    // opaque, and windowing means only some rows exist.
+                    .debug_selector(move || format!("review-change-row-{row_index}"))
+                    .flex_none()
+                    .h(px(review_row_height(change)))
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
                     .px(px(8.0))
-                    .py(px(7.0))
+                    .pt(px(7.0))
                     .rounded(px(8.0))
                     .cursor_pointer()
                     .when(active, |row| row.bg(rgb(theme::selected_row())))
                     .hover(|row| row.bg(rgb(theme::hover())))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let diff = this.state.review_diff(&change_clone);
-                        this.review_selected = Some(change_clone.id.clone());
-                        *this.review_diff.borrow_mut() = Some((change_clone.id.clone(), diff));
+                        let Some(change) = snapshot_for_row.changeset.changes.get(row_index) else {
+                            return;
+                        };
+                        let diff = std::rc::Rc::new(this.state.review_diff(change));
+                        this.review_selected = Some(change.id.clone());
+                        *this.review_diff.borrow_mut() = Some((change.id.clone(), diff));
                         cx.notify();
                     }))
                     .child(
                         txt(change.path.workspace_relative.clone(), 11.5, theme::text())
+                            .line_height(px(15.0))
                             .whitespace_nowrap()
                             .text_ellipsis(),
                     )
@@ -284,32 +390,49 @@ impl Shell {
                             .flex()
                             .flex_row()
                             .gap(px(6.0))
-                            .child(txt(change_kind(lang, &change.kind), 10.0, theme::faint()))
+                            .child(
+                                txt(change_kind(lang, &change.kind), 10.0, theme::faint())
+                                    .line_height(px(13.0)),
+                            )
                             .when_some(tool_label, |row, tool| {
-                                row.child(txt(tool, 10.0, theme::faint()).min_w_0().text_ellipsis())
+                                row.child(
+                                    txt(tool, 10.0, theme::faint())
+                                        .line_height(px(13.0))
+                                        .min_w_0()
+                                        .text_ellipsis(),
+                                )
                             })
-                            .child(txt(
-                                format!("{} rev", change.revisions.len()),
-                                10.0,
-                                theme::faint(),
-                            )),
+                            .child(
+                                txt(
+                                    format!("{} rev", change.revisions.len()),
+                                    10.0,
+                                    theme::faint(),
+                                )
+                                .line_height(px(13.0)),
+                            ),
                     )
                     .when(matches!(&change.kind, ChangeKind::Renamed { .. }), |row| {
                         let from = match &change.kind {
                             ChangeKind::Renamed { from } => from.workspace_relative.clone(),
                             _ => String::new(),
                         };
-                        row.child(txt(
-                            format!("{from} → {}", change.path.workspace_relative),
-                            10.0,
-                            theme::faint(),
-                        ))
+                        row.child(
+                            txt(
+                                format!("{from} → {}", change.path.workspace_relative),
+                                10.0,
+                                theme::faint(),
+                            )
+                            .line_height(px(13.0)),
+                        )
                     }),
             );
         }
+        if trailing > 0.0 {
+            changes = changes.child(review_spacer(trailing));
+        }
 
         let findings = findings_section(&snapshot, lang, cx);
-        let detail = self.review_detail(selected_change, diff.as_ref(), lang, cx);
+        let detail = self.review_detail(&snapshot, selected_index, diff.as_deref(), lang, cx);
         let body = div()
             .flex()
             .flex_row()
@@ -367,7 +490,8 @@ impl Shell {
 
     fn review_detail(
         &self,
-        change: Option<&Change>,
+        snapshot: &std::rc::Rc<ReviewSnapshot>,
+        selected: Option<usize>,
         diff: Option<&FileDiff>,
         lang: crate::i18n::Lang,
         cx: &mut Context<Self>,
@@ -382,8 +506,11 @@ impl Shell {
                 .child(txt(tr(lang, "review.selectHint"), 12.0, theme::faint()))
                 .into_any_element();
         };
-        let show_open = change.is_some() && !diff.binary && !diff.lines.is_empty();
-        let change_for_diff = change.cloned();
+        let show_open = selected.is_some() && !diff.binary && !diff.lines.is_empty();
+        // The open-diff action resolves its change when pressed, from the shared
+        // snapshot: a diff is read on demand, so the frame clones no change and
+        // no diff to arm the control.
+        let snapshot_for_diff = std::rc::Rc::clone(snapshot);
         let mut detail = div().flex().flex_col().gap(px(8.0));
         detail = detail.child(
             div()
@@ -425,7 +552,9 @@ impl Shell {
                                     .cursor_pointer()
                                     .hover(|button| button.bg(rgb(theme::hover())))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        let Some(change) = change_for_diff.as_ref() else {
+                                        let Some(change) = selected.and_then(|index| {
+                                            snapshot_for_diff.changeset.changes.get(index)
+                                        }) else {
                                             return;
                                         };
                                         match this.state.review_patch(change) {
@@ -671,7 +800,7 @@ fn verifications_section(snapshot: &ReviewSnapshot, lang: crate::i18n::Lang) -> 
 }
 
 fn findings_section(
-    snapshot: &ReviewSnapshot,
+    snapshot: &std::rc::Rc<ReviewSnapshot>,
     lang: crate::i18n::Lang,
     cx: &mut Context<Shell>,
 ) -> AnyElement {
@@ -687,13 +816,15 @@ fn findings_section(
     }
     for (index, finding) in snapshot.review.findings.iter().enumerate() {
         let color = severity_color(finding.severity);
+        // The finding names its change by id; resolving it to a ROW keeps the
+        // frame from copying the change (and both snapshots of every revision)
+        // once per finding.
         let target = finding.change_id.as_ref().and_then(|id| {
             snapshot
                 .changeset
                 .changes
                 .iter()
-                .find(|change| &change.id == id)
-                .cloned()
+                .position(|change| &change.id == id)
         });
         let row = div()
             .id(format!("review-finding-{index}"))
@@ -708,16 +839,20 @@ fn findings_section(
             .border_1()
             .border_color(rgb(theme::border_soft()))
             .when(target.is_some(), |row| {
+                let snapshot = std::rc::Rc::clone(snapshot);
                 row.cursor_pointer()
                     .hover(|row| row.bg(rgb(theme::hover())))
-            })
-            .when_some(target, |row, change| {
-                row.on_click(cx.listener(move |this, _, _, cx| {
-                    let diff = this.state.review_diff(&change);
-                    this.review_selected = Some(change.id.clone());
-                    *this.review_diff.borrow_mut() = Some((change.id.clone(), diff));
-                    cx.notify();
-                }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(change) =
+                            target.and_then(|index| snapshot.changeset.changes.get(index))
+                        else {
+                            return;
+                        };
+                        let diff = std::rc::Rc::new(this.state.review_diff(change));
+                        this.review_selected = Some(change.id.clone());
+                        *this.review_diff.borrow_mut() = Some((change.id.clone(), diff));
+                        cx.notify();
+                    }))
             })
             .child(
                 div()
@@ -874,4 +1009,47 @@ fn short_digest(digest: Option<&str>) -> String {
         return "-".to_string();
     };
     digest.chars().take(19).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{review_band, REVIEW_ROW_H};
+
+    /// The list's rows are exact heights, so the built band and the two spacers
+    /// must reproduce the whole list's height.
+    #[test]
+    fn the_change_list_band_spans_the_whole_list() {
+        let heights = vec![REVIEW_ROW_H; 100];
+        for (view_top, view_h, first, end) in [
+            (0.0f32, 300.0f32, 0usize, 15usize),
+            (2_000.0, 300.0, 38, 60),
+            (4_000.0, 300.0, 83, 100),
+        ] {
+            let (got_first, got_end, leading, trailing) = review_band(&heights, view_top, view_h);
+            assert_eq!(
+                (got_first, got_end),
+                (first, end),
+                "the band for a view at {view_top}"
+            );
+            assert_eq!(leading, first as f32 * REVIEW_ROW_H);
+            assert_eq!(trailing, (100 - end) as f32 * REVIEW_ROW_H);
+            let built = (got_end - got_first) as f32 * REVIEW_ROW_H;
+            assert_eq!(
+                leading + built + trailing,
+                4_400.0,
+                "the spacers keep the whole list's height"
+            );
+        }
+        // A view past the end keeps the list's height in one leading spacer.
+        assert_eq!(
+            review_band(&heights, 10_000.0, 300.0),
+            (100, 100, 4_400.0, 0.0)
+        );
+        // A view above the top builds nothing and leaves one trailing spacer.
+        assert_eq!(
+            review_band(&heights, -10_000.0, 300.0),
+            (0, 0, 0.0, 4_400.0)
+        );
+        assert_eq!(review_band(&[], 0.0, 300.0), (0, 0, 0.0, 0.0));
+    }
 }
