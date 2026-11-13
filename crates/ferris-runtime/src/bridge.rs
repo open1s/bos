@@ -838,17 +838,22 @@ pub fn bounded(text: &str, max: usize) -> String {
 /// ordinary drive/UNC form; containment is already proven by resolve_entry
 /// and re-checked by the shim through realpathSync.
 fn plain_path(path: &Path) -> String {
-    let text = path.to_string_lossy().into_owned();
-    #[cfg(windows)]
-    {
-        if let Some(rest) = text.strip_prefix(r"\?UNC") {
-            return format!(r"\{}", rest);
-        }
-        if let Some(rest) = text.strip_prefix(r"\?") {
-            return rest.to_string();
-        }
+    strip_verbatim(&path.to_string_lossy())
+}
+
+/// Strip a Windows verbatim device prefix back to an ordinary path.
+///
+/// `\\?\D:\x` becomes `D:\x` and `\\?\UNC\server\share` becomes
+/// `\\server\share`. A non-verbatim path is returned unchanged. Kept as a
+/// string operation so it is testable on every host (issue #304).
+fn strip_verbatim(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{}", rest);
     }
-    text
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    text.to_string()
 }
 
 /// Resolve the package entry inside the canonical root, refusing traversal
@@ -1076,5 +1081,27 @@ fn shutdown_shared(session: Arc<Mutex<BridgeSession>>) {
             Ok(session) => session.shutdown(),
             Err(poisoned) => poisoned.into_inner().shutdown(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_verbatim;
+
+    /// The verbatim device prefix Node mangles is stripped back to an ordinary
+    /// drive/UNC path, and an ordinary path is unchanged (issue #304).
+    #[test]
+    fn verbatim_prefixes_become_ordinary_paths() {
+        assert_eq!(strip_verbatim(r"\\?\D:\pkg\entry.js"), r"D:\pkg\entry.js");
+        assert_eq!(
+            strip_verbatim(r"\\?\UNC\server\share\entry.js"),
+            r"\\server\share\entry.js"
+        );
+        assert_eq!(strip_verbatim(r"D:\pkg\entry.js"), r"D:\pkg\entry.js");
+        assert_eq!(strip_verbatim("/unix/path/entry.js"), "/unix/path/entry.js");
+        assert_eq!(
+            strip_verbatim(r"C:\a dir with spaces\entry.js"),
+            r"C:\a dir with spaces\entry.js"
+        );
     }
 }

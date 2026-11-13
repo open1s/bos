@@ -2325,9 +2325,11 @@ mod tests {
             refused.is_err(),
             "a workspace fact with no root is a failure, not a silent skip"
         );
+        // Both documents are staged before either is committed (issue #310),
+        // so a staging failure leaves the global untouched — no partial commit.
         assert!(
-            base.join("settings.toml").exists(),
-            "the global file is still written before the refusal"
+            !base.join("settings.toml").exists(),
+            "a failed Apply must not leave the global already changed"
         );
 
         // A workspace document with nothing in it has nothing to lose, so an

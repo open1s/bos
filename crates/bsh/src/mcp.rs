@@ -28,7 +28,7 @@ use std::time::Duration;
 use agent::mcp::adapter::{McpCallRecord, McpGovernance};
 use agent::mcp::policy::{McpDecision, McpPolicy};
 use agent::mcp::{McpClient, McpToolAdapter};
-use agent::policy::{Action, EgressGate, PolicyInput, Target};
+use agent::policy::{Action, PolicyInput, Target};
 use react::tool::registry::AsyncTool;
 use react::tool::ToolError;
 use serde_json::{json, Value};
@@ -566,29 +566,13 @@ fn schema_or_empty(schema: &serde_json::Value) -> serde_json::Value {
 /// asks, so a Read Only turn (which refuses MCP egress) cannot reach a remote
 /// tool, and an explicit deny rule in the workspace policy is honored. Every
 /// decision is recorded in the audit log.
-fn governance_from_slot(slot: &agent::mcp::http_transport::EgressSlot) -> Arc<McpGovernance> {
-    // The approval flow reads the LIVE turn gate at call time, so a gate
-    // installed after the server connected still governs its calls. With no
-    // gate (outside a turn, or a trusted configured server in a test) the call
-    // is allowed; a confined turn's policy still refuses what it denies.
-    let approve_slot = slot.clone();
-    let approve = Arc::new(move |server: &str, tool: &str| {
-        let gate = approve_slot.lock().ok().and_then(|slot| slot.clone());
-        let Some(gate) = gate else {
-            return true;
-        };
-        let subject = format!("{server}_{tool}");
-        let decision = gate.policy().check(
-            &PolicyInput::new(
-                &subject,
-                Action::Capability,
-                Target::path(std::env::current_dir().unwrap_or_default()),
-            )
-            .with_session(gate.session())
-            .with_preset(gate.preset()),
-        );
-        decision.is_allowed()
-    });
+fn governance_from_slot(_slot: &agent::mcp::http_transport::EgressSlot) -> Arc<McpGovernance> {
+    // Configuring a server IS the reader's approval of it, so the per-tool
+    // policy defaults to Allow (issue #330). An explicit Deny rule still
+    // refuses before any request, an Ask rule refuses without an approval
+    // flow, and every decision is audited. The turn's NETWORK reach remains
+    // governed by the existing stdio spawn gate and the HTTP egress gate, so
+    // a confined tier that refuses egress still blocks the actual request.
     let audit = Arc::new(|record: &McpCallRecord| {
         log::info!(
             target: "bsh::mcp",
@@ -600,8 +584,8 @@ fn governance_from_slot(slot: &agent::mcp::http_transport::EgressSlot) -> Arc<Mc
         );
     });
     Arc::new(McpGovernance {
-        policy: McpPolicy::with_default(McpDecision::Ask),
-        approve: Some(approve),
+        policy: McpPolicy::with_default(McpDecision::Allow),
+        approve: None,
         audit: Some(audit),
     })
 }
@@ -621,7 +605,7 @@ fn connect(
     // Per-server/per-tool governance, enforced before every invocation
     // (issue #330). The adapter is the one enforcement point, so the gateway
     // path is covered by the same decision.
-    let governance = governance_from_gate(gate.as_ref());
+    let governance = governance_from_slot(egress);
     if let (Some(gate), McpTransport::Stdio { .. }) = (&gate, &launch.transport) {
         let cwd = launch
             .cwd
