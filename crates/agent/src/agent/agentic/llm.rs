@@ -85,7 +85,9 @@ impl LlmProvider {
 ///
 /// `api_mode` is left untouched: every vendor (including DeepSeek, which
 /// supports both `/responses` and `/chat/completions`) honors the configured
-/// `api_mode` verbatim.
+/// `api_mode` verbatim. The OpenAI-compatible default dispatches all three
+/// modes, Anthropic Messages included, so a custom provider's protocol choice
+/// reaches the wire.
 ///
 /// The exception is the `anthropic/` prefix: that vendor speaks the Messages
 /// protocol at `/v1/messages`, which is not one of the OpenAI modes, so it

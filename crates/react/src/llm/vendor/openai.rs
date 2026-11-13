@@ -23,6 +23,11 @@ use crate::llm::{
 };
 
 /// An OpenAI-compatible vendor client.
+///
+/// One endpoint, three wires: the request's [`ApiMode`] dispatches Chat to
+/// `/chat/completions`, Responses to `/responses`, and Anthropic Messages to
+/// the Messages vendor at the same endpoint and key — so a custom gateway
+/// speaks whichever protocol its provider configuration names.
 pub struct OpenAiVendor {
     client: Arc<Client>,
     endpoint: Arc<String>,
@@ -400,6 +405,20 @@ impl OpenAiVendor {
 }
 
 impl OpenAiVendor {
+    /// The Messages vendor for the same endpoint, model and key.
+    ///
+    /// Built per call so the delegate shares this vendor's HTTP client and
+    /// never keeps a second connection pool; the endpoint normalization
+    /// (a trailing `/v1` is respected) is the Messages vendor's own.
+    fn messages_delegate(&self) -> super::anthropic::AnthropicVendor {
+        super::anthropic::AnthropicVendor::new(
+            self.client.clone(),
+            self.endpoint.as_str(),
+            self.model.clone(),
+            self.api_key.as_str(),
+        )
+    }
+
     /// The wire path a model list is read from.
     ///
     /// The endpoint may or may not carry a trailing slash, and a doubled
@@ -435,7 +454,10 @@ impl OpenAiVendor {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::Http(format!("HTTP {}: {}", status, body)));
+            return Err(LlmError::Http(format!(
+                "HTTP {}: {} (endpoint: {})",
+                status, body, url
+            )));
         }
         let body = response
             .text()
@@ -488,10 +510,10 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             request.model = self.model.clone();
         }
         if request.api_mode == ApiMode::Anthropic {
-            return Err(LlmError::Other(
-                "the Anthropic Messages protocol needs a vendor that speaks /v1/messages"
-                    .to_string(),
-            ));
+            return self
+                .messages_delegate()
+                .complete(persona, request, session, context)
+                .await;
         }
         if request.api_mode == ApiMode::Responses {
             return ResponsesTransport::new(
@@ -546,7 +568,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            let err = LlmError::Http(format!("HTTP {}: {}", status, body));
+            let err = LlmError::Http(format!("HTTP {}: {} (endpoint: {})", status, body, url));
             context.notify_error(&err);
             return Err(err);
         }
@@ -606,10 +628,10 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             request.model = self.model.clone();
         }
         if request.api_mode == ApiMode::Anthropic {
-            return Err(LlmError::Other(
-                "the Anthropic Messages protocol needs a vendor that speaks /v1/messages"
-                    .to_string(),
-            ));
+            return self
+                .messages_delegate()
+                .stream_complete(persona, request, session, context)
+                .await;
         }
         if request.api_mode == ApiMode::Responses {
             return ResponsesTransport::new(
@@ -692,12 +714,13 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    let err = LlmError::Other(format!("HTTP {}: {}", status, body));
+                    let err =
+                        LlmError::Other(format!("HTTP {}: {} (endpoint: {})", status, body, url));
                     context.notify_error(&err);
                     return Err(err);
                 }
             } else {
-                let err = LlmError::Other(format!("HTTP {}: {}", status, body));
+                let err = LlmError::Other(format!("HTTP {}: {} (endpoint: {})", status, body, url));
                 context.notify_error(&err);
                 return Err(err);
             }
@@ -1215,17 +1238,246 @@ mod tests {
         );
         assert_eq!(slashed.models_url(), "https://api.example.com/v1/models");
     }
+    /// One captured HTTP request: path, lower-cased headers and decoded body.
+    #[derive(Debug, Clone, Default)]
+    struct Captured {
+        path: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    /// A local Messages endpoint: captures every request and answers with a
+    /// minimal Anthropic SSE stream, so a test asserts the WIRE rather than
+    /// the mere absence of an error.
+    async fn spawn_messages_mock() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<Captured>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let sink = Arc::clone(&sink);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = socket.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                    let mut lines = head.lines();
+                    let path = lines
+                        .next()
+                        .unwrap_or_default()
+                        .split(' ')
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut headers = Vec::new();
+                    let mut len = 0usize;
+                    for line in lines {
+                        if let Some((name, value)) = line.split_once(':') {
+                            let name = name.trim().to_ascii_lowercase();
+                            let value = value.trim().to_string();
+                            if name == "content-length" {
+                                len = value.parse().unwrap_or(0);
+                            }
+                            headers.push((name, value));
+                        }
+                    }
+                    while buf.len() < head_end + len {
+                        let Ok(n) = socket.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let body = String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned();
+                    sink.lock().expect("lock").push(Captured {
+                        path,
+                        headers,
+                        body,
+                    });
+                    let sse = concat!(
+                        "event: message_start\n",
+                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                        "event: content_block_start\n",
+                        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                        "event: content_block_delta\n",
+                        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello from messages\"}}\n\n",
+                        "event: content_block_stop\n",
+                        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                        "event: message_delta\n",
+                        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+                        "event: message_stop\n",
+                        "data: {\"type\":\"message_stop\"}\n\n",
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (addr, captured)
+    }
+
+    /// A local endpoint that answers every request with 404, capturing the
+    /// path so a test can assert the error names it.
+    async fn spawn_404_mock() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&paths);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let sink = Arc::clone(&sink);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = socket.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                    let mut lines = head.lines();
+                    let path = lines
+                        .next()
+                        .unwrap_or_default()
+                        .split(' ')
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    let len: usize = lines
+                        .find_map(|l| {
+                            let (n, v) = l.split_once(':')?;
+                            n.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < head_end + len {
+                        let Ok(n) = socket.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    sink.lock().expect("lock").push(path);
+                    let body = "{\"error\":\"no such route\"}";
+                    let response = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (addr, paths)
+    }
+
+    /// A failed call names the endpoint it tried, so a gateway that lacks a
+    /// protocol path is diagnosable from the error alone — on all three wires.
     #[tokio::test]
-    async fn anthropic_mode_is_refused_by_the_openai_transports() {
+    async fn http_errors_name_the_attempted_endpoint() {
+        use crate::llm::{ApiMode, LlmError};
+        let (addr, paths) = spawn_404_mock().await;
+        let vendor = OpenAiVendor::new(format!("http://{addr}"), "m".to_string(), "k".to_string());
+        for (mode, suffix) in [
+            (ApiMode::Chat, "/chat/completions"),
+            (ApiMode::Responses, "/responses"),
+            (ApiMode::Anthropic, "/v1/messages"),
+        ] {
+            let outcome = vendor
+                .complete(
+                    None,
+                    LlmRequest {
+                        model: "m".to_string(),
+                        input: Content::text("hi"),
+                        api_mode: mode,
+                        ..Default::default()
+                    },
+                    &mut LlmSession::new(),
+                    &mut LlmContext::default(),
+                )
+                .await;
+            let message = match outcome {
+                Err(LlmError::Http(message)) | Err(LlmError::Other(message)) => message,
+                other => panic!("expected an HTTP failure, got {other:?}"),
+            };
+            assert!(message.contains("404"), "the status survives: {message}");
+            assert!(
+                message.contains(suffix),
+                "the error names the attempted path {suffix}: {message}"
+            );
+        }
+        let seen = paths.lock().expect("lock");
+        assert_eq!(seen.len(), 3, "one attempt per protocol");
+    }
+
+    /// The OpenAI-compatible transport speaks all three protocols: Anthropic
+    /// mode keeps the same endpoint and key but the wire is Messages —
+    /// /v1/messages, x-api-key, anthropic-version, a top-level max_tokens —
+    /// on both the whole-response and the streaming path.
+    #[tokio::test]
+    async fn anthropic_mode_speaks_messages_on_the_same_endpoint() {
+        use crate::llm::{ApiMode, StreamToken};
+        use futures::StreamExt;
+        let (addr, captured) = spawn_messages_mock().await;
         let vendor = OpenAiVendor::new(
-            "https://endpoint.invalid".to_string(),
+            format!("http://{addr}"),
             "gpt-test".to_string(),
             "test-key".to_string(),
         );
         let request = || LlmRequest {
             model: "gpt-test".to_string(),
             input: Content::text("hi"),
-            api_mode: crate::llm::ApiMode::Anthropic,
+            api_mode: ApiMode::Anthropic,
             ..Default::default()
         };
         let outcome = vendor
@@ -1235,19 +1487,51 @@ mod tests {
                 &mut LlmSession::new(),
                 &mut LlmContext::default(),
             )
-            .await;
-        assert!(
-            matches!(outcome, Err(crate::llm::LlmError::Other(_))),
-            "the OpenAI vendor must refuse the Anthropic Messages protocol, not speak Chat"
+            .await
+            .expect("the messages protocol completes");
+        assert_eq!(
+            outcome.text(),
+            Some("hello from messages"),
+            "the aggregate carries the streamed text"
         );
-        let streamed = vendor
+        let mut stream = vendor
             .stream_complete(
                 None,
                 request(),
                 &mut LlmSession::new(),
                 &mut LlmContext::default(),
             )
-            .await;
-        assert!(streamed.is_err(), "the streaming path must refuse it too");
+            .await
+            .expect("the messages protocol streams");
+        let mut streamed = String::new();
+        while let Some(token) = stream.next().await {
+            if let StreamToken::Text(chunk) = token.expect("a token") {
+                streamed.push_str(&chunk);
+            }
+        }
+        assert_eq!(streamed, "hello from messages");
+        let seen = captured.lock().expect("lock");
+        assert_eq!(seen.len(), 2, "one request per path");
+        for cap in seen.iter() {
+            assert_eq!(cap.path, "/v1/messages", "the wire path is Messages");
+            assert!(
+                cap.headers
+                    .iter()
+                    .any(|(n, v)| n == "x-api-key" && v == "test-key"),
+                "the key rides x-api-key, not Authorization"
+            );
+            assert!(
+                cap.headers.iter().any(|(n, v)| n == "anthropic-version"
+                    && v == crate::llm::vendor::anthropic::ANTHROPIC_VERSION),
+                "the version header is present"
+            );
+            let body: serde_json::Value = serde_json::from_str(&cap.body).expect("json body");
+            assert_eq!(body["model"], "gpt-test");
+            assert!(
+                body["max_tokens"].is_number(),
+                "Messages requires max_tokens"
+            );
+            assert!(body["messages"].is_array());
+        }
     }
 }

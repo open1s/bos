@@ -496,7 +496,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            let err = LlmError::Http(format!("HTTP {}: {}", status, text));
+            let err = LlmError::Http(format!("HTTP {}: {} (endpoint: {})", status, text, url));
             context.notify_error(&err);
             return Err(err);
         }

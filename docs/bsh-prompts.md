@@ -40,26 +40,29 @@ Everything else in the corpus serves one of those five.
 
 ## 2. Assembly order
 
-`compose_system_prompt` joins the first three layers; the BSH build appends
-the rest, and `Agent::system_prompt_for` writes the discovery block ahead of
-all of them. Order is deterministic, so a request is reproducible and the
-KV-cache prefix stays stable.
+`compose_system_prompt` joins identity, persona and workflow; the BSH build
+appends the rest, and `Agent::system_prompt_for` writes the discovery block
+directly after the identity line, ahead of the standing contract. Order is
+deterministic, so a request is reproducible and the KV-cache prefix stays
+stable.
 
-Discovery is layer 0, not a tail paragraph: a withheld tool or a searched skill
-is unreachable until the model knows to look, and a paragraph appended after the
-whole contract arrives after the first action has been chosen. The block keeps
-the capability gate - it is written only for a search this agent really carries -
-and it is the first thing in the system prompt, under
+Discovery is not a tail paragraph: a withheld tool or a searched skill is
+unreachable until the model knows to look, and a paragraph appended after the
+whole contract arrives after the first action has been chosen. It is also not
+the opener: the identity line comes first, so the persona never reads as a tool
+manual with the identity as a footnote. The block keeps the capability gate -
+it is written only for a search this agent really carries - under
 `## Check what you were given first`, whose line then names the searches the
 request actually carries (`find_tool`, `find_skill`, or both). The heading is
 derived from the request's tool array, not from a second guess at the same
 policy, so it can neither promise a search the request dropped nor hide one it
-kept.
+kept. Each guidance paragraph leads with its bold decision rule and carries
+the mechanics as bullets, so the priority survives a skim.
 
 | # | Layer | Constant | Owner | When |
 |---|-------|----------|-------|------|
-| 0 | Discovery priority | `DISCOVERY_PRIORITY` + `DISCOVERY_GUIDANCE` / `SKILL_DISCOVERY_GUIDANCE` | `agent` | when a tool is withheld or a skill is searched |
-| 1 | Harness identity | `HARNESS_IDENTITY` | `agent` | always |
+| 0 | Harness identity | `HARNESS_IDENTITY` | `agent` | always (unless `complete`) |
+| 1 | Discovery priority | `DISCOVERY_PRIORITY` + `DISCOVERY_GUIDANCE` / `SKILL_DISCOVERY_GUIDANCE` | `agent` | when a tool is withheld or a skill is searched |
 | 2 | Persona slot | `DEFAULT_PERSONA` or the workspace/preset persona | `agent` | always (unless `complete`) |
 | 3 | Decision procedure | `WORKFLOW_GUIDANCE` | `agent` | always (unless `complete`) |
 | 4 | Product context | `HARNESS_CONTEXT` | `bsh` | when the persona is not `complete` |

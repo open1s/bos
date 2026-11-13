@@ -4915,6 +4915,9 @@ impl AppState {
         if id.trim().is_empty() {
             return Err(crate::settings::provider::ProviderRefusal::NameEmpty);
         }
+        if let Some(refusal) = crate::settings::provider::id_refusal(id) {
+            return Err(refusal);
+        }
         if self.draft_mut().global.providers.contains_key(id) {
             return Err(crate::settings::provider::ProviderRefusal::IdTaken);
         }

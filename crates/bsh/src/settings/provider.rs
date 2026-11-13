@@ -22,9 +22,10 @@ use super::global::{self, GlobalSettings, ModelEntry, Provider};
 /// The wire protocols a provider can speak, as the value the leaf's api_mode
 /// and the engine's AgentConfig::api_mode carry.
 ///
-/// Anthropic Messages only reaches this shell through the anthropic vendor,
-/// whose clients send it unconditionally; the OpenAI transports refuse the
-/// protocol rather than guessing.
+/// The OpenAI-compatible transport dispatches on all three: chat and
+/// responses on its own wires, Anthropic Messages delegated to the Messages
+/// vendor at the same endpoint and key, so a custom gateway may speak any of
+/// them. The anthropic vendor sends Messages unconditionally.
 pub(crate) const PROTOCOLS: [&str; 3] = ["chat", "responses", "anthropic"];
 
 /// The protocol a provider speaks when neither the family nor the user says.
@@ -50,6 +51,8 @@ pub(crate) enum ProviderRefusal {
     NeedsModel,
     /// A provider already carries that id.
     IdTaken,
+    /// The provider id is not a lower-case identifier.
+    IdInvalid,
     /// No model id was given in the model row.
     ModelIdRequired,
     /// Two models of one provider share an id.
@@ -67,6 +70,7 @@ impl ProviderRefusal {
             Self::BaseUrlInvalid => "settings.models.customBaseUrlInvalid",
             Self::NeedsModel => "settings.providerNeedsModel",
             Self::IdTaken => "settings.providerIdTaken",
+            Self::IdInvalid => "settings.models.customRouteInvalid",
             Self::ModelIdRequired => "settings.modelIdRequired",
             Self::ModelIdDuplicate => "settings.models.modelIdDuplicate",
             Self::ModelNameInvalid => "settings.models.modelNameInvalid",
@@ -154,6 +158,34 @@ pub(crate) fn toggle_input_type(leaf: &mut ModelEntry, kind: &str) {
         next.insert(0, "text".to_string());
     }
     leaf.input_types = Some(next);
+}
+
+/// The refusal a provider id draws, if any.
+///
+/// The id is the wire prefix and the credential name, so it follows the
+/// reference's identifier shape: a lower-case letter leading lower-case
+/// letters and digits, in dash-separated segments. An empty id is the name
+/// refusal, which the form words as its own required-field sentence.
+pub(crate) fn id_refusal(raw: &str) -> Option<ProviderRefusal> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Some(ProviderRefusal::NameEmpty);
+    }
+    let alnum = |seg: &str| {
+        !seg.is_empty()
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    };
+    let mut segments = value.split('-');
+    let first = segments.next().unwrap_or("");
+    let ok =
+        first.starts_with(|c: char| c.is_ascii_lowercase()) && alnum(first) && segments.all(alnum);
+    if ok {
+        None
+    } else {
+        Some(ProviderRefusal::IdInvalid)
+    }
 }
 
 /// The refusal a base URL draws, if any.
@@ -947,6 +979,23 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_id_must_be_a_lower_case_identifier() {
+        assert_eq!(id_refusal("acme"), None);
+        assert_eq!(id_refusal("acme-gw2"), None);
+        assert_eq!(id_refusal("Acme"), Some(ProviderRefusal::IdInvalid));
+        assert_eq!(id_refusal("a b"), Some(ProviderRefusal::IdInvalid));
+        assert_eq!(id_refusal("1x"), Some(ProviderRefusal::IdInvalid));
+        assert_eq!(id_refusal("a-"), Some(ProviderRefusal::IdInvalid));
+        assert_eq!(id_refusal("-a"), Some(ProviderRefusal::IdInvalid));
+        assert_eq!(id_refusal("a--b"), Some(ProviderRefusal::IdInvalid));
+        assert_eq!(id_refusal("  "), Some(ProviderRefusal::NameEmpty));
+        assert_eq!(
+            ProviderRefusal::IdInvalid.key(),
+            "settings.models.customRouteInvalid"
+        );
+    }
+
+    #[test]
     fn a_base_url_must_be_an_address() {
         assert_eq!(base_url_refusal("   "), Some(ProviderRefusal::NeedsBaseUrl));
         assert_eq!(
@@ -1024,7 +1073,8 @@ mod tests {
                 "files".to_string(),
                 "plan".to_string(),
                 "schedule".to_string(),
-                "federation".to_string()
+                "federation".to_string(),
+                "surface".to_string()
             ]
         );
         assert!(global.preset("no-such-preset").is_none());

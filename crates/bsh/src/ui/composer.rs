@@ -60,7 +60,8 @@ struct ModelChipData {
     effort: Option<String>,
     /// The level the Effort row shows, or `Default` when the model decides.
     effort_level: Option<String>,
-    current: String,
+    /// The active (provider, model) pair the menu's check marks compare against.
+    current: Option<crate::settings::global::ModelRef>,
     groups: Vec<(String, Vec<String>)>,
     streaming: bool,
 }
@@ -443,10 +444,19 @@ pub(crate) fn effort_level_label(lang: crate::i18n::Lang, level: Option<&str>) -
 }
 /// The models the model chip's menu offers - the active provider's catalog, the
 /// same list the Models pane draws - each marked when it is the active model.
-pub(crate) fn model_choices(models: &[String], current: &str) -> Vec<(String, bool)> {
+pub(crate) fn model_choices(
+    provider: &str,
+    models: &[String],
+    current: Option<&crate::settings::global::ModelRef>,
+) -> Vec<(String, bool)> {
     models
         .iter()
-        .map(|model| (model.clone(), model == current))
+        .map(|model| {
+            let checked = current.is_some_and(|reference| {
+                reference.provider == provider && reference.model == *model
+            });
+            (model.clone(), checked)
+        })
         .collect()
 }
 
@@ -484,13 +494,9 @@ impl Shell {
         let permission_rows = super::permission::permission_rows(lang, &effective);
         let permission = effective.permission.clone();
         let label = effective.model_name;
-        // The menu rows are nicknames, so the checked row compares against the
-        // nickname rather than the API id the wire carries.
-        let current = effective
-            .model_ref
-            .as_ref()
-            .map(|reference| reference.model.clone())
-            .unwrap_or_default();
+        // The menu rows are nicknames, but the check is the whole reference:
+        // the same nickname under two providers must mark only the chosen one.
+        let current = effective.model_ref.clone();
         let effort = effort_suffix(effective.reasoning_effort.as_deref());
         // The menu offers the same list the Models pane draws, grouped by
         // provider, with the provider the choice in effect names leading. The
@@ -956,7 +962,9 @@ impl Shell {
                                             .py(px(6.0))
                                             .into_any_element()
                                     }));
-                                for (model, active) in model_choices(models, &current) {
+                                for (model, active) in
+                                    model_choices(provider, models, current.as_ref())
+                                {
                                     let pick = shell.clone();
                                     let name = model.clone();
                                     let label = model.clone();

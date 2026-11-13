@@ -607,6 +607,10 @@ pub(crate) struct Shell {
     /// Create, at which point this id lands on it. Choosing an entry clears the
     /// plaintext field, so a created provider never carries both sources.
     pub(crate) add_key_vault: Option<String>,
+    /// The protocol the add card's segments picked for the provider it will
+    /// create. `None` means the reader never chose, and the create falls back
+    /// to the default protocol instead of a control that only looks wired.
+    pub(crate) add_api_mode: Option<String>,
     /// The model leaves the open provider editor or add card is editing, with
     /// one text engine per row so a keystroke repaints its own row.
     pub(crate) model_rows: Vec<ModelRowEditor>,
@@ -2179,6 +2183,7 @@ impl Shell {
             add_display,
             add_base_url,
             add_key_vault: None,
+            add_api_mode: None,
             model_rows: Vec::new(),
             new_model_id,
             new_model_name,

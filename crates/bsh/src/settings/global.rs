@@ -1880,6 +1880,10 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
         "plan".to_string(),
         "schedule".to_string(),
         "federation".to_string(),
+        // Agent-authored surfaces ride the everyday write presets for the same
+        // reason federation does: a model that cannot see the bundle cannot
+        // use the feature at all. Read Only drops it with the writes gate.
+        "surface".to_string(),
     ];
     let standard_guard = || {
         (
@@ -1991,9 +1995,10 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
 /// is not on this list is not refused - it is what the card's custom mode is
 /// for, where the endpoint and the protocol are typed instead of looked up.
 ///
-/// The protocol is the value that reaches `AgentConfig::api_mode`: the first
-/// three vendors speak their own wire format and ignore it, while `openai`
-/// dispatches on it, so the default recorded here is the one its own transport
+/// The protocol is the value that reaches `AgentConfig::api_mode`: the
+/// OpenAI-based transports dispatch on it across chat, responses and
+/// Anthropic Messages, while the anthropic vendor sends Messages
+/// unconditionally, so the default recorded here is the one its own transport
 /// implements.
 pub(crate) const BUILT_IN_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     (

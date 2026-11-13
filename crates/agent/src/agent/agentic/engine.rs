@@ -491,8 +491,27 @@ impl Agent {
                 }
             }
         }
-        let mut base = super::discovery::prompt_block(tools);
-        push_paragraph(&mut base, &self.config.system_prompt);
+        // Identity opens the prompt; the discovery block follows it and still
+        // precedes every operational rule, so "check what you were given" is
+        // read before the first action is chosen without burying who the agent
+        // is under tool mechanics. A `complete` persona carries no identity
+        // line and keeps its whole-prompt semantics.
+        let discovery = super::discovery::prompt_block(tools);
+        let standing = &self.config.system_prompt;
+        let mut base = match standing.strip_prefix(crate::agent::prompts::HARNESS_IDENTITY) {
+            Some(rest) => {
+                let mut opened = String::from(crate::agent::prompts::HARNESS_IDENTITY);
+                push_paragraph(&mut opened, &discovery);
+                push_paragraph(&mut opened, rest.trim_start());
+                opened
+            }
+            None => {
+                let mut opened = String::new();
+                push_paragraph(&mut opened, &discovery);
+                push_paragraph(&mut opened, standing);
+                opened
+            }
+        };
         if let Ok(prompts) = self.live_prompts.read() {
             for prompt in prompts.iter() {
                 push_paragraph(&mut base, prompt);

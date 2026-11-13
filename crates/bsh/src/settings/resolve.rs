@@ -1610,8 +1610,8 @@ mcp_servers = [
         assert_eq!(r.preset_id.as_deref(), Some("standard"));
         assert_eq!(
             r.plugins,
-            vec!["shell", "files", "plan", "schedule", "federation"],
-            "the shipped standard preset mounts the core bundles, scheduling and federation"
+            vec!["shell", "files", "plan", "schedule", "federation", "surface"],
+            "the shipped standard preset mounts the core bundles, scheduling, federation and surfaces"
         );
         assert!(r.refusal().is_none());
     }
@@ -1725,7 +1725,8 @@ mcp_servers = [
                 "files".to_string(),
                 "plan".to_string(),
                 "schedule".to_string(),
-                "federation".to_string()
+                "federation".to_string(),
+                "surface".to_string()
             ],
             "the DEFAULT preset is restored as well, not silently cleared"
         );

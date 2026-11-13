@@ -296,24 +296,31 @@ mod tests {
 
     #[tokio::test]
     async fn the_runtime_serves_the_current_document() {
-        let _guard = LOCK.lock().expect("test lock");
-        let id = present("Served", PanelLocation::Right, document("live")).expect("present");
-        let view = views()
-            .into_iter()
-            .find(|view| view.id == id)
-            .expect("view");
-        patch(
-            &id,
-            Revision::new(1),
-            vec![PatchOp::SetText {
-                id: "body".to_string(),
-                text: "patched".to_string(),
-            }],
-        )
-        .expect("patch");
+        // The lock covers the shared-store mutations only; holding a sync
+        // MutexGuard across the await would serialise the runtime on a lock
+        // the async executor cannot see.
+        let (id, view) = {
+            let _guard = LOCK.lock().expect("test lock");
+            let id = present("Served", PanelLocation::Right, document("live")).expect("present");
+            let view = views()
+                .into_iter()
+                .find(|view| view.id == id)
+                .expect("view");
+            patch(
+                &id,
+                Revision::new(1),
+                vec![PatchOp::SetText {
+                    id: "body".to_string(),
+                    text: "patched".to_string(),
+                }],
+            )
+            .expect("patch");
+            (id, view)
+        };
         let value = view.runtime.panel("panel").await.expect("panel");
         let json = serde_json::to_string(&value).expect("json");
         assert!(json.contains("patched"), "{json}");
+        let _guard = LOCK.lock().expect("test lock");
         assert!(close(&id));
     }
 }

@@ -5712,6 +5712,9 @@ impl Shell {
             ));
             body.push(self.models_field("settings.apiMode", self.api_mode_choices(cx)));
             body.push(
+                txt(lang.tr("settings.apiModeHint"), 12.0, theme::faint()).into_any_element(),
+            );
+            body.push(
                 txt(lang.tr("settings.advancedHint"), 12.0, theme::faint()).into_any_element(),
             );
         }
@@ -6771,16 +6774,40 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The measured protocol picker: three segments, the chosen one filled.
-    /// Changing the protocol leaves the typed address alone, the way the
-    /// reference does.
+    /// The editor's protocol segments: a pick writes the open provider's
+    /// family protocol, leaving the typed address alone.
     fn api_mode_choices(&self, cx: &mut Context<Self>) -> AnyElement {
-        let lang = self.state.lang;
         let open = self.state.editing_provider.clone().unwrap_or_default();
         let current = self.state.draft().global.family_protocol_of(&open);
+        self.protocol_choices(current, Some(open), cx)
+    }
+
+    /// The add card's protocol segments: a pending choice on the card itself,
+    /// because the provider does not exist yet and the editor's leaf is not
+    /// there to write. Create lands the choice on the new provider.
+    fn add_api_mode_choices(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self
+            .add_api_mode
+            .clone()
+            .unwrap_or_else(|| crate::settings::provider::DEFAULT_PROTOCOL.to_string());
+        self.protocol_choices(current, None, cx)
+    }
+
+    /// The measured protocol picker: three segments, the chosen one filled.
+    /// Changing the protocol leaves the typed address alone, the way the
+    /// reference does. `target` names the provider whose family protocol a
+    /// pick writes; `None` is the add card, whose pick waits on the Shell
+    /// until Create.
+    fn protocol_choices(
+        &self,
+        current: String,
+        target: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
         let mut row = div().flex().flex_row().gap(px(4.0));
         for protocol in crate::settings::provider::PROTOCOLS {
-            let owned = open.clone();
+            let owned = target.clone();
             let mode = protocol.to_string();
             let tag = mode.clone();
             let chosen = current == tag;
@@ -6813,10 +6840,15 @@ impl Shell {
                         if chosen { theme::page() } else { theme::text() },
                     ))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state
-                            .draft_mut()
-                            .global
-                            .set_family_protocol(&owned, &mode);
+                        match owned.clone() {
+                            Some(id) => {
+                                this.state
+                                    .draft_mut()
+                                    .global
+                                    .set_family_protocol(&id, &mode);
+                            }
+                            None => this.add_api_mode = Some(mode.clone()),
+                        }
                         cx.notify();
                     }))
                     .into_any_element(),
@@ -6860,10 +6892,14 @@ impl Shell {
                             };
                             this.models_add_open = true;
                             this.add_key_vault = None;
-                            // The name is never carried over from a previous
-                            // form: the field starts empty, so Create always
-                            // requires fresh user input.
+                            // No field is carried over from a previous form:
+                            // the card starts empty, so Create always requires
+                            // fresh user input and an editor's values never
+                            // leak into a create.
                             set_value(&this.add_display, String::new(), window, cx);
+                            set_value(&this.add_route, String::new(), window, cx);
+                            set_value(&this.add_base_url, String::new(), window, cx);
+                            this.add_api_mode = None;
                             cx.notify();
                         }))
                         .into_any_element(),
@@ -7078,6 +7114,24 @@ impl Shell {
             column = column.child(self.add_note(lang.tr("settings.providerIdRequired")));
         } else if taken {
             column = column.child(self.add_note(lang.tr("settings.providerIdTaken")));
+            // A taken id is not a dead end: the provider behind it is editable,
+            // so the card offers its editor and hands the typed connection over.
+            let owned = route.clone();
+            column = column.child(
+                self.models_link(
+                    "add-edit-taken".to_string(),
+                    lang.tr("settings.providerIdTakenEdit"),
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.edit_taken_provider(&owned, window, cx);
+                })),
+            );
+        } else if let Some(refusal) = crate::settings::provider::id_refusal(&route) {
+            column = column.child(self.add_note(lang.tr(refusal.key())));
+        } else {
+            column = column.child(
+                txt(lang.tr("settings.customRouteHint"), 12.0, theme::faint()).into_any_element(),
+            );
         }
         column = column
             .child(self.editor_field(
@@ -7088,7 +7142,8 @@ impl Shell {
                 "settings.customBaseUrl",
                 self.editor_input(&self.add_base_url, "add-base-url".to_string()),
             ))
-            .child(self.editor_field("settings.apiMode", self.api_mode_choices(cx)))
+            .child(self.editor_field("settings.apiMode", self.add_api_mode_choices(cx)))
+            .child(txt(lang.tr("settings.apiModeHint"), 12.0, theme::faint()).into_any_element())
             .child(self.add_api_key_field(cx));
         // The refusals the reference prints above the create button, in the
         // order it checks them.
@@ -7194,6 +7249,14 @@ impl Shell {
             // family does. The custom route already wrote it in one call.
             if route == ModelsAddRoute::Catalogue {
                 self.state.set_provider_name(id, &named);
+            } else {
+                // The card's segments are the provider's protocol; an untouched
+                // choice falls back to the default the tree speaks.
+                let mode = self
+                    .add_api_mode
+                    .clone()
+                    .unwrap_or_else(|| crate::settings::provider::DEFAULT_PROTOCOL.to_string());
+                self.state.draft_mut().global.set_family_protocol(id, &mode);
             }
             // Adding a provider no longer selects it for anything: a model is
             // chosen per chat from the composer, and the workspace document
@@ -7202,6 +7265,38 @@ impl Shell {
             self.catalogue_choice = None;
             self.catalogue_open = false;
             self.add_key_vault = None;
+            self.add_api_mode = None;
+        }
+        cx.notify();
+    }
+
+    /// A taken id hands the typed connection to the provider that owns it.
+    ///
+    /// The add card and the editor share the same text engines, so the values
+    /// the reader typed travel into the editor instead of being discarded;
+    /// nothing is committed until the editor's own Apply. A protocol the reader
+    /// picked on the card travels the same way, as one draft write.
+    pub(crate) fn edit_taken_provider(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let typed_url = self.add_base_url.read(cx).value().trim().to_string();
+        let typed_name = self.add_display.read(cx).value().trim().to_string();
+        let typed_mode = self.add_api_mode.clone();
+        self.models_add_open = false;
+        self.catalogue_choice = None;
+        self.catalogue_open = false;
+        load_provider_into_form(self, id, window, cx);
+        if !typed_url.is_empty() {
+            set_value(&self.add_base_url, typed_url, window, cx);
+        }
+        if !typed_name.is_empty() {
+            set_value(&self.add_display, typed_name, window, cx);
+        }
+        if let Some(mode) = typed_mode {
+            self.state.draft_mut().global.set_family_protocol(id, &mode);
         }
         cx.notify();
     }

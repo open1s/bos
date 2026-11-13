@@ -968,7 +968,7 @@ mod tests {
         let (document, _) = host.view("com.example.parent").expect("view");
         match document.root {
             SurfaceNode::Button { action, .. } => {
-                assert_eq!(action, format!("com.example.child\u{1f}demo.go"));
+                assert_eq!(action, "com.example.child\u{1f}demo.go".to_string());
             }
             other => panic!("expected the child button, got {other:?}"),
         }

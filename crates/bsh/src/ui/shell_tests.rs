@@ -6208,18 +6208,48 @@ fn the_model_chip_swaps_its_chevron_for_the_ongoing_dot(cx: &mut TestAppContext)
     );
 }
 
+/// A nickname shared by two providers marks only the chosen provider's row:
+/// the check is the (provider, model) pair, not the bare nickname.
+#[test]
+fn the_model_menu_checks_only_the_chosen_providers_row() {
+    let models = ["z-ai/glm-5.3-flash".to_string()];
+    let chosen = crate::settings::global::ModelRef {
+        provider: "nvidia".to_string(),
+        model: "z-ai/glm-5.3-flash".to_string(),
+    };
+    assert_eq!(
+        super::composer::model_choices("nvidia", &models, Some(&chosen)),
+        [("z-ai/glm-5.3-flash".to_string(), true)],
+        "the chosen provider's row is marked"
+    );
+    assert_eq!(
+        super::composer::model_choices("a", &models, Some(&chosen)),
+        [("z-ai/glm-5.3-flash".to_string(), false)],
+        "the same nickname under another provider stays unmarked"
+    );
+    assert_eq!(
+        super::composer::model_choices("nvidia", &models, None),
+        [("z-ai/glm-5.3-flash".to_string(), false)],
+        "no choice marks nothing"
+    );
+}
+
 /// The model chip's list is the pane's list, its rows mark the active model, and
 /// an unresolved model takes the reference's own fallback wording.
 #[test]
 fn the_model_menu_reads_the_catalog_and_names_the_effort() {
     let models = ["gpt-4o".to_string(), "o3".to_string()];
+    let current = crate::settings::global::ModelRef {
+        provider: "openai".to_string(),
+        model: "o3".to_string(),
+    };
     assert_eq!(
-        super::composer::model_choices(&models, "o3"),
+        super::composer::model_choices("openai", &models, Some(&current)),
         [("gpt-4o".to_string(), false), ("o3".to_string(), true)],
         "only the active model is marked"
     );
     assert!(
-        super::composer::model_choices(&[], "o3").is_empty(),
+        super::composer::model_choices("openai", &[], Some(&current)).is_empty(),
         "an empty catalog offers no rows, which is what the menu's empty line explains"
     );
     let en = crate::i18n::Lang::En;
@@ -8159,6 +8189,193 @@ fn creating_a_custom_provider_starts_with_an_empty_catalogue(cx: &mut TestAppCon
     );
     assert!(!open, "a successful create closes the add card");
     assert_eq!(refusal, None, "creation is not refused");
+}
+
+/// The add card's protocol segments are a real choice: the protocol picked on
+/// the card is the one the new provider speaks, not a control that only looks
+/// wired while the create silently falls back to chat.
+#[gpui::test]
+fn the_add_card_protocol_choice_reaches_the_new_provider(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("add-protocol", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let add = cx.debug_bounds("provider-add").expect("the add control");
+    cx.simulate_click(add.center(), Modifiers::default());
+    draw_until(cx, "the custom route segment", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("add-route-Custom").is_some()
+    });
+    let custom = cx
+        .debug_bounds("add-route-Custom")
+        .expect("the custom route");
+    cx.simulate_click(custom.center(), Modifiers::default());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.add_route.update(cx, |input, cx| {
+                input.set_value("acme".to_string(), window, cx)
+            });
+            this.add_display.update(cx, |input, cx| {
+                input.set_value("Acme".to_string(), window, cx)
+            });
+            this.add_base_url.update(cx, |input, cx| {
+                input.set_value("https://acme.example/v1".to_string(), window, cx)
+            });
+        });
+    });
+    scroll_settings(&shell, cx, true);
+    let responses = cx
+        .debug_bounds("api-mode-responses")
+        .expect("the add card offers the protocol segments");
+    cx.simulate_click(responses.center(), Modifiers::default());
+    let create = cx.debug_bounds("add-create").expect("the create action");
+    cx.simulate_click(create.center(), Modifiers::default());
+    let (created, mode) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.state.draft().global.providers.contains_key("acme"),
+            shell.state.draft().global.family_protocol_of("acme"),
+        )
+    });
+    assert!(created, "the provider lands");
+    assert_eq!(
+        mode, "responses",
+        "the protocol picked on the add card is the one the provider speaks"
+    );
+}
+
+/// A taken id is not a dead end: the card offers the existing provider's
+/// editor, the typed connection travels into it, and Apply lands the gateway
+/// on the provider that already owns the id.
+#[gpui::test]
+fn a_taken_id_hands_the_typed_connection_to_the_provider_editor(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("taken-id", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            seed_provider(
+                &mut this.state.draft_mut().global,
+                "openai",
+                "https://api.openai.com/v1",
+            );
+        });
+    });
+    scroll_settings(&shell, cx, true);
+    let add = cx.debug_bounds("provider-add").expect("the add control");
+    cx.simulate_click(add.center(), Modifiers::default());
+    scroll_settings(&shell, cx, false);
+    draw_until(cx, "the custom route segment", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("add-route-Custom").is_some()
+    });
+    let custom = cx
+        .debug_bounds("add-route-Custom")
+        .expect("the custom route");
+    cx.simulate_click(custom.center(), Modifiers::default());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.add_route.update(cx, |input, cx| {
+                input.set_value("openai".to_string(), window, cx)
+            });
+            this.add_display.update(cx, |input, cx| {
+                input.set_value("My OpenAI".to_string(), window, cx)
+            });
+            this.add_base_url.update(cx, |input, cx| {
+                input.set_value("https://gw.example/v1".to_string(), window, cx)
+            });
+        });
+    });
+    draw_until(cx, "the taken-id edit link", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("add-edit-taken").is_some()
+    });
+    let link = cx
+        .debug_bounds("add-edit-taken")
+        .expect("a taken id offers the existing provider's editor");
+    cx.simulate_click(link.center(), Modifiers::default());
+    let (open, editing, url) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.models_add_open,
+            shell.state.editing_provider.clone(),
+            shell.add_base_url.read(cx).value().to_string(),
+        )
+    });
+    assert!(!open, "the add card closes");
+    assert_eq!(
+        editing.as_deref(),
+        Some("openai"),
+        "the existing provider's editor opens"
+    );
+    assert_eq!(
+        url, "https://gw.example/v1",
+        "the typed gateway travels into the editor"
+    );
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.apply_provider_edit("openai", window, cx)
+        });
+    });
+    let stored = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .draft()
+            .global
+            .providers
+            .get("openai")
+            .expect("the provider")
+            .base_url
+            .clone()
+    });
+    assert_eq!(
+        stored, "https://gw.example/v1",
+        "Apply lands the gateway on the provider that owns the id"
+    );
+}
+
+/// Opening the add card starts from empty fields: a previous editor's values
+/// never leak into a fresh create.
+#[gpui::test]
+fn opening_the_add_card_clears_stale_form_fields(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("stale-add", 1);
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("models"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.add_route.update(cx, |input, cx| {
+                input.set_value("stale".to_string(), window, cx)
+            });
+            this.add_display.update(cx, |input, cx| {
+                input.set_value("Stale".to_string(), window, cx)
+            });
+            this.add_base_url.update(cx, |input, cx| {
+                input.set_value("https://stale.example".to_string(), window, cx)
+            });
+        });
+    });
+    let add = cx.debug_bounds("provider-add").expect("the add control");
+    cx.simulate_click(add.center(), Modifiers::default());
+    let (route, url, name) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.add_route.read(cx).value().to_string(),
+            shell.add_base_url.read(cx).value().to_string(),
+            shell.add_display.read(cx).value().to_string(),
+        )
+    });
+    assert_eq!(route, "", "the id field starts empty");
+    assert_eq!(url, "", "the address field starts empty");
+    assert_eq!(name, "", "the name field starts empty");
 }
 
 /// The display-name label resolves in both dictionaries, so the field never
@@ -11825,6 +12042,10 @@ fn the_provider_form_keys_resolve_in_both_locales() {
         "settings.providerNeedsModel",
         "settings.providerIdRequired",
         "settings.providerIdTaken",
+        "settings.providerIdTakenEdit",
+        "settings.models.customRouteInvalid",
+        "settings.customRouteHint",
+        "settings.apiModeHint",
         "settings.models.customNeedsBaseUrl",
         "settings.editProvider",
         "settings.saveProvider",

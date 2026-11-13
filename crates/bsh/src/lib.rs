@@ -117,36 +117,6 @@ pub fn unknown_launch_command(args: &[String]) -> Option<String> {
     Some(first.clone())
 }
 
-#[cfg(test)]
-mod launch_command_tests {
-    use super::unknown_launch_command;
-
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
-    }
-
-    #[test]
-    fn known_commands_are_not_typos() {
-        for value in ["ext", "federation", "fed"] {
-            assert_eq!(unknown_launch_command(&args(&[value])), None, "{value}");
-        }
-    }
-
-    #[test]
-    fn flags_are_not_commands() {
-        assert_eq!(unknown_launch_command(&args(&["--settings=tools"])), None);
-        assert_eq!(unknown_launch_command(&args(&[])), None);
-    }
-
-    #[test]
-    fn a_misspelt_command_is_reported() {
-        assert_eq!(
-            unknown_launch_command(&args(&["federaton", "--profile", "work"])),
-            Some("federaton".to_string())
-        );
-    }
-}
-
 /// Run one `bsh federation` command, profile-aware.
 ///
 /// `--profile NAME` (or `-p`) selects which node's files the command reads or
@@ -260,4 +230,34 @@ pub fn run() {
     // that pair of braces rather than the only guarantee.
     caps::stop_bridge_pool();
     crate::extension::shutdown();
+}
+
+#[cfg(test)]
+mod launch_command_tests {
+    use super::unknown_launch_command;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn known_commands_are_not_typos() {
+        for value in ["ext", "federation", "fed"] {
+            assert_eq!(unknown_launch_command(&args(&[value])), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn flags_are_not_commands() {
+        assert_eq!(unknown_launch_command(&args(&["--settings=tools"])), None);
+        assert_eq!(unknown_launch_command(&args(&[])), None);
+    }
+
+    #[test]
+    fn a_misspelt_command_is_reported() {
+        assert_eq!(
+            unknown_launch_command(&args(&["federaton", "--profile", "work"])),
+            Some("federaton".to_string())
+        );
+    }
 }

@@ -2470,8 +2470,15 @@ async fn the_discovery_paragraph_appears_only_when_a_tool_is_withheld() {
     let _ = agent.react("task".to_string()).await;
     let guided = seen.lock().unwrap().clone().expect("a persona");
     assert!(
-        guided.starts_with(crate::agent::prompts::DISCOVERY_PRIORITY),
-        "the way back to a withheld tool is the prompt's first section"
+        guided.starts_with(crate::agent::prompts::HARNESS_IDENTITY),
+        "identity opens the prompt"
+    );
+    assert_eq!(
+        guided
+            .matches(crate::agent::prompts::HARNESS_IDENTITY)
+            .count(),
+        1,
+        "the identity line is not duplicated by the assembly"
     );
     assert!(
         guided.contains(crate::agent::prompts::DISCOVERY_GUIDANCE),
@@ -2483,9 +2490,12 @@ async fn the_discovery_paragraph_appears_only_when_a_tool_is_withheld() {
     let contract = guided
         .find(crate::agent::prompts::WORKFLOW_GUIDANCE)
         .expect("the standing contract");
+    let identity = guided
+        .find(crate::agent::prompts::HARNESS_IDENTITY)
+        .expect("the identity line");
     assert!(
-        priority < contract,
-        "discovery is read before the standing contract, not after it"
+        identity < priority && priority < contract,
+        "identity opens, discovery precedes the standing contract"
     );
 }
 
@@ -2514,8 +2524,12 @@ async fn the_skill_paragraph_opens_the_prompt_when_skills_are_searched() {
     let _ = agent.react("task".to_string()).await;
     let guided = seen.lock().unwrap().clone().expect("a persona");
     assert!(
-        guided.starts_with(crate::agent::prompts::DISCOVERY_PRIORITY),
-        "a searched skill is announced first"
+        guided.starts_with(crate::agent::prompts::HARNESS_IDENTITY),
+        "identity opens the prompt"
+    );
+    assert!(
+        guided.contains(crate::agent::prompts::DISCOVERY_PRIORITY),
+        "a searched skill is announced before the work starts"
     );
     assert!(guided.contains(crate::agent::prompts::SKILL_DISCOVERY_GUIDANCE));
     assert!(
@@ -3366,6 +3380,117 @@ fn build_vendor_keeps_openai_as_the_unprefixed_default() {
     let (name, vendor) = super::llm::build_vendor(&config);
     assert_eq!(name, "openai");
     assert_eq!(vendor.provider_name(), "openai");
+}
+
+/// A custom provider prefix keeps the OpenAI-compatible transport, and the
+/// configured Anthropic protocol reaches the wire as Messages: the gateway
+/// scenario the Models pane's protocol picker configures.
+#[tokio::test]
+async fn a_custom_prefix_honors_the_anthropic_protocol_on_the_wire() {
+    use react::llm::{ApiMode, Content, LlmRequest};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Default)]
+    struct Captured {
+        path: String,
+        x_api_key: String,
+    }
+    let captured = Arc::new(Mutex::new(Vec::<Captured>::new()));
+    let sink = Arc::clone(&captured);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let head_end = loop {
+                    let Ok(n) = socket.read(&mut tmp).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                let mut lines = head.lines();
+                let path = lines
+                    .next()
+                    .unwrap_or_default()
+                    .split(' ')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let x_api_key = lines
+                    .find_map(|line| {
+                        let (n, v) = line.split_once(':')?;
+                        n.trim()
+                            .eq_ignore_ascii_case("x-api-key")
+                            .then(|| v.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                sink.lock()
+                    .expect("lock")
+                    .push(Captured { path, x_api_key });
+                let sse = concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"gateway says hi\"}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse.len(),
+                    sse
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+
+    let config = AgentConfig {
+        name: "gateway-agent".to_string(),
+        model: "gateway/m".to_string(),
+        base_url: format!("http://{addr}"),
+        api_key: "test-key".to_string(),
+        api_mode: "anthropic".to_string(),
+        ..Default::default()
+    };
+    let (name, vendor) = super::llm::build_vendor(&config);
+    assert_eq!(name, "gateway", "the custom prefix is the router key");
+    let outcome = vendor
+        .complete(
+            None,
+            LlmRequest {
+                model: "m".to_string(),
+                input: Content::text("hi"),
+                api_mode: ApiMode::Anthropic,
+                ..Default::default()
+            },
+            &mut crate::agent::context::AgentSession::new(),
+            &mut crate::agent::context::AgentReactContext::default(),
+        )
+        .await
+        .expect("a custom gateway speaks the configured protocol");
+    assert_eq!(outcome.text(), Some("gateway says hi"));
+    let seen = captured.lock().expect("lock");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/v1/messages");
+    assert_eq!(seen[0].x_api_key, "test-key");
 }
 
 /// The summarizer seam both the manual command and the automatic pressure

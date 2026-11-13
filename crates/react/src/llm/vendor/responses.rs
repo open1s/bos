@@ -913,7 +913,7 @@ impl ResponsesTransport {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            let err = LlmError::Http(format!("HTTP {}: {}", status, body));
+            let err = LlmError::Http(format!("HTTP {}: {} (endpoint: {})", status, body, url));
             context.notify_error(&err);
             return Err(err);
         }
@@ -972,7 +972,7 @@ impl ResponsesTransport {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            let err = LlmError::Other(format!("HTTP {}: {}", status, body));
+            let err = LlmError::Other(format!("HTTP {}: {} (endpoint: {})", status, body, url));
             context.notify_error(&err);
             return Err(err);
         }

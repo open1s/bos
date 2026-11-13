@@ -1294,9 +1294,10 @@ fn build_agent_for_session_inner(
     }
 
     // Agent-authored interfaces. Available whenever the turn may write, and
-    // still answerable to the reader's per-tool switches: a presented surface
-    // is a proposal the reader can close, not authority.
-    if writes {
+    // still answerable to the reader's per-tool switches and to the preset's
+    // bundle list: a presented surface is a proposal the reader can close,
+    // not authority, and a shell-only preset keeps no surface tool.
+    if writes && !off_bundle("surface") {
         let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
         for tool in surface_tools() {
             if off_tool(tool.name()) {
@@ -4555,11 +4556,11 @@ pub(crate) fn grep_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "grep",
-        "Search code (file contents) with a ripgrep pattern, a regular expression. Returns each matching line with its file and 1-based line number. path may be a directory, searched recursively, or a single file, which is always searched whatever its ignore status or include glob. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set. Matching is case-sensitive unless case_insensitive is set. include takes one glob filter for the walk (negation unsupported); invert reports the lines that do NOT match; context adds that many lines on each side of a match; files_without_match returns the paths of files with no match; text searches binary files as text.",
+        "Search file contents with a ripgrep regular expression; returns each matching line with its file and 1-based line number. A named file is always searched; directories skip ignored, hidden and dependency/build trees unless include_ignored. Case-sensitive unless case_insensitive.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "pattern": { "type": "string", "minLength": 1, "description": "Ripgrep-compatible regular expression to match against file contents. Escape regex metacharacters when searching for them literally." },
+                "pattern": { "type": "string", "minLength": 1, "description": "Ripgrep regular expression; escape metacharacters to search them literally." },
                 "path": { "type": "string", "description": "File or directory to search. Directories are searched recursively; a named file is searched directly. Defaults to the workspace root." },
                 "case_insensitive": { "type": "boolean", "description": "Match without case sensitivity. Defaults to false." },
                 "include_ignored": { "type": "boolean", "description": "Include hidden, ignored, dependency and build paths normally skipped. Use only when the default search is insufficient." },
@@ -5381,7 +5382,7 @@ fn sed_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "sed",
-        "Apply one sed program to a workspace file. The program processes a private copy and replaces the file by rename, so a failed script leaves the original untouched. Output is GNU's in-place output: the automatic print and p, P, =, l, F and s///p all write to the edited file, so quiet=true plus '/pattern/p' filters the file to matching lines. backup_suffix keeps the original at path + suffix, like sed -iSUFFIX. dry_run=true returns the resulting text instead of writing. The engine's sandbox is always on, so e, r, R, w and W are refused. Prefer edit_file when the exact text is known; use sed for a global, pattern-based or line-addressed change.",
+        "Apply one sed program to a workspace file over a private copy, replacing by rename so a failed script leaves the original untouched. GNU in-place output: the automatic print and p, P, =, l, F and s///p write to the file. e, r, R, w and W are refused. Prefer edit_file when the exact text is known.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -5675,21 +5676,24 @@ fn surface_tools() -> Vec<Arc<dyn agent::tools::Tool>> {
         },
     )));
 
-    tools.push(Arc::new(FunctionTool::new(
-        "close_surface",
-        "Close a surface you presented.",
-        serde_json::json!({
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false
-        }),
-        |args| {
-            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
-            let closed = crate::extension::agent_surface::close(id);
-            Ok(serde_json::json!({ "id": id, "closed": closed }))
-        },
-    )));
+    tools.push(Arc::new(
+        FunctionTool::new(
+            "close_surface",
+            "Close a surface you presented.",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            |args| {
+                let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+                let closed = crate::extension::agent_surface::close(id);
+                Ok(serde_json::json!({ "id": id, "closed": closed }))
+            },
+        )
+        .with_deferred(true),
+    ));
 
     tools.push(Arc::new(FunctionTool::new(
         "surface_catalogue",
@@ -8840,6 +8844,7 @@ mod tests {
             vec![
                 "apply_patch".to_string(),
                 "bash".to_string(),
+                "close_surface".to_string(),
                 "diagnostics__graph".to_string(),
                 "diagnostics__why".to_string(),
                 "edit_file".to_string(),
@@ -8857,6 +8862,8 @@ mod tests {
                 "job_list".to_string(),
                 "job_output".to_string(),
                 "list_dir".to_string(),
+                "patch_surface".to_string(),
+                "present_surface".to_string(),
                 "read_file".to_string(),
                 "read_files".to_string(),
                 "schedule_create".to_string(),
@@ -8864,12 +8871,13 @@ mod tests {
                 "schedule_edit".to_string(),
                 "schedule_list".to_string(),
                 "sed".to_string(),
+                "surface_catalogue".to_string(),
                 "update_plan".to_string(),
                 "write_file".to_string(),
             ],
             "Workspace Write carries the whole shell family, including the \
              job tools its own read-write turn may start, the federation \
-             family and the automation-task tools"
+             family, the automation-task tools and the surface family"
         );
         assert_eq!(
             names(&read_only),
