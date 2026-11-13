@@ -316,7 +316,6 @@ impl Runner {
             // composed, the runtime snapshot and the workspace instructions this
             // turn carried. Recorded on the prompt row, display only.
             {
-                use crate::context_assembly::{ContextAssemblyReport, ContextSource, SourceStatus};
                 let mut injections: Vec<crate::model::ContextInjection> = Vec::new();
                 // The whole system prompt the turn will send - persona plus the
                 // discovery block, live sections and recalled memory - so the
@@ -326,51 +325,15 @@ impl Runner {
                 // Per-request assembly diagnostics (issue #336): a privacy-
                 // conscious account of what reached the model - counts, labels
                 // and token estimates, never raw memory or workspace content.
-                let memory_recalled = persona.contains("Relevant memory:");
-                let retrieval_hits = if memory_recalled {
-                    persona
-                        .split("Relevant memory:")
-                        .nth(1)
-                        .map(|block| block.lines().filter(|l| l.starts_with("- ")).count())
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-                let retrieval_skip = if input.retrieval_text().is_none() {
-                    Some("no usable text query".to_string())
-                } else if !memory_state.is_ready() {
-                    Some(format!("memory {}", memory_state.label()))
-                } else if retrieval_hits == 0 {
-                    Some("no matching items".to_string())
-                } else {
-                    None
-                };
-                let persona_tokens = agent::agent::context::estimate_tokens(&persona);
-                let snapshot_tokens = agent::agent::context::estimate_tokens(&context.snapshot);
-                let instruction_tokens = context
-                    .instructions
-                    .as_deref()
-                    .map(agent::agent::context::estimate_tokens)
-                    .unwrap_or(0);
-                // Memory and tool guidance ride inside the system prompt, so
-                // their tokens are already counted in persona_tokens.
-                let sources = vec![
-                    SourceStatus { source: ContextSource::Persona, included: !persona.trim().is_empty(), reason: None, tokens: persona_tokens },
-                    SourceStatus { source: ContextSource::HostRuntime, included: !context.snapshot.is_empty(), reason: None, tokens: snapshot_tokens },
-                    SourceStatus { source: ContextSource::WorkspaceInstructions, included: context.instructions.is_some(), reason: context.instructions.is_none().then(|| "no instruction file".to_string()), tokens: instruction_tokens },
-                    SourceStatus { source: ContextSource::RetrievedMemory, included: memory_recalled, reason: retrieval_skip.clone(), tokens: 0 },
-                    SourceStatus { source: ContextSource::ToolGuidance, included: !persona_complete, reason: persona_complete.then(|| "complete persona".to_string()), tokens: 0 },
-                    SourceStatus { source: ContextSource::UserInput, included: true, reason: None, tokens: agent::agent::context::estimate_tokens(input.as_text().unwrap_or_default()) },
-                ];
-                let report = ContextAssemblyReport {
+                let report = crate::context_assembly::assemble_report(
                     persona_complete,
-                    fingerprint: ContextAssemblyReport::compute_fingerprint(persona_complete, &sources, &memory_state),
-                    sources,
-                    memory: memory_state.clone(),
-                    retrieval_hits,
-                    retrieval_skip,
-                    estimated_tokens: persona_tokens + snapshot_tokens + instruction_tokens,
-                };
+                    &persona,
+                    &context.snapshot,
+                    context.instructions.as_deref(),
+                    &memory_state,
+                    input.retrieval_text().is_some(),
+                    agent::agent::context::estimate_tokens(input.as_text().unwrap_or_default()),
+                );
                 log::info!(
                     target: "bsh::context",
                     "context assembly: persona_complete={} memory={} retrieval_hits={} est_tokens={} fingerprint={:016x} retrieval_skip={}",

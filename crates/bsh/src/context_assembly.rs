@@ -173,6 +173,100 @@ impl ContextAssemblyReport {
     }
 }
 
+/// Build the per-request assembly report from what actually reached the model
+/// (issue #336). Extracted from the runner so the inclusion/omission, retrieval
+/// and token accounting are testable across success, missing-source, retrieval-
+/// failure and complete-persona cases. Counts and labels only - no raw content.
+pub(crate) fn assemble_report(
+    persona_complete: bool,
+    persona: &str,
+    snapshot: &str,
+    instructions: Option<&str>,
+    memory_state: &MemoryState,
+    has_query: bool,
+    user_input_tokens: usize,
+) -> ContextAssemblyReport {
+    let memory_recalled = persona.contains("Relevant memory:");
+    let retrieval_hits = if memory_recalled {
+        persona
+            .split("Relevant memory:")
+            .nth(1)
+            .map(|block| block.lines().filter(|l| l.starts_with("- ")).count())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let retrieval_skip = if !has_query {
+        Some("no usable text query".to_string())
+    } else if !memory_state.is_ready() {
+        Some(format!("memory {}", memory_state.label()))
+    } else if retrieval_hits == 0 {
+        Some("no matching items".to_string())
+    } else {
+        None
+    };
+    let persona_tokens = agent::agent::context::estimate_tokens(persona);
+    let snapshot_tokens = agent::agent::context::estimate_tokens(snapshot);
+    let instruction_tokens = instructions
+        .map(agent::agent::context::estimate_tokens)
+        .unwrap_or(0);
+    // Memory and tool guidance ride inside the system prompt, so their tokens
+    // are already counted in persona_tokens.
+    let sources = vec![
+        SourceStatus {
+            source: ContextSource::Persona,
+            included: !persona.trim().is_empty(),
+            reason: None,
+            tokens: persona_tokens,
+        },
+        SourceStatus {
+            source: ContextSource::HostRuntime,
+            included: !snapshot.is_empty(),
+            reason: None,
+            tokens: snapshot_tokens,
+        },
+        SourceStatus {
+            source: ContextSource::WorkspaceInstructions,
+            included: instructions.is_some(),
+            reason: instructions
+                .is_none()
+                .then(|| "no instruction file".to_string()),
+            tokens: instruction_tokens,
+        },
+        SourceStatus {
+            source: ContextSource::RetrievedMemory,
+            included: memory_recalled,
+            reason: retrieval_skip.clone(),
+            tokens: 0,
+        },
+        SourceStatus {
+            source: ContextSource::ToolGuidance,
+            included: !persona_complete,
+            reason: persona_complete.then(|| "complete persona".to_string()),
+            tokens: 0,
+        },
+        SourceStatus {
+            source: ContextSource::UserInput,
+            included: true,
+            reason: None,
+            tokens: user_input_tokens,
+        },
+    ];
+    ContextAssemblyReport {
+        persona_complete,
+        fingerprint: ContextAssemblyReport::compute_fingerprint(
+            persona_complete,
+            &sources,
+            memory_state,
+        ),
+        sources,
+        memory: memory_state.clone(),
+        retrieval_hits,
+        retrieval_skip,
+        estimated_tokens: persona_tokens + snapshot_tokens + instruction_tokens,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +335,98 @@ mod tests {
         other[0].tokens = 999;
         let d = ContextAssemblyReport::compute_fingerprint(false, &other, &MemoryState::Ready);
         assert_eq!(a, d, "the fingerprint names the composition, not the size");
+    }
+
+    /// The report reflects the assembled request across success, missing
+    /// sources, retrieval failure and complete-persona cases (issue #336).
+    #[test]
+    fn report_covers_success_missing_sources_failure_and_complete() {
+        let source = |r: &ContextAssemblyReport, s: ContextSource| {
+            r.sources.iter().find(|x| x.source == s).unwrap().clone()
+        };
+
+        // Successful assembly: memory recalled, instructions present.
+        let persona = "PERSONA\n\nRelevant memory:\n- a note\n- another";
+        let r = assemble_report(
+            false,
+            persona,
+            "SNAPSHOT",
+            Some("INSTRUCTIONS"),
+            &MemoryState::Ready,
+            true,
+            5,
+        );
+        assert!(source(&r, ContextSource::RetrievedMemory).included);
+        assert_eq!(r.retrieval_hits, 2);
+        assert!(r.retrieval_skip.is_none());
+        assert!(source(&r, ContextSource::WorkspaceInstructions).included);
+        assert!(r.estimated_tokens > 0);
+
+        // Missing sources: no instruction file, no matching memory.
+        let r = assemble_report(
+            false,
+            "PERSONA",
+            "SNAPSHOT",
+            None,
+            &MemoryState::Empty,
+            true,
+            5,
+        );
+        let instr = source(&r, ContextSource::WorkspaceInstructions);
+        assert!(!instr.included);
+        assert_eq!(instr.reason.as_deref(), Some("no instruction file"));
+        assert_eq!(r.retrieval_hits, 0);
+        assert_eq!(r.retrieval_skip.as_deref(), Some("no matching items"));
+
+        // Retrieval skipped: no usable query (a media-only turn).
+        let r = assemble_report(
+            false,
+            "PERSONA",
+            "SNAPSHOT",
+            None,
+            &MemoryState::Ready,
+            false,
+            0,
+        );
+        assert_eq!(r.retrieval_skip.as_deref(), Some("no usable text query"));
+
+        // Retrieval unavailable: memory failed to initialize.
+        let r = assemble_report(
+            false,
+            "PERSONA",
+            "SNAPSHOT",
+            None,
+            &MemoryState::InitFailed { reason: "x".into() },
+            true,
+            5,
+        );
+        assert_eq!(r.retrieval_skip.as_deref(), Some("memory init-failed"));
+
+        // Complete persona: tool guidance omitted, mode reported.
+        let r = assemble_report(
+            true,
+            "PERSONA",
+            "SNAPSHOT",
+            None,
+            &MemoryState::Disabled,
+            true,
+            5,
+        );
+        let guidance = source(&r, ContextSource::ToolGuidance);
+        assert!(!guidance.included);
+        assert_eq!(guidance.reason.as_deref(), Some("complete persona"));
+        assert!(r.persona_complete);
+    }
+
+    /// Composition is deterministic and bounded: equivalent inputs give the
+    /// same fingerprint, and the report never carries raw content (issue #337).
+    #[test]
+    fn composition_is_deterministic_and_bounded() {
+        let a = assemble_report(false, "P", "S", Some("I"), &MemoryState::Ready, true, 3);
+        let b = assemble_report(false, "P", "S", Some("I"), &MemoryState::Ready, true, 3);
+        assert_eq!(a.fingerprint, b.fingerprint);
+        assert_eq!(a.estimated_tokens, b.estimated_tokens);
+        // The report is an account of counts/labels, not a copy of the content.
+        assert_eq!(a.sources.len(), 6, "one status per context source");
     }
 }

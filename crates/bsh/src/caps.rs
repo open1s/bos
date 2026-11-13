@@ -7670,6 +7670,10 @@ mod tests {
             "the harness execution footer remains"
         );
         assert!(
+            prompt.contains(crate::prompts::HARNESS_CONTEXT),
+            "the host-owned runtime contract survives complete mode (issue #332)"
+        );
+        assert!(
             !prompt.contains(agent::HARNESS_IDENTITY),
             "the identity layer is omitted"
         );
@@ -8614,7 +8618,7 @@ mod tests {
         // Missing file -> ready but empty (NotFound is not a failure).
         settings.workspace.agent.memory_path =
             Some(dir.join("missing.jsonl").to_string_lossy().into_owned());
-        let (memory, state) = open_memory(&settings);
+        let (memory, state) = super::open_memory(&settings);
         assert!(memory.is_some(), "a missing file opens an empty store");
         assert_eq!(state, MemoryState::Empty);
 
@@ -8622,7 +8626,7 @@ mod tests {
         let bad = dir.join("bad.jsonl");
         std::fs::write(&bad, "this is not json").expect("write");
         settings.workspace.agent.memory_path = Some(bad.to_string_lossy().into_owned());
-        let (memory, state) = open_memory(&settings);
+        let (memory, state) = super::open_memory(&settings);
         assert!(memory.is_none(), "a malformed store is not attached");
         assert!(
             matches!(state, MemoryState::InitFailed { .. }),
@@ -8631,14 +8635,9 @@ mod tests {
 
         // Valid file with an item -> ready.
         let good = dir.join("good.jsonl");
-        std::fs::write(
-            &good,
-            "{"id":"1","content":"a note","created_at_ms":0}
-",
-        )
-        .expect("write");
+        std::fs::write(&good, r#"{"id":"1","content":"a note","created_at_ms":0}"#).expect("write");
         settings.workspace.agent.memory_path = Some(good.to_string_lossy().into_owned());
-        let (memory, state) = open_memory(&settings);
+        let (memory, state) = super::open_memory(&settings);
         assert!(memory.is_some());
         assert_eq!(state, MemoryState::Ready);
 
