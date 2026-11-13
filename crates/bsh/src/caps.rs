@@ -600,6 +600,10 @@ pub(crate) struct BuiltAgent {
     /// recorded when the turn ends; a build without a goal (a pricing build, or
     /// a session that never set one) carries none.
     pub(crate) goal: Option<GoalStore>,
+    /// The memory lifecycle state this build resolved (issue #334): disabled,
+    /// ready, empty, or an initialization failure that is surfaced rather than
+    /// silently dropping the feature.
+    pub(crate) memory_state: crate::context_assembly::MemoryState,
 }
 
 impl BuiltAgent {
@@ -850,6 +854,16 @@ fn build_agent_for_session_inner(
     let mut system_prompt =
         agent::prompts::compose_system_prompt_with(eff.llm_system_prompt(), persona_complete);
     if persona_complete {
+        // A complete persona replaces the identity, workflow and per-tool
+        // guidance, but NOT the host-owned runtime contract (issue #332): the
+        // session/workspace semantics and stop/queue behavior stay, ahead of
+        // the execution footer so the footer remains the closing section.
+        system_prompt.push_str(
+            "
+
+",
+        );
+        system_prompt.push_str(crate::prompts::HARNESS_CONTEXT);
         system_prompt.push_str(crate::prompts::COMPLETE_PERSONA_CONTRACT);
     }
     let mut config = AgentConfig {
@@ -1562,11 +1576,15 @@ fn build_agent_for_session_inner(
         }
     }
 
-    if eff.memory_enabled {
-        if let Some(memory) = open_memory(settings) {
+    let memory_state = if eff.memory_enabled {
+        let (memory, state) = open_memory(settings);
+        if let Some(memory) = memory {
             agent = agent.with_memory(memory);
         }
-    }
+        state
+    } else {
+        crate::context_assembly::MemoryState::Disabled
+    };
 
     let mut task_subagents: Option<Arc<SubagentContext>> = None;
     if let Some((parent, registry)) = subagents {
@@ -1818,6 +1836,7 @@ fn build_agent_for_session_inner(
         policy,
         effective: eff,
         goal: goal_store,
+        memory_state,
     };
     built.start_live_driver();
     if let Some(snapshot) = &built.snapshot {
@@ -5970,28 +5989,57 @@ fn describe_schedule_request(request: &crate::schedule::ScheduleRequest) -> serd
 ///
 /// FileMemory::open is async while the build is sync and may run inside an
 /// async context, so the open happens on its own current-thread runtime.
-fn open_memory(settings: &Settings) -> Option<Arc<dyn MemoryStore>> {
+fn open_memory(
+    settings: &Settings,
+) -> (
+    Option<Arc<dyn MemoryStore>>,
+    crate::context_assembly::MemoryState,
+) {
+    use crate::context_assembly::MemoryState;
     // A test that builds a bare Settings has no redirect. Attaching nothing is
     // the only safe answer: memory_file would otherwise fall back to the
     // reader's own ~/.bos/bsh/memory.jsonl, which no test owns and several
     // tests inside one process would share. A settings document opened from a
     // scratch root (the normal test path) still gets its own scratch file.
     if cfg!(test) && settings.save_root.is_none() {
-        return None;
+        return (None, MemoryState::Disabled);
     }
     let path = settings.memory_file();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let opened = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok()
-            .and_then(|rt| rt.block_on(FileMemory::open(path)).ok())
-            .map(|memory| memory.with_max_items(500));
-        let _ = tx.send(opened);
+        // The failure reason is retained, not dropped to an Option (issue
+        // #334): an enabled memory that cannot open is surfaced, not silently
+        // disabled. The reason names the path and the error, never the content.
+        let result = (|| -> Result<(FileMemory, MemoryState), String> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("could not start the memory runtime: {e}"))?;
+            let memory = rt
+                .block_on(FileMemory::open(&path))
+                .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+            let memory = memory.with_max_items(500);
+            let state = if rt.block_on(memory.is_empty()) {
+                MemoryState::Empty
+            } else {
+                MemoryState::Ready
+            };
+            Ok((memory, state))
+        })();
+        let _ = tx.send(result);
     });
-    let opened = rx.recv().ok().flatten()?;
-    Some(Arc::new(opened) as Arc<dyn MemoryStore>)
+    match rx.recv() {
+        Ok(Ok((memory, state))) => (Some(Arc::new(memory) as Arc<dyn MemoryStore>), state),
+        Ok(Err(reason)) => {
+            log::warn!("memory is enabled but unavailable: {reason}");
+            (None, MemoryState::InitFailed { reason })
+        }
+        Err(_) => {
+            let reason = "the memory open thread did not return".to_string();
+            log::warn!("memory is enabled but unavailable: {reason}");
+            (None, MemoryState::InitFailed { reason })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8553,6 +8601,50 @@ mod tests {
     }
 
     /// A scratch directory no other test shares.
+    /// Memory lifecycle states are distinguishable (issue #334): a missing file
+    /// opens empty, a malformed file is a surfaced init failure, and a valid
+    /// file is ready. A failure never silently disables the feature.
+    #[test]
+    fn memory_open_states_are_distinguishable() {
+        use crate::context_assembly::MemoryState;
+        let dir = scratch("memory-states");
+        let mut settings = bare();
+        settings.save_root = Some(dir.clone());
+
+        // Missing file -> ready but empty (NotFound is not a failure).
+        settings.workspace.agent.memory_path =
+            Some(dir.join("missing.jsonl").to_string_lossy().into_owned());
+        let (memory, state) = open_memory(&settings);
+        assert!(memory.is_some(), "a missing file opens an empty store");
+        assert_eq!(state, MemoryState::Empty);
+
+        // Malformed file -> init failure, surfaced rather than silent.
+        let bad = dir.join("bad.jsonl");
+        std::fs::write(&bad, "this is not json").expect("write");
+        settings.workspace.agent.memory_path = Some(bad.to_string_lossy().into_owned());
+        let (memory, state) = open_memory(&settings);
+        assert!(memory.is_none(), "a malformed store is not attached");
+        assert!(
+            matches!(state, MemoryState::InitFailed { .. }),
+            "the failure is surfaced: {state:?}"
+        );
+
+        // Valid file with an item -> ready.
+        let good = dir.join("good.jsonl");
+        std::fs::write(
+            &good,
+            "{"id":"1","content":"a note","created_at_ms":0}
+",
+        )
+        .expect("write");
+        settings.workspace.agent.memory_path = Some(good.to_string_lossy().into_owned());
+        let (memory, state) = open_memory(&settings);
+        assert!(memory.is_some());
+        assert_eq!(state, MemoryState::Ready);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn scratch(label: &str) -> std::path::PathBuf {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/bsh-caps-skill-tests")

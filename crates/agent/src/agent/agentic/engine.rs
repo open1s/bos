@@ -481,6 +481,16 @@ impl Agent {
     /// Non-text input (images/audio only) has no query to match against, so
     /// it uses the composed prompt unchanged.
     async fn system_prompt_for(&self, task: &Content, tools: &[react::llm::LlmTool]) -> String {
+        // One assembly per task: the inject event and the request share it, so
+        // the memory recall is not paid twice on the same turn.
+        let task_key = task.retrieval_text().unwrap_or_default();
+        if let Ok(cache) = self.system_prompt_cache.lock() {
+            if let Some((key, prompt)) = cache.as_ref() {
+                if *key == task_key {
+                    return prompt.clone();
+                }
+            }
+        }
         let mut base = super::discovery::prompt_block(tools);
         push_paragraph(&mut base, &self.config.system_prompt);
         if let Ok(prompts) = self.live_prompts.read() {
@@ -488,11 +498,23 @@ impl Agent {
                 push_paragraph(&mut base, prompt);
             }
         }
-        let Some(query) = task.as_text() else {
-            return base;
+        // Multimodal turns retrieve on their accompanying text, not on a
+        // pretend-text reading of the binary payload (issue #335). A turn with
+        // no usable query skips retrieval with an observable reason.
+        let result = match task.retrieval_text() {
+            Some(query) => {
+                let memory = self.recalled_context(&query).await;
+                react::template::with_memory(&base, memory.as_deref())
+            }
+            None => {
+                log::debug!("memory retrieval skipped: no usable text query in this turn");
+                base
+            }
         };
-        let memory = self.recalled_context(query).await;
-        react::template::with_memory(&base, memory.as_deref())
+        if let Ok(mut cache) = self.system_prompt_cache.lock() {
+            *cache = Some((task_key, result.clone()));
+        }
+        result
     }
 
     /// The full system prompt a turn for `task` will carry: the discovery
@@ -501,6 +523,10 @@ impl Agent {
     /// provider. A host surfacing the injection shows the whole of it, so no key
     /// info the model receives is missing from the inject event.
     pub async fn injected_system_prompt(&self, task: &Content) -> String {
+        // A fresh assembly for this turn: drop any prior turn's cached prompt.
+        if let Ok(mut cache) = self.system_prompt_cache.lock() {
+            *cache = None;
+        }
         let context = self.prepare_context();
         self.system_prompt_for(task, context.tools.as_slice()).await
     }

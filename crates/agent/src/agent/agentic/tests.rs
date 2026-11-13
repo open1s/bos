@@ -221,6 +221,107 @@ async fn injected_system_prompt_includes_recalled_memory() {
     );
 }
 
+/// A memory change invalidates the cached assembly, so the next turn's prompt
+/// recalls the new note rather than a stale cached copy.
+#[tokio::test]
+async fn injected_system_prompt_reflects_memory_changes() {
+    let memory = crate::memory::InMemoryMemory::new();
+    memory.add("alpha fact".to_string(), None).await;
+    let config = AgentConfig {
+        system_prompt: "PERSONA".to_string(),
+        ..AgentConfig::default()
+    };
+    let agent = Agent::new(config, Arc::new(LlmProvider::new())).with_memory(Arc::new(memory));
+    let query = react::llm::Content::text("fact");
+    let first = agent.injected_system_prompt(&query).await;
+    assert!(
+        first.contains("alpha fact"),
+        "first assembly recalls the note"
+    );
+    agent.remember("beta fact".to_string()).await;
+    let second = agent.injected_system_prompt(&query).await;
+    assert!(
+        second.contains("beta fact"),
+        "the memory change is reflected, not a stale cache: {second}"
+    );
+}
+/// Multimodal turns retrieve on their accompanying text; a media-only turn
+/// skips retrieval rather than treating the payload as a query (issue #335).
+#[tokio::test]
+async fn multimodal_retrieval_uses_accompanying_text() {
+    use react::llm::{Content, ContentPart};
+    let memory = crate::memory::InMemoryMemory::new();
+    memory
+        .add("the deploy target is staging".to_string(), None)
+        .await;
+    let config = AgentConfig {
+        system_prompt: "P".to_string(),
+        ..AgentConfig::default()
+    };
+    let agent = Agent::new(config, Arc::new(LlmProvider::new())).with_memory(Arc::new(memory));
+
+    // Text-only: retrieves.
+    let text = Content::text("where is the deploy target");
+    assert!(agent
+        .injected_system_prompt(&text)
+        .await
+        .contains("staging"));
+
+    // Mixed text + image: retrieves on the text part.
+    let mixed = Content::parts(vec![
+        ContentPart::Text {
+            text: "where is the deploy target".to_string(),
+        },
+        ContentPart::Binary {
+            binary: react::llm::Binary::from_url("image/png", "http://x/i.png", None),
+        },
+    ]);
+    assert!(agent
+        .injected_system_prompt(&mixed)
+        .await
+        .contains("staging"));
+
+    // Image-only: no usable query, retrieval skipped, no memory injected.
+    let image_only = Content::parts(vec![ContentPart::Binary {
+        binary: react::llm::Binary::from_url("image/png", "http://x/i.png", None),
+    }]);
+    assert!(!agent
+        .injected_system_prompt(&image_only)
+        .await
+        .contains("staging"));
+
+    // Audio-only: likewise skipped.
+    let audio_only = Content::audio("QUJD", "wav");
+    assert!(!agent
+        .injected_system_prompt(&audio_only)
+        .await
+        .contains("staging"));
+}
+
+/// retrieval_text extracts text parts and never reads binary as text.
+#[test]
+fn retrieval_text_scopes_to_text_parts() {
+    use react::llm::{Content, ContentPart};
+    assert_eq!(
+        Content::text("hello").retrieval_text().as_deref(),
+        Some("hello")
+    );
+    let mixed = Content::parts(vec![
+        ContentPart::Text {
+            text: "one".to_string(),
+        },
+        ContentPart::Binary {
+            binary: react::llm::Binary::from_url("image/png", "http://x/i.png", None),
+        },
+        ContentPart::Text {
+            text: "two".to_string(),
+        },
+    ]);
+    assert_eq!(mixed.retrieval_text().as_deref(), Some("one two"));
+    let image_only = Content::image("http://x/i.png");
+    assert_eq!(image_only.retrieval_text(), None);
+}
+
 // =========================================================================
 // AgentConfig Tests
 // =========================================================================

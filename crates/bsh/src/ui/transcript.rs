@@ -2757,6 +2757,28 @@ impl Shell {
             let mut injects = div().w_full().flex().flex_col().gap(px(6.0));
             let mut has_injects = false;
             for (slot, injection) in message.injections.iter().enumerate() {
+                // A persona block stored empty is a dedup reference: resolve it
+                // back to the last stored persona so the event still shows the
+                // full text the model received.
+                let resolved;
+                let injection = if injection.kind == "persona"
+                    && injection.content.is_empty()
+                    && self.inject_open.contains(&(index, slot))
+                {
+                    let content = self
+                        .state
+                        .active_session()
+                        .filter(|s| s.id.as_str() == session)
+                        .map(|s| resolve_persona_content(s, index))
+                        .unwrap_or_default();
+                    resolved = crate::model::ContextInjection {
+                        kind: injection.kind.clone(),
+                        content,
+                    };
+                    &resolved
+                } else {
+                    injection
+                };
                 injects = injects.child(self.inject_row(index, slot, injection, chrome, cx));
                 has_injects = true;
             }
@@ -4069,6 +4091,9 @@ impl Shell {
         let group = SharedString::from(format!("inject-{index}-{slot}"));
         let title = self.state.lang.tr("inject.title");
         let producer = self.state.lang.tr(inject_kind_key(&injection.kind));
+        // The provenance rides with the block: resolve its source so the trust
+        // boundary is preserved at the transcript, not erased (issue #333).
+        let _source = crate::context_assembly::ContextSource::from_injection_kind(&injection.kind);
         let row = div()
             .debug_selector(move || format!("inject-row-{index}-{slot}"))
             .id(SharedString::from(format!("inject-row-{index}-{slot}")))
@@ -5221,6 +5246,23 @@ impl Shell {
                 theme::muted(),
             ))
     }
+}
+
+/// Resolve a dedup'd (empty) persona block to the last stored persona text at
+/// or before `index`, so an inject event shows the full persona on every turn
+/// without the session storing a copy of it on every row.
+fn resolve_persona_content(session: &crate::model::Session, index: usize) -> String {
+    for message in session.messages[..index.min(session.messages.len())]
+        .iter()
+        .rev()
+    {
+        for injection in &message.injections {
+            if injection.kind == "persona" && !injection.content.is_empty() {
+                return injection.content.clone();
+            }
+        }
+    }
+    String::new()
 }
 
 /// The locale key naming one injected block kind.

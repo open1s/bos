@@ -4271,6 +4271,8 @@ impl Shell {
         // store, and the pump settles the recorded transition when the turn
         // ends, before it decides whether to continue.
         let goal_store = built.goal.clone();
+        let memory_state = built.memory_state.clone();
+        let persona_complete = built.persona_complete;
         self.state
             .attach_turn_extensions(&id, built.extension_activations);
         let agent = built.agent;
@@ -4314,10 +4316,17 @@ impl Shell {
             self.state
                 .auto_compaction_retain(&id, &transcript, appended, budget)
         };
-        let rx = self
-            .state
-            .runner
-            .spawn(&id, agent, input, transcript, facts, auto_retain, cap);
+        let rx = self.state.runner.spawn(
+            &id,
+            agent,
+            input,
+            transcript,
+            facts,
+            auto_retain,
+            cap,
+            memory_state,
+            persona_complete,
+        );
         self.pump(id, rx, cx);
         change_set
     }

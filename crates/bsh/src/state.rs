@@ -4075,10 +4075,31 @@ impl AppState {
             if session.messages[index].role != Role::User {
                 return;
             }
-            // Record every injected block on the turn that carried it. The
-            // persona is injected on every turn, so it rides every row: an
-            // inject event must not drop key info the model actually received.
-            session.messages[index].injections = injections.to_vec();
+            // Every injected block rides the turn that carried it, so the
+            // inject event never drops key info. The persona is injected every
+            // turn but rarely changes: store its full text only when it changes
+            // and carry an empty block otherwise (the transcript resolves it
+            // back to the stored text), so a long session does not keep a copy
+            // of the same system prompt on every row.
+            let mut recorded: Vec<crate::model::ContextInjection> =
+                Vec::with_capacity(injections.len());
+            for injection in injections {
+                if injection.kind == "persona" {
+                    if session.last_injected_persona.as_deref() == Some(injection.content.as_str())
+                    {
+                        recorded.push(crate::model::ContextInjection {
+                            kind: injection.kind.clone(),
+                            content: String::new(),
+                        });
+                    } else {
+                        session.last_injected_persona = Some(injection.content.clone());
+                        recorded.push(injection.clone());
+                    }
+                } else {
+                    recorded.push(injection.clone());
+                }
+            }
+            session.messages[index].injections = recorded;
         }
         self.save_session(id);
     }
@@ -6960,6 +6981,96 @@ mod tests {
         assert!(
             prompts[1].injections.iter().any(|i| i.kind == "context"),
             "the per-turn context still rides the row"
+        );
+    }
+
+    /// An unchanged persona is stored once and referenced afterwards: the second
+    /// turn's persona block is empty (a dedup reference) while the session keeps
+    /// the full text, so a long session does not store the same prompt per row.
+    #[test]
+    fn an_unchanged_persona_is_stored_once_and_referenced() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-inject-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        let id = state.active_id.clone().expect("a session");
+        let persona = crate::model::ContextInjection {
+            kind: "persona".to_string(),
+            content: "SYSTEM PROMPT".to_string(),
+        };
+        let context = crate::model::ContextInjection {
+            kind: "context".to_string(),
+            content: "SNAPSHOT".to_string(),
+        };
+        state.begin_turn_in(&id, "first").expect("a turn opens");
+        state.apply_event(
+            &id,
+            crate::runner::AgentEvent::ContextInjected {
+                injections: vec![persona.clone(), context.clone()],
+            },
+        );
+        state.begin_turn_in(&id, "second").expect("a turn opens");
+        state.apply_event(
+            &id,
+            crate::runner::AgentEvent::ContextInjected {
+                injections: vec![persona.clone(), context.clone()],
+            },
+        );
+        let session = state.store.session(&id).expect("the session");
+        let prompts: Vec<&crate::model::ChatMessage> = session
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::model::Role::User)
+            .collect();
+        let p0 = prompts[0]
+            .injections
+            .iter()
+            .find(|i| i.kind == "persona")
+            .unwrap();
+        let p1 = prompts[1]
+            .injections
+            .iter()
+            .find(|i| i.kind == "persona")
+            .unwrap();
+        assert_eq!(
+            p0.content, "SYSTEM PROMPT",
+            "the first turn stores the persona"
+        );
+        assert!(
+            p1.content.is_empty(),
+            "the unchanged persona is a dedup reference"
+        );
+        assert_eq!(
+            session.last_injected_persona.as_deref(),
+            Some("SYSTEM PROMPT")
+        );
+        // A changed persona is stored in full again.
+        state.begin_turn_in(&id, "third").expect("a turn opens");
+        let changed = crate::model::ContextInjection {
+            kind: "persona".to_string(),
+            content: "NEW PROMPT".to_string(),
+        };
+        state.apply_event(
+            &id,
+            crate::runner::AgentEvent::ContextInjected {
+                injections: vec![changed, context.clone()],
+            },
+        );
+        let session = state.store.session(&id).expect("the session");
+        let prompts: Vec<&crate::model::ChatMessage> = session
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::model::Role::User)
+            .collect();
+        let p2 = prompts[2]
+            .injections
+            .iter()
+            .find(|i| i.kind == "persona")
+            .unwrap();
+        assert_eq!(
+            p2.content, "NEW PROMPT",
+            "a changed persona is stored in full"
         );
     }
 

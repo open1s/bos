@@ -396,6 +396,11 @@ pub struct Agent {
     engine_cache: std::sync::Mutex<Option<ReActEngine<AgentReActApp>>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     context_cache: std::sync::Mutex<Option<AgentReactContext>>,
+    /// The last assembled system prompt, keyed by task text, so the inject
+    /// event and the request share one assembly instead of recalling memory
+    /// twice. Cleared per turn and whenever memory changes.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    system_prompt_cache: std::sync::Mutex<Option<(String, String)>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     last_stream_tokens: std::sync::Mutex<Option<(u64, u64)>>,
     /// Cached prompt tokens from the same stream, when the provider reported them.
@@ -470,6 +475,7 @@ impl Agent {
             plan: PlanStore::default(),
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
+            system_prompt_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
             last_stream_cache_tokens: std::sync::Mutex::new(None),
             last_stream_tool_calls: std::sync::Mutex::new(0),
@@ -862,15 +868,29 @@ impl Agent {
         metadata: Option<serde_json::Value>,
     ) -> Option<MemoryItem> {
         let memory = self.memory.as_ref()?;
-        Some(memory.add(content.into(), metadata).await)
+        let item = memory.add(content.into(), metadata).await;
+        self.invalidate_system_prompt_cache();
+        Some(item)
+    }
+
+    /// Drop the cached system prompt: a memory change alters the recalled
+    /// context the next assembly must carry.
+    fn invalidate_system_prompt_cache(&self) {
+        if let Ok(mut cache) = self.system_prompt_cache.lock() {
+            *cache = None;
+        }
     }
 
     /// Remove the memory item with `id`, returning whether it existed.
     pub async fn forget(&self, id: &str) -> bool {
-        match self.memory.as_ref() {
+        let removed = match self.memory.as_ref() {
             Some(memory) => memory.remove(id).await,
             None => false,
+        };
+        if removed {
+            self.invalidate_system_prompt_cache();
         }
+        removed
     }
 
     /// Clear the attached memory, returning whether anything was removed.
@@ -879,6 +899,9 @@ impl Agent {
             Some(memory) => {
                 let had_items = !memory.is_empty().await;
                 memory.clear().await;
+                if had_items {
+                    self.invalidate_system_prompt_cache();
+                }
                 had_items
             }
             None => false,
@@ -2167,6 +2190,7 @@ impl Clone for Agent {
             plan: self.plan.clone(),
             engine_cache: std::sync::Mutex::new(None),
             context_cache: std::sync::Mutex::new(None),
+            system_prompt_cache: std::sync::Mutex::new(None),
             last_stream_tokens: std::sync::Mutex::new(None),
             last_stream_cache_tokens: std::sync::Mutex::new(None),
             last_stream_tool_calls: std::sync::Mutex::new(0),

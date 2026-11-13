@@ -265,6 +265,8 @@ impl Runner {
         facts: crate::context::RuntimeFacts,
         auto_retain: Option<usize>,
         tool_output_cap: usize,
+        memory_state: crate::context_assembly::MemoryState,
+        persona_complete: bool,
     ) -> async_channel::Receiver<AgentEvent> {
         self.stop(session_id);
         Self::seed_session(&agent, &transcript);
@@ -314,11 +316,85 @@ impl Runner {
             // composed, the runtime snapshot and the workspace instructions this
             // turn carried. Recorded on the prompt row, display only.
             {
+                use crate::context_assembly::{ContextAssemblyReport, ContextSource, SourceStatus};
                 let mut injections: Vec<crate::model::ContextInjection> = Vec::new();
                 // The whole system prompt the turn will send - persona plus the
                 // discovery block, live sections and recalled memory - so the
                 // inject event misses no key info the model receives.
                 let persona = agent.injected_system_prompt(&input).await;
+
+                // Per-request assembly diagnostics (issue #336): a privacy-
+                // conscious account of what reached the model - counts, labels
+                // and token estimates, never raw memory or workspace content.
+                let memory_recalled = persona.contains("Relevant memory:");
+                let retrieval_hits = if memory_recalled {
+                    persona
+                        .split("Relevant memory:")
+                        .nth(1)
+                        .map(|block| block.lines().filter(|l| l.starts_with("- ")).count())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let retrieval_skip = if input.retrieval_text().is_none() {
+                    Some("no usable text query".to_string())
+                } else if !memory_state.is_ready() {
+                    Some(format!("memory {}", memory_state.label()))
+                } else if retrieval_hits == 0 {
+                    Some("no matching items".to_string())
+                } else {
+                    None
+                };
+                let persona_tokens = agent::agent::context::estimate_tokens(&persona);
+                let snapshot_tokens = agent::agent::context::estimate_tokens(&context.snapshot);
+                let instruction_tokens = context
+                    .instructions
+                    .as_deref()
+                    .map(agent::agent::context::estimate_tokens)
+                    .unwrap_or(0);
+                // Memory and tool guidance ride inside the system prompt, so
+                // their tokens are already counted in persona_tokens.
+                let sources = vec![
+                    SourceStatus { source: ContextSource::Persona, included: !persona.trim().is_empty(), reason: None, tokens: persona_tokens },
+                    SourceStatus { source: ContextSource::HostRuntime, included: !context.snapshot.is_empty(), reason: None, tokens: snapshot_tokens },
+                    SourceStatus { source: ContextSource::WorkspaceInstructions, included: context.instructions.is_some(), reason: context.instructions.is_none().then(|| "no instruction file".to_string()), tokens: instruction_tokens },
+                    SourceStatus { source: ContextSource::RetrievedMemory, included: memory_recalled, reason: retrieval_skip.clone(), tokens: 0 },
+                    SourceStatus { source: ContextSource::ToolGuidance, included: !persona_complete, reason: persona_complete.then(|| "complete persona".to_string()), tokens: 0 },
+                    SourceStatus { source: ContextSource::UserInput, included: true, reason: None, tokens: agent::agent::context::estimate_tokens(input.as_text().unwrap_or_default()) },
+                ];
+                let report = ContextAssemblyReport {
+                    persona_complete,
+                    fingerprint: ContextAssemblyReport::compute_fingerprint(persona_complete, &sources, &memory_state),
+                    sources,
+                    memory: memory_state.clone(),
+                    retrieval_hits,
+                    retrieval_skip,
+                    estimated_tokens: persona_tokens + snapshot_tokens + instruction_tokens,
+                };
+                log::info!(
+                    target: "bsh::context",
+                    "context assembly: persona_complete={} memory={} retrieval_hits={} est_tokens={} fingerprint={:016x} retrieval_skip={}",
+                    report.persona_complete,
+                    report.memory.label(),
+                    report.retrieval_hits,
+                    report.estimated_tokens,
+                    report.fingerprint,
+                    report.retrieval_skip.as_deref().unwrap_or("none")
+                );
+                // Per-source inclusion/omission with its trust boundary: the
+                // provenance is consumed here, not erased before diagnostics.
+                for status in &report.sources {
+                    log::debug!(
+                        target: "bsh::context",
+                        "context source: {} included={} trust={:?} tokens={} reason={}",
+                        status.source.label(),
+                        status.included,
+                        status.source.trust(),
+                        status.tokens,
+                        status.reason.as_deref().unwrap_or("-")
+                    );
+                }
+
                 if !persona.trim().is_empty() {
                     injections.push(crate::model::ContextInjection {
                         kind: "persona".to_string(),
@@ -626,6 +702,8 @@ mod tests {
             },
             Some(0),
             1_000,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
         );
         let events = futures::executor::block_on(async {
             let mut events = Vec::new();
@@ -800,6 +878,8 @@ mod tests {
             facts,
             None,
             1_000,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
         );
         drain(receiver);
         let rows = seen.lock().unwrap().clone();
@@ -854,6 +934,8 @@ mod tests {
             facts,
             None,
             1_000,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
         );
         drain(receiver);
         let rows = seen.lock().unwrap().clone();
@@ -1064,6 +1146,8 @@ mod tests {
             facts,
             None,
             1_000,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
         );
         drain(receiver);
         let rows = seen.lock().unwrap().clone();

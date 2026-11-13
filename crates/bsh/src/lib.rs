@@ -16,6 +16,7 @@ pub(crate) mod caps;
 pub(crate) mod command_invocation;
 pub(crate) mod compositions;
 pub(crate) mod context;
+pub(crate) mod context_assembly;
 pub(crate) mod export;
 pub(crate) mod extension;
 pub(crate) mod federation;

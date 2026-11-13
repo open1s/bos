@@ -635,6 +635,14 @@ pub(crate) struct Session {
     /// The transcript.
     #[serde(default)]
     pub(crate) messages: Vec<ChatMessage>,
+    /// The last persona (assembled system prompt) recorded on a prompt row.
+    ///
+    /// The persona is injected every turn but rarely changes; storing its full
+    /// text on every row would bloat the session. Rows whose persona matches
+    /// this carry an empty persona block that the transcript resolves back to
+    /// the stored text, so the inject event still shows it on every turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_injected_persona: Option<String>,
     /// The agent's working plan.
     #[serde(default)]
     pub(crate) plan: Vec<PlanItem>,
@@ -728,6 +736,7 @@ impl Session {
             agent_preset: None,
             subagent: None,
             messages: Vec::new(),
+            last_injected_persona: None,
             plan: Vec::new(),
             goal: None,
             plan_mode: false,

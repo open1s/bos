@@ -216,6 +216,32 @@ impl Content {
             _ => None,
         }
     }
+
+    /// The text available to drive memory retrieval, including the text parts
+    /// of a multimodal turn (issue #335). A binary payload is never treated as
+    /// text; an image/audio-only turn yields None so retrieval is skipped with
+    /// a reason rather than pretending the payload is a query.
+    pub fn retrieval_text(&self) -> Option<String> {
+        match self {
+            Content::Text(s) => Some(s.clone()),
+            Content::Parts(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    if let ContentPart::Text { text: t } = part {
+                        if !text.is_empty() {
+                            text.push(' ');
+                        }
+                        text.push_str(t);
+                    }
+                }
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+        }
+    }
 }
 
 /// What the reader asked the agent to deliver, as the host classified it.
