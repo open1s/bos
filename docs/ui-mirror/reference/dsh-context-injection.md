@@ -36,6 +36,13 @@ One **collapsed disclosure per injected context source** (not one grouped row):
   `theme::CODE_FONT` at `theme::CODE_BLOCK_SIZE` (11px) / 16px line, indented
   22px + delta, selectable text. Collapsed by default; `inject_open` keyed by
   (row, slot), cleared on session switch.
+- No missing key info: the persona block captures the WHOLE system prompt the
+  turn sends (`Agent::injected_system_prompt` = the discovery block + the
+  configured persona + live prompt sections + recalled memory), not just
+  `config.system_prompt`; the context block carries the full runtime snapshot
+  (cwd, current date/time + UTC offset, layout, sandbox, permission, preset) and
+  the framed instructions. The current time matches the reference's
+  `dsh-time-context`, which injects "now" on every turn.
 
 ## Honest deltas
 

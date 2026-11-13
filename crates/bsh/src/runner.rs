@@ -315,7 +315,10 @@ impl Runner {
             // turn carried. Recorded on the prompt row, display only.
             {
                 let mut injections: Vec<crate::model::ContextInjection> = Vec::new();
-                let persona = agent.config().system_prompt.clone();
+                // The whole system prompt the turn will send - persona plus the
+                // discovery block, live sections and recalled memory - so the
+                // inject event misses no key info the model receives.
+                let persona = agent.injected_system_prompt(&input).await;
                 if !persona.trim().is_empty() {
                     injections.push(crate::model::ContextInjection {
                         kind: "persona".to_string(),

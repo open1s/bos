@@ -495,6 +495,16 @@ impl Agent {
         react::template::with_memory(&base, memory.as_deref())
     }
 
+    /// The full system prompt a turn for `task` will carry: the discovery
+    /// block, the configured persona, any live prompt sections and the recalled
+    /// memory - the exact assembly [`Self::system_prompt_for`] sends to the
+    /// provider. A host surfacing the injection shows the whole of it, so no key
+    /// info the model receives is missing from the inject event.
+    pub async fn injected_system_prompt(&self, task: &Content) -> String {
+        let context = self.prepare_context();
+        self.system_prompt_for(task, context.tools.as_slice()).await
+    }
+
     /// Run the agent using ReAct engine. Uses the agent's existing session
     /// and writes results back after completion. Session is not locked during
     /// engine execution to avoid deadlocks with hooks.

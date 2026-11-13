@@ -189,6 +189,38 @@ async fn the_system_prompt_is_the_persona_the_request_carries() {
     assert!(persona.contains(crate::agent::prompts::WORKFLOW_GUIDANCE));
 }
 
+/// The inject event must surface the WHOLE system prompt a turn sends, not just
+/// the configured persona: the recalled memory is key info the model receives,
+/// so it must not be missing from the injection the reader sees.
+#[tokio::test]
+async fn injected_system_prompt_includes_recalled_memory() {
+    let memory = crate::memory::InMemoryMemory::new();
+    memory
+        .add("the deployment target is staging-cluster".to_string(), None)
+        .await;
+    let config = AgentConfig {
+        system_prompt: "CUSTOM PERSONA".to_string(),
+        ..AgentConfig::default()
+    };
+    let agent = Agent::new(config, Arc::new(LlmProvider::new())).with_memory(Arc::new(memory));
+    let full = agent
+        .injected_system_prompt(&react::llm::Content::text("where is the deployment target"))
+        .await;
+    assert!(full.contains("CUSTOM PERSONA"), "the persona is present");
+    assert!(
+        full.contains("Relevant memory:"),
+        "the recalled memory block is present: {full}"
+    );
+    assert!(
+        full.contains("staging-cluster"),
+        "the memory content is present: {full}"
+    );
+    assert!(
+        full.len() > "CUSTOM PERSONA".len(),
+        "the injected prompt is more than the persona alone"
+    );
+}
+
 // =========================================================================
 // AgentConfig Tests
 // =========================================================================

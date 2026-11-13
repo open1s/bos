@@ -285,6 +285,12 @@ fn render_snapshot(facts: &RuntimeFacts, child: bool) -> String {
     } else {
         format!("Current working directory: {cwd:?}.")
     });
+    // The reference injects the current time on every turn; a snapshot without
+    // it leaves time-sensitive work guessing "now".
+    sections.push(format!(
+        "Current date and time: {}.",
+        crate::state::now_datetime_line()
+    ));
     // The shape of the workspace, so the first step can read the file it needs
     // instead of spending a whole round trip on list_dir. A turn is one LLM
     // call per step and a step costs seconds, so a free listing is not free.
@@ -392,8 +398,8 @@ mod tests {
         TurnContext::from_facts(&facts(settings), child)
     }
 
-    /// The snapshot opens with the reference's heading and states the four
-    /// live facts in its own sentences.
+    /// The snapshot opens with the reference's heading and states the live
+    /// facts in its own sentences, including the current date and time.
     #[test]
     fn the_snapshot_carries_the_live_facts() {
         let root = scratch("facts");
@@ -402,6 +408,10 @@ mod tests {
         assert!(
             snapshot.contains(&format!("Current working directory: {root:?}.")),
             "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("Current date and time: "),
+            "the snapshot states now, like the reference: {snapshot}"
         );
         assert!(
             snapshot.contains("Sandbox: confined to the workspace."),
