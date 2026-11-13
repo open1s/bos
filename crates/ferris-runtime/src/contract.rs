@@ -380,6 +380,83 @@ pub trait Runtime: Send + Sync {
             kind: format!("{} hook {point}", self.kind()),
         })
     }
+
+    /// The typed services this runtime publishes (issue #302).
+    ///
+    /// Only a first-party (Rust) runtime can supply a typed service value; a
+    /// guest runtime returns none. The host publishes each through the
+    /// activation's provide_service, which enforces the manifest declaration.
+    fn provided_services(&self) -> Vec<ProvidedService> {
+        Vec::new()
+    }
+}
+
+/// A typed service a first-party runtime publishes (issue #302).
+///
+/// The publication is a closure that captures the concrete-typed value, so the
+/// registry keys it by the value's real TypeId and a consumer can acquire it
+/// back as that same type (a type-erased value here would lose the TypeId).
+/// The name/contract/version/scope must match a provides declaration in the
+/// extension's manifest; the host enforces that before publishing.
+pub struct ProvidedService {
+    /// Stable service name.
+    pub name: String,
+    /// Stable interface identifier.
+    pub contract: String,
+    /// The provider's concrete version.
+    pub version: semver::Version,
+    /// The visibility scope to publish at.
+    pub scope: ferris_core::composable::Scope,
+    /// Publishes the concrete-typed value, returning its revocation token.
+    publisher: Arc<
+        dyn Fn(&ferris_core::composable::ServiceRegistry) -> ferris_core::composable::ServiceToken
+            + Send
+            + Sync,
+    >,
+}
+
+impl ProvidedService {
+    /// Build a provided service from a concrete typed value.
+    pub fn new<T: std::any::Any + Send + Sync>(
+        name: impl Into<String>,
+        contract: impl Into<String>,
+        version: semver::Version,
+        scope: ferris_core::composable::Scope,
+        value: Arc<T>,
+    ) -> Self {
+        let name = name.into();
+        let contract = contract.into();
+        let (pub_name, pub_contract, pub_version, pub_scope) = (
+            name.clone(),
+            contract.clone(),
+            version.clone(),
+            scope.clone(),
+        );
+        let publisher = Arc::new(move |registry: &ferris_core::composable::ServiceRegistry| {
+            registry.provide_contract(
+                pub_scope.clone(),
+                pub_name.clone(),
+                &pub_contract,
+                pub_version.clone(),
+                Arc::clone(&value),
+            )
+        });
+        Self {
+            name,
+            contract,
+            version,
+            scope,
+            publisher,
+        }
+    }
+
+    /// Publish into the shared registry, returning the revocation token.
+    pub fn publish(
+        &self,
+        registry: &ferris_core::composable::ServiceRegistry,
+    ) -> ferris_core::composable::ServiceToken {
+        (self.publisher)(registry)
+    }
 }
 
 /// The on-disk tool descriptor every declarative and process package ships for
@@ -649,6 +726,10 @@ impl Runtime for LazyRuntime {
     /// a runtime-registered skill never reached the agent.
     fn skills_dir(&self) -> Option<PathBuf> {
         self.inner.skills_dir()
+    }
+
+    fn provided_services(&self) -> Vec<ProvidedService> {
+        self.inner.provided_services()
     }
 
     fn declarative(&self) -> crate::declarative::DeclarativeContributions {

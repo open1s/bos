@@ -90,6 +90,10 @@ hostkit = { path = "../hostkit" }
 # not have. vendor/gpui-libghostty/VENDOR.md records the one-line fallback; drop
 # the copy and go back to "=0.3.1" from crates.io once upstream accepts it.
 gpui-libghostty = { path = "../../vendor/gpui-libghostty" }
+# The Windows terminal backend parses the ConPTY byte stream into a screen grid
+# (issue #296); macOS/Linux keep the Ghostty native surface. vt100 is a pure-Rust
+# VT parser, so it adds no native build step.
+vt100 = "0.18"
 regorus = { workspace = true }
 # The edit tool's substring search. memchr is already in the workspace graph
 # through the framework's regex stack, so naming it adds no package; the
@@ -214,6 +218,16 @@ gpui = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"] 
 # .ico.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.34"
+
+# The Windows terminal pane's PTY host: ConPTY spawns the shell attached to a
+# pseudoconsole (issue #296). Windows-only; macOS/Linux use the Ghostty surface.
+[target.'cfg(windows)'.dependencies]
+conpty = "0.5"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
 
 # A bare `bsh` binary has no bundle, so macOS would draw a generic Dock tile;
 # assets::install_dock_icon hands AppKit the .icns compiled into the binary

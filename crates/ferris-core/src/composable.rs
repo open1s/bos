@@ -622,9 +622,10 @@ impl ServiceRegistry {
         self.generations
             .read()
             .map(|generations| {
-                generations
-                    .keys()
-                    .any(|(_, _, service, contract)| service == name && contract.is_empty())
+                // A provider of this name exists whether it was published as a
+                // plain service or under a typed contract: the live driver's
+                // readiness check must reconcile both (issue #302).
+                generations.keys().any(|(_, _, service, _)| service == name)
             })
             .unwrap_or(false)
     }

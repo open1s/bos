@@ -1359,6 +1359,49 @@ fn an_invoked_skill_is_drawn_as_the_block_the_model_received(cx: &mut TestAppCon
         "the invocation's block is drawn under the prompt"
     );
 }
+/// The context/persona the harness auto-injected draws as an inject event under
+/// the prompt: collapsed by default, and opening it shows the text the model
+/// received (issue: inject event).
+#[gpui::test]
+fn an_auto_injection_is_drawn_as_an_openable_event(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_queue("inject-event-render", &[]);
+        let id = state.active_id.clone().expect("a session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[0].injections = vec![
+                crate::model::ContextInjection {
+                    kind: "context".to_string(),
+                    content: "Current runtime context. SNAPSHOT".to_string(),
+                },
+                crate::model::ContextInjection {
+                    kind: "instructions".to_string(),
+                    content: "workspace instructions BODY".to_string(),
+                },
+            ];
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // The collapsed event row is drawn under the prompt; the body is not.
+    let row = cx
+        .debug_bounds("inject-row-0-0")
+        .expect("the inject event row is drawn");
+    assert!(
+        cx.debug_bounds("inject-body-0-0").is_none(),
+        "the injected text is collapsed by default"
+    );
+    // Opening the event shows the injected blocks.
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("inject-body-0-0").is_some(),
+        "opening the event shows the injected text"
+    );
+}
 
 /// A steer the turn ends before taking goes back to its old place in the dock,
 /// and its pending bubble goes away - the reader never loses a message.

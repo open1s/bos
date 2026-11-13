@@ -27,12 +27,13 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dependencies]
-ferris-core = { path = "../ferris-core" }
+ferris-core = { path = "../ferris-core", features = ["tokio"] }
 hostkit = { path = "../hostkit" }
 # The surface-provider adapter. Pinned exactly: cordis-core is an execution
 # host for Rust surface providers, kept out of the contract crate.
 cordis-core = "=0.6.1"
 async-trait.workspace = true
+semver = { version = "1.0.28", features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

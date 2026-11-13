@@ -341,6 +341,19 @@ pub(crate) struct SkillInvocation {
     pub(crate) content: String,
 }
 
+/// One context/persona block the harness auto-injected into a turn.
+///
+/// Display only, like SkillInvocation: the model received the text once, and
+/// the transcript draws it so what the model saw is what the bubble shows. The
+/// runner records these at the moment of injection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ContextInjection {
+    /// What was injected: persona, context or instructions.
+    pub(crate) kind: String,
+    /// The exact text the request carried.
+    pub(crate) content: String,
+}
+
 /// One segment of a turn, in the order the stream produced it.
 ///
 /// A turn interleaves reasoning, visible text and tool calls - the model thinks,
@@ -395,6 +408,13 @@ pub(crate) struct ChatMessage {
     /// saw is what the bubble shows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) skills: Vec<SkillInvocation>,
+    /// Context/persona blocks the harness auto-injected into this turn.
+    ///
+    /// Display only: the runtime snapshot, the workspace instructions and the
+    /// persona the request carried, recorded at injection so the transcript can
+    /// show an inject event. Empty for turns written before the event existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) injections: Vec<ContextInjection>,
     /// Whether this is a mid-turn STEER rather than the turn's own prompt.
     ///
     /// A steered message is a real user turn in the model history - it sits
@@ -427,6 +447,7 @@ impl ChatMessage {
             error: None,
             meta: None,
             skills: Vec::new(),
+            injections: Vec::new(),
             steering: false,
         }
     }
@@ -451,6 +472,7 @@ impl ChatMessage {
             error: None,
             meta: None,
             skills: Vec::new(),
+            injections: Vec::new(),
             steering: false,
         }
     }

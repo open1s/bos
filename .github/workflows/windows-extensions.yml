@@ -7,11 +7,15 @@ on:
     paths:
       - "crates/ferris-core/**"
       - "crates/ferris-runtime/**"
+      - "crates/bsh/src/terminal*.rs"
+      - "crates/bsh/src/ui/terminal_view.rs"
       - ".github/workflows/windows-extensions.yml"
   pull_request:
     paths:
       - "crates/ferris-core/**"
       - "crates/ferris-runtime/**"
+      - "crates/bsh/src/terminal*.rs"
+      - "crates/bsh/src/ui/terminal_view.rs"
       - ".github/workflows/windows-extensions.yml"
   workflow_dispatch:
 
@@ -48,3 +52,14 @@ jobs:
 
       - name: Lint
         run: cargo clippy -p ferris-core -p ferris-runtime --all-targets -- -D warnings
+
+      # The Windows terminal pane (ConPTY backend, issue #296) is Windows-only
+      # code; compile-verify it on a real Windows host (the macOS dev host cannot
+      # cross-check bsh because its TLS C dependency needs the Windows SDK).
+      - name: Check bsh Windows terminal
+        run: cargo check -p bsh
+
+      # Run the ConPTY runtime integration test (issue #296): a real shell spawn
+      # whose output must reach the screen grid, not just a compile check.
+      - name: Test bsh Windows terminal
+        run: cargo test -p bsh --lib terminal_windows -- --nocapture

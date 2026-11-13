@@ -5214,7 +5214,19 @@ impl Shell {
             let key = keystroke.key.as_str();
             if key == "c" || key == "v" {
                 if let Some(view) = self.right.terminal_view.clone() {
-                    view.update(cx, |view, _| view.key_down(keystroke, event.is_held));
+                    view.update(cx, |view, cx| {
+                        // The software terminal owns its clipboard (issue #296);
+                        // Ghostty sees the chord itself.
+                        if view.is_software_terminal() {
+                            if key == "c" {
+                                view.copy_screen(cx);
+                            } else {
+                                view.paste_clipboard(cx);
+                            }
+                        } else {
+                            view.key_down(keystroke, event.is_held);
+                        }
+                    });
                 }
             }
             return;

@@ -46,6 +46,12 @@ pub trait BuiltinExtension: Send + Sync {
     async fn shutdown(&self) -> Result<(), ExtensionError> {
         Ok(())
     }
+
+    /// The typed services this extension publishes (issue #302). Default none.
+    /// Each must match a provides declaration in the manifest.
+    fn provided_services(&self) -> Vec<crate::contract::ProvidedService> {
+        Vec::new()
+    }
 }
 
 /// The runtime wrapper around a BuiltinExtension.
@@ -162,6 +168,10 @@ impl Runtime for BuiltinRuntime {
             });
         }
         self.extension.call_tool(name, &arguments, context)
+    }
+
+    fn provided_services(&self) -> Vec<crate::contract::ProvidedService> {
+        self.extension.provided_services()
     }
 }
 
@@ -348,5 +358,137 @@ tools = ["echo"]
             |_, _| Ok(Value::Null),
         );
         assert!(BuiltinRuntime::new(Arc::new(extension)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod service_publication_tests {
+    use super::*;
+    use ferris_core::composable::{Scope, ServiceRegistry};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The concrete service type the provider publishes and the consumer
+    /// acquires back, typed.
+    struct Counter {
+        value: AtomicU64,
+    }
+
+    const PROVIDER_MANIFEST: &str = r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.provider"
+name = "Provider"
+version = "1.0.0"
+description = "Publishes a counter service"
+authors = ["Test"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "builtin"
+entry = "provider"
+startup = "on-demand"
+
+[[services.provides]]
+name = "com.example.counter"
+contract = "com.example.counter-api"
+version = "1.0.0"
+scope = "host"
+"#;
+
+    struct ProviderExt;
+
+    impl BuiltinExtension for ProviderExt {
+        fn manifest_toml(&self) -> &'static str {
+            PROVIDER_MANIFEST
+        }
+        fn tools(&self) -> Vec<ToolDescriptor> {
+            Vec::new()
+        }
+        fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: &Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Err(ExtensionError::UnsupportedRuntime {
+                kind: "provider".to_string(),
+            })
+        }
+        fn provided_services(&self) -> Vec<crate::contract::ProvidedService> {
+            vec![crate::contract::ProvidedService::new(
+                "com.example.counter",
+                "com.example.counter-api",
+                semver::Version::new(1, 0, 0),
+                Scope::Host,
+                Arc::new(Counter {
+                    value: AtomicU64::new(7),
+                }),
+            )]
+        }
+    }
+
+    /// Two independent extensions: a provider publishes a typed, versioned
+    /// service at a shared scope and a consumer acquires it back as the same
+    /// concrete type; unloading the provider revokes it (issue #302).
+    #[test]
+    fn a_provider_and_consumer_exchange_a_typed_service() {
+        let provider = BuiltinRuntime::new(Arc::new(ProviderExt)).expect("provider runtime");
+        let services = provider.provided_services();
+        assert_eq!(services.len(), 1);
+
+        // The host publishes the provider's service into the shared registry.
+        let registry = ServiceRegistry::new();
+        let token = services[0].publish(&registry);
+        assert!(registry.has_name("com.example.counter"));
+
+        // A different extension acquires it back, typed and version-checked.
+        let requirement = semver::VersionReq::parse("^1").unwrap();
+        let lease = registry
+            .acquire_contract::<Counter>(
+                &Scope::Host,
+                "com.example.counter",
+                "com.example.counter-api",
+                &requirement,
+            )
+            .expect("the consumer acquires the typed service");
+        assert_eq!(lease.value.load(Ordering::SeqCst), 7);
+        drop(lease);
+
+        // An incompatible version requirement is refused.
+        let too_new = semver::VersionReq::parse("^2").unwrap();
+        assert!(registry
+            .acquire_contract::<Counter>(
+                &Scope::Host,
+                "com.example.counter",
+                "com.example.counter-api",
+                &too_new,
+            )
+            .is_none());
+
+        // The provider unloads: its token revokes the service, so a consumer
+        // can no longer acquire it (no stale lease).
+        assert!(registry.revoke(&token));
+        assert!(!registry.has_name("com.example.counter"));
+        assert!(registry
+            .acquire_contract::<Counter>(
+                &Scope::Host,
+                "com.example.counter",
+                "com.example.counter-api",
+                &requirement,
+            )
+            .is_none());
+    }
+
+    /// A runtime that provides no services returns none (the guest default).
+    #[test]
+    fn a_guest_runtime_provides_no_services() {
+        let ext = ClosureExtension::new(PROVIDER_MANIFEST, Vec::new(), |_n, _a| Ok(Value::Null));
+        let runtime = BuiltinRuntime::new(Arc::new(ext)).expect("runtime");
+        assert!(runtime.provided_services().is_empty());
     }
 }

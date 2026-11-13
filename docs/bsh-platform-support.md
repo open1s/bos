@@ -36,7 +36,7 @@ test modules enforce it on each host.
 | Surface | macOS | Linux | Windows | Notes |
 |---|---|---|---|---|
 | Browser engine | yes | yes | yes | Windows Chrome/Chromium discovery (#326); fail-closed sandbox, no automatic --no-sandbox (#325); graceful tree shutdown (#327); native orphan reaper (#314); turn egress policy on navigation (#329) |
-| Terminal pane | yes | Wayland only | not yet | libghostty native surface is macOS/Wayland; X11 and Windows show an actionable platform message before surface creation (#296, #297). A confined turn requires an explicit release before an unconfined shell starts (#323). |
+| Terminal pane | yes | Wayland only | ConPTY software terminal | macOS/Linux draw the libghostty native surface; X11 shows an actionable message (#297). Windows spawns the shell via ConPTY and draws a vt100-parsed software screen (#296); it reports itself unconfined. A confined turn requires an explicit release before an unconfined shell starts (#323). |
 | Host terminal service (extensions) | sh | sh | PowerShell / cmd | native shell, dialect documented (#298) |
 | Settings / vault / secrets | yes | yes | yes | atomic multi-document commit (#310); owner-only secret files (#299) |
 | Extension market / installer | yes | yes | yes | cache identity from validated repository identity (#305); git subpath confinement (#322); MCP config confinement (#321) |
@@ -52,10 +52,15 @@ test modules enforce it on each host.
 
 ## Conformance and CI
 
-- `cargo test -p hostkit` runs the shared OS-service conformance suite on every
-  host CI runs on (process ownership/termination, path safety, environment,
-  private files, root resolution).
-- The Windows code paths are compile-verified in CI via
+- `.github/workflows/platform-conformance.yml` runs the shared conformance
+  suite on **ubuntu-latest, windows-latest and macos-latest** (issue #313):
+  - `cargo test -p hostkit` — the OS-service contract (process
+    ownership/termination, path safety, environment, private files, root
+    resolution), not cfg-gated, so it exercises each host's native code.
+  - `cargo test -p agent --test platform_conformance` — the per-tool
+    execution contract (shell backend resolution, background-job kill/exit)
+    through the real production paths.
+- The Windows code paths are additionally compile-verified in the core lane via
   `cargo check -p hostkit --target x86_64-pc-windows-msvc` (no link needed).
 - Runtime lifecycle tests (jobs, hooks, MCP, process runtime, bridge, browser
   reaper) run on the host CI lane; the process-lifecycle contract is the same
@@ -63,9 +68,12 @@ test modules enforce it on each host.
 
 ## Honest limits
 
-- The Windows terminal pane has no native backend yet; it is explicitly gated,
-  not silently broken (#296).
-- Runtime behavior on Windows is compile-verified and unit-tested where the
-  host allows; full Windows runtime integration runs on the Windows CI lane.
+- The Windows terminal pane uses a ConPTY software terminal (vt100 grid drawn
+  by the pane), not Ghostty's GPU surface: shell spawn with PowerShell/cmd
+  fallback, input, resize, clipboard copy/paste, exit and cancellation. It has
+  no Ghostty scrollback/mouse-selection and reports itself unconfined (#296).
+- The Windows terminal code is compile-verified for x86_64-pc-windows-msvc by
+  isolating it from bsh's TLS C dependency (aws-lc-sys needs Windows SDK
+  headers); a ConPTY runtime integration test runs on the Windows CI lane.
 - WSL Bash cannot be confined by the Windows AppContainer backend; a confined
   turn refuses it rather than claiming an isolation it does not have.

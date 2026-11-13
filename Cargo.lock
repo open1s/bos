@@ -1397,6 +1397,7 @@ dependencies = [
  "bus",
  "chacha20poly1305",
  "config",
+ "conpty",
  "dirs 7.0.0",
  "ed25519-dalek",
  "extism",
@@ -1452,8 +1453,10 @@ dependencies = [
  "tungstenite 0.30.0",
  "uucore",
  "uuid",
+ "vt100",
  "walkdir",
  "wasmtime 50.0.1",
+ "windows-sys 0.61.2",
  "winresource",
  "zeroize",
 ]
@@ -2002,6 +2005,15 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
+name = "conpty"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b72b06487a0d4683349ad74d62e87ad639b09667082b3c495c5b6bab7d84b3da"
+dependencies = [
+ "windows 0.44.0",
 ]
 
 [[package]]
@@ -3597,6 +3609,7 @@ dependencies = [
  "libc",
  "log",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
@@ -13292,6 +13305,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "vt100"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb05cdd19ae8707bf6a0a269972c07e6358103a7079faec749dec318a5b3dc23"
+dependencies = [
+ "itoa",
+ "unicode-width",
+ "vte",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14684,6 +14718,15 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
+
+[[package]]
+name = "windows"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e745dab35a0c4c77aa3ce42d595e13d2003d6902d6b08c9ef5fc326d08da12b"
+dependencies = [
+ "windows-targets 0.42.2",
+]
 
 [[package]]
 name = "windows"

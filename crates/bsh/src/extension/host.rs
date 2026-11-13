@@ -654,6 +654,35 @@ impl AppliedExtension {
         Some(token)
     }
 
+    /// Publish a first-party runtime's provided service (issue #302).
+    ///
+    /// The manifest must declare the exact name/contract/version/scope, exactly
+    /// as for provide_service. The publication closure preserves the value's
+    /// concrete type so a consumer acquires it back typed. The activation keeps
+    /// the revocation token and revokes it on unload.
+    pub(crate) fn publish_provided(
+        &mut self,
+        service: &ferris_sdk::host_runtime::contract::ProvidedService,
+    ) -> Option<ferris_sdk::composable::ServiceToken> {
+        if !self.service_provides.iter().any(|declaration| {
+            declaration.name == service.name
+                && declaration.contract == service.contract
+                && declaration.version == service.version
+                && service_scope_matches(
+                    &declaration.scope,
+                    &service.scope,
+                    &self.extension_id,
+                    self.workspace.as_deref(),
+                    &self.session_id,
+                )
+        }) {
+            return None;
+        }
+        let token = service.publish(&self.services);
+        self.service_tokens.push(token.clone());
+        Some(token)
+    }
+
     /// Acquire a typed service only when this extension declared a matching
     /// requirement. The returned lease must be held for the full call.
     pub(crate) fn acquire_service<T>(
@@ -1550,6 +1579,39 @@ impl ExtensionHost {
             }
             Err(error) => log::warn!("built-in annotations was not registered: {error}"),
         }
+        #[cfg(test)]
+        self.register_service_test_builtin();
+    }
+
+    /// Test-only first-party extension that publishes a typed service, so the
+    /// production activation path's service publication is exercised end to end
+    /// (issue #302).
+    #[cfg(test)]
+    fn register_service_test_builtin(&mut self) {
+        match BuiltinRuntime::new(Arc::new(ServiceTestProvider)) {
+            Ok(runtime) => {
+                let package = Package {
+                    root: PathBuf::from("<builtin>"),
+                    manifest: runtime.manifest().clone(),
+                    report: ValidationReport::default(),
+                    source: ExtensionSource::Builtin,
+                    trust: TrustLevel::Builtin,
+                    hash: String::new(),
+                    installed_at: 0,
+                    signature: None,
+                    verification: ferris_sdk::signing::SignatureVerification::Missing,
+                    source_path: None,
+                };
+                let tools = runtime.descriptors();
+                let id = package.id().to_string();
+                self.builtins.push(BuiltinLoaded {
+                    package,
+                    runtime: Arc::new(LazyRuntime::new(id, Arc::new(runtime))),
+                    tools,
+                });
+            }
+            Err(error) => log::warn!("service test builtin not registered: {error}"),
+        }
     }
 
     /// Runtimes a replacement package set no longer uses, deduplicated.
@@ -2435,7 +2497,7 @@ impl ExtensionHost {
                 let _ = lease.revoke(agent, registry);
                 continue;
             }
-            applied.push(AppliedExtension {
+            let mut activation_ext = AppliedExtension {
                 info,
                 activation: Some(activation),
                 fiber,
@@ -2447,7 +2509,22 @@ impl ExtensionHost {
                 service_provides: entry.package.manifest.services.provides.clone(),
                 service_requires: entry.package.manifest.services.requires.clone(),
                 service_tokens: Vec::new(),
-            });
+            };
+            // Publish the runtime's typed services into the shared registry
+            // (issue #302). Only a first-party runtime supplies any; the
+            // manifest declaration is enforced per service, and each token is
+            // revoked when this activation unloads.
+            if let Some(runtime) = &entry.runtime {
+                for service in runtime.provided_services() {
+                    if activation_ext.publish_provided(&service).is_none() {
+                        log::warn!(
+                            "extension {id}: service {} not published (no matching manifest declaration)",
+                            service.name
+                        );
+                    }
+                }
+            }
+            applied.push(activation_ext);
         }
         applied
     }
@@ -4442,6 +4519,69 @@ required = ["agent.tools.register"]
 tools = ["graph", "why"]
 "#;
 
+/// Test-only first-party extension that publishes a typed counter service at
+/// Host scope, so the production activation path's service publication is
+/// exercised end to end (issue #302).
+#[cfg(test)]
+struct ServiceTestProvider;
+
+#[cfg(test)]
+const SERVICE_TEST_MANIFEST: &str = r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.bos.bsh.service-test"
+name = "Service Test"
+version = "1.0.0"
+description = "Publishes a typed counter service for the activation test"
+authors = ["BrickOS Team"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "builtin"
+entry = "service-test"
+startup = "on-demand"
+
+[[services.provides]]
+name = "com.bos.bsh.counter"
+contract = "com.bos.bsh.counter-api"
+version = "1.0.0"
+scope = "host"
+"#;
+
+#[cfg(test)]
+impl ferris_sdk::host_runtime::builtin::BuiltinExtension for ServiceTestProvider {
+    fn manifest_toml(&self) -> &'static str {
+        SERVICE_TEST_MANIFEST
+    }
+    fn tools(&self) -> Vec<ferris_sdk::host_runtime::contract::ToolDescriptor> {
+        Vec::new()
+    }
+    fn call_tool(
+        &self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+        _context: &ferris_sdk::host_runtime::contract::CallContext,
+    ) -> Result<serde_json::Value, ferris_sdk::types::ExtensionError> {
+        Err(ferris_sdk::types::ExtensionError::UnsupportedRuntime {
+            kind: "service-test".to_string(),
+        })
+    }
+    fn provided_services(&self) -> Vec<ferris_sdk::host_runtime::contract::ProvidedService> {
+        vec![ferris_sdk::host_runtime::contract::ProvidedService::new(
+            "com.bos.bsh.counter",
+            "com.bos.bsh.counter-api",
+            semver::Version::new(1, 0, 0),
+            ferris_sdk::composable::Scope::Host,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(42)),
+        )]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4468,6 +4608,49 @@ mod tests {
             disabled: BTreeSet::new(),
             preset_allowed: None,
         }
+    }
+
+    /// The production activation path publishes a first-party extension's
+    /// typed service into the shared host registry, a consumer acquires it back
+    /// typed, and unloading the provider revokes it (issue #302).
+    #[test]
+    fn the_activation_publishes_a_first_party_service_end_to_end() {
+        let root = scratch("service-pub");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let mut agent = ::agent::Agent::from_config(::agent::AgentConfig::default());
+        let mut registry = ::agent::plugins::PluginRegistry::new();
+        let applied = host.apply_with_fibers(&mut agent, &mut registry, None, "session-test");
+
+        // The service-test builtin published its typed service on activation.
+        assert!(
+            host.services().has_name("com.bos.bsh.counter"),
+            "the activation published the first-party service"
+        );
+        // A consumer acquires it back as the concrete type, version-checked.
+        let requirement = semver::VersionReq::parse("^1").unwrap();
+        let lease = host
+            .services()
+            .acquire_contract::<std::sync::atomic::AtomicU64>(
+                &ferris_sdk::composable::Scope::Host,
+                "com.bos.bsh.counter",
+                "com.bos.bsh.counter-api",
+                &requirement,
+            )
+            .expect("a consumer acquires the typed service");
+        assert_eq!(lease.load(std::sync::atomic::Ordering::SeqCst), 42);
+        drop(lease);
+
+        // Unloading the provider activation revokes only its service.
+        let provider = applied
+            .into_iter()
+            .find(|activation| activation.extension_id() == "com.bos.bsh.service-test")
+            .expect("the service provider was applied");
+        provider.unload(&mut agent, &mut registry).expect("unload");
+        assert!(
+            !host.services().has_name("com.bos.bsh.counter"),
+            "unload revoked the provider's service"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn write_manifest(root: &Path, legacy: &str) {
@@ -4832,8 +5015,8 @@ tools = ["echo"]
         let host = ExtensionHost::open(config(&root)).expect("host");
         let metrics = host.metrics();
         assert_eq!(
-            metrics.applied, 4,
-            "the builtin inspector, diagnostics, annotations and good package still apply"
+            metrics.applied, 5,
+            "the builtin inspector, diagnostics, annotations, service-test and good package still apply"
         );
         let statuses = host.statuses();
         assert!(

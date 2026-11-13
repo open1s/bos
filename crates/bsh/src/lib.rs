@@ -53,6 +53,13 @@ pub(crate) mod store;
 pub(crate) mod subagent;
 pub(crate) mod task_tools;
 pub(crate) mod terminal;
+// The Windows pane's software screen (issue #296): compiled on Windows and in
+// tests (its VT parsing is unit-tested on every host).
+#[cfg(any(windows, test))]
+pub(crate) mod terminal_grid;
+// The Windows pane's ConPTY host (issue #296); Windows-only.
+#[cfg(windows)]
+pub(crate) mod terminal_windows;
 pub(crate) mod theme;
 pub(crate) mod tool_metadata;
 pub(crate) mod trash;

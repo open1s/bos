@@ -102,6 +102,14 @@ pub(crate) enum AgentEvent {
         /// The model-written checkpoint text, unframed.
         summary: String,
     },
+    /// The harness auto-injected context/persona into this turn.
+    ///
+    /// Lands right after the turn frame is injected and before the first token,
+    /// so the transcript can draw an inject event naming what the model received.
+    ContextInjected {
+        /// The injected blocks: persona, runtime context, workspace instructions.
+        injections: Vec<crate::model::ContextInjection>,
+    },
     /// A steered message was taken by the running turn's next step.
     ///
     /// The ticket is the host identity the message was queued with. It lands
@@ -302,6 +310,34 @@ impl Runner {
             // cannot be summarized into the history it supersedes.
             let context = crate::context::TurnContext::from_facts(&facts, false);
             context.inject(&agent);
+            // Surface the auto-injection as a chat event: the persona the build
+            // composed, the runtime snapshot and the workspace instructions this
+            // turn carried. Recorded on the prompt row, display only.
+            {
+                let mut injections: Vec<crate::model::ContextInjection> = Vec::new();
+                let persona = agent.config().system_prompt.clone();
+                if !persona.trim().is_empty() {
+                    injections.push(crate::model::ContextInjection {
+                        kind: "persona".to_string(),
+                        content: persona,
+                    });
+                }
+                if !context.snapshot.is_empty() {
+                    injections.push(crate::model::ContextInjection {
+                        kind: "context".to_string(),
+                        content: context.snapshot.clone(),
+                    });
+                }
+                if let Some(instructions) = &context.instructions {
+                    injections.push(crate::model::ContextInjection {
+                        kind: "instructions".to_string(),
+                        content: instructions.clone(),
+                    });
+                }
+                if !injections.is_empty() {
+                    let _ = tx.send_blocking(AgentEvent::ContextInjected { injections });
+                }
+            }
 
             // What this turn asks for, decided once from the reader's own
             // words before the stream opens. The engine uses it for the action

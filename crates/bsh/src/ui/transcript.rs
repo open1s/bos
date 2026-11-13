@@ -2749,22 +2749,38 @@ impl Shell {
             for (slot, skill) in message.skills.iter().enumerate() {
                 stack = stack.child(self.skill_block(index, slot, skill, chrome));
             }
-            return div()
-                .w_full()
-                .flex()
-                .flex_row()
-                .justify_end()
-                .child(
-                    div()
-                        .group(group)
-                        .flex()
-                        .flex_col()
-                        .items_end()
-                        .gap(px(6.0))
-                        .child(stack)
-                        .child(actions),
-                )
-                .into_any_element();
+            // The context/persona the harness auto-injected shows as an inject
+            // event the reader can open: what the model was given this turn. The
+            // reference draws a full-width disclosure, so it sits above the
+            // right-aligned prompt rather than inside the bubble's shrink-to-fit
+            // stack (which would collapse its width).
+            let mut injects = div().w_full().flex().flex_col().gap(px(6.0));
+            let mut has_injects = false;
+            for (slot, injection) in message.injections.iter().enumerate() {
+                injects = injects.child(self.inject_row(index, slot, injection, chrome, cx));
+                has_injects = true;
+            }
+            let bubble = div().w_full().flex().flex_row().justify_end().child(
+                div()
+                    .group(group)
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(6.0))
+                    .child(stack)
+                    .child(actions),
+            );
+            if has_injects {
+                return div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(injects)
+                    .child(bubble)
+                    .into_any_element();
+            }
+            return bubble.into_any_element();
         }
 
         let mut column = div().w_full().flex().flex_col().gap(px(8.0));
@@ -4031,6 +4047,150 @@ impl Shell {
             )
     }
 
+    /// One auto-injection event, mirroring the reference's ContextInjectionRow:
+    /// a collapsed disclosure titled "Context injection" with the producer beside
+    /// it, opening to a bounded code block carrying the exact text the model
+    /// received. One row per injected source (persona, snapshot, instructions).
+    fn inject_row(
+        &self,
+        index: usize,
+        slot: usize,
+        injection: &crate::model::ContextInjection,
+        chrome: &RowChrome<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let content = chrome.content_size;
+        let row_h = 24.0 + theme::delta_at(content);
+        let small = theme::small_size_at(content);
+        let quiet = theme::faint();
+        let hover = theme::muted();
+        let key = (index, slot);
+        let open = self.inject_open.contains(&key);
+        let group = SharedString::from(format!("inject-{index}-{slot}"));
+        let title = self.state.lang.tr("inject.title");
+        let producer = self.state.lang.tr(inject_kind_key(&injection.kind));
+        let row = div()
+            .debug_selector(move || format!("inject-row-{index}-{slot}"))
+            .id(SharedString::from(format!("inject-row-{index}-{slot}")))
+            .group(group.clone())
+            .flex_shrink_0()
+            .h(px(row_h))
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_w_0()
+            .cursor_pointer()
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .w(px(theme::DISCLOSURE_LEADING))
+                    .h(px(theme::DISCLOSURE_LEADING))
+                    .mr(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        icon(IconName::CircleDashed, theme::DISCLOSURE_GLYPH, quiet)
+                            .group_hover(group.clone(), |style| style.opacity(0.0)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(theme::DISCLOSURE_LEADING))
+                            .h(px(theme::DISCLOSURE_LEADING))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .opacity(0.0)
+                            .group_hover(group.clone(), |style| style.opacity(1.0))
+                            .child(icon(
+                                if open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                },
+                                theme::DISCLOSURE_GLYPH,
+                                hover,
+                            )),
+                    ),
+            )
+            .child(
+                txt(title, small, quiet)
+                    .flex_none()
+                    .line_height(px(row_h))
+                    .group_hover(group.clone(), |style| style.text_color(rgb(hover))),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(2.0))
+                    .h(px(2.0))
+                    .mx(px(8.0))
+                    .rounded(px(1.0))
+                    .bg(rgb(quiet)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .group_hover(group.clone(), |style| style.text_color(rgb(hover)))
+                    .child(txt(producer, small, quiet).line_height(px(row_h))),
+            );
+        let mut root = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(row.on_click(cx.listener(move |this, _event, _window, cx| {
+                if !this.inject_open.remove(&key) {
+                    this.inject_open.insert(key);
+                }
+                cx.notify();
+            })));
+        if open {
+            // The reference bounds the body at 141px and writes it in its code
+            // face (11px/16px) on the code-block fill, indented under the title.
+            root = root.child(
+                div()
+                    .debug_selector(move || format!("inject-body-{index}-{slot}"))
+                    .w_full()
+                    .min_w_0()
+                    .pl(px(22.0 + theme::delta_at(content)))
+                    .pt(px(4.0))
+                    .pb(px(4.0))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("inject-scroll-{index}-{slot}")))
+                            .max_h(px(141.0))
+                            .overflow_y_scroll()
+                            .rounded(px(8.0))
+                            .bg(rgb(theme::new_session_fill()))
+                            .pt(px(10.0))
+                            .pr(px(16.0))
+                            .pb(px(12.0))
+                            .pl(px(12.0))
+                            .child(
+                                selectable_txt(
+                                    ("inject-body", index * 64 + slot),
+                                    injection.content.clone(),
+                                    theme::CODE_BLOCK_SIZE,
+                                    theme::muted(),
+                                    index as u64 * 1024 + 4 + slot as u64,
+                                )
+                                .font_family(theme::CODE_FONT)
+                                .line_height(px(16.0)),
+                            ),
+                    ),
+            );
+        }
+        root
+    }
+
     /// One reasoning disclosure: one Thinking segment of a turn.
     ///
     /// A turn can think, call a tool and think again, so the row names the
@@ -5060,6 +5220,15 @@ impl Shell {
                 theme::body_size_at(self.state.draft().global.general.content_font_size),
                 theme::muted(),
             ))
+    }
+}
+
+/// The locale key naming one injected block kind.
+fn inject_kind_key(kind: &str) -> &'static str {
+    match kind {
+        "persona" => "inject.persona",
+        "instructions" => "inject.instructions",
+        _ => "inject.context",
     }
 }
 

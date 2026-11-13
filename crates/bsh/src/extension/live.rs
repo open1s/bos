@@ -139,3 +139,70 @@ fn reconcile(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use ferris_sdk::composable::{Scope, ServiceRegistry};
+    use std::sync::Arc;
+
+    /// The readiness predicate the live driver reconciles against (the same
+    /// computation LiveEntry::ready performs): a requirement is satisfied when
+    /// it is optional or a provider of that name exists.
+    fn ready(requirements: &[(String, bool)], services: &ServiceRegistry) -> bool {
+        requirements
+            .iter()
+            .all(|(name, optional)| *optional || services.has_name(name))
+    }
+
+    /// Provider disappearance suspends a required consumer; publication and
+    /// replacement reconcile it, and each transition emits the change event
+    /// the live driver subscribes to (issue #302).
+    #[tokio::test]
+    async fn provider_lifecycle_reconciles_a_required_consumer() {
+        let services = Arc::new(ServiceRegistry::new());
+        let mut changes = services.subscribe_changes();
+        let requirements = vec![("com.example.search".to_string(), false)];
+
+        // No provider: the required consumer is not ready (would be suspended).
+        assert!(!ready(&requirements, &services));
+
+        // A provider publishes at a shared scope: the consumer becomes ready,
+        // and the change event the driver watches is emitted.
+        let token = services.provide_contract(
+            Scope::Host,
+            "com.example.search",
+            "com.example.search-api",
+            semver::Version::new(1, 0, 0),
+            Arc::new(42u32),
+        );
+        let change = changes.recv().await.expect("publish emits a change");
+        assert_eq!(change.name, "com.example.search");
+        assert!(ready(&requirements, &services));
+
+        // Provider disappears: the consumer is no longer ready (suspended).
+        assert!(services.revoke(&token));
+        let change = changes.recv().await.expect("revoke emits a change");
+        assert_eq!(change.name, "com.example.search");
+        assert!(!ready(&requirements, &services));
+
+        // A replacement provider reconciles the consumer again.
+        let replacement = services.provide_contract(
+            Scope::Host,
+            "com.example.search",
+            "com.example.search-api",
+            semver::Version::new(1, 1, 0),
+            Arc::new(43u32),
+        );
+        let _ = changes.recv().await.expect("replacement emits a change");
+        assert!(ready(&requirements, &services));
+        assert!(services.revoke(&replacement));
+    }
+
+    /// An optional requirement never blocks activation (issue #302).
+    #[test]
+    fn an_optional_requirement_does_not_block() {
+        let services = ServiceRegistry::new();
+        let requirements = vec![("com.example.optional".to_string(), true)];
+        assert!(ready(&requirements, &services));
+    }
+}

@@ -3771,6 +3771,11 @@ impl AppState {
         {
             self.land_automatic_compaction(id, *before, *dropped, summary.clone());
         }
+        // The auto-injected context/persona is a transcript event, not a stream
+        // delta: record it on the prompt row before the store borrow below.
+        if let AgentEvent::ContextInjected { injections } = &event {
+            self.record_prompt_injections(id, injections);
+        }
         // A steered message and a withdrawn one are transcript/queue events,
         // not stream deltas: they touch no message the turn is filling in, so
         // they are handled before the store borrow below.
@@ -3906,7 +3911,8 @@ impl AppState {
                 AgentEvent::AutoCompacted { .. }
                 | AgentEvent::Steered { .. }
                 | AgentEvent::SteerWithdrawn { .. }
-                | AgentEvent::ActionMissed { .. } => {}
+                | AgentEvent::ActionMissed { .. }
+                | AgentEvent::ContextInjected { .. } => {}
                 // A turn that ends with nothing to show is a failure the
                 // reader must see. A reasoning model can spend every step in
                 // `reasoning_content` and never write an answer; the engine
@@ -3991,6 +3997,35 @@ impl AppState {
                 return;
             }
             session.messages[index].skills = skills.to_vec();
+        }
+        self.save_session(id);
+    }
+
+    /// Record the context/persona blocks the harness auto-injected into a turn
+    /// on its prompt row, so the transcript can draw an inject event. Display
+    /// only, like the invoked-skill blocks; the model already received them.
+    pub(crate) fn record_prompt_injections(
+        &mut self,
+        id: &str,
+        injections: &[crate::model::ContextInjection],
+    ) {
+        if injections.is_empty() {
+            return;
+        }
+        {
+            let Some(session) = self.store.session_mut(id) else {
+                return;
+            };
+            let Some(index) = session.messages.len().checked_sub(2) else {
+                return;
+            };
+            if session.messages[index].role != Role::User {
+                return;
+            }
+            // Record every injected block on the turn that carried it. The
+            // persona is injected on every turn, so it rides every row: an
+            // inject event must not drop key info the model actually received.
+            session.messages[index].injections = injections.to_vec();
         }
         self.save_session(id);
     }
@@ -6778,6 +6813,100 @@ mod tests {
             state.notice_retry.as_deref(),
             Some("fix it"),
             "the retry control carries the reader's own message"
+        );
+    }
+    /// The auto-injection event records the injected blocks on the prompt row,
+    /// so the transcript can draw them and a reload restores them.
+    #[test]
+    fn a_context_injected_event_lands_on_the_prompt_row() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-inject-event-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        let id = state.active_id.clone().expect("a session");
+        state.begin_turn_in(&id, "fix it").expect("a turn opens");
+        state.apply_event(
+            &id,
+            crate::runner::AgentEvent::ContextInjected {
+                injections: vec![
+                    crate::model::ContextInjection {
+                        kind: "context".to_string(),
+                        content: "SNAPSHOT".to_string(),
+                    },
+                    crate::model::ContextInjection {
+                        kind: "instructions".to_string(),
+                        content: "AGENTS".to_string(),
+                    },
+                ],
+            },
+        );
+        let session = state.store.session(&id).expect("the session");
+        let prompt = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == crate::model::Role::User)
+            .expect("the prompt row");
+        assert_eq!(
+            prompt.injections.len(),
+            2,
+            "the injections landed on the prompt row"
+        );
+        assert_eq!(prompt.injections[0].kind, "context");
+        assert_eq!(prompt.injections[1].content, "AGENTS");
+    }
+    /// The persona is injected on every turn, so it rides every prompt row: an
+    /// inject event must not drop key info the model received, even when the
+    /// system prompt is unchanged from the previous turn.
+    #[test]
+    fn a_persona_is_recorded_on_every_turn() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-inject-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
+        let id = state.active_id.clone().expect("a session");
+        let persona = crate::model::ContextInjection {
+            kind: "persona".to_string(),
+            content: "SYSTEM PROMPT".to_string(),
+        };
+        let context = crate::model::ContextInjection {
+            kind: "context".to_string(),
+            content: "SNAPSHOT".to_string(),
+        };
+        state.begin_turn_in(&id, "first").expect("a turn opens");
+        state.apply_event(
+            &id,
+            crate::runner::AgentEvent::ContextInjected {
+                injections: vec![persona.clone(), context.clone()],
+            },
+        );
+        state.begin_turn_in(&id, "second").expect("a turn opens");
+        state.apply_event(
+            &id,
+            crate::runner::AgentEvent::ContextInjected {
+                injections: vec![persona.clone(), context.clone()],
+            },
+        );
+        let session = state.store.session(&id).expect("the session");
+        let prompts: Vec<&crate::model::ChatMessage> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == crate::model::Role::User)
+            .collect();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[0].injections.iter().any(|i| i.kind == "persona"),
+            "the first turn records the persona"
+        );
+        assert!(
+            prompts[1].injections.iter().any(|i| i.kind == "persona"),
+            "the persona rides the second turn too: no key info is dropped"
+        );
+        assert!(
+            prompts[1].injections.iter().any(|i| i.kind == "context"),
+            "the per-turn context still rides the row"
         );
     }
 

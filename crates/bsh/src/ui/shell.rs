@@ -696,6 +696,9 @@ pub(crate) struct Shell {
     /// tool and thinks again has more than one. A session switch closes them
     /// all, the way the reference resets a turn's disclosure state.
     pub(crate) think_open: std::collections::HashSet<(usize, usize)>,
+    /// The prompt rows whose auto-injection event the reader has opened, by
+    /// message index. Collapsed is the default; a session switch closes them.
+    pub(crate) inject_open: std::collections::HashSet<(usize, usize)>,
     /// The settled turns whose process group the reader has opened, by message
     /// index. Collapsed is the default; a click is the only way in, and a
     /// session switch closes them with the reasoning disclosures.
@@ -2242,6 +2245,7 @@ impl Shell {
             following_tail: true,
             audit_jump_to: None,
             think_open: std::collections::HashSet::new(),
+            inject_open: std::collections::HashSet::new(),
             process_open: std::collections::HashSet::new(),
             compaction_open: std::collections::HashSet::new(),
             chat_last_offset: 0.0,
@@ -7382,6 +7386,7 @@ impl Render for Shell {
             self.tail_max = None;
             self.following_tail = true;
             self.think_open.clear();
+            self.inject_open.clear();
             self.process_open.clear();
             self.image_lightbox = None;
             self.compaction_open.clear();

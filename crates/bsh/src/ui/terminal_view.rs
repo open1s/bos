@@ -29,10 +29,38 @@ use gpui_libghostty::{
 
 use crate::terminal::Emission;
 
+/// One pane's terminal backend.
+///
+/// macOS/Linux draw Ghostty's native surface; Windows draws a ConPTY-backed
+/// software screen (issue #296), because Ghostty ships no Windows render
+/// surface. The view drives whichever backend through the same pane contract.
+pub(crate) enum Surface {
+    /// The Ghostty native surface (macOS, Linux/Wayland).
+    Ghostty(NativeSurface),
+    /// The Windows ConPTY software terminal (issue #296).
+    #[cfg(windows)]
+    ConPty(crate::terminal_windows::ConPtyTerminal),
+}
+
+impl Surface {
+    /// The Ghostty surface, if this backend is Ghostty (None for the Windows
+    /// ConPTY backend). An Option so the call sites stay refutable on every
+    /// platform, where the enum has a different number of variants.
+    fn ghostty_mut(&mut self) -> Option<&mut NativeSurface> {
+        match self {
+            Surface::Ghostty(surface) => Some(surface),
+            #[cfg(windows)]
+            Surface::ConPty(_) => None,
+        }
+    }
+}
+
 /// One pane's libghostty surface.
 pub(crate) struct TerminalView {
-    surface: NativeSurface,
-    theme: TerminalThemeState,
+    surface: Surface,
+    /// Ghostty's theme-file state; None on the Windows ConPTY backend, which
+    /// re-renders its grid from the pane palette directly.
+    theme: Option<TerminalThemeState>,
     /// The theme last applied, so a same-palette tick costs one compare.
     applied: TerminalTheme,
     /// The text size last applied, compared the same way.
@@ -74,25 +102,54 @@ impl TerminalView {
         // macOS prints a login banner before the shell; the pane has never
         // shown one, and its first output is the shell's prompt.
         options.quiet_login = true;
+        // Windows has no Ghostty render surface: spawn a ConPTY software
+        // terminal instead (issue #296). The pane reports it as unconfined.
+        #[cfg(windows)]
+        {
+            let _ = (&options, window, &theme);
+            let (rows, cols) = initial_grid(font_size);
+            let terminal = crate::terminal_windows::ConPtyTerminal::spawn(
+                &crate::terminal_windows::default_shell(),
+                rows,
+                cols,
+            )?;
+            return Ok(cx.new(|_| Self {
+                surface: Surface::ConPty(terminal),
+                theme: None,
+                applied: theme,
+                applied_font: font_size,
+                frame: Bounds::default(),
+                pump: None,
+                visible: true,
+                focused: false,
+            }));
+        }
         // SAFETY: GPUI owns the parent view; this entity services and drops its
         // native child on the window's UI thread, as the generated adapter does.
-        let (surface, theme_state) =
-            unsafe { spawn_surface(options, window, f64::from(window.scale_factor()))? };
-        Ok(cx.new(|_| Self {
-            surface,
-            theme: theme_state,
-            applied: theme,
-            applied_font: font_size,
-            frame: Bounds::default(),
-            pump: None,
-            visible: true,
-            focused: false,
-        }))
+        #[cfg(not(windows))]
+        {
+            let (surface, theme_state) =
+                unsafe { spawn_surface(options, window, f64::from(window.scale_factor()))? };
+            Ok(cx.new(|_| Self {
+                surface: Surface::Ghostty(surface),
+                theme: Some(theme_state),
+                applied: theme,
+                applied_font: font_size,
+                frame: Bounds::default(),
+                pump: None,
+                visible: true,
+                focused: false,
+            }))
+        }
     }
 
     /// Whether the shell behind the surface is alive.
     pub(crate) fn is_alive(&self) -> bool {
-        self.surface.is_alive()
+        match &self.surface {
+            Surface::Ghostty(surface) => surface.is_alive(),
+            #[cfg(windows)]
+            Surface::ConPty(terminal) => terminal.is_alive(),
+        }
     }
 
     /// Show or hide the native child without changing GPUI's focus.
@@ -105,8 +162,10 @@ impl TerminalView {
             return;
         }
         self.visible = visible;
-        self.surface.set_visible(visible);
-        self.surface.set_focus(visible && self.focused);
+        if let Some(surface) = self.surface.ghostty_mut() {
+            surface.set_visible(visible);
+            surface.set_focus(visible && self.focused);
+        }
     }
 
     /// Mirror GPUI's focus so Ghostty colours its cursor and reports focus.
@@ -115,7 +174,9 @@ impl TerminalView {
             return;
         }
         self.focused = focused;
-        self.surface.set_focus(self.visible && focused);
+        if let Some(surface) = self.surface.ghostty_mut() {
+            surface.set_focus(self.visible && focused);
+        }
     }
 
     /// Place the surface at the pane's measured bounds.
@@ -124,41 +185,67 @@ impl TerminalView {
     /// exactly what the shim converts into the parent view's own frame.
     pub(crate) fn update_frame(&mut self, bounds: Bounds<Pixels>, scale_factor: f64) {
         self.frame = bounds;
-        self.surface.set_frame(
-            f64::from(f32::from(bounds.origin.x)),
-            f64::from(f32::from(bounds.origin.y)),
-            f64::from(f32::from(bounds.size.width)),
-            f64::from(f32::from(bounds.size.height)),
-            scale_factor,
-        );
-        // The shim reveals the view on its first frame; keep an explicit hide
-        // (a background tab) across layout changes.
-        self.surface.set_visible(self.visible);
+        match &mut self.surface {
+            Surface::Ghostty(surface) => {
+                surface.set_frame(
+                    f64::from(f32::from(bounds.origin.x)),
+                    f64::from(f32::from(bounds.origin.y)),
+                    f64::from(f32::from(bounds.size.width)),
+                    f64::from(f32::from(bounds.size.height)),
+                    scale_factor,
+                );
+                // The shim reveals the view on its first frame; keep an explicit
+                // hide (a background tab) across layout changes.
+                surface.set_visible(self.visible);
+            }
+            #[cfg(windows)]
+            Surface::ConPty(terminal) => {
+                // Resize the pseudoconsole to the pane's measured cell grid.
+                let (rows, cols) = grid_for_bounds(bounds, self.applied_font);
+                terminal.resize(rows, cols);
+            }
+        }
     }
 
     /// Forward one keystroke down.
     pub(crate) fn key_down(&mut self, keystroke: &Keystroke, is_held: bool) {
-        let action = if is_held {
-            KeyAction::Repeat
-        } else {
-            KeyAction::Press
-        };
-        self.surface.send_key(
-            action,
-            &keystroke.key,
-            keystroke.key_char.as_deref(),
-            ghostty_modifiers(keystroke.modifiers),
-        );
+        match &mut self.surface {
+            Surface::Ghostty(surface) => {
+                let action = if is_held {
+                    KeyAction::Repeat
+                } else {
+                    KeyAction::Press
+                };
+                surface.send_key(
+                    action,
+                    &keystroke.key,
+                    keystroke.key_char.as_deref(),
+                    ghostty_modifiers(keystroke.modifiers),
+                );
+            }
+            #[cfg(windows)]
+            Surface::ConPty(terminal) => {
+                let bytes = encode_key(
+                    &keystroke.key,
+                    keystroke.key_char.as_deref(),
+                    keystroke.modifiers,
+                );
+                let _ = terminal.write_input(&bytes);
+            }
+        }
     }
 
     /// Forward one keystroke up (the kitty protocol reports releases).
     pub(crate) fn key_up(&mut self, keystroke: &Keystroke) {
-        self.surface.send_key(
-            KeyAction::Release,
-            &keystroke.key,
-            keystroke.key_char.as_deref(),
-            ghostty_modifiers(keystroke.modifiers),
-        );
+        if let Some(surface) = self.surface.ghostty_mut() {
+            surface.send_key(
+                KeyAction::Release,
+                &keystroke.key,
+                keystroke.key_char.as_deref(),
+                ghostty_modifiers(keystroke.modifiers),
+            );
+        }
+        // A ConPTY shell does not consume key releases.
     }
 
     /// Send Tab, for the pane's key binding.
@@ -167,21 +254,39 @@ impl TerminalView {
     /// the key-view loop and move focus out of the pane), so it never reaches
     /// the ordinary key path; the shell still has to see the byte.
     pub(crate) fn tab(&mut self) {
-        self.surface
-            .send_key(KeyAction::Press, "tab", None, Modifiers::empty());
+        match &mut self.surface {
+            Surface::Ghostty(surface) => {
+                surface.send_key(KeyAction::Press, "tab", None, Modifiers::empty());
+            }
+            #[cfg(windows)]
+            Surface::ConPty(terminal) => {
+                let _ = terminal.write_input(b"	");
+            }
+        }
     }
 
     /// Write what the input gate decided: a carriage return, or the shell's
     /// kill-whole-line.
     pub(crate) fn emission(&mut self, emission: Emission) {
-        match emission {
-            Emission::Enter => {
-                self.surface
-                    .send_key(KeyAction::Press, "enter", None, Modifiers::empty())
-            }
-            Emission::KillLine => {
-                self.surface
-                    .send_key(KeyAction::Press, "u", None, Modifiers::CONTROL)
+        match &mut self.surface {
+            Surface::Ghostty(surface) => match emission {
+                Emission::Enter => {
+                    surface.send_key(KeyAction::Press, "enter", None, Modifiers::empty())
+                }
+                Emission::KillLine => {
+                    surface.send_key(KeyAction::Press, "u", None, Modifiers::CONTROL)
+                }
+            },
+            #[cfg(windows)]
+            Surface::ConPty(terminal) => {
+                let bytes: &[u8] = match emission {
+                    Emission::Enter => {
+                        b"
+"
+                    }
+                    Emission::KillLine => b"", // Ctrl-U
+                };
+                let _ = terminal.write_input(bytes);
             }
         }
     }
@@ -191,8 +296,68 @@ impl TerminalView {
         // Ghostty's text path is NUL-terminated; a NUL has no meaning in a
         // commit and would truncate it.
         let text = text.replace('\0', "");
-        if let Ok(text) = CString::new(text) {
-            self.surface.text(&text);
+        match &mut self.surface {
+            Surface::Ghostty(surface) => {
+                if let Ok(text) = CString::new(text) {
+                    surface.text(&text);
+                }
+            }
+            #[cfg(windows)]
+            Surface::ConPty(terminal) => {
+                let _ = terminal.write_input(text.as_bytes());
+            }
+        }
+    }
+
+    /// Whether this pane draws a software screen (the Windows ConPTY backend)
+    /// rather than a Ghostty native surface (issue #296).
+    pub(crate) fn is_software_terminal(&self) -> bool {
+        #[cfg(windows)]
+        {
+            matches!(self.surface, Surface::ConPty(_))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Copy the software screen's text to the clipboard (issue #296). Ghostty
+    /// owns its own selection/clipboard, so this is a no-op for that backend.
+    pub(crate) fn copy_screen(&mut self, _cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        if let Surface::ConPty(terminal) = &self.surface {
+            let text: String = terminal
+                .cells()
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|c| c.text.clone())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                );
+            _cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Paste the clipboard into the software terminal (issue #296). Ghostty
+    /// handles its own paste, so this is a no-op for that backend.
+    pub(crate) fn paste_clipboard(&mut self, _cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        if let Surface::ConPty(terminal) = &mut self.surface {
+            let text = _cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            if !text.is_empty() {
+                let _ = terminal.write_input(text.as_bytes());
+            }
         }
     }
 
@@ -200,8 +365,9 @@ impl TerminalView {
     pub(crate) fn mouse_move(&mut self, position: Point<Pixels>, modifiers: gpui::Modifiers) {
         let x = f64::from(f32::from(position.x - self.frame.origin.x));
         let y = f64::from(f32::from(position.y - self.frame.origin.y));
-        self.surface
-            .mouse_position(x, y, ghostty_modifiers(modifiers));
+        if let Some(surface) = self.surface.ghostty_mut() {
+            surface.mouse_position(x, y, ghostty_modifiers(modifiers));
+        }
     }
 
     /// A pointer button press.
@@ -212,11 +378,13 @@ impl TerminalView {
         modifiers: gpui::Modifiers,
     ) {
         self.mouse_move(position, modifiers);
-        self.surface.mouse_button(
-            gpui_libghostty::__private::MouseState::Press,
-            ghostty_button(button),
-            ghostty_modifiers(modifiers),
-        );
+        if let Some(surface) = self.surface.ghostty_mut() {
+            surface.mouse_button(
+                gpui_libghostty::__private::MouseState::Press,
+                ghostty_button(button),
+                ghostty_modifiers(modifiers),
+            );
+        }
     }
 
     /// A pointer button release.
@@ -227,11 +395,13 @@ impl TerminalView {
         modifiers: gpui::Modifiers,
     ) {
         self.mouse_move(position, modifiers);
-        self.surface.mouse_button(
-            gpui_libghostty::__private::MouseState::Release,
-            ghostty_button(button),
-            ghostty_modifiers(modifiers),
-        );
+        if let Some(surface) = self.surface.ghostty_mut() {
+            surface.mouse_button(
+                gpui_libghostty::__private::MouseState::Release,
+                ghostty_button(button),
+                ghostty_modifiers(modifiers),
+            );
+        }
     }
 
     /// Forward one wheel event; Ghostty scrolls its own scrollback.
@@ -250,7 +420,9 @@ impl TerminalView {
             ),
             ScrollDelta::Lines(delta) => (f64::from(delta.x), f64::from(delta.y), false),
         };
-        self.surface.mouse_scroll(x, y, precision);
+        if let Some(surface) = self.surface.ghostty_mut() {
+            surface.mouse_scroll(x, y, precision);
+        }
     }
 
     /// Re-apply the palette when the window's theme changed.
@@ -261,15 +433,28 @@ impl TerminalView {
         if theme == self.applied && font_size == self.applied_font {
             return false;
         }
-        match self.theme.apply(&mut self.surface, &theme, Some(font_size)) {
-            Ok(()) => {
+        match (&mut self.theme, &mut self.surface) {
+            (Some(state), Surface::Ghostty(surface)) => {
+                match state.apply(surface, &theme, Some(font_size)) {
+                    Ok(()) => {
+                        self.applied = theme;
+                        self.applied_font = font_size;
+                        true
+                    }
+                    // A failed theme write leaves the previous colours; the
+                    // next tick or the next theme switch tries again.
+                    Err(_) => false,
+                }
+            }
+            // The ConPTY grid re-renders from the pane palette on the next
+            // frame; there is no Ghostty theme file to rewrite.
+            #[cfg(windows)]
+            (_, Surface::ConPty(_)) => {
                 self.applied = theme;
                 self.applied_font = font_size;
                 true
             }
-            // A failed theme write leaves the previous colours; the next tick
-            // or the next theme switch tries again.
-            Err(_) => false,
+            _ => false,
         }
     }
 
@@ -278,17 +463,40 @@ impl TerminalView {
         if self.pump.is_some() {
             return;
         }
-        self.surface.tick();
-        let wakeup = self.surface.wakeup();
-        let view = cx.entity().downgrade();
-        self.pump = Some(cx.spawn(async move |_, cx| loop {
-            wakeup.wait().await;
-            // Ghostty draws its native child during the tick; GPUI has no
-            // terminal pixels to repaint for this wakeup.
-            if view.update(cx, |view, _| view.surface.tick()).is_err() {
-                break;
+        match &mut self.surface {
+            Surface::Ghostty(surface) => {
+                surface.tick();
+                let wakeup = surface.wakeup();
+                let view = cx.entity().downgrade();
+                self.pump = Some(cx.spawn(async move |_, cx| loop {
+                    wakeup.wait().await;
+                    // Ghostty draws its native child during the tick; GPUI has
+                    // no terminal pixels to repaint for this wakeup.
+                    let alive = view.update(cx, |view, _| {
+                        if let Some(surface) = view.surface.ghostty_mut() {
+                            surface.tick();
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }));
             }
-        }));
+            // The ConPTY reader thread feeds the screen; repaint on a short
+            // cadence so new output appears (issue #296).
+            #[cfg(windows)]
+            Surface::ConPty(_) => {
+                let view = cx.entity().downgrade();
+                self.pump = Some(cx.spawn(async move |_, cx| loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(50))
+                        .await;
+                    if view.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }));
+            }
+        }
     }
 }
 
@@ -296,6 +504,59 @@ impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_pump(cx);
         let view = cx.entity().downgrade();
+        // The Windows ConPTY backend draws its software screen itself: Ghostty
+        // has no Windows render surface (issue #296).
+        #[cfg(windows)]
+        if let Surface::ConPty(terminal) = &self.surface {
+            let cells = terminal.cells();
+            let font_size = self.applied_font;
+            let fg = rgba(crate::theme::text());
+            let bg = rgba(crate::theme::page());
+            let measure_view = view.clone();
+            return div()
+                .size_full()
+                .min_h(px(0.0))
+                .child(
+                    canvas(
+                        move |bounds, window, cx| {
+                            let scale_factor = f64::from(window.scale_factor());
+                            let _ = measure_view
+                                .update(cx, |view, _| view.update_frame(bounds, scale_factor));
+                        },
+                        move |bounds, _state, window, cx| {
+                            let line_height = px(font_size * 1.4);
+                            let mut y = bounds.origin.y;
+                            for row in &cells {
+                                let text: String = row.iter().map(|c| c.text.clone()).collect();
+                                let text = text.trim_end();
+                                if !text.is_empty() {
+                                    let mut style = window.text_style();
+                                    style.color = fg.into();
+                                    let run = style.to_run(text.len());
+                                    let line = window.text_system().shape_line(
+                                        text.to_string().into(),
+                                        px(font_size),
+                                        &[run],
+                                        None,
+                                    );
+                                    let _ = line.paint(
+                                        point(bounds.origin.x, y),
+                                        line_height,
+                                        TextAlign::Left,
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                                y += line_height;
+                            }
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .bg(bg);
+        }
         div().size_full().min_h(px(0.0)).child(
             canvas(
                 move |bounds, window, cx| {
@@ -307,6 +568,17 @@ impl Render for TerminalView {
             .absolute()
             .size_full(),
         )
+    }
+}
+
+/// A 0xRRGGBB colour as a GPUI RGBA (the Windows grid renderer).
+#[cfg(windows)]
+fn rgba(rgb: u32) -> gpui::Rgba {
+    gpui::Rgba {
+        r: ((rgb >> 16) & 0xFF) as f32 / 255.0,
+        g: ((rgb >> 8) & 0xFF) as f32 / 255.0,
+        b: (rgb & 0xFF) as f32 / 255.0,
+        a: 1.0,
     }
 }
 
@@ -351,5 +623,51 @@ fn ghostty_button(button: gpui::MouseButton) -> GhosttyButton {
         gpui::MouseButton::Right => GhosttyButton::Right,
         gpui::MouseButton::Middle => GhosttyButton::Middle,
         _ => GhosttyButton::Unknown,
+    }
+}
+
+/// The initial cell grid for a new Windows terminal before the pane is measured.
+#[cfg(windows)]
+fn initial_grid(_font_size: f32) -> (u16, u16) {
+    (24, 80)
+}
+
+/// The cell grid that fits the pane's measured bounds at the current font size.
+#[cfg(windows)]
+fn grid_for_bounds(bounds: Bounds<Pixels>, font_size: f32) -> (u16, u16) {
+    let cell_w = (font_size * 0.6).max(1.0);
+    let cell_h = (font_size * 1.4).max(1.0);
+    let cols = (f32::from(bounds.size.width) / cell_w).floor() as u16;
+    let rows = (f32::from(bounds.size.height) / cell_h).floor() as u16;
+    (rows.max(1), cols.max(1))
+}
+
+/// Encode a keystroke as the byte sequence a ConPTY shell expects (issue #296).
+#[cfg(windows)]
+fn encode_key(key: &str, key_char: Option<&str>, modifiers: gpui::Modifiers) -> Vec<u8> {
+    // Control chords map to their C0 control byte.
+    if modifiers.control {
+        if let Some(ch) = key_char.and_then(|c| c.chars().next()) {
+            let upper = ch.to_ascii_uppercase();
+            if upper.is_ascii_uppercase() {
+                return vec![(upper as u8) - b'A' + 1];
+            }
+        }
+    }
+    match key {
+        "enter" => b"\r".to_vec(),
+        "tab" => b"\t".to_vec(),
+        "backspace" => b"\x7f".to_vec(),
+        "escape" => b"\x1b".to_vec(),
+        "up" => b"\x1b[A".to_vec(),
+        "down" => b"\x1b[B".to_vec(),
+        "right" => b"\x1b[C".to_vec(),
+        "left" => b"\x1b[D".to_vec(),
+        "home" => b"\x1b[H".to_vec(),
+        "end" => b"\x1b[F".to_vec(),
+        "pageup" => b"\x1b[5~".to_vec(),
+        "pagedown" => b"\x1b[6~".to_vec(),
+        "delete" => b"\x1b[3~".to_vec(),
+        _ => key_char.map(|c| c.as_bytes().to_vec()).unwrap_or_default(),
     }
 }

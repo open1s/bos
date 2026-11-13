@@ -1242,10 +1242,9 @@ pub(crate) fn surface_support() -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        Err(String::from(
-            "The integrated terminal's native backend is not yet available on Windows. \
-             Use the shell tool for commands; the terminal pane requires macOS or Linux/Wayland.",
-        ))
+        // Windows draws a ConPTY-backed software screen (issue #296); there is
+        // no display-server gate as on Linux.
+        Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
