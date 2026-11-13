@@ -7362,6 +7362,46 @@ fn the_general_pane_toggles_the_complete_persona(cx: &mut TestAppContext) {
     });
 }
 
+/// A disabled complete-persona switch still answers a press: with no persona
+/// it shows the "write a persona first" notice instead of doing nothing, so a
+/// press is never silent on any platform.
+#[gpui::test]
+fn the_disabled_persona_switch_answers_with_a_notice(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = state_with_turns("persona-disabled", 1);
+        state.settings.workspace.agent.complete = false;
+        state.settings.workspace.agent.system_prompt = String::new();
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let toggle = cx
+        .debug_bounds("persona-complete-toggle")
+        .expect("the persona switch is shown even with no persona");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    draw_until(
+        cx,
+        "the disabled switch answers with a notice",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.update(|_, cx| {
+                shell
+                    .read(cx)
+                    .state
+                    .notice
+                    .as_deref()
+                    .is_some_and(|n| n.contains("persona"))
+            })
+        },
+    );
+    assert!(
+        !cx.update(|_, cx| shell.read(cx).state.persona_complete),
+        "the flag stays off: complete persona needs a persona"
+    );
+}
+
 /// The complete flag is written where the persona lives: with a preset persona
 /// the switch edits that preset's declaration, never the inert workspace flag.
 #[gpui::test]

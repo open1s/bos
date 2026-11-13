@@ -2690,9 +2690,11 @@ impl Shell {
                 // installed row opens its disclosure); the toggle is the
                 // control the press meant, so it must not also toggle the row.
                 cx.stop_propagation();
-                if enabled {
-                    action(this, !checked, cx);
-                }
+                // Always run the action, even when the switch is disabled: the
+                // action owns the refusal (the persona switch answers "write a
+                // persona first"), so a press is never silent. Only the persona
+                // switch is ever disabled; every other caller passes enabled.
+                action(this, !checked, cx);
             }))
             .into_any_element()
     }

@@ -692,12 +692,14 @@ impl Settings {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let name = root
-                .rsplit('/')
-                .next()
+            // The leaf name must survive both path separators: a Windows root
+            // uses `\`, so splitting only on `/` named the workspace with its
+            // whole path (issue: cross-platform workspace registration).
+            let name = std::path::Path::new(&root)
+                .file_name()
+                .map(|leaf| leaf.to_string_lossy().into_owned())
                 .filter(|leaf| !leaf.is_empty())
-                .unwrap_or(&root)
-                .to_string();
+                .unwrap_or_else(|| root.clone());
             let id = self.note_workspace(&name, &root);
             self.global.general.active_workspace = id;
             return;

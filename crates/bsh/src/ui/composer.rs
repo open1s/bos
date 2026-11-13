@@ -807,18 +807,19 @@ impl Shell {
             cx.notify();
             return;
         }
-        if eff.preset_system_prompt.is_some() {
-            if !eff.preset_id.is_empty() {
-                let id = eff.preset_id.clone();
-                let mut preset = self.state.settings.global.preset(&id).unwrap_or_default();
-                if preset.system_prompt.is_some() {
-                    preset.complete = on;
-                    self.state.settings.global.presets.insert(id, preset);
-                } else {
-                    self.state.settings.workspace.agent.complete = on;
-                }
+        if eff.preset_system_prompt.is_some() && !eff.preset_id.is_empty() {
+            let id = eff.preset_id.clone();
+            let mut preset = self.state.settings.global.preset(&id).unwrap_or_default();
+            if preset.system_prompt.is_some() {
+                preset.complete = on;
+                self.state.settings.global.presets.insert(id, preset);
+            } else {
+                self.state.settings.workspace.agent.complete = on;
             }
         } else {
+            // No preset owns the persona (or it names none): the workspace flag
+            // is the authority. This also covers a preset prompt with no id, so
+            // the switch always lands on a writable flag instead of doing nothing.
             self.state.settings.workspace.agent.complete = on;
         }
         if let Err(error) = self.state.settings.save() {
@@ -1319,7 +1320,9 @@ impl Shell {
                                         ),
                                 )
                         })
-                        .disabled(!persona_ready)
+                        // Not `.disabled`: a press must reach the handler so it
+                        // can answer "write a persona first" instead of doing
+                        // nothing. The row keeps its dimmed look above.
                         .on_click(move |_, _window, cx| {
                             pick.update(cx, |this, cx| {
                                 this.set_persona_complete(!persona_on, cx);
