@@ -352,6 +352,11 @@ pub(crate) struct ContextInjection {
     pub(crate) kind: String,
     /// The exact text the request carried.
     pub(crate) content: String,
+    /// The producer the durable source names (DSH's `producer.label`): the
+    /// instruction file (`AGENTS.md`), `runtime-context`, etc. Empty on legacy
+    /// rows, which fall back to the kind label.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) source: String,
 }
 
 /// One segment of a turn, in the order the stream produced it.

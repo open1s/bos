@@ -2774,6 +2774,7 @@ impl Shell {
                     resolved = crate::model::ContextInjection {
                         kind: injection.kind.clone(),
                         content,
+                        source: injection.source.clone(),
                     };
                     &resolved
                 } else {
@@ -4090,7 +4091,14 @@ impl Shell {
         let open = self.inject_open.contains(&key);
         let group = SharedString::from(format!("inject-{index}-{slot}"));
         let title = self.state.lang.tr("inject.title");
-        let producer = self.state.lang.tr(inject_kind_key(&injection.kind));
+        // The reference names the producer the durable source identifies (the
+        // instruction file, runtime-context); legacy rows without a source fall
+        // back to the translated kind label.
+        let producer = if injection.source.is_empty() {
+            self.state.lang.tr(inject_kind_key(&injection.kind))
+        } else {
+            injection.source.clone()
+        };
         // The provenance rides with the block: resolve its source so the trust
         // boundary is preserved at the transcript, not erased (issue #333).
         let _source = crate::context_assembly::ContextSource::from_injection_kind(&injection.kind);

@@ -362,18 +362,25 @@ impl Runner {
                     injections.push(crate::model::ContextInjection {
                         kind: "persona".to_string(),
                         content: persona,
+                        source: "persona".to_string(),
                     });
                 }
                 if !context.snapshot.is_empty() {
                     injections.push(crate::model::ContextInjection {
                         kind: "context".to_string(),
                         content: context.snapshot.clone(),
+                        source: "runtime-context".to_string(),
                     });
                 }
                 if let Some(instructions) = &context.instructions {
+                    // Name the producer the way the reference does: the file the
+                    // instructions came from (AGENTS.md), not a generic kind.
+                    let source =
+                        crate::instructions::sources(std::path::Path::new(&facts.cwd)).join(", ");
                     injections.push(crate::model::ContextInjection {
                         kind: "instructions".to_string(),
                         content: instructions.clone(),
+                        source,
                     });
                 }
                 if !injections.is_empty() {

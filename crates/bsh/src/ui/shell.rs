@@ -5398,6 +5398,11 @@ impl Shell {
         }
     }
 
+    /// How long the streaming pump holds a batch to coalesce fast tokens.
+    /// Bounds the transcript relayout/draw rate during a byte-by-byte stream
+    /// (~60 refreshes/s) instead of one refresh per token.
+    const STREAM_COALESCE_MS: u64 = 16;
+
     /// Forward runner events into the state until the turn ends.
     ///
     /// Both spawned tasks are OWNED by the shell (see [Self::keep_task]). That
@@ -5475,6 +5480,11 @@ impl Shell {
         let stream_ticket = self.state.streams.get(&id).copied();
         let events = cx.spawn(async move |this, cx| {
             let mut saw_terminal = false;
+            // Whether the NEXT batch should hold a coalescing window. Set only
+            // when events are still queued after a batch: a fast stream keeps
+            // producing, so it is folded; an idle channel means the next event
+            // is a fresh start and lands without delay.
+            let mut coalesce_next = false;
             while let Ok(first) = rx.recv().await {
                 // Coalesce everything that has already arrived. A delta that
                 // wakes this task with more queued behind it is ONE transcript
@@ -5487,6 +5497,29 @@ impl Shell {
                         Ok(next) => batch.push(next),
                         Err(async_channel::TryRecvError::Empty) => break,
                         Err(async_channel::TryRecvError::Closed) => break,
+                    }
+                }
+                // A byte-by-byte stream can wake this task once per token, and
+                // each wake would be its own relayout and draw. When the last
+                // batch left events still queued, the stream is outrunning the
+                // pane: hold a short window so the fast tokens accumulate into
+                // one batch and the refresh rate is bounded by the window, not
+                // the token rate. The first batch and any terminal event are
+                // never held, so a reply's first token and its end stay prompt.
+                if coalesce_next
+                    && !batch
+                        .iter()
+                        .any(|e| matches!(e, AgentEvent::Done | AgentEvent::Error(_)))
+                {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(Self::STREAM_COALESCE_MS))
+                        .await;
+                    loop {
+                        match rx.try_recv() {
+                            Ok(next) => batch.push(next),
+                            Err(async_channel::TryRecvError::Empty) => break,
+                            Err(async_channel::TryRecvError::Closed) => break,
+                        }
                     }
                 }
                 let session_id = id.clone();
@@ -5593,6 +5626,10 @@ impl Shell {
                         cx,
                     );
                 });
+                // Events still queued means the stream is fast: coalesce the
+                // next batch. An empty channel means the next event is a fresh
+                // start, so it is applied (and drawn) without a holding window.
+                coalesce_next = !rx.is_empty();
                 if terminal.is_some() {
                     saw_terminal = true;
                     break;

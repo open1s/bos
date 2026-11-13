@@ -392,6 +392,17 @@ fn truncate_to_fit(
 /// is dropped first when the batch is over budget, and the most specific file
 /// is truncated as the last resort; a file that could not be read is rendered
 /// as a named, explicit note instead of vanishing.
+/// The display names of the instruction files a workspace contributes, in the
+/// order the model reads them. The producer label an inject row shows beside
+/// its title (DSH names the file, e.g. `AGENTS.md`, not a generic kind). Uses
+/// the same cached load as `render`, so asking twice in a turn is a cache hit.
+pub(crate) fn sources(cwd: &Path) -> Vec<String> {
+    if cwd.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    load(cwd).into_iter().map(|file| file.display).collect()
+}
+
 pub(crate) fn render(cwd: &Path) -> Option<String> {
     if cwd.as_os_str().is_empty() {
         return None;
@@ -575,6 +586,18 @@ mod tests {
         let root = scratch("empty");
         assert_eq!(render(&root), None);
         assert_eq!(render(Path::new("")), None, "no workspace, no render");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The producer names the instruction files the workspace contributes, so an
+    /// inject row shows `AGENTS.md` the way the reference does, not a generic kind.
+    #[test]
+    fn sources_name_the_instruction_files() {
+        let root = scratch("sources");
+        assert!(sources(&root).is_empty(), "no file, no producer");
+        std::fs::write(root.join("AGENTS.md"), "rule").expect("agents");
+        assert_eq!(sources(&root), vec!["AGENTS.md".to_string()]);
+        assert_eq!(sources(Path::new("")), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&root);
     }
 

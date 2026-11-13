@@ -1215,6 +1215,26 @@ impl Store {
     /// Startup reads no history. Selecting a row calls this once: it reads only
     /// the last `WINDOW` rows, and a row that already carries a window is left
     /// alone. A restore re-attaches a document to a log that never moved.
+    /// Release an inactive session's cached History - its segment handles and
+    /// decoded page cache - without touching the transcript window. The window
+    /// is already bounded (see `trim_front`); the page cache is what grows with
+    /// deep scrolling, and dropping it for a chat the reader left keeps that
+    /// memory from accumulating across every visited session. The log still
+    /// holds every row: paging that session again reopens the History cheaply.
+    pub(crate) fn evict_history_cache(&mut self, id: &str) -> bool {
+        let Some(at) = self.sessions.iter().position(|session| session.id == id) else {
+            return false;
+        };
+        let dir = crate::history::History::dir_for(self.dir_for(&self.sessions[at]), id);
+        self.histories.borrow_mut().remove(&dir).is_some()
+    }
+
+    /// How many session Histories (segment handles + page caches) are cached.
+    #[cfg(test)]
+    pub(crate) fn cached_histories(&self) -> usize {
+        self.histories.borrow().len()
+    }
+
     pub(crate) fn rehydrate(&mut self, id: &str) -> bool {
         let Some(at) = self.sessions.iter().position(|session| session.id == id) else {
             return false;
@@ -1995,6 +2015,59 @@ mod raw_tests {
         assert_eq!(all.messages[0].text, "turn 0 user");
         assert_eq!(all.messages[1].text, "turn 0 answer");
         assert_eq!(all.messages[WINDOW].text, "turn 128 user");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Evicting an inactive session's History releases its page cache but keeps
+    /// the bounded window; paging it again reopens the log, so nothing is lost.
+    #[test]
+    fn evicting_a_history_cache_keeps_the_window_and_reopens() {
+        use crate::model::ChatMessage;
+        use crate::store::{Store, WINDOW};
+
+        let base = std::env::temp_dir().join(format!("bsh-evict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).expect("workspace");
+
+        let mut session = crate::model::Session::new("live", "long chat");
+        session.id = "evict".to_string();
+        session.workspace = "live".to_string();
+        for index in 0..600 {
+            session
+                .messages
+                .push(ChatMessage::user(format!("message {index}")));
+        }
+        let store = Store::open_over(
+            &[("live".to_string(), root.to_string_lossy().to_string())],
+            base.join("quarantine"),
+        );
+        store.save(&session).expect("the save");
+
+        let mut opened = Store::open_over(
+            &[("live".to_string(), root.to_string_lossy().to_string())],
+            base.join("quarantine"),
+        );
+        opened.rehydrate("evict");
+        let window = opened.session("evict").unwrap().messages.len();
+        assert_eq!(window, WINDOW);
+        assert!(opened.cached_histories() >= 1, "rehydrate caches a History");
+
+        // Eviction releases the page cache but keeps the window.
+        assert!(opened.evict_history_cache("evict"));
+        assert_eq!(opened.cached_histories(), 0, "the page cache is released");
+        assert_eq!(
+            opened.session("evict").unwrap().messages.len(),
+            window,
+            "the bounded window stays"
+        );
+        // Evicting an absent cache is a no-op.
+        assert!(!opened.evict_history_cache("evict"));
+
+        // Paging again reopens the History from the log.
+        let added = opened.load_older("evict", WINDOW);
+        assert_eq!(added, WINDOW, "the log still serves older pages");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 

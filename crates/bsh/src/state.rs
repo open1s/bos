@@ -1381,6 +1381,26 @@ impl AppState {
     /// This is a view change, not a runtime one: another session's turn keeps
     /// streaming, and the remembered id is a machine preference, so only the
     /// global document is rewritten.
+    /// Release the cached History page caches of the chats the reader is not
+    /// looking at, so deep-scroll pages do not accumulate across every visited
+    /// session. The bounded transcript windows stay (a fork/branch may still
+    /// read them); a streaming session keeps its cache because its turn is
+    /// still reading and writing the log.
+    fn evict_inactive_histories(&mut self, active: &str) {
+        let ids: Vec<String> = self
+            .store
+            .sessions
+            .iter()
+            .filter(|session| session.id != active)
+            .map(|session| session.id.clone())
+            .collect();
+        for id in ids {
+            if !self.is_streaming(&id) {
+                self.store.evict_history_cache(&id);
+            }
+        }
+    }
+
     pub(crate) fn select(&mut self, id: &str) {
         if self
             .store
@@ -1395,6 +1415,7 @@ impl AppState {
             self.store.rehydrate(id);
             self.active_id = Some(id.to_string());
             self.subagent = None;
+            self.evict_inactive_histories(id);
             self.tab = Tab::Chat;
             self.settings.global.general.active_session = id.to_string();
             // The window follows the chat: the workspace this session belongs to
@@ -4090,6 +4111,7 @@ impl AppState {
                         recorded.push(crate::model::ContextInjection {
                             kind: injection.kind.clone(),
                             content: String::new(),
+                            source: injection.source.clone(),
                         });
                     } else {
                         session.last_injected_persona = Some(injection.content.clone());
@@ -6907,10 +6929,12 @@ mod tests {
                     crate::model::ContextInjection {
                         kind: "context".to_string(),
                         content: "SNAPSHOT".to_string(),
+                        source: String::new(),
                     },
                     crate::model::ContextInjection {
                         kind: "instructions".to_string(),
                         content: "AGENTS".to_string(),
+                        source: String::new(),
                     },
                 ],
             },
@@ -6944,10 +6968,12 @@ mod tests {
         let persona = crate::model::ContextInjection {
             kind: "persona".to_string(),
             content: "SYSTEM PROMPT".to_string(),
+            source: String::new(),
         };
         let context = crate::model::ContextInjection {
             kind: "context".to_string(),
             content: "SNAPSHOT".to_string(),
+            source: String::new(),
         };
         state.begin_turn_in(&id, "first").expect("a turn opens");
         state.apply_event(
@@ -6998,10 +7024,12 @@ mod tests {
         let persona = crate::model::ContextInjection {
             kind: "persona".to_string(),
             content: "SYSTEM PROMPT".to_string(),
+            source: String::new(),
         };
         let context = crate::model::ContextInjection {
             kind: "context".to_string(),
             content: "SNAPSHOT".to_string(),
+            source: String::new(),
         };
         state.begin_turn_in(&id, "first").expect("a turn opens");
         state.apply_event(
@@ -7050,6 +7078,7 @@ mod tests {
         let changed = crate::model::ContextInjection {
             kind: "persona".to_string(),
             content: "NEW PROMPT".to_string(),
+            source: String::new(),
         };
         state.apply_event(
             &id,
@@ -8463,6 +8492,37 @@ mod tests {
         let mut state = super::AppState::with_store(crate::store::Store::open_at(dir));
         seed_models(&mut state);
         state
+    }
+
+    /// Selecting a chat keeps the other sessions' bounded windows - a fork or
+    /// branch may still read them - while releasing their History page caches.
+    #[test]
+    fn selecting_a_chat_keeps_windows_and_evicts_history_caches() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("bsh-evict-caches-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = super::AppState::with_store(crate::store::Store::open_at(dir.clone()));
+        let first = state.active_id.clone().expect("the first session");
+        let second = state.new_session().expect("the second session");
+        for id in [&first, &second] {
+            let session = state.store.session_mut(id).expect("the session");
+            session
+                .messages
+                .push(crate::model::ChatMessage::user("hello"));
+            session.paged_from = Some(0);
+        }
+
+        state.select(&first);
+        assert!(
+            !state.store.session(&second).unwrap().messages.is_empty(),
+            "the inactive window stays: a fork/branch may still read it"
+        );
+        assert!(
+            !state.store.session(&first).unwrap().messages.is_empty(),
+            "the active window stays"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Two chats in ONE workspace choose different models, and the choice is a

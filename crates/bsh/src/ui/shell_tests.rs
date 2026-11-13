@@ -1373,10 +1373,12 @@ fn an_auto_injection_is_drawn_as_an_openable_event(cx: &mut TestAppContext) {
                 crate::model::ContextInjection {
                     kind: "context".to_string(),
                     content: "Current runtime context. SNAPSHOT".to_string(),
+                    source: "runtime-context".to_string(),
                 },
                 crate::model::ContextInjection {
                     kind: "instructions".to_string(),
                     content: "workspace instructions BODY".to_string(),
+                    source: "AGENTS.md".to_string(),
                 },
             ];
         }

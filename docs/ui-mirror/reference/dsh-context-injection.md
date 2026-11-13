@@ -30,7 +30,10 @@ One **collapsed disclosure per injected context source** (not one grouped row):
   full-width disclosure, and the right-aligned user-bubble stack is shrink-to-fit
   and would collapse its width.
 - Title uses `inject.title` = "Context injection" / "上下文注入" (reference bytes).
-- Producer label beside the title via `inject.persona/context/instructions`;
+- Producer label beside the title names the **source** the way the reference
+  does (`producer.label`): the instruction file (`AGENTS.md`), `runtime-context`,
+  `persona`. `ContextInjection.source` carries it; legacy rows without a source
+  fall back to the translated kind label (`inject.persona/context/instructions`);
   2px separator dot, 24px + delta header rhythm, chevron-on-hover leading.
 - Body: `max_h(141px)` scrollport, code-block fill (`theme::new_session_fill`),
   `theme::CODE_FONT` at `theme::CODE_BLOCK_SIZE` (11px) / 16px line, indented
@@ -48,8 +51,10 @@ One **collapsed disclosure per injected context source** (not one grouped row):
 
 - Icon: BSH's kit has no `IconContextInjectionOutlineRegular`; the row uses
   `CircleDashed` (the compaction marker's icon) as the stand-in.
-- Producer label is the injection kind, not the instruction file path / preset
-  name (the BSH `ContextInjection` record carries kind + content only).
+- Producer label now names the source (instruction file / `runtime-context`),
+  matching the reference. A `skill-catalog` row has no BSH backing: BSH loads
+  skills through the `find_skill` tool rather than injecting a catalogue into the
+  prompt, so there is no catalogue injection to show (not faked).
 - Body is the opaque code-block form; the reference's form-specific bodies
   (instruction file list, snapshot sections, catalog) are not modelled.
 - Every injected block rides the turn that carried it: the persona is injected
