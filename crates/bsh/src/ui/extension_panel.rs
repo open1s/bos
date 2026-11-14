@@ -206,6 +206,10 @@ pub(crate) struct ExtensionPanelView {
     /// view is a placeholder: the runtime may serve a live card for the same
     /// panel, and it is fetched once per selection (and on Refresh).
     attempted: bool,
+    /// Whether the card on screen is a drill-down served by a non-refresh
+    /// action (a file diff, say). The auto-refresh must not clobber it: the
+    /// reader stays on the diff until Back or Refresh returns to the live card.
+    drilled: bool,
     /// Editable input state, keyed by node path.
     ///
     /// A declared input carries a starting value, not the field's life: the
@@ -268,6 +272,7 @@ impl ExtensionPanelView {
             picker: None,
             picker_subscription: None,
             attempted: false,
+            drilled: false,
             inputs: RefCell::new(BTreeMap::new()),
             sections: RefCell::new(BTreeMap::new()),
             trees: RefCell::new(BTreeMap::new()),
@@ -284,6 +289,33 @@ impl ExtensionPanelView {
             }
         }
         view
+    }
+
+    /// The panels this view offers, as (qualified id, title) pairs the Start
+    /// launcher draws one tile per panel. Read from the cached view so the
+    /// launcher never pays for a host scan on a render.
+    pub(crate) fn panel_tiles(&self) -> Vec<(String, String)> {
+        self.panels
+            .iter()
+            .map(|panel| (panel.panel_id.clone(), panel.title.clone()))
+            .collect()
+    }
+
+    /// Open one panel by its qualified id, the way the Start launcher's tile
+    /// does: select it, or refresh it when it is already the selected one.
+    pub(crate) fn select_panel_by_id(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .panels
+            .iter()
+            .position(|panel| panel.panel_id == panel_id)
+        else {
+            return;
+        };
+        if index == self.selected {
+            self.refresh(cx);
+        } else {
+            self.select(index, cx);
+        }
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -381,9 +413,20 @@ impl ExtensionPanelView {
             return;
         }
         self.attempted = false;
+        self.drilled = false;
         self.error = None;
         self.message = None;
         self.load(cx);
+    }
+
+    /// The periodic re-read: keep the live card fresh without pulling the
+    /// reader off a drill-down. Unlike the manual refresh, it leaves the
+    /// drilled flag set, so a file diff stays on screen across ticks.
+    fn tick_refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.loading {
+            self.attempted = false;
+            self.load(cx);
+        }
     }
 
     /// Arm the next live re-read, when the package declared an interval.
@@ -403,7 +446,7 @@ impl ExtensionPanelView {
             cx.background_executor().timer(interval).await;
             let _ = this.update(cx, |this, cx| {
                 this.refresh_pending = false;
-                this.refresh(cx);
+                this.tick_refresh(cx);
             });
         })
         .detach();
@@ -496,6 +539,7 @@ impl ExtensionPanelView {
     fn seed(&mut self, panel: &PanelSurface, document: &UiDocument) {
         self.revision = 0;
         self.host_backed = false;
+        self.drilled = false;
         if let Some((document, revision)) = self.store.view(&panel.panel_id) {
             self.document = Some(document);
             self.revision = revision;
@@ -575,13 +619,28 @@ impl ExtensionPanelView {
             // frame that needs the document, so resolve the generation here.
             let resolved = live_surface(&panel, &*resolve);
             let panel = resolved.clone().unwrap_or(panel);
-            let outcome = panel.runtime.panel(&panel.contribution_id).await;
+            // The panel call runs on the extension's tokio runtime, the same
+            // seam the action dispatch uses: a runtime like Cordis bridges
+            // through spawn_blocking, which panics on the GPUI executor
+            // ("there is no reactor running").
+            let runtime = Arc::clone(&panel.runtime);
+            let contribution = panel.contribution_id.clone();
+            let outcome =
+                crate::extension::run_on_tokio(async move { runtime.panel(&contribution).await })
+                    .await;
             let _ = this.update(cx, |this, cx| {
                 if let Some(fresh) = resolved {
                     this.rebind(&fresh);
                     let _ = this.store.renew(&fresh.panel_id);
                 }
                 this.loading = false;
+                // A drill-down card is sticky: the periodic refresh keeps the
+                // live data fresh underneath, but does not pull the reader off
+                // the diff they opened. Back / Refresh clears the flag.
+                if this.drilled {
+                    cx.notify();
+                    return;
+                }
                 match outcome {
                     Ok(value) => match serde_json::from_value::<UiDocument>(value) {
                         Ok(document) => this.apply_live(&panel, document),
@@ -703,6 +762,9 @@ impl ExtensionPanelView {
             }),
         );
         let resolve = Arc::clone(&self.surface_resolver);
+        // A non-refresh action drills into a detail card; the auto-refresh
+        // must leave it on screen until the reader returns.
+        let drills = action != "refresh";
         self.message = Some("Running…".to_string());
         cx.spawn(async move |this, cx| {
             let action_for_call = call_name;
@@ -741,6 +803,7 @@ impl ExtensionPanelView {
                 match outcome {
                     Ok(value) => {
                         if let Ok(document) = serde_json::from_value::<UiDocument>(value.clone()) {
+                            this.drilled = drills;
                             this.apply_live(&panel, document);
                         } else {
                             this.message = Some(summarize(&value));
@@ -2304,6 +2367,182 @@ mod tests {
         let (name, args) = wait_for_call(cx, &recorder);
         assert_eq!(name, "commit");
         assert_eq!(args["value"], "hi");
+    }
+
+    /// A runtime whose panel call needs a tokio reactor, like Cordis's
+    /// spawn_blocking bridge. Loading it must not panic on the GPUI executor.
+    struct TokioPanel {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Runtime for TokioPanel {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Cordis
+        }
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+        async fn panel(&self, _id: &str) -> Result<Value, ExtensionError> {
+            let called = Arc::clone(&self.called);
+            tokio::task::spawn_blocking(move || {
+                called.store(true, Ordering::SeqCst);
+                serde_json::json!({
+                    "schema_version": "1.0",
+                    "root": {"type": "text", "text": "tokio card"}
+                })
+            })
+            .await
+            .map_err(|error| ExtensionError::Runtime {
+                extension: "com.example.ui".to_string(),
+                message: error.to_string(),
+            })
+        }
+    }
+
+    /// The live-card load runs on the extension runtime, so a panel that
+    /// needs a tokio reactor loads instead of aborting the app. This is the
+    /// regression behind the launch crash: "there is no reactor running".
+    #[gpui::test]
+    fn a_panel_needing_tokio_loads_off_the_gpui_executor(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.dispatcher.allow_parking();
+        let called = Arc::new(AtomicBool::new(false));
+        let surface = surface_with(
+            Arc::new(TokioPanel {
+                called: Arc::clone(&called),
+            }),
+            None,
+        );
+        let view = cx.new(|_| ExtensionPanelView::new(vec![surface], Lang::En));
+        let harness_view = view.clone();
+        let (_harness, vcx) = cx.add_window_view(move |_, _| PanelHarness { view: harness_view });
+        // Before the fix this aborted the whole process: the load called
+        // spawn_blocking on the GPUI executor, which has no tokio reactor.
+        // The call now runs on the extension runtime; reaching it at all is
+        // the regression, so wait for the tokio side to report in.
+        let mut reached = false;
+        for _ in 0..40 {
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+            if called.load(Ordering::SeqCst) {
+                reached = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(reached, "the tokio-backed panel call runs without aborting");
+    }
+
+    /// The launcher reads one (id, title) tile per panel from the cached view.
+    #[test]
+    fn panel_tiles_lists_id_and_title() {
+        let mut a = surface_with(Arc::new(Noop), None);
+        a.panel_id = "ext.a".to_string();
+        a.title = "Panel A".to_string();
+        let mut b = surface_with(Arc::new(Noop), None);
+        b.panel_id = "ext.b".to_string();
+        b.title = "Panel B".to_string();
+        let view = ExtensionPanelView::new(vec![a, b], Lang::En);
+        assert_eq!(
+            view.panel_tiles(),
+            vec![
+                ("ext.a".to_string(), "Panel A".to_string()),
+                ("ext.b".to_string(), "Panel B".to_string()),
+            ]
+        );
+    }
+
+    /// A launcher tile selects its panel by id; an unknown id is a no-op.
+    #[gpui::test]
+    fn select_panel_by_id_switches_the_selected_panel(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.dispatcher.allow_parking();
+        let mut a = surface_with(
+            Arc::new(Noop),
+            Some(document(
+                serde_json::json!({"type": "text", "text": "panel-a-body"}),
+            )),
+        );
+        a.panel_id = "ext.a".to_string();
+        a.title = "A".to_string();
+        let mut b = surface_with(
+            Arc::new(Noop),
+            Some(document(
+                serde_json::json!({"type": "text", "text": "panel-b-body"}),
+            )),
+        );
+        b.panel_id = "ext.b".to_string();
+        b.title = "B".to_string();
+        let view = cx.new(|_| ExtensionPanelView::new(vec![a, b], Lang::En));
+        let harness_view = view.clone();
+        let (_harness, vcx) = cx.add_window_view(move |_, _| PanelHarness { view: harness_view });
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        vcx.update(|_, cx| view.update(cx, |view, cx| view.select_panel_by_id("ext.b", cx)));
+        let doc = vcx.update(|_, cx| view.read(cx).document.clone());
+        assert!(
+            serde_json::to_string(&doc)
+                .unwrap()
+                .contains("panel-b-body"),
+            "the tile selects panel B"
+        );
+
+        vcx.update(|_, cx| view.update(cx, |view, cx| view.select_panel_by_id("ext.missing", cx)));
+        let doc = vcx.update(|_, cx| view.read(cx).document.clone());
+        assert!(
+            serde_json::to_string(&doc)
+                .unwrap()
+                .contains("panel-b-body"),
+            "an unknown id leaves the selection alone"
+        );
+    }
+
+    /// The manual Refresh returns to the live card; the periodic tick keeps a
+    /// drill-down on screen. This is the regression behind the diff vanishing
+    /// after one refresh interval: the timer used to call the manual refresh.
+    #[gpui::test]
+    fn the_periodic_tick_keeps_a_drill_down_but_manual_refresh_clears_it(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.dispatcher.allow_parking();
+        let doc = document(serde_json::json!({"type": "text", "text": "x"}));
+        let surface = panel(doc);
+        let view = cx.new(|_| ExtensionPanelView::new(vec![surface], Lang::En));
+        let harness_view = view.clone();
+        let (_harness, vcx) = cx.add_window_view(move |_, _| PanelHarness { view: harness_view });
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // A drill-down survives the periodic tick.
+        vcx.update(|_, cx| view.update(cx, |view, _| view.drilled = true));
+        vcx.update(|_, cx| view.update(cx, |view, cx| view.tick_refresh(cx)));
+        let kept = vcx.update(|_, cx| view.read(cx).drilled);
+        assert!(kept, "the periodic tick keeps the drill-down");
+
+        // The manual Refresh returns to the live card (the tick's load has
+        // settled by then, so refresh is not gated on loading).
+        vcx.update(|_, cx| view.update(cx, |view, _| view.loading = false));
+        vcx.update(|_, cx| view.update(cx, |view, cx| view.refresh(cx)));
+        let cleared = vcx.update(|_, cx| view.read(cx).drilled);
+        assert!(!cleared, "the manual refresh clears the drill-down");
+    }
+
+    /// Selecting another panel re-seeds the view and leaves any drill-down:
+    /// the new panel starts on its own live card, not a stale diff.
+    #[test]
+    fn reseeding_a_panel_clears_the_drill_down() {
+        let doc = document(serde_json::json!({"type": "text", "text": "x"}));
+        let surface = panel(doc.clone());
+        let mut view = ExtensionPanelView::new(vec![surface.clone()], Lang::En);
+        view.drilled = true;
+        view.seed(&surface, &doc);
+        assert!(!view.drilled, "a re-seeded panel returns to its live card");
     }
 
     /// The timeline, badges and fill render without a host and validate.
