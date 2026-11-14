@@ -139,6 +139,9 @@ pub(crate) struct Runner {
     rt: Runtime,
     tasks: HashMap<String, JoinHandle<()>>,
     stops: HashMap<String, Arc<AtomicBool>>,
+    /// When each session's previous turn was prepared, for the time-context's
+    /// elapsed span. A session's first turn has no preceding message.
+    prepared: HashMap<String, u64>,
 }
 
 impl Runner {
@@ -152,6 +155,7 @@ impl Runner {
             rt,
             tasks: HashMap::new(),
             stops: HashMap::new(),
+            prepared: HashMap::new(),
         }
     }
 
@@ -271,6 +275,21 @@ impl Runner {
         self.stop(session_id);
         Self::seed_session(&agent, &transcript);
 
+        // The time-context facts, sampled once per turn preparation: the turn
+        // number counted from the reader's own prompts, and the span since
+        // this session's previous preparation (unavailable on a first turn).
+        let turn = transcript
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .count()
+            + 1;
+        let prepared_at = crate::state::now();
+        let elapsed = self
+            .prepared
+            .insert(session_id.to_string(), prepared_at)
+            .map(|previous| prepared_at.saturating_sub(previous));
+        let time = crate::context::TimeFacts { turn, elapsed };
+
         let (tx, rx) = async_channel::unbounded();
         // The turn's delivery sink, installed before the stream starts: the
         // agent reports a steered ticket at the step that takes it, which is
@@ -310,7 +329,7 @@ impl Runner {
             // workspace, and the send path must not do file I/O on the UI
             // thread. It is injected after the checkpoint so the fresh snapshot
             // cannot be summarized into the history it supersedes.
-            let context = crate::context::TurnContext::from_facts(&facts, false);
+            let context = crate::context::TurnContext::from_facts_at(&facts, false, &time);
             context.inject(&agent);
             // Surface the auto-injection as a chat event: the persona the build
             // composed, the runtime snapshot and the workspace instructions this
@@ -329,6 +348,7 @@ impl Runner {
                     persona_complete,
                     &persona,
                     &context.snapshot,
+                    &context.time_context,
                     context.instructions.as_deref(),
                     &memory_state,
                     input.retrieval_text().is_some(),
@@ -370,6 +390,13 @@ impl Runner {
                         kind: "context".to_string(),
                         content: context.snapshot.clone(),
                         source: "runtime-context".to_string(),
+                    });
+                }
+                if !context.time_context.is_empty() {
+                    injections.push(crate::model::ContextInjection {
+                        kind: "time".to_string(),
+                        content: context.time_context.clone(),
+                        source: "time-context".to_string(),
                     });
                 }
                 if let Some(instructions) = &context.instructions {

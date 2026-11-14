@@ -15,8 +15,9 @@ immutable per-request snapshot plus a diagnostics record.
 ## 2. Interfaces
 
 ```text
-ContextSource        persona | host-runtime | workspace-instructions
-                     | retrieved-memory | tool-guidance | user-input
+ContextSource        persona | host-runtime | time-context
+                     | workspace-instructions | retrieved-memory
+                     | tool-guidance | user-input
 Trust                host-authority | untrusted-data
 ContextProvider      id, scope, precedence, refresh policy
                      fn assemble(ctx) -> Result<ContextBlock, ProviderError>
@@ -64,6 +65,7 @@ The concrete first slice of these types lives in
 | Persona composition | `caps.rs` + `agent::prompts::compose_system_prompt_with` | Persona provider |
 | Runtime contract | `prompts::HARNESS_CONTEXT`, appended in both modes (#332) | host-runtime provider |
 | Runtime snapshot | `context.rs::render_snapshot` | host-runtime provider (dynamic) |
+| Time snapshot | `context.rs::render_time_context` (instant, zone rule, elapsed) | time-context provider (dynamic, per-turn) |
 | Workspace instructions | `instructions.rs::render` | workspace provider (untrusted) |
 | Memory retrieval | `agent recalled_context` / `system_prompt_for` | memory provider (untrusted) |
 | Memory lifecycle | `caps.rs::open_memory` → `MemoryState` (#334) | provider failure state |

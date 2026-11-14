@@ -19,6 +19,8 @@ pub(crate) enum ContextSource {
     Persona,
     /// Host-owned runtime contract and execution constraints.
     HostRuntime,
+    /// The sampled clock: instant, zone rule and elapsed span.
+    TimeContext,
     /// Workspace instruction files (AGENTS.md and friends).
     WorkspaceInstructions,
     /// Retrieved persistent memory.
@@ -52,7 +54,9 @@ impl ContextSource {
             | ContextSource::WorkspaceInstructions
             | ContextSource::RetrievedMemory
             | ContextSource::UserInput => Trust::UntrustedData,
-            ContextSource::HostRuntime | ContextSource::ToolGuidance => Trust::HostAuthority,
+            ContextSource::HostRuntime
+            | ContextSource::TimeContext
+            | ContextSource::ToolGuidance => Trust::HostAuthority,
         }
     }
 
@@ -62,6 +66,7 @@ impl ContextSource {
         match kind {
             "persona" => Some(ContextSource::Persona),
             "context" => Some(ContextSource::HostRuntime),
+            "time" => Some(ContextSource::TimeContext),
             "instructions" => Some(ContextSource::WorkspaceInstructions),
             _ => None,
         }
@@ -72,6 +77,7 @@ impl ContextSource {
         match self {
             ContextSource::Persona => "persona",
             ContextSource::HostRuntime => "host-runtime",
+            ContextSource::TimeContext => "time-context",
             ContextSource::WorkspaceInstructions => "workspace-instructions",
             ContextSource::RetrievedMemory => "retrieved-memory",
             ContextSource::ToolGuidance => "tool-guidance",
@@ -177,10 +183,12 @@ impl ContextAssemblyReport {
 /// (issue #336). Extracted from the runner so the inclusion/omission, retrieval
 /// and token accounting are testable across success, missing-source, retrieval-
 /// failure and complete-persona cases. Counts and labels only - no raw content.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_report(
     persona_complete: bool,
     persona: &str,
     snapshot: &str,
+    time_snapshot: &str,
     instructions: Option<&str>,
     memory_state: &MemoryState,
     has_query: bool,
@@ -207,6 +215,7 @@ pub(crate) fn assemble_report(
     };
     let persona_tokens = agent::agent::context::estimate_tokens(persona);
     let snapshot_tokens = agent::agent::context::estimate_tokens(snapshot);
+    let time_tokens = agent::agent::context::estimate_tokens(time_snapshot);
     let instruction_tokens = instructions
         .map(agent::agent::context::estimate_tokens)
         .unwrap_or(0);
@@ -224,6 +233,12 @@ pub(crate) fn assemble_report(
             included: !snapshot.is_empty(),
             reason: None,
             tokens: snapshot_tokens,
+        },
+        SourceStatus {
+            source: ContextSource::TimeContext,
+            included: !time_snapshot.is_empty(),
+            reason: None,
+            tokens: time_tokens,
         },
         SourceStatus {
             source: ContextSource::WorkspaceInstructions,
@@ -263,7 +278,7 @@ pub(crate) fn assemble_report(
         memory: memory_state.clone(),
         retrieval_hits,
         retrieval_skip,
-        estimated_tokens: persona_tokens + snapshot_tokens + instruction_tokens,
+        estimated_tokens: persona_tokens + snapshot_tokens + time_tokens + instruction_tokens,
     }
 }
 
@@ -281,6 +296,7 @@ mod tests {
         assert_eq!(ContextSource::UserInput.trust(), Trust::UntrustedData);
         assert_eq!(ContextSource::Persona.trust(), Trust::UntrustedData);
         assert_eq!(ContextSource::HostRuntime.trust(), Trust::HostAuthority);
+        assert_eq!(ContextSource::TimeContext.trust(), Trust::HostAuthority);
         assert_eq!(ContextSource::ToolGuidance.trust(), Trust::HostAuthority);
     }
 
@@ -306,6 +322,8 @@ mod tests {
         assert_eq!(persona.trust(), Trust::UntrustedData);
         let runtime = ContextSource::from_injection_kind("context").unwrap();
         assert_eq!(runtime.trust(), Trust::HostAuthority);
+        let time = ContextSource::from_injection_kind("time").unwrap();
+        assert_eq!(time.trust(), Trust::HostAuthority);
         assert!(ContextSource::from_injection_kind("unknown").is_none());
     }
 
@@ -351,6 +369,7 @@ mod tests {
             false,
             persona,
             "SNAPSHOT",
+            "TIME",
             Some("INSTRUCTIONS"),
             &MemoryState::Ready,
             true,
@@ -367,6 +386,7 @@ mod tests {
             false,
             "PERSONA",
             "SNAPSHOT",
+            "TIME",
             None,
             &MemoryState::Empty,
             true,
@@ -383,6 +403,7 @@ mod tests {
             false,
             "PERSONA",
             "SNAPSHOT",
+            "TIME",
             None,
             &MemoryState::Ready,
             false,
@@ -395,6 +416,7 @@ mod tests {
             false,
             "PERSONA",
             "SNAPSHOT",
+            "TIME",
             None,
             &MemoryState::InitFailed { reason: "x".into() },
             true,
@@ -407,6 +429,7 @@ mod tests {
             true,
             "PERSONA",
             "SNAPSHOT",
+            "TIME",
             None,
             &MemoryState::Disabled,
             true,
@@ -422,11 +445,29 @@ mod tests {
     /// same fingerprint, and the report never carries raw content (issue #337).
     #[test]
     fn composition_is_deterministic_and_bounded() {
-        let a = assemble_report(false, "P", "S", Some("I"), &MemoryState::Ready, true, 3);
-        let b = assemble_report(false, "P", "S", Some("I"), &MemoryState::Ready, true, 3);
+        let a = assemble_report(
+            false,
+            "P",
+            "S",
+            "T",
+            Some("I"),
+            &MemoryState::Ready,
+            true,
+            3,
+        );
+        let b = assemble_report(
+            false,
+            "P",
+            "S",
+            "T",
+            Some("I"),
+            &MemoryState::Ready,
+            true,
+            3,
+        );
         assert_eq!(a.fingerprint, b.fingerprint);
         assert_eq!(a.estimated_tokens, b.estimated_tokens);
         // The report is an account of counts/labels, not a copy of the content.
-        assert_eq!(a.sources.len(), 6, "one status per context source");
+        assert_eq!(a.sources.len(), 7, "one status per context source");
     }
 }

@@ -26,7 +26,7 @@ One **collapsed disclosure per injected context source** (not one grouped row):
 ## How BSH aligns (crates/bsh/src/ui/transcript.rs `inject_row`)
 
 - One disclosure per `ChatMessage.injections` entry (persona / context /
-  instructions), rendered **full-width above the prompt** — the reference draws a
+  time / instructions), rendered **full-width above the prompt** — the reference draws a
   full-width disclosure, and the right-aligned user-bubble stack is shrink-to-fit
   and would collapse its width.
 - Title uses `inject.title` = "Context injection" / "上下文注入" (reference bytes).
@@ -43,9 +43,12 @@ One **collapsed disclosure per injected context source** (not one grouped row):
   turn sends (`Agent::injected_system_prompt` = the discovery block + the
   configured persona + live prompt sections + recalled memory), not just
   `config.system_prompt`; the context block carries the full runtime snapshot
-  (cwd, current date/time + UTC offset, layout, sandbox, permission, preset) and
-  the framed instructions. The current time matches the reference's
-  `dsh-time-context`, which injects "now" on every turn.
+  (cwd, layout, sandbox, permission, preset, approval policy) and the framed
+  instructions. The clock rides its OWN `time-context` injection, like the
+  reference's `dsh-time-context`: sampled ISO instant with the IANA zone, the
+  zone interpretation rule, and the elapsed span since the preceding
+  model-visible message (unavailable on a first turn). Both snapshots open with
+  the reference's supersedes-earlier-snapshots heading.
 
 ## Honest deltas
 
@@ -57,6 +60,11 @@ One **collapsed disclosure per injected context source** (not one grouped row):
   prompt, so there is no catalogue injection to show (not faked).
 - Body is the opaque code-block form; the reference's form-specific bodies
   (instruction file list, snapshot sections, catalog) are not modelled.
+- Time is sampled once per turn preparation (turn N, step 1), not per ReAct step
+  as the reference does; BSH's engine has no per-step prompt seam, and a stale
+  per-turn clock is honest where a faked per-step one would not be. The approval
+  line states BSH's fact (no interactive prompts; policy refusals are automatic)
+  rather than copying the reference's approval-prompt wording.
 - Every injected block rides the turn that carried it: the persona is injected
   each turn, so it is recorded on every prompt row (no dedup) — an inject event
   never drops key info the model received.

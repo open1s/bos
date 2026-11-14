@@ -37,6 +37,51 @@ pub(crate) const RUNTIME_CONTEXT_PREAMBLE: &str =
 /// no-widening rule and the reporting rule are the reference's.
 pub(crate) const SUBAGENT_CONTEXT: &str = "You are a delegated subagent: your permission scope was fixed when you were started and cannot be widened from inside this session, and a tool this child was not given cannot be added here. When the task needs access beyond that scope, do not retry a denied operation; state the limitation in your reply so the delegating agent can handle it.";
 
+/// The reference's time-context heading, in the same supersedes shape as the
+/// runtime snapshot.
+pub(crate) const TIME_CONTEXT_PREAMBLE: &str =
+    "Current time context. This snapshot supersedes earlier time-context snapshots.";
+
+/// The facts one turn's time-context states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TimeFacts {
+    /// The turn about to run, counted from the reader's own prompts.
+    pub(crate) turn: usize,
+    /// Seconds since this session's previous turn preparation, when there was
+    /// one; a first turn has no preceding model-visible message.
+    pub(crate) elapsed: Option<u64>,
+}
+
+/// A span in the reference's human shape: hours, minutes, seconds.
+fn format_elapsed(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Render the time-context: the sampled instant with its zone, the zone
+/// interpretation rule, and the span since the preceding model-visible
+/// message. Sampled once per turn preparation, like the runtime snapshot.
+pub(crate) fn render_time_context(facts: &TimeFacts) -> String {
+    let zone = crate::state::local_zone_name();
+    let elapsed = facts
+        .elapsed
+        .map(format_elapsed)
+        .unwrap_or_else(|| "unavailable".to_string());
+    format!(
+        "{TIME_CONTEXT_PREAMBLE}\n\nTime sampled while preparing turn {}, step 1: {}[{zone}]\nLocal time zone for this request: {zone}. Interpret otherwise-unqualified dates and times in this zone.\nElapsed since the preceding model-visible message: {elapsed}.",
+        facts.turn,
+        crate::state::now_iso_line(),
+    )
+}
+
 /// The resolved facts one turn's snapshot states.
 ///
 /// Stored (rather than the rendered text) so a child turn built later can
@@ -82,14 +127,17 @@ impl RuntimeFacts {
     }
 }
 
-/// The two user messages a turn carries in front of its own input.
+/// The user messages a turn carries in front of its own input: the runtime
+/// snapshot, the time-context, and the framed workspace instructions.
 ///
-/// Both are rebuilt per turn. `instructions` is `None` when the workspace has
+/// All are rebuilt per turn. `instructions` is `None` when the workspace has
 /// no AGENTS.md, so nothing empty is ever sent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TurnContext {
     /// The runtime snapshot. Empty only in tests that opt out of injecting.
     pub(crate) snapshot: String,
+    /// The time-context snapshot: sampled instant, zone rule, elapsed span.
+    pub(crate) time_context: String,
     /// The framed workspace instructions, when the workspace has any.
     pub(crate) instructions: Option<String>,
 }
@@ -97,8 +145,22 @@ pub(crate) struct TurnContext {
 impl TurnContext {
     /// Render one turn's context from already-resolved facts.
     pub(crate) fn from_facts(facts: &RuntimeFacts, child: bool) -> Self {
+        Self::from_facts_at(
+            facts,
+            child,
+            &TimeFacts {
+                turn: 1,
+                elapsed: None,
+            },
+        )
+    }
+
+    /// Render with the turn's own time facts: the turn number the runner
+    /// counted and the span since this session's previous preparation.
+    pub(crate) fn from_facts_at(facts: &RuntimeFacts, child: bool, time: &TimeFacts) -> Self {
         Self {
             snapshot: render_snapshot(facts, child),
+            time_context: render_time_context(time),
             instructions: crate::instructions::render(Path::new(&facts.cwd)),
         }
     }
@@ -118,6 +180,11 @@ impl TurnContext {
         if !self.snapshot.is_empty() {
             injected.push(react::llm::LlmMessage::User {
                 content: react::llm::Content::Text(self.snapshot.clone()),
+            });
+        }
+        if !self.time_context.is_empty() {
+            injected.push(react::llm::LlmMessage::User {
+                content: react::llm::Content::Text(self.time_context.clone()),
             });
         }
         if let Some(instructions) = &self.instructions {
@@ -140,6 +207,9 @@ impl TurnContext {
         if !self.snapshot.is_empty() {
             messages.push(self.snapshot.as_str());
         }
+        if !self.time_context.is_empty() {
+            messages.push(self.time_context.as_str());
+        }
         if let Some(instructions) = &self.instructions {
             messages.push(instructions);
         }
@@ -154,6 +224,7 @@ impl TurnContext {
 /// the harness put around it.
 pub(crate) fn is_injected_user_text(text: &str) -> bool {
     text.starts_with(RUNTIME_CONTEXT_PREAMBLE)
+        || text.starts_with(TIME_CONTEXT_PREAMBLE)
         || (text.starts_with("<system-reminder>")
             && text.contains("The following workspace instructions"))
         // The engine's closing request when a turn reaches its step guard. It is
@@ -285,12 +356,6 @@ fn render_snapshot(facts: &RuntimeFacts, child: bool) -> String {
     } else {
         format!("Current working directory: {cwd:?}.")
     });
-    // The reference injects the current time on every turn; a snapshot without
-    // it leaves time-sensitive work guessing "now".
-    sections.push(format!(
-        "Current date and time: {}.",
-        crate::state::now_datetime_line()
-    ));
     // The shape of the workspace, so the first step can read the file it needs
     // instead of spending a whole round trip on list_dir. A turn is one LLM
     // call per step and a step costs seconds, so a free listing is not free.
@@ -307,6 +372,12 @@ fn render_snapshot(facts: &RuntimeFacts, child: bool) -> String {
         (false, None) => format!("Sandbox: none ({SANDBOX_RELEASED_REASON})."),
     });
     sections.push(format!("Permission: {}.", facts.permission));
+    // BSH has no per-operation approval prompt; the honest counterpart of the
+    // reference's approval:policy line is that policy refusals are automatic.
+    sections.push(
+        "Approval policy: no interactive approval prompts; an operation the policy denies is refused automatically, so do not ask the reader to approve a sandbox or permission widening from inside the turn."
+            .to_string(),
+    );
     sections.push(if facts.presets_disabled {
         "Agent preset: none (presets are off).".to_string()
     } else if facts.preset.trim().is_empty() {
@@ -410,8 +481,12 @@ mod tests {
             "{snapshot}"
         );
         assert!(
-            snapshot.contains("Current date and time: "),
-            "the snapshot states now, like the reference: {snapshot}"
+            !snapshot.contains("Current date and time"),
+            "time rides in its own time-context block: {snapshot}"
+        );
+        assert!(
+            snapshot.contains("Approval policy: no interactive approval prompts"),
+            "the approval fact is stated, not faked: {snapshot}"
         );
         assert!(
             snapshot.contains("Sandbox: confined to the workspace."),
@@ -423,6 +498,42 @@ mod tests {
         );
         assert!(snapshot.contains("Agent preset: standard."), "{snapshot}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The time-context states the sampled instant with its zone, the zone
+    /// rule and the elapsed span; a first turn says unavailable.
+    #[test]
+    fn the_time_context_carries_turn_zone_and_elapsed() {
+        let block = render_time_context(&TimeFacts {
+            turn: 3,
+            elapsed: Some(9 * 3600 + 59 * 60 + 22),
+        });
+        assert!(block.starts_with(TIME_CONTEXT_PREAMBLE), "{block}");
+        assert!(
+            block.contains("Time sampled while preparing turn 3, step 1: "),
+            "{block}"
+        );
+        assert!(
+            block.contains("Local time zone for this request: "),
+            "{block}"
+        );
+        assert!(
+            block.contains("Interpret otherwise-unqualified dates and times in this zone."),
+            "{block}"
+        );
+        assert!(
+            block.contains("Elapsed since the preceding model-visible message: 9h 59m 22s."),
+            "{block}"
+        );
+        let first = render_time_context(&TimeFacts {
+            turn: 1,
+            elapsed: None,
+        });
+        assert!(
+            first.contains("Elapsed since the preceding model-visible message: unavailable."),
+            "{first}"
+        );
+        assert!(is_injected_user_text(&block), "the frame is not a user row");
     }
 
     /// The first user message names the workspace top level, so step one can
@@ -587,15 +698,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// With no instructions the context is ONE user message, never an empty
-    /// second one.
+    /// With no instructions the context is the snapshot plus the time-context,
+    /// never an empty third one.
     #[test]
-    fn a_workspace_without_instructions_injects_only_the_snapshot() {
+    fn a_workspace_without_instructions_injects_snapshot_and_time() {
         let root = scratch("inject");
         let context = TurnContext::from_facts(&facts(&rooted(&root)), false);
         assert_eq!(context.instructions, None);
-        assert_eq!(context.injected_messages().len(), 1);
+        assert_eq!(context.injected_messages().len(), 2);
         assert!(context.injected_messages()[0].starts_with(RUNTIME_CONTEXT_PREAMBLE));
+        assert!(context.injected_messages()[1].starts_with(TIME_CONTEXT_PREAMBLE));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -607,9 +719,10 @@ mod tests {
         std::fs::write(root.join("AGENTS.md"), "workspace rule").expect("the file");
         let context = TurnContext::from_facts(&facts(&rooted(&root)), false);
         let messages = context.injected_messages();
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert!(messages[0].starts_with(RUNTIME_CONTEXT_PREAMBLE));
-        assert!(messages[1].contains("Instructions from: AGENTS.md"));
+        assert!(messages[1].starts_with(TIME_CONTEXT_PREAMBLE));
+        assert!(messages[2].contains("Instructions from: AGENTS.md"));
 
         let provider = std::sync::Arc::new(agent::agent::agentic::LlmProvider::new());
         let agent = Agent::new(agent::AgentConfig::default(), provider);
@@ -623,9 +736,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(user_rows.len(), 2, "{user_rows:?}");
+        assert_eq!(user_rows.len(), 3, "{user_rows:?}");
         assert!(user_rows[0].starts_with(RUNTIME_CONTEXT_PREAMBLE));
-        assert!(user_rows[1].contains("Instructions from: AGENTS.md"));
+        assert!(user_rows[1].starts_with(TIME_CONTEXT_PREAMBLE));
+        assert!(user_rows[2].contains("Instructions from: AGENTS.md"));
         assert!(
             user_rows.iter().all(|row| !row.is_empty()),
             "no empty injected message"

@@ -166,46 +166,27 @@ fn utc_parts(at: u64) -> (i32, u32, u32, u32, u32) {
     )
 }
 
-/// The day of the week for a calendar date (Sakamoto's method), 0 = Sunday.
-fn weekday_of(y: i32, m: u32, d: u32) -> usize {
-    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
-    let y = if m < 3 { y - 1 } else { y };
-    ((y + y / 4 - y / 100 + y / 400 + T[(m - 1) as usize] + d as i32).rem_euclid(7)) as usize
-}
-
-/// The current local date and time, for the runtime snapshot.
-///
-/// The reference injects the current time on every turn so the model knows
-/// "now"; a snapshot without it leaves time-sensitive work guessing. Local
-/// wall clock with the UTC offset, falling back to a UTC reading where the
-/// platform has no local clock.
-pub(crate) fn now_datetime_line() -> String {
-    const DAYS: [&str; 7] = [
-        "Sunday",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-    ];
+/// The current local instant as ISO 8601 with the UTC offset, for the
+/// time-context snapshot. Falls back to a UTC reading where the platform has
+/// no local clock.
+pub(crate) fn now_iso_line() -> String {
     let at = now();
     #[cfg(unix)]
     {
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         let stamp = at as libc::time_t;
-        // SAFETY: `localtime_r` writes only into the `tm` this frame owns.
+        // SAFETY: localtime_r writes only into the tm this frame owns.
         if unsafe { !libc::localtime_r(&stamp, &mut tm).is_null() } {
             let mins = tm.tm_gmtoff / 60;
             let sign = if mins >= 0 { '+' } else { '-' };
             return format!(
-                "{}, {:04}-{:02}-{:02} {:02}:{:02} (UTC{}{:02}:{:02})",
-                DAYS[(tm.tm_wday as usize) % 7],
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
                 tm.tm_year + 1900,
                 tm.tm_mon + 1,
                 tm.tm_mday,
                 tm.tm_hour,
                 tm.tm_min,
+                tm.tm_sec,
                 sign,
                 mins.abs() / 60,
                 mins.abs() % 60
@@ -213,10 +194,40 @@ pub(crate) fn now_datetime_line() -> String {
         }
     }
     let (y, mo, d, h, mi) = utc_parts(at);
-    format!(
-        "{}, {y:04}-{mo:02}-{d:02} {h:02}:{mi:02} (UTC)",
-        DAYS[weekday_of(y, mo, d)]
-    )
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{:02}+00:00", at % 60)
+}
+
+/// The local IANA zone name, for the time-context interpretation rule.
+///
+/// macOS and Linux point /etc/localtime into the zoneinfo tree; the path after
+/// zoneinfo/ is the zone name. Where the link is absent (or the platform has
+/// no local clock) the UTC offset is the honest fallback.
+pub(crate) fn local_zone_name() -> String {
+    #[cfg(unix)]
+    {
+        if let Ok(target) = std::fs::read_link("/etc/localtime") {
+            let text = target.to_string_lossy();
+            if let Some(pos) = text.find("zoneinfo/") {
+                let zone = &text[pos + "zoneinfo/".len()..];
+                if !zone.is_empty() {
+                    return zone.to_string();
+                }
+            }
+        }
+        if let Ok(zone) = std::env::var("TZ") {
+            if !zone.is_empty() && !zone.starts_with(':') {
+                return zone;
+            }
+        }
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let stamp = now() as libc::time_t;
+        if unsafe { !libc::localtime_r(&stamp, &mut tm).is_null() } {
+            let mins = tm.tm_gmtoff / 60;
+            let sign = if mins >= 0 { '+' } else { '-' };
+            return format!("UTC{}{:02}:{:02}", sign, mins.abs() / 60, mins.abs() % 60);
+        }
+    }
+    "UTC".to_string()
 }
 
 /// Format an instant as the reference's message clock.

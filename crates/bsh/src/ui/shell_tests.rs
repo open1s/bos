@@ -1376,6 +1376,11 @@ fn an_auto_injection_is_drawn_as_an_openable_event(cx: &mut TestAppContext) {
                     source: "runtime-context".to_string(),
                 },
                 crate::model::ContextInjection {
+                    kind: "time".to_string(),
+                    content: "Current time context. CLOCK".to_string(),
+                    source: "time-context".to_string(),
+                },
+                crate::model::ContextInjection {
                     kind: "instructions".to_string(),
                     content: "workspace instructions BODY".to_string(),
                     source: "AGENTS.md".to_string(),
@@ -1394,6 +1399,10 @@ fn an_auto_injection_is_drawn_as_an_openable_event(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("inject-body-0-0").is_none(),
         "the injected text is collapsed by default"
+    );
+    assert!(
+        cx.debug_bounds("inject-row-0-1").is_some(),
+        "the time-context draws as its own inject event, like the reference"
     );
     // Opening the event shows the injected blocks.
     cx.simulate_click(row.center(), Modifiers::default());
