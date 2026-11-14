@@ -36,6 +36,8 @@ pub struct CordisRuntime {
     /// Policy used for host service calls. Absent means deny.
     policy: Option<Arc<PolicyEngine>>,
     trust: TrustLevel,
+    /// The open workspace, handed to tool and panel calls as call metadata.
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl CordisRuntime {
@@ -79,6 +81,7 @@ impl CordisRuntime {
             terminal,
             policy: None,
             trust: TrustLevel::Community,
+            workspace: None,
         })
     }
 
@@ -91,6 +94,13 @@ impl CordisRuntime {
         self
     }
 
+    /// Attach the workspace the package's tools and panels operate on.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: Option<std::path::PathBuf>) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
     /// Run the synchronous bridge exchange on a blocking worker and apply the
     /// caller's deadline to the bridge read.
     async fn invoke_async(
@@ -98,6 +108,7 @@ impl CordisRuntime {
         registration: String,
         arguments: Value,
         timeout_ms: u64,
+        workspace: Option<std::path::PathBuf>,
     ) -> Result<Value, ExtensionError> {
         let session = Arc::clone(&self.session);
         let outcome = tokio::task::spawn_blocking(move || {
@@ -112,6 +123,7 @@ impl CordisRuntime {
                     &registration,
                     arguments,
                     Some(std::time::Duration::from_millis(timeout_ms.max(1))),
+                    workspace.as_deref(),
                 )
                 .map_err(|error| error.to_string())
         })
@@ -319,7 +331,8 @@ impl Runtime for CordisRuntime {
             })
             .ok_or_else(|| self.error(format!("unknown Cordis command {id}")))?;
         let timeout = self.options.invoke_timeout.as_millis() as u64;
-        self.invoke_async(registration, arguments, timeout).await
+        self.invoke_async(registration, arguments, timeout, None)
+            .await
     }
 
     async fn call_tool(
@@ -332,8 +345,43 @@ impl Runtime for CordisRuntime {
         let registration = self
             .registration_id(name)
             .ok_or_else(|| self.error(format!("unknown Cordis tool {name}")))?;
-        self.invoke_async(registration, arguments, context.timeout_ms)
-            .await
+        self.invoke_async(
+            registration,
+            arguments,
+            context.timeout_ms,
+            context.workspace.clone(),
+        )
+        .await
+    }
+
+    /// Serve one panel's live card from the ctx.panels registration named by
+    /// the panel's contribution id — the Cordis analog of the wasm runtime's
+    /// call_panel export. Panel actions stay tool calls, so one engine answers
+    /// both the first frame and every later press.
+    async fn panel(&self, id: &str) -> Result<Value, ExtensionError> {
+        self.ensure()?;
+        let registration = self
+            .registrations
+            .lock()
+            .ok()
+            .and_then(|registrations| {
+                registrations
+                    .iter()
+                    .find(|registration| {
+                        registration.kind == BridgeKind::Panel
+                            && (registration.name == id || registration.id == id)
+                    })
+                    .map(|registration| registration.id.clone())
+            })
+            .ok_or_else(|| self.error(format!("unknown Cordis panel {id}")))?;
+        let timeout = self.options.invoke_timeout.as_millis() as u64;
+        self.invoke_async(
+            registration,
+            serde_json::json!({}),
+            timeout,
+            self.workspace.clone(),
+        )
+        .await
     }
 
     /// Deliver one observe hook batch to the Cordis listeners that mapped onto
@@ -366,7 +414,7 @@ impl Runtime for CordisRuntime {
             .unwrap_or_default();
         let timeout = self.options.invoke_timeout.as_millis() as u64;
         for registration in listeners {
-            self.invoke_async(registration, payload.clone(), timeout)
+            self.invoke_async(registration, payload.clone(), timeout, None)
                 .await?;
         }
         Ok(())
@@ -471,6 +519,102 @@ mod tests {
         assert_eq!(output["terminal"], "bridge-ok");
         runtime.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// A ctx.panels registration serves the live card, and the call's
+    /// workspace reaches both the panel render and a tool's execute as the
+    /// second argument — the seam a workspace-acting panel needs.
+    #[tokio::test]
+    async fn a_panel_registration_serves_the_live_card_with_the_workspace() {
+        if find_interpreter().is_none() {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("bsh-cordis-panel-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(
+            root.join("extension.toml"),
+            r#"
+schema_version = "2.0"
+[extension]
+id = "com.example.cordis-panel"
+name = "Cordis Panel"
+version = "1.0.0"
+description = "A panel seam test"
+[compatibility]
+host = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "cordis"
+[runtime.config]
+entry = "index.js"
+[capabilities]
+required = ["agent.tools.register", "ui.panels"]
+[[contribution]]
+kind = "tool"
+id = "echo_ws"
+[contribution.payload]
+[[contribution]]
+kind = "panel"
+id = "card"
+[contribution.payload]
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            root.join("index.js"),
+            r#"
+module.exports = {
+  apply(ctx) {
+    ctx.panels.register({
+      name: 'card',
+      description: 'test card',
+      render(args, meta) {
+        return {
+          schema_version: '1.0',
+          root: { type: 'text', text: 'ws=' + (meta && meta.workspace) },
+        };
+      },
+    });
+    ctx.tools.register({
+      name: 'echo_ws',
+      description: 'echo the call workspace',
+      parameters: { type: 'object', properties: {} },
+      async execute(args, meta) {
+        return { workspace: meta && meta.workspace };
+      },
+    });
+  },
+};
+"#,
+        )
+        .expect("entry");
+        let manifest = ferris_core::manifest_v2::load_package_manifest(&root).expect("manifest");
+        let data_root = root.join("data");
+        let workspace = root.join("workspace");
+        let runtime = CordisRuntime::new(&manifest, &root, &data_root, Arc::new(TestTerminal))
+            .expect("runtime")
+            .with_workspace(Some(workspace.clone()));
+
+        let card = runtime.panel("card").await.expect("panel card");
+        assert_eq!(card["root"]["text"], format!("ws={}", workspace.display()));
+        assert!(runtime.panel("missing").await.is_err());
+
+        let context = CallContext::new(
+            manifest.extension.id.clone(),
+            "cordis-panel-test",
+            Some(workspace.clone()),
+            5_000,
+        );
+        let output = runtime
+            .call_tool("echo_ws", serde_json::json!({}), &context)
+            .await
+            .expect("call");
+        assert_eq!(output["workspace"], workspace.display().to_string());
+
+        runtime.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The canonical BSH-point to Cordis-stage mapping (issue #300).

@@ -210,6 +210,8 @@ pub enum BridgeKind {
     Skill,
     /// A host-event listener that maps onto a BOS hook stage.
     Hook,
+    /// A live panel card provider, the Cordis analog of the wasm panel export.
+    Panel,
 }
 
 impl BridgeKind {
@@ -220,6 +222,7 @@ impl BridgeKind {
             "command" => Some(BridgeKind::Command),
             "skill" => Some(BridgeKind::Skill),
             "hook" => Some(BridgeKind::Hook),
+            "panel" => Some(BridgeKind::Panel),
             _ => None,
         }
     }
@@ -231,6 +234,7 @@ impl BridgeKind {
             BridgeKind::Command => "command",
             BridgeKind::Skill => "skill",
             BridgeKind::Hook => "hook",
+            BridgeKind::Panel => "panel",
         }
     }
 }
@@ -599,15 +603,21 @@ impl BridgeSession {
     }
     /// Call one registration the plugin announced.
     pub fn invoke(&mut self, registration: &str, input: Value) -> Result<Value, BridgeError> {
-        self.invoke_with_timeout(registration, input, None)
+        self.invoke_with_timeout(registration, input, None, None)
     }
 
     /// Invoke with a caller deadline, capped by the bridge's own timeout.
+    ///
+    /// The workspace travels with the call, not the load: one bridge serves
+    /// every turn of a session, and the shim hands it to the tool's execute
+    /// as the second argument so a panel or tool can act on the open
+    /// workspace without the model naming it.
     pub fn invoke_with_timeout(
         &mut self,
         registration: &str,
         input: Value,
         timeout: Option<Duration>,
+        workspace: Option<&Path>,
     ) -> Result<Value, BridgeError> {
         let timeout = timeout
             .map(|timeout| timeout.min(self.options.invoke_timeout))
@@ -616,7 +626,11 @@ impl BridgeSession {
         let frame = json!({
             "id": id,
             "method": "invoke",
-            "params": { "registration": registration, "input": input }
+            "params": {
+                "registration": registration,
+                "input": input,
+                "workspace": workspace.map(|path| path.display().to_string()),
+            }
         });
         self.write_frame(&frame)
             .map_err(|error| BridgeError::Failed(error.to_string()))?;

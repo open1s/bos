@@ -163,7 +163,8 @@ pub fn build(
                 })?;
             let runtime =
                 crate::cordis::CordisRuntime::new(manifest, root, &ports.data_root, terminal)?
-                    .with_authorization(Arc::clone(&ports.policy), ports.trust);
+                    .with_authorization(Arc::clone(&ports.policy), ports.trust)
+                    .with_workspace(ports.workspace.clone());
             let tools = runtime.descriptors()?;
             let contributions = declarative::load_contributions(root, manifest)?;
             finish(

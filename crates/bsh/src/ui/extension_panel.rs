@@ -705,7 +705,7 @@ impl ExtensionPanelView {
             let context = CallContext::new(
                 panel.owner.clone(),
                 format!("panel:{}", panel.panel_id),
-                None,
+                panel.workspace.clone(),
                 30_000,
             );
             let outcome = crate::extension::run_on_tokio(async move {

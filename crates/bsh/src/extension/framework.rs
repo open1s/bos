@@ -199,7 +199,8 @@ impl ferris_sdk::RuntimeResolver for FerrisRuntimeResolver {
                     Arc::new(super::terminal::HostTerminal),
                 )
                 .map_err(runtime_error)?
-                .with_authorization(policy, self.trust);
+                .with_authorization(policy, self.trust)
+                .with_workspace(self.workspace.clone());
                 Arc::new(inner) as Arc<dyn ferris_sdk::host_runtime::Runtime>
             }
             ferris_sdk::types::RuntimeKind::Extism => {

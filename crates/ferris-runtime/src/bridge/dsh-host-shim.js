@@ -22,7 +22,7 @@
  *
  * host -> shim:
  *   {"id":N,"method":"load","params":{"entry":"<abs path>","config":{...},"cwd":"<dir>"}}
- *   {"id":N,"method":"invoke","params":{"registration":"<id>","input":{...}}}
+ *   {"id":N,"method":"invoke","params":{"registration":"<id>","input":{...},"workspace":"<dir>"|null}}
  *   {"id":N,"method":"shutdown"}
  *
  * shim -> host:
@@ -31,6 +31,7 @@
  *    "schema":{...}}                       // tools
  *   {"type":"register", ..., "kind":"command", "name","description","input":{...}|null}
  *   {"type":"register", ..., "kind":"skill", "name","description","invocation":{...}}
+ *   {"type":"register", ..., "kind":"panel", "name","description"}  // live card provider
  *   {"type":"register", ..., "kind":"hook", "name":"<event>", "stages":[...]}
  *   {"type":"register", ..., "kind":"context", "name":"<event>"}   // an event listener
  *   {"type":"refuse","kind":"<seam>","name":"<detail>","reason":"<sentence>"}
@@ -191,6 +192,41 @@ function makeTools() {
         if (entry.kind === 'tool') out.push(entry.name);
       }
       return out;
+    },
+  };
+}
+
+/** Build `ctx.panels`: a live card provider per declared panel. */
+function makePanels() {
+  return {
+    register(definition) {
+      if (!definition || typeof definition !== 'object') {
+        throw new TypeError('a panel registration must be an object');
+      }
+      const name = definition.name;
+      if (typeof name !== 'string' || name.length === 0) {
+        throw new TypeError('a panel registration needs a non-empty name');
+      }
+      if (typeof definition.render !== 'function') {
+        refuse(
+          'panel',
+          name,
+          'the plugin registered panel "' +
+            name +
+            '" without a render function, so it has no live card',
+        );
+        return noopDisposer();
+      }
+      const registration = announce('panel', {
+        name,
+        description:
+          typeof definition.description === 'string' ? definition.description : '',
+      });
+      registrations.get(registration).execute = (args, meta) =>
+        definition.render(args && typeof args === 'object' ? args : {}, meta);
+      return () => {
+        registrations.delete(registration);
+      };
     },
   };
 }
@@ -385,6 +421,7 @@ function makeGet(ctx) {
     tools: () => ctx.tools,
     commands: () => ctx.commands,
     skills: () => ctx.skills,
+    panels: () => ctx.panels,
     logger: () => ctx.logger,
   };
   return (name) => {
@@ -444,6 +481,7 @@ function makeContext(config) {
   ctx.tools = makeTools();
   ctx.commands = makeCommands();
   ctx.skills = makeSkills();
+  ctx.panels = makePanels();
   ctx.terminal = {
     run: (command, cwd) => hostCall('terminal', 'run', { command, cwd: cwd || null }),
   };
@@ -465,7 +503,7 @@ function makeContext(config) {
   ctx.inject = (services, callback) => {
     const wanted = Array.isArray(services) ? services : [services];
     const available = wanted.filter((name) =>
-      ['tools', 'commands', 'skills', 'logger', 'events', 'terminal'].includes(name),
+      ['tools', 'commands', 'skills', 'panels', 'logger', 'events', 'terminal'].includes(name),
     );
     if (typeof callback === 'function') {
       const scoped = Object.create(ctx);
@@ -639,7 +677,12 @@ async function handleInvoke(params) {
     );
   }
   const input = params.input === undefined ? {} : params.input;
-  return await entry.execute(input);
+  // The call's workspace, when the host named one: a tool's second argument,
+  // so entries that only read args keep working unchanged.
+  const meta = {
+    workspace: typeof params.workspace === 'string' ? params.workspace : null,
+  };
+  return await entry.execute(input, meta);
 }
 
 /** Read one line-delimited frame at a time; never buffer the whole stream. */
