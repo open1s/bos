@@ -231,6 +231,14 @@ mod tests {
                     eprintln!("NVIDIA rate limited, skipping test: {}", err_str);
                     return;
                 }
+                if err_str.contains("error sending request")
+                    || err_str.contains("connection")
+                    || err_str.contains("dns")
+                    || err_str.contains("timed out")
+                {
+                    eprintln!("NVIDIA endpoint unreachable, skipping test: {}", err_str);
+                    return;
+                }
                 panic!("NVIDIA request failed: {:?}", e);
             }
         };

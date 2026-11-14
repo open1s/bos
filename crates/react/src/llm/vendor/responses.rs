@@ -63,6 +63,10 @@ pub struct ResponsesRequest {
     /// Whether to stream the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Let the model answer with several tool calls at once; the engine runs
+    /// such a batch concurrently. Only sent when tools are offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -534,7 +538,10 @@ pub fn build_request(
     session: &impl ReactSession,
     context: &impl ReactContext,
     stream: bool,
+    parallel_tool_calls: bool,
 ) -> ResponsesRequest {
+    let tools = serialize_tools(context.tools());
+    let parallel = tools.as_ref().map(|_| parallel_tool_calls);
     ResponsesRequest {
         model: req.model.clone(),
         instructions: build_instructions(
@@ -544,7 +551,7 @@ pub fn build_request(
             context,
         ),
         input: build_input(session.history(), &req.input),
-        tools: serialize_tools(context.tools()),
+        tools,
         temperature: req.temperature,
         top_p: req.top_p,
         max_output_tokens: req.max_tokens,
@@ -552,6 +559,7 @@ pub fn build_request(
             effort: Some(effort),
         }),
         stream: Some(stream),
+        parallel_tool_calls: parallel,
     }
 }
 
@@ -841,6 +849,7 @@ pub struct ResponsesTransport {
     client: Arc<Client>,
     api_key: Arc<String>,
     endpoint: Arc<String>,
+    parallel_tool_calls: bool,
 }
 
 impl ResponsesTransport {
@@ -850,7 +859,14 @@ impl ResponsesTransport {
             client,
             api_key,
             endpoint,
+            parallel_tool_calls: true,
         }
+    }
+
+    /// Allow (or forbid) several tool calls in one provider response.
+    pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
+        self.parallel_tool_calls = parallel;
+        self
     }
 
     /// Run a non-streaming Responses call.
@@ -867,7 +883,14 @@ impl ResponsesTransport {
             request.model = "gpt-4".to_string();
         }
 
-        let responses_req = build_request(persona, &request, session, context, false);
+        let responses_req = build_request(
+            persona,
+            &request,
+            session,
+            context,
+            false,
+            self.parallel_tool_calls,
+        );
 
         let url = format!("{}/responses", self.endpoint);
 
@@ -943,7 +966,14 @@ impl ResponsesTransport {
             request.model = "gpt-4".to_string();
         }
 
-        let responses_req = build_request(persona, &request, session, context, true);
+        let responses_req = build_request(
+            persona,
+            &request,
+            session,
+            context,
+            true,
+            self.parallel_tool_calls,
+        );
 
         let url = format!("{}/responses", self.endpoint);
 
@@ -1178,6 +1208,30 @@ mod tests {
     }
 
     #[test]
+    fn a_responses_batch_request_asks_for_parallel_tool_calls() {
+        use crate::llm::{LlmContext, LlmRequest, LlmSession, LlmTool, LlmToolKind};
+        let context = LlmContext {
+            tools: vec![LlmTool {
+                name: "a".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                kind: LlmToolKind::Function,
+                config: None,
+            }],
+            ..Default::default()
+        };
+        let session = LlmSession::new();
+        let req = LlmRequest::new("m");
+        let built = build_request(None, &req, &session, &context, false, true);
+        assert_eq!(built.parallel_tool_calls, Some(true));
+        let built = build_request(None, &req, &session, &context, false, false);
+        assert_eq!(built.parallel_tool_calls, Some(false));
+        let bare = LlmContext::default();
+        let built = build_request(None, &req, &session, &bare, false, true);
+        assert_eq!(built.parallel_tool_calls, None);
+    }
+
+    #[test]
     fn build_request_maps_history_and_hosted_tools() {
         let session = session_with_history();
         let context = context_with_tools();
@@ -1194,7 +1248,7 @@ mod tests {
             intent: Default::default(),
         };
 
-        let built = build_request(None, &req, &session, &context, false);
+        let built = build_request(None, &req, &session, &context, false, true);
 
         assert_eq!(built.model, "gpt-5");
         assert_eq!(built.max_output_tokens, Some(100));
@@ -1282,7 +1336,7 @@ mod tests {
         let mut req = LlmRequest::new("gpt-5");
         req.input = Content::text("hi");
 
-        let built = build_request(None, &req, &session, &context, false);
+        let built = build_request(None, &req, &session, &context, false, true);
 
         assert_eq!(built.input.len(), 1);
         match &built.input[0] {

@@ -33,6 +33,8 @@ pub struct OpenAiVendor {
     endpoint: Arc<String>,
     model: String,
     api_key: Arc<String>,
+    /// Whether the provider may return several tool calls in one response.
+    parallel_tool_calls: bool,
 }
 
 impl Clone for OpenAiVendor {
@@ -42,6 +44,7 @@ impl Clone for OpenAiVendor {
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
             api_key: Arc::clone(&self.api_key),
+            parallel_tool_calls: self.parallel_tool_calls,
         }
     }
 }
@@ -129,6 +132,10 @@ struct OpenAiRequest {
     /// Ask a streaming provider to end the stream with a usage-only chunk.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OpenAiStreamOptions>,
+    /// Let the model answer with several tool calls at once; the engine runs
+    /// such a batch concurrently. Only sent when tools are offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
 }
 
 /// The `stream_options` object a streaming request carries.
@@ -221,7 +228,14 @@ impl OpenAiVendor {
             endpoint: Arc::new(endpoint),
             model,
             api_key: Arc::new(api_key),
+            parallel_tool_calls: true,
         }
+    }
+
+    /// Allow (or forbid) several tool calls in one provider response.
+    pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
+        self.parallel_tool_calls = parallel;
+        self
     }
 
     /// Start building an OpenAI vendor.
@@ -371,6 +385,7 @@ impl OpenAiVendor {
         let max_tokens = req
             .max_tokens
             .unwrap_or(crate::llm::vendor::DEFAULT_COMPLETION_CAP);
+        let parallel_tool_calls = tools.as_ref().map(|_| self.parallel_tool_calls);
 
         OpenAiRequest {
             model: req.model.clone(),
@@ -383,6 +398,7 @@ impl OpenAiVendor {
             reasoning_effort: req.reasoning_effort,
             stream: Some(false),
             stream_options: None,
+            parallel_tool_calls,
         }
     }
 
@@ -521,6 +537,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 self.api_key.clone(),
                 self.endpoint.clone(),
             )
+            .with_parallel_tool_calls(self.parallel_tool_calls)
             .complete(persona, request, session, context)
             .await;
         }
@@ -639,6 +656,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 self.api_key.clone(),
                 self.endpoint.clone(),
             )
+            .with_parallel_tool_calls(self.parallel_tool_calls)
             .stream_complete(persona, request, session, context)
             .await;
         }
@@ -992,6 +1010,12 @@ impl OpenAiClient {
             inner: OpenAiVendor::new(endpoint, model, api_key),
         }
     }
+
+    /// Allow (or forbid) several tool calls in one provider response.
+    pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
+        self.inner = self.inner.with_parallel_tool_calls(parallel);
+        self
+    }
 }
 
 #[async_trait]
@@ -1039,6 +1063,42 @@ mod tests {
     use crate::llm::vendor::OpenAiVendor;
     use crate::llm::{Content, LlmClient, LlmContext, LlmRequest, LlmSession};
 
+    /// A batch-capable request tells the provider it may answer with several
+    /// tool calls at once; a sequential one says false; a tool-less request
+    /// omits the field entirely.
+    #[test]
+    fn a_batch_request_asks_the_provider_for_parallel_tool_calls() {
+        use crate::llm::{LlmContext, LlmRequest, LlmSession, LlmTool, LlmToolKind};
+        let vendor = OpenAiVendor::new(
+            "http://127.0.0.1:1/v1".to_string(),
+            "m".to_string(),
+            "k".to_string(),
+        );
+        let context = LlmContext {
+            tools: vec![LlmTool {
+                name: "a".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                kind: LlmToolKind::Function,
+                config: None,
+            }],
+            ..Default::default()
+        };
+        let session = LlmSession::new();
+        let req = LlmRequest::new("m");
+        let wire = serde_json::to_value(vendor.convert_request(None, &req, &session, &context))
+            .expect("serialize");
+        assert_eq!(wire["parallel_tool_calls"], true);
+        let sequential = vendor.clone().with_parallel_tool_calls(false);
+        let wire = serde_json::to_value(sequential.convert_request(None, &req, &session, &context))
+            .expect("serialize");
+        assert_eq!(wire["parallel_tool_calls"], false);
+        let bare = LlmContext::default();
+        let wire = serde_json::to_value(vendor.convert_request(None, &req, &session, &bare))
+            .expect("serialize");
+        assert!(wire.get("parallel_tool_calls").is_none());
+    }
+
     #[test]
     fn a_stream_request_asks_the_provider_for_usage() {
         let request = super::OpenAiRequest {
@@ -1054,6 +1114,7 @@ mod tests {
             stream_options: Some(super::OpenAiStreamOptions {
                 include_usage: true,
             }),
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(&request).expect("serialize");
         assert_eq!(json["stream_options"]["include_usage"], true);
@@ -1072,6 +1133,7 @@ mod tests {
             reasoning_effort: None,
             stream: Some(false),
             stream_options: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(&request).expect("serialize");
         assert!(json.get("stream_options").is_none());

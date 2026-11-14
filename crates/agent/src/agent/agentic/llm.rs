@@ -126,11 +126,10 @@ pub fn build_vendor(
             model_name,
             config.api_key.clone(),
         )),
-        _ => Box::new(OpenAiClient::new(
-            config.base_url.clone(),
-            model_name,
-            config.api_key.clone(),
-        )),
+        _ => Box::new(
+            OpenAiClient::new(config.base_url.clone(), model_name, config.api_key.clone())
+                .with_parallel_tool_calls(config.parallel_tool_calls),
+        ),
     };
 
     (vendor_name, vendor)
