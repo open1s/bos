@@ -1053,6 +1053,7 @@
 "right.start.extensionsHint": "Manage extensions"
 "right.start.federationHint": "Connect federation nodes"
 "right.start.tasksHint": "View the task list"
+"right.start.extensionPanelHint": "Extension panel"
 "right.start.recent": "Recently used"
 "right.start.viewMore": "View more"
 "right.start.showLess": "Show less"

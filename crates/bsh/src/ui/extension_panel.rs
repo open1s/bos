@@ -200,6 +200,11 @@ pub(crate) struct ExtensionPanelView {
     /// Dropping this unsubscribes the picker, and a chosen row would then stop
     /// switching panels, so the view holds it for its whole life.
     picker_subscription: Option<Subscription>,
+    /// Whether the chooser row above the document is drawn.
+    ///
+    /// A dedicated tab shows one panel and hides the chooser; the Refresh
+    /// control stays, in a minimal row of its own.
+    show_picker: bool,
     /// Whether the runtime's live card has been requested for this selection.
     ///
     /// A panel that ships a declared view shows it on the first frame, but that
@@ -271,6 +276,7 @@ impl ExtensionPanelView {
             lang,
             picker: None,
             picker_subscription: None,
+            show_picker: true,
             attempted: false,
             drilled: false,
             inputs: RefCell::new(BTreeMap::new()),
@@ -291,6 +297,26 @@ impl ExtensionPanelView {
         view
     }
 
+    /// Hide the panel chooser: a dedicated tab shows its one panel directly.
+    ///
+    /// The Refresh control stays, in a minimal row of its own, so the panel
+    /// can still be re-read without a picker that has nothing to choose.
+    pub(crate) fn without_picker(mut self) -> Self {
+        self.show_picker = false;
+        self
+    }
+
+    /// The cached surface for one panel id, when this view holds it.
+    ///
+    /// The dedicated-tab open path prefers the live host's surface and falls
+    /// back to this cached one when no host is open.
+    pub(crate) fn panel_surface(&self, panel_id: &str) -> Option<PanelSurface> {
+        self.panels
+            .iter()
+            .find(|panel| panel.panel_id == panel_id)
+            .cloned()
+    }
+
     /// The panels this view offers, as (qualified id, title) pairs the Start
     /// launcher draws one tile per panel. Read from the cached view so the
     /// launcher never pays for a host scan on a render.
@@ -301,8 +327,12 @@ impl ExtensionPanelView {
             .collect()
     }
 
-    /// Open one panel by its qualified id, the way the Start launcher's tile
-    /// does: select it, or refresh it when it is already the selected one.
+    /// Open one panel by its qualified id: select it, or refresh it when it is
+    /// already the selected one.
+    ///
+    /// The Start launcher opens dedicated tabs now, so the by-id path is kept
+    /// for the tests; the picker dropdown itself selects by index.
+    #[allow(dead_code)]
     pub(crate) fn select_panel_by_id(&mut self, panel_id: &str, cx: &mut Context<Self>) {
         let Some(index) = self
             .panels
@@ -1769,7 +1799,9 @@ impl Render for ExtensionPanelView {
         self.palette = Palette::new(panel_palette(&self.panel_theme, &self.panel_theme_dark));
         self.ensure_loaded(cx);
         self.schedule_refresh(cx);
-        self.ensure_picker(window, cx);
+        if self.show_picker {
+            self.ensure_picker(window, cx);
+        }
         // Record what this frame draws from; a click later in the frame's life
         // is an action on this revision, not on whatever replaced it since.
         self.render_revision = self.revision;
@@ -1789,32 +1821,34 @@ impl Render for ExtensionPanelView {
         }
         // One searchable dropdown over every panel installed for this mount.
         // The pill strip it replaces had to be scanned left to right, and a
-        // reader with a dozen packages had no way to ask for one by name.
-        let mut chooser = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .w_full()
-            .debug_selector(|| "extension-panel-chooser".to_string())
-            .child(txt(
-                tr(self.lang, "right.extensions.picker"),
-                12.0,
-                self.palette.muted,
-            ));
-        if let Some(picker) = self.picker.clone() {
-            chooser = chooser.child(
-                div()
-                    .flex_1()
-                    .h(px(30.0))
-                    .debug_selector(|| "extension-panel-picker".to_string())
-                    .child(
-                        Combobox::new(&picker)
-                            .placeholder(tr(self.lang, "right.extensions.picker"))
-                            .search_placeholder(tr(self.lang, "right.extensions.search"))
-                            .menu_width(px(320.0)),
-                    ),
-            );
+        // reader with a dozen packages had no way to ask for one by name. A
+        // dedicated tab hides the chooser - its strip chip already names the
+        // panel - and keeps only the Refresh control in the row.
+        let mut chooser = div().flex().flex_row().items_center().gap(px(8.0)).w_full();
+        if self.show_picker {
+            chooser = chooser
+                .debug_selector(|| "extension-panel-chooser".to_string())
+                .child(txt(
+                    tr(self.lang, "right.extensions.picker"),
+                    12.0,
+                    self.palette.muted,
+                ));
+            if let Some(picker) = self.picker.clone() {
+                chooser = chooser.child(
+                    div()
+                        .flex_1()
+                        .h(px(30.0))
+                        .debug_selector(|| "extension-panel-picker".to_string())
+                        .child(
+                            Combobox::new(&picker)
+                                .placeholder(tr(self.lang, "right.extensions.picker"))
+                                .search_placeholder(tr(self.lang, "right.extensions.search"))
+                                .menu_width(px(320.0)),
+                        ),
+                );
+            }
+        } else {
+            chooser = chooser.debug_selector(|| "extension-panel-toolbar".to_string());
         }
         chooser = chooser.child(
             Button::new("extension-panel-refresh")
@@ -2569,5 +2603,61 @@ mod tests {
         assert!(report.is_valid(), "{:?}", report.errors);
         assert!(super::catalog_icon("git-branch").is_some());
         assert!(super::catalog_icon("no-such-icon").is_none());
+    }
+
+    /// A dedicated tab hides the chooser but keeps Refresh: the strip chip
+    /// already names the panel, so a picker over one panel would be chrome
+    /// without a choice.
+    #[gpui::test]
+    fn without_picker_hides_the_chooser_and_keeps_refresh(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.dispatcher.allow_parking();
+        let surface = panel(document(
+            serde_json::json!({"type": "text", "text": "dedicated"}),
+        ));
+        let view = cx.new(|_| ExtensionPanelView::new(vec![surface], Lang::En).without_picker());
+        let harness_view = view.clone();
+        let (_harness, vcx) = cx.add_window_view(move |_, _| PanelHarness { view: harness_view });
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            vcx.debug_bounds("extension-panel-chooser").is_none(),
+            "the dedicated tab draws no chooser row"
+        );
+        assert!(
+            vcx.debug_bounds("extension-panel-picker").is_none(),
+            "and no picker dropdown"
+        );
+        assert!(
+            vcx.debug_bounds("extension-panel-toolbar").is_some(),
+            "the minimal refresh row stays"
+        );
+        let has_doc = vcx.update(|_, cx| view.read(cx).document.is_some());
+        assert!(has_doc, "the panel document is on screen behind the row");
+        // The kept Refresh button still re-reads the live card: a manual
+        // refresh clears a drill-down synchronously.
+        vcx.update(|_, cx| view.update(cx, |view, _| view.drilled = true));
+        click(vcx, "extension-panel-refresh");
+        let drilled = vcx.update(|_, cx| view.read(cx).drilled);
+        assert!(!drilled, "the kept Refresh button re-reads the live card");
+    }
+
+    /// The discrimination side of the dedicated tab: a view built the normal
+    /// way still draws the picker, so the hidden-chooser test cannot pass by
+    /// the picker never rendering at all.
+    #[gpui::test]
+    fn the_default_view_keeps_the_picker(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.dispatcher.allow_parking();
+        let surface = panel(document(
+            serde_json::json!({"type": "text", "text": "picker"}),
+        ));
+        let view = cx.new(|_| ExtensionPanelView::new(vec![surface], Lang::En));
+        let harness_view = view.clone();
+        let (_harness, vcx) = cx.add_window_view(move |_, _| PanelHarness { view: harness_view });
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            vcx.debug_bounds("extension-panel-picker").is_some(),
+            "the Extensions pane keeps its chooser"
+        );
     }
 }

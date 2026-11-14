@@ -549,6 +549,18 @@ pub(crate) struct RightPanel {
     /// behind its own tab until that tab is closed, so switching from Browser to
     /// Files and back returns to the same surfaces rather than reopening them.
     pub(crate) open_panes: Vec<RightTab>,
+    /// The extension panels the reader has opened as dedicated tabs, in open
+    /// order.
+    pub(crate) open_extensions: Vec<String>,
+    /// The extension panel whose dedicated tab holds the body, if any.
+    ///
+    /// Mutually exclusive with `tab`: while this is set, `tab` is None, so
+    /// every built-in pane check reads false and the body draws the panel.
+    pub(crate) active_extension: Option<String>,
+    /// One single-panel view per open extension tab, keyed by qualified panel
+    /// id. Each view is built without the picker: the tab chip names the panel.
+    pub(crate) extension_tabs:
+        std::collections::BTreeMap<String, Entity<crate::ui::extension_panel::ExtensionPanelView>>,
     /// The width a reader dragged out, before it is committed.
     pub(crate) user_w: Option<f32>,
     /// Whether the panel has taken the whole column, which is what its header's
@@ -1169,22 +1181,26 @@ pub(crate) enum RightSearchEntry {
 }
 
 /// One entry the Show All Tabs catalogue can draw.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CatalogEntry {
     /// The Start screen, when no pane is open.
     Start,
     /// A pane, whether it is the open one or a pane the catalogue can switch to.
     Pane(RightTab),
+    /// An extension panel opened as its own dedicated tab.
+    Extension(String),
     /// A document opened out of Files.
     File(usize),
 }
 
 /// One tab the strip can draw: the open pane, or a document opened in Files.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StripSlot {
     /// The Start screen, the panel's own new-tab page.
     Start,
     Pane(RightTab),
+    /// An extension panel's dedicated tab, by qualified panel id.
+    Extension(String),
     File(usize),
 }
 
@@ -1293,14 +1309,16 @@ pub(crate) fn plan_tab_strip(
 /// Choose which open tabs the strip can show, in order, around the active one.
 ///
 /// Unlike the old launcher planner, every item here is an OPEN tab: Start (when
-/// it is the active new-tab page), the pane tabs the reader opened, and the
-/// document tabs. All of them carry labels and closes, so they are packed at
-/// the same width floor; when even the floor does not fit, the window closes
-/// around the tab on screen and the rest move into the catalog.
+/// it is the active new-tab page), the pane tabs the reader opened, the
+/// extension panels opened as dedicated tabs, and the document tabs. All of
+/// them carry labels and closes, so they are packed at the same width floor;
+/// when even the floor does not fit, the window closes around the tab on screen
+/// and the rest move into the catalog.
 fn plan_open_strip(
     available: f32,
     start: Option<(f32, f32)>,
     panes: &[(RightTab, f32, f32)],
+    extensions: &[(String, f32, f32)],
     files: &[(f32, f32)],
     active: Option<StripSlot>,
 ) -> StripPlan {
@@ -1310,6 +1328,9 @@ fn plan_open_strip(
     }
     for (tab, width, floor) in panes {
         items.push((StripSlot::Pane(*tab), *width, *floor));
+    }
+    for (id, width, floor) in extensions {
+        items.push((StripSlot::Extension(id.clone()), *width, *floor));
     }
     for (index, (width, floor)) in files.iter().enumerate() {
         items.push((StripSlot::File(index), *width, *floor));
@@ -1379,7 +1400,7 @@ fn plan_open_strip(
     );
     let visible = (start_index..=end_index)
         .zip(widths)
-        .map(|(index, width)| (items[index].0, width))
+        .map(|(index, width)| (items[index].0.clone(), width))
         .collect();
     StripPlan {
         visible,
@@ -1677,9 +1698,10 @@ impl Shell {
             .items_center()
             .gap(px(4.0));
         // The strip is the set of OPEN tabs: Start when it is the active
-        // new-tab page, every pane the reader opened, and every document. The
-        // active tab stays visible; the rest are one click away, and anything
-        // that does not fit is in the catalog at the trailing edge.
+        // new-tab page, every pane the reader opened, every extension panel
+        // opened as a dedicated tab, and every document. The active tab stays
+        // visible; the rest are one click away, and anything that does not fit
+        // is in the catalog at the trailing edge.
         let active_pane = self.right.tab;
         let mut open_panes = self.right.open_panes.clone();
         if let Some(tab) = active_pane {
@@ -1697,6 +1719,22 @@ impl Shell {
                 let label = self.state.lang.tr(tab.key());
                 (
                     *tab,
+                    pane_tab_w_with(&label, close),
+                    pane_tab_floor_with(&label, close),
+                )
+            })
+            .collect();
+        // Extension panels opened as dedicated tabs: the chip carries the
+        // panel's own title and packs at the same widths a pane tab does.
+        let extension_widths: Vec<(String, f32, f32)> = self
+            .right
+            .open_extensions
+            .iter()
+            .map(|id| {
+                let close = self.right.active_extension.as_deref() == Some(id.as_str());
+                let label = self.extension_tab_label(id, cx);
+                (
+                    id.clone(),
                     pane_tab_w_with(&label, close),
                     pane_tab_floor_with(&label, close),
                 )
@@ -1726,19 +1764,20 @@ impl Shell {
                 (width.min(STRIP_TAB_MAX_W), floor.min(width))
             })
             .collect();
-        let start = active_pane.is_none().then(|| {
+        let start = (active_pane.is_none() && self.right.active_extension.is_none()).then(|| {
             let label = self.state.lang.tr("right.start");
             (
                 pane_tab_w_with(&label, false),
                 pane_tab_floor_with(&label, false),
             )
         });
-        let active = match active_pane {
-            Some(RightTab::Files) if self.files.active.is_some() => {
+        let active = match (&self.right.active_extension, active_pane) {
+            (Some(id), _) => Some(StripSlot::Extension(id.clone())),
+            (None, Some(RightTab::Files)) if self.files.active.is_some() => {
                 self.files.active.map(StripSlot::File)
             }
-            Some(tab) => Some(StripSlot::Pane(tab)),
-            None => Some(StripSlot::Start),
+            (None, Some(tab)) => Some(StripSlot::Pane(tab)),
+            (None, None) => Some(StripSlot::Start),
         };
         // The comment control is a document's own, and so is the preview
         // switch: both appear with their document and share the strip's
@@ -1749,6 +1788,7 @@ impl Shell {
             self.strip_budget(band, 3 + usize::from(comments) + usize::from(preview)),
             start,
             &panes,
+            &extension_widths,
             &file_widths,
             active,
         );
@@ -1764,6 +1804,9 @@ impl Shell {
             let chip = match slot {
                 StripSlot::Start => self.start_tab_chip(width, cx).into_any_element(),
                 StripSlot::Pane(pane) => self.right_tab_chip(pane, width, cx).into_any_element(),
+                StripSlot::Extension(id) => {
+                    self.extension_tab_chip(id, width, cx).into_any_element()
+                }
                 StripSlot::File(index) => match self.files.tabs.get(index) {
                     Some(file_tab) => self
                         .files_tab_chip(index, file_tab, width, cx)
@@ -2054,9 +2097,22 @@ impl Shell {
             .iter()
             .map(|pane| (*pane, lang.tr(pane.key()), self.right.tab == Some(*pane)))
             .collect();
-        let total = docs.len() + panes.len();
-        let can_close = self.right.tab.is_some() || self.files.active.is_some();
-        let can_others = self.right.tab.is_some() && total > 1;
+        let extensions: Vec<(String, String, bool)> = self
+            .right
+            .open_extensions
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    self.extension_tab_label(id, cx),
+                    self.right.active_extension.as_deref() == Some(id.as_str()),
+                )
+            })
+            .collect();
+        let total = docs.len() + panes.len() + extensions.len();
+        let has_active = self.right.tab.is_some() || self.right.active_extension.is_some();
+        let can_close = has_active || self.files.active.is_some();
+        let can_others = has_active && total > 1;
         let can_all = total > 0;
         let title = format!("{} ({})", lang.tr("right.tabs"), total);
         let tooltip = title.clone();
@@ -2093,7 +2149,7 @@ impl Shell {
                         }),
                     );
                 }
-                if !panes.is_empty() && !docs.is_empty() {
+                if (!panes.is_empty() || !extensions.is_empty()) && !docs.is_empty() {
                     menu = menu
                         .item(PopupMenuItem::separator())
                         .item(PopupMenuItem::label(lang.tr("right.tabs.panes")));
@@ -2109,6 +2165,20 @@ impl Shell {
                         )
                         .on_click(move |_, _window, cx| {
                             shell.update(cx, |this, cx| this.activate_pane(pane, cx));
+                        }),
+                    );
+                }
+                for (id, label, active) in extensions.iter().cloned() {
+                    let shell = entity.clone();
+                    menu = menu.item(
+                        catalog_row(
+                            format!("tab-catalog-ext-{id}"),
+                            IconName::Puzzle,
+                            label,
+                            active,
+                        )
+                        .on_click(move |_, _window, cx| {
+                            shell.update(cx, |this, cx| this.activate_extension_tab(&id, cx));
                         }),
                     );
                 }
@@ -2180,7 +2250,9 @@ impl Shell {
         };
         let label = lang.tr(tab.key());
         let documents = self.files.tabs.len();
-        let other_tabs = documents + self.right.open_panes.len().saturating_sub(1);
+        let other_tabs = documents
+            + self.right.open_panes.len().saturating_sub(1)
+            + self.right.open_extensions.len();
         let slug = tab.slug();
         let debug = if active {
             String::from("right-tab")
@@ -2278,6 +2350,137 @@ impl Shell {
                         .disabled(other_tabs == 0)
                         .on_click(move |_, _, cx| {
                             others.update(cx, |this, cx| this.close_other_pane_tabs(tab, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(lang.tr("right.closeAll")).on_click(move |_, _, cx| {
+                        all.update(cx, |this, cx| this.close_all_tabs(cx));
+                    }),
+                )
+                .item(PopupMenuItem::separator())
+                .item(PopupMenuItem::new(lang.tr("right.showAllTabs")).on_click(
+                    move |_, window, cx| {
+                        show.update(cx, |this, cx| this.open_tab_catalog(window, cx));
+                    },
+                ))
+            })
+    }
+
+    /// The label of an open extension tab: its panel's own title.
+    ///
+    /// Read from the tab's single-panel view, so the strip never pays for a
+    /// host scan; the qualified id is the fallback when the view is gone.
+    fn extension_tab_label(&self, panel_id: &str, cx: &App) -> String {
+        self.right
+            .extension_tabs
+            .get(panel_id)
+            .and_then(|view| view.read(cx).panel_tiles().into_iter().next())
+            .map(|(_, title)| title)
+            .unwrap_or_else(|| panel_id.to_string())
+    }
+
+    /// One extension panel's dedicated tab: the panel's title, the puzzle
+    /// glyph in the launcher's amber, and the close that drops the tab.
+    ///
+    /// Pressing an inactive chip brings its panel to the front; the panel is
+    /// the tab's whole body, so there is no picker to reopen.
+    fn extension_tab_chip(
+        &self,
+        panel_id: String,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let lang = self.state.lang;
+        let selected = self.right.active_extension.as_deref() == Some(panel_id.as_str());
+        let label = self.extension_tab_label(&panel_id, cx);
+        let documents = self.files.tabs.len();
+        let other_tabs = documents
+            + self.right.open_panes.len()
+            + self.right.open_extensions.len().saturating_sub(1);
+        const AMBER: u32 = 0xE8912D;
+        let debug = format!("right-tab-ext-{panel_id}");
+        let close_debug = format!("right-tab-ext-close-{panel_id}");
+        let click_id = panel_id.clone();
+        let close_id = panel_id.clone();
+        let menu_id = panel_id.clone();
+        let entity = cx.entity();
+        div()
+            .id(SharedString::from(format!("right-tab-ext-{panel_id}")))
+            .debug_selector(move || debug.clone())
+            .w(px(width))
+            .h(px(theme::RIGHT_TAB_H))
+            .flex_none()
+            .min_w_0()
+            .px(px(8.0))
+            .rounded(px(theme::RADIUS_SM))
+            .when(selected, |chip| chip.bg(rgb(theme::selected_row())))
+            .when(!selected, |chip| chip.cursor_pointer())
+            .when(!selected, |chip| chip.hover(|s| s.bg(rgb(theme::hover()))))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .overflow_hidden()
+            .child(icon(IconName::Puzzle, 14.0, AMBER).flex_none())
+            .child(
+                txt(
+                    label,
+                    theme::CHIP_SIZE,
+                    if selected {
+                        theme::text()
+                    } else {
+                        theme::muted()
+                    },
+                )
+                .flex_1()
+                .min_w_0()
+                .text_ellipsis(),
+            )
+            // Only the selected tab draws a close, the pane tabs' own rule.
+            .when(selected, |chip| {
+                chip.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "right-tab-ext-close-{close_id}"
+                        )))
+                        .debug_selector(move || close_debug.clone())
+                        .ml(px(2.0))
+                        .px(px(3.0))
+                        .flex_none()
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::hover())))
+                        .child(icon(IconName::X, 12.0, theme::faint()))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.close_extension_tab(&close_id, cx);
+                        })),
+                )
+            })
+            .when(!selected, |chip| {
+                chip.on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.activate_extension_tab(&click_id, cx);
+                }))
+            })
+            .context_menu(move |menu, _, _| {
+                let close = entity.clone();
+                let close_id = menu_id.clone();
+                let others = entity.clone();
+                let others_id = menu_id.clone();
+                let all = entity.clone();
+                let show = entity.clone();
+                menu.item(
+                    PopupMenuItem::new(lang.tr("right.close")).on_click(move |_, _, cx| {
+                        close.update(cx, |this, cx| this.close_extension_tab(&close_id, cx));
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new(lang.tr("right.closeOthers"))
+                        .disabled(other_tabs == 0)
+                        .on_click(move |_, _, cx| {
+                            others.update(cx, |this, cx| {
+                                this.close_other_extension_tabs(&others_id, cx);
+                            });
                         }),
                 )
                 .item(
@@ -2435,31 +2638,43 @@ impl Shell {
             .flex()
             .flex_col()
             .overflow_hidden();
-        let body = match self.right.tab {
-            None => body.child(self.right_start(cx)),
-            Some(RightTab::Files) => {
-                let pane = body.child(self.files_pane(cx));
-                let _ = __all;
-                pane
+        // An extension tab holds the body directly: its single-panel view,
+        // with no picker wrapper. Start only shows when no extension tab is
+        // active either.
+        let body = if let Some(view) = self
+            .right
+            .active_extension
+            .as_ref()
+            .and_then(|id| self.right.extension_tabs.get(id))
+        {
+            body.child(view.clone().into_any_element())
+        } else {
+            match self.right.tab {
+                None => body.child(self.right_start(cx)),
+                Some(RightTab::Files) => {
+                    let pane = body.child(self.files_pane(cx));
+                    let _ = __all;
+                    pane
+                }
+                Some(RightTab::Terminal) => body.child(self.terminal_pane(cx)),
+                Some(RightTab::Diff) => body.child(self.diff_pane(cx)),
+                Some(RightTab::Browser) => body.child(self.browser_pane(cx)),
+                Some(RightTab::Federation) => body.child(self.federation_pane(cx)),
+                Some(RightTab::Tasks) => body.child(self.tasks_pane(cx)),
+                Some(RightTab::Extensions) => body.child(match &self.right_extension_panels {
+                    Some(view) => view.clone().into_any_element(),
+                    None => div()
+                        .debug_selector(|| "right-extensions-empty".to_string())
+                        .flex_1()
+                        .px(px(theme::RIGHT_PAD * 2.0))
+                        .child(txt(
+                            self.state.lang.tr("right.extensions.empty"),
+                            theme::CHIP_SIZE,
+                            theme::faint(),
+                        ))
+                        .into_any_element(),
+                }),
             }
-            Some(RightTab::Terminal) => body.child(self.terminal_pane(cx)),
-            Some(RightTab::Diff) => body.child(self.diff_pane(cx)),
-            Some(RightTab::Browser) => body.child(self.browser_pane(cx)),
-            Some(RightTab::Federation) => body.child(self.federation_pane(cx)),
-            Some(RightTab::Tasks) => body.child(self.tasks_pane(cx)),
-            Some(RightTab::Extensions) => body.child(match &self.right_extension_panels {
-                Some(view) => view.clone().into_any_element(),
-                None => div()
-                    .debug_selector(|| "right-extensions-empty".to_string())
-                    .flex_1()
-                    .px(px(theme::RIGHT_PAD * 2.0))
-                    .child(txt(
-                        self.state.lang.tr("right.extensions.empty"),
-                        theme::CHIP_SIZE,
-                        theme::faint(),
-                    ))
-                    .into_any_element(),
-            }),
         };
         // Finder's overview sits over the body, under the strip: the tab bar
         // that opened it stays visible, so closing the catalogue is the same
@@ -2483,13 +2698,29 @@ impl Shell {
         // category and search filters are applied to this one list, so a search
         // narrows the category the reader already chose instead of replacing it.
         let mut entries: Vec<(CatalogEntry, String)> = Vec::new();
-        match self.right.tab {
-            Some(_) => {
-                for tab in RightTab::ALL {
-                    entries.push((CatalogEntry::Pane(tab), lang.tr(tab.key())));
+        if let Some(id) = &self.right.active_extension {
+            entries.push((
+                CatalogEntry::Extension(id.clone()),
+                self.extension_tab_label(id, cx),
+            ));
+        } else {
+            match self.right.tab {
+                Some(_) => {
+                    for tab in RightTab::ALL {
+                        entries.push((CatalogEntry::Pane(tab), lang.tr(tab.key())));
+                    }
                 }
+                None => entries.push((CatalogEntry::Start, lang.tr("right.start"))),
             }
-            None => entries.push((CatalogEntry::Start, lang.tr("right.start"))),
+        }
+        for id in &self.right.open_extensions {
+            if self.right.active_extension.as_deref() == Some(id.as_str()) {
+                continue;
+            }
+            entries.push((
+                CatalogEntry::Extension(id.clone()),
+                self.extension_tab_label(id, cx),
+            ));
         }
         for (index, tab) in self.files.tabs.iter().enumerate() {
             entries.push((CatalogEntry::File(index), tab.label()));
@@ -2498,7 +2729,7 @@ impl Shell {
         let shown: Vec<(CatalogEntry, String)> = entries
             .iter()
             .filter(|(entry, label)| {
-                self.catalog_filter.admits(*entry)
+                self.catalog_filter.admits(entry.clone())
                     && (query.is_empty() || label.to_lowercase().contains(&query))
             })
             .cloned()
@@ -2618,6 +2849,9 @@ impl Shell {
                 CatalogEntry::Pane(tab) => {
                     self.catalog_pane_card(*tab, card_w, cx).into_any_element()
                 }
+                CatalogEntry::Extension(id) => self
+                    .catalog_extension_card(id.clone(), card_w, cx)
+                    .into_any_element(),
                 CatalogEntry::File(index) => match self.files.tabs.get(*index) {
                     Some(tab) => self
                         .catalog_file_card(*index, tab, card_w, cx)
@@ -2790,6 +3024,64 @@ impl Shell {
                     cx.stop_propagation();
                     this.close_tab_catalog(cx);
                     this.close_right_pane_tab(tab, cx);
+                })),
+        )
+    }
+
+    /// The card for one open extension tab, with the close that drops it.
+    ///
+    /// Pressing the card activates the tab: the catalogue is also the way back
+    /// to a panel whose chip did not fit the strip.
+    fn catalog_extension_card(
+        &self,
+        panel_id: String,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let label = self.extension_tab_label(&panel_id, cx);
+        let selected = self.right.active_extension.as_deref() == Some(panel_id.as_str());
+        const AMBER: u32 = 0xE8912D;
+        let activate_id = panel_id.clone();
+        let close_id = panel_id.clone();
+        let close_debug = format!("tab-catalog-ext-close-{panel_id}");
+        self.catalog_card(
+            format!("tab-catalog-ext-{panel_id}"),
+            format!("tab-catalog-ext-{panel_id}"),
+            width,
+            selected,
+        )
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            cx.stop_propagation();
+            this.close_tab_catalog(cx);
+            this.activate_extension_tab(&activate_id, cx);
+        }))
+        .child(icon(IconName::Puzzle, 16.0, AMBER).flex_none())
+        .child(
+            txt(label, 13.0, theme::text())
+                .flex_1()
+                .min_w_0()
+                .text_ellipsis(),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "tab-catalog-ext-close-{close_id}"
+                )))
+                .debug_selector(move || close_debug.clone())
+                .w(px(20.0))
+                .h(px(20.0))
+                .flex_none()
+                .rounded(px(4.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::hover())))
+                .child(icon(IconName::X, 12.0, theme::faint()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.close_tab_catalog(cx);
+                    this.close_extension_tab(&close_id, cx);
                 })),
         )
     }
@@ -5620,10 +5912,32 @@ impl Shell {
             .gap(px(gap));
         let mut shown = 0usize;
         if scope != RightSearchScope::Documents {
+            // Extension panels contribute their own launcher tiles, grouped
+            // just before the Tasks tray. Read from the cached right-pane view
+            // so a render never pays for a host scan.
+            let extension_tiles = self
+                .right_extension_panels
+                .as_ref()
+                .map(|view| view.read(cx).panel_tiles())
+                .unwrap_or_default();
             for tab in RightTab::ALL
                 .into_iter()
                 .filter(|tab| tab.on_start_screen())
             {
+                if tab == RightTab::Tasks {
+                    for (panel_id, title) in &extension_tiles {
+                        if !query.is_empty() && !title.to_lowercase().contains(&query) {
+                            continue;
+                        }
+                        shown += 1;
+                        grid = grid.child(self.right_start_extension_card(
+                            panel_id.clone(),
+                            title.clone(),
+                            card_w,
+                            cx,
+                        ));
+                    }
+                }
                 let label = lang.tr(tab.key());
                 if !query.is_empty() && !label.to_lowercase().contains(&query) {
                     continue;
@@ -6217,6 +6531,71 @@ impl Shell {
                 if tab == RightTab::Terminal {
                     window.focus(&this.terminal_focus, cx);
                 }
+            }))
+    }
+
+    /// One extension panel as a Start-grid tile, in the extension family's
+    /// amber. Clicking it opens the panel as its own dedicated tab in the
+    /// strip, so a contributed panel is reachable in one click from the
+    /// launcher and keeps its place beside the built-in panes.
+    fn right_start_extension_card(
+        &self,
+        panel_id: String,
+        title: String,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let lang = self.state.lang;
+        let description = lang.tr("right.start.extensionPanelHint");
+        const AMBER: u32 = 0xE8912D;
+        let id = format!("right-card-ext-{panel_id}");
+        let debug_id = id.clone();
+        let tip = title.clone();
+        let click_id = panel_id.clone();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || debug_id.clone())
+            .w(px(width))
+            .h(px(118.0))
+            .flex_none()
+            .p(px(8.0))
+            .rounded(px(12.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::hover())))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(5.0))
+            .tooltip_show_delay(std::time::Duration::from_millis(500))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(48.0))
+                    .h(px(48.0))
+                    .rounded(px(13.0))
+                    .bg(rgb(theme::soft(AMBER)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon(IconName::Puzzle, 24.0, AMBER)),
+            )
+            .child(
+                txt(title, 12.5, theme::text())
+                    .font_weight(FontWeight::MEDIUM)
+                    .min_w_0()
+                    .text_ellipsis(),
+            )
+            .child(
+                txt(description, 10.0, theme::faint())
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .text_ellipsis(),
+            )
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.clear_right_search(window, cx);
+                this.open_extension_panel_tab(&click_id, window, cx);
             }))
     }
 
@@ -6929,7 +7308,9 @@ impl Shell {
         };
         let close_name = name.clone();
         let documents = self.files.tabs.len();
-        let other_tabs = documents + self.right.open_panes.len().saturating_sub(1);
+        let other_tabs = documents
+            + self.right.open_panes.len().saturating_sub(1)
+            + self.right.open_extensions.len();
         let full_path = tab.rel.display().to_string();
         let lang = self.state.lang;
         let entity = cx.entity();
@@ -8587,6 +8968,7 @@ impl Shell {
     pub(crate) fn show_right_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
         self.right.open = true;
         self.right.tab = Some(tab);
+        self.right.active_extension = None;
         if !self.right.open_panes.contains(&tab) {
             self.right.open_panes.push(tab);
         }
@@ -8613,6 +8995,115 @@ impl Shell {
             }
         }
         cx.notify();
+    }
+
+    /// Open an extension panel as its own dedicated tab in the strip.
+    ///
+    /// The launcher tile's path: the panel gets a tab labelled with its title,
+    /// exactly the way Files gets one, and the body shows the panel directly
+    /// with no picker. An already-open tab is brought to the front instead of
+    /// rebuilt, so its live card and drill-down survive the press.
+    pub(crate) fn open_extension_panel_tab(
+        &mut self,
+        panel_id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Prefer the live host's surface; the cached mount view is the
+        // fallback when no host is open.
+        let surface = crate::extension::live_panel(panel_id).or_else(|| {
+            self.right_extension_panels
+                .as_ref()
+                .and_then(|view| view.read(cx).panel_surface(panel_id))
+        });
+        let Some(surface) = surface else {
+            return;
+        };
+        self.right.open = true;
+        if !self.right.extension_tabs.contains_key(panel_id) {
+            let lang = self.state.lang;
+            let view = cx.new(|_| {
+                crate::ui::extension_panel::ExtensionPanelView::new(vec![surface], lang)
+                    .without_picker()
+            });
+            self.right.extension_tabs.insert(panel_id.to_string(), view);
+            self.right.open_extensions.push(panel_id.to_string());
+        }
+        self.right.tab = None;
+        self.right.active_extension = Some(panel_id.to_string());
+        self.right.catalog_open = false;
+        self.hide_terminal_view(cx);
+        self.sync_terminal(cx);
+        cx.notify();
+    }
+
+    /// Bring one open extension tab to the front.
+    ///
+    /// The extension tab's press path: the built-in pane is handed back (`tab`
+    /// becomes None) and the terminal's native layer goes down, the same way
+    /// choosing any other tab leaves the surface it replaces.
+    pub(crate) fn activate_extension_tab(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+        if !self.right.extension_tabs.contains_key(panel_id) {
+            return;
+        }
+        self.right.open = true;
+        self.right.tab = None;
+        self.right.active_extension = Some(panel_id.to_string());
+        self.right.catalog_open = false;
+        self.hide_terminal_view(cx);
+        cx.notify();
+    }
+
+    /// Close one extension tab and activate its neighbour, or Start when none
+    /// is left. The pane tabs and documents stay as they are.
+    pub(crate) fn close_extension_tab(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+        let was_active = self.right.active_extension.as_deref() == Some(panel_id);
+        let index = self
+            .right
+            .open_extensions
+            .iter()
+            .position(|id| id == panel_id);
+        self.right.open_extensions.retain(|id| id != panel_id);
+        self.right.extension_tabs.remove(panel_id);
+        if !was_active {
+            cx.notify();
+            return;
+        }
+        let next = index.and_then(|index| {
+            self.right
+                .open_extensions
+                .get(index)
+                .or_else(|| self.right.open_extensions.get(index.saturating_sub(1)))
+                .cloned()
+        });
+        self.right.catalog_open = false;
+        match next {
+            Some(next) => self.activate_extension_tab(&next, cx),
+            None => {
+                self.right.active_extension = None;
+                self.right.tab = None;
+                self.hide_terminal_view(cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Close every tab except one extension tab, which is the extension tab's
+    /// "Close Other Tabs": other extension tabs, every pane and every document
+    /// go, the chosen panel stays.
+    pub(crate) fn close_other_extension_tabs(&mut self, keep: &str, cx: &mut Context<Self>) {
+        if !self.right.extension_tabs.contains_key(keep) {
+            return;
+        }
+        self.right.open_extensions.retain(|id| id.as_str() == keep);
+        self.right
+            .extension_tabs
+            .retain(|id, _| id.as_str() == keep);
+        self.right.open_panes.clear();
+        self.files.tabs.clear();
+        self.files.active = None;
+        self.browser_pane_closed();
+        self.activate_extension_tab(keep, cx);
     }
 
     /// Reveal or hide the seam's bar.
@@ -8662,6 +9153,7 @@ impl Shell {
     ) {
         self.right.open = true;
         self.right.tab = Some(tab);
+        self.right.active_extension = None;
         if !self.right.open_panes.contains(&tab) {
             self.right.open_panes.push(tab);
         }
@@ -9796,14 +10288,19 @@ impl Shell {
         cx.notify();
     }
 
-    /// Drop the file pane's view of the workspace it was showing.
+    /// Drop the file pane's view of the workspace it was showing, and rebase
+    /// the dedicated extension tabs onto the new root.
     ///
     /// Every path in the pane is relative, so a switch changes what each one
     /// MEANS: an open tab is a buffer whose rel would now resolve into another
     /// workspace's file, and saving it would write there. So the tabs go, the
     /// cached tree goes with them, and the pane re-lists whatever workspace is
-    /// active now.
+    /// active now. The extension tabs carry a workspace too, and follow it.
     pub(crate) fn refile_workspace(&mut self, cx: &mut Context<Self>) {
+        self.refile_extension_tabs(cx);
+        // The mounted-panel cache (Extensions pane and launcher tiles) follows
+        // the same switch, so every path that refiles also refreshes it.
+        self.refresh_extension_surfaces(cx);
         self.files.tabs.clear();
         self.files.active = None;
         self.files.expanded.clear();
@@ -9823,6 +10320,73 @@ impl Shell {
             return;
         }
         self.files.notes = crate::notes::Notes::default();
+        cx.notify();
+    }
+
+    /// Rebase the open extension tabs onto the workspace that is active now.
+    ///
+    /// A panel surface carries the workspace it was built against, so a switch
+    /// makes every dedicated tab's view stale: the Git panel would keep showing
+    /// the old root's history. Each open tab is rebuilt from the current
+    /// generation's surface; a panel the new workspace does not offer loses its
+    /// tab, and the body goes to the next open tab or Start. A tab whose surface
+    /// is unchanged keeps its view, so a refile that changes nothing does not
+    /// throw away the reader's drill-down.
+    pub(crate) fn refile_extension_tabs(&mut self, cx: &mut Context<Self>) {
+        if self.right.open_extensions.is_empty() {
+            return;
+        }
+        let root = self.state.settings.active_workspace_root();
+        let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+        // The same call the mount views are rebuilt from: it reopens the host
+        // when the workspace changed, so the surfaces below are the new
+        // generation's, and a later refresh takes the cheap unchanged path.
+        let panels = crate::extension::panels(&self.state.settings, workspace.as_deref(), None);
+        let lang = self.state.lang;
+        let open = self.right.open_extensions.clone();
+        let mut kept: Vec<String> = Vec::new();
+        for id in open {
+            let Some(fresh) = panels.iter().find(|panel| panel.panel_id == id) else {
+                // The new workspace does not offer this panel: its tab goes.
+                self.right.extension_tabs.remove(&id);
+                continue;
+            };
+            let unchanged = self
+                .right
+                .extension_tabs
+                .get(&id)
+                .and_then(|view| view.read(cx).panel_surface(&id))
+                .is_some_and(|stored| {
+                    std::sync::Arc::ptr_eq(&stored.runtime, &fresh.runtime)
+                        && stored.workspace == fresh.workspace
+                });
+            if !unchanged {
+                let surface = fresh.clone();
+                let view = cx.new(|_| {
+                    crate::ui::extension_panel::ExtensionPanelView::new(vec![surface], lang)
+                        .without_picker()
+                });
+                self.right.extension_tabs.insert(id.clone(), view);
+            }
+            kept.push(id);
+        }
+        self.right.open_extensions = kept;
+        // The active tab may have been one the new workspace does not offer.
+        if self
+            .right
+            .active_extension
+            .as_ref()
+            .is_some_and(|id| !self.right.extension_tabs.contains_key(id))
+        {
+            self.right.catalog_open = false;
+            match self.right.open_extensions.first().cloned() {
+                Some(next) => self.activate_extension_tab(&next, cx),
+                None => {
+                    self.right.active_extension = None;
+                    self.right.tab = None;
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -10484,6 +11048,8 @@ impl Shell {
         // kept file keeps the Files pane, every other pane closes.
         let had_browser = self.right.open_panes.contains(&RightTab::Browser);
         let had_terminal = self.right.open_panes.contains(&RightTab::Terminal);
+        self.right.open_extensions.clear();
+        self.right.extension_tabs.clear();
         self.right
             .open_panes
             .retain(|pane| *pane == RightTab::Files);
@@ -10504,7 +11070,10 @@ impl Shell {
         self.files.tabs.clear();
         self.files.active = None;
         self.right.open_panes.clear();
+        self.right.open_extensions.clear();
+        self.right.extension_tabs.clear();
         self.right.tab = None;
+        self.right.active_extension = None;
         self.right.catalog_open = false;
         self.browser_pane_closed();
         self.hide_terminal_view(cx);
@@ -10517,6 +11086,7 @@ impl Shell {
     /// behind it stays a tab, and choosing one brings it back.
     pub(crate) fn show_start(&mut self, cx: &mut Context<Self>) {
         self.right.tab = None;
+        self.right.active_extension = None;
         self.right.catalog_open = false;
         self.hide_terminal_view(cx);
         cx.notify();
@@ -10551,6 +11121,7 @@ impl Shell {
             Some(next) => self.activate_pane(next, cx),
             None => {
                 self.right.tab = None;
+                self.right.active_extension = None;
                 self.hide_terminal_view(cx);
                 cx.notify();
             }
@@ -10561,6 +11132,8 @@ impl Shell {
     /// Tabs": other panes and every document go, the chosen pane stays.
     pub(crate) fn close_other_pane_tabs(&mut self, keep: RightTab, cx: &mut Context<Self>) {
         self.right.open_panes.retain(|pane| *pane == keep);
+        self.right.open_extensions.clear();
+        self.right.extension_tabs.clear();
         self.files.tabs.clear();
         self.files.active = None;
         if keep != RightTab::Browser {
@@ -10577,6 +11150,10 @@ impl Shell {
     /// Start is the new-tab page and has no close of its own, so pressing Close
     /// there is a no-op (the menu disables it).
     pub(crate) fn close_active_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.right.active_extension.clone() {
+            self.close_extension_tab(&id, cx);
+            return;
+        }
         match self.right.tab {
             Some(RightTab::Files) if self.files.active.is_some() => {
                 if let Some(index) = self.files.active {
@@ -10590,6 +11167,10 @@ impl Shell {
 
     /// Keep the tab on screen and close every other pane and document tab.
     pub(crate) fn close_other_active_tabs(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.right.active_extension.clone() {
+            self.close_other_extension_tabs(&id, cx);
+            return;
+        }
         match self.right.tab {
             Some(RightTab::Files) if self.files.active.is_some() => {
                 if let Some(keep) = self.files.active {
@@ -10610,6 +11191,7 @@ impl Shell {
     pub(crate) fn open_tab_catalog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right.tab.is_none()
             && self.right.open_panes.is_empty()
+            && self.right.open_extensions.is_empty()
             && self.files.tabs.is_empty()
         {
             return;
@@ -10704,6 +11286,7 @@ impl Shell {
     pub(crate) fn focus_launcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.right.open = true;
         self.right.tab = None;
+        self.right.active_extension = None;
         self.right.catalog_open = false;
         self.right_search
             .update(cx, |state, cx| state.focus_handle(cx).focus(window, cx));
@@ -10716,7 +11299,7 @@ impl Shell {
     /// nothing), but the footer's Open is the launcher's primary action: with
     /// no query it opens the first pane card, which is Files.
     pub(crate) fn open_first_launcher_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.right.tab.is_some() {
+        if self.right.tab.is_some() || self.right.active_extension.is_some() {
             return;
         }
         if let Some((entry, _)) = self.right_search_matches().into_iter().next() {
@@ -10736,7 +11319,10 @@ impl Shell {
     ) {
         // The field lives on the main right pane only; with a pane open there is
         // no visible search to press Enter in.
-        if self.right.tab.is_some() || self.right_search_text.trim().is_empty() {
+        if self.right.tab.is_some()
+            || self.right.active_extension.is_some()
+            || self.right_search_text.trim().is_empty()
+        {
             return;
         }
         let Some((entry, _)) = self.right_search_matches().into_iter().next() else {
@@ -12469,7 +13055,7 @@ mod tests {
         );
         let files = [file];
         let active = Some(StripSlot::File(0));
-        let plan = plan_open_strip(400.0, None, &panes, &files, active);
+        let plan = plan_open_strip(400.0, None, &panes, &[], &files, active);
         assert!(!plan.overflow);
         let used: f32 = plan.visible.iter().map(|(_, width)| *width).sum::<f32>()
             + STRIP_GAP * plan.visible.len().saturating_sub(1) as f32;
@@ -12489,6 +13075,67 @@ mod tests {
         assert!(
             active_w > inactive_w + 20.0,
             "the selected tab gets the label room: {active_w} vs {inactive_w}"
+        );
+    }
+
+    /// Extension panels opened as dedicated tabs are strip items too: they
+    /// plan in open order beside the pane tabs, with no Start chip while one
+    /// of them holds the body.
+    #[test]
+    fn the_open_strip_plans_extension_tabs_beside_the_panes() {
+        let pane = |label: &str| {
+            (
+                pane_tab_w_with(label, false),
+                pane_tab_floor_with(label, false),
+            )
+        };
+        let panes = [(RightTab::Files, pane("Files").0, pane("Files").1)];
+        let extensions = [
+            (
+                "com.example.git.history".to_string(),
+                pane("Git").0,
+                pane("Git").1,
+            ),
+            (
+                "com.example.notes.board".to_string(),
+                pane("Notes").0,
+                pane("Notes").1,
+            ),
+        ];
+        let active = Some(StripSlot::Extension("com.example.git.history".to_string()));
+        let plan = plan_open_strip(900.0, None, &panes, &extensions, &[], active);
+        assert!(!plan.overflow);
+        let shown: Vec<StripSlot> = plan.visible.iter().map(|(slot, _)| slot.clone()).collect();
+        assert_eq!(
+            shown,
+            vec![
+                StripSlot::Pane(RightTab::Files),
+                StripSlot::Extension("com.example.git.history".to_string()),
+                StripSlot::Extension("com.example.notes.board".to_string()),
+            ],
+            "extension tabs keep their open order beside the panes"
+        );
+    }
+
+    /// A crowded strip keeps the extension tab on screen, the same rule the
+    /// active document and the active pane get.
+    #[test]
+    fn a_crowded_strip_keeps_the_active_extension_tab() {
+        let extensions = [
+            ("ext.a".to_string(), 120.0, 90.0),
+            ("ext.b".to_string(), 120.0, 90.0),
+            ("ext.c".to_string(), 120.0, 90.0),
+            ("ext.d".to_string(), 120.0, 90.0),
+        ];
+        let active = Some(StripSlot::Extension("ext.c".to_string()));
+        let plan = plan_open_strip(280.0, None, &[], &extensions, &[], active);
+        assert!(plan.overflow);
+        assert!(
+            plan.visible
+                .iter()
+                .any(|(slot, _)| *slot == StripSlot::Extension("ext.c".to_string())),
+            "the active extension tab must stay on screen: {:?}",
+            plan.visible
         );
     }
 
@@ -12577,7 +13224,7 @@ mod tests {
             &launchers(),
         );
         assert!(plan.overflow, "the strip cannot hold all six chips too");
-        let shown: Vec<StripSlot> = plan.visible.iter().map(|(slot, _)| *slot).collect();
+        let shown: Vec<StripSlot> = plan.visible.iter().map(|(slot, _)| slot.clone()).collect();
         assert!(shown.contains(&StripSlot::File(0)));
         assert!(shown.contains(&StripSlot::File(1)));
         assert_eq!(

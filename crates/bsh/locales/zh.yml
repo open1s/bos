@@ -1047,6 +1047,7 @@
 "right.start.extensionsHint": "管理扩展功能"
 "right.start.federationHint": "连接联邦节点"
 "right.start.tasksHint": "查看任务列表"
+"right.start.extensionPanelHint": "扩展面板"
 "right.start.recent": "最近使用"
 "right.start.viewMore": "查看更多"
 "right.start.showLess": "收起"

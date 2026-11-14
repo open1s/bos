@@ -7325,7 +7325,14 @@ impl Shell {
         if self.renaming_session.as_deref() != Some(id) {
             self.cancel_session_rename(cx);
         }
+        // Selecting a chat can move the active workspace (the session owns
+        // one); when it does, the workspace-aware extension panels must follow.
+        let before = self.state.settings.active_workspace_root();
         self.state.select(id);
+        if self.state.settings.active_workspace_root() != before {
+            self.refresh_extension_surfaces(cx);
+            self.refile_extension_tabs(cx);
+        }
         self.review_requested = None;
         self.review_selected = None;
         self.maybe_compact_history(cx);
