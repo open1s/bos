@@ -1946,7 +1946,10 @@ impl Shell {
         let narrow = self.conversation_w > px(0.0)
             && self.conversation_w <= px(theme::TURN_RAIL_MIN_CONTAINER);
 
-        let active = self.visible_turn(&turns);
+        // A clicked mark stays the long one until the reader takes the wheel:
+        // near the end the jump clamps, and the turn-at-top rule would light
+        // the last mark instead of the one the reader chose.
+        let active = self.rail_pinned.or_else(|| self.visible_turn(&turns));
         let last_ordinal = turns.len().saturating_sub(1);
         // Measured (TurnNavigator): a 28px frame parked 12px off the transcript's
         // right edge, capped at `min(band - 64, 420)` and scrolled when the marks
@@ -1998,8 +2001,12 @@ impl Shell {
                             .into_any_element(),
                     );
                 }
-                for (turn, _index) in turns.iter().enumerate().take(rail_end).skip(rail_first) {
+                for (turn, index) in turns.iter().enumerate().take(rail_end).skip(rail_first) {
                     let on = active == Some(turn);
+                    // The mark's ordinal is not a row: a turn's row is 1 + its
+                    // message index (row 0 is the timestamp). Passing the
+                    // ordinal landed every jump short by the rows above it.
+                    let row = *index + 1;
                     let group = SharedString::from(format!("turn-{turn}"));
                     let bar_group = group.clone();
                     let is_last = turn == last_ordinal;
@@ -2043,7 +2050,8 @@ impl Shell {
                                     }),
                             )
                             .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.jump_to_turn(turn, is_last);
+                                this.rail_pinned = Some(turn);
+                                this.jump_to_turn(row, is_last);
                                 cx.notify();
                             }))
                             .into_any_element(),

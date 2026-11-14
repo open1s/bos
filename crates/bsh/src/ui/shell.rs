@@ -721,6 +721,14 @@ pub(crate) struct Shell {
     pub(crate) traj_last_offset: f32,
     /// The chat transcript's eased scroll, and the trajectory tab's.
     pub(crate) chat_smooth: super::smooth::Smooth,
+    /// A rail jump awaiting its target row's first measurement, as (rows, row).
+    /// Culled rows are placed by the average height, so the first jump is an
+    /// estimate; once a frame builds the target row the jump re-aims at the
+    /// measured top, so the tick lands on its turn, not near it.
+    pub(crate) pending_jump: Option<(usize, usize)>,
+    /// The rail mark the reader clicked, held until they scroll: the long bar
+    /// names their choice even when the jump clamps at the transcript's end.
+    pub(crate) rail_pinned: Option<usize>,
     pub(crate) traj_smooth: super::smooth::Smooth,
     /// The trajectory tab's scroll position, so its wheel can be eased and a test
     /// can read it.
@@ -2256,6 +2264,8 @@ impl Shell {
             chat_last_offset: 0.0,
             traj_last_offset: 0.0,
             chat_smooth: super::smooth::Smooth::default(),
+            pending_jump: None,
+            rail_pinned: None,
             traj_smooth: super::smooth::Smooth::default(),
             traj_scroll: ScrollHandle::new(),
             audit_scroll: ScrollHandle::new(),
@@ -5925,6 +5935,38 @@ impl Shell {
             .set_offset(point(px(0.0), px(target)));
         self.chat_last_offset = target;
         self.chat_smooth.aim(target);
+        self.pending_jump = Some((rows, row));
+    }
+
+    /// Re-aim a pending rail jump once its target row has been measured.
+    ///
+    /// Culled rows are placed by the average height, so the first jump is an
+    /// estimate; the frame that builds the target row records its true height,
+    /// and this settles the offset on the measured top. Runs on the frame tick,
+    /// after the previous frame's layout, so the render stays immutable.
+    pub(crate) fn settle_pending_jump(&mut self) {
+        let Some((rows, row)) = self.pending_jump else {
+            return;
+        };
+        let current_rows = self
+            .state
+            .active_session()
+            .map(|session| 1 + session.messages.len());
+        if current_rows != Some(rows) {
+            self.pending_jump = None;
+            return;
+        }
+        if !self.transcript_layout.borrow().built_rows().contains(&row) {
+            return;
+        }
+        let top = self.transcript_layout.borrow().row_top(rows, row);
+        let max = f32::from(self.transcript_scroll.max_offset().y);
+        let target = (-top).clamp(-max, 0.0);
+        self.transcript_scroll
+            .set_offset(point(px(0.0), px(target)));
+        self.chat_last_offset = target;
+        self.chat_smooth.aim(target);
+        self.pending_jump = None;
     }
 
     /// Page in the window of messages above the transcript when the reader
@@ -6780,6 +6822,11 @@ impl Shell {
     /// delta becomes a TARGET the frame loop eases towards, instead of an instant
     /// jump.
     pub(crate) fn wheel_chat(&mut self, delta: f32, cx: &mut Context<Self>) {
+        // The reader took the wheel: a pending rail re-aim must not yank them
+        // back to the jump target, and the pinned mark gives way to the
+        // turn-at-top rule again.
+        self.pending_jump = None;
+        self.rail_pinned = None;
         if delta == 0.0 {
             return;
         }
@@ -7109,7 +7156,7 @@ impl Shell {
     /// choosing a mark is never fighting the scroll.
     pub(crate) fn follow_rail(&mut self) {
         let turns = self.turn_indices();
-        let active = self.visible_turn(&turns);
+        let active = self.rail_pinned.or_else(|| self.visible_turn(&turns));
         if active == self.rail_active {
             return;
         }
@@ -7454,6 +7501,8 @@ impl Render for Shell {
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.rail_hover = None;
             self.rail_active = None;
+            self.rail_pinned = None;
+            self.pending_jump = None;
             self.changes_open.clear();
             self.changes_hover = None;
             self.changes_preview = None;
@@ -7506,6 +7555,8 @@ impl Render for Shell {
             }
         }
         self.tail_max = Some(max);
+        // A rail jump settles on its measured row before the easing runs.
+        self.settle_pending_jump();
         // The wheel's easing runs after the tail decision, and asks for the next
         // frame while it is still moving.
         if self.advance_smooth() {

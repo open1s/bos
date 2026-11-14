@@ -3412,15 +3412,77 @@ fn rail_tick_click_scrolls_the_transcript(cx: &mut TestAppContext) {
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let (at_first, _) = scroll(cx, &shell);
-    // Child 0 is the timestamp row, so turn 1 lands just below the top rather than
-    // at offset 0 - and it must leave the end, where the transcript opened.
+    // Child 0 is the timestamp row, so the first turn's row is 1: the tick must
+    // land on that row's top, not on the ordinal and not merely near the top.
+    let first_top = px(cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let rows = 1 + shell
+            .state
+            .active_session()
+            .expect("a session")
+            .messages
+            .len();
+        -shell.transcript_layout.borrow().row_top(rows, 1)
+    }));
     assert!(
         at_first > start,
         "the first tick must move back up the transcript"
     );
-    assert!(
-        at_first > -px(150.0),
-        "the first turn must land near the top, not at the end"
+    assert_eq!(
+        at_first, first_top,
+        "the first tick lands on the first turn's row, not on the tick ordinal"
+    );
+
+    // A middle tick must land on ITS turn: the ordinal and the row differ by
+    // every assistant row above it, which is the gap a reader saw.
+    let tenth: &str = Box::leak(String::from("turn-tick-10").into_boxed_str());
+    let bounds = cx.debug_bounds(tenth).expect("the tenth rail tick");
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    let turns = cx.update(|_, cx| shell.read(cx).turn_indices());
+    let tenth_row = turns[10] + 1;
+    draw_until(
+        cx,
+        "the tenth turn is the one at the top",
+        DRAW_UNTIL_MAX,
+        |cx| {
+            cx.update(|_, cx| {
+                let shell = shell.read(cx);
+                shell.visible_turn(&shell.turn_indices()) == Some(10)
+            })
+        },
+    );
+    let (at_tenth, _) = scroll(cx, &shell);
+    let tenth_top = px(cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let rows = 1 + shell
+            .state
+            .active_session()
+            .expect("a session")
+            .messages
+            .len();
+        -shell.transcript_layout.borrow().row_top(rows, tenth_row)
+    }));
+    assert_eq!(
+        at_tenth, tenth_top,
+        "the tenth tick lands on the tenth turn's measured row top"
+    );
+
+    // Near the end the jump clamps: the turn-at-top rule would light the last
+    // mark, but the reader's choice must stay the long one.
+    let near_end: &str = Box::leak(String::from("turn-tick-27").into_boxed_str());
+    let bounds = cx
+        .debug_bounds(near_end)
+        .expect("the twenty-eighth rail tick");
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let bar = cx
+        .debug_bounds("turn-bar-27")
+        .expect("the clicked mark's bar");
+    assert_eq!(
+        bar.size.width,
+        px(20.0),
+        "the clicked mark stays long even when the jump clamps at the end"
     );
 
     let last: &str = Box::leak(String::from("turn-tick-29").into_boxed_str());
