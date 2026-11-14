@@ -7,7 +7,6 @@ authors.workspace = true
 license.workspace = true
 description = "BrainOS Zenoh communication wrapper"
 documentation = "https://github.com/open1s/bos/blob/main/docs/rust-user-guide.md"
-homepage = "https://github.com/open1s/bos"
 repository = "https://github.com/open1s/bos"
 
 [dependencies]
@@ -30,3 +29,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 [lib]
 name = "bus"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

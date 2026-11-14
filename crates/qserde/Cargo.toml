@@ -7,7 +7,6 @@ authors.workspace = true
 license.workspace = true
 description = "Multi-backend serialization for Rust types"
 documentation = "https://github.com/open1s/bos/blob/main/docs/rust-user-guide.md"
-homepage = "https://github.com/open1s/bos"
 repository = "https://github.com/open1s/bos"
 
 [dependencies]
@@ -47,3 +46,6 @@ all-backends = [
 [lib]
 name = "qserde"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

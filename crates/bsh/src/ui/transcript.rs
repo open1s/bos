@@ -2868,7 +2868,7 @@ impl Shell {
         }
 
         if let Some(question) = &message.question {
-            column = column.child(self.question_card(index, question, cx));
+            column = column.child(self.question_card(session, index, question, cx));
         }
 
         column
@@ -2876,11 +2876,14 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The ask_user card: the model's question with its options as buttons,
-    /// OpenCode-style, so answering is one click instead of retyping a choice.
-    /// Once answered, the chosen option stays lit and the rest dim.
+    /// The ask_user card: one question per step, options as buttons
+    /// (OpenCode-style). A single-select question advances on one click; a
+    /// multi-select question toggles and a Next button advances; the last
+    /// step sends the answers as the reader's next message. Once answered,
+    /// the card settles to the recorded answers.
     fn question_card(
         &self,
+        session: &str,
         index: usize,
         question: &crate::model::QuestionBlock,
         cx: &mut Context<Self>,
@@ -2895,25 +2898,48 @@ impl Shell {
             .border_color(rgb(theme::border_soft()))
             .bg(rgb(theme::page()))
             .px(px(12.0))
-            .py(px(10.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(6.0))
-                    .child(icon(IconName::CircleDashed, 14.0, theme::accent()))
-                    .child(
-                        txt(question.question.clone(), theme::CHIP_SIZE, theme::text())
-                            .font_weight(FontWeight::MEDIUM),
+            .py(px(10.0));
+        if let Some(answered) = &question.answered {
+            return card.child(txt(answered.clone(), theme::CHIP_SIZE, theme::muted()));
+        }
+        let progress = self
+            .question_progress
+            .get(&(session.to_string(), index))
+            .cloned()
+            .unwrap_or_default();
+        let total = question.questions.len();
+        let step = progress.step.min(total.saturating_sub(1));
+        let item = &question.questions[step];
+        let picks = progress.picks.get(step).cloned().unwrap_or_default();
+        card = card.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(icon(IconName::CircleDashed, 14.0, theme::accent()))
+                .child(
+                    txt(item.question.clone(), theme::CHIP_SIZE, theme::text())
+                        .font_weight(FontWeight::MEDIUM),
+                )
+                .child(div().ml_auto().child(txt(
+                    crate::i18n::tr_args(
+                        self.state.lang,
+                        "question.step",
+                        &[("n", (step + 1).to_string()), ("total", total.to_string())],
                     ),
-            );
+                    theme::CHIP_SIZE,
+                    theme::faint(),
+                ))),
+        );
         let mut row = div().flex().flex_row().flex_wrap().gap(px(6.0));
-        for (option_index, option) in question.options.iter().enumerate() {
-            let chosen = question.answered.as_deref() == Some(option.as_str());
-            let answered = question.answered.is_some();
+        for (option_index, option) in item.options.iter().enumerate() {
+            let chosen = picks.iter().any(|p| p == option);
             let label = option.clone();
             let pick = option.clone();
-            let mut chip = div()
+            let multi = item.multi_select;
+            let sess = session.to_string();
+            let chip = div()
                 .id(SharedString::from(format!(
                     "question-option-{index}-{option_index}"
                 )))
@@ -2939,23 +2965,89 @@ impl Shell {
                     theme::CHIP_SIZE,
                     if chosen {
                         theme::accent()
-                    } else if answered {
-                        theme::faint()
                     } else {
                         theme::text()
                     },
-                ));
-            if !answered {
-                chip = chip
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::hover())))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        this.answer_question(index, pick.clone(), window, cx);
-                    }));
-            }
+                ))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::hover())))
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    if multi {
+                        this.toggle_question_option(&sess, index, pick.clone());
+                        cx.notify();
+                    } else {
+                        this.pick_question_option(&sess, index, pick.clone(), window, cx);
+                    }
+                }));
             row = row.child(chip);
         }
         card = card.child(row);
+        let mut footer = div().flex().flex_row().items_center().gap(px(8.0));
+        if step > 0 {
+            let sess = session.to_string();
+            footer = footer.child(
+                div()
+                    .id(SharedString::from(format!("question-back-{index}")))
+                    .debug_selector(move || format!("question-back-{index}"))
+                    .flex()
+                    .items_center()
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(
+                        self.state.lang.tr("question.back"),
+                        theme::CHIP_SIZE,
+                        theme::muted(),
+                    ))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.question_back(&sess, index);
+                        cx.notify();
+                    })),
+            );
+        }
+        if item.multi_select {
+            let sess = session.to_string();
+            let last = step + 1 >= total;
+            let enabled = !picks.is_empty();
+            let label = self.state.lang.tr(if last {
+                "question.send"
+            } else {
+                "question.next"
+            });
+            let mut next = div()
+                .id(SharedString::from(format!("question-next-{index}")))
+                .debug_selector(move || format!("question-next-{index}"))
+                .flex()
+                .items_center()
+                .h(px(28.0))
+                .px(px(12.0))
+                .rounded(px(8.0))
+                .bg(rgb(if enabled {
+                    theme::accent()
+                } else {
+                    theme::new_session_fill()
+                }))
+                .child(txt(
+                    label,
+                    theme::CHIP_SIZE,
+                    if enabled {
+                        theme::page()
+                    } else {
+                        theme::faint()
+                    },
+                ));
+            if enabled {
+                next =
+                    next.cursor_pointer()
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            this.question_next(&sess, index, window, cx);
+                        }));
+            }
+            footer = footer.child(div().ml_auto().child(next));
+        }
+        card = card.child(footer);
         card
     }
 

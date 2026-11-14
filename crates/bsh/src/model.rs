@@ -376,17 +376,28 @@ pub(crate) enum TurnPart {
     Tool(usize),
 }
 
-/// A question the model asked the reader, with the options the chat draws as
-/// buttons (OpenCode's question-tool shape). The reader's choice - clicked or
-/// typed - arrives as their next message; `answered` records it so the card
-/// settles instead of offering the choice again.
+/// One question of an ask_user card: the options the chat draws as buttons,
+/// and whether the reader may pick several (OpenCode's question-tool shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct QuestionBlock {
+pub(crate) struct QuestionItem {
     /// The question, in the model's own words.
     pub(crate) question: String,
     /// The offered choices, in order.
     pub(crate) options: Vec<String>,
-    /// The reader's answer, once given.
+    /// Whether several options may be picked; a single-select question
+    /// advances on the first click.
+    #[serde(default)]
+    pub(crate) multi_select: bool,
+}
+
+/// A question card the model asked the reader, one question per step. The
+/// reader's choices - clicked or typed - arrive as their next message;
+/// `answered` records them so the card settles instead of asking again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct QuestionBlock {
+    /// The questions, in step order.
+    pub(crate) questions: Vec<QuestionItem>,
+    /// The reader's answers, once given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) answered: Option<String>,
 }

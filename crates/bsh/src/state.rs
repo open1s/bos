@@ -3887,29 +3887,49 @@ impl AppState {
         if let AgentEvent::ToolCall { name, args } = &event {
             if name == "ask_user" {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
-                    let question = parsed
-                        .get("question")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    let options: Vec<String> = parsed
-                        .get("options")
+                    let questions: Vec<crate::model::QuestionItem> = parsed
+                        .get("questions")
                         .and_then(|v| v.as_array())
                         .map(|list| {
                             list.iter()
-                                .filter_map(|v| v.as_str())
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
+                                .filter_map(|item| {
+                                    let question = item
+                                        .get("question")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .trim()
+                                        .to_string();
+                                    let options: Vec<String> = item
+                                        .get("options")
+                                        .and_then(|v| v.as_array())
+                                        .map(|opts| {
+                                            opts.iter()
+                                                .filter_map(|v| v.as_str())
+                                                .map(|s| s.trim().to_string())
+                                                .filter(|s| !s.is_empty())
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    if question.is_empty() || options.len() < 2 {
+                                        return None;
+                                    }
+                                    Some(crate::model::QuestionItem {
+                                        question,
+                                        options,
+                                        multi_select: item
+                                            .get("multi_select")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false),
+                                    })
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if !question.is_empty() && options.len() >= 2 {
+                    if !questions.is_empty() {
                         self.pending_questions.insert(
                             id.to_string(),
                             crate::model::QuestionBlock {
-                                question,
-                                options,
+                                questions,
                                 answered: None,
                             },
                         );

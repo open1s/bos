@@ -1247,48 +1247,69 @@ fn build_agent_for_session_inner(
             plan_tools.push(Arc::new(DeclaredTool::new(
                 Arc::new(FunctionTool::new(
                     "ask_user",
-                    "Ask the reader a question with two to six short options. The chat shows the options as buttons; the reader's choice arrives as their next message. Use it when a decision genuinely needs the reader - ambiguous scope, a choice between approaches. End your turn after calling it and wait for the answer.",
+                    "Ask the reader up to six questions with 2-6 options each, drawn as buttons. multi_select allows several picks; single-select advances on one click. Answers arrive as the next user message; end your turn after calling.",
                     serde_json::json!({
                         "type": "object",
                         "properties": {
-                            "question": { "type": "string", "description": "The question, in one or two sentences." },
-                            "options": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 6, "description": "The choices, each a short label." }
+                            "questions": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "question": { "type": "string" },
+                                        "options": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 6 },
+                                        "multi_select": { "type": "boolean" }
+                                    },
+                                    "required": ["question", "options"]
+                                }
+                            }
                         },
-                        "required": ["question", "options"],
-                        "additionalProperties": false
+                        "required": ["questions"]
                     }),
                     |args| {
-                        let question = args
-                            .get("question")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        let options: Vec<String> = args
-                            .get("options")
+                        let questions = args
+                            .get("questions")
                             .and_then(|v| v.as_array())
-                            .map(|list| {
-                                list.iter()
-                                    .filter_map(|v| v.as_str())
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty())
-                                    .collect()
-                            })
+                            .cloned()
                             .unwrap_or_default();
-                        if question.is_empty() {
+                        if questions.is_empty() || questions.len() > 6 {
                             return Err(ToolError::InvalidInput(
-                                "question is required".to_string(),
+                                "questions must list one to six questions".to_string(),
                             ));
                         }
-                        if options.len() < 2 || options.len() > 6 {
-                            return Err(ToolError::InvalidInput(
-                                "options must list two to six choices".to_string(),
-                            ));
+                        for item in &questions {
+                            let question = item
+                                .get("question")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim();
+                            let options = item
+                                .get("options")
+                                .and_then(|v| v.as_array())
+                                .map(|list| {
+                                    list.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .filter(|s| !s.trim().is_empty())
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            if question.is_empty() {
+                                return Err(ToolError::InvalidInput(
+                                    "every question needs text".to_string(),
+                                ));
+                            }
+                            if !(2..=6).contains(&options) {
+                                return Err(ToolError::InvalidInput(
+                                    "every question needs two to six options".to_string(),
+                                ));
+                            }
                         }
                         Ok(serde_json::json!({
                             "status": "presented",
-                            "options": options.len(),
-                            "note": "The reader sees the question with the options as buttons. End your turn now; their answer arrives as the next user message."
+                            "questions": questions.len(),
+                            "note": "The reader sees the questions as steps with the options as buttons. End your turn now; their answers arrive as the next user message."
                         }))
                     },
                 )),
@@ -4627,15 +4648,15 @@ pub(crate) fn grep_tool(
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "minLength": 1, "description": "Ripgrep regular expression; escape metacharacters to search them literally." },
-                "path": { "type": "string", "description": "File or directory to search. Directories are searched recursively; a named file is searched directly. Defaults to the workspace root." },
+                "path": { "type": "string", "description": "File or directory to search; directories recurse. Defaults to the workspace root." },
                 "case_insensitive": { "type": "boolean", "description": "Match without case sensitivity. Defaults to false." },
-                "include_ignored": { "type": "boolean", "description": "Include hidden, ignored, dependency and build paths normally skipped. Use only when the default search is insufficient." },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum number of matching result rows. Check truncated before assuming the search is complete." },
-                "invert": { "type": "boolean", "description": "Return lines that do not match the pattern instead of lines that match." },
-                "context": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Number of surrounding lines to include before and after each matching line; maximum 20." },
-                "files_without_match": { "type": "boolean", "description": "Return paths of searched files that contain no match instead of matching rows." },
-                "include": { "type": "string", "description": "One glob filter limiting which files are searched, such as '*.rs'. Negated filters are unsupported." },
-                "text": { "type": "boolean", "description": "Treat binary files as text. Leave false unless binary content must be searched." }
+                "include_ignored": { "type": "boolean", "description": "Also search hidden, ignored and dependency/build paths." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max matching rows; check truncated before assuming completeness." },
+                "invert": { "type": "boolean", "description": "Return non-matching lines instead of matching ones." },
+                "context": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Surrounding lines per match (0-20)." },
+                "files_without_match": { "type": "boolean", "description": "Return paths of files with no match instead of rows." },
+                "include": { "type": "string", "description": "One glob filter, e.g. '*.rs'; negation unsupported." },
+                "text": { "type": "boolean", "description": "Search binary files as text." }
             },
             "required": ["pattern"],
             "additionalProperties": false
@@ -5452,14 +5473,14 @@ fn sed_tool(
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Path of the existing text file to edit, relative to the workspace or absolute inside the allowed workspace." },
-                "script": { "type": "string", "minLength": 1, "maxLength": 8192, "description": "One sed program, such as 's/old/new/g' or '/^#/d'. Newlines and semicolons separate commands. Up to 8192 bytes." },
-                "dry_run": { "type": "boolean", "description": "Run the program over a private copy, return the resulting text, and leave the file untouched. Defaults to false (edit the file)." },
-                "extended": { "type": "boolean", "description": "Use POSIX extended regular expressions, like sed -E. Defaults to false." },
-                "posix": { "type": "boolean", "description": "Disable GNU extensions, like sed --posix. Defaults to false." },
-                "quiet": { "type": "boolean", "description": "Suppress the automatic print, like sed -n. Explicit p, P, =, l and F still write to the file, so quiet plus '/pattern/p' filters the file to matching lines. Defaults to false." },
-                "line_length": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Wrap the l command at this column, like sed -l. Defaults to GNU's 70." },
-                "backup_suffix": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Keep the original at path + this suffix before replacing the file, like sed -iSUFFIX. The suffix must not contain a path separator." }
+                "path": { "type": "string", "description": "Existing text file to edit, inside the workspace." },
+                "script": { "type": "string", "minLength": 1, "maxLength": 8192, "description": "One sed program, e.g. 's/old/new/g'; newlines/semicolons separate commands." },
+                "dry_run": { "type": "boolean", "description": "Return the resulting text without writing. Defaults to false." },
+                "extended": { "type": "boolean", "description": "POSIX extended regexes (sed -E). Defaults to false." },
+                "posix": { "type": "boolean", "description": "Disable GNU extensions (sed --posix). Defaults to false." },
+                "quiet": { "type": "boolean", "description": "Suppress automatic print (sed -n); p, P, =, l, F still write, so quiet + '/pat/p' filters to matching lines." },
+                "line_length": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Wrap column for l (sed -l). Defaults to 70." },
+                "backup_suffix": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Keep the original at path + suffix (sed -iSUFFIX); no path separator." }
             },
             "required": ["path", "script"],
             "additionalProperties": false
@@ -7554,15 +7575,19 @@ mod tests {
         let ok = registry
             .execute(
                 "ask_user",
-                &serde_json::json!({"question": "Which approach?", "options": ["A", "B"]}),
+                &serde_json::json!({"questions": [
+                    {"question": "Which approach?", "options": ["A", "B"]},
+                    {"question": "Which extras?", "options": ["x", "y", "z"], "multi_select": true}
+                ]}),
             )
-            .expect("a valid question presents");
+            .expect("valid questions present");
         assert_eq!(ok["status"], "presented");
+        assert_eq!(ok["questions"], 2);
         assert!(
             registry
                 .execute(
                     "ask_user",
-                    &serde_json::json!({"question": "x", "options": ["only one"]})
+                    &serde_json::json!({"questions": [{"question": "x", "options": ["only one"]}]})
                 )
                 .is_err(),
             "one option is not a choice"
@@ -7571,10 +7596,16 @@ mod tests {
             registry
                 .execute(
                     "ask_user",
-                    &serde_json::json!({"question": "  ", "options": ["a", "b"]})
+                    &serde_json::json!({"questions": [{"question": "  ", "options": ["a", "b"]}]})
                 )
                 .is_err(),
             "a blank question is refused"
+        );
+        assert!(
+            registry
+                .execute("ask_user", &serde_json::json!({"questions": []}))
+                .is_err(),
+            "no questions is refused"
         );
     }
 
@@ -8679,7 +8710,24 @@ mod tests {
                 "write_file".to_string(),
             ]
         );
-        assert_eq!(names("plan"), vec!["update_plan".to_string()]);
+        assert_eq!(
+            names("plan"),
+            vec!["ask_user".to_string(), "update_plan".to_string()]
+        );
+        // The reader's own switch removes the question tool like any other.
+        settings
+            .workspace
+            .disabled
+            .tools
+            .push("ask_user".to_string());
+        let built = build(&settings);
+        let plan: Vec<String> = built
+            .plugins
+            .iter()
+            .find(|p| p.name == "plan")
+            .map(|p| p.tools.clone())
+            .unwrap_or_default();
+        assert_eq!(plan, vec!["update_plan".to_string()]);
         assert_eq!(
             built.agent.config().max_steps,
             0,
@@ -8982,6 +9030,7 @@ mod tests {
             names(&confined),
             vec![
                 "apply_patch".to_string(),
+                "ask_user".to_string(),
                 "bash".to_string(),
                 "close_surface".to_string(),
                 "diagnostics__graph".to_string(),
@@ -9021,6 +9070,7 @@ mod tests {
         assert_eq!(
             names(&read_only),
             vec![
+                "ask_user".to_string(),
                 "diagnostics__graph".to_string(),
                 "diagnostics__why".to_string(),
                 "extensions__list".to_string(),

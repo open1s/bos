@@ -35,3 +35,6 @@ futures = { workspace = true }
 
 [build-dependencies]
 napi-build = "2"
+
+[lints]
+workspace = true

@@ -73,3 +73,6 @@ required-features = ["cli"]
 [lib]
 name = "resource"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -29,3 +29,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Wdk_System_Threading",
 ] }
+
+[lints]
+workspace = true

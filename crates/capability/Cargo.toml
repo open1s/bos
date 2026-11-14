@@ -16,3 +16,6 @@ semver = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 sha2 = "0.11.1"
 async-trait.workspace = true
+
+[lints]
+workspace = true

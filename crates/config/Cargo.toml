@@ -7,7 +7,6 @@ authors.workspace = true
 license.workspace = true
 description = "BrainOS configuration library"
 documentation = "https://github.com/open1s/bos/blob/main/docs/rust-user-guide.md"
-homepage = "https://github.com/open1s/bos"
 repository = "https://github.com/open1s/bos"
 
 [dependencies]
@@ -18,7 +17,7 @@ serde_yaml = "0.9.33"
 anyhow = { version = "1.0" }
 thiserror = { workspace = true }
 tokio = { version = "1.50", features = ["full"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true }
 log = "0.4.29"
 shellexpand = "3.1"
 
@@ -28,3 +27,6 @@ tempfile = "3.0"
 [lib]
 name = "config"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

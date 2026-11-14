@@ -39,3 +39,6 @@ tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
+
+[lints]
+workspace = true

@@ -16,3 +16,6 @@ ferris-sdk = { path = "../ferris-sdk" }
 tokio.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+
+[lints]
+workspace = true

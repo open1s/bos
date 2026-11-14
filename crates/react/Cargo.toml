@@ -7,7 +7,6 @@ authors.workspace = true
 license.workspace = true
 description = "ReAct-inspired reasoning and acting engine in Rust"
 documentation = "https://github.com/open1s/bos/blob/main/docs/rust-user-guide.md"
-homepage = "https://github.com/open1s/bos"
 repository = "https://github.com/open1s/bos"
 
 [dependencies]
@@ -31,3 +30,6 @@ bus = { workspace = true }
 [dev-dependencies]
 config = { path = "../config" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+
+[lints]
+workspace = true

@@ -7,7 +7,6 @@ authors.workspace = true
 license.workspace = true
 description = "Tracing and observability for BrainOS"
 documentation = "https://github.com/open1s/bos#readme"
-homepage = "https://github.com/open1s/bos"
 repository = "https://github.com/open1s/bos"
 
 [dependencies]
@@ -16,3 +15,6 @@ flexi_logger = "0.31.8"
 serde_json = "1.0.149"
 dirs = "6.0.0"
 config = { path = "../config" }
+
+[lints]
+workspace = true

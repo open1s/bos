@@ -257,6 +257,17 @@ struct ForegroundTask {
     close: Option<Box<dyn Fn()>>,
 }
 
+/// The reader's in-progress answers on one ask_user card: which step is on
+/// screen and the picks made at every step. Transient UI state; the settled
+/// answers live on the message's question block.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QuestionProgress {
+    /// The question currently on screen.
+    pub(crate) step: usize,
+    /// One pick list per question, in step order.
+    pub(crate) picks: Vec<Vec<String>>,
+}
+
 pub(crate) struct Shell {
     /// The model list the last successful fetch returned, if any.
     pub(crate) models_fetched: Option<Vec<String>>,
@@ -703,6 +714,9 @@ pub(crate) struct Shell {
     /// The prompt rows whose auto-injection event the reader has opened, by
     /// message index. Collapsed is the default; a session switch closes them.
     pub(crate) inject_open: std::collections::HashSet<(usize, usize)>,
+    /// In-progress answers for unanswered ask_user cards, by session and
+    /// message index: the current step and the picks made at each step.
+    pub(crate) question_progress: std::collections::HashMap<(String, usize), QuestionProgress>,
     /// The settled turns whose process group the reader has opened, by message
     /// index. Collapsed is the default; a click is the only way in, and a
     /// session switch closes them with the reasoning disclosures.
@@ -2259,6 +2273,7 @@ impl Shell {
             audit_jump_to: None,
             think_open: std::collections::HashSet::new(),
             inject_open: std::collections::HashSet::new(),
+            question_progress: std::collections::HashMap::new(),
             process_open: std::collections::HashSet::new(),
             compaction_open: std::collections::HashSet::new(),
             chat_last_offset: 0.0,
@@ -3304,6 +3319,135 @@ impl Shell {
             );
         }
         None
+    }
+
+    /// In-progress picks for an unanswered question card, keyed by session
+    /// and message index: the current step and the picks made at each step.
+    pub(crate) fn question_progress_mut(
+        &mut self,
+        session: &str,
+        index: usize,
+    ) -> &mut QuestionProgress {
+        self.question_progress
+            .entry((session.to_string(), index))
+            .or_default()
+    }
+
+    /// A single-select click: record the pick, then advance to the next
+    /// question - or send the answers when it was the last one.
+    pub(crate) fn pick_question_option(
+        &mut self,
+        session: &str,
+        index: usize,
+        option: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let total = self
+            .state
+            .store
+            .session(session)
+            .and_then(|s| s.messages.get(index))
+            .and_then(|m| m.question.as_ref())
+            .map(|q| q.questions.len())
+            .unwrap_or(1);
+        let (step, last) = {
+            let progress = self.question_progress_mut(session, index);
+            while progress.picks.len() < total {
+                progress.picks.push(Vec::new());
+            }
+            progress.picks[progress.step] = vec![option];
+            (progress.step, progress.step + 1 >= total)
+        };
+        if last {
+            self.send_question_answers(session, index, window, cx);
+        } else {
+            let progress = self.question_progress_mut(session, index);
+            progress.step = step + 1;
+            cx.notify();
+        }
+    }
+
+    /// A multi-select click: toggle the option in the current step's picks.
+    pub(crate) fn toggle_question_option(&mut self, session: &str, index: usize, option: String) {
+        let progress = self.question_progress_mut(session, index);
+        let picks = &mut progress.picks[progress.step];
+        if let Some(pos) = picks.iter().position(|p| *p == option) {
+            picks.remove(pos);
+        } else {
+            picks.push(option);
+        }
+    }
+
+    /// Back one step, keeping the picks already made.
+    pub(crate) fn question_back(&mut self, session: &str, index: usize) {
+        let progress = self.question_progress_mut(session, index);
+        progress.step = progress.step.saturating_sub(1);
+    }
+
+    /// The multi-select Next / Send button: advance, or send on the last step.
+    pub(crate) fn question_next(
+        &mut self,
+        session: &str,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let total = self
+            .state
+            .store
+            .session(session)
+            .and_then(|s| s.messages.get(index))
+            .and_then(|m| m.question.as_ref())
+            .map(|q| q.questions.len())
+            .unwrap_or(1);
+        let (step, last) = {
+            let progress = self.question_progress_mut(session, index);
+            (progress.step, progress.step + 1 >= total)
+        };
+        if last {
+            self.send_question_answers(session, index, window, cx);
+        } else {
+            let progress = self.question_progress_mut(session, index);
+            progress.step = step + 1;
+            cx.notify();
+        }
+    }
+
+    /// Settle the card with every step's picks and send them as one message.
+    fn send_question_answers(
+        &mut self,
+        session: &str,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let progress = self
+            .question_progress
+            .remove(&(session.to_string(), index))
+            .unwrap_or_default();
+        let text = self
+            .state
+            .store
+            .session(session)
+            .and_then(|s| s.messages.get(index))
+            .and_then(|m| m.question.as_ref())
+            .map(|q| {
+                q.questions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| {
+                        let picks = progress.picks.get(i).cloned().unwrap_or_default();
+                        format!("{}: {}", item.question, picks.join(", "))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+",
+                    )
+            })
+            .unwrap_or_default();
+        self.answer_question(index, text, window, cx);
     }
 
     /// One click on a question option: settle the card with the choice and
@@ -7512,6 +7656,7 @@ impl Render for Shell {
             self.following_tail = true;
             self.think_open.clear();
             self.inject_open.clear();
+            self.question_progress.clear();
             self.process_open.clear();
             self.image_lightbox = None;
             self.compaction_open.clear();
