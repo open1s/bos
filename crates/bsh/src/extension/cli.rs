@@ -1588,7 +1588,11 @@ fn command_mock(args: &[String]) -> Result<i32, String> {
                     &data_root,
                     Arc::new(crate::extension::terminal::HostTerminal),
                 )
-                .map_err(|error| error.to_string())?,
+                .map_err(|error| error.to_string())?
+                // The mock grants every capability above; without the policy
+                // attached the bridge's terminal.run is denied, which made
+                // the mock useless for any package that runs a command.
+                .with_authorization(std::sync::Arc::clone(&policy), TrustLevel::Local),
             ),
             RuntimeKind::Builtin => {
                 return Err("the built-in runtime has no development mock".to_string());
