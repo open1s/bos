@@ -98,6 +98,41 @@ function countDiffLines(text) {
   return counts;
 }
 
+/**
+ * Drop paths that .gitignore excludes, so the change list never shows an
+ * ignored file. Both backends already hide ignored files from their own
+ * working-copy view; this is the explicit guarantee, applied uniformly.
+ *
+ * The terminal seam has no stdin, so paths go to git check-ignore as arguments
+ * (batched to stay under the argument limit); it prints the ignored ones
+ * NUL-separated. A workspace with no git backend (a native jj repo) errors out
+ * of check-ignore and is left to jj, which honors .gitignore itself.
+ */
+async function filterIgnored(terminal, repo, files, platform) {
+  if (files.length === 0) return files;
+  const ignored = new Set();
+  for (let i = 0; i < files.length; i += 100) {
+    const batch = files.slice(i, i + 100).map((file) => file.path);
+    let out;
+    try {
+      out = await vcs.run(
+        terminal, repo, 'git',
+        ['--no-pager', 'check-ignore', '-z', '--', ...batch],
+        platform,
+        { okCodes: [0, 1] },
+      );
+    } catch {
+      // No git backend here; jj already applied its own ignore rules.
+      return files;
+    }
+    for (const path of out.stdout.text.split('\0')) {
+      if (path.length > 0) ignored.add(path);
+    }
+  }
+  if (ignored.size === 0) return files;
+  return files.filter((file) => !ignored.has(file.path));
+}
+
 /** The working copy's changed files with status and exact line counts. */
 async function collectChanges(terminal, repo, backend, platform) {
   const files = [];
@@ -154,13 +189,14 @@ async function collectChanges(terminal, repo, backend, platform) {
       });
     }
   }
+  const visible = await filterIgnored(terminal, repo, files, platform);
   let adds = 0;
   let dels = 0;
-  for (const file of files) {
+  for (const file of visible) {
     adds += file.adds || 0;
     dels += file.dels || 0;
   }
-  return { files, totals: { adds, dels } };
+  return { files: visible, totals: { adds, dels } };
 }
 
 /** The head label the message field and footer name. */
@@ -524,6 +560,7 @@ module.exports = {
   collectChanges,
   commitAction,
   countDiffLines,
+  filterIgnored,
   fileAction,
   fileIcon,
   gitBadges,

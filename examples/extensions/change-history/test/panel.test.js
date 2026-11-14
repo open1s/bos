@@ -352,3 +352,81 @@ test('jj panel: card, commit and the working-copy badge', async (t) => {
   const rail = findNode(card.root, 'timeline');
   assert.ok(rail.items.some((item) => item.badges.some((badge) => badge.text === 'main')));
 });
+
+// ---------------------------------------------------------------------------
+// .gitignore awareness
+// ---------------------------------------------------------------------------
+
+test('filterIgnored drops the paths git check-ignore reports', async () => {
+  const terminal = {
+    run(command) {
+      // check-ignore prints the ignored paths NUL-separated.
+      assert.match(command, /check-ignore/);
+      return Promise.resolve({ stdout: 'debug.log\0build/out.o\0', stderr: '', code: 0 });
+    },
+  };
+  const files = [
+    { path: 'README.md', status: 'M', adds: 1, dels: 0 },
+    { path: 'debug.log', status: 'A', adds: 1, dels: 0 },
+    { path: 'build/out.o', status: 'A', adds: 1, dels: 0 },
+  ];
+  const kept = await panel.filterIgnored(terminal, '/repo', files, 'linux');
+  assert.deepEqual(kept.map((f) => f.path), ['README.md']);
+});
+
+test('filterIgnored keeps everything when no git backend answers', async () => {
+  const terminal = { run() { return Promise.reject(new Error('not a git repository')); } };
+  const files = [{ path: 'a.txt', status: 'M', adds: 1, dels: 0 }];
+  const kept = await panel.filterIgnored(terminal, '/repo', files, 'linux');
+  assert.deepEqual(kept.map((f) => f.path), ['a.txt']);
+});
+
+test('git panel hides .gitignore-ignored files from the change list', async (t) => {
+  if (!hasBinary('git')) return t.skip('git is not installed');
+  const repo = scratchRepo('ignore-git');
+  t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
+  gitInit(repo);
+  const terminal = shellTerminal();
+  fs.writeFileSync(path.join(repo, '.gitignore'), '*.log\nbuild/\n');
+  spawnSync('git', ['add', '-A'], { cwd: repo });
+  spawnSync('git', ['commit', '-qm', 'add ignore rules'], { cwd: repo });
+  // A real change plus ignored files that must not appear.
+  fs.appendFileSync(path.join(repo, 'README.md'), 'change\n');
+  fs.writeFileSync(path.join(repo, 'debug.log'), 'secret');
+  fs.mkdirSync(path.join(repo, 'build'));
+  fs.writeFileSync(path.join(repo, 'build', 'out.o'), 'object');
+
+  const changes = await panel.collectChanges(terminal, repo, 'git', process.platform);
+  assert.deepEqual(changes.files.map((f) => f.path), ['README.md']);
+
+  const card = await panel.gitPanel(terminal, {}, { workspace: repo });
+  const json = JSON.stringify(card);
+  assert.ok(!json.includes('debug.log'), 'no ignored log in the card');
+  assert.ok(!json.includes('out.o'), 'no ignored build file in the card');
+});
+
+test('jj panel hides .gitignore-ignored files from the change list', async (t) => {
+  if (!hasBinary('jj')) return t.skip('jj is not installed');
+  if (!hasBinary('git')) return t.skip('jj git backend needs git');
+  const parent = scratchRepo('ignore-jj');
+  const repo = path.join(parent, 'repo');
+  t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+  jjInit(repo);
+  const terminal = shellTerminal();
+  fs.writeFileSync(path.join(repo, '.gitignore'), '*.log\nbuild/\n');
+  fs.writeFileSync(path.join(repo, 'README.md'), 'seed\n');
+  spawnSync('jj', ['describe', '-m', 'seed'], { cwd: repo });
+  spawnSync('jj', ['new', '-m', 'work'], { cwd: repo });
+  fs.appendFileSync(path.join(repo, 'README.md'), 'change\n');
+  fs.writeFileSync(path.join(repo, 'debug.log'), 'secret');
+  fs.mkdirSync(path.join(repo, 'build'));
+  fs.writeFileSync(path.join(repo, 'build', 'out.o'), 'object');
+
+  const changes = await panel.collectChanges(terminal, repo, 'jj', process.platform);
+  assert.deepEqual(changes.files.map((f) => f.path), ['README.md']);
+
+  const card = await panel.gitPanel(terminal, {}, { workspace: repo });
+  const json = JSON.stringify(card);
+  assert.ok(!json.includes('debug.log'), 'no ignored log in the card');
+  assert.ok(!json.includes('out.o'), 'no ignored build file in the card');
+});

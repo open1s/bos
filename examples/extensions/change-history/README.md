@@ -66,6 +66,12 @@ the backend's stderr — a refused action never runs half a command.
   (the parent's description wins, mirroring git's `--amend --no-edit`).
 - Calls are serialized (`max_concurrent_calls = 1`) because jj takes a
   working-copy lock per command; output is capped at 200 KB per stream.
+- **`.gitignore` is respected.** Ignored files never appear in the Changes
+  list and are never committed. Both backends already hide ignored files from
+  their working-copy view; the panel additionally filters the change list
+  through `git check-ignore` as an explicit guarantee (a native jj repo with
+  no git backend relies on jj's own ignore rules). A tracked file that later
+  matches `.gitignore` stays listed, because git still tracks it.
 - `undo` on jj reverses the **last operation**, whatever it was — including
   a working-copy snapshot taken by a read. Run it right after the mutation
   you want to reverse.
