@@ -3370,13 +3370,43 @@ impl Shell {
 
     /// A multi-select click: toggle the option in the current step's picks.
     pub(crate) fn toggle_question_option(&mut self, session: &str, index: usize, option: String) {
+        let total = self
+            .state
+            .store
+            .session(session)
+            .and_then(|s| s.messages.get(index))
+            .and_then(|m| m.question.as_ref())
+            .map(|q| q.questions.len())
+            .unwrap_or(1);
         let progress = self.question_progress_mut(session, index);
-        let picks = &mut progress.picks[progress.step];
+        while progress.picks.len() < total {
+            progress.picks.push(Vec::new());
+        }
+        let step = progress.step.min(total.saturating_sub(1));
+        progress.step = step;
+        let picks = &mut progress.picks[step];
         if let Some(pos) = picks.iter().position(|p| *p == option) {
             picks.remove(pos);
         } else {
             picks.push(option);
         }
+    }
+
+    /// Jump to a step the reader has already reached, keeping every pick.
+    pub(crate) fn question_goto(&mut self, session: &str, index: usize, step: usize) {
+        let total = self
+            .state
+            .store
+            .session(session)
+            .and_then(|s| s.messages.get(index))
+            .and_then(|m| m.question.as_ref())
+            .map(|q| q.questions.len())
+            .unwrap_or(1);
+        let progress = self.question_progress_mut(session, index);
+        while progress.picks.len() < total {
+            progress.picks.push(Vec::new());
+        }
+        progress.step = step.min(total.saturating_sub(1));
     }
 
     /// Back one step, keeping the picks already made.
@@ -3460,6 +3490,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         if let Some(id) = self.state.active_id.clone() {
+            self.question_progress.remove(&(id.clone(), index));
             if let Some(session) = self.state.store.session_mut(&id) {
                 if let Some(message) = session.messages.get_mut(index) {
                     if let Some(question) = &mut message.question {
@@ -3663,6 +3694,7 @@ impl Shell {
         // A typed answer settles the open question card just like a click.
         if let Some(id) = self.state.active_id.clone() {
             self.state.answer_last_question(&id, &text);
+            self.question_progress.retain(|(s, _), _| s != &id);
         }
         // Measured: the reference queues a submission while its session is
         // already running instead of opening a second turn over the same

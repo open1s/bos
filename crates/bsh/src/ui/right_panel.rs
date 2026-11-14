@@ -8312,6 +8312,7 @@ fn pointer_button(button: MouseButton) -> Option<PointerButton> {
 fn page_point(
     bounds: Bounds<Pixels>,
     viewport: (u32, u32),
+    scale: f32,
     position: Point<Pixels>,
     clamp: bool,
 ) -> Option<(f32, f32)> {
@@ -8325,9 +8326,12 @@ fn page_point(
     } else if x < 0.0 || y < 0.0 || x > width || y > height {
         return None;
     }
+    // CDP aims input in the capture's DEVICE pixels: the CSS viewport times
+    // the window's scale. Without the scale a Retina drag lands at half the
+    // page the reader sees.
     Some((
-        x * viewport.0 as f32 / width,
-        y * viewport.1 as f32 / height,
+        x * viewport.0 as f32 / width * scale,
+        y * viewport.1 as f32 / height * scale,
     ))
 }
 
@@ -8375,11 +8379,12 @@ const BROWSER_WHEEL_GAIN: f32 = 2.0;
 fn page_wheel(
     bounds: Bounds<Pixels>,
     viewport: (u32, u32),
+    scale: f32,
     position: Point<Pixels>,
     delta: &ScrollDelta,
     line_height: Pixels,
 ) -> Option<(f32, f32, f32, f32)> {
-    let (x, y) = page_point(bounds, viewport, position, true)?;
+    let (x, y) = page_point(bounds, viewport, scale, position, true)?;
     let gain = if delta.precise() {
         1.0
     } else {
@@ -9448,7 +9453,7 @@ impl Shell {
     fn browser_page_point(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
         let bounds = self.browser_bounds.get()?;
         let engine = self.state.browser.engine()?;
-        page_point(bounds, engine.viewport(), position, false)
+        page_point(bounds, engine.viewport(), engine.scale(), position, false)
     }
 
     /// Map a window point to the page, CLAMPED into the frame.
@@ -9458,7 +9463,7 @@ impl Shell {
     fn browser_page_point_clamped(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
         let bounds = self.browser_bounds.get()?;
         let engine = self.state.browser.engine()?;
-        page_point(bounds, engine.viewport(), position, true)
+        page_point(bounds, engine.viewport(), engine.scale(), position, true)
     }
 
     /// A press inside the page: focus the pane, then HOLD that button down.
@@ -9640,6 +9645,7 @@ impl Shell {
         let Some((x, y, delta_x, delta_y)) = page_wheel(
             bounds,
             engine.viewport(),
+            engine.scale(),
             event.position,
             &event.delta,
             line_height,
@@ -12747,6 +12753,28 @@ mod tests {
         );
     }
 
+    /// On a scaled display the pane aims input at the capture's DEVICE pixels:
+    /// the CSS viewport times the window's scale. Without it a Retina drag
+    /// lands at half the page the reader sees.
+    #[test]
+    fn a_scaled_display_aims_input_at_device_pixels() {
+        let bounds = Bounds {
+            origin: point(px(100.0), px(50.0)),
+            size: size(px(200.0), px(100.0)),
+        };
+        let viewport = (200, 100);
+        assert_eq!(
+            page_point(bounds, viewport, 2.0, point(px(200.0), px(100.0)), false),
+            Some((200.0, 100.0)),
+            "a point at the CSS edge aims at the device edge"
+        );
+        assert_eq!(
+            page_point(bounds, viewport, 1.0, point(px(200.0), px(100.0)), false),
+            Some((100.0, 50.0)),
+            "an unscaled display keeps the CSS mapping"
+        );
+    }
+
     /// The captured release maps an outside point to the page's edge; an
     /// ordinary press outside the frame maps to nothing.
     #[test]
@@ -12757,20 +12785,20 @@ mod tests {
         };
         let viewport = (1000, 500);
         assert_eq!(
-            page_point(bounds, viewport, point(px(200.0), px(100.0)), false),
+            page_point(bounds, viewport, 1.0, point(px(200.0), px(100.0)), false),
             Some((500.0, 250.0)),
             "an inside point maps the same either way"
         );
         assert_eq!(
-            page_point(bounds, viewport, point(px(0.0), px(0.0)), false),
+            page_point(bounds, viewport, 1.0, point(px(0.0), px(0.0)), false),
             None,
             "a press outside the frame is not the page's"
         );
         assert_eq!(
-            page_point(bounds, viewport, point(px(0.0), px(0.0)), true),
+            page_point(bounds, viewport, 1.0, point(px(0.0), px(0.0)), true),
             Some((0.0, 0.0))
         );
-        let (x, y) = page_point(bounds, viewport, point(px(400.0), px(300.0)), true)
+        let (x, y) = page_point(bounds, viewport, 1.0, point(px(400.0), px(300.0)), true)
             .expect("an outside point clamps into the frame");
         assert!((x - 995.0).abs() < 0.001, "the last page column: {x}");
         assert!((y - 495.0).abs() < 0.001, "the last page row: {y}");
@@ -12792,6 +12820,7 @@ mod tests {
         let up = page_wheel(
             frame(),
             (1000, 500),
+            1.0,
             point(px(200.0), px(100.0)),
             &ScrollDelta::Pixels(point(px(0.0), px(50.0))),
             px(20.0),
@@ -12805,6 +12834,7 @@ mod tests {
         let down = page_wheel(
             frame(),
             (1000, 500),
+            1.0,
             point(px(200.0), px(100.0)),
             &ScrollDelta::Pixels(point(px(0.0), px(-50.0))),
             px(20.0),
@@ -12825,6 +12855,7 @@ mod tests {
         let notch = page_wheel(
             frame(),
             (1000, 500),
+            1.0,
             point(px(200.0), px(100.0)),
             &ScrollDelta::Lines(point(0.0, 3.0)),
             px(20.0),
@@ -12840,6 +12871,7 @@ mod tests {
         let precise = page_wheel(
             frame(),
             (1000, 500),
+            1.0,
             point(px(200.0), px(100.0)),
             &ScrollDelta::Pixels(point(px(0.0), px(60.0))),
             px(20.0),
@@ -12855,6 +12887,7 @@ mod tests {
         let (_, _, dx, dy) = page_wheel(
             frame(),
             (1000, 500),
+            1.0,
             point(px(200.0), px(100.0)),
             &ScrollDelta::Pixels(point(px(30.0), px(0.0))),
             px(20.0),
@@ -12871,6 +12904,7 @@ mod tests {
         let (x, y, _, _) = page_wheel(
             frame(),
             (1000, 500),
+            1.0,
             point(px(0.0), px(0.0)),
             &ScrollDelta::Lines(point(0.0, 1.0)),
             px(20.0),

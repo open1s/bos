@@ -1414,6 +1414,24 @@ fn an_auto_injection_is_drawn_as_an_openable_event(cx: &mut TestAppContext) {
     );
 }
 
+/// Every question-card chrome key resolves in both dictionaries.
+#[test]
+fn question_card_keys_resolve_in_both_locales() {
+    for key in [
+        "question.step",
+        "question.back",
+        "question.next",
+        "question.send",
+        "question.answered",
+        "question.hintSingle",
+        "question.hintMulti",
+    ] {
+        for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
+            assert_ne!(crate::i18n::tr(lang, key), key, "missing locale value");
+        }
+    }
+}
+
 /// The ask_user call and its result land the question on the assistant row,
 /// options intact, so the transcript can draw the choice as buttons.
 #[test]
@@ -1608,6 +1626,29 @@ fn a_question_card_steps_and_multi_selects(cx: &mut TestAppContext) {
     });
     assert!(next, "the multi-select step draws its Next/Send button");
     assert_eq!(sent, 1, "advancing a step must not send yet");
+    // The stepper shows every step; a completed step navigates back.
+    let step0 = cx
+        .debug_bounds("question-step-1-0")
+        .expect("the stepper draws step one");
+    assert!(
+        cx.debug_bounds("question-step-1-1").is_some(),
+        "the stepper draws step two"
+    );
+    cx.simulate_click(step0.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("question-next-1").is_none(),
+        "returning to the single-select step hides Next"
+    );
+    let again = cx
+        .debug_bounds("question-option-1-0")
+        .expect("step one draws again");
+    cx.simulate_click(again.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("question-next-1").is_some(),
+        "advancing again returns to the multi-select step"
+    );
     // Step 2: toggle two picks, then send.
     for selector in ["question-option-1-0", "question-option-1-1"] {
         let chip = cx.debug_bounds(selector).expect("step two draws");
@@ -1639,6 +1680,84 @@ fn a_question_card_steps_and_multi_selects(cx: &mut TestAppContext) {
     });
     let expected = "Which approach?: Fix the cause
 Which extras?: x, y";
+    assert_eq!(answered.as_deref(), Some(expected));
+    assert_eq!(last_user.as_deref(), Some(expected));
+}
+
+/// A multi-select first step toggles from an empty draft and sends its picks.
+#[gpui::test]
+fn a_question_card_multi_select_first_step_sends(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    cx.dispatcher.allow_parking();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("question-multi-first", 1);
+        let mut provider = crate::settings::global::Provider {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            ..Default::default()
+        };
+        provider.models.insert(
+            "local".to_string(),
+            crate::settings::global::ModelEntry {
+                model: "local-id".to_string(),
+                ..Default::default()
+            },
+        );
+        state
+            .settings
+            .global
+            .providers
+            .insert("p".to_string(), provider);
+        state.select_model("local");
+        let id = state.active_id.clone().expect("a session");
+        if let Some(session) = state.store.session_mut(&id) {
+            if let Some(last) = session.messages.last_mut() {
+                last.question = Some(crate::model::QuestionBlock {
+                    questions: vec![crate::model::QuestionItem {
+                        question: "Which extras?".to_string(),
+                        options: vec!["x".to_string(), "y".to_string(), "z".to_string()],
+                        multi_select: true,
+                    }],
+                    answered: None,
+                });
+            }
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    for selector in ["question-option-1-0", "question-option-1-1"] {
+        let chip = cx.debug_bounds(selector).expect("the option tile draws");
+        cx.simulate_click(chip.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let send = cx
+        .debug_bounds("question-next-1")
+        .expect("the send button draws");
+    cx.simulate_click(send.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (answered, last_user) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let id = shell.state.active_id.clone().expect("a session");
+        let session = shell.state.store.session(&id).expect("the session");
+        (
+            session
+                .messages
+                .iter()
+                .find_map(|m| m.question.as_ref())
+                .and_then(|q| q.answered.clone()),
+            session
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == crate::model::Role::User)
+                .map(|m| m.text.clone()),
+        )
+    });
+    let expected = "Which extras?: x, y";
     assert_eq!(answered.as_deref(), Some(expected));
     assert_eq!(last_user.as_deref(), Some(expected));
 }
@@ -35070,8 +35189,8 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
     let body = String::from(
         "<!doctype html><html><body style=\"margin:0\">\
          <p id=\"copy\" style=\"font-size:16px;margin:20px 24px\">alpha beta gamma delta</p>\
-         <script>window.__drag=0;\
-         document.addEventListener('mousemove', function(e){ if (e.buttons === 1) { window.__drag++; } });\
+         <script>window.__drag=0;window.__dragPts=[];\
+         document.addEventListener('mousemove', function(e){ if (e.buttons === 1) { window.__drag++; window.__dragPts.push([e.clientX,e.clientY,e.button]); } });\
          </script></body></html>",
     );
     std::thread::spawn(move || {
@@ -35198,7 +35317,7 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
     // starved renderer); retry the drag a bounded number of times. The
     // assertion below is unchanged: a real selection must still appear.
     let mut state = serde_json::Value::Null;
-    for _attempt in 0..3 {
+    for _attempt in 0..4 {
         cx.simulate_event(gpui_kit::MouseDownEvent {
             position: start,
             modifiers,
@@ -35206,6 +35325,7 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
             click_count: 1,
             first_mouse: false,
         });
+        std::thread::sleep(std::time::Duration::from_millis(12));
         let steps = 6;
         for step in 1..=steps {
             let t = step as f32 / steps as f32;
@@ -35219,6 +35339,7 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
                 modifiers,
             });
             cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(12));
         }
         cx.simulate_event(gpui_kit::MouseUpEvent {
             position: end,
@@ -35226,6 +35347,7 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
             button: gpui_kit::MouseButton::Left,
             click_count: 1,
         });
+        std::thread::sleep(std::time::Duration::from_millis(12));
         // The selection is applied asynchronously by the page; under a loaded
         // suite a single 200ms read flakes even when the drag itself landed. Poll
         // the page's own selection for a bounded window instead. The window is
@@ -35242,7 +35364,7 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
                     .engine()
                     .expect("the engine is ready")
                     .evaluate(
-                        "JSON.stringify({selected: String(window.getSelection()), drags: window.__drag})",
+                        "JSON.stringify({selected: String(window.getSelection()), drags: window.__drag, pts: window.__dragPts})",
                     )
                     .expect("the page selection reads")
             })
