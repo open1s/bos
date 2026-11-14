@@ -175,6 +175,35 @@ pub struct UiOption {
     pub label: String,
 }
 
+/// How a badge draws: coloured text, an outlined chip, or a filled chip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BadgeStyle {
+    /// Coloured text with no box, like a diff stat.
+    #[default]
+    Plain,
+    /// An outlined chip, like a branch label.
+    Chip,
+    /// A filled chip, like a count.
+    Filled,
+}
+
+/// A short labelled mark: a status letter, a line stat, a branch chip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiBadge {
+    /// The badge text.
+    pub text: String,
+    /// Semantic colour role.
+    #[serde(default)]
+    pub tone: Tone,
+    /// Optional leading icon name from the host catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// How the badge draws.
+    #[serde(default)]
+    pub style: BadgeStyle,
+}
+
 /// One row in a list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiListItem {
@@ -189,6 +218,25 @@ pub struct UiListItem {
     /// Whether the row shows a checked mark.
     #[serde(default)]
     pub checked: bool,
+    /// Optional leading icon name from the host catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Right-aligned marks: status, stats, labels.
+    #[serde(default)]
+    pub badges: Vec<UiBadge>,
+}
+
+/// One row of a timeline: a rail dot, chips and a title.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiTimelineItem {
+    /// Primary text.
+    pub title: String,
+    /// Secondary text.
+    #[serde(default)]
+    pub detail: String,
+    /// Chips drawn before the title, like branch and HEAD labels.
+    #[serde(default)]
+    pub badges: Vec<UiBadge>,
 }
 
 /// One node in a tree.
@@ -201,6 +249,22 @@ pub struct UiTreeNode {
     /// Children.
     #[serde(default)]
     pub children: Vec<UiTreeNode>,
+    /// Optional leading icon name from the host catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Secondary text drawn after the label, like a parent path.
+    #[serde(default)]
+    pub detail: String,
+    /// Right-aligned marks: status, stats, labels.
+    #[serde(default)]
+    pub badges: Vec<UiBadge>,
+    /// Action dispatched when the node is activated; the payload carries the
+    /// node id as `{"id": ...}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Whether a node with children starts open; the reader's toggle wins.
+    #[serde(default = "section_starts_open")]
+    pub open: bool,
 }
 
 /// One tab.
@@ -269,6 +333,9 @@ pub enum UiNode {
         /// Visual weight.
         #[serde(default)]
         style: ButtonStyle,
+        /// Optional leading icon name from the host catalog.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
     },
     /// A single-line text field.
     Input {
@@ -282,6 +349,13 @@ pub enum UiNode {
         placeholder: String,
         /// Action dispatched on submit.
         action: String,
+        /// Optional trailing icon name from the host catalog.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
+        /// The submit button's label; empty hides the button and submits on
+        /// Enter / Cmd+Enter instead.
+        #[serde(default = "default_submit_label")]
+        submit_label: String,
     },
     /// A select field.
     Select {
@@ -393,6 +467,28 @@ pub enum UiNode {
         /// Message.
         text: String,
     },
+    /// A short labelled mark drawn inline: a count, a status, a chip.
+    Badge {
+        /// The badge text.
+        text: String,
+        /// Semantic colour role.
+        #[serde(default)]
+        tone: Tone,
+        /// Optional leading icon name from the host catalog.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
+        /// How the badge draws.
+        #[serde(default)]
+        style: BadgeStyle,
+    },
+    /// Horizontal flex fill: pushes later row children to the far edge.
+    Fill,
+    /// A commit-style rail: one dot and line per item, chips and a title.
+    Timeline {
+        /// Rows, newest first.
+        #[serde(default)]
+        items: Vec<UiTimelineItem>,
+    },
     /// A horizontal rule.
     Divider,
     /// Vertical space.
@@ -401,6 +497,11 @@ pub enum UiNode {
         #[serde(default = "default_spacer")]
         size: u16,
     },
+}
+
+/// The submit button a declared input shows unless it opts out.
+fn default_submit_label() -> String {
+    "Apply".to_string()
 }
 
 fn default_heading_level() -> u8 {
@@ -521,10 +622,13 @@ fn walk(node: &UiNode, depth: usize, state: &mut WalkState<'_>) {
             value,
             placeholder,
             action,
+            submit_label,
+            ..
         } => {
             text_leaf("ui.input.label", label, state);
             text_leaf("ui.input.value", value, state);
             text_leaf("ui.input.placeholder", placeholder, state);
+            text_leaf("ui.input.submit_label", submit_label, state);
             action_id("ui.input.action", action, state);
         }
         UiNode::Select {
@@ -567,6 +671,7 @@ fn walk(node: &UiNode, depth: usize, state: &mut WalkState<'_>) {
                 if let Some(action) = &item.action {
                     action_id("ui.list.item.action", action, state);
                 }
+                walk_badges("ui.list.item.badges", &item.badges, state);
             }
         }
         UiNode::Table {
@@ -675,12 +780,40 @@ fn walk(node: &UiNode, depth: usize, state: &mut WalkState<'_>) {
             }
             text_leaf("ui.image.alt", alt, state);
         }
+        UiNode::Badge { text, .. } => {
+            text_leaf("ui.badge.text", text, state);
+        }
+        UiNode::Fill => {}
+        UiNode::Timeline { items } => {
+            if items.len() > state.limits.max_list_items {
+                state.report.error(
+                    "ui.timeline.items",
+                    format!("must contain at most {} items", state.limits.max_list_items),
+                );
+            }
+            for item in items {
+                text_leaf("ui.timeline.item.title", &item.title, state);
+                text_leaf("ui.timeline.item.detail", &item.detail, state);
+                walk_badges("ui.timeline.item.badges", &item.badges, state);
+            }
+        }
         UiNode::Divider => {}
         UiNode::Spacer { size } => {
             if *size > 512 {
                 state.report.error("ui.spacer.size", "must be at most 512");
             }
         }
+    }
+}
+
+/// Badges are inline marks, but each still spends the node and text budgets.
+fn walk_badges(field: &str, badges: &[UiBadge], state: &mut WalkState<'_>) {
+    if badges.len() > 8 {
+        state.report.error(field, "must contain at most 8 badges");
+    }
+    for badge in badges {
+        state.nodes += 1;
+        text_leaf("ui.badge.text", &badge.text, state);
     }
 }
 
@@ -708,6 +841,11 @@ fn walk_tree(node: &UiTreeNode, depth: usize, state: &mut WalkState<'_>) {
             .error("ui.tree.id", "node ids must not be empty");
     }
     text_leaf("ui.tree.label", &node.label, state);
+    text_leaf("ui.tree.detail", &node.detail, state);
+    if let Some(action) = &node.action {
+        action_id("ui.tree.action", action, state);
+    }
+    walk_badges("ui.tree.badges", &node.badges, state);
     for child in &node.children {
         walk_tree(child, depth + 1, state);
     }
@@ -879,6 +1017,7 @@ mod tests {
                         label: "Refresh".to_string(),
                         action: "git.refresh".to_string(),
                         style: ButtonStyle::Primary,
+                        icon: None,
                     },
                 ],
             },
@@ -905,6 +1044,68 @@ mod tests {
             .errors
             .iter()
             .any(|issue| issue.field == "ui.button.action"));
+    }
+
+    /// Badges spend the node budget and cap at eight per row: a row cannot
+    /// smuggle a hundred chips past the limits.
+    #[test]
+    fn a_row_cannot_carry_more_than_eight_badges() {
+        let badges: Vec<Value> = (0..9)
+            .map(|index| serde_json::json!({"text": format!("b{index}")}))
+            .collect();
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": {
+                "type": "list",
+                "items": [{"title": "row", "badges": badges}]
+            }
+        }))
+        .expect("document");
+        let report = document.validate(&id());
+        assert!(!report.is_valid());
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "ui.list.item.badges"));
+    }
+
+    /// A timeline row's chips and a tree node's action validate like any
+    /// other control: the rail is a real surface, not a text escape hatch.
+    #[test]
+    fn the_timeline_and_tree_actions_validate() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": {
+                "type": "column",
+                "children": [
+                    {"type": "timeline", "items": [
+                        {"title": "feat: something",
+                         "badges": [{"text": "HEAD", "tone": "accent", "icon": "check", "style": "chip"}]}
+                    ]},
+                    {"type": "tree", "nodes": [
+                        {"id": "a.txt", "label": "a.txt", "action": "file",
+                         "badges": [{"text": "A", "tone": "success"}]}
+                    ]},
+                    {"type": "badge", "text": "8", "style": "filled"},
+                    {"type": "fill"}
+                ]
+            }
+        }))
+        .expect("document");
+        assert!(document.validate(&id()).is_valid());
+
+        let bad: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": {"type": "tree", "nodes": [
+                {"id": "a.txt", "label": "a.txt", "action": "not an id!"}
+            ]}
+        }))
+        .expect("document");
+        let report = bad.validate(&id());
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "ui.tree.action"));
     }
 
     /// A collapsed section still validates its body: a hidden mistake must be

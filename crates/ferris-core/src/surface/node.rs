@@ -459,6 +459,9 @@ fn surface_from_ui(node: crate::ui::UiNode, counter: &mut usize) -> SurfaceNode 
             label,
             action,
             style,
+            // The surface transport carries the callable surface, not the
+            // decorative icon; the panel renderer draws it from the UiNode.
+            icon: _,
         } => SurfaceNode::Button {
             id: next_control_id(counter, "button"),
             label,
@@ -470,6 +473,8 @@ fn surface_from_ui(node: crate::ui::UiNode, counter: &mut usize) -> SurfaceNode 
             value,
             placeholder,
             action,
+            icon: _,
+            submit_label: _,
         } => SurfaceNode::Input {
             id: next_control_id(counter, "input"),
             label,
@@ -552,6 +557,29 @@ fn surface_from_ui(node: crate::ui::UiNode, counter: &mut usize) -> SurfaceNode 
             id: None,
             level,
             text,
+        },
+        // The surface transport has no badge, fill or rail of its own: a
+        // badge degrades to toned text, a fill to zero space, and a timeline
+        // to a list whose rows keep their chips.
+        UiNode::Badge { text, tone, .. } => SurfaceNode::Text {
+            id: None,
+            text,
+            tone,
+        },
+        UiNode::Fill => SurfaceNode::Spacer { id: None, size: 0 },
+        UiNode::Timeline { items } => SurfaceNode::List {
+            id: None,
+            items: items
+                .into_iter()
+                .map(|item| crate::ui::UiListItem {
+                    title: item.title,
+                    detail: item.detail,
+                    action: None,
+                    checked: false,
+                    icon: None,
+                    badges: item.badges,
+                })
+                .collect(),
         },
         UiNode::Divider => SurfaceNode::Divider { id: None },
         UiNode::Spacer { size } => SurfaceNode::Spacer { id: None, size },

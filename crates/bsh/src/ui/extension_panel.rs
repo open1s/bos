@@ -29,7 +29,8 @@ use crate::theme;
 use ferris_sdk::host_runtime::CallContext;
 use ferris_sdk::types::ExtensionError;
 use ferris_sdk::ui::{
-    ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, Tone, UiDocument, UiNode,
+    BadgeStyle, ButtonStyle, NotificationLevel, PanelLocation, ThemePalette, Tone, UiBadge,
+    UiDocument, UiNode,
 };
 
 use super::{hairline_bottom, icon, txt, IconName};
@@ -213,6 +214,11 @@ pub(crate) struct ExtensionPanelView {
     inputs: RefCell<BTreeMap<String, (String, Entity<InputState>)>>,
     /// Section open state, keyed by node path.
     sections: RefCell<BTreeMap<String, bool>>,
+    /// Tree folder open state, keyed by node path; the document's default is
+    /// recorded on first draw and the reader's toggle wins afterwards.
+    trees: RefCell<BTreeMap<String, bool>>,
+    /// Select dropdown open state, keyed by node path.
+    selects: RefCell<BTreeMap<String, bool>>,
     /// The panel's own light palette, when the package named a theme.
     panel_theme: Option<ThemePalette>,
     /// The panel's own dark palette, when the package named one.
@@ -264,6 +270,8 @@ impl ExtensionPanelView {
             attempted: false,
             inputs: RefCell::new(BTreeMap::new()),
             sections: RefCell::new(BTreeMap::new()),
+            trees: RefCell::new(BTreeMap::new()),
+            selects: RefCell::new(BTreeMap::new()),
             panel_theme,
             panel_theme_dark,
             refresh_ms,
@@ -746,6 +754,41 @@ impl ExtensionPanelView {
         .detach();
     }
 
+    /// One inline mark: plain coloured text, an outlined chip, or a filled
+    /// chip, with an optional leading catalog icon.
+    fn render_badge(&self, badge: &UiBadge) -> AnyElement {
+        let color = self.tone_color(badge.tone);
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(3.0))
+            .flex_shrink_0();
+        if let Some(name) = badge.icon.as_deref().and_then(catalog_icon) {
+            row = row.child(icon(name, 12.0, color).into_any_element());
+        }
+        match badge.style {
+            BadgeStyle::Plain => row
+                .child(txt(badge.text.clone(), 11.5, color))
+                .into_any_element(),
+            BadgeStyle::Chip => row
+                .h(px(20.0))
+                .px(px(6.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(rgb(color))
+                .child(txt(badge.text.clone(), 11.0, color))
+                .into_any_element(),
+            BadgeStyle::Filled => row
+                .h(px(20.0))
+                .px(px(6.0))
+                .rounded(px(6.0))
+                .bg(rgb(self.palette.new_session_fill))
+                .child(txt(badge.text.clone(), 11.0, color))
+                .into_any_element(),
+        }
+    }
+
     fn render_node(
         &self,
         node: &UiNode,
@@ -796,6 +839,7 @@ impl ExtensionPanelView {
                 label,
                 action,
                 style,
+                icon: leading,
             } => {
                 let (fill, ink) = match style {
                     ButtonStyle::Primary => (self.palette.accent, self.palette.page),
@@ -804,6 +848,11 @@ impl ExtensionPanelView {
                     ButtonStyle::Secondary => (self.palette.new_session_fill, self.palette.text),
                 };
                 let action = action.clone();
+                let mut content = div().flex().flex_row().items_center().gap(px(6.0));
+                if let Some(name) = leading.as_deref().and_then(catalog_icon) {
+                    content = content.child(icon(name, 14.0, ink).into_any_element());
+                }
+                content = content.child(txt(label.clone(), 13.0, ink));
                 Button::new(format!("extension-action-{path}"))
                     .debug_selector(|| format!("extension-action-{path}"))
                     .accessibility_label(label.clone())
@@ -813,7 +862,7 @@ impl ExtensionPanelView {
                     .bg(rgb(fill))
                     .border_1()
                     .border_color(rgb(self.palette.border_soft))
-                    .child(txt(label.clone(), 13.0, ink))
+                    .child(content)
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.dispatch(&action, json!({}), cx)
                     }))
@@ -824,46 +873,77 @@ impl ExtensionPanelView {
                 value,
                 placeholder,
                 action,
+                icon: trailing,
+                submit_label,
             } => {
-                let action = action.clone();
                 // A declared input is a real field: the state entity keeps what
-                // the reader typed across frames, and Apply sends it as
-                // `{"value": ...}` instead of an empty payload.
+                // the reader typed across frames, and the submit sends it as
+                // a value payload instead of an empty one.
                 let entity = self.input_for(path, value, placeholder, window, cx);
                 let read_path = path.to_string();
-                div()
+                let mut field = div()
+                    .debug_selector(|| format!("extension-input-{path}"))
                     .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(txt(label.clone(), 12.0, self.palette.muted))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .h(px(30.0))
-                                    .child(Input::new(&entity).w_full()),
-                            )
-                            .child(
-                                Button::new(format!("extension-apply-{path}"))
-                                    .debug_selector(|| format!("extension-apply-{path}"))
-                                    .accessibility_label(label.clone())
-                                    .px(px(10.0))
-                                    .h(px(30.0))
-                                    .rounded(px(8.0))
-                                    .bg(rgb(self.palette.accent))
-                                    .child(txt("Apply", 12.0, self.palette.page))
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        let text = this.input_value(&read_path, cx);
-                                        this.dispatch(&action, json!({ "value": text }), cx)
-                                    })),
-                            ),
-                    )
-                    .into_any_element()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .h(px(36.0))
+                    .px(px(10.0))
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(rgb(self.palette.border_soft))
+                    .bg(rgb(self.palette.page))
+                    .child(div().flex_1().min_w_0().child(Input::new(&entity).w_full()));
+                if let Some(name) = trailing.as_deref().and_then(catalog_icon) {
+                    field = field.child(icon(name, 14.0, self.palette.muted).into_any_element());
+                }
+                // Cmd+Enter always submits; a field with no submit button also
+                // submits on plain Enter, the way the reference's message box
+                // does. Shift+Enter is left to the field.
+                let key_path = path.to_string();
+                let key_action = action.clone();
+                let enter_submits = submit_label.is_empty();
+                field = field.on_key_down(cx.listener(
+                    move |this, event: &KeyDownEvent, _window, cx| {
+                        let keystroke = &event.keystroke;
+                        if keystroke.key != "enter" || keystroke.modifiers.shift {
+                            return;
+                        }
+                        if keystroke.modifiers.platform || enter_submits {
+                            let text = this.input_value(&key_path, cx);
+                            this.dispatch(&key_action, json!({ "value": text }), cx);
+                            cx.stop_propagation();
+                        }
+                    },
+                ));
+                let mut column = div().flex().flex_col().gap(px(4.0)).w_full();
+                if !label.is_empty() {
+                    column = column.child(txt(label.clone(), 12.0, self.palette.muted));
+                }
+                let mut row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(field);
+                if !submit_label.is_empty() {
+                    let action = action.clone();
+                    row = row.child(
+                        Button::new(format!("extension-apply-{path}"))
+                            .debug_selector(|| format!("extension-apply-{path}"))
+                            .accessibility_label(submit_label.clone())
+                            .px(px(10.0))
+                            .h(px(36.0))
+                            .rounded(px(8.0))
+                            .bg(rgb(self.palette.accent))
+                            .child(txt(submit_label.clone(), 12.0, self.palette.page))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                let text = this.input_value(&read_path, cx);
+                                this.dispatch(&action, json!({ "value": text }), cx)
+                            })),
+                    );
+                }
+                column.child(row).into_any_element()
             }
             UiNode::Select {
                 label,
@@ -871,36 +951,121 @@ impl ExtensionPanelView {
                 options,
                 action,
             } => {
-                let action = action.clone();
-                let mut row = div().flex().flex_col().gap(px(4.0)).child(txt(
-                    if value.is_empty() {
-                        label.clone()
-                    } else {
-                        format!("{label}: {value}")
-                    },
-                    12.0,
-                    self.palette.muted,
-                ));
-                let mut chips = div().flex().flex_row().flex_wrap().gap(px(6.0));
-                for option in options {
-                    let action = action.clone();
-                    let option_value = option.value.clone();
-                    chips = chips.child(
-                        Button::new(format!("extension-option-{path}-{}", option.value))
-                            .debug_selector(|| format!("extension-option-{path}-{}", option.value))
-                            .accessibility_label(option.label.clone())
-                            .px(px(9.0))
-                            .h(px(26.0))
-                            .rounded(px(7.0))
-                            .bg(rgb(self.palette.new_session_fill))
-                            .child(txt(option.label.clone(), 12.0, self.palette.text))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.dispatch(&action, json!({ "value": option_value.clone() }), cx)
-                            })),
-                    );
+                // A real dropdown: one closed field naming the current option,
+                // opening a menu of the rest. The open state is the view's, so
+                // a live refresh does not close the menu under the reader.
+                let is_open = *self
+                    .selects
+                    .borrow_mut()
+                    .entry(path.to_string())
+                    .or_insert(false);
+                let current = options
+                    .iter()
+                    .find(|option| option.value == *value)
+                    .map(|option| option.label.clone())
+                    .unwrap_or_else(|| {
+                        if value.is_empty() {
+                            label.clone()
+                        } else {
+                            value.clone()
+                        }
+                    });
+                let toggle = path.to_string();
+                let next = !is_open;
+                let mut column = div().flex().flex_col().gap(px(4.0)).w_full();
+                if !label.is_empty() {
+                    column = column.child(txt(label.clone(), 12.0, self.palette.muted));
                 }
-                row = row.child(chips);
-                row.into_any_element()
+                column = column.child(
+                    Button::new(format!("extension-select-{path}"))
+                        .debug_selector(|| format!("extension-select-{path}"))
+                        .accessibility_label(current.clone())
+                        .w_full()
+                        .h(px(34.0))
+                        .px(px(10.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(rgb(self.palette.border_soft))
+                        .bg(rgb(self.palette.page))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(div().flex_1().min_w_0().child(txt(
+                            current,
+                            13.0,
+                            self.palette.text,
+                        )))
+                        .child(
+                            icon(IconName::ChevronDown, 14.0, self.palette.muted)
+                                .into_any_element(),
+                        )
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.selects.borrow_mut().insert(toggle.clone(), next);
+                            cx.notify();
+                        })),
+                );
+                if is_open {
+                    let mut menu = div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .w_full()
+                        .p(px(4.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(rgb(self.palette.border_soft))
+                        .bg(rgb(self.palette.page));
+                    for option in options {
+                        let selected = option.value == *value;
+                        let action = action.clone();
+                        let option_value = option.value.clone();
+                        let close_path = path.to_string();
+                        let mut option_row =
+                            Button::new(format!("extension-option-{path}-{}", option.value))
+                                .debug_selector(|| {
+                                    format!("extension-option-{path}-{}", option.value)
+                                })
+                                .accessibility_label(option.label.clone())
+                                .w_full()
+                                .h(px(28.0))
+                                .px(px(8.0))
+                                .rounded(px(6.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0));
+                        if selected {
+                            option_row = option_row.bg(rgb(self.palette.new_session_fill));
+                        }
+                        option_row = option_row.child(txt(
+                            option.label.clone(),
+                            12.0,
+                            if selected {
+                                self.palette.accent
+                            } else {
+                                self.palette.text
+                            },
+                        ));
+                        if selected {
+                            option_row = option_row.child(
+                                icon(IconName::Check, 12.0, self.palette.accent).into_any_element(),
+                            );
+                        }
+                        menu = menu.child(option_row.on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                this.selects.borrow_mut().insert(close_path.clone(), false);
+                                this.dispatch(
+                                    &action,
+                                    json!({ "value": option_value.clone() }),
+                                    cx,
+                                );
+                            },
+                        )));
+                    }
+                    column = column.child(menu);
+                }
+                column.into_any_element()
             }
             UiNode::Checkbox {
                 label,
@@ -939,41 +1104,59 @@ impl ExtensionPanelView {
             UiNode::List { items } => {
                 let mut list = div().flex().flex_col().gap(px(2.0)).w_full();
                 for (index, item) in items.iter().enumerate() {
-                    let mut content = vec![txt(item.title.clone(), 13.0, self.palette.text)];
-                    if !item.detail.is_empty() {
-                        content.push(txt(item.detail.clone(), 11.0, self.palette.faint));
+                    let mut content = div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .w_full()
+                        .min_w_0();
+                    if let Some(name) = item.icon.as_deref().and_then(catalog_icon) {
+                        content = content.child(
+                            icon(
+                                name,
+                                14.0,
+                                file_icon_color(
+                                    item.icon.as_deref().unwrap_or(""),
+                                    self.palette.muted,
+                                ),
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                    content = content.child(txt(item.title.clone(), 13.0, self.palette.text));
+                    content = content.child(div().flex_1().min_w_0().child(txt(
+                        item.detail.clone(),
+                        11.0,
+                        self.palette.faint,
+                    )));
+                    for badge in &item.badges {
+                        content = content.child(self.render_badge(badge));
                     }
                     if let Some(action) = &item.action {
                         let action = action.clone();
-                        let mut row = Button::new(format!("extension-list-{path}-{index}"))
-                            .debug_selector(|| format!("extension-list-{path}-{index}"))
-                            .w_full()
-                            .px(px(8.0))
-                            .py(px(6.0))
-                            .rounded(px(7.0))
-                            .flex()
-                            .flex_col()
-                            .items_start()
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.dispatch(&action, json!({ "index": index }), cx)
-                            }));
-                        for child in content {
-                            row = row.child(child);
-                        }
-                        list = list.child(row);
+                        list = list.child(
+                            Button::new(format!("extension-list-{path}-{index}"))
+                                .debug_selector(|| format!("extension-list-{path}-{index}"))
+                                .w_full()
+                                .px(px(8.0))
+                                .py(px(6.0))
+                                .rounded(px(7.0))
+                                .child(content)
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.dispatch(&action, json!({ "index": index }), cx)
+                                })),
+                        );
                     } else {
-                        let mut row = div()
-                            .id(SharedString::from(format!("extension-list-{path}-{index}")))
-                            .w_full()
-                            .px(px(8.0))
-                            .py(px(6.0))
-                            .rounded(px(7.0))
-                            .flex()
-                            .flex_col();
-                        for child in content {
-                            row = row.child(child);
-                        }
-                        list = list.child(row);
+                        list = list.child(
+                            div()
+                                .id(SharedString::from(format!("extension-list-{path}-{index}")))
+                                .w_full()
+                                .px(px(8.0))
+                                .py(px(6.0))
+                                .rounded(px(7.0))
+                                .child(content),
+                        );
                     }
                 }
                 list.into_any_element()
@@ -1081,11 +1264,84 @@ impl ExtensionPanelView {
                 table.into_any_element()
             }
             UiNode::Tree { nodes } => {
-                let mut tree = div().flex().flex_col().gap(px(2.0));
-                for node in nodes {
-                    tree = tree.child(self.render_tree(node, path, 0));
+                let mut tree = div().flex().flex_col().gap(px(2.0)).w_full();
+                for (index, node) in nodes.iter().enumerate() {
+                    tree =
+                        tree.child(self.render_tree(node, &format!("{path}-tree-{index}"), 0, cx));
                 }
                 tree.into_any_element()
+            }
+            UiNode::Badge {
+                text,
+                tone,
+                icon,
+                style,
+            } => self.render_badge(&UiBadge {
+                text: text.clone(),
+                tone: *tone,
+                icon: icon.clone(),
+                style: *style,
+            }),
+            UiNode::Fill => div().flex_1().into_any_element(),
+            UiNode::Timeline { items } => {
+                // The reference's commit rail: a dot per row joined by a line,
+                // chips and the title beside it. The line stops at the last
+                // row, so the rail does not dangle past the history.
+                let mut column = div().flex().flex_col().w_full();
+                for (index, item) in items.iter().enumerate() {
+                    let last = index + 1 == items.len();
+                    let mut rail = div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .w(px(14.0))
+                        .flex_shrink_0()
+                        .child(
+                            div()
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(self.palette.accent))
+                                .mt(px(6.0)),
+                        );
+                    if !last {
+                        rail =
+                            rail.child(div().w(px(1.0)).flex_1().bg(rgb(self.palette.border_soft)));
+                    }
+                    let mut content = div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .pb(px(10.0))
+                        .min_w_0()
+                        .flex_1();
+                    if !item.badges.is_empty() {
+                        let mut chips = div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(4.0));
+                        for badge in &item.badges {
+                            chips = chips.child(self.render_badge(badge));
+                        }
+                        content = content.child(chips);
+                    }
+                    content = content.child(txt(item.title.clone(), 13.0, self.palette.text));
+                    if !item.detail.is_empty() {
+                        content = content.child(txt(item.detail.clone(), 11.0, self.palette.faint));
+                    }
+                    column = column.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .w_full()
+                            .child(rail)
+                            .child(content),
+                    );
+                }
+                column.into_any_element()
             }
             UiNode::Tabs { tabs } => {
                 let selected = self
@@ -1233,18 +1489,162 @@ impl ExtensionPanelView {
         node: &ferris_sdk::ui::UiTreeNode,
         path: &str,
         depth: usize,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut column = div().flex().flex_col().gap(px(2.0));
-        column = column.child(div().pl(px(depth as f32 * 12.0)).child(txt(
-            node.label.clone(),
-            12.0,
-            self.palette.text,
+        let has_children = !node.children.is_empty();
+        // The document's default is recorded on first draw; afterwards the
+        // reader's toggle wins, including across a live refresh.
+        let is_open = if has_children {
+            let mut trees = self.trees.borrow_mut();
+            *trees.entry(path.to_string()).or_insert(node.open)
+        } else {
+            true
+        };
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .w_full()
+            .min_w_0()
+            .pl(px(depth as f32 * 14.0));
+        if has_children {
+            row = row.child(
+                icon(
+                    if is_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    },
+                    12.0,
+                    self.palette.muted,
+                )
+                .into_any_element(),
+            );
+        } else {
+            row = row.child(div().w(px(12.0)).flex_shrink_0());
+        }
+        let icon_name = node.icon.as_deref().unwrap_or(if has_children {
+            if is_open {
+                "folder-open"
+            } else {
+                "folder"
+            }
+        } else {
+            "file"
+        });
+        if let Some(name) = catalog_icon(icon_name) {
+            row = row.child(
+                icon(name, 14.0, file_icon_color(icon_name, self.palette.muted)).into_any_element(),
+            );
+        }
+        row = row.child(txt(node.label.clone(), 13.0, self.palette.text));
+        row = row.child(div().flex_1().min_w_0().child(txt(
+            node.detail.clone(),
+            11.0,
+            self.palette.faint,
         )));
-        for (index, child) in node.children.iter().enumerate() {
-            column =
-                column.child(self.render_tree(child, &format!("{path}-tree-{index}"), depth + 1));
+        for badge in &node.badges {
+            row = row.child(self.render_badge(badge));
+        }
+        let element = if has_children {
+            let toggle = path.to_string();
+            let next = !is_open;
+            Button::new(format!("extension-tree-{path}"))
+                .debug_selector(|| format!("extension-tree-{path}"))
+                .accessibility_label(node.label.clone())
+                .w_full()
+                .px(px(4.0))
+                .py(px(3.0))
+                .rounded(px(6.0))
+                .child(row)
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.trees.borrow_mut().insert(toggle.clone(), next);
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else if let Some(action) = &node.action {
+            let action = action.clone();
+            let id = node.id.clone();
+            Button::new(format!("extension-tree-{path}"))
+                .debug_selector(|| format!("extension-tree-{path}"))
+                .accessibility_label(node.label.clone())
+                .w_full()
+                .px(px(4.0))
+                .py(px(3.0))
+                .rounded(px(6.0))
+                .child(row)
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.dispatch(&action, json!({ "id": id.clone() }), cx)
+                }))
+                .into_any_element()
+        } else {
+            row.into_any_element()
+        };
+        let mut column = div().flex().flex_col().gap(px(2.0)).w_full().child(element);
+        if has_children && is_open {
+            for (index, child) in node.children.iter().enumerate() {
+                column = column.child(self.render_tree(
+                    child,
+                    &format!("{path}-tree-{index}"),
+                    depth + 1,
+                    cx,
+                ));
+            }
         }
         column.into_any_element()
+    }
+}
+
+/// Resolve a contract icon name to the host's Lucide catalog.
+///
+/// Names are kebab-case strings, not Rust variants, so a package document
+/// stays stable across kit upgrades; an unknown name draws no icon rather
+/// than failing the card.
+fn catalog_icon(name: &str) -> Option<IconName> {
+    Some(match name {
+        "folder" => IconName::Folder,
+        "folder-open" => IconName::FolderOpen,
+        "file" => IconName::File,
+        "file-code" => IconName::FileCode,
+        "file-text" => IconName::FileText,
+        "file-image" => IconName::FileImage,
+        "file-archive" => IconName::FileArchive,
+        "file-cog" => IconName::FileCog,
+        "file-diff" => IconName::FileDiff,
+        "file-spreadsheet" => IconName::FileSpreadsheet,
+        "git-branch" => IconName::GitBranch,
+        "git-commit" => IconName::GitCommitHorizontal,
+        "globe" => IconName::Globe,
+        "check" => IconName::Check,
+        "chevron-down" => IconName::ChevronDown,
+        "chevron-right" => IconName::ChevronRight,
+        "sparkles" => IconName::Sparkles,
+        "refresh-cw" => IconName::RefreshCw,
+        "terminal" => IconName::Terminal,
+        "braces" => IconName::Braces,
+        "hash" => IconName::Hash,
+        "settings" => IconName::Settings,
+        "database" => IconName::Database,
+        "binary" => IconName::Binary,
+        _ => return None,
+    })
+}
+
+/// The decorative colour a file-class icon carries, as the reference's file
+/// tree does: folders amber, code yellow, docs blue, config red. These are
+/// file-class colours, not semantic tones, so they are constants rather than
+/// palette roles.
+fn file_icon_color(name: &str, muted: u32) -> u32 {
+    match name {
+        "folder" | "folder-open" => 0xE8A33D,
+        "file-code" | "terminal" | "braces" | "binary" => 0xD9A514,
+        "file-text" => 0x4176E6,
+        "file-cog" | "settings" => 0xD64545,
+        "file-image" => 0x3FA66A,
+        "file-archive" => 0xB0813F,
+        "file-spreadsheet" | "database" => 0x3FA66A,
+        _ => muted,
     }
 }
 
@@ -1700,5 +2100,235 @@ mod tests {
         assert!(item.matches("devkit"));
         assert!(item.matches("RIGHT"));
         assert!(!item.matches("federation"));
+    }
+
+    // -------------------------------------------------------------------
+    // Interaction tests: the high-fidelity controls, clicked for real.
+    // -------------------------------------------------------------------
+
+    use gpui_kit::{
+        AppContext as _, Context, Entity, Focusable, IntoElement, Modifiers, Render,
+        TestAppContext, VisualTestContext, Window,
+    };
+
+    /// A runtime that records every tool call the panel dispatches.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    }
+
+    #[async_trait]
+    impl Runtime for Recorder {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Declarative
+        }
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+        async fn call_tool(
+            &self,
+            name: &str,
+            arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            self.calls
+                .lock()
+                .expect("recorder")
+                .push((name.to_string(), arguments));
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    struct PanelHarness {
+        view: Entity<ExtensionPanelView>,
+    }
+
+    impl Render for PanelHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.view.clone()
+        }
+    }
+
+    fn document(root: Value) -> UiDocument {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": root,
+        }))
+        .expect("document")
+    }
+
+    /// Boot a window showing one panel over a recording runtime. A macro,
+    /// not a function: the visual context borrows the app context the test
+    /// owns, so it cannot be returned from a helper.
+    macro_rules! panel_window {
+        ($cx:expr, $root:expr $(,)?) => {{
+            $cx.update(gpui_kit::component::init);
+            // The dispatch path runs on the extension's own tokio runtime,
+            // a real background thread the deterministic scheduler forbids.
+            $cx.dispatcher.allow_parking();
+            let recorder = Recorder::default();
+            let surface = surface_with(
+                Arc::new(Recorder {
+                    calls: Arc::clone(&recorder.calls),
+                }),
+                Some(document($root)),
+            );
+            let view = $cx.new(|_| ExtensionPanelView::new(vec![surface], Lang::En));
+            let harness_view = view.clone();
+            let (_harness, vcx) =
+                $cx.add_window_view(move |_, _| PanelHarness { view: harness_view });
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+            (recorder, vcx, view)
+        }};
+    }
+
+    /// Pump frames until the recorder saw a call, or fail naming the wait.
+    fn wait_for_call(cx: &mut VisualTestContext, recorder: &Recorder) -> (String, Value) {
+        for _ in 0..40 {
+            if let Some(call) = recorder.calls.lock().expect("recorder").first().cloned() {
+                return call;
+            }
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        panic!("the panel dispatched no tool call within 40 frames");
+    }
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} renders"));
+        let spot = bounds.origin + (bounds.size / 2.0).into();
+        cx.simulate_click(spot, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// The branch dropdown opens on click and dispatches the chosen value.
+    #[gpui::test]
+    fn a_select_option_dispatches_the_chosen_value(cx: &mut TestAppContext) {
+        let (recorder, cx, _view) = panel_window!(
+            cx,
+            serde_json::json!({
+                "type": "select",
+                "label": "",
+                "value": "all",
+                "options": [
+                    {"value": "all", "label": "All branches"},
+                    {"value": "main", "label": "main"}
+                ],
+                "action": "refresh"
+            }),
+        );
+        assert!(
+            cx.debug_bounds("extension-option-root-main").is_none(),
+            "the menu starts closed"
+        );
+        click(cx, "extension-select-root");
+        click(cx, "extension-option-root-main");
+        let (name, args) = wait_for_call(cx, &recorder);
+        assert_eq!(name, "refresh");
+        assert_eq!(args["value"], "main");
+    }
+
+    /// A file-tree leaf dispatches its id, and a folder toggles its children.
+    #[gpui::test]
+    fn a_tree_leaf_dispatches_its_id_and_a_folder_toggles(cx: &mut TestAppContext) {
+        let (recorder, cx, _view) = panel_window!(
+            cx,
+            serde_json::json!({
+                "type": "tree",
+                "nodes": [
+                    {
+                        "id": "src",
+                        "label": "src",
+                        "open": true,
+                        "children": [
+                            {"id": "src/a.txt", "label": "a.txt", "action": "file",
+                             "badges": [{"text": "A", "tone": "success"}]}
+                        ]
+                    }
+                ]
+            }),
+        );
+        click(cx, "extension-tree-root-tree-0-tree-0");
+        let (name, args) = wait_for_call(cx, &recorder);
+        assert_eq!(name, "file");
+        assert_eq!(args["id"], "src/a.txt");
+
+        // The folder collapses its children, then opens them again.
+        click(cx, "extension-tree-root-tree-0");
+        assert!(
+            cx.debug_bounds("extension-tree-root-tree-0-tree-0")
+                .is_none(),
+            "the folder collapsed"
+        );
+        click(cx, "extension-tree-root-tree-0");
+        assert!(
+            cx.debug_bounds("extension-tree-root-tree-0-tree-0")
+                .is_some(),
+            "the folder reopened"
+        );
+    }
+
+    /// The message field submits on Cmd+Enter with what the reader typed.
+    #[gpui::test]
+    fn cmd_enter_submits_the_message_field(cx: &mut TestAppContext) {
+        let (recorder, cx, view) = panel_window!(
+            cx,
+            serde_json::json!({
+                "type": "input",
+                "label": "",
+                "value": "",
+                "placeholder": "Message (Cmd+Enter to commit)",
+                "action": "commit",
+                "submit_label": ""
+            }),
+        );
+        // Focus the field's own InputState: a click on the wrapper div focuses
+        // the div, and printable keys would not reach the editor.
+        let focus = cx
+            .update(|_, cx| {
+                view.read(cx)
+                    .inputs
+                    .borrow()
+                    .get("root")
+                    .map(|(_, entity)| entity.read(cx).focus_handle(cx))
+            })
+            .expect("the input state exists");
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("h");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("i");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("cmd-enter");
+        let (name, args) = wait_for_call(cx, &recorder);
+        assert_eq!(name, "commit");
+        assert_eq!(args["value"], "hi");
+    }
+
+    /// The timeline, badges and fill render without a host and validate.
+    #[test]
+    fn the_rail_and_chips_validate_within_the_ui_limits() {
+        let doc = document(serde_json::json!({
+            "type": "column",
+            "children": [
+                {"type": "row", "children": [
+                    {"type": "text", "text": "Changes"},
+                    {"type": "fill"},
+                    {"type": "badge", "text": "8", "style": "filled"}
+                ]},
+                {"type": "timeline", "items": [
+                    {"title": "feat: batch execution",
+                     "badges": [
+                        {"text": "HEAD", "tone": "accent", "icon": "check", "style": "chip"},
+                        {"text": "main", "tone": "accent", "icon": "git-branch", "style": "chip"}
+                     ]}
+                ]}
+            ]
+        }));
+        let report = doc.validate(&ExtensionId::parse("com.example.ui").expect("id"));
+        assert!(report.is_valid(), "{:?}", report.errors);
+        assert!(super::catalog_icon("git-branch").is_some());
+        assert!(super::catalog_icon("no-such-icon").is_none());
     }
 }

@@ -778,6 +778,7 @@ mod tests {
                 label: "Go".to_string(),
                 action: "not a contribution id".to_string(),
                 style: ButtonStyle::Primary,
+                icon: None,
             },
         };
         let good = view();
@@ -951,6 +952,7 @@ mod tests {
                 label: "Go".to_string(),
                 action: "demo.go".to_string(),
                 style: ferris_sdk::ui::ButtonStyle::Primary,
+                icon: None,
             },
         };
         host.mount_external(

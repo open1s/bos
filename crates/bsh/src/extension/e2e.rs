@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::host::{ExtensionHost, HostConfig};
+use super::host::{AppliedExtension, ExtensionHost, HostConfig};
 use super::market::GitMarket;
 use ferris_sdk::capability::{GrantScope, PolicyEngine, PolicyMode};
 use ferris_sdk::package::ExtensionStore;
@@ -359,6 +359,394 @@ async fn disabling_the_first_party_notes_package_removes_its_tools() {
         .expect("notes status");
     assert!(!status.configured);
     assert!(!status.applied);
+    host.shutdown().await;
+}
+
+/// Install the first-party change-history package into a scratch host and
+/// return its model-facing tool through the production agent path. The
+/// activation handles must outlive the tool: dropping them revokes it.
+fn change_history_tool(
+    root: &Path,
+) -> (
+    ExtensionHost,
+    Vec<AppliedExtension>,
+    std::sync::Arc<dyn react::tool::registry::AsyncTool>,
+) {
+    let store = ExtensionStore::open(root).expect("store");
+    let package = store
+        .install(&examples().join("change-history"))
+        .expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let host = ExtensionHost::open(config(root)).expect("host");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.bos.bsh.change-history")
+        .expect("change-history status");
+    assert!(status.applied, "change-history applies: {:?}", status.error);
+    assert_eq!(status.runtime, "cordis");
+    let qualified = status
+        .tools
+        .iter()
+        .find(|tool| tool.ends_with("__change_history"))
+        .cloned()
+        .expect("the tool is registered");
+    let mut agent = ::agent::Agent::from_config(::agent::AgentConfig::default());
+    let mut registry = ::agent::plugins::PluginRegistry::default();
+    let applied = host.apply_with_fibers(&mut agent, &mut registry, None, "session");
+    let tool = agent
+        .live_tools()
+        .read()
+        .expect("live tools")
+        .get_async(&qualified)
+        .expect("the tool reaches the agent");
+    (host, applied, tool)
+}
+
+/// Run one change_history call against the live tool.
+async fn change_history_call(
+    tool: &std::sync::Arc<dyn react::tool::registry::AsyncTool>,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, agent::tools::ToolError> {
+    react::tool::registry::AsyncTool::run(&**tool, &arguments).await
+}
+
+/// The first-party change-history package installs through the store and
+/// manages a real git repository through the production agent tool path.
+#[cfg_attr(
+    windows,
+    ignore = "cordis bridge cannot resolve a drive-letter entry on Windows"
+)]
+#[tokio::test]
+async fn the_change_history_package_manages_a_real_git_repository() {
+    if ferris_sdk::host_runtime::bridge::find_interpreter().is_none() {
+        eprintln!("skipping change-history e2e: no Node interpreter for the cordis bridge");
+        return;
+    }
+    let root = scratch("change-history-git");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    for args in [
+        vec!["init", "-q"],
+        vec!["symbolic-ref", "HEAD", "refs/heads/main"],
+        vec!["config", "user.name", "E2E"],
+        vec!["config", "user.email", "e2e@example.invalid"],
+        vec!["config", "commit.gpgsign", "false"],
+    ] {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(&args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &root)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+    std::fs::write(workspace.join("README.md"), "seed\n").expect("seed file");
+    for args in [vec!["add", "-A"], vec!["commit", "-qm", "first commit"]] {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(&args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &root)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    let (mut host, _applied, tool) = change_history_tool(&root);
+    let ws = workspace.display().to_string();
+
+    // status reads the seeded repository through the terminal seam.
+    let out = change_history_call(&tool, serde_json::json!({"action": "status", "path": ws}))
+        .await
+        .expect("status runs");
+    assert_eq!(out["backend"], "git");
+    assert_eq!(out["data"]["branch"], "main");
+
+    // new seals a working-tree change into a commit.
+    std::fs::write(workspace.join("change.txt"), "change\n").expect("write");
+    let out = change_history_call(
+        &tool,
+        serde_json::json!({"action": "new", "path": ws, "message": "e2e: second commit"}),
+    )
+    .await
+    .expect("new runs");
+    assert_eq!(out["data"]["entries"][0]["subject"], "e2e: second commit");
+
+    // log lists both commits, newest first.
+    let out = change_history_call(
+        &tool,
+        serde_json::json!({"action": "log", "path": ws, "limit": 5}),
+    )
+    .await
+    .expect("log runs");
+    let entries = out["data"]["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 2, "{out}");
+    assert_eq!(entries[1]["subject"], "first commit");
+
+    // describe rewords HEAD.
+    change_history_call(
+        &tool,
+        serde_json::json!({"action": "describe", "path": ws, "message": "e2e: reworded"}),
+    )
+    .await
+    .expect("describe runs");
+    let out = change_history_call(
+        &tool,
+        serde_json::json!({"action": "log", "path": ws, "limit": 1}),
+    )
+    .await
+    .expect("log runs");
+    assert_eq!(out["data"]["entries"][0]["subject"], "e2e: reworded");
+
+    // undo is an honest refusal on the git backend.
+    let error = change_history_call(&tool, serde_json::json!({"action": "undo", "path": ws}))
+        .await
+        .expect_err("git undo refuses");
+    assert!(error.to_string().contains("operation log"), "{error}");
+
+    host.shutdown().await;
+}
+
+/// The package's Git panel serves a live card through the production panel
+/// seam, and the card's commit action seals a real change.
+#[cfg_attr(
+    windows,
+    ignore = "cordis bridge cannot resolve a drive-letter entry on Windows"
+)]
+#[tokio::test]
+async fn the_change_history_panel_serves_a_live_card_and_commits() {
+    if ferris_sdk::host_runtime::bridge::find_interpreter().is_none() {
+        eprintln!("skipping change-history panel e2e: no Node interpreter");
+        return;
+    }
+    let root = scratch("change-history-panel");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    for args in [
+        vec!["init", "-q"],
+        vec!["symbolic-ref", "HEAD", "refs/heads/main"],
+        vec!["config", "user.name", "E2E"],
+        vec!["config", "user.email", "e2e@example.invalid"],
+        vec!["config", "commit.gpgsign", "false"],
+    ] {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(&args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &root)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+    std::fs::write(workspace.join("README.md"), "seed\n").expect("seed file");
+    for args in [vec!["add", "-A"], vec!["commit", "-qm", "first commit"]] {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(&args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &root)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    let store = ExtensionStore::open(&root).expect("store");
+    let package = store
+        .install(&examples().join("change-history"))
+        .expect("install");
+    grant_all(
+        &store,
+        package.id(),
+        &package.manifest.capabilities.required,
+    );
+    let mut host = ExtensionHost::open(config(&root)).expect("host");
+    let status = host
+        .statuses()
+        .into_iter()
+        .find(|status| status.id == "com.bos.bsh.change-history")
+        .expect("change-history status");
+    assert!(status.applied, "change-history applies: {:?}", status.error);
+    assert!(
+        status.panels.iter().any(|panel| panel.ends_with("__git")),
+        "the Git panel is declared: {:?}",
+        status.panels
+    );
+
+    // The live card comes from the runtime's panel seam, exactly as the UI
+    // fetches it, and validates against the host's UI contract.
+    let surface = host
+        .live_panel("change-history__git")
+        .expect("the panel surface");
+    let value = surface.runtime.panel("git").await.expect("live card");
+    let document: ferris_sdk::ui::UiDocument =
+        serde_json::from_value(value.clone()).expect("card is a UiDocument");
+    let report = document.validate(&package.id().clone());
+    assert!(report.is_valid(), "card validates: {:?}", report.errors);
+    let text = serde_json::to_string(&value).expect("card text");
+    assert!(text.contains("commit"), "the message field acts: {text}");
+    assert!(
+        text.contains("first commit"),
+        "the graph shows history: {text}"
+    );
+
+    // The card's commit action seals a working-tree change.
+    std::fs::write(workspace.join("panel.txt"), "panel\n").expect("write");
+    let context = ferris_sdk::host_runtime::CallContext::new(
+        package.id().clone(),
+        "panel:e2e",
+        Some(workspace.clone()),
+        30_000,
+    );
+    let card = surface
+        .runtime
+        .call_tool(
+            "commit",
+            serde_json::json!({"value": "panel: committed"}),
+            &context,
+        )
+        .await
+        .expect("commit action");
+    let card_text = serde_json::to_string(&card).expect("card text");
+    assert!(
+        card_text.contains("No changes in the working copy"),
+        "the refreshed card is clean: {card_text}"
+    );
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["log", "-1", "--format=%s"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", &root)
+        .output()
+        .expect("git runs");
+    assert_eq!(
+        String::from_utf8_lossy(&log.stdout).trim(),
+        "panel: committed"
+    );
+
+    host.shutdown().await;
+}
+
+/// The same package prefers jj when the workspace is a jj repository, and the
+/// stack operations (new, squash, undo) run through the production path.
+#[cfg_attr(
+    windows,
+    ignore = "cordis bridge cannot resolve a drive-letter entry on Windows"
+)]
+#[tokio::test]
+async fn the_change_history_package_prefers_jj_when_present() {
+    if ferris_sdk::host_runtime::bridge::find_interpreter().is_none() {
+        eprintln!("skipping change-history e2e: no Node interpreter for the cordis bridge");
+        return;
+    }
+    let jj_present = std::process::Command::new("jj")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !jj_present {
+        eprintln!("skipping change-history jj e2e: jj is not installed");
+        return;
+    }
+    let root = scratch("change-history-jj");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&root).expect("root");
+    let init = std::process::Command::new("jj")
+        .args(["git", "init", "workspace"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .output()
+        .expect("jj runs");
+    assert!(
+        init.status.success(),
+        "jj git init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    for [key, value] in [["user.name", "E2E"], ["user.email", "e2e@example.invalid"]] {
+        let config = std::process::Command::new("jj")
+            .args(["config", "set", "--repo", key, value])
+            .current_dir(&workspace)
+            .env("HOME", &root)
+            .output()
+            .expect("jj runs");
+        assert!(
+            config.status.success(),
+            "jj config: {}",
+            String::from_utf8_lossy(&config.stderr)
+        );
+    }
+
+    let (mut host, _applied, tool) = change_history_tool(&root);
+    let ws = workspace.display().to_string();
+
+    // status detects the jj backend.
+    let out = change_history_call(&tool, serde_json::json!({"action": "status", "path": ws}))
+        .await
+        .expect("status runs");
+    assert_eq!(out["backend"], "jj");
+
+    // describe the working copy, then start a new change on top.
+    std::fs::write(workspace.join("a.txt"), "one\n").expect("write");
+    change_history_call(
+        &tool,
+        serde_json::json!({"action": "describe", "path": ws, "message": "e2e: first"}),
+    )
+    .await
+    .expect("describe runs");
+    let out = change_history_call(
+        &tool,
+        serde_json::json!({"action": "new", "path": ws, "message": "e2e: second"}),
+    )
+    .await
+    .expect("new runs");
+    assert_eq!(out["data"]["entries"][0]["description"], "e2e: second");
+
+    // log shows the stack, newest first.
+    let out = change_history_call(
+        &tool,
+        serde_json::json!({"action": "log", "path": ws, "limit": 5}),
+    )
+    .await
+    .expect("log runs");
+    let entries = out["data"]["entries"].as_array().expect("entries");
+    assert_eq!(entries[0]["description"], "e2e: second");
+    assert_eq!(entries[1]["description"], "e2e: first");
+
+    // squash folds the working copy into its parent without opening an editor.
+    std::fs::write(workspace.join("b.txt"), "two\n").expect("write");
+    change_history_call(&tool, serde_json::json!({"action": "squash", "path": ws}))
+        .await
+        .expect("squash runs");
+    let out = change_history_call(
+        &tool,
+        serde_json::json!({"action": "log", "path": ws, "limit": 3}),
+    )
+    .await
+    .expect("log runs");
+    let entries = out["data"]["entries"].as_array().expect("entries");
+    assert_eq!(entries[1]["description"], "e2e: first");
+
+    // undo reverses the last operation.
+    let out = change_history_call(&tool, serde_json::json!({"action": "undo", "path": ws}))
+        .await
+        .expect("undo runs");
+    let text = format!(
+        "{}{}",
+        out["output"].as_str().unwrap_or(""),
+        out["stderr"].as_str().unwrap_or("")
+    );
+    assert!(text.contains("Undid operation"), "{text}");
+
     host.shutdown().await;
 }
 
