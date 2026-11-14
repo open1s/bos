@@ -4162,7 +4162,7 @@ impl Shell {
                 .and_then(|preset| preset.name.clone())
                 .unwrap_or_else(|| match default_named.as_str() {
                     "standard" => tr(lang, "settings.presetStandard").to_string(),
-                    "ptc" => tr(lang, "settings.presetPtc").to_string(),
+                    "federation" | "ptc" => tr(lang, "settings.presetFederation").to_string(),
                     "creator" => tr(lang, "settings.presetCreator").to_string(),
                     "read-only" => tr(lang, "settings.presetReadOnly").to_string(),
                     other => other.to_string(),
@@ -4237,7 +4237,7 @@ impl Shell {
             let builtin = entry.builtin;
             let display = preset.name.clone().unwrap_or_else(|| match name.as_str() {
                 "standard" => tr(lang, "settings.presetStandard").to_string(),
-                "ptc" => tr(lang, "settings.presetPtc").to_string(),
+                "federation" | "ptc" => tr(lang, "settings.presetFederation").to_string(),
                 "creator" => tr(lang, "settings.presetCreator").to_string(),
                 "read-only" => tr(lang, "settings.presetReadOnly").to_string(),
                 _ => name.clone(),
@@ -4247,7 +4247,7 @@ impl Shell {
                 .clone()
                 .unwrap_or_else(|| match name.as_str() {
                     "standard" => tr(lang, "settings.presetStandardHint").to_string(),
-                    "ptc" => tr(lang, "settings.presetPtcHint").to_string(),
+                    "federation" | "ptc" => tr(lang, "settings.presetFederationHint").to_string(),
                     "creator" => tr(lang, "settings.presetCreatorHint").to_string(),
                     "read-only" => tr(lang, "settings.presetReadOnlyHint").to_string(),
                     _ => tr(lang, "settings.presetCustomHint").to_string(),

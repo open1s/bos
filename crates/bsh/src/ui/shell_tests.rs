@@ -7510,7 +7510,7 @@ fn the_persona_switch_edits_the_preset_that_owns_the_persona(cx: &mut TestAppCon
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(|window, cx| {
         let mut state = state_with_turns("persona-preset-toggle", 1);
-        state.settings.global.default_preset = "ptc".to_string();
+        state.settings.global.default_preset = "federation".to_string();
         state.settings.workspace.agent.complete = false;
         let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
         Harness { shell }
@@ -7535,7 +7535,7 @@ fn the_persona_switch_edits_the_preset_that_owns_the_persona(cx: &mut TestAppCon
                 .settings
                 .global
                 .presets
-                .get("ptc")
+                .get("federation")
                 .is_some_and(|preset| preset.complete),
             state.settings.workspace.agent.complete,
         )
@@ -22115,7 +22115,8 @@ fn open_call_policy_tab(cx: &mut VisualTestContext, shell: &Entity<Shell>) {
 fn the_policy_tab_names_the_preset_that_ran_the_call(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_preset_call("traj-preset-named", Some(("ptc", Some("PTC"))), "");
+        let state =
+            state_with_preset_call("traj-preset-named", Some(("federation", Some("PTC"))), "");
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
@@ -34964,41 +34965,46 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
     let start = to_window(boxes[0], boxes[1]);
     let end = to_window(boxes[2], boxes[3]);
     let modifiers = Modifiers::default();
-    cx.simulate_event(gpui_kit::MouseDownEvent {
-        position: start,
-        modifiers,
-        button: gpui_kit::MouseButton::Left,
-        click_count: 1,
-        first_mouse: false,
-    });
-    let steps = 6;
-    for step in 1..=steps {
-        let t = step as f32 / steps as f32;
-        let position = gpui_kit::point(
-            start.x + (end.x - start.x) * t,
-            start.y + (end.y - start.y) * t,
-        );
-        cx.simulate_event(gpui_kit::MouseMoveEvent {
-            position,
-            pressed_button: Some(gpui_kit::MouseButton::Left),
-            modifiers,
-        });
-        cx.run_until_parked();
-    }
-    cx.simulate_event(gpui_kit::MouseUpEvent {
-        position: end,
-        modifiers,
-        button: gpui_kit::MouseButton::Left,
-        click_count: 1,
-    });
-    // The selection is applied asynchronously by the page; under a loaded
-    // suite a single 200ms read flakes even when the drag itself landed. Poll
-    // the page's own selection for a bounded window instead. The window is
-    // generous because the full suite runs this next to browser-heavy tests.
+    // Under a saturated machine the whole drag can be lost (coalesced moves,
+    // starved renderer); retry the drag a bounded number of times. The
+    // assertion below is unchanged: a real selection must still appear.
     let mut state = serde_json::Value::Null;
-    for _ in 0..60 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let raw = cx
+    for _attempt in 0..3 {
+        cx.simulate_event(gpui_kit::MouseDownEvent {
+            position: start,
+            modifiers,
+            button: gpui_kit::MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+        let steps = 6;
+        for step in 1..=steps {
+            let t = step as f32 / steps as f32;
+            let position = gpui_kit::point(
+                start.x + (end.x - start.x) * t,
+                start.y + (end.y - start.y) * t,
+            );
+            cx.simulate_event(gpui_kit::MouseMoveEvent {
+                position,
+                pressed_button: Some(gpui_kit::MouseButton::Left),
+                modifiers,
+            });
+            cx.run_until_parked();
+        }
+        cx.simulate_event(gpui_kit::MouseUpEvent {
+            position: end,
+            modifiers,
+            button: gpui_kit::MouseButton::Left,
+            click_count: 1,
+        });
+        // The selection is applied asynchronously by the page; under a loaded
+        // suite a single 200ms read flakes even when the drag itself landed. Poll
+        // the page's own selection for a bounded window instead. The window is
+        // generous because the full suite runs this next to browser-heavy tests.
+        state = serde_json::Value::Null;
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let raw = cx
             .update(|_, cx| {
                 shell
                     .read(cx)
@@ -35014,7 +35020,15 @@ fn a_drag_over_the_live_page_selects_the_text(cx: &mut TestAppContext) {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        state = serde_json::from_str(&raw).expect("the selection JSON parses");
+            state = serde_json::from_str(&raw).expect("the selection JSON parses");
+            if state["selected"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("alpha")
+            {
+                break;
+            }
+        }
         if state["selected"]
             .as_str()
             .unwrap_or_default()

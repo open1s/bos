@@ -172,7 +172,7 @@ The file's own existence is a policy input, not a detail:
 
 | state | data | reach |
 |---|---|---|
-| **ABSENT** - no file | `egress_unrestricted = true` | **UNRESTRICTED**: any address, hostname and port. This is the fresh-workspace state; the network works out of the box, and Standard/PTC inherit it. |
+| **ABSENT** - no file | `egress_unrestricted = true` | **UNRESTRICTED**: any address, hostname and port. This is the fresh-workspace state; the network works out of the box, and Standard/Federation inherit it. |
 | **PRESENT, no rule** - only comments/blanks | all lists empty, `egress_unrestricted = false` | **DENY ALL**: the reader created the file and left it empty, which is a deliberate lockdown. |
 | **PRESENT with rules** | the classified lists | **ALLOWLIST**: exactly the doors the rules name. |
 
@@ -363,16 +363,18 @@ Shipped presets:
 
 - standard: the default everyday coding mode; shell, files and plan, inherit
   the session permission and workspace policy, deny secrets and Git internals.
-- ptc: all Standard capabilities plus parallel_tool_calls and a batch-call
+  Keeps the federation queries but not distributed delegation.
+- federation (legacy id `ptc`, still loads): all Standard capabilities plus
+  parallel_tool_calls, distributed federation delegation, and a batch-call
   persona (filter, organize, deduplicate, count, summarize).
 - creator: all Standard capabilities plus an extension-authoring persona; writes
   extension packages, skills and presets inside the workspace.
 - read-only: read the workspace and search the web; no writes, shell, MCP or
   extensions.
 
-PTC and Creator are bsh behaviours, not host-plane runtimes: PTC uses parallel
-tool calls and a batch persona, Creator uses workspace writes and an
-extension-authoring persona.
+Federation and Creator are bsh behaviours, not host-plane runtimes: Federation
+uses parallel tool calls, distributed delegation and a batch persona, Creator
+uses workspace writes and an extension-authoring persona.
 
 The Agent presets pane is DSH-shaped: a two-column Built-in grid, a Custom
 section below, and a compact no-preset row above it. Each card shows its name,

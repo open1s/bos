@@ -4508,7 +4508,13 @@ impl AppState {
             .and_then(|preset| preset.name)
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| id.to_string())
+            .unwrap_or_else(|| match id {
+                "standard" => crate::i18n::tr(self.lang, "settings.presetStandard"),
+                "federation" | "ptc" => crate::i18n::tr(self.lang, "settings.presetFederation"),
+                "creator" => crate::i18n::tr(self.lang, "settings.presetCreator"),
+                "read-only" => crate::i18n::tr(self.lang, "settings.presetReadOnly"),
+                other => other.to_string(),
+            })
     }
     /// Re-read the denial ring and counters into the pane's snapshot.
     pub(crate) fn refresh_policy_audit(&mut self) {

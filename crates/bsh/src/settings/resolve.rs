@@ -436,6 +436,8 @@ pub(crate) struct Resolution {
     pub(crate) preset_web_search: Option<bool>,
     /// Parallel tool-call override.
     pub(crate) preset_parallel_tool_calls: Option<bool>,
+    /// Distributed-delegation override; none allows it.
+    pub(crate) preset_distributed_delegate: Option<bool>,
     /// MCP tool allowlist, or none for every tool of the allowed servers.
     pub(crate) preset_mcp_tools: Option<Vec<String>>,
     /// Binary-shipped Rego module ids.
@@ -681,6 +683,9 @@ pub(crate) fn resolve_with_catalogue(
         preset_parallel_tool_calls: preset
             .as_ref()
             .and_then(|preset| preset.parallel_tool_calls),
+        preset_distributed_delegate: preset
+            .as_ref()
+            .and_then(|preset| preset.distributed_delegate),
         preset_mcp_tools: preset.as_ref().and_then(|preset| preset.mcp_tools.clone()),
         preset_builtin_policy: preset
             .as_ref()
@@ -1848,7 +1853,7 @@ mcp_servers = [
         ids.sort();
         assert_eq!(
             ids,
-            vec!["creator", "ptc", "read-only", "standard", "tight"],
+            vec!["creator", "federation", "read-only", "standard", "tight"],
             "the roster carries what the binary ships plus what was declared"
         );
         assert!(

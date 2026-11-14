@@ -471,7 +471,7 @@ workspace flag behind. The build reports `persona_complete`,
 
 **Preset personas carry the stance.** The workflow contract is a layer, and a
 preset persona is the slot closest to the model's sense of who it is, so the
-three shipped personas that override it (PTC, Creator, Read-only) end with
+three shipped personas that override it (Federation, Creator, Read-only) end with
 `ACTION_FIRST_PERSONA` (~330 bytes): work first, report briefly, answer a
 repository question from gathered evidence. Standard ships no persona and
 therefore inherits the framework contract unchanged.

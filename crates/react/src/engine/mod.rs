@@ -14,6 +14,14 @@ use async_stream::stream;
 use bus::Bus;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
+
+/// How many calls of one batch run at once.
+///
+/// An unbounded join_all let a fifty-call response spawn fifty shells at
+/// once; a bounded window overlaps the waits that dominate a batch without
+/// stampeding the machine or the provider's rate limits. Results keep the
+/// model's order (`buffered`, not `buffer_unordered`).
+pub const TOOL_BATCH_CONCURRENCY: usize = 8;
 use log::info;
 use serde_json::Value;
 use std::pin::Pin;
@@ -854,11 +862,25 @@ impl<A: ReActApp> ReActEngine<A> {
                                 if self.parallel_tool_calls && batch.len() > 1 {
                                     let batch_started = Instant::now();
                                     let this: &Self = &*self;
+                                    // A semaphore bounds the window instead of a
+                                    // stream combinator: join_all keeps the
+                                    // model's order and a plain async-block
+                                    // future type, which nests inside hosts'
+                                    // own spawns without tripping rustc's
+                                    // higher-ranked lifetime limitation.
+                                    let window = std::sync::Arc::new(tokio::sync::Semaphore::new(
+                                        TOOL_BATCH_CONCURRENCY,
+                                    ));
                                     let joined = futures::future::join_all(batch.iter_mut().map(
                                         |entry: &mut (String, String, serde_json::Value)| {
+                                            let window = window.clone();
                                             let (name, call_id, args) =
                                                 (&entry.0, &entry.1, &mut entry.2);
                                             async move {
+                                                let _permit = window
+                                                    .acquire()
+                                                    .await
+                                                    .expect("the batch window stays open");
                                                 this.run_tool_resilient(name, args, call_id).await
                                             }
                                         },

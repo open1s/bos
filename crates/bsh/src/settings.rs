@@ -263,6 +263,8 @@ pub(crate) struct Effective {
     pub(crate) preset_web_search: Option<bool>,
     /// Parallel tool-call override.
     pub(crate) preset_parallel_tool_calls: Option<bool>,
+    /// Whether the turn may delegate work to federation peers.
+    pub(crate) distributed_delegate: bool,
     /// MCP tool allowlist, or none for every tool of the allowed servers.
     pub(crate) preset_mcp_tools: Option<Vec<String>>,
     /// Binary-shipped Rego module ids.
@@ -1026,6 +1028,7 @@ impl Settings {
             preset_egress: resolution.preset_egress,
             preset_web_search: resolution.preset_web_search,
             preset_parallel_tool_calls: resolution.preset_parallel_tool_calls,
+            distributed_delegate: resolution.preset_distributed_delegate.unwrap_or(true),
             preset_mcp_tools: resolution.preset_mcp_tools,
             preset_builtin_policy: resolution.preset_builtin_policy,
             preset_policy_mode: resolution.preset_policy_mode,

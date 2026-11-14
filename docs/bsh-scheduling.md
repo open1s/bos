@@ -46,7 +46,7 @@ Rules worth knowing:
 - The tools are attached to a writable turn (Read Only never schedules) and
   each answers to the reader's own per-tool switch, so a switch in the Tools
   pane removes exactly that tool.
-- They mount through a `schedule` bundle: the shipped `standard`, `ptc` and
+- They mount through a `schedule` bundle: the shipped `standard`, `federation` and
   `creator` presets list it, and a custom preset opts in by adding
   `schedule` to its `plugins`. Turning the bundle off in Settings >
   Extensions removes all four at once.
@@ -88,7 +88,7 @@ Consequences worth stating:
 
 ## Federation, scheduled
 
-The shipped `standard`, `ptc` and `creator` presets mount the `federation`
+The shipped `standard`, `federation` and `creator` presets mount the `federation`
 bundle, so their turns carry `federation_status`, `federation_peers`,
 `federation_delegate`, `federation_cancel`, `federation_query` and
 `federation_cleanup`. Only `federation_status` rides every request: it is

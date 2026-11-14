@@ -751,7 +751,8 @@ mod tests {
                 react::LlmMessage::User { content }
                     if content
                         .as_text()
-                        .is_some_and(|text| text.starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE))
+                        .is_some_and(|text| text.starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE)
+                            || text.starts_with(crate::context::TIME_CONTEXT_PREAMBLE))
             )),
             "only the injected frame precedes the checkpoint: {messages:?}"
         );
@@ -880,11 +881,20 @@ mod tests {
         );
         drain(receiver);
         let rows = seen.lock().unwrap().clone();
-        assert_eq!(rows.len(), 3, "snapshot, instructions, input: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            4,
+            "snapshot, time, instructions, input: {rows:?}"
+        );
         assert!(
             rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE),
             "the first user message is the snapshot: {}",
             rows[0]
+        );
+        assert!(
+            rows[1].starts_with(crate::context::TIME_CONTEXT_PREAMBLE),
+            "the time-context follows the snapshot: {}",
+            rows[1]
         );
         assert!(
             rows[0].contains(&format!("Current working directory: {root:?}.")),
@@ -895,11 +905,11 @@ mod tests {
         assert!(rows[0].contains("Permission: workspace-write."));
         assert!(rows[0].contains("Agent preset: standard."));
         assert!(
-            rows[1].contains("Instructions from: AGENTS.md") && rows[1].contains("workspace rule"),
-            "the instruction message follows the snapshot: {}",
-            rows[1]
+            rows[2].contains("Instructions from: AGENTS.md") && rows[2].contains("workspace rule"),
+            "the instruction message follows the frame: {}",
+            rows[2]
         );
-        assert_eq!(rows[2], "go", "the reader's line is last");
+        assert_eq!(rows[3], "go", "the reader's line is last");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -936,9 +946,10 @@ mod tests {
         );
         drain(receiver);
         let rows = seen.lock().unwrap().clone();
-        assert_eq!(rows.len(), 2, "snapshot and input only: {rows:?}");
+        assert_eq!(rows.len(), 3, "snapshot, time and input only: {rows:?}");
         assert!(rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE));
-        assert_eq!(rows[1], "go");
+        assert!(rows[1].starts_with(crate::context::TIME_CONTEXT_PREAMBLE));
+        assert_eq!(rows[2], "go");
         assert!(
             rows.iter().all(|row| !row.is_empty()),
             "no empty injected message: {rows:?}"
@@ -973,7 +984,7 @@ mod tests {
         ));
         assert!(result.is_ok(), "the child turn runs: {result:?}");
         let rows = seen.lock().unwrap().clone();
-        assert_eq!(rows.len(), 2, "snapshot and input: {rows:?}");
+        assert_eq!(rows.len(), 3, "snapshot, time and input: {rows:?}");
         assert!(rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE));
         assert!(
             rows[0].contains(crate::context::SUBAGENT_CONTEXT),
@@ -981,7 +992,8 @@ mod tests {
             rows[0]
         );
         assert!(rows[0].contains("Permission: workspace-write."));
-        assert_eq!(rows[1], "do the task");
+        assert!(rows[1].starts_with(crate::context::TIME_CONTEXT_PREAMBLE));
+        assert_eq!(rows[2], "do the task");
 
         // The live child transcript is what the pane draws; the injected
         // snapshot is not a row of the child's own conversation.
@@ -1148,13 +1160,14 @@ mod tests {
         );
         drain(receiver);
         let rows = seen.lock().unwrap().clone();
-        assert_eq!(rows.len(), 3, "snapshot, history, input: {rows:?}");
+        assert_eq!(rows.len(), 4, "snapshot, time, history, input: {rows:?}");
         assert!(
             rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE),
             "the frame is the first message: {rows:?}"
         );
-        assert_eq!(rows[1], "earlier line", "the replayed history follows it");
-        assert_eq!(rows[2], "now", "the reader's line comes last");
+        assert!(rows[1].starts_with(crate::context::TIME_CONTEXT_PREAMBLE));
+        assert_eq!(rows[2], "earlier line", "the replayed history follows it");
+        assert_eq!(rows[3], "now", "the reader's line comes last");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

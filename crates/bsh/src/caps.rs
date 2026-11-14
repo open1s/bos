@@ -1331,6 +1331,11 @@ fn build_agent_for_session_inner(
             {
                 continue;
             }
+            // Standard keeps the federation queries but not distributed
+            // delegation; the Federation preset grants it.
+            if !eff.distributed_delegate && name == "federation_delegate" {
+                continue;
+            }
             if off_tool(&name) {
                 continue;
             }
@@ -7479,6 +7484,46 @@ mod tests {
     }
 
     /// Every tool name a finished build registered, sorted.
+    /// The legacy `ptc` id still loads, as the Federation preset.
+    #[test]
+    fn the_legacy_ptc_id_loads_as_federation() {
+        let mut settings = bare();
+        settings.global.default_preset = "ptc".to_string();
+        assert!(crate::settings::global::ships_preset("ptc"));
+        let built = build(&settings);
+        assert!(built.agent.config().parallel_tool_calls);
+        assert!(built
+            .agent
+            .config()
+            .system_prompt
+            .contains(crate::prompts::FEDERATION_PERSONA));
+    }
+
+    /// Standard keeps the federation queries but not distributed delegation;
+    /// the Federation preset grants the delegate.
+    #[test]
+    fn standard_withholds_distributed_delegate_and_federation_grants_it() {
+        let mut settings = bare();
+        settings.global.federation.enabled = true;
+        let standard = build(&settings);
+        let names = tool_names(&standard);
+        assert!(
+            names.iter().any(|n| n == "federation_status"),
+            "the queries stay: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "federation_delegate"),
+            "Standard must not delegate to peers: {names:?}"
+        );
+        settings.global.default_preset = "federation".to_string();
+        let federated = build(&settings);
+        let names = tool_names(&federated);
+        assert!(
+            names.iter().any(|n| n == "federation_delegate"),
+            "Federation grants the delegate: {names:?}"
+        );
+    }
+
     fn tool_names(built: &BuiltAgent) -> Vec<String> {
         let mut names = built
             .agent
@@ -7626,7 +7671,7 @@ mod tests {
 
         // A preset's own persona wins over BOTH.
         settings.workspace.agent.system_prompt = String::new();
-        settings.global.default_preset = "ptc".to_string();
+        settings.global.default_preset = "federation".to_string();
         let built = build(&settings);
         assert_ne!(
             built.agent.config().system_prompt,
@@ -7635,11 +7680,11 @@ mod tests {
         );
         let prompt = &built.agent.config().system_prompt;
         assert!(
-            prompt.contains(crate::prompts::PTC_PERSONA),
+            prompt.contains(crate::prompts::FEDERATION_PERSONA),
             "and it is the preset's own persona, in the persona slot"
         );
         assert!(
-            prompt.find(agent::HARNESS_IDENTITY) < prompt.find(crate::prompts::PTC_PERSONA),
+            prompt.find(agent::HARNESS_IDENTITY) < prompt.find(crate::prompts::FEDERATION_PERSONA),
             "the persona slot follows the identity"
         );
         assert!(
@@ -7859,8 +7904,8 @@ mod tests {
     fn the_shipped_personas_are_pinned_and_keep_their_bullets() {
         let roster: [(&str, &str, &[&str]); 3] = [
             (
-                "ptc",
-                crate::prompts::PTC_PERSONA,
+                "federation",
+                crate::prompts::FEDERATION_PERSONA,
                 &[
                     "Plan the batches first",
                     "Never serialize what can be batched",
@@ -7908,13 +7953,13 @@ mod tests {
         }
     }
 
-    /// Standard and PTC ALLOW NETWORK AND WEB SEARCH BY DEFAULT. Proved through
+    /// Standard and Federation ALLOW NETWORK AND WEB SEARCH BY DEFAULT. Proved through
     /// the build and a REAL shell, on a fresh workspace with NO `.bsh/egress-allowlist`:
     /// the command reaches a local endpoint, the result reports
     /// `network: "unrestricted"`, and the derived spec is the unrestricted state
     /// rather than an empty-list deny.
     #[test]
-    fn standard_and_ptc_allow_network_and_search_by_default() {
+    fn standard_and_federation_allow_network_and_search_by_default() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let Some(host) = lan_address() else {
             eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
@@ -7927,7 +7972,7 @@ mod tests {
             !egress_allowlist_path(&root).exists(),
             "the premise: a fresh workspace has no allowlist file"
         );
-        for id in ["standard", "ptc"] {
+        for id in ["standard", "federation"] {
             let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
             let port = listener.local_addr().expect("its port").port();
             let hits = std::sync::Arc::new(AtomicUsize::new(0));
@@ -7998,7 +8043,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A Standard/PTC turn on a fresh workspace (NO allowlist file) reaches an
+    /// A Standard/Federation turn on a fresh workspace (NO allowlist file) reaches an
     /// HTTP endpoint THROUGH heel's proxy: the listener counts the request, the
     /// response comes back, and the result reports the absent-file state,
     /// `unrestricted`.
@@ -8008,13 +8053,13 @@ mod tests {
     /// localhost:<proxy port> is granted, and `curl` uses the proxy it is
     /// handed.
     #[test]
-    fn standard_and_ptc_reach_http_through_the_heel_proxy() {
+    fn standard_and_federation_reach_http_through_the_heel_proxy() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let Some(host) = lan_address() else {
             eprintln!("no non-loopback IPv4 address on this host; the proxy probe needs one");
             return;
         };
-        for id in ["standard", "ptc"] {
+        for id in ["standard", "federation"] {
             let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
             let port = listener.local_addr().expect("its port").port();
             let hits = std::sync::Arc::new(AtomicUsize::new(0));
@@ -8084,13 +8129,13 @@ mod tests {
     /// sandbox proxy, not a direct socket: the ICMP test beside it pins that a
     /// direct socket has no path.
     #[test]
-    fn standard_and_ptc_reach_a_non_listed_tcp_endpoint_through_the_connect_tunnel() {
+    fn standard_and_federation_reach_a_non_listed_tcp_endpoint_through_the_connect_tunnel() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let Some(host) = lan_address() else {
             eprintln!("no non-loopback IPv4 address on this host; the tunnel probe needs one");
             return;
         };
-        for id in ["standard", "ptc"] {
+        for id in ["standard", "federation"] {
             let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
             let port = listener.local_addr().expect("its port").port();
             let hits = std::sync::Arc::new(AtomicUsize::new(0));
@@ -8168,8 +8213,8 @@ mod tests {
     /// showing the unproxied-socket diagnostic.
     #[cfg(target_os = "macos")]
     #[test]
-    fn standard_and_ptc_deny_icmp_even_when_egress_is_unrestricted() {
-        for id in ["standard", "ptc"] {
+    fn standard_and_federation_deny_icmp_even_when_egress_is_unrestricted() {
+        for id in ["standard", "federation"] {
             let root = scratch(&format!("icmp-{id}"));
             assert!(
                 !egress_allowlist_path(&root).exists(),
@@ -8852,7 +8897,6 @@ mod tests {
                 "federation_cancel".to_string(),
                 "federation_capabilities".to_string(),
                 "federation_cleanup".to_string(),
-                "federation_delegate".to_string(),
                 "federation_peers".to_string(),
                 "federation_query".to_string(),
                 "federation_status".to_string(),
@@ -8877,7 +8921,8 @@ mod tests {
             ],
             "Workspace Write carries the whole shell family, including the \
              job tools its own read-write turn may start, the federation \
-             family, the automation-task tools and the surface family"
+             queries (Standard withholds distributed delegation), the \
+             automation-task tools and the surface family"
         );
         assert_eq!(
             names(&read_only),
@@ -12025,24 +12070,24 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "the generated preset permission policy denies writes"
         );
 
-        // PTC is the batch-tool mode: parallel calls plus its instruction.
-        settings.global.default_preset = "ptc".to_string();
+        // Federation is the batch-tool mode: parallel calls plus its instruction.
+        settings.global.default_preset = "federation".to_string();
         let built = build(&settings);
         assert!(
             built.agent.config().parallel_tool_calls,
-            "PTC enables parallel calls"
+            "Federation enables parallel calls"
         );
         assert!(
             tool_names(&built).iter().any(|name| name == "web_search"),
-            "PTC keeps web search"
+            "Federation keeps web search"
         );
         assert!(
             built
                 .agent
                 .config()
                 .system_prompt
-                .contains(crate::prompts::PTC_PERSONA),
-            "PTC carries its batch-call persona"
+                .contains(crate::prompts::FEDERATION_PERSONA),
+            "Federation carries its batch-call persona"
         );
 
         // Creator is the extension-authoring mode.
@@ -12615,20 +12660,21 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let _ = ScheduleQueue::global().drain();
     }
 
-    /// The shipped everyday presets carry the federation family. It is
+    /// The shipped everyday presets carry the federation QUERIES. They are
     /// CALLABLE through `find_tool` without riding every request, and the
-    /// Extensions switch still closes it.
+    /// Extensions switch still closes them. Standard withholds distributed
+    /// delegation; the Federation preset grants it (proved separately).
     #[test]
     fn the_standard_preset_offers_the_federation_tools() {
         let built = build(&bare());
         let names = tool_names(&built);
-        for name in [
-            "federation_status",
-            "federation_peers",
-            "federation_delegate",
-        ] {
+        for name in ["federation_status", "federation_peers"] {
             assert!(names.iter().any(|tool| tool == name), "{name}: {names:?}");
         }
+        assert!(
+            !names.iter().any(|tool| tool == "federation_delegate"),
+            "Standard keeps delegation on this node: {names:?}"
+        );
         let advertised: Vec<String> = built
             .agent
             .model_tools()
@@ -13765,7 +13811,13 @@ id = "zen"
                 ..Preset::default()
             },
         );
-        for id in ["standard", "ptc", "creator", "read-only", "heel-probe"] {
+        for id in [
+            "standard",
+            "federation",
+            "creator",
+            "read-only",
+            "heel-probe",
+        ] {
             settings.global.default_preset = id.to_string();
             settings.global.general.sandbox_enabled = None;
             let on = settings.effective();
@@ -14027,7 +14079,7 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The inherited FULL-ACCESS arm as a user meets it: PTC declares no sandbox
+    /// The inherited FULL-ACCESS arm as a user meets it: Federation declares no sandbox
     /// field, so the shell is handed `workspace_root: None` and its cwd is the
     /// app's launch directory, NOT the workspace. The policy must permit that
     /// spawn by TIER (`spawn-shell-full-access`); a path-only policy refused
@@ -14037,12 +14089,12 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
         let root = scratch("full-access-inherited-spawn");
         let mut settings = rooted(&root);
         settings.workspace.agent.permission = FULL_ACCESS.to_string();
-        settings.global.default_preset = "ptc".to_string();
+        settings.global.default_preset = "federation".to_string();
         let resolved = settings.effective();
         assert_eq!(resolved.permission.effective, FULL_ACCESS);
         assert!(
             !resolved.sandbox.heel && !resolved.sandbox.off_by_preset,
-            "the premise: PTC inherits, so the shell is released with no root"
+            "the premise: Federation inherits, so the shell is released with no root"
         );
         let built = build(&settings);
         assert_eq!(built.policy.data().permission, FULL_ACCESS);
@@ -14058,7 +14110,7 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
         let decision = built.policy.check(
             &PolicyInput::new("bash", Action::Spawn, Target::path(&launch))
                 .with_session("session")
-                .with_preset("ptc"),
+                .with_preset("federation"),
         );
         assert!(
             decision.is_allowed(),
@@ -14184,7 +14236,7 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
     #[test]
     fn the_shipped_presets_keep_their_sandbox_behaviour() {
         let mut settings = bare();
-        for id in ["standard", "ptc", "creator", "read-only"] {
+        for id in ["standard", "federation", "creator", "read-only"] {
             let preset = settings
                 .global
                 .preset(id)

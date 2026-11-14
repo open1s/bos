@@ -179,11 +179,11 @@ pub(crate) fn stale_tool_reference(text: &str) -> Option<&'static str> {
         .find(|needle| text.contains(needle))
 }
 
-/// The shipped `ptc` preset persona.
+/// The shipped `federation` preset persona (legacy id `ptc`).
 ///
-/// BSH's `ptc` is its parallel-call preset, not the reference's programmatic
+/// BSH's `federation` (legacy id `ptc`) is its batch-and-delegate preset, not the reference's programmatic
 /// tool-calling mode; the wording says what this preset actually does.
-pub(crate) const PTC_PERSONA: &str = "You execute work in batched steps: every independent call rides in ONE step, and you read each batch's results before the next step depends on them.\n\n- Read the intent before batching: a batch that answers the wrong question is fast and useless.
+pub(crate) const FEDERATION_PERSONA: &str = "You execute work in batched steps: every independent call rides in ONE step, and you read each batch's results before the next step depends on them.\n\n- Read the intent before batching: a batch that answers the wrong question is fast and useless.
 - Plan the batches first: what is independent, what depends on what, and what the answer needs from each batch.\n- Never serialize what can be batched; never batch a call that needs a result you have not read yet.\n- Let the tools do the work: filter, deduplicate, count and compare inside the batch, then report only what the answer needs.\n- Hold the same engineering discipline as the default persona: smallest sufficient change, workspace conventions, verify and report honestly.";
 
 /// The shipped `creator` preset persona.
@@ -358,7 +358,7 @@ mod tests {
     /// optimizes the wrong question.
     #[test]
     fn the_parallel_preset_reads_intent_before_batching() {
-        assert!(PTC_PERSONA.contains("Read the intent before batching"));
+        assert!(FEDERATION_PERSONA.contains("Read the intent before batching"));
     }
 
     #[test]
@@ -391,7 +391,7 @@ mod tests {
             LIST_DIR,
             WEB_SEARCH,
             SUBAGENT_GUIDANCE,
-            PTC_PERSONA,
+            FEDERATION_PERSONA,
             CREATOR_PERSONA,
             READ_ONLY_PERSONA,
             ACTION_FIRST_PERSONA,
@@ -462,7 +462,7 @@ mod tests {
             None
         );
         for persona in [
-            PTC_PERSONA,
+            FEDERATION_PERSONA,
             CREATOR_PERSONA,
             READ_ONLY_PERSONA,
             ACTION_FIRST_PERSONA,
@@ -475,7 +475,7 @@ mod tests {
     /// and Standard keeps the framework contract by shipping no persona at all.
     #[test]
     fn shipped_personas_end_with_the_action_first_stance() {
-        for body in [PTC_PERSONA, CREATOR_PERSONA, READ_ONLY_PERSONA] {
+        for body in [FEDERATION_PERSONA, CREATOR_PERSONA, READ_ONLY_PERSONA] {
             let composed = preset_persona(body);
             assert_eq!(
                 composed,

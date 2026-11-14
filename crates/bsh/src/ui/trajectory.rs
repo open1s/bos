@@ -3282,10 +3282,16 @@ mod tests {
     /// permission that was in force when it ran.
     #[test]
     fn a_call_with_no_refusal_reads_as_allowed() {
-        let verdict = verdict_for("read_file", "/w/src/main.rs", "workspace-write", "ptc", &[]);
+        let verdict = verdict_for(
+            "read_file",
+            "/w/src/main.rs",
+            "workspace-write",
+            "federation",
+            &[],
+        );
         assert!(verdict.allowed);
         assert_eq!(verdict.permission, "workspace-write");
-        assert_eq!(verdict.preset, "ptc");
+        assert_eq!(verdict.preset, "federation");
         assert_eq!(verdict.action, "read");
         assert_eq!(verdict.target, "/w/src/main.rs");
         assert!(verdict.rule.is_none() && verdict.reason.is_none());
@@ -3308,7 +3314,7 @@ mod tests {
             "write_file",
             "/w/src/main.rs",
             "read-only",
-            "ptc",
+            "federation",
             &refusals,
         );
         assert!(!verdict.allowed);
@@ -3338,15 +3344,21 @@ mod tests {
             "write_file",
             "/w/public.txt",
             "workspace-write",
-            "ptc",
+            "federation",
             &refusals,
         );
         assert!(other.allowed, "another path is not this refusal");
         assert_eq!(
-            other.preset, "ptc",
+            other.preset, "federation",
             "an allowed call takes the caller's fallback"
         );
-        let same = verdict_for("write_file", "/w/secret.txt", "read-only", "ptc", &refusals);
+        let same = verdict_for(
+            "write_file",
+            "/w/secret.txt",
+            "read-only",
+            "federation",
+            &refusals,
+        );
         assert!(!same.allowed);
     }
 
@@ -3363,7 +3375,13 @@ mod tests {
             rule: Some("deny-spawn".to_string()),
             reason: None,
         }];
-        let read = verdict_for("read_file", "/w/src/main.rs", "read-only", "ptc", &refusals);
+        let read = verdict_for(
+            "read_file",
+            "/w/src/main.rs",
+            "read-only",
+            "federation",
+            &refusals,
+        );
         assert!(read.allowed, "a spawn refusal is not a read refusal");
     }
     /// `Turns` folds a turn to its first content row plus one summary row

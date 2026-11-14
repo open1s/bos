@@ -468,7 +468,7 @@ mod tests {
     /// The level table, measured from what each shipped preset actually allows.
     ///
     /// read-only denies writes and the shell and denies local egress - grade 1.
-    /// standard, ptc and creator declare NO ceiling and keep the shell, so the
+    /// standard, federation and creator declare NO ceiling and keep the shell, so the
     /// session tier decides - they are one grade, 2, and inventing a different
     /// one would contradict the code. The deriving rule points the same way.
     #[test]
@@ -476,7 +476,7 @@ mod tests {
         let table: [(&str, u8, Option<&str>, bool, bool); 4] = [
             ("read-only", 1, Some("read-only"), false, true),
             ("standard", 2, None, true, false),
-            ("ptc", 2, None, true, false),
+            ("federation", 2, None, true, false),
             ("creator", 2, None, true, false),
         ];
         for (id, level, permission, shell, egress_denied) in table {
@@ -513,13 +513,13 @@ mod tests {
         }
     }
 
-    /// The absent fields behave exactly as before: standard, ptc and creator
+    /// The absent fields behave exactly as before: standard, federation and creator
     /// resolve to "the workspace" for reads and writes, while read-only keeps
     /// its declared read root and its empty write list.
     #[test]
     fn an_absent_scope_still_resolves_to_the_whole_workspace() {
         let workspace = EgressReach::Unrestricted;
-        for id in ["standard", "ptc", "creator"] {
+        for id in ["standard", "federation", "creator"] {
             let scope = ResolvedPresetScope::resolve(&shipped(id), "workspace-write", &workspace);
             assert_eq!(scope.read, ScopeReach::Workspace, "{id} read");
             assert_eq!(scope.write, ScopeReach::Workspace, "{id} write");

@@ -210,10 +210,11 @@ starts at byte 16 and the file data begins at `8 + u32[4]`)
 - "Declare several presets and **let sessions select one**", and `config.id` is
   "the preset identity **saved by sessions**" - which is why `active_preset`
   moved off the workspace and onto the session.
-- Four ship: `standard`, `ptc`, `minimal`, `cordis`. Only the first two
-  ship here: `ptc` mounts a host-plane PTC runtime this deployment composes
-  nowhere, and `cordis` is a Cordis plugin composition with no counterpart.
-  Shipping either would be a name with nothing behind it.
+- The reference ships `standard`, `ptc`, `minimal`, `cordis`. BSH ships
+  `standard`, `federation` (the legacy `ptc` id loads as an alias), `creator`
+  and `read-only`: `minimal` mounts a host-plane PTC runtime this deployment
+  composes nowhere, and `cordis` is a Cordis plugin composition with no
+  counterpart. Shipping either would be a name with nothing behind it.
 - A shipped preset **publishes no `name`**; the dictionaries carry its copy. A
   declaration that names itself owns its copy and is never translated.
 - "A user override replaces the complete child list and does not automatically

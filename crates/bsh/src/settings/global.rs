@@ -1320,7 +1320,7 @@ where
             let level = match value.trim() {
                 "inspect" => 0,
                 "read-only" | "review" | "research" => 1,
-                "standard" | "code" | "ptc" | "creator" | "docs" => 2,
+                "standard" | "code" | "ptc" | "federation" | "creator" | "docs" => 2,
                 "elevated" => 3,
                 "admin" | "full-access" => 4,
                 other => {
@@ -1420,9 +1420,13 @@ pub(crate) struct Preset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) web_search: Option<bool>,
     /// Whether the turn may issue tool calls in parallel. None inherits the
-    /// workspace/model setting; PTC sets it true.
+    /// workspace/model setting; Federation sets it true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parallel_tool_calls: Option<bool>,
+    /// Whether the turn may delegate work to federation peers. None allows it
+    /// (the legacy behaviour); Standard sets it false, Federation true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) distributed_delegate: Option<bool>,
     /// Optional MCP tool allowlist, in namespace_tool form. None allows every
     /// tool of the allowed servers; an empty list allows none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1500,7 +1504,7 @@ impl Preset {
     /// |---|---|---|
     /// | 0 | - | nothing: no bundles, tools, MCP servers, extensions, reads, writes, egress or hosted search |
     /// | 1 | read-only | reads the workspace (or its declared read scope); no writes, no shell, no local egress |
-    /// | 2 | standard, ptc, creator | the session tier capped by the preset: workspace writes and a confined shell |
+    /// | 2 | standard, federation, creator | the session tier capped by the preset: workspace writes and a confined shell |
     /// | 3 | - | a full-access CEILING with `sandbox = "heel"`: the tier is released but the shell stays confined |
     /// | 4 | - | a full-access ceiling with the shell released (`sandbox` absent or `none`) |
     pub(crate) fn derived_level(&self) -> u8 {
@@ -1585,7 +1589,7 @@ impl Preset {
              # 0 inspect: grants nothing. 1 read-only: reads the workspace, no\n\
              # writes, no shell, no local egress. 2 standard: the session tier\n\
              # capped here, workspace writes and a confined shell (standard,\n\
-             # ptc, creator). 3 elevated: a full-access ceiling with a confined\n\
+             # federation, creator). 3 elevated: a full-access ceiling with a confined\n\
              # shell. 4 full-access: a full-access ceiling with the shell\n\
              # released. Unset DERIVES the level from these fields.\n",
         );
@@ -1674,6 +1678,12 @@ impl Preset {
             "parallel_tool_calls",
             self.parallel_tool_calls,
             "false",
+        );
+        push_optional_bool(
+            &mut out,
+            "distributed_delegate",
+            self.distributed_delegate,
+            "true",
         );
         out.push('\n');
 
@@ -1819,11 +1829,20 @@ fn push_policy(out: &mut String, policy: Option<&str>) {
 /// The presets the binary itself ships, as (id, mounted plugins).
 ///
 /// The reference ships four - `standard`, `ptc`, `minimal` and
-/// `cordis`. Only the two with backing here are shipped: `ptc` mounts
-/// against a host-plane PTC runtime this deployment composes nowhere, and
-/// `cordis` is a Cordis plugin composition with no counterpart, so shipping
-/// either would be a name with nothing behind it.
-const BUILT_IN_PRESET_IDS: &[&str] = &["standard", "ptc", "creator", "read-only"];
+/// `cordis`. BSH's batch-and-delegate preset is named `federation` (the
+/// legacy id `ptc` still loads as an alias); `minimal` and `cordis` mount
+/// against host planes this deployment composes nowhere, so shipping either
+/// would be a name with nothing behind it.
+const BUILT_IN_PRESET_IDS: &[&str] = &["standard", "federation", "creator", "read-only"];
+
+/// The canonical id of a preset: the legacy `ptc` name loads as
+/// `federation`, so an older settings file keeps its preset.
+pub(crate) fn canonical_preset_id(id: &str) -> &str {
+    match id.trim() {
+        "ptc" => "federation",
+        other => other,
+    }
+}
 
 /// The sensitive path prefixes every shipped narrow preset denies.
 fn preset_deny_paths() -> Vec<String> {
@@ -1869,6 +1888,7 @@ fn preset_deny_paths() -> Vec<String> {
 /// intersected with the workspace allowlist, never unioned with it, so a preset
 /// can narrow the workspace's reach and never widen it.
 pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
+    let id = canonical_preset_id(id);
     // Federation rides the everyday presets: its node is on by default (it
     // only answers enrolled peers), and a model that cannot see the delegation
     // tools cannot use the feature at all. A preset that wants a turn with no
@@ -1908,10 +1928,14 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
             // for, so the Details row shows the grant instead of a reader
             // inferring it from a switch somewhere else.
             web_search: Some(true),
+            // Standard keeps the federation queries but not distributed
+            // delegation: work stays on this node unless the reader picks
+            // the Federation preset.
+            distributed_delegate: Some(false),
             order: Some(10),
             ..Preset::default()
         }),
-        "ptc" => Some(Preset {
+        "federation" => Some(Preset {
             level: Some(2),
             plugins: standard_bundles,
             deny: standard_guard().0,
@@ -1921,7 +1945,10 @@ pub(crate) fn built_in_preset(id: &str) -> Option<Preset> {
             // inheriting the workspace allowlist and narrows nothing.
             web_search: Some(true),
             parallel_tool_calls: Some(true),
-            system_prompt: Some(crate::prompts::preset_persona(crate::prompts::PTC_PERSONA)),
+            distributed_delegate: Some(true),
+            system_prompt: Some(crate::prompts::preset_persona(
+                crate::prompts::FEDERATION_PERSONA,
+            )),
             order: Some(20),
             ..Preset::default()
         }),
@@ -2044,7 +2071,7 @@ pub(crate) fn built_in(id: &str) -> Option<(&'static str, &'static str, &'static
 /// A declaration with the same id replaces the shipped row rather than adding
 /// to it, so a pane asks this to tell a restored default from a user's own.
 pub(crate) fn ships_preset(id: &str) -> bool {
-    BUILT_IN_PRESET_IDS.contains(&id)
+    BUILT_IN_PRESET_IDS.contains(&canonical_preset_id(id))
 }
 
 /// The standard an installed package was read as.
@@ -2388,6 +2415,7 @@ impl GlobalSettings {
     /// A declaration wins outright: the reference's own rule is that a user
     /// override replaces the complete child list and does not merge with it.
     pub(crate) fn preset(&self, id: &str) -> Option<Preset> {
+        let id = canonical_preset_id(id);
         if let Some(declared) = self.presets.get(id) {
             return Some(declared.clone());
         }
@@ -3263,6 +3291,7 @@ search_depth = "advanced"
             egress: Some(vec!["1.2.3.4".to_string()]),
             web_search: Some(false),
             parallel_tool_calls: Some(true),
+            distributed_delegate: Some(true),
             mcp_tools: Some(vec!["github_search".to_string()]),
             builtin_policy: vec!["deny-secrets".to_string()],
             policy_mode: Some(PolicyMode::Advisory),
