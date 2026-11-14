@@ -3306,6 +3306,29 @@ impl Shell {
         None
     }
 
+    /// One click on a question option: settle the card with the choice and
+    /// send it as the reader's next message, exactly as if they had typed it.
+    pub(crate) fn answer_question(
+        &mut self,
+        index: usize,
+        option: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.state.active_id.clone() {
+            if let Some(session) = self.state.store.session_mut(&id) {
+                if let Some(message) = session.messages.get_mut(index) {
+                    if let Some(question) = &mut message.question {
+                        question.answered = Some(option.clone());
+                    }
+                }
+            }
+        }
+        self.composer
+            .update(cx, |input, cx| input.set_value(option, window, cx));
+        self.send(window, cx);
+    }
+
     /// Send the composer's text, or queue it while the session is running.
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_string();
@@ -3493,6 +3516,10 @@ impl Shell {
         // travel as prose and look like the skill simply did nothing.
         self.warn_unresolved_skill(&text);
         self.warn_unresolved_command(&text);
+        // A typed answer settles the open question card just like a click.
+        if let Some(id) = self.state.active_id.clone() {
+            self.state.answer_last_question(&id, &text);
+        }
         // Measured: the reference queues a submission while its session is
         // already running instead of opening a second turn over the same
         // transcript, which is what its queue dock lists.

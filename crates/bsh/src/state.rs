@@ -618,6 +618,9 @@ pub(crate) struct AppState {
     /// control can only steer a LIVE turn: an idle session's queued row is an
     /// ordinary send, not a message into a mailbox nobody drains.
     steer_mailboxes: HashMap<String, Arc<SteerMailbox>>,
+    /// Questions the ask_user tool presented this turn, waiting for their
+    /// ToolResult to land on the assistant row.
+    pending_questions: HashMap<String, crate::model::QuestionBlock>,
     /// The agent each live turn was built with, by session id.
     ///
     /// A message steered into a running turn must load a `/name` gesture the
@@ -980,6 +983,7 @@ impl AppState {
             inbox: HashMap::new(),
             inbox_seq: 0,
             steer_mailboxes: HashMap::new(),
+            pending_questions: HashMap::new(),
             turn_agents: HashMap::new(),
             turn_extension_activations: HashMap::new(),
             steering: HashMap::new(),
@@ -3840,6 +3844,23 @@ impl AppState {
     }
 
     /// Fold one runner event into the transcript.
+    /// The reader answered by typing: settle the newest unanswered question
+    /// card with their words, the same as a clicked option settles it.
+    pub(crate) fn answer_last_question(&mut self, id: &str, text: &str) {
+        if let Some(session) = self.store.session_mut(id) {
+            if let Some(message) = session.messages.iter_mut().rev().find(|message| {
+                message
+                    .question
+                    .as_ref()
+                    .is_some_and(|q| q.answered.is_none())
+            }) {
+                if let Some(question) = &mut message.question {
+                    question.answered = Some(text.to_string());
+                }
+            }
+        }
+    }
+
     pub(crate) fn apply_event(&mut self, id: &str, event: AgentEvent) {
         // An automatic compaction lands BEFORE the turn's first token: the
         // runner summarizes the over-threshold window and reports the span it
@@ -3860,6 +3881,54 @@ impl AppState {
         // delta: record it on the prompt row before the store borrow below.
         if let AgentEvent::ContextInjected { injections } = &event {
             self.record_prompt_injections(id, injections);
+        }
+        // An ask_user call presents its question as buttons on the assistant
+        // row: the call carries the shape, the result confirms it landed.
+        if let AgentEvent::ToolCall { name, args } = &event {
+            if name == "ask_user" {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
+                    let question = parsed
+                        .get("question")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    let options: Vec<String> = parsed
+                        .get("options")
+                        .and_then(|v| v.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !question.is_empty() && options.len() >= 2 {
+                        self.pending_questions.insert(
+                            id.to_string(),
+                            crate::model::QuestionBlock {
+                                question,
+                                options,
+                                answered: None,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        if let AgentEvent::ToolResult { name, output, .. } = &event {
+            if name == "ask_user" && output.contains("presented") {
+                if let Some(block) = self.pending_questions.remove(id) {
+                    if let Some(session) = self.store.session_mut(id) {
+                        if let Some(last) = session.messages.last_mut() {
+                            if last.role == Role::Assistant {
+                                last.question = Some(block);
+                            }
+                        }
+                    }
+                }
+            }
         }
         // A steered message and a withdrawn one are transcript/queue events,
         // not stream deltas: they touch no message the turn is filling in, so

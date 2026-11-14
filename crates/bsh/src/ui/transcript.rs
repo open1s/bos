@@ -2867,9 +2867,96 @@ impl Shell {
             ));
         }
 
+        if let Some(question) = &message.question {
+            column = column.child(self.question_card(index, question, cx));
+        }
+
         column
             .child(self.message_footer(index, message, chrome.compact_usage, cx))
             .into_any_element()
+    }
+
+    /// The ask_user card: the model's question with its options as buttons,
+    /// OpenCode-style, so answering is one click instead of retyping a choice.
+    /// Once answered, the chosen option stays lit and the rest dim.
+    fn question_card(
+        &self,
+        index: usize,
+        question: &crate::model::QuestionBlock,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut card = div()
+            .debug_selector(move || format!("question-card-{index}"))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(rgb(theme::border_soft()))
+            .bg(rgb(theme::page()))
+            .px(px(12.0))
+            .py(px(10.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(6.0))
+                    .child(icon(IconName::CircleDashed, 14.0, theme::accent()))
+                    .child(
+                        txt(question.question.clone(), theme::CHIP_SIZE, theme::text())
+                            .font_weight(FontWeight::MEDIUM),
+                    ),
+            );
+        let mut row = div().flex().flex_row().flex_wrap().gap(px(6.0));
+        for (option_index, option) in question.options.iter().enumerate() {
+            let chosen = question.answered.as_deref() == Some(option.as_str());
+            let answered = question.answered.is_some();
+            let label = option.clone();
+            let pick = option.clone();
+            let mut chip = div()
+                .id(SharedString::from(format!(
+                    "question-option-{index}-{option_index}"
+                )))
+                .debug_selector(move || format!("question-option-{index}-{option_index}"))
+                .flex()
+                .items_center()
+                .h(px(28.0))
+                .px(px(12.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(rgb(if chosen {
+                    theme::accent()
+                } else {
+                    theme::border()
+                }))
+                .bg(rgb(if chosen {
+                    theme::selected_row()
+                } else {
+                    theme::page()
+                }))
+                .child(txt(
+                    label,
+                    theme::CHIP_SIZE,
+                    if chosen {
+                        theme::accent()
+                    } else if answered {
+                        theme::faint()
+                    } else {
+                        theme::text()
+                    },
+                ));
+            if !answered {
+                chip = chip
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.answer_question(index, pick.clone(), window, cx);
+                    }));
+            }
+            row = row.child(chip);
+        }
+        card = card.child(row);
+        card
     }
 
     /// The settled turn's process group: one disclosure over every step.

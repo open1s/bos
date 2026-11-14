@@ -376,9 +376,28 @@ pub(crate) enum TurnPart {
     Tool(usize),
 }
 
+/// A question the model asked the reader, with the options the chat draws as
+/// buttons (OpenCode's question-tool shape). The reader's choice - clicked or
+/// typed - arrives as their next message; `answered` records it so the card
+/// settles instead of offering the choice again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct QuestionBlock {
+    /// The question, in the model's own words.
+    pub(crate) question: String,
+    /// The offered choices, in order.
+    pub(crate) options: Vec<String>,
+    /// The reader's answer, once given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) answered: Option<String>,
+}
+
 /// One message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ChatMessage {
+    /// A question the model asked with clickable options, when it used the
+    /// ask_user tool this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) question: Option<QuestionBlock>,
     /// Author of the message.
     pub(crate) role: Role,
     /// Visible response text.
@@ -454,6 +473,7 @@ impl ChatMessage {
             skills: Vec::new(),
             injections: Vec::new(),
             steering: false,
+            question: None,
         }
     }
 
@@ -479,6 +499,7 @@ impl ChatMessage {
             skills: Vec::new(),
             injections: Vec::new(),
             steering: false,
+            question: None,
         }
     }
 

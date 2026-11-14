@@ -1663,6 +1663,9 @@ fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
             // request; the log does not carry them.
             skills: Vec::new(),
             injections: Vec::new(),
+            // The question card is display-only, like the skill blocks: the
+            // log does not carry it.
+            question: None,
             steering: steering.as_ref().is_some_and(|column| column.value(index)),
             // A file written before the timeline had no column: its rows draw
             // in the older reasoning-then-text-then-steps order.
@@ -1742,6 +1745,7 @@ mod tests {
             meta: (index.is_multiple_of(5)).then(MessageMeta::default),
             skills: Vec::new(),
             injections: Vec::new(),
+            question: None,
             // An even index is a user row; make one of them a steering row so
             // the round trip proves the flag survives the log.
             steering: index == 2,

@@ -120,14 +120,20 @@ pub(crate) const TOOL_GUIDANCE: &[(&str, &str)] = &[
     ("list_dir", LIST_DIR),
     ("web_search", WEB_SEARCH),
     ("mcp", MCP_GATEWAY),
+    ("ask_user", ASK_USER),
     ("subagent", SUBAGENT_GUIDANCE),
 ];
+
+/// The question-tool contract: the options ride the chat as buttons, and the
+/// turn ends so the reader's answer can arrive as the next message.
+pub(crate) const ASK_USER: &str = "When a decision genuinely needs the reader - ambiguous scope, a choice between approaches - call ask_user with the question and two to six short options instead of a prose question. The chat draws the options as buttons; the reader's choice arrives as their next message. End your turn after the call and wait for the answer.";
 
 /// Tool names the BSH prompt corpus may reference.
 ///
 /// Used by the stale-reference test to catch references to tools this shell does not expose.
 #[cfg(test)]
 pub(crate) const KNOWN_TOOLS: &[&str] = &[
+    "ask_user",
     "bash",
     "apply_patch",
     "edit_file",

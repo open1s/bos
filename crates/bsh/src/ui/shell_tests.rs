@@ -1414,6 +1414,115 @@ fn an_auto_injection_is_drawn_as_an_openable_event(cx: &mut TestAppContext) {
     );
 }
 
+/// The ask_user call and its result land the question on the assistant row,
+/// options intact, so the transcript can draw the choice as buttons.
+#[test]
+fn ask_user_events_land_the_question_on_the_assistant_row() {
+    let mut state = state_with_turns("question-events", 1);
+    let id = state.active_id.clone().expect("a session");
+    state.apply_event(
+        &id,
+        crate::runner::AgentEvent::ToolCall {
+            name: "ask_user".to_string(),
+            args: serde_json::json!({"question": "Which approach?", "options": ["A", "B"]})
+                .to_string(),
+        },
+    );
+    state.apply_event(
+        &id,
+        crate::runner::AgentEvent::ToolResult {
+            name: "ask_user".to_string(),
+            output: "{\"status\":\"presented\"}".to_string(),
+            ms: 1,
+        },
+    );
+    let session = state.store.session(&id).expect("the session");
+    let last = session.messages.last().expect("the assistant row");
+    let question = last.question.as_ref().expect("the question landed");
+    assert_eq!(question.question, "Which approach?");
+    assert_eq!(question.options, vec!["A".to_string(), "B".to_string()]);
+    assert_eq!(question.answered, None);
+}
+
+/// A question card draws its options as buttons, and one click settles the
+/// card with the choice and sends it as the reader's next message.
+#[gpui::test]
+fn a_question_option_click_answers_and_sends(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    // The click opens a real turn, so the session needs a chosen, reachable
+    // model: a bound-but-silent loopback endpoint keeps the send gate green.
+    cx.dispatcher.allow_parking();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("question-click", 1);
+        let mut provider = crate::settings::global::Provider {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            ..Default::default()
+        };
+        provider.models.insert(
+            "local".to_string(),
+            crate::settings::global::ModelEntry {
+                model: "local-id".to_string(),
+                ..Default::default()
+            },
+        );
+        state
+            .settings
+            .global
+            .providers
+            .insert("p".to_string(), provider);
+        state.select_model("local");
+        let id = state.active_id.clone().expect("a session");
+        if let Some(session) = state.store.session_mut(&id) {
+            if let Some(last) = session.messages.last_mut() {
+                last.question = Some(crate::model::QuestionBlock {
+                    question: "Which approach?".to_string(),
+                    options: vec!["Fix the cause".to_string(), "Work around it".to_string()],
+                    answered: None,
+                });
+            }
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let chip = cx
+        .debug_bounds("question-option-1-0")
+        .expect("the option chip draws");
+    cx.simulate_click(chip.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (answered, sent) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let id = shell.state.active_id.clone().expect("a session");
+        let session = shell.state.store.session(&id).expect("the session");
+        let answered = session
+            .messages
+            .iter()
+            .find_map(|m| m.question.as_ref())
+            .and_then(|q| q.answered.clone());
+        let sent = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::model::Role::User)
+            .map(|m| m.text.clone());
+        (answered, sent)
+    });
+    assert_eq!(
+        answered.as_deref(),
+        Some("Fix the cause"),
+        "the click settles the card with the choice"
+    );
+    assert_eq!(
+        sent.as_deref(),
+        Some("Fix the cause"),
+        "the choice travels as the reader's next message"
+    );
+}
+
 /// A steer the turn ends before taking goes back to its old place in the dock,
 /// and its pending bubble goes away - the reader never loses a message.
 #[gpui::test]

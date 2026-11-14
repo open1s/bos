@@ -329,10 +329,15 @@ impl Shell {
         if leading > 0.0 {
             changes = changes.child(review_spacer(leading));
         }
-        for row_index in first..end {
+        for (row_index, change) in changeset
+            .changes
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(end - first)
+        {
             #[cfg(test)]
             REVIEW_ROWS_BUILT.with(|built| built.set(built.get() + 1));
-            let change = &changeset.changes[row_index];
             let active = selected_index == Some(row_index);
             // The click shares the frame's snapshot and names its row by index,
             // so a row costs no copy of the change (and of every revision's two

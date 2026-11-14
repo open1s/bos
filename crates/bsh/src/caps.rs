@@ -1231,12 +1231,73 @@ fn build_agent_for_session_inner(
             bundles.push(plugins::Bundle::new("files", files));
         }
     }
-    if !off_bundle("plan") && !off_tool("update_plan") {
-        let tool: Arc<dyn agent::tools::Tool> = Arc::new(DeclaredTool::new(
-            Arc::new(PlanTool::new(agent.plan())),
-            declare("update_plan"),
-        ));
-        bundles.push(plugins::Bundle::new("plan", vec![tool]));
+    if !off_bundle("plan") {
+        let mut plan_tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        if !off_tool("update_plan") {
+            plan_tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(PlanTool::new(agent.plan())),
+                declare("update_plan"),
+            )));
+        }
+        // The model's way to ask the reader: the chat draws the options as
+        // buttons and the choice arrives as the next user message (OpenCode's
+        // question-tool shape). Rides the plan bundle so every preset that can
+        // plan can also ask.
+        if !off_tool("ask_user") {
+            plan_tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(FunctionTool::new(
+                    "ask_user",
+                    "Ask the reader a question with two to six short options. The chat shows the options as buttons; the reader's choice arrives as their next message. Use it when a decision genuinely needs the reader - ambiguous scope, a choice between approaches. End your turn after calling it and wait for the answer.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string", "description": "The question, in one or two sentences." },
+                            "options": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 6, "description": "The choices, each a short label." }
+                        },
+                        "required": ["question", "options"],
+                        "additionalProperties": false
+                    }),
+                    |args| {
+                        let question = args
+                            .get("question")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let options: Vec<String> = args
+                            .get("options")
+                            .and_then(|v| v.as_array())
+                            .map(|list| {
+                                list.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if question.is_empty() {
+                            return Err(ToolError::InvalidInput(
+                                "question is required".to_string(),
+                            ));
+                        }
+                        if options.len() < 2 || options.len() > 6 {
+                            return Err(ToolError::InvalidInput(
+                                "options must list two to six choices".to_string(),
+                            ));
+                        }
+                        Ok(serde_json::json!({
+                            "status": "presented",
+                            "options": options.len(),
+                            "note": "The reader sees the question with the options as buttons. End your turn now; their answer arrives as the next user message."
+                        }))
+                    },
+                )),
+                declare("ask_user"),
+            )));
+        }
+        if !plan_tools.is_empty() {
+            bundles.push(plugins::Bundle::new("plan", plan_tools));
+        }
     }
 
     // The model's way to settle a goal. This is session-durable state rather
@@ -7484,6 +7545,39 @@ mod tests {
     }
 
     /// Every tool name a finished build registered, sorted.
+    /// ask_user presents a validated question: two to six options, a non-empty
+    /// question, and a presented note that tells the model to end its turn.
+    #[test]
+    fn ask_user_presents_options_and_validates_them() {
+        let built = build(&bare());
+        let registry = built.agent.registry().expect("the registry");
+        let ok = registry
+            .execute(
+                "ask_user",
+                &serde_json::json!({"question": "Which approach?", "options": ["A", "B"]}),
+            )
+            .expect("a valid question presents");
+        assert_eq!(ok["status"], "presented");
+        assert!(
+            registry
+                .execute(
+                    "ask_user",
+                    &serde_json::json!({"question": "x", "options": ["only one"]})
+                )
+                .is_err(),
+            "one option is not a choice"
+        );
+        assert!(
+            registry
+                .execute(
+                    "ask_user",
+                    &serde_json::json!({"question": "  ", "options": ["a", "b"]})
+                )
+                .is_err(),
+            "a blank question is refused"
+        );
+    }
+
     /// The legacy `ptc` id still loads, as the Federation preset.
     #[test]
     fn the_legacy_ptc_id_loads_as_federation() {
