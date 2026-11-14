@@ -362,6 +362,7 @@ function buildCard(state) {
       placeholder: 'Message (Cmd+Enter to commit on "' + head.label + '")',
       action: 'commit',
       submit_label: '',
+      submit_icon: 'check',
     },
     {
       type: 'row',
@@ -409,6 +410,7 @@ function buildCard(state) {
       },
       {
         type: 'row',
+        pad_x: 14,
         children: [
           { type: 'badge', text: head.label + (dirty ? '*' : ''), tone: 'muted', icon: 'git-branch', style: 'plain' },
           { type: 'fill' },

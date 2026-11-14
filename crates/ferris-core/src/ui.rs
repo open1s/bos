@@ -293,6 +293,11 @@ pub enum UiNode {
         /// Children.
         #[serde(default)]
         children: Vec<UiNode>,
+        /// Horizontal inset in device-independent pixels, so a panel-level
+        /// row aligns with section content instead of sitting flush at the
+        /// card edge.
+        #[serde(default)]
+        pad_x: u16,
     },
     /// A vertical stack.
     Column {
@@ -352,10 +357,15 @@ pub enum UiNode {
         /// Optional trailing icon name from the host catalog.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         icon: Option<String>,
-        /// The submit button's label; empty hides the button and submits on
-        /// Enter / Cmd+Enter instead.
+        /// The submit button's label; empty hides the text and, without a
+        /// submit icon, the button itself, submitting on Enter / Cmd+Enter
+        /// instead.
         #[serde(default = "default_submit_label")]
         submit_label: String,
+        /// Optional submit-button icon name from the host catalog. With an
+        /// empty submit label the button is icon-only - the commit check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submit_icon: Option<String>,
     },
     /// A select field.
     Select {
@@ -595,7 +605,9 @@ fn walk(node: &UiNode, depth: usize, state: &mut WalkState<'_>) {
         return;
     }
     match node {
-        UiNode::Container { children } | UiNode::Row { children } | UiNode::Column { children } => {
+        UiNode::Container { children, .. }
+        | UiNode::Row { children, .. }
+        | UiNode::Column { children, .. } => {
             for child in children {
                 walk(child, depth + 1, state);
             }

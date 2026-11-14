@@ -435,7 +435,7 @@ fn surface_from_ui(node: crate::ui::UiNode, counter: &mut usize) -> SurfaceNode 
             id: None,
             children: surface_children(children, counter),
         },
-        UiNode::Row { children } => SurfaceNode::Row {
+        UiNode::Row { children, .. } => SurfaceNode::Row {
             id: None,
             children: surface_children(children, counter),
         },
@@ -475,6 +475,7 @@ fn surface_from_ui(node: crate::ui::UiNode, counter: &mut usize) -> SurfaceNode 
             action,
             icon: _,
             submit_label: _,
+            submit_icon: _,
         } => SurfaceNode::Input {
             id: next_control_id(counter, "input"),
             label,

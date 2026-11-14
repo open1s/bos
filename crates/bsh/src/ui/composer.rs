@@ -1084,7 +1084,10 @@ impl Shell {
                 .border_color(rgb(theme::border())),
             CHIP_CAP,
         )
-        .child(icon(IconName::Bot, 14.0, theme::muted()))
+        // The agent's mark: a neural brain-circuit reads as a live AI persona,
+        // far cooler than the stock bot face; the accent matches the Start
+        // rocket so the AI surfaces share one vivid launch colour.
+        .child(icon(IconName::BrainCircuit, 14.0, theme::accent()))
         .child(chip_label(label, FontWeight::MEDIUM))
         .child(
             icon(IconName::ChevronDown, CHIP_CHEVRON, theme::caption())

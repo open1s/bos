@@ -249,6 +249,7 @@ test('git panel: card, commit, file diff and branch filter', async (t) => {
   const input = findNode(card.root, 'input');
   assert.equal(input.action, 'commit');
   assert.equal(input.submit_label, '');
+  assert.equal(input.submit_icon, 'check');
   assert.match(input.placeholder, /Cmd\+Enter to commit on "main"/);
   assert.match(JSON.stringify(card), /No changes in the working copy/);
   const select = findNode(card.root, 'select');
@@ -257,6 +258,10 @@ test('git panel: card, commit, file diff and branch filter', async (t) => {
   const timeline = findNode(card.root, 'timeline');
   assert.ok(timeline.items.some((item) => item.title === 'first commit'));
   assert.ok(timeline.items[0].badges.some((badge) => badge.text === 'HEAD'));
+  const gitTab = card.root.tabs[0].content;
+  const footer = gitTab.children[gitTab.children.length - 1];
+  assert.equal(footer.type, 'row');
+  assert.equal(footer.pad_x, 14);
 
   // A working-tree change appears in the file tree with status and stats.
   fs.writeFileSync(path.join(repo, 'change.txt'), 'one\ntwo\n');

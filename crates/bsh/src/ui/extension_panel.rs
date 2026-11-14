@@ -902,8 +902,15 @@ impl ExtensionPanelView {
                 }
                 column.into_any_element()
             }
-            UiNode::Row { children } => {
-                let mut row = div().flex().flex_row().items_center().gap(px(8.0)).w_full();
+            UiNode::Row { children, pad_x } => {
+                let mut row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .w_full()
+                    .min_w_0()
+                    .px(px(f32::from(*pad_x)));
                 for (index, child) in children.iter().enumerate() {
                     row =
                         row.child(self.render_node(child, &format!("{path}-{index}"), window, cx));
@@ -968,6 +975,7 @@ impl ExtensionPanelView {
                 action,
                 icon: trailing,
                 submit_label,
+                submit_icon,
             } => {
                 // A declared input is a real field: the state entity keeps what
                 // the reader typed across frames, and the submit sends it as
@@ -976,6 +984,8 @@ impl ExtensionPanelView {
                 let read_path = path.to_string();
                 let mut field = div()
                     .debug_selector(|| format!("extension-input-{path}"))
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -986,7 +996,12 @@ impl ExtensionPanelView {
                     .border_1()
                     .border_color(rgb(self.palette.border_soft))
                     .bg(rgb(self.palette.page))
-                    .child(div().flex_1().min_w_0().child(Input::new(&entity).w_full()));
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&entity).appearance(false).w_full()),
+                    );
                 if let Some(name) = trailing.as_deref().and_then(catalog_icon) {
                     field = field.child(icon(name, 14.0, self.palette.muted).into_any_element());
                 }
@@ -1018,18 +1033,31 @@ impl ExtensionPanelView {
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
+                    .w_full()
                     .child(field);
-                if !submit_label.is_empty() {
+                if !submit_label.is_empty() || submit_icon.is_some() {
                     let action = action.clone();
+                    let mut face = div().flex().flex_row().items_center().gap(px(6.0));
+                    if let Some(name) = submit_icon.as_deref().and_then(catalog_icon) {
+                        face = face.child(icon(name, 14.0, self.palette.page).into_any_element());
+                    }
+                    if !submit_label.is_empty() {
+                        face = face.child(txt(submit_label.clone(), 12.0, self.palette.page));
+                    }
+                    let a11y = if submit_label.is_empty() {
+                        submit_icon.clone().unwrap_or_else(|| "Submit".to_string())
+                    } else {
+                        submit_label.clone()
+                    };
                     row = row.child(
                         Button::new(format!("extension-apply-{path}"))
                             .debug_selector(|| format!("extension-apply-{path}"))
-                            .accessibility_label(submit_label.clone())
+                            .accessibility_label(a11y)
                             .px(px(10.0))
                             .h(px(36.0))
                             .rounded(px(8.0))
                             .bg(rgb(self.palette.accent))
-                            .child(txt(submit_label.clone(), 12.0, self.palette.page))
+                            .child(face)
                             .on_click(cx.listener(move |this, _event, _window, cx| {
                                 let text = this.input_value(&read_path, cx);
                                 this.dispatch(&action, json!({ "value": text }), cx)
@@ -2204,7 +2232,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     use gpui_kit::{
-        AppContext as _, Context, Entity, Focusable, IntoElement, Modifiers, Render,
+        px, AppContext as _, Context, Entity, Focusable, IntoElement, Modifiers, Render,
         TestAppContext, VisualTestContext, Window,
     };
 
@@ -2401,6 +2429,94 @@ mod tests {
         let (name, args) = wait_for_call(cx, &recorder);
         assert_eq!(name, "commit");
         assert_eq!(args["value"], "hi");
+    }
+
+    /// An input that opts out of the text button but names a submit icon
+    /// draws an icon-only check button, and clicking it submits the typed
+    /// value - the commit affordance is never a blank box.
+    #[gpui::test]
+    fn an_input_with_a_submit_icon_draws_the_check_button(cx: &mut TestAppContext) {
+        let (recorder, cx, view) = panel_window!(
+            cx,
+            serde_json::json!({
+                "type": "input",
+                "label": "",
+                "value": "",
+                "placeholder": "Message (Cmd+Enter to commit)",
+                "action": "commit",
+                "submit_label": "",
+                "submit_icon": "check"
+            }),
+        );
+        assert!(
+            cx.debug_bounds("extension-apply-root").is_some(),
+            "the check submit button renders"
+        );
+        let focus = cx
+            .update(|_, cx| {
+                view.read(cx)
+                    .inputs
+                    .borrow()
+                    .get("root")
+                    .map(|(_, entity)| entity.read(cx).focus_handle(cx))
+            })
+            .expect("the input state exists");
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("h");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("i");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        click(cx, "extension-apply-root");
+        let (name, args) = wait_for_call(cx, &recorder);
+        assert_eq!(name, "commit");
+        assert_eq!(args["value"], "hi");
+    }
+
+    /// The message field spans the panel instead of collapsing to a blank
+    /// button-sized box: its placeholder is readable at the panel's width.
+    #[gpui::test]
+    fn the_message_field_spans_the_panel(cx: &mut TestAppContext) {
+        let (_recorder, cx, _view) = panel_window!(
+            cx,
+            serde_json::json!({
+                "type": "input",
+                "label": "",
+                "value": "",
+                "placeholder": "Message (Cmd+Enter to commit)",
+                "action": "commit",
+                "submit_label": "",
+                "submit_icon": "check"
+            }),
+        );
+        let bounds = cx
+            .debug_bounds("extension-input-root")
+            .expect("the field renders");
+        assert!(
+            bounds.size.width > px(300.0),
+            "the field spans the panel, not a blank box: {:?}",
+            bounds.size
+        );
+    }
+
+    /// A row may declare a horizontal inset so panel-level rows (the footer
+    /// badge) align with section content instead of sitting flush at the edge.
+    /// Pinned at the contract level: the gpui test thread's stack cannot
+    /// render nested row documents (every existing panel click test uses a
+    /// single-node document), so the gutter's `.px` application rides the kit
+    /// primitive in the app's own window.
+    #[test]
+    fn a_row_declares_its_horizontal_gutter() {
+        let doc = document(serde_json::json!({
+            "type": "row",
+            "pad_x": 14,
+            "children": [ { "type": "text", "text": "@ change*" } ]
+        }));
+        let report = doc.validate(&ExtensionId::parse("com.example.ui").expect("id"));
+        assert!(report.is_valid(), "{:?}", report.errors);
+        let root = serde_json::to_value(&doc.root).expect("serializes");
+        assert_eq!(root["type"], "row");
+        assert_eq!(root["pad_x"], 14, "the gutter survives the contract");
     }
 
     /// A runtime whose panel call needs a tokio reactor, like Cordis's

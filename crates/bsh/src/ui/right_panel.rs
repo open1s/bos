@@ -2009,7 +2009,10 @@ impl Shell {
             .items_center()
             .gap(px(6.0))
             .overflow_hidden()
-            .child(icon(IconName::Compass, 14.0, theme::text()).flex_none())
+            // The launch mark: an accent rocket reads as "start" far more vividly
+            // than the reference's static compass, and the accent ties it to the
+            // primary action colour in both themes.
+            .child(icon(IconName::Rocket, 14.0, theme::accent()).flex_none())
             .child(
                 txt(label, theme::CHIP_SIZE, theme::text())
                     .font_weight(FontWeight::MEDIUM)
@@ -2972,7 +2975,7 @@ impl Shell {
             cx.stop_propagation();
             this.close_tab_catalog(cx);
         }))
-        .child(icon(IconName::Compass, 16.0, theme::text()).flex_none())
+        .child(icon(IconName::Rocket, 16.0, theme::accent()).flex_none())
         .child(
             txt(label, 13.0, theme::text())
                 .flex_1()
