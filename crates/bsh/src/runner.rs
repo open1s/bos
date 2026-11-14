@@ -1170,4 +1170,67 @@ mod tests {
         assert_eq!(rows[3], "now", "the reader's line comes last");
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// A child follow-up (send_message / the UI reopen) runs stream_child over
+    /// the SAME live session. The session-scoped AGENTS.md block and the
+    /// identical snapshot already sit in that session's log, so the second
+    /// turn must not inject them again; only the fresh time-context is new.
+    #[test]
+    fn a_child_follow_up_keeps_one_instructions_block() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let child = capturing_agent(seen.clone());
+        let root = workspace("child-dedup");
+        std::fs::write(root.join("AGENTS.md"), "workspace rule").expect("the file");
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        let registry = Arc::new(crate::subagent::SubagentRegistry::default());
+        let context = crate::context::TurnContext::from_facts(&facts, true);
+        let first = futures::executor::block_on(crate::caps::stream_child(
+            &child,
+            "first task".to_string(),
+            registry.clone(),
+            "child-run",
+            &context,
+        ));
+        assert!(first.is_ok(), "the first child turn runs: {first:?}");
+        let follow = crate::context::TurnContext::from_facts(&facts, true);
+        let second = futures::executor::block_on(crate::caps::stream_child(
+            &child,
+            "second task".to_string(),
+            registry,
+            "child-run",
+            &follow,
+        ));
+        assert!(second.is_ok(), "the follow-up runs: {second:?}");
+        let rows = seen.lock().unwrap().clone();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Instructions from: AGENTS.md"))
+                .count(),
+            1,
+            "the follow-up does not re-inject the session's AGENTS.md: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE))
+                .count(),
+            1,
+            "the identical snapshot is not stacked: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row == "first task"),
+            "first prompt kept: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row == "second task"),
+            "follow-up prompt present: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

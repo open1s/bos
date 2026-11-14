@@ -175,33 +175,62 @@ impl TurnContext {
     /// prefix is stable, the frame is the first thing the model reads, and the
     /// compaction path still cannot fold it - the runner injects only after
     /// the checkpoint is installed.
+    ///
+    /// The check is session-wide: a block whose text already sits anywhere in
+    /// the active session log - the messages sent to the model - is NOT
+    /// injected again. A parent turn re-seeds, so its log never carries the
+    /// frame and every block lands; a follow-up turn into a LIVE session (a
+    /// child continuation) already carries the session-scoped AGENTS.md block
+    /// and the identical snapshot, so only genuinely new context (the fresh
+    /// time-context) is prepended. Duplicate session-scope injection is
+    /// therefore impossible by construction, not by caller discipline.
+    ///
+    /// A fresh instructions block also SUPERSEDES the expired one: when this
+    /// turn carries instructions, the history keeps only the current block,
+    /// so a changed AGENTS.md never leaves a stale copy beside the new one.
+    /// A render without instructions removes nothing.
     pub(crate) fn inject(&self, agent: &Agent) {
+        let mut session = agent.session();
+        let present: Vec<&str> = session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                react::llm::LlmMessage::User { content } => content.as_text(),
+                _ => None,
+            })
+            .collect();
         let mut injected: Vec<react::llm::LlmMessage> = Vec::new();
-        if !self.snapshot.is_empty() {
+        for text in self.injected_messages() {
+            if present.contains(&text) {
+                continue;
+            }
             injected.push(react::llm::LlmMessage::User {
-                content: react::llm::Content::Text(self.snapshot.clone()),
-            });
-        }
-        if !self.time_context.is_empty() {
-            injected.push(react::llm::LlmMessage::User {
-                content: react::llm::Content::Text(self.time_context.clone()),
-            });
-        }
-        if let Some(instructions) = &self.instructions {
-            injected.push(react::llm::LlmMessage::User {
-                content: react::llm::Content::Text(instructions.clone()),
+                content: react::llm::Content::Text(text.to_string()),
             });
         }
         if injected.is_empty() {
             return;
         }
-        let mut session = agent.session();
-        injected.extend(session.messages().iter().cloned());
+        let current = self.instructions.as_deref();
+        let history = session.messages().iter().filter(|message| {
+            let Some(want) = current else {
+                return true;
+            };
+            match message {
+                react::llm::LlmMessage::User { content } => content
+                    .as_text()
+                    .map(|text| !is_instructions_user_text(text) || text == want)
+                    .unwrap_or(true),
+                _ => true,
+            }
+        });
+        injected.extend(history.cloned());
         session.restore_messages(injected);
     }
 
-    /// The messages [`Self::inject`] would append, in order.
-    #[cfg(test)]
+    /// The candidate blocks one inject would place, in order: the snapshot,
+    /// the time-context, then the framed instructions. [`Self::inject`] skips
+    /// any of these the session log already carries.
     pub(crate) fn injected_messages(&self) -> Vec<&str> {
         let mut messages = Vec::new();
         if !self.snapshot.is_empty() {
@@ -225,8 +254,7 @@ impl TurnContext {
 pub(crate) fn is_injected_user_text(text: &str) -> bool {
     text.starts_with(RUNTIME_CONTEXT_PREAMBLE)
         || text.starts_with(TIME_CONTEXT_PREAMBLE)
-        || (text.starts_with("<system-reminder>")
-            && text.contains("The following workspace instructions"))
+        || is_instructions_user_text(text)
         // The engine's closing request when a turn reaches its step guard. It is
         // a harness instruction, not something the child or its caller said, so
         // the read-only view must not draw it as a user row.
@@ -234,6 +262,15 @@ pub(crate) fn is_injected_user_text(text: &str) -> bool {
         // The engine's one retry when a step came back empty: also harness
         // wording, never a row the caller wrote.
         || text.starts_with(react::engine::EMPTY_ANSWER_NOTE)
+}
+
+/// Whether a user row is the framed workspace-instructions block.
+///
+/// The session-wide inject check uses it to find the session's one AGENTS.md
+/// block: an identical block is kept in place, an expired one is removed when
+/// a fresh render replaces it.
+pub(crate) fn is_instructions_user_text(text: &str) -> bool {
+    text.starts_with("<system-reminder>") && text.contains("The following workspace instructions")
 }
 
 /// The most top-level entries the layout names.
@@ -773,6 +810,202 @@ mod tests {
         assert!(
             instructions.contains("do not override"),
             "the framing denies the instruction any authority over host policy"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A follow-up turn injects into a LIVE session (a child continuation),
+    /// where the previous turn's frame still sits in the log sent to the
+    /// model. Only context that is not already in that session-wide log is
+    /// injected: the identical AGENTS.md block and snapshot are skipped, the
+    /// fresh time-context (new turn, new instant) still lands at the head.
+    #[test]
+    fn a_live_session_never_reinjects_context_it_already_carries() {
+        let root = scratch("dedup");
+        std::fs::write(root.join("AGENTS.md"), "workspace rule").expect("the file");
+        let provider = std::sync::Arc::new(agent::agent::agentic::LlmProvider::new());
+        let agent = Agent::new(agent::AgentConfig::default(), provider);
+        TurnContext::from_facts(&facts(&rooted(&root)), false).inject(&agent);
+        agent
+            .session()
+            .add_user_content(react::llm::Content::Text("first task".to_string()));
+
+        // The follow-up renders its own fresh time facts and injects again.
+        let follow = TurnContext::from_facts_at(
+            &facts(&rooted(&root)),
+            false,
+            &TimeFacts {
+                turn: 2,
+                elapsed: Some(5),
+            },
+        );
+        follow.inject(&agent);
+
+        let session = agent.session();
+        let rows: Vec<&str> = session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                react::llm::LlmMessage::User { content } => content.as_text(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Instructions from: AGENTS.md"))
+                .count(),
+            1,
+            "the session-scoped block is injected once: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.starts_with(RUNTIME_CONTEXT_PREAMBLE))
+                .count(),
+            1,
+            "the identical snapshot is not stacked: {rows:?}"
+        );
+        assert!(
+            rows[0].starts_with(TIME_CONTEXT_PREAMBLE) && rows[0].contains("preparing turn 2"),
+            "the fresh time-context leads: {rows:?}"
+        );
+        let instr = rows
+            .iter()
+            .position(|row| row.contains("Instructions from: AGENTS.md"))
+            .expect("the block");
+        let task = rows
+            .iter()
+            .position(|row| *row == "first task")
+            .expect("the history");
+        assert!(
+            instr < task,
+            "the kept block still precedes the history: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Injecting the very same context twice adds no rows: everything it
+    /// would send already exists in the session log sent to the model.
+    #[test]
+    fn an_unchanged_context_adds_no_rows_on_a_second_inject() {
+        let root = scratch("dedup-same");
+        std::fs::write(root.join("AGENTS.md"), "workspace rule").expect("the file");
+        let provider = std::sync::Arc::new(agent::agent::agentic::LlmProvider::new());
+        let agent = Agent::new(agent::AgentConfig::default(), provider);
+        let context = TurnContext::from_facts(&facts(&rooted(&root)), false);
+        context.inject(&agent);
+        let before: Vec<String> = agent
+            .session()
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                react::llm::LlmMessage::User { content } => content.as_text().map(str::to_string),
+                _ => None,
+            })
+            .collect();
+        context.inject(&agent);
+        let after: Vec<String> = agent
+            .session()
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                react::llm::LlmMessage::User { content } => content.as_text().map(str::to_string),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            before, after,
+            "a repeated inject of present context is a no-op"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A changed instruction file injects the fresh block AND removes the
+    /// expired one: the session log carries exactly one, current AGENTS.md
+    /// block, still ahead of the history.
+    #[test]
+    fn changed_instructions_replace_the_expired_block() {
+        let root = scratch("dedup-change");
+        std::fs::write(root.join("AGENTS.md"), "rule one").expect("the file");
+        let provider = std::sync::Arc::new(agent::agent::agentic::LlmProvider::new());
+        let agent = Agent::new(agent::AgentConfig::default(), provider);
+        TurnContext::from_facts(&facts(&rooted(&root)), false).inject(&agent);
+        agent
+            .session()
+            .add_user_content(react::llm::Content::Text("first task".to_string()));
+        std::fs::write(root.join("AGENTS.md"), "rule two is longer").expect("the file");
+        TurnContext::from_facts(&facts(&rooted(&root)), false).inject(&agent);
+
+        let session = agent.session();
+        let rows: Vec<&str> = session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                react::llm::LlmMessage::User { content } => content.as_text(),
+                _ => None,
+            })
+            .collect();
+        let blocks: Vec<&&str> = rows
+            .iter()
+            .filter(|row| row.contains("Instructions from: AGENTS.md"))
+            .collect();
+        assert_eq!(blocks.len(), 1, "one current instructions block: {rows:?}");
+        assert!(
+            blocks[0].contains("rule two is longer"),
+            "the fresh rule wins: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("rule one")),
+            "the expired rule is removed: {rows:?}"
+        );
+        let block = rows
+            .iter()
+            .position(|row| row.contains("Instructions from: AGENTS.md"))
+            .expect("the block");
+        let task = rows
+            .iter()
+            .position(|row| *row == "first task")
+            .expect("the history");
+        assert!(
+            block < task,
+            "the current block precedes the history: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A turn whose render carries no instructions keeps the session's
+    /// existing block: absence of a fresh render is not a removal.
+    #[test]
+    fn a_turn_without_instructions_keeps_the_session_block() {
+        let root = scratch("dedup-keep");
+        std::fs::write(root.join("AGENTS.md"), "workspace rule").expect("the file");
+        let provider = std::sync::Arc::new(agent::agent::agentic::LlmProvider::new());
+        let agent = Agent::new(agent::AgentConfig::default(), provider);
+        TurnContext::from_facts(&facts(&rooted(&root)), false).inject(&agent);
+        let bare = TurnContext {
+            snapshot: String::new(),
+            time_context: "fresh time row".to_string(),
+            instructions: None,
+        };
+        bare.inject(&agent);
+        let session = agent.session();
+        let rows: Vec<&str> = session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                react::llm::LlmMessage::User { content } => content.as_text(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows[0], "fresh time row",
+            "the new row still lands: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Instructions from: AGENTS.md"))
+                .count(),
+            1,
+            "the session block survives a render without instructions: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
