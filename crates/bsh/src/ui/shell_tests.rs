@@ -2261,6 +2261,54 @@ fn the_queue_is_a_line_of_identified_rows() {
     assert!(state.is_streaming(&id), "and that session reads as running");
 }
 
+/// A turn running in ANOTHER session must not paint the selected one as busy.
+///
+/// The composer's stop mark, the model chip's busy dot and the command menu's
+/// stop row describe the conversation on screen, so they read the selected
+/// session's own streaming state. They used to read `any_streaming()`, so
+/// leaving a running session left every session looking like it was running -
+/// the stop button sat on an idle chat and the model chip spun for a turn that
+/// was not its own.
+#[test]
+fn a_turn_in_another_session_does_not_mark_the_selected_one_running() {
+    let mut state = AppState::with_store(scratch_store("active-streaming-scope"));
+    let running = state.active_id.clone().expect("an active session");
+    // Start a turn while this session is the one on screen.
+    assert!(
+        state.begin_turn_in(&running, "run").is_some(),
+        "the turn opens in the selected session"
+    );
+    assert!(
+        state.active_streaming(),
+        "the selected session reads as running while its own turn runs"
+    );
+    // Leave it for a fresh session; the turn keeps running in the background.
+    let idle = state.new_session().expect("a second session");
+    assert_eq!(state.active_id.as_deref(), Some(idle.as_str()));
+    assert!(
+        state.any_streaming(),
+        "the premise: the turn still runs somewhere"
+    );
+    assert!(
+        state.is_streaming(&running),
+        "the session left behind still reads as running"
+    );
+    assert!(!state.is_streaming(&idle), "the selected session is idle");
+    assert!(
+        !state.active_streaming(),
+        "the selected session must not read as running just because another one is"
+    );
+    // Once the selected session runs its own turn, it reads as running again.
+    assert!(
+        state.begin_turn_in(&idle, "run").is_some(),
+        "a turn opens in the selected session"
+    );
+    assert!(
+        state.active_streaming(),
+        "the selected session running reads as running"
+    );
+}
+
 /// The running turn's plan is read live from the agent's own store, and the
 /// finished copy lands on the session - which is the copy the trajectory pane
 /// and the next launch read.
@@ -6624,6 +6672,48 @@ fn the_model_chip_swaps_its_chevron_for_the_ongoing_dot(cx: &mut TestAppContext)
     assert!(
         cx.debug_bounds("composer-model-chevron").is_none(),
         "and the chevron goes with it"
+    );
+}
+
+/// A running session's lead dot is the animated live mark; an idle one is not.
+///
+/// The dot used to be the same static accent pill for running and selected
+/// rows, so a running session was indistinguishable from the one merely on
+/// screen. A running row now breathes in the live green, and this pins that the
+/// animated mark is drawn only while the session's own turn runs.
+#[gpui::test]
+fn a_running_session_breathes_a_live_dot(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("running-dot", 1);
+        let id = state.active_id.clone().expect("a session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.id = String::from("run-row");
+        }
+        state.active_id = Some(String::from("run-row"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("session-running-dot-run-row").is_none(),
+        "an idle session draws no animated running dot"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            assert!(
+                this.state.begin_turn_in("run-row", "run").is_some(),
+                "the turn opens in the selected session"
+            );
+            cx.notify();
+        })
+    });
+    draw_until(
+        cx,
+        "the running session draws its animated live dot",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("session-running-dot-run-row").is_some(),
     );
 }
 

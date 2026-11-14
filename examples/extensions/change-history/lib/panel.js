@@ -486,7 +486,12 @@ async function commitAction(terminal, rawArgs, meta, deps = {}) {
   const message = typeof args.value === 'string' ? args.value.trim() : '';
   if (message.length === 0) fail('enter a commit message');
   const changes = await collectChanges(terminal, repo, backend, platform);
-  if (changes.files.length === 0) fail('nothing to commit: the working copy is clean');
+  if (changes.files.length === 0) {
+    // A clean working copy is a no-op, not a failure: return a gentle notice
+    // (the host renders a plain result as muted text) rather than throwing a
+    // red panel error at the reader.
+    return 'Nothing to commit — the working copy is clean.';
+  }
   if (backend === 'jj') {
     await vcs.run(terminal, repo, 'jj', ['--color=never', 'commit', '-m', message], platform);
   } else {

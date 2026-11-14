@@ -563,7 +563,7 @@ impl Shell {
     pub(crate) fn card_rows(&self, trigger: Trigger) -> Vec<CardRow> {
         match trigger {
             Trigger::Command => {
-                let entries = entries(self.state.any_streaming());
+                let entries = entries(self.state.active_streaming());
                 let query = slash_query(&self.composer_value).unwrap_or("");
                 let mut rows: Vec<CardRow> = filter_indices(&entries, query, self.state.lang)
                     .into_iter()

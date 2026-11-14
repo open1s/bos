@@ -475,7 +475,7 @@ impl Shell {
     /// The composer card under the conversation.
     pub(crate) fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = self.state.lang;
-        let streaming = self.state.any_streaming();
+        let streaming = self.state.active_streaming();
         let sendable = can_send(&self.composer_value, self.state.attachments.len());
         let hero = self.state.hero_phase();
         // One resolution per frame: `effective()` clones a whole resolved

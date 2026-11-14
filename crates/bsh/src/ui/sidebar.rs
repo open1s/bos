@@ -9,6 +9,7 @@ use super::shell::Shell;
 use super::{asset_icon, hairline_all, icon, txt, DivExt, IconName};
 use crate::state::age;
 use crate::theme;
+use crate::ui::todo_panel::{SPIN_FPS, SPIN_PERIOD};
 
 /// The scroll a navigation key asks for, or `None` when the key is not one.
 ///
@@ -102,6 +103,45 @@ pub(crate) const PIN_MARK_W: f32 = 16.0;
 fn session_actions_w(streaming: bool) -> f32 {
     let icons = if streaming { 3.0 } else { 2.0 };
     icons * (ROW_ACTION_BOX + ROW_ACTION_GAP) + ROW_MENU_BOX
+}
+
+/// The row's leading status dot.
+///
+/// A running session breathes in a deep live green so it reads as active at a
+/// glance - distinct from the selected row's static accent dot and an idle
+/// row's grey, which used to be the same pill for running and selected alike.
+/// The pulse rides the shared StateDot cycle ([`SPIN_PERIOD`]) and, like every
+/// other animated mark, freezes at its start under reduced motion.
+fn lead_dot(streaming: bool, selected: bool, id: &str) -> AnyElement {
+    let dot = div()
+        .w(px(theme::TREE_ROW_LEAD))
+        .h(px(6.0))
+        .rounded_full();
+    if streaming {
+        let selector = format!("session-running-dot-{id}");
+        return dot
+            .bg(rgb(theme::sink(theme::success(), 0.3)))
+            .debug_selector(move || selector.clone())
+            .with_animation(
+                format!("session-running-{id}"),
+                Animation::new(SPIN_PERIOD).repeat().with_max_fps(SPIN_FPS),
+                |dot, phase| {
+                    // A 0.8 -> 1 -> 0.8 breath: the high floor keeps the deep
+                    // green from washing out against the sidebar - alive, never
+                    // pale.
+                    let breath =
+                        0.8 + 0.2 * (0.5 - 0.5 * (phase * std::f32::consts::TAU).cos());
+                    dot.opacity(breath)
+                },
+            )
+            .into_any_element();
+    }
+    dot.bg(rgb(if selected {
+        theme::accent()
+    } else {
+        theme::border_strong()
+    }))
+    .into_any_element()
 }
 
 /// How wide the workspace header's cluster is: its plus box and the bare menu
@@ -747,17 +787,7 @@ impl Shell {
                             .shadow_sm()
                         })
                         .when(!selected, |row| row.hover(|s| s.bg(rgb(theme::hover()))))
-                        .child(
-                            div()
-                                .w(px(theme::TREE_ROW_LEAD))
-                                .h(px(6.0))
-                                .rounded_full()
-                                .bg(if streaming || selected {
-                                    rgb(theme::accent())
-                                } else {
-                                    rgb(theme::border_strong())
-                                }),
-                        )
+                        .child(lead_dot(streaming, selected, &id))
                         .child(icon(
                             IconName::MessageSquare,
                             13.0,

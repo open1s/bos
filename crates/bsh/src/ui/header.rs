@@ -501,7 +501,6 @@ impl Shell {
             })
             .unwrap_or_default();
         let child_run = self.state.subagent_view_run();
-        let streaming = self.state.any_streaming();
         let lang = self.state.lang;
         let parent_title = self.state.subagent_parent_title().unwrap_or_default();
         div()
@@ -597,20 +596,6 @@ impl Shell {
             // duplicating it.
             .when(!self.state.hero_phase(), |row| {
                 row.child(self.agent_preset_chip(lang, cx))
-            })
-            .when(streaming && child_run.is_none(), |row| {
-                row.child(
-                    div()
-                        .px(px(8.0))
-                        .py(px(2.0))
-                        .rounded(px(6.0))
-                        .bg(rgb(theme::accent()))
-                        .child(txt(
-                            lang.tr("status.running"),
-                            theme::CHIP_SIZE,
-                            theme::page(),
-                        )),
-                )
             })
             // A child turn streams outside `any_streaming`, so its own run
             // status is the one the preview header must name.

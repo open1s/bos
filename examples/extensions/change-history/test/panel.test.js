@@ -298,10 +298,9 @@ test('git panel: card, commit, file diff and branch filter', async (t) => {
   assertUiLimits(card);
   assert.match(JSON.stringify(card), /No changes in the working copy/);
   assert.match(JSON.stringify(card), /panel: second commit/);
-  await assert.rejects(
-    panel.commitAction(terminal, { value: 'empty' }, meta),
-    /nothing to commit/,
-  );
+  // A clean working copy is a gentle notice, not a thrown error.
+  const notice = await panel.commitAction(terminal, { value: 'empty' }, meta);
+  assert.match(notice, /Nothing to commit/);
 
   // The branch filter selects and persists across refreshes.
   card = await panel.gitPanel(terminal, { value: 'main' }, meta);

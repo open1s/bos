@@ -596,6 +596,16 @@ impl ExtensionPanelView {
 
     /// Apply a live card through the surface host, falling back to a local
     /// validation when the host is not open.
+    /// Apply a periodic-refresh card, skipping an identical one. Replacing an
+    /// unchanged document rebuilds the tree and resets scroll and focus (the
+    /// jitter the reader sees on every tick), so a card that did not move is
+    /// left alone. Actions still go through apply_live directly.
+    fn apply_refresh(&mut self, panel: &PanelSurface, document: UiDocument) {
+        if self.document.as_ref() != Some(&document) {
+            self.apply_live(panel, document);
+        }
+    }
+
     fn apply_live(&mut self, panel: &PanelSurface, document: UiDocument) {
         match self.store.apply(&panel.panel_id, &document) {
             Ok((document, revision)) => {
@@ -673,7 +683,7 @@ impl ExtensionPanelView {
                 }
                 match outcome {
                     Ok(value) => match serde_json::from_value::<UiDocument>(value) {
-                        Ok(document) => this.apply_live(&panel, document),
+                        Ok(document) => this.apply_refresh(&panel, document),
                         Err(error) => {
                             this.live_failure(format!("panel document is not valid: {error}"))
                         }
@@ -2589,6 +2599,32 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(reached, "the tokio-backed panel call runs without aborting");
+    }
+
+    /// The periodic refresh returns an identical card when nothing changed; it
+    /// must not replace the document (which rebuilds the tree and resets scroll
+    /// and focus, the jitter the reader sees). A changed card still applies.
+    #[test]
+    fn an_unchanged_refresh_does_not_replace_the_card() {
+        let surface = surface_with(Arc::new(Noop), None);
+        let mut view = ExtensionPanelView::new(vec![surface.clone()], Lang::En);
+        let stable = document(serde_json::json!({"type": "text", "text": "stable card"}));
+
+        view.apply_refresh(&surface, stable.clone());
+        let first_rev = view.revision;
+        assert!(view.document.is_some(), "the first card lands");
+
+        // An identical refresh keeps the revision: no rebuild, no jitter.
+        view.apply_refresh(&surface, stable.clone());
+        assert_eq!(
+            view.revision, first_rev,
+            "an identical refresh keeps the revision instead of rebuilding the card"
+        );
+
+        // A changed card still applies and advances the revision.
+        let changed = document(serde_json::json!({"type": "text", "text": "moved card"}));
+        view.apply_refresh(&surface, changed);
+        assert!(view.revision > first_rev, "a changed card applies");
     }
 
     /// The launcher reads one (id, title) tile per panel from the cached view.

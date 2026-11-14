@@ -2181,6 +2181,19 @@ impl AppState {
         !self.streams.is_empty()
     }
 
+    /// Whether the session on screen is streaming.
+    ///
+    /// The running affordances - the composer's stop mark, the model chip's
+    /// busy dot, the command menu's stop row - describe the conversation the
+    /// reader is in, so a turn running in ANOTHER session must not paint this
+    /// one as busy. Leaving a running session used to leave every session
+    /// looking like it was running because those controls read [`Self::any_streaming`].
+    pub(crate) fn active_streaming(&self) -> bool {
+        self.active_id
+            .as_deref()
+            .is_some_and(|id| self.is_streaming(id))
+    }
+
     /// The background jobs of the session on screen, newest first.
     ///
     /// This is the reference's own scope: the header's chip and its popover

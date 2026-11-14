@@ -320,7 +320,6 @@
 "msg.cancelled": "Stopped by you"
 "turn.count": "turns"
 "turn.tokens": "tokens"
-"status.running": "Running"
 "empty.none": "Nothing here yet."
 "settings.account": "Account"
 "settings.accountHint": "View and manage local identity, configuration files, and data directories."
