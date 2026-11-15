@@ -567,10 +567,20 @@ function resolveEntry(entry, root) {
   }
   // Both sides are resolved through the real filesystem before comparing, or a
   // symlinked scratch directory (macOS /var -> /private/var) reads as outside
-  // its own package.
-  const resolved = fs.realpathSync(path.resolve(entry));
-  const realRoot = fs.realpathSync(path.resolve(root));
-  if (resolved !== realRoot && !resolved.startsWith(realRoot + path.sep)) {
+  // its own package. The native realpath is used because Windows keeps two
+  // spellings of one directory: %TEMP% often carries the 8.3 short name
+  // (RUNNER~1), and the JS fallback can expand a file inside it while leaving
+  // the directory short, which read as a foreign root and refused every cordis
+  // plugin under such a temp dir. Paths are also folded case-insensitively
+  // there, because the filesystem is.
+  const realpath = fs.realpathSync.native || fs.realpathSync;
+  const resolved = realpath(path.resolve(entry));
+  const realRoot = realpath(path.resolve(root));
+  const fold = (value) => (process.platform === 'win32' ? value.toLowerCase() : value);
+  if (
+    fold(resolved) !== fold(realRoot) &&
+    !fold(resolved).startsWith(fold(realRoot) + path.sep)
+  ) {
     throw new Error('the entry ' + resolved + ' is outside the package ' + realRoot);
   }
   return resolved;
