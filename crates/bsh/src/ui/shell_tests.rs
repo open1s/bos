@@ -29238,33 +29238,37 @@ fn the_compact_command_card_draws_running_and_failed_outcomes(cx: &mut TestAppCo
     let root = skills_scratch("slash-compact-card");
     let (harness, cx) = slash_shell(cx, "slash-compact-card", root, 8);
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
-    let id = cx.update(|_, cx| {
+    // The compaction request completes on the Tokio runtime and wakes the GPUI
+    // executor from that worker, which is the production path. Parking mode is
+    // the kit's seam for a test that really performs that cross-thread I/O.
+    cx.dispatcher.allow_parking();
+    let (id, running, compacting, notice) = cx.update(|_, cx| {
         let id = shell.read(cx).state.active_id.clone().expect("a session");
         // The seam is the START of the card, so the session only needs a
         // resolvable target: the request itself fails against the seed port,
         // and its outcome is landed by the test below.
-        shell.update(cx, |this, _| {
+        shell.update(cx, |this, cx| {
             if let Some(session) = this.state.store.session_mut(&id) {
                 session.provider = Some("local".to_string());
                 session.model = Some("local-model".to_string());
             }
-        });
-        // The handler starts the row synchronously and only then spawns the
-        // auxiliary request, so this observes the reference's running card.
-        shell.update(cx, |this, cx| this.compact_history(cx));
-        id
-    });
-    let (running, compacting, notice) = cx.update(|_, cx| {
-        let state = &shell.read(cx).state;
-        let session = state.active_session().expect("the session");
-        (
-            session
-                .compact_command
-                .as_ref()
-                .is_some_and(|command| command.outcome.is_none()),
-            state.is_compacting(&id),
-            state.notice.clone(),
-        )
+            // The handler starts the row synchronously and only then spawns the
+            // auxiliary request. Reading the state inside this same closure is
+            // what makes the running assertion exact: no other update can
+            // interleave while the shell is borrowed.
+            this.compact_history(cx);
+            let state = &this.state;
+            let session = state.active_session().expect("the session");
+            (
+                id.clone(),
+                session
+                    .compact_command
+                    .as_ref()
+                    .is_some_and(|command| command.outcome.is_none()),
+                state.is_compacting(&id),
+                state.notice.clone(),
+            )
+        })
     });
     assert!(running, "the command card starts in its running state");
     assert!(compacting, "and the manual admission flag is held");
@@ -29273,6 +29277,19 @@ fn the_compact_command_card_draws_running_and_failed_outcomes(cx: &mut TestAppCo
         Some(cx.update(|_, cx| shell.read(cx).state.lang.tr("slash.compacting"))),
         "the running label is the reference's Compacting context…"
     );
+
+    // Let the seed-port request fail and land its own outcome first, so the
+    // deterministic outcome below is the one the reader keeps and no runtime
+    // task is still pending when the shell goes away.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while cx.update(|_, cx| shell.read(cx).state.is_compacting(&id)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the seed-port request fails promptly"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 
     // Land the failure the reference's summary code produces, so the card's
     // outcome half is drawn without a provider.
@@ -29322,6 +29339,12 @@ fn the_compact_command_card_draws_running_and_failed_outcomes(cx: &mut TestAppCo
         "the card keeps the exact outcome text and its error state"
     );
     assert_eq!(compacted, 0, "and the boundary did not move");
+
+    // Let the runtime finish the failed request before the shell goes away, so
+    // no local task is dropped by a thread that did not spawn it.
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    cx.run_until_parked();
 }
 
 /// The compact row NAMES its cause: a provider error keeps the provider's text,
