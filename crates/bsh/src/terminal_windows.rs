@@ -151,19 +151,28 @@ mod tests {
     /// grid (issue #296). Runs on the Windows CI lane.
     #[test]
     fn a_conpty_spawn_reaches_the_screen() {
-        let mut terminal = ConPtyTerminal::spawn("echo bsh-conpty-ok", 24, 80).expect("spawn");
-        // Give the shell a moment to run and the reader thread to drain it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Spawn the interactive shell the pane spawns, then type the command.
+        // A one-shot `echo ...` command can exit before the pseudoconsole
+        // reader attaches; its output then goes to the inherited console (it
+        // showed up in the CI log) and never reaches the grid.
+        let mut terminal = ConPtyTerminal::spawn(&default_shell(), 24, 80).expect("spawn");
+        terminal
+            .write_input(b"echo bsh-conpty-ok\r\n")
+            .expect("write the command");
+        // Give the shell a moment to start, run, and the reader to drain it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut found = false;
         while std::time::Instant::now() < deadline {
-            let text: String = terminal
-                .cells()
-                .iter()
-                .map(|row| row.iter().map(|c| c.text.clone()).collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if text.contains("bsh-conpty-ok") {
-                found = true;
+            // The console echoes the typed line with the prompt in front, so
+            // the grid proves real output only when a row IS the marker.
+            found = terminal.cells().iter().any(|row| {
+                row.iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .trim()
+                    == "bsh-conpty-ok"
+            });
+            if found {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
