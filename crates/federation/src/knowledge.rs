@@ -426,6 +426,28 @@ pub enum KnowledgeError {
         /// The item.
         id: String,
     },
+    /// The knowledge snapshot could not be durably committed (issue #339).
+    ///
+    /// The previous file is intact and the live store was not changed; a
+    /// retryable failure may succeed once storage recovers.
+    #[error("cannot commit the knowledge store at {path}: {detail}")]
+    Storage {
+        /// The file the commit targeted.
+        path: String,
+        /// The durable kernel's account, naming the failed stage.
+        detail: String,
+        /// Whether retrying the same commit later can succeed.
+        retryable: bool,
+    },
+    /// An existing knowledge file is not a readable snapshot (issue #339).
+    ///
+    /// Distinct from an invalid request: a host loading this at startup must
+    /// fail closed and preserve the file, never substitute an empty store.
+    #[error("the knowledge store is not a valid snapshot: {message}")]
+    InvalidStore {
+        /// What the parser said.
+        message: String,
+    },
 }
 
 /// The host decision for one knowledge query or publication.
@@ -479,12 +501,22 @@ impl From<KnowledgeError> for capability::CapabilityError {
             KnowledgeError::TooLarge { .. } => CapabilityError::Invalid {
                 message: error.to_string(),
             },
+            KnowledgeError::Storage { .. } => CapabilityError::Unavailable {
+                reason: error.to_string(),
+            },
+            KnowledgeError::InvalidStore { .. } => CapabilityError::Invalid {
+                message: error.to_string(),
+            },
         }
     }
 }
 
 /// The local authoritative knowledge store.
-#[derive(Debug, Default)]
+///
+/// Cloning is cheap enough to be the publication seam (issue #339): a
+/// publication is applied to a clone, committed, and only then published as
+/// the live store, so a failed commit cannot leave uncommitted items behind.
+#[derive(Debug, Clone, Default)]
 pub struct KnowledgeService {
     items: BTreeMap<String, KnowledgeItem>,
     publisher: BTreeMap<String, NodeId>,
@@ -516,6 +548,10 @@ impl KnowledgeService {
     }
 
     /// Load a snapshot written by to_json.
+    ///
+    /// A parse failure is a typed `KnowledgeError::InvalidStore`, distinct
+    /// from an invalid request, so a host can fail closed on a corrupt store
+    /// instead of treating it as empty (issue #339).
     pub fn from_json(text: &str) -> Result<Self, KnowledgeError> {
         #[derive(Deserialize)]
         struct Snapshot {
@@ -524,13 +560,47 @@ impl KnowledgeService {
             revoked: BTreeSet<String>,
         }
         let snapshot: Snapshot =
-            serde_json::from_str(text).map_err(|error| KnowledgeError::Invalid {
+            serde_json::from_str(text).map_err(|error| KnowledgeError::InvalidStore {
                 message: error.to_string(),
             })?;
         Ok(Self {
             items: snapshot.items,
             publisher: snapshot.publisher,
             revoked: snapshot.revoked,
+        })
+    }
+
+    /// Write the snapshot atomically, creating the parent directory.
+    ///
+    /// The store can carry governed material, so it is kept owner-only on
+    /// every host (issue #299), the same private policy as the peer store.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), KnowledgeError> {
+        self.save_with_gate(path, &hostkit::durable::NoFaults)
+    }
+
+    /// Commit the snapshot through the durable kernel with a fault-injection
+    /// gate (issue #339).
+    ///
+    /// A failure at any commit stage leaves the previous file intact and is
+    /// reported as a typed `KnowledgeError::Storage` naming the stage and
+    /// whether a retry can succeed. Production callers pass
+    /// `hostkit::durable::NoFaults`; tests inject a stage failure.
+    pub fn save_with_gate(
+        &self,
+        path: &std::path::Path,
+        gate: &dyn hostkit::durable::CommitGate,
+    ) -> Result<(), KnowledgeError> {
+        let text = self.to_json()?;
+        hostkit::durable::commit(
+            path,
+            text.as_bytes(),
+            hostkit::durable::Privacy::OwnerOnly,
+            gate,
+        )
+        .map_err(|error| KnowledgeError::Storage {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+            retryable: error.is_retryable(),
         })
     }
 
@@ -754,5 +824,164 @@ mod tests {
         let restored = KnowledgeService::from_json(&json).expect("restored");
         assert!(restored.is_revoked("k-1"));
         assert!(restored.get("k-1").is_none());
+    }
+
+    /// Issue #339: a restart keeps the item, its publisher, workspace scope,
+    /// provenance, expiry and the revoked markers, not just the payloads.
+    #[test]
+    fn a_publication_round_trips_with_publisher_scope_provenance_and_expiry() {
+        let node = NodeIdentity::from_seed([17u8; 32]).node_id();
+        let stranger = NodeIdentity::from_seed([18u8; 32]).node_id();
+        let workspace = WorkspaceId::new("ws:research").expect("a workspace");
+        let payload = serde_json::json!({ "fact": "governed" });
+        let live = KnowledgeItem {
+            id: "k-live".to_string(),
+            class: KnowledgeClass::Workspace,
+            workspace: Some(workspace.clone()),
+            payload: payload.clone(),
+            provenance: Provenance {
+                origin: node.clone(),
+                source: "memory/k-live".to_string(),
+                issued_at_ms: 1_000,
+                expires_at_ms: Some(9_000_000),
+                content_hash: knowledge_hash(&payload),
+            },
+            retention_ms: Some(60_000),
+        };
+        let mut service = KnowledgeService::new();
+        service
+            .publish(&node, &KnowledgePublication::new(vec![live.clone()]), 2_000)
+            .expect("published");
+        let doomed = item(&node);
+        service
+            .publish(&node, &KnowledgePublication::new(vec![doomed]), 2_000)
+            .expect("published");
+        assert!(service.revoke(&node, "k-1").expect("revoked"));
+
+        let json = service.to_json().expect("serialized");
+        let mut restored = KnowledgeService::from_json(&json).expect("restored");
+
+        let kept = restored.get("k-live").expect("the item survived");
+        assert_eq!(kept, &live, "payload, scope, provenance and expiry survive");
+        assert_eq!(kept.workspace.as_ref(), Some(&workspace));
+        assert_eq!(kept.provenance.expires_at_ms, Some(9_000_000));
+        // The publisher map survived: only the original publisher may revoke.
+        assert!(matches!(
+            restored.revoke(&stranger, "k-live"),
+            Err(KnowledgeError::RevokeDenied { .. })
+        ));
+        assert!(restored
+            .revoke(&node, "k-live")
+            .expect("the publisher revokes"));
+        // The revoked marker survived and still refuses a republication.
+        assert!(restored.is_revoked("k-1"));
+        assert!(restored.get("k-1").is_none());
+        assert!(matches!(
+            restored.publish(&node, &KnowledgePublication::new(vec![item(&node)]), 3_000),
+            Err(KnowledgeError::Revoked { .. })
+        ));
+    }
+
+    /// Issue #339: a corrupt snapshot is a distinct error a host can fail
+    /// closed on, never an invalid request and never an empty store.
+    #[test]
+    fn a_corrupt_snapshot_is_a_distinct_invalid_store_error() {
+        let error = KnowledgeService::from_json("{not json").expect_err("corrupt");
+        assert!(
+            matches!(error, KnowledgeError::InvalidStore { .. }),
+            "{error:?}"
+        );
+        let wrong_shape = KnowledgeService::from_json(r#"{"items":{}}"#).expect_err("shape");
+        assert!(
+            matches!(wrong_shape, KnowledgeError::InvalidStore { .. }),
+            "{wrong_shape:?}"
+        );
+    }
+
+    /// A gate that fails exactly one commit stage (issue #339).
+    struct FaultAt(hostkit::durable::IoStage);
+
+    impl hostkit::durable::CommitGate for FaultAt {
+        fn pass(
+            &self,
+            stage: hostkit::durable::IoStage,
+            _path: &std::path::Path,
+        ) -> std::io::Result<()> {
+            if stage == self.0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected commit failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Issue #339: an injected failure at every commit stage leaves the
+    /// previous snapshot intact and reports a typed, retryable error.
+    #[test]
+    fn a_failed_snapshot_commit_keeps_the_previous_file() {
+        let node = NodeIdentity::from_seed([19u8; 32]).node_id();
+        for stage in [
+            hostkit::durable::IoStage::CreateTemp,
+            hostkit::durable::IoStage::Write,
+            hostkit::durable::IoStage::Sync,
+            hostkit::durable::IoStage::Replace,
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "federation-knowledge-fault-{}-{stage}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            let path = dir.join("knowledge.json");
+
+            let mut before = KnowledgeService::new();
+            before
+                .publish(&node, &KnowledgePublication::new(vec![item(&node)]), 2)
+                .expect("published");
+            before.save(&path).expect("the pre-state is committed");
+
+            let mut candidate = before.clone();
+            let second = KnowledgeItem {
+                id: "k-2".to_string(),
+                ..item(&node)
+            };
+            candidate
+                .publish(&node, &KnowledgePublication::new(vec![second]), 3)
+                .expect("published on the clone");
+            let error = candidate
+                .save_with_gate(&path, &FaultAt(stage))
+                .expect_err("the injected stage must fail");
+            match &error {
+                KnowledgeError::Storage {
+                    path: failed,
+                    detail,
+                    retryable,
+                } => {
+                    assert_eq!(failed, &path.display().to_string());
+                    assert!(detail.contains(&stage.to_string()), "{detail}");
+                    assert!(retryable, "an injected I/O failure is retryable");
+                }
+                other => panic!("expected a Storage error at {stage}, got {other:?}"),
+            }
+
+            let text = std::fs::read_to_string(&path).expect("the previous file is intact");
+            let on_disk = KnowledgeService::from_json(&text).expect("still a snapshot");
+            assert!(on_disk.get("k-1").is_some());
+            assert!(
+                on_disk.get("k-2").is_none(),
+                "stage {stage} leaked the uncommitted item"
+            );
+
+            candidate
+                .save_with_gate(&path, &hostkit::durable::NoFaults)
+                .expect("the retry commits once the fault is gone");
+            let text = std::fs::read_to_string(&path).expect("read after retry");
+            let recovered = KnowledgeService::from_json(&text).expect("snapshot");
+            assert!(recovered.get("k-2").is_some());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

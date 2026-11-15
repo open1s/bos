@@ -1,9 +1,9 @@
 //! Governance policy for MCP server and tool invocation.
 //!
-//! An [`McpPolicy`](crate::mcp::policy::McpPolicy) holds allow/deny rules keyed by MCP server and tool. A rule
+//! An [`McpPolicy`] holds allow/deny rules keyed by MCP server and tool. A rule
 //! field may be an exact name or `*` to match anything. Matching is explicit and
 //! total: a matching `Deny` always beats a matching `Allow`, and when nothing
-//! matches the policy returns its default (an explicit choice, [`McpDecision::Ask`](crate::mcp::policy::McpDecision::Ask)
+//! matches the policy returns its default (an explicit choice, [`McpDecision::Ask`]
 //! unless configured otherwise).
 
 /// The effect of one [`McpRule`].

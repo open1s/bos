@@ -481,13 +481,20 @@ impl Agent {
     /// Non-text input (images/audio only) has no query to match against, so
     /// it uses the composed prompt unchanged.
     async fn system_prompt_for(&self, task: &Content, tools: &[react::llm::LlmTool]) -> String {
+        self.assemble_for(task, tools).await.system_prompt
+    }
+
+    /// The typed assembly behind [`Self::system_prompt_for`] (issue #346):
+    /// the prompt AND the recall account it was built from, so diagnostics
+    /// never re-derive inclusion from rendered strings.
+    async fn assemble_for(&self, task: &Content, tools: &[react::llm::LlmTool]) -> PromptAssembly {
         // One assembly per task: the inject event and the request share it, so
         // the memory recall is not paid twice on the same turn.
         let task_key = task.retrieval_text().unwrap_or_default();
         if let Ok(cache) = self.system_prompt_cache.lock() {
-            if let Some((key, prompt)) = cache.as_ref() {
+            if let Some((key, assembly)) = cache.as_ref() {
                 if *key == task_key {
-                    return prompt.clone();
+                    return assembly.clone();
                 }
             }
         }
@@ -519,35 +526,50 @@ impl Agent {
         }
         // Multimodal turns retrieve on their accompanying text, not on a
         // pretend-text reading of the binary payload (issue #335). A turn with
-        // no usable query skips retrieval with an observable reason.
-        let result = match task.retrieval_text() {
-            Some(query) => {
-                let memory = self.recalled_context(&query).await;
-                react::template::with_memory(&base, memory.as_deref())
-            }
+        // no usable query skips retrieval with an observable reason. The
+        // recall is the typed hybrid seam (issue #345); the rendered block is
+        // byte-compatible with the legacy format.
+        let memory = match task.retrieval_text() {
+            Some(query) => self.recall_report(&query).await,
             None => {
                 log::debug!("memory retrieval skipped: no usable text query in this turn");
-                base
+                crate::agent::agentic::MemoryRecallReport {
+                    skip: Some("no usable text query in this turn".to_string()),
+                    ..Default::default()
+                }
             }
         };
+        let result = react::template::with_memory(&base, memory.block.as_deref());
+        let assembly = PromptAssembly {
+            system_prompt: result,
+            base_prompt: base,
+            memory,
+        };
         if let Ok(mut cache) = self.system_prompt_cache.lock() {
-            *cache = Some((task_key, result.clone()));
+            *cache = Some((task_key, assembly.clone()));
         }
-        result
+        assembly
     }
 
     /// The full system prompt a turn for `task` will carry: the discovery
     /// block, the configured persona, any live prompt sections and the recalled
-    /// memory - the exact assembly [`Self::system_prompt_for`] sends to the
+    /// memory - the exact assembly [`Self::assemble_prompt`] sends to the
     /// provider. A host surfacing the injection shows the whole of it, so no key
     /// info the model receives is missing from the inject event.
     pub async fn injected_system_prompt(&self, task: &Content) -> String {
+        self.assemble_prompt(task).await.system_prompt
+    }
+
+    /// The full typed assembly a turn for `task` will carry (issue #346):
+    /// the exact system prompt plus the memory recall account. Hosts derive
+    /// diagnostics from this snapshot, not from searching the rendered text.
+    pub async fn assemble_prompt(&self, task: &Content) -> PromptAssembly {
         // A fresh assembly for this turn: drop any prior turn's cached prompt.
         if let Ok(mut cache) = self.system_prompt_cache.lock() {
             *cache = None;
         }
         let context = self.prepare_context();
-        self.system_prompt_for(task, context.tools.as_slice()).await
+        self.assemble_for(task, context.tools.as_slice()).await
     }
 
     /// Run the agent using ReAct engine. Uses the agent's existing session

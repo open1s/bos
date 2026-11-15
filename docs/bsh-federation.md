@@ -155,6 +155,42 @@ BSH launch reads `rotation.json` and delivers it to every enrolled peer; the
 same record can be applied by hand with `accept-rotation`, and delivery is
 idempotent for a peer that was offline.
 
+### Durable trust and knowledge transitions
+
+A trust or knowledge transition is acknowledged only after its durable commit
+succeeds (issues #338, #339). Both handlers use one shape: clone the store,
+apply the change to the clone, commit the clone through the staged durable
+kernel (create-dir, create-temp, write, sync, harden, replace; owner-only on
+every host), and only then publish the clone as the live store. A failure at
+any commit stage leaves the previous file intact, keeps the live store at the
+pre-transition state, and answers the sender with a typed `Unavailable` error
+naming the path and the failed stage. Concurrent authorization reads see
+either the whole pre-transition or the whole post-transition store, never a
+mix.
+
+**Rotation.** The rotation audit row names both identities (`old -> new` in
+the subject) and the durable outcome: `ok` only after the commit,
+`storage_failed` when the commit fails, `denied` when the record itself is
+refused. The committed snapshot carries a rotation log (`PeerStore.rotations`,
+serde-defaulted so peer files written before the log existed still load).
+
+Retry / idempotency rule: a failed commit changes nothing, so the sender
+retries with a FRESH envelope — a new `message_id`, because the replay cache
+deduplicates by message identity — carrying the SAME signed `RotationRecord`.
+An already-committed rotation answers `ok` without re-applying, even after a
+restart, because the log entry was committed inside the snapshot. No failed
+attempt can strand the peer between identities: the old identity stays trusted
+until the rotated store is durably committed.
+
+**Knowledge publication.** A publication is acknowledged with an accepted
+count only after the snapshot commit succeeds; a failed commit answers a typed
+`unavailable` error, records an `unavailable` audit row, and leaves the live
+store without the item. A later successful publication builds on the unchanged
+live store, so it cannot silently drop the predecessors of a failed attempt.
+Revocation follows the same contract. A corrupt `knowledge.json` is a distinct
+`KnowledgeError::InvalidStore`, so a host can fail closed at startup instead of
+treating an unreadable store as an empty one.
+
 ## Several nodes on one machine
 
 One BSH process runs one federation node. A **profile** is that node's name on
@@ -779,7 +815,9 @@ being asked to type them.
   `builtin/knowledge_query` or `builtin/knowledge_publish` grant. The default is
   deny, and a node without both refuses explicitly. BSH persists the store to
   `knowledge.json` after a publication or revocation, and the pane lists local
-  items with a Revoke action.
+  items with a Revoke action. The acknowledgement follows the durable commit:
+  a failed snapshot write is a typed `unavailable` error with the live store
+  unchanged, never a warning behind an accepted count (issue #339).
 - Federation membership is advertised (signed `federation` and `policy_revision`
   on discovery records) and recorded on a peer at enrollment, but it grants
   nothing by itself: trust and grants stay per peer. There is no shared membership

@@ -233,6 +233,11 @@ pub(crate) const READ_ONLY: &str = "read-only";
 /// The permission mode that releases the workspace confinement.
 pub(crate) const FULL_ACCESS: &str = "danger-full-access";
 
+/// The token budget one turn's memory recall may spend (issue #345): top-K is
+/// constrained by tokens, not only item count, so a few long records cannot
+/// crowd out the request window.
+pub(crate) const MEMORY_RECALL_TOKEN_BUDGET: usize = 1024;
+
 /// Whether a permission mode confines a turn to the active workspace.
 ///
 /// Confined is what installs the shell's `WorkspaceValidator` and gives the file
@@ -604,6 +609,9 @@ pub(crate) struct BuiltAgent {
     /// ready, empty, or an initialization failure that is surfaced rather than
     /// silently dropping the feature.
     pub(crate) memory_state: crate::context_assembly::MemoryState,
+    /// The governed capture coordinator for this build's completed turns
+    /// (issue #343), when memory opened.
+    pub(crate) memory_capture: Option<Arc<crate::memory_capture::CaptureHandle>>,
 }
 
 impl BuiltAgent {
@@ -1664,12 +1672,16 @@ fn build_agent_for_session_inner(
         }
     }
 
+    let mut memory_capture = None;
     let memory_state = if eff.memory_enabled {
-        let (memory, state) = open_memory(settings);
-        if let Some(memory) = memory {
+        let opened = open_memory(settings, choice, session);
+        if let Some(memory) = opened.store {
             agent = agent.with_memory(memory);
+            // Recall is bounded by tokens, not only item count (issue #345).
+            agent.set_memory_token_budget(Some(MEMORY_RECALL_TOKEN_BUDGET));
         }
-        state
+        memory_capture = opened.capture;
+        opened.state
     } else {
         crate::context_assembly::MemoryState::Disabled
     };
@@ -1925,6 +1937,7 @@ fn build_agent_for_session_inner(
         effective: eff,
         goal: goal_store,
         memory_state,
+        memory_capture,
     };
     built.start_live_driver();
     if let Some(snapshot) = &built.snapshot {
@@ -6076,59 +6089,118 @@ fn describe_schedule_request(request: &crate::schedule::ScheduleRequest) -> serd
     }
 }
 
-/// Open the file-backed memory store on a short-lived runtime.
+/// What one memory open resolved (issues #334, #340, #343).
+pub(crate) struct OpenMemory {
+    /// The scoped store the agent recalls from, when memory opened.
+    pub(crate) store: Option<Arc<dyn MemoryStore>>,
+    /// The lifecycle state, surfaced rather than silently disabled.
+    pub(crate) state: crate::context_assembly::MemoryState,
+    /// The capture coordinator over the workspace store, when memory opened.
+    pub(crate) capture: Option<Arc<crate::memory_capture::CaptureHandle>>,
+}
+
+/// Open the scoped, coordinated memory stores on a short-lived runtime.
 ///
 /// FileMemory::open is async while the build is sync and may run inside an
 /// async context, so the open happens on its own current-thread runtime.
+/// The scope resolver (issue #340) decides the storage identity and the access
+/// scope: a workspace store isolated by the stable workspace id, plus the
+/// legacy user store, composed into one recall surface. Both stores enforce
+/// scope on reads AND writes; the legacy file is upgraded in place, never
+/// destroyed.
 fn open_memory(
     settings: &Settings,
-) -> (
-    Option<Arc<dyn MemoryStore>>,
-    crate::context_assembly::MemoryState,
-) {
+    choice: &crate::settings::resolve::SessionChoice,
+    session: &str,
+) -> OpenMemory {
     use crate::context_assembly::MemoryState;
     // A test that builds a bare Settings has no redirect. Attaching nothing is
-    // the only safe answer: memory_file would otherwise fall back to the
-    // reader's own ~/.bos/bsh/memory.jsonl, which no test owns and several
+    // the only safe answer: the resolver would otherwise fall back to the
+    // reader's own ~/.bos/bsh memory files, which no test owns and several
     // tests inside one process would share. A settings document opened from a
-    // scratch root (the normal test path) still gets its own scratch file.
+    // scratch root (the normal test path) still gets its own scratch files.
     if cfg!(test) && settings.save_root.is_none() {
-        return (None, MemoryState::Disabled);
+        return OpenMemory {
+            store: None,
+            state: MemoryState::Disabled,
+            capture: None,
+        };
     }
-    let path = settings.memory_file();
+    let resolved = crate::memory_scope::MemoryScopeResolver::resolve(settings, choice, session);
+    log::debug!(target: "bsh::memory", "memory scope: {}", resolved.diagnostic());
+    let capture_enabled = settings.workspace.agent.memory_capture;
+    let capture_scope = resolved.viewer.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         // The failure reason is retained, not dropped to an Option (issue
         // #334): an enabled memory that cannot open is surfaced, not silently
         // disabled. The reason names the path and the error, never the content.
-        let result = (|| -> Result<(FileMemory, MemoryState), String> {
+        type Opened = Result<(Arc<dyn MemoryStore>, MemoryState, Arc<FileMemory>), String>;
+        let result = (|| -> Opened {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| format!("could not start the memory runtime: {e}"))?;
-            let memory = rt
-                .block_on(FileMemory::open(&path))
-                .map_err(|e| format!("could not open {}: {e}", path.display()))?;
-            let memory = memory.with_max_items(500);
-            let state = if rt.block_on(memory.is_empty()) {
+            let workspace = rt
+                .block_on(FileMemory::open_scoped(
+                    &resolved.workspace_store,
+                    resolved.storage_scope.clone(),
+                    Some(resolved.viewer.clone()),
+                ))
+                .map_err(|e| {
+                    format!("could not open {}: {e}", resolved.workspace_store.display())
+                })?;
+            let workspace = Arc::new(workspace.with_max_items(500));
+            let user_id = crate::memory_scope::user_identity();
+            let user = rt
+                .block_on(FileMemory::open_scoped(
+                    &resolved.user_store,
+                    agent::memory::MemoryScope::user(user_id.clone()),
+                    Some(agent::memory::MemoryScope::user(user_id)),
+                ))
+                .map_err(|e| format!("could not open {}: {e}", resolved.user_store.display()))?;
+            let user = Arc::new(user.with_max_items(500));
+            let composed = agent::memory::ScopedMemory::new(vec![Arc::clone(&workspace), user])
+                .map_err(|e| format!("could not compose the memory scopes: {e}"))?;
+            let state = if rt.block_on(composed.is_empty()) {
                 MemoryState::Empty
             } else {
                 MemoryState::Ready
             };
-            Ok((memory, state))
+            Ok((Arc::new(composed) as Arc<dyn MemoryStore>, state, workspace))
         })();
         let _ = tx.send(result);
     });
     match rx.recv() {
-        Ok(Ok((memory, state))) => (Some(Arc::new(memory) as Arc<dyn MemoryStore>), state),
+        Ok(Ok((store, state, workspace))) => {
+            let policy = agent::memory::capture::CapturePolicy {
+                enabled: capture_enabled,
+                scope: capture_scope,
+                explicit_enabled: true,
+                ..Default::default()
+            };
+            OpenMemory {
+                store: Some(store),
+                state,
+                capture: Some(crate::memory_capture::CaptureHandle::new(workspace, policy)),
+            }
+        }
         Ok(Err(reason)) => {
             log::warn!("memory is enabled but unavailable: {reason}");
-            (None, MemoryState::InitFailed { reason })
+            OpenMemory {
+                store: None,
+                state: MemoryState::InitFailed { reason },
+                capture: None,
+            }
         }
         Err(_) => {
             let reason = "the memory open thread did not return".to_string();
             log::warn!("memory is enabled but unavailable: {reason}");
-            (None, MemoryState::InitFailed { reason })
+            OpenMemory {
+                store: None,
+                state: MemoryState::InitFailed { reason },
+                capture: None,
+            }
         }
     }
 }
@@ -8806,31 +8878,40 @@ mod tests {
         let mut settings = bare();
         settings.save_root = Some(dir.clone());
 
+        let choice = crate::settings::resolve::SessionChoice::default();
         // Missing file -> ready but empty (NotFound is not a failure).
         settings.workspace.agent.memory_path =
             Some(dir.join("missing.jsonl").to_string_lossy().into_owned());
-        let (memory, state) = super::open_memory(&settings);
-        assert!(memory.is_some(), "a missing file opens an empty store");
-        assert_eq!(state, MemoryState::Empty);
+        let opened = super::open_memory(&settings, &choice, "s1");
+        assert!(
+            opened.store.is_some(),
+            "a missing file opens an empty store"
+        );
+        assert_eq!(opened.state, MemoryState::Empty);
 
         // Malformed file -> init failure, surfaced rather than silent.
         let bad = dir.join("bad.jsonl");
         std::fs::write(&bad, "this is not json").expect("write");
         settings.workspace.agent.memory_path = Some(bad.to_string_lossy().into_owned());
-        let (memory, state) = super::open_memory(&settings);
-        assert!(memory.is_none(), "a malformed store is not attached");
+        let opened = super::open_memory(&settings, &choice, "s1");
+        assert!(opened.store.is_none(), "a malformed store is not attached");
         assert!(
-            matches!(state, MemoryState::InitFailed { .. }),
-            "the failure is surfaced: {state:?}"
+            matches!(opened.state, MemoryState::InitFailed { .. }),
+            "the failure is surfaced: {:?}",
+            opened.state
         );
 
         // Valid file with an item -> ready.
         let good = dir.join("good.jsonl");
         std::fs::write(&good, r#"{"id":"1","content":"a note","created_at_ms":0}"#).expect("write");
         settings.workspace.agent.memory_path = Some(good.to_string_lossy().into_owned());
-        let (memory, state) = super::open_memory(&settings);
-        assert!(memory.is_some());
-        assert_eq!(state, MemoryState::Ready);
+        let opened = super::open_memory(&settings, &choice, "s1");
+        assert!(opened.store.is_some());
+        assert_eq!(opened.state, MemoryState::Ready);
+        assert!(
+            opened.capture.is_some(),
+            "memory open attaches the capture coordinator"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

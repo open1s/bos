@@ -9,6 +9,8 @@ description = "Host-neutral OS services: process-tree ownership, path safety, en
 
 [dependencies]
 dirs = "7.0.0"
+fs2 = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

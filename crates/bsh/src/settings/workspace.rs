@@ -116,6 +116,13 @@ pub(crate) struct AgentSection {
     pub(crate) parallel_tool_calls: bool,
     /// Attach the file-backed memory store.
     pub(crate) memory_enabled: bool,
+    /// Run governed knowledge capture at completed turns (issue #343).
+    ///
+    /// Off by default: automatic extraction is opt-in governance. Explicit
+    /// "remember this" requests are honored whenever memory is enabled,
+    /// independent of this switch.
+    #[serde(default)]
+    pub(crate) memory_capture: bool,
     /// Completion cap; absent leaves it to the engine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
@@ -162,6 +169,7 @@ impl Default for AgentSection {
             // one after another.
             parallel_tool_calls: true,
             memory_enabled: true,
+            memory_capture: false,
             max_tokens: None,
             // The reply reserve is subtracted from this ceiling before the
             // compaction trigger is computed, so a 32k budget with a 12.8k cap

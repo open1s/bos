@@ -1,7 +1,7 @@
 //! Per-session skill activation and skill authoring validation.
 //!
-//! [`SkillActivation`](crate::skills::session::SkillActivation) records which skills are switched on in which session, so
-//! activation in one session never leaks into another. [`SkillAuthoringRecord`](crate::skills::session::SkillAuthoringRecord)
+//! [`SkillActivation`] records which skills are switched on in which session, so
+//! activation in one session never leaks into another. [`SkillAuthoringRecord`]
 //! validates a skill definition (name, description, JSON schema) and reports
 //! every problem with the name of the offending field.
 

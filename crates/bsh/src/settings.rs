@@ -1042,31 +1042,6 @@ impl Settings {
         }
     }
 
-    /// The memory file in effect.
-    ///
-    /// An explicit workspace path wins. Otherwise the file sits beside the
-    /// settings document this configuration writes - `save_root` for a test or
-    /// a redirected install, the bsh data directory for the app - exactly like
-    /// the vault and the recycle bin. Recomputing it from `$HOME` made every
-    /// test build read (and, on a remember, rewrite) the reader's real memory
-    /// file, which is shared state no test owns.
-    pub(crate) fn memory_file(&self) -> PathBuf {
-        let raw = self
-            .workspace
-            .agent
-            .memory_path
-            .as_deref()
-            .unwrap_or("")
-            .trim();
-        if !raw.is_empty() {
-            return PathBuf::from(shellexpand::tilde(raw).into_owned());
-        }
-        match &self.save_root {
-            Some(root) => root.join("memory.jsonl"),
-            None => dir().join("memory.jsonl"),
-        }
-    }
-
     /// Every effective MCP server: the global entries in file order, with a
     /// workspace entry of the same name replacing its global twin.
     pub(crate) fn mcp_servers(&self) -> Vec<mcp::McpServer> {

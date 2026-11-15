@@ -1,7 +1,7 @@
 //! The baseline policy shipped in-tree.
 //!
 //! This module is the reference example a user copies: small, readable, and
-//! written against the same [`PolicyInput`](crate::policy::PolicyInput)
+//! written against the same [`crate::policy::PolicyInput`]
 //! document any other source sees. It answers every action, so a workspace
 //! policy can layer over it without having to restate a floor.
 //!
@@ -48,7 +48,7 @@
 //!
 //! Every denying rule carries a `# rule: <id>` comment, and the verdict repeats
 //! the id in its `rule` field. The loader extracts the comments into
-//! [`PolicySet::rule_ids`](crate::policy::PolicySet::rule_ids); the verdict's
+//! [`crate::policy::PolicySet::rule_ids`]; the verdict's
 //! field is what a denial names.
 
 use super::set::PolicySource;
@@ -226,7 +226,7 @@ host_matches(host, entry) if {
 "#;
 
 /// The baseline as a [`PolicySource`], ready for
-/// [`PolicySet::compile`](crate::policy::PolicySet::compile).
+/// [`crate::policy::PolicySet::compile`].
 pub fn baseline_source() -> PolicySource {
     PolicySource::new("baseline", BASELINE_POLICY_REGO)
 }

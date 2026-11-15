@@ -1,17 +1,17 @@
 //! Scoped "allow-always" approval rules for tool invocations.
 //!
-//! A [`RuleSet`](crate::security::rules::RuleSet) holds a list of [`ToolRule`](crate::security::rules::ToolRule)s. Each rule names a tool (exact
+//! A [`RuleSet`] holds a list of [`ToolRule`]s. Each rule names a tool (exact
 //! name or a `*` glob), may narrow the match with an argument predicate, is
-//! scoped to a [`RuleScope`](crate::security::rules::RuleScope), and carries an [`RuleEffect`](crate::security::rules::RuleEffect). [`RuleSet::decide`](crate::security::rules::RuleSet::decide)
-//! evaluates a tool call against the rules and returns a [`Decision`](crate::security::rules::Decision).
+//! scoped to a [`RuleScope`], and carries an [`RuleEffect`]. [`RuleSet::decide`]
+//! evaluates a tool call against the rules and returns a [`Decision`].
 //!
 //! Precedence is explicit and total:
 //!
-//! 1. An explicit [`RuleEffect::Deny`](crate::security::rules::RuleEffect::Deny) matches beat any [`RuleEffect::Allow`](crate::security::rules::RuleEffect::Allow).
+//! 1. An explicit [`RuleEffect::Deny`] matches beat any [`RuleEffect::Allow`].
 //! 2. Among rules with the same effect, the most specific rule wins. Specificity
 //!    is evaluated lexicographically: narrower scope first, then "has an
 //!    argument predicate".
-//! 3. When nothing matches, the answer is [`DecisionEffect::Ask`](crate::security::rules::DecisionEffect::Ask).
+//! 3. When nothing matches, the answer is [`DecisionEffect::Ask`].
 //!
 //! The rule set also keeps a capacity-bounded, oldest-first audit ring that
 //! records every decision, and can be saved to / loaded from a JSON file. A

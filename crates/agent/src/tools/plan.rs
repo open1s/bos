@@ -38,9 +38,7 @@ pub struct PlanItem {
 /// Shared, cheaply cloneable store for the working plan.
 ///
 /// The agent owns one instance, [`PlanTool`] and the host share clones of
-/// it, so a tool call is immediately visible through [`Agent::plan_items`].
-///
-/// [`Agent::plan_items`]: crate::Agent::plan_items
+/// it, so a tool call is immediately visible through [`crate::Agent::plan_items`].
 #[derive(Debug, Clone, Default)]
 pub struct PlanStore {
     items: Arc<Mutex<Vec<PlanItem>>>,
@@ -100,9 +98,7 @@ pub struct PlanTool {
 
 impl PlanTool {
     /// Attach a tool to `store` — usually the store returned by
-    /// [`Agent::plan`].
-    ///
-    /// [`Agent::plan`]: crate::Agent::plan
+    /// [`crate::Agent::plan`].
     pub fn new(store: PlanStore) -> Self {
         Self { store }
     }

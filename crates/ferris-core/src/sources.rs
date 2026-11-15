@@ -197,7 +197,7 @@ fn split_hash(raw: &str) -> (&str, Option<&str>) {
 /// An optional `subpath` selects a package inside the checkout. It is
 /// untrusted (a registry index supplies it), so it is validated as a strictly
 /// relative Git package path and proven to stay inside the canonical checkout
-/// before the manifest is checked or read; see [`git_package_root`].
+/// before the manifest is checked or read; see `git_package_root`.
 pub fn fetch_git(
     repository: &str,
     revision: Option<&str>,

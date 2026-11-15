@@ -39,7 +39,7 @@ pub enum ConfigError {
     #[error("Load error: {0}")]
     LoadError(#[from] anyhow::Error),
 
-    /// A [`CustomConfigSource`](crate::types::CustomConfigSource) failed.
+    /// A [`crate::types::CustomConfigSource`] failed.
     #[error("Custom source error: {0}")]
     Custom(String),
 }

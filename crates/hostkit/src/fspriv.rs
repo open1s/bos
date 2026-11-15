@@ -7,7 +7,7 @@
 //! errors instead of silently storing the secret world-readable.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 /// Open options for a private file: mode 0600 at creation on Unix.
@@ -48,31 +48,16 @@ pub fn private_permissions(path: &Path) -> io::Result<()> {
 /// after the rename so a pre-existing world-readable file cannot survive the
 /// replacement. A failure at any stage leaves the previous file intact.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "secret path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "secret".to_string()),
-        std::process::id()
-    ));
-    let result = (|| -> io::Result<()> {
-        let mut file = private_open_options().open(&tmp)?;
-        private_permissions(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, path)?;
-        private_permissions(path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    // One commit kernel for every durable write (issues #338/#339/#341/#342):
+    // the staged pipeline, the typed stage errors and the temp cleanup live in
+    // the durable module; this wrapper keeps the historical io::Result surface.
+    crate::durable::commit(
+        path,
+        bytes,
+        crate::durable::Privacy::OwnerOnly,
+        &crate::durable::NoFaults,
+    )
+    .map_err(io::Error::other)
 }
 
 /// Windows: replace the file's DACL with a protected, owner-only one.

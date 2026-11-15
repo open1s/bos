@@ -271,6 +271,7 @@ impl Runner {
         tool_output_cap: usize,
         memory_state: crate::context_assembly::MemoryState,
         persona_complete: bool,
+        capture: Option<Arc<crate::memory_capture::CaptureHandle>>,
     ) -> async_channel::Receiver<AgentEvent> {
         self.stop(session_id);
         Self::seed_session(&agent, &transcript);
@@ -290,6 +291,9 @@ impl Runner {
             .map(|previous| prepared_at.saturating_sub(previous));
         let time = crate::context::TimeFacts { turn, elapsed };
 
+        // Owned copies for the spawned task: the capture evidence outlives
+        // the method body (issue #343).
+        let session = session_id.to_string();
         let (tx, rx) = async_channel::unbounded();
         // The turn's delivery sink, installed before the stream starts: the
         // agent reports a steered ticket at the step that takes it, which is
@@ -336,36 +340,105 @@ impl Runner {
             // turn carried. Recorded on the prompt row, display only.
             {
                 let mut injections: Vec<crate::model::ContextInjection> = Vec::new();
-                // The whole system prompt the turn will send - persona plus the
-                // discovery block, live sections and recalled memory - so the
-                // inject event misses no key info the model receives.
-                let persona = agent.injected_system_prompt(&input).await;
+                // The TYPED assembly (issue #346): the exact system prompt plus
+                // the recall account it was built from. Diagnostics read the
+                // account, never search the rendered text.
+                let assembly = agent.assemble_prompt(&input).await;
+                let persona = assembly.system_prompt.clone();
+                let recall =
+                    crate::context_assembly::MemoryRecallInfo::from_agent(&assembly.memory);
 
-                // Per-request assembly diagnostics (issue #336): a privacy-
-                // conscious account of what reached the model - counts, labels
-                // and token estimates, never raw memory or workspace content.
+                // The immutable snapshot is the source of truth: one typed
+                // block per source, each carrying its trust boundary and
+                // provenance to serialization (issue #346).
+                let mut blocks = vec![crate::context_assembly::ContextBlock {
+                    source: crate::context_assembly::ContextSource::Persona,
+                    trust: crate::context_assembly::ContextSource::Persona.trust(),
+                    text: assembly.base_prompt.clone(),
+                    token_estimate: agent::agent::context::estimate_tokens(&assembly.base_prompt),
+                    provenance: Some("persona".to_string()),
+                }];
+                if !context.snapshot.is_empty() {
+                    blocks.push(crate::context_assembly::ContextBlock {
+                        source: crate::context_assembly::ContextSource::HostRuntime,
+                        trust: crate::context_assembly::ContextSource::HostRuntime.trust(),
+                        text: context.snapshot.clone(),
+                        token_estimate: agent::agent::context::estimate_tokens(&context.snapshot),
+                        provenance: Some("runtime-context".to_string()),
+                    });
+                }
+                if !context.time_context.is_empty() {
+                    blocks.push(crate::context_assembly::ContextBlock {
+                        source: crate::context_assembly::ContextSource::TimeContext,
+                        trust: crate::context_assembly::ContextSource::TimeContext.trust(),
+                        text: context.time_context.clone(),
+                        token_estimate: agent::agent::context::estimate_tokens(&context.time_context),
+                        provenance: Some("time-context".to_string()),
+                    });
+                }
+                if let Some(instructions) = &context.instructions {
+                    blocks.push(crate::context_assembly::ContextBlock {
+                        source: crate::context_assembly::ContextSource::WorkspaceInstructions,
+                        trust: crate::context_assembly::ContextSource::WorkspaceInstructions.trust(),
+                        text: instructions.clone(),
+                        token_estimate: agent::agent::context::estimate_tokens(instructions),
+                        provenance: Some("AGENTS.md".to_string()),
+                    });
+                }
+                if let Some(block) =
+                    crate::context_assembly::memory_block(&recall, assembly.memory.block.as_deref())
+                {
+                    blocks.push(block);
+                }
+                let snapshot = crate::context_assembly::AssemblySnapshot::build(blocks);
+
+                // Per-request assembly diagnostics (issues #336/#346): counts,
+                // labels and token estimates derived from the typed assembly,
+                // never raw memory or workspace content.
                 let report = crate::context_assembly::assemble_report(
                     persona_complete,
+                    &assembly.base_prompt,
                     &persona,
                     &context.snapshot,
                     &context.time_context,
                     context.instructions.as_deref(),
                     &memory_state,
-                    input.retrieval_text().is_some(),
+                    &recall,
                     agent::agent::context::estimate_tokens(input.as_text().unwrap_or_default()),
                 );
                 log::info!(
                     target: "bsh::context",
-                    "context assembly: persona_complete={} memory={} retrieval_hits={} est_tokens={} fingerprint={:016x} retrieval_skip={}",
+                    "context assembly: persona_complete={} memory={} retrieval_hits={} est_tokens={} snapshot_tokens={} fingerprint={:016x} snapshot_fingerprint={:016x} retrieval_skip={}",
                     report.persona_complete,
                     report.memory.label(),
                     report.retrieval_hits,
                     report.estimated_tokens,
+                    snapshot.total_tokens(),
                     report.fingerprint,
+                    snapshot.fingerprint(),
                     report.retrieval_skip.as_deref().unwrap_or("none")
                 );
-                // Per-source inclusion/omission with its trust boundary: the
-                // provenance is consumed here, not erased before diagnostics.
+                // The memory block's provenance, read from the snapshot itself.
+                if let Some(block) = snapshot.block(crate::context_assembly::ContextSource::RetrievedMemory) {
+                    log::debug!(
+                        target: "bsh::context",
+                        "retrieved memory block: trust={:?} tokens={} provenance={}",
+                        block.trust,
+                        block.token_estimate,
+                        block.provenance.as_deref().unwrap_or("-")
+                    );
+                }
+                // Per-block trust and provenance, read from the snapshot itself.
+                for block in snapshot.blocks() {
+                    log::debug!(
+                        target: "bsh::context",
+                        "context block: {} trust={:?} tokens={} provenance={}",
+                        block.source.label(),
+                        block.trust,
+                        block.token_estimate,
+                        block.provenance.as_deref().unwrap_or("-")
+                    );
+                }
                 for status in &report.sources {
                     log::debug!(
                         target: "bsh::context",
@@ -420,8 +493,8 @@ impl Runner {
             // contract (one corrective retry when an actionable turn is
             // answered with prose only) and reports it on the turn outcome; it
             // is never serialized to the provider.
-            let text = input.as_text().unwrap_or_default();
-            let mut intent = crate::intent::classify(text);
+            let text = input.as_text().unwrap_or_default().to_string();
+            let mut intent = crate::intent::classify(&text);
             // The lexical classifier is fast but has no semantics; an
             // unclassified message gets one semantic second opinion from the
             // configured model (bounded, cached, and abandoned on any error).
@@ -432,7 +505,7 @@ impl Runner {
                 && text.trim().chars().count() >= 12
                 && !text.contains("<extension_command")
             {
-                if let Some(classified) = agent.classify_intent_with_model(text).await {
+                if let Some(classified) = agent.classify_intent_with_model(&text).await {
                     intent = classified;
                 }
             }
@@ -449,6 +522,9 @@ impl Runner {
             let mut tool_calls = 0usize;
             let mut tool_failures = 0usize;
             let mut tool_successes = 0usize;
+            // The turn's answer text, accumulated for the capture coordinator
+            // (issue #343): only a COMPLETED turn offers evidence.
+            let mut answer = String::new();
 
             // The terminal event is held back until the mailbox has been handed
             // back: a steer the turn never reached another step for must be
@@ -468,7 +544,10 @@ impl Runner {
                     let terminal =
                         matches!(&item, Ok(StreamToken::Done | StreamToken::Stopped) | Err(_));
                     let event = match item {
-                        Ok(StreamToken::Text(text)) => AgentEvent::Text(text),
+                        Ok(StreamToken::Text(text)) => {
+                            answer.push_str(&text);
+                            AgentEvent::Text(text)
+                        }
                         Ok(StreamToken::ReasoningContent(text)) => AgentEvent::Reasoning(text),
                         Ok(StreamToken::ToolCall { name, args, .. }) => {
                             tool_calls += 1;
@@ -531,6 +610,22 @@ impl Runner {
                     tool_calls,
                     failures: tool_failures,
                 });
+            }
+            // Governed capture at the completed-turn boundary (issue #343):
+            // only a Done turn offers evidence - a stopped or failed turn does
+            // not - and the capture runs ASYNCHRONOUSLY beside the terminal
+            // event, so a capture failure never invalidates the turn.
+            if matches!(terminal_event, Some(AgentEvent::Done)) {
+                if let Some(capture) = &capture {
+                    let evidence = agent::memory::capture::TurnEvidence {
+                        user_text: text.clone(),
+                        assistant_text: answer.clone(),
+                        session: Some(session.clone()),
+                        turn: Some(format!("t{turn}")),
+                        tool_evidence: Vec::new(),
+                    };
+                    capture.spawn(&tokio::runtime::Handle::current(), evidence);
+                }
             }
             if let Some(event) = terminal_event {
                 let _ = tx.send_blocking(event);
@@ -701,6 +796,7 @@ mod tests {
             1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
+            None,
         );
         let events = futures::executor::block_on(async {
             let mut events = Vec::new();
@@ -878,6 +974,7 @@ mod tests {
             1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
+            None,
         );
         drain(receiver);
         let rows = seen.lock().unwrap().clone();
@@ -943,6 +1040,7 @@ mod tests {
             1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
+            None,
         );
         drain(receiver);
         let rows = seen.lock().unwrap().clone();
@@ -1157,6 +1255,7 @@ mod tests {
             1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
+            None,
         );
         drain(receiver);
         let rows = seen.lock().unwrap().clone();
@@ -1232,5 +1331,161 @@ mod tests {
             "follow-up prompt present: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A mock that holds the stream open, so a stop lands before Done.
+    struct SlowMock;
+
+    #[async_trait::async_trait]
+    impl agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContext> for SlowMock {
+        async fn complete(
+            &self,
+            _persona: Option<String>,
+            _req: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> react::llm::LlmResponseResult {
+            Ok(summary_response("late"))
+        }
+
+        async fn stream_complete(
+            &self,
+            _persona: Option<String>,
+            _req: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> Result<react::llm::TokenStream, react::llm::LlmError> {
+            Ok(Box::pin(futures::stream::unfold(0u8, |state| async move {
+                if state == 0 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Some((Ok(react::llm::StreamToken::Done), 1))
+                } else {
+                    None
+                }
+            })))
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "slow-mock"
+        }
+    }
+
+    fn capture_agent(
+        vendor: &str,
+        client: Box<
+            dyn agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContext>,
+        >,
+    ) -> Arc<agent::agent::Agent> {
+        let mut provider = agent::agent::agentic::LlmProvider::new();
+        provider.register_vendor(vendor.to_string(), client);
+        Arc::new(agent::agent::Agent::new(
+            agent::agent::AgentConfig {
+                model: "mock-model".to_string(),
+                ..Default::default()
+            },
+            Arc::new(provider),
+        ))
+    }
+
+    fn test_capture(
+        dir: &std::path::Path,
+        rt: &tokio::runtime::Runtime,
+    ) -> Arc<crate::memory_capture::CaptureHandle> {
+        let store = rt
+            .block_on(agent::memory::FileMemory::open_scoped(
+                dir.join("ws.jsonl"),
+                agent::memory::MemoryScope::workspace("w"),
+                Some(agent::memory::MemoryScope::session("w", "s")),
+            ))
+            .unwrap();
+        let policy = agent::memory::capture::CapturePolicy {
+            enabled: true,
+            scope: agent::memory::MemoryScope::session("w", "s"),
+            ..Default::default()
+        };
+        crate::memory_capture::CaptureHandle::new(Arc::new(store), policy)
+    }
+
+    fn test_facts() -> crate::context::RuntimeFacts {
+        crate::context::RuntimeFacts {
+            cwd: String::new(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        }
+    }
+
+    /// Issue #343: capture runs at the COMPLETED-turn boundary only. A Done
+    /// turn offers its evidence asynchronously; a stopped turn offers nothing.
+    #[test]
+    fn capture_runs_on_done_turns_and_not_on_stopped_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = Runner::new();
+        let capture = test_capture(dir.path(), runner.rt());
+
+        // A completed turn: the explicit request is captured beside the turn.
+        let agent = capture_agent("mock", Box::new(SummaryMock));
+        let rx = runner.spawn(
+            "capture-done",
+            agent,
+            react::llm::Content::Text("Remember this: the gate runs clippy".to_string()),
+            Vec::new(),
+            test_facts(),
+            None,
+            1_000,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
+            Some(Arc::clone(&capture)),
+        );
+        futures::executor::block_on(async {
+            while let Ok(event) = rx.recv().await {
+                if matches!(event, AgentEvent::Done | AgentEvent::Error(_)) {
+                    break;
+                }
+            }
+        });
+        runner.rt().block_on(async {
+            for _ in 0..400 {
+                if capture.last_summary().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let summary = capture.last_summary().expect("the Done turn captured");
+        assert_eq!(summary.committed, 1, "the explicit request was committed");
+
+        // A stopped turn: no Done, no capture.
+        let stopped = test_capture(dir.path(), runner.rt());
+        let slow = capture_agent("slow", Box::new(SlowMock));
+        let rx = runner.spawn(
+            "capture-stopped",
+            slow,
+            react::llm::Content::Text("Remember this: never captured".to_string()),
+            Vec::new(),
+            test_facts(),
+            None,
+            1_000,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
+            Some(Arc::clone(&stopped)),
+        );
+        runner.stop("capture-stopped");
+        futures::executor::block_on(async {
+            while let Ok(event) = rx.recv().await {
+                if matches!(event, AgentEvent::Done | AgentEvent::Error(_)) {
+                    break;
+                }
+            }
+        });
+        runner.rt().block_on(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        assert!(
+            stopped.last_summary().is_none(),
+            "a stopped turn must not run capture"
+        );
     }
 }

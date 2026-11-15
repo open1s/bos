@@ -46,6 +46,42 @@ pub use llm::{build_vendor, LlmProvider};
 /// is attached with [`Agent::with_memory`].
 pub const DEFAULT_MEMORY_RECALL_LIMIT: usize = 5;
 
+/// The typed account of one turn's memory recall (issue #346).
+///
+/// Diagnostics read THIS, never a rendered prompt: the hits carry provenance
+/// and score explanations, the block is the exact text injected, and the skip
+/// reason says why nothing was recalled. Trust is a property of the source
+/// (retrieved memory is untrusted data) and survives to the assembly snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryRecallReport {
+    /// The recalled hits, best first, with provenance and explanations.
+    pub hits: Vec<crate::memory::RecallHit>,
+    /// The exact block injected into the prompt, when anything was recalled.
+    pub block: Option<String>,
+    /// Why recall returned nothing, when it did.
+    pub skip: Option<String>,
+    /// Estimated tokens of the injected block (documented estimator).
+    pub token_estimate: usize,
+    /// Ranked candidates dropped by the token budget (issue #345).
+    pub truncated: usize,
+}
+
+/// One immutable prompt assembly: the serialized prompt plus the typed recall
+/// account it was built from (issue #346).
+///
+/// `base_prompt` is the prompt BEFORE memory injection, so token accounting
+/// can check the memory estimate against the final serialized request within
+/// the estimator's documented rounding limits.
+#[derive(Debug, Clone)]
+pub struct PromptAssembly {
+    /// The full system prompt the request carries.
+    pub system_prompt: String,
+    /// The prompt before the memory block was injected.
+    pub base_prompt: String,
+    /// The typed memory recall account.
+    pub memory: MemoryRecallReport,
+}
+
 /// Process-wide answers from the model-assisted intent classifier.
 ///
 /// The shell builds an agent per turn, so a per-agent cache would pay a
@@ -386,6 +422,10 @@ pub struct Agent {
     /// Metadata filter applied to memory recall, if any.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     memory_filter: Option<MetadataFilter>,
+    /// Optional token budget for one recall (issue #345): top-K is bounded by
+    /// tokens, not only item count.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    memory_token_budget: Option<usize>,
     /// Whether each completed exchange is stored in memory automatically.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     auto_remember: bool,
@@ -396,11 +436,13 @@ pub struct Agent {
     engine_cache: std::sync::Mutex<Option<ReActEngine<AgentReActApp>>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     context_cache: std::sync::Mutex<Option<AgentReactContext>>,
-    /// The last assembled system prompt, keyed by task text, so the inject
+    /// The last typed prompt assembly, keyed by task text, so the inject
     /// event and the request share one assembly instead of recalling memory
-    /// twice. Cleared per turn and whenever memory changes.
+    /// twice. Cleared per turn and whenever memory changes. The assembly is
+    /// the source of truth for diagnostics (issue #346): no consumer needs to
+    /// re-derive inclusion from rendered strings.
     #[rkyv(with = qserde::rkyv::with::Skip)]
-    system_prompt_cache: std::sync::Mutex<Option<(String, String)>>,
+    system_prompt_cache: std::sync::Mutex<Option<(String, PromptAssembly)>>,
     #[rkyv(with = qserde::rkyv::with::Skip)]
     last_stream_tokens: std::sync::Mutex<Option<(u64, u64)>>,
     /// Cached prompt tokens from the same stream, when the provider reported them.
@@ -471,6 +513,7 @@ impl Agent {
             memory: None,
             memory_recall_limit: DEFAULT_MEMORY_RECALL_LIMIT,
             memory_filter: None,
+            memory_token_budget: None,
             auto_remember: false,
             plan: PlanStore::default(),
             engine_cache: std::sync::Mutex::new(None),
@@ -747,6 +790,12 @@ impl Agent {
         self.memory_filter = filter;
     }
 
+    /// Bound one recall by estimated tokens (issue #345), in addition to the
+    /// item limit. `None` removes the budget.
+    pub fn set_memory_token_budget(&mut self, budget: Option<usize>) {
+        self.memory_token_budget = budget;
+    }
+
     /// Enable or disable automatic remembering of completed exchanges.
     ///
     /// When on, every run that finishes through [`Agent::react`] or
@@ -862,15 +911,40 @@ impl Agent {
     }
 
     /// Store `content` with `metadata` in the attached memory.
+    ///
+    /// Legacy best-effort surface: a commit failure is logged and `None` is
+    /// returned. Use [`Agent::try_remember`] for the typed commit guarantee
+    /// (issue #342).
     pub async fn remember_with(
         &self,
         content: impl Into<String>,
         metadata: Option<serde_json::Value>,
     ) -> Option<MemoryItem> {
-        let memory = self.memory.as_ref()?;
-        let item = memory.add(content.into(), metadata).await;
+        match self.try_remember(content, metadata).await {
+            Ok(item) => item,
+            Err(error) => {
+                log::error!("memory: remember was not committed: {error}");
+                None
+            }
+        }
+    }
+
+    /// Store `content` with the durable-commit guarantee (issue #342).
+    ///
+    /// Returns `Ok(None)` when no memory is attached; `Err` when the store
+    /// refused or failed the commit. The caller can distinguish persisted from
+    /// rejected from failed without reading logs.
+    pub async fn try_remember(
+        &self,
+        content: impl Into<String>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<Option<MemoryItem>, crate::memory::MemoryError> {
+        let Some(memory) = self.memory.as_ref() else {
+            return Ok(None);
+        };
+        let item = memory.try_add(content.into(), metadata).await?;
         self.invalidate_system_prompt_cache();
-        Some(item)
+        Ok(Some(item))
     }
 
     /// Drop the cached system prompt: a memory change alters the recalled
@@ -944,6 +1018,64 @@ impl Agent {
             block.push_str(item.content.trim());
         }
         Some(block)
+    }
+
+    /// The typed hybrid recall account for `query` (issues #345, #346).
+    ///
+    /// This is the seam the prompt assembly uses: hybrid multilingual ranking,
+    /// scope/metadata filtering before ranking, per-hit provenance and score
+    /// explanations, and an observable skip reason. The rendered block keeps
+    /// the legacy "Relevant memory:" format byte-for-byte.
+    pub async fn recall_report(&self, query: &str) -> MemoryRecallReport {
+        let Some(memory) = self.memory.as_ref() else {
+            return MemoryRecallReport {
+                skip: Some("no memory attached".to_string()),
+                ..Default::default()
+            };
+        };
+        if self.memory_recall_limit == 0 {
+            return MemoryRecallReport {
+                skip: Some("recall limit is zero".to_string()),
+                ..Default::default()
+            };
+        }
+        if query.trim().is_empty() {
+            return MemoryRecallReport {
+                skip: Some("no usable text query".to_string()),
+                ..Default::default()
+            };
+        }
+        let request = crate::memory::RecallRequest {
+            limit: self.memory_recall_limit,
+            token_budget: self.memory_token_budget,
+            filter: self.memory_filter.clone(),
+            ..Default::default()
+        };
+        let outcome = memory.recall(query, &request).await;
+        if outcome.hits.is_empty() {
+            return MemoryRecallReport {
+                skip: Some(
+                    outcome
+                        .skip
+                        .unwrap_or_else(|| "no matching items".to_string()),
+                ),
+                truncated: outcome.truncated,
+                ..Default::default()
+            };
+        }
+        let mut block = String::from("Relevant memory:");
+        for hit in &outcome.hits {
+            block.push_str("\n- ");
+            block.push_str(hit.item.content.trim());
+        }
+        let token_estimate = crate::agent::context::estimate_tokens(&block);
+        MemoryRecallReport {
+            hits: outcome.hits,
+            block: Some(block),
+            skip: None,
+            token_estimate,
+            truncated: outcome.truncated,
+        }
     }
 
     /// Get the config.
@@ -2186,6 +2318,7 @@ impl Clone for Agent {
             memory: self.memory.clone(),
             memory_recall_limit: self.memory_recall_limit,
             memory_filter: self.memory_filter.clone(),
+            memory_token_budget: self.memory_token_budget,
             auto_remember: self.auto_remember,
             plan: self.plan.clone(),
             engine_cache: std::sync::Mutex::new(None),

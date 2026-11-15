@@ -86,7 +86,7 @@ pub enum StreamToken {
     },
     /// A tool call finished executing in the ReAct loop.
     ///
-    /// Yielded by the engine immediately after the [`ToolCall`](Self::ToolCall)
+    /// Yielded by the engine immediately after the [`Self::ToolCall`]
     /// it answers and once `after_tool_result` hooks approved the result, so
     /// observers can pair call and result (both arrive with the same `name`).
     ToolResult {

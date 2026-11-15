@@ -35,6 +35,8 @@ pub(crate) mod instructions;
 pub(crate) mod intent;
 pub(crate) mod market;
 pub(crate) mod mcp;
+pub(crate) mod memory_capture;
+pub(crate) mod memory_scope;
 pub(crate) mod model;
 pub(crate) mod notes;
 mod open_in_app;

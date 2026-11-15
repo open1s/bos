@@ -2002,7 +2002,7 @@ mod budget_tests {
 
     /// The allocation-free part estimate must equal the joined-text one.
     ///
-    /// [`estimate_session`](ContextBudget::estimate_session) runs on every turn,
+    /// [`ContextBudget::estimate_session`] runs on every turn,
     /// so it counts text parts in place instead of building the joined string;
     /// this pins the two accountings together.
     #[test]

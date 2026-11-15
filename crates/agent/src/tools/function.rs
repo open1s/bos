@@ -207,7 +207,7 @@ impl AsyncFunctionTool {
 
     /// Create a tool from an async closure that takes owned arguments.
     ///
-    /// [`new`](Self::new) accepts a closure that *borrows* its arguments
+    /// [`Self::new`] accepts a closure that *borrows* its arguments
     /// and returns a future tied to that borrow, which forces the caller to
     /// satisfy a `for<'a>` bound. When the closure moves its arguments into
     /// the future instead, `from_fn` states that directly:

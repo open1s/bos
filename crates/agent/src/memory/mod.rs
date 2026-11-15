@@ -7,9 +7,23 @@
 //! wherever the agent accepts a `MemoryStore`; [`FileMemory`] persists to
 //! a JSON-lines file so memories survive a restart.
 
+pub mod capture;
+pub mod error;
 mod file;
+pub mod record;
+pub mod repository;
+pub mod retrieval;
+mod scoped;
 
-pub use file::FileMemory;
+pub use error::MemoryError;
+pub use file::{FileMemory, FileRepository};
+pub use record::{
+    Confidence, ConfidenceLevel, EvidenceSource, Lifecycle, MemoryKind, MemoryRecord, MemoryScope,
+    Provenance, Relations, RECORD_SCHEMA,
+};
+pub use repository::MemoryRepository;
+pub use retrieval::{RecallHit, RecallOutcome, RecallRequest, ScoreFeature};
+pub use scoped::ScopedMemory;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -57,7 +71,7 @@ impl MemoryItem {
 }
 
 /// Current wall-clock time in milliseconds, saturating at zero before the epoch.
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
@@ -86,7 +100,7 @@ impl MetadataFilter {
     }
 
     /// Whether `item` carries this key with the expected value.
-    fn matches(&self, item: &MemoryItem) -> bool {
+    pub(crate) fn matches(&self, item: &MemoryItem) -> bool {
         item.metadata
             .as_ref()
             .and_then(|metadata| metadata.get(&self.key))
@@ -139,6 +153,46 @@ pub trait MemoryStore: Send + Sync {
 
     /// Remove every item.
     async fn clear(&self);
+
+    /// Fallible add: reports success only after the durability boundary is
+    /// reached (issue #342). The default adapts the legacy infallible method;
+    /// durable stores override it with the commit guarantee.
+    async fn try_add(
+        &self,
+        content: String,
+        metadata: Option<Value>,
+    ) -> Result<MemoryItem, MemoryError> {
+        Ok(self.add(content, metadata).await)
+    }
+
+    /// Fallible remove, with the same commit guarantee as [`Self::try_add`].
+    async fn try_remove(&self, id: &str) -> Result<bool, MemoryError> {
+        Ok(self.remove(id).await)
+    }
+
+    /// Fallible clear, with the same commit guarantee as [`Self::try_add`].
+    async fn try_clear(&self) -> Result<(), MemoryError> {
+        self.clear().await;
+        Ok(())
+    }
+
+    /// Hybrid, explainable recall (issue #345): Unicode-aware tokens with CJK
+    /// n-grams, BM25 ranking, scope/kind/metadata filtering before ranking and
+    /// a token-budgeted top-K. The default synthesizes legacy records from
+    /// [`Self::all`]; unscoped stores ignore the request's viewer filter,
+    /// scoped stores enforce it. The legacy [`Self::search`] ranking is
+    /// unchanged for compatibility.
+    async fn recall(&self, query: &str, request: &RecallRequest) -> RecallOutcome {
+        let items = self.all().await;
+        let scope = MemoryScope::user("local");
+        let records: Vec<MemoryRecord> = items
+            .iter()
+            .map(|item| MemoryRecord::from_legacy(item, &scope))
+            .collect();
+        let mut request = request.clone();
+        request.viewer = None;
+        retrieval::recall(&records, query, &request)
+    }
 
     /// Number of stored items.
     async fn len(&self) -> usize;

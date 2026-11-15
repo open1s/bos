@@ -1438,32 +1438,60 @@ pub(crate) fn assemble_with_federation(
             node = node.with_artifact_store(Arc::new(federation::FileArtifactStore::new(root)));
         }
     }
+    if !knowledge_enabled {
+        log::debug!(target: "bsh::federation", "knowledge store: disabled");
+    }
     if knowledge_enabled {
         let knowledge_peers = node.peers();
         let knowledge_path = peer_file
             .as_ref()
             .map(|path| path.with_file_name("knowledge.json"));
-        let service = knowledge_path
-            .as_ref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(
-                |text| match federation::KnowledgeService::from_json(&text) {
-                    Ok(service) => Some(service),
-                    Err(error) => {
-                        log::warn!("federation: knowledge store was not loaded: {error}");
-                        None
-                    }
-                },
-            )
-            .unwrap_or_default();
-        node = node.with_knowledge(
-            Arc::new(RwLock::new(service)),
-            Arc::new(crate::federation_knowledge::GrantKnowledgeAuthorizer::new(
-                knowledge_peers,
-            )),
-        );
-        if let Some(path) = knowledge_path {
-            node = node.with_knowledge_persistence(path);
+        // Fail closed (issue #339): a missing store is genuinely empty, but an
+        // unreadable or malformed one is a FAILED state, never an empty
+        // fallback. Publication against a failed load would let the next
+        // snapshot overwrite the original file with empty-derived state.
+        match load_knowledge_service(knowledge_path.as_deref()) {
+            KnowledgeLoad::Missing => {
+                log::info!(
+                    target: "bsh::federation",
+                    "knowledge store: missing/empty; starting an empty store"
+                );
+                node = attach_knowledge(
+                    node,
+                    knowledge_peers,
+                    federation::KnowledgeService::default(),
+                    knowledge_path,
+                );
+            }
+            KnowledgeLoad::Loaded(service) => {
+                log::info!(target: "bsh::federation", "knowledge store: loaded");
+                node = attach_knowledge(node, knowledge_peers, service, knowledge_path);
+            }
+            KnowledgeLoad::Failed(reason) => {
+                if knowledge_recovery_enabled() {
+                    // Explicit, visible recovery: the operator chose to start
+                    // from an empty store. The original file is still replaced
+                    // only by a later durable commit, never by the load itself.
+                    log::warn!(
+                        target: "bsh::federation",
+                        "knowledge store: RECOVERY mode (BSH_KNOWLEDGE_RECOVERY=reset) after failed load: {reason}"
+                    );
+                    node = attach_knowledge(
+                        node,
+                        knowledge_peers,
+                        federation::KnowledgeService::default(),
+                        knowledge_path,
+                    );
+                } else {
+                    log::error!(
+                        target: "bsh::federation",
+                        "knowledge store: failed to load ({reason}); knowledge federation is disabled (fail closed).                          Set BSH_KNOWLEDGE_RECOVERY=reset to start from an empty store."
+                    );
+                    // No knowledge service and no persistence attached: the
+                    // publication handler answers Unavailable, and the original
+                    // file stays untouched for inspection.
+                }
+            }
         }
     }
     let federation = federation_id
@@ -1741,6 +1769,73 @@ async fn refresh(node: &Arc<FederationNode>, cache: &Arc<RwLock<BTreeMap<NodeId,
         }
     });
     futures::future::join_all(probes).await;
+}
+
+/// The fail-closed knowledge load outcome (issue #339).
+///
+/// Missing is a genuinely empty store; Failed is an unreadable or malformed
+/// existing store, which must never be replaced by an empty-derived snapshot.
+#[derive(Debug)]
+pub(crate) enum KnowledgeLoad {
+    /// No file exists (or no persistence path is configured).
+    Missing,
+    /// The file parsed into a live service.
+    Loaded(federation::KnowledgeService),
+    /// The file exists but could not be read or parsed; the reason is
+    /// actionable and carries no payload content.
+    Failed(String),
+}
+
+/// Load the knowledge store, distinguishing missing from unreadable.
+pub(crate) fn load_knowledge_service(path: Option<&std::path::Path>) -> KnowledgeLoad {
+    let Some(path) = path else {
+        return KnowledgeLoad::Missing;
+    };
+    match hostkit::durable::load(path) {
+        Ok(hostkit::durable::Loaded::Missing) => KnowledgeLoad::Missing,
+        Ok(hostkit::durable::Loaded::Present(bytes)) => {
+            let text = match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(error) => {
+                    return KnowledgeLoad::Failed(format!(
+                        "{}: not UTF-8: {error}",
+                        path.display()
+                    ));
+                }
+            };
+            match federation::KnowledgeService::from_json(&text) {
+                Ok(service) => KnowledgeLoad::Loaded(service),
+                Err(error) => KnowledgeLoad::Failed(format!("{}: {error}", path.display())),
+            }
+        }
+        Err(error) => KnowledgeLoad::Failed(format!("{}: {error}", path.display())),
+    }
+}
+
+/// The explicit, visible recovery mode for a failed knowledge load (#339).
+pub(crate) fn knowledge_recovery_enabled() -> bool {
+    std::env::var("BSH_KNOWLEDGE_RECOVERY")
+        .map(|value| value.trim() == "reset")
+        .unwrap_or(false)
+}
+
+/// Attach a loaded (or explicitly recovered) knowledge service.
+fn attach_knowledge(
+    node: FederationNode,
+    peers: Arc<RwLock<federation::PeerStore>>,
+    service: federation::KnowledgeService,
+    path: Option<PathBuf>,
+) -> FederationNode {
+    let mut node = node.with_knowledge(
+        Arc::new(RwLock::new(service)),
+        Arc::new(crate::federation_knowledge::GrantKnowledgeAuthorizer::new(
+            peers,
+        )),
+    );
+    if let Some(path) = path {
+        node = node.with_knowledge_persistence(path);
+    }
+    node
 }
 
 #[cfg(test)]
@@ -3345,5 +3440,233 @@ mod tests {
             .expect_err("unknown skill");
         assert!(error.to_string().contains("unknown skill"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Issue #339: the load distinguishes missing, loaded and failed states.
+    #[test]
+    fn knowledge_load_distinguishes_missing_loaded_and_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("knowledge.json");
+        assert!(matches!(
+            load_knowledge_service(Some(&path)),
+            KnowledgeLoad::Missing
+        ));
+        assert!(matches!(
+            load_knowledge_service(None),
+            KnowledgeLoad::Missing
+        ));
+        std::fs::write(&path, "{not json").unwrap();
+        match load_knowledge_service(Some(&path)) {
+            KnowledgeLoad::Failed(reason) => {
+                assert!(reason.contains("knowledge.json"));
+                assert!(
+                    !reason.contains("not json"),
+                    "the reason carries no payload"
+                );
+            }
+            other => panic!("malformed store must fail closed: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{not json",
+            "the original file is preserved for inspection"
+        );
+        let service = federation::KnowledgeService::default();
+        std::fs::write(&path, service.to_json().unwrap()).unwrap();
+        assert!(matches!(
+            load_knowledge_service(Some(&path)),
+            KnowledgeLoad::Loaded(_)
+        ));
+    }
+
+    /// Issue #339: a malformed store disables publication through the BSH
+    /// assembly path, and a later publication cannot overwrite the original
+    /// file with an empty-derived snapshot.
+    #[tokio::test]
+    async fn a_malformed_knowledge_store_fails_closed_through_assembly() {
+        let dir = tempfile::tempdir().unwrap();
+        let knowledge_path = dir.path().join("knowledge.json");
+        std::fs::write(&knowledge_path, "{malformed").unwrap();
+
+        let network = Arc::new(InMemoryNetwork::new());
+        let receiver_identity = NodeIdentity::from_seed([71u8; 32]);
+        let publisher_identity = NodeIdentity::from_seed([72u8; 32]);
+        let receiver_id = receiver_identity.node_id();
+        let publisher_id = publisher_identity.node_id();
+
+        let mut peers = PeerStore::new();
+        peers.enroll(publisher_id.clone(), unix_ms(), None);
+        let (receiver_transport, receiver_inbox) = network.join(receiver_id.clone());
+        let receiver = assemble_with_federation(
+            receiver_identity,
+            peers,
+            Arc::new(receiver_transport),
+            receiver_inbox,
+            None,
+            None,
+            None,
+            None,
+            Some(dir.path().join("leases.json")),
+            Vec::new(),
+            None,
+            None,
+            true,
+        );
+        let (publisher_transport, publisher_inbox) = network.join(publisher_id.clone());
+        let publisher = assemble(
+            publisher_identity,
+            PeerStore::new(),
+            Arc::new(publisher_transport),
+            publisher_inbox,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let context = agent::capability::InvocationContext::local(
+            agent::capability::InvocationId::new("knowledge-test"),
+            agent::capability::Principal::Local {
+                session: "test".to_string(),
+                preset: String::new(),
+            },
+            agent::capability::WorkspaceId::new("ws:test").expect("a workspace"),
+        );
+        let payload = serde_json::json!({"note": "governed"});
+        let item = federation::KnowledgeItem {
+            id: "item-1".to_string(),
+            class: federation::KnowledgeClass::Public,
+            workspace: None,
+            provenance: federation::Provenance {
+                origin: publisher_id.clone(),
+                source: "test".to_string(),
+                issued_at_ms: unix_ms(),
+                expires_at_ms: None,
+                content_hash: federation::knowledge_hash(&payload),
+            },
+            payload,
+            retention_ms: None,
+        };
+        let publication = federation::KnowledgePublication::new(vec![item]);
+        let result = publisher
+            .node()
+            .publish_knowledge(&receiver_id, &publication, &context)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(agent::capability::CapabilityError::Unavailable { .. })
+            ),
+            "a failed load must refuse publication: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&knowledge_path).unwrap(),
+            "{malformed",
+            "no publication may overwrite the malformed original"
+        );
+        assert!(receiver.node().knowledge_items().is_empty());
+        let _ = publisher;
+    }
+
+    /// Issue #339: a missing store starts empty and a successful publication
+    /// survives a restart through the BSH assembly path.
+    #[tokio::test]
+    async fn a_missing_knowledge_store_accepts_and_persists_publications() {
+        let dir = tempfile::tempdir().unwrap();
+        let knowledge_path = dir.path().join("knowledge.json");
+
+        let network = Arc::new(InMemoryNetwork::new());
+        let receiver_identity = NodeIdentity::from_seed([73u8; 32]);
+        let publisher_identity = NodeIdentity::from_seed([74u8; 32]);
+        let receiver_id = receiver_identity.node_id();
+        let publisher_id = publisher_identity.node_id();
+
+        let mut peers = PeerStore::new();
+        peers.enroll(publisher_id.clone(), unix_ms(), None);
+        peers
+            .grant(
+                &publisher_id,
+                "builtin/knowledge_publish".parse().expect("a capability"),
+                unix_ms(),
+                None,
+            )
+            .expect("grant");
+        let (receiver_transport, receiver_inbox) = network.join(receiver_id.clone());
+        let receiver = assemble_with_federation(
+            receiver_identity,
+            peers,
+            Arc::new(receiver_transport),
+            receiver_inbox,
+            None,
+            None,
+            None,
+            None,
+            Some(dir.path().join("leases.json")),
+            Vec::new(),
+            None,
+            None,
+            true,
+        );
+        let (publisher_transport, publisher_inbox) = network.join(publisher_id.clone());
+        let publisher = assemble(
+            publisher_identity,
+            PeerStore::new(),
+            Arc::new(publisher_transport),
+            publisher_inbox,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let context = agent::capability::InvocationContext::local(
+            agent::capability::InvocationId::new("knowledge-test-2"),
+            agent::capability::Principal::Local {
+                session: "test".to_string(),
+                preset: String::new(),
+            },
+            agent::capability::WorkspaceId::new("ws:test").expect("a workspace"),
+        );
+        let payload = serde_json::json!({"note": "durable"});
+        let item = federation::KnowledgeItem {
+            id: "item-2".to_string(),
+            class: federation::KnowledgeClass::Public,
+            workspace: None,
+            provenance: federation::Provenance {
+                origin: publisher_id.clone(),
+                source: "test".to_string(),
+                issued_at_ms: unix_ms(),
+                expires_at_ms: None,
+                content_hash: federation::knowledge_hash(&payload),
+            },
+            payload,
+            retention_ms: None,
+        };
+        let publication = federation::KnowledgePublication::new(vec![item]);
+        let accepted = publisher
+            .node()
+            .publish_knowledge(&receiver_id, &publication, &context)
+            .await
+            .expect("a missing store accepts publications");
+        assert_eq!(accepted, 1);
+        assert!(knowledge_path.exists(), "the publication committed durably");
+
+        // Restart: a fresh load of the committed file serves the same item.
+        match load_knowledge_service(Some(&knowledge_path)) {
+            KnowledgeLoad::Loaded(service) => {
+                assert!(service.items().any(|item| item.id == "item-2"));
+            }
+            other => panic!("the committed store must load: {other:?}"),
+        }
+        let _ = receiver;
+        let _ = publisher;
     }
 }

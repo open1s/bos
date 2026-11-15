@@ -113,10 +113,7 @@ fn session_actions_w(streaming: bool) -> f32 {
 /// The pulse rides the shared StateDot cycle ([`SPIN_PERIOD`]) and, like every
 /// other animated mark, freezes at its start under reduced motion.
 fn lead_dot(streaming: bool, selected: bool, id: &str) -> AnyElement {
-    let dot = div()
-        .w(px(theme::TREE_ROW_LEAD))
-        .h(px(6.0))
-        .rounded_full();
+    let dot = div().w(px(theme::TREE_ROW_LEAD)).h(px(6.0)).rounded_full();
     if streaming {
         let selector = format!("session-running-dot-{id}");
         return dot
@@ -129,8 +126,7 @@ fn lead_dot(streaming: bool, selected: bool, id: &str) -> AnyElement {
                     // A 0.8 -> 1 -> 0.8 breath: the high floor keeps the deep
                     // green from washing out against the sidebar - alive, never
                     // pale.
-                    let breath =
-                        0.8 + 0.2 * (0.5 - 0.5 * (phase * std::f32::consts::TAU).cos());
+                    let breath = 0.8 + 0.2 * (0.5 - 0.5 * (phase * std::f32::consts::TAU).cos());
                     dot.opacity(breath)
                 },
             )

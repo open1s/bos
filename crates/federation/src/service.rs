@@ -37,11 +37,11 @@ use crate::discovery::DiscoveryRecord;
 use crate::envelope::Envelope;
 use crate::identity::NodeIdentity;
 use crate::knowledge::{
-    KnowledgeAuthorizer, KnowledgeItem, KnowledgePublication, KnowledgeQuery, KnowledgeResponse,
-    KnowledgeService,
+    KnowledgeAuthorizer, KnowledgeError, KnowledgeItem, KnowledgePublication, KnowledgeQuery,
+    KnowledgeResponse, KnowledgeService,
 };
 use crate::membership::FederationId;
-use crate::peers::PeerStore;
+use crate::peers::{PeerStore, RotationEntry};
 use crate::resource::{LeaseId, LeaseStore, ResourceStreamMessage};
 use crate::rotation::RotationRecord;
 use crate::task::{FederatedTask, TaskCreateRequest, TaskIdRequest, TaskQueue};
@@ -1963,20 +1963,29 @@ impl FederationNode {
     }
 
     /// Revoke one item this Node published, and persist the result.
+    ///
+    /// The revocation is acknowledged only after the snapshot is durably
+    /// committed (issue #339): a failed commit leaves the live store
+    /// unchanged and returns a typed storage error.
     pub fn revoke_knowledge(&self, id: &str) -> Result<bool, CapabilityError> {
         let Some(service) = &self.knowledge else {
             return Err(CapabilityError::Unavailable {
                 reason: "this Node serves no knowledge".to_string(),
             });
         };
-        let mut guard = service
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let revoked = guard.revoke(&self.node(), id)?;
+        let mut candidate = service
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let revoked = candidate.revoke(&self.node(), id)?;
         if revoked {
             if let Some(path) = &self.knowledge_path {
-                persist_knowledge(&guard, path);
+                persist_knowledge(&candidate, path)?;
             }
+            let mut guard = service
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = candidate;
         }
         Ok(revoked)
     }
@@ -2774,21 +2783,18 @@ fn error_reason(error: &CapabilityError) -> Option<String> {
     }
 }
 
-fn persist_knowledge(service: &KnowledgeService, path: &std::path::Path) {
-    let Ok(text) = service.to_json() else {
-        tracing::warn!("federation: knowledge store did not serialize");
-        return;
-    };
-    // Owner-only on every host (issue #299); the knowledge store can carry
-    // governed material, so it gets the same private policy as the other
-    // federation stores. The warn-and-continue policy for knowledge writes
-    // is unchanged: replay durability is enforced separately (issue #303).
-    if let Err(error) = hostkit::fspriv::write_private(path, text.as_bytes()) {
-        tracing::warn!(
-            "federation: knowledge store {} was not written: {error}",
-            path.display()
-        );
-    }
+/// Commit one knowledge snapshot durably (issue #339).
+///
+/// Owner-only on every host (issue #299); the knowledge store can carry
+/// governed material, so it gets the same private policy as the other
+/// federation stores. A failure is returned to the caller, never logged
+/// away: a publication acknowledgement must correspond to a committed
+/// snapshot, and the caller keeps its pre-publication state on failure.
+fn persist_knowledge(
+    service: &KnowledgeService,
+    path: &std::path::Path,
+) -> Result<(), KnowledgeError> {
+    service.save(path)
 }
 
 /// Attach the correlation a request payload carries to an audit event.
@@ -3021,6 +3027,24 @@ fn decode_knowledge_accepted(payload: &Value) -> Result<usize, CapabilityError> 
     Err(wire_error(payload, None))
 }
 
+/// Serve one signed key rotation as a single durable trust transition
+/// (issue #338).
+///
+/// The handler clones the peer store, applies the rotation to the clone,
+/// commits the clone to the peer file, and only on a successful commit
+/// publishes it as the live store. A failed commit changes nothing: the
+/// live store and the persisted file stay at the pre-rotation state, the
+/// audit row records `storage_failed`, and the sender receives a typed
+/// `Unavailable` error naming the path and the failed stage.
+///
+/// Retry / idempotency rule: a failed commit changes nothing, so the sender
+/// retries with a FRESH envelope (a new `message_id`, because the replay
+/// cache deduplicates by message identity) carrying the SAME signed
+/// `RotationRecord`. An already-committed rotation, whose
+/// (old, new, rotated_at_ms) triple is in the durable rotation log, answers
+/// `ok` without re-applying, so a duplicate delivery is a success. No
+/// failed attempt can strand the peer: the old identity stays trusted until
+/// the rotated store is durably committed.
 async fn serve_rotation(
     identity: &NodeIdentity,
     peers: &Arc<RwLock<PeerStore>>,
@@ -3053,46 +3077,89 @@ async fn serve_rotation(
         );
         return seal_reply(identity, envelope, error_payload(error));
     }
-    let outcome = {
-        let mut store = peers
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        store.rotate(&record, unix_ms()).map(|()| {
-            if let Some(path) = peer_path {
-                if let Err(error) = store.save(path) {
-                    tracing::warn!(
-                        "federation: rotated peer store {} was not written: {error}",
-                        path.display()
-                    );
-                }
-            }
-        })
-    };
-    match outcome {
-        Ok(()) => {
-            record_federation_event(audit, envelope, &record, "ok", None, started);
-            seal_reply(identity, envelope, json!({ "ok": true }))
-        }
-        Err(error) => {
-            let reason = error.to_string();
+    // A committed rotation replayed is a success. The durable log answers
+    // before validation, because the old identity is already revoked and a
+    // fresh apply would be refused.
+    let already_committed = peers
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .rotations
+        .iter()
+        .any(|entry| {
+            entry.old == record.old
+                && entry.new == record.new
+                && entry.at_ms == record.rotated_at_ms
+        });
+    if already_committed {
+        record_federation_event(
+            audit,
+            envelope,
+            &record,
+            "ok",
+            Some("the rotation was already durably committed".to_string()),
+            started,
+        );
+        return seal_reply(identity, envelope, json!({ "ok": true }));
+    }
+    // Clone -> rotate -> commit -> publish under ONE write guard: the whole
+    // transition is serialized, so an authorization read sees either the whole
+    // pre-rotation or the whole post-rotation store, and two concurrent
+    // rotations cannot interleave their commits (the second clones the
+    // already-rotated state and is refused, never silently overwriting).
+    let mut store = peers
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut rotated = store.clone();
+    if let Err(error) = rotated.rotate(&record, unix_ms()) {
+        let reason = error.to_string();
+        drop(store);
+        record_federation_event(
+            audit,
+            envelope,
+            &record,
+            "denied",
+            Some(reason.clone()),
+            started,
+        );
+        return seal_reply(
+            identity,
+            envelope,
+            error_payload(CapabilityError::Denied {
+                reason,
+                policy: None,
+            }),
+        );
+    }
+    // The log entry travels inside the committed snapshot, so a restart
+    // still recognizes the rotation as committed.
+    rotated.rotations.push(RotationEntry {
+        old: record.old.clone(),
+        new: record.new.clone(),
+        at_ms: record.rotated_at_ms,
+    });
+    if let Some(path) = peer_path {
+        if let Err(error) = rotated.save_with_gate(path, &hostkit::durable::NoFaults) {
+            let reason = format!("the rotated peer store was not durably committed: {error}");
+            drop(store);
             record_federation_event(
                 audit,
                 envelope,
                 &record,
-                "denied",
+                "storage_failed",
                 Some(reason.clone()),
                 started,
             );
-            seal_reply(
+            return seal_reply(
                 identity,
                 envelope,
-                error_payload(CapabilityError::Denied {
-                    reason,
-                    policy: None,
-                }),
-            )
+                error_payload(CapabilityError::Unavailable { reason }),
+            );
         }
     }
+    *store = rotated;
+    drop(store);
+    record_federation_event(audit, envelope, &record, "ok", None, started);
+    seal_reply(identity, envelope, json!({ "ok": true }))
 }
 
 fn record_federation_event(
@@ -3110,6 +3177,7 @@ fn record_federation_event(
         Some(&rotation.old.to_string()),
         outcome,
     )
+    .with_subject(format!("{} -> {}", rotation.old, rotation.new))
     .with_elapsed_ms(started.elapsed().as_millis() as u64);
     if let Some(reason) = reason {
         event = event.with_reason(reason);
@@ -3362,17 +3430,26 @@ async fn serve_knowledge_publication(
             return seal_reply(identity, envelope, error_payload(error));
         }
     };
+    // Clone -> publish -> commit -> swap under ONE write guard (issue #339):
+    // the item is acknowledged only after the snapshot is durably committed,
+    // and the whole transition is serialized, so two concurrent publications
+    // cannot interleave their snapshots and lose an acknowledged item. A
+    // failed commit leaves the live store at its pre-publication state and
+    // answers with a typed storage error instead of an accepted count.
     let result = {
         let mut guard = service
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let outcome = guard.publish(&envelope.sender, &publication, unix_ms());
-        if outcome.is_ok() {
-            if let Some(path) = knowledge_path {
-                persist_knowledge(&guard, path);
-            }
-        }
-        outcome
+        let mut candidate = guard.clone();
+        candidate
+            .publish(&envelope.sender, &publication, unix_ms())
+            .and_then(|count| {
+                if let Some(path) = knowledge_path {
+                    persist_knowledge(&candidate, path)?;
+                }
+                *guard = candidate;
+                Ok(count)
+            })
     };
     let event = match &result {
         Ok(count) => FederationEvent::new(
@@ -5446,5 +5523,733 @@ mod budget_tests {
         assert_eq!(event.trace_id.as_deref(), Some("trace-1"));
         assert_eq!(event.span_id.as_deref(), Some("span-1"));
         assert_eq!(event.task.as_deref(), Some("task-1"));
+    }
+}
+
+#[cfg(test)]
+mod rotation_durability_tests {
+    use super::*;
+    use crate::audit::MemoryAudit;
+    use crate::peers::TrustState;
+    use capability::MessageId;
+
+    fn identity(seed: u8) -> NodeIdentity {
+        NodeIdentity::from_seed([seed; 32])
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "federation-rotation-durable-{label}-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn capability_id() -> CapabilityId {
+        "builtin/read_file".parse().expect("a capability")
+    }
+
+    fn enrolled_store(old: &NodeId) -> PeerStore {
+        let mut store = PeerStore::new();
+        store.enroll(old.clone(), unix_ms(), None);
+        store
+            .grant(old, capability_id(), unix_ms(), None)
+            .expect("grant");
+        store
+    }
+
+    fn rotation_envelope(
+        sender: &NodeIdentity,
+        recipient: &NodeId,
+        record: &RotationRecord,
+        message_id: &str,
+    ) -> Envelope {
+        let mut message = FederationMessage::new(
+            "rotation",
+            serde_json::to_vec(record).expect("rotation bytes"),
+        );
+        message.id = MessageId::new(message_id);
+        Envelope::seal(&message, sender, recipient).expect("sealed")
+    }
+
+    async fn serve(
+        provider: &NodeIdentity,
+        peers: &Arc<RwLock<PeerStore>>,
+        peer_path: &Option<PathBuf>,
+        audit: &Option<Arc<dyn FederationAudit>>,
+        envelope: &Envelope,
+    ) -> Value {
+        let reply = serve_rotation(provider, peers, peer_path, audit, envelope).await;
+        Envelope::decode(&reply)
+            .expect("reply envelope")
+            .payload
+            .clone()
+    }
+
+    /// Issue #338: a failed commit keeps the live store pre-rotation, answers
+    /// a typed unavailable error naming path and stage, audits storage_failed
+    /// with both identities, and a FRESH envelope carrying the same signed
+    /// record succeeds once storage recovers.
+    #[tokio::test]
+    async fn a_failed_rotation_commit_keeps_state_and_a_fresh_retry_succeeds() {
+        for case in ["replace", "create-dir"] {
+            let dir = scratch(case);
+            let peer_path = match case {
+                "replace" => {
+                    let path = dir.join("peers.json");
+                    std::fs::create_dir_all(&path).expect("directory obstacle");
+                    path
+                }
+                _ => {
+                    let blocker = dir.join("blocker");
+                    std::fs::write(&blocker, b"not a directory").expect("blocker");
+                    blocker.join("peers.json")
+                }
+            };
+            let provider = identity(201);
+            let old = identity(202);
+            let new = identity(203);
+            let peers = Arc::new(RwLock::new(enrolled_store(&old.node_id())));
+            let sink = Arc::new(MemoryAudit::new());
+            let audit: Option<Arc<dyn FederationAudit>> = Some(sink.clone());
+            let record = RotationRecord::sign(&old, &new, unix_ms(), None);
+            let envelope = rotation_envelope(
+                &new,
+                &provider.node_id(),
+                &record,
+                &format!("m-fail-{case}"),
+            );
+
+            let reply = serve(
+                &provider,
+                &peers,
+                &Some(peer_path.clone()),
+                &audit,
+                &envelope,
+            )
+            .await;
+            assert_eq!(reply["ok"], json!(false), "case {case}: {reply}");
+            assert_eq!(
+                reply["error"]["kind"],
+                json!("unavailable"),
+                "case {case}: {reply}"
+            );
+            let message = reply["error"]["message"].as_str().expect("a message");
+            assert!(
+                message.contains("peers.json"),
+                "case {case}: names the path: {message}"
+            );
+            let stage = if case == "replace" {
+                "replace"
+            } else {
+                "create-dir"
+            };
+            assert!(
+                message.contains(stage),
+                "case {case}: names the stage: {message}"
+            );
+
+            {
+                let store = peers.read().expect("peers");
+                assert!(
+                    store.is_trusted(&old.node_id(), unix_ms()),
+                    "case {case}: the old identity stays trusted"
+                );
+                assert!(store
+                    .authorize(&old.node_id(), &capability_id(), unix_ms())
+                    .is_ok());
+                assert!(
+                    store.record(&new.node_id()).is_none(),
+                    "case {case}: the new identity is not enrolled"
+                );
+                assert!(store.rotations.is_empty());
+            }
+            let events = sink.events();
+            assert_eq!(events.len(), 1, "case {case}");
+            assert_eq!(events[0].operation, "rotation");
+            assert_eq!(events[0].outcome, "storage_failed", "case {case}");
+            assert_eq!(
+                events[0].subject.as_deref(),
+                Some(format!("{} -> {}", old.node_id(), new.node_id()).as_str())
+            );
+            assert_eq!(
+                events[0].capability.as_deref(),
+                Some(old.node_id().to_string().as_str())
+            );
+
+            // Repair storage; retry with a FRESH envelope, same signed record.
+            match case {
+                "replace" => std::fs::remove_dir_all(&peer_path).expect("unblock"),
+                _ => std::fs::remove_file(dir.join("blocker")).expect("unblock"),
+            }
+            let retry = rotation_envelope(
+                &new,
+                &provider.node_id(),
+                &record,
+                &format!("m-retry-{case}"),
+            );
+            let reply = serve(&provider, &peers, &Some(peer_path.clone()), &audit, &retry).await;
+            assert_eq!(reply["ok"], json!(true), "case {case}: {reply}");
+            let store = peers.read().expect("peers");
+            assert!(store.is_trusted(&new.node_id(), unix_ms()));
+            assert!(!store.is_trusted(&old.node_id(), unix_ms()));
+            assert!(store
+                .authorize(&new.node_id(), &capability_id(), unix_ms())
+                .is_ok());
+            drop(store);
+            let on_disk = PeerStore::load(&peer_path).expect("committed");
+            assert!(on_disk.is_trusted(&new.node_id(), unix_ms()));
+            assert_eq!(on_disk.rotations.len(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Issue #338: immediately after the response, a restart that loads only
+    /// the file trusts the new identity with the copied grants and keeps the
+    /// old identity revoked.
+    #[tokio::test]
+    async fn a_committed_rotation_survives_an_immediate_restart() {
+        let dir = scratch("restart");
+        let path = dir.join("peers.json");
+        let provider = identity(204);
+        let old = identity(205);
+        let new = identity(206);
+        let now = unix_ms();
+        let mut store = PeerStore::new();
+        store.enroll(old.node_id(), now, None);
+        store
+            .grant_scoped(
+                &old.node_id(),
+                capability_id(),
+                vec!["read".to_string()],
+                vec!["/workspace/*".to_string()],
+                now,
+                None,
+            )
+            .expect("scoped grant");
+        store.save(&path).expect("the pre-state is committed");
+        let peers = Arc::new(RwLock::new(store));
+        let record = RotationRecord::sign(&old, &new, now, None);
+        let envelope = rotation_envelope(&new, &provider.node_id(), &record, "m-restart");
+        let reply = serve(&provider, &peers, &Some(path.clone()), &None, &envelope).await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+
+        let restarted = PeerStore::load(&path).expect("load after the response");
+        assert!(restarted.is_trusted(&new.node_id(), now));
+        assert!(restarted
+            .authorize_scoped(
+                &new.node_id(),
+                &capability_id(),
+                now,
+                Some("read"),
+                Some("/workspace/notes.txt"),
+                None,
+            )
+            .is_ok());
+        let old_record = restarted.record(&old.node_id()).expect("kept for audit");
+        assert_eq!(old_record.state, TrustState::Revoked);
+        assert!(old_record.grants.is_empty());
+        assert_eq!(restarted.rotations.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #338: duplicate delivery of a committed record answers ok
+    /// without re-applying, in this process and across a restart.
+    #[tokio::test]
+    async fn a_duplicate_rotation_delivery_is_an_idempotent_success() {
+        let dir = scratch("duplicate");
+        let path = dir.join("peers.json");
+        let provider = identity(207);
+        let old = identity(208);
+        let new = identity(209);
+        let peers = Arc::new(RwLock::new(enrolled_store(&old.node_id())));
+        let sink = Arc::new(MemoryAudit::new());
+        let audit: Option<Arc<dyn FederationAudit>> = Some(sink.clone());
+        let record = RotationRecord::sign(&old, &new, unix_ms(), None);
+
+        let first = rotation_envelope(&new, &provider.node_id(), &record, "m-dup-1");
+        let reply = serve(&provider, &peers, &Some(path.clone()), &audit, &first).await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        let second = rotation_envelope(&new, &provider.node_id(), &record, "m-dup-2");
+        let reply = serve(&provider, &peers, &Some(path.clone()), &audit, &second).await;
+        assert_eq!(
+            reply["ok"],
+            json!(true),
+            "a duplicate is a success: {reply}"
+        );
+        assert_eq!(
+            peers.read().expect("peers").rotations.len(),
+            1,
+            "the duplicate did not re-apply the transition"
+        );
+        let events = sink.events();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.outcome == "ok"));
+        assert!(events[1]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("already durably committed")));
+
+        // A restart loads the committed log and still answers ok.
+        let restarted = Arc::new(RwLock::new(PeerStore::load(&path).expect("load")));
+        let third = rotation_envelope(&new, &provider.node_id(), &record, "m-dup-3");
+        let reply = serve(&provider, &restarted, &Some(path.clone()), &None, &third).await;
+        assert_eq!(reply["ok"], json!(true), "after a restart: {reply}");
+        assert_eq!(restarted.read().expect("peers").rotations.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #338: authorization reads running during a chain of rotations
+    /// see either the whole pre-rotation or the whole post-rotation state,
+    /// never a torn mix of the two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_authorization_reads_see_a_whole_rotation_snapshot() {
+        let dir = scratch("concurrent");
+        let path = dir.join("peers.json");
+        let provider = identity(210);
+        let chain: Vec<NodeIdentity> = (211..=215).map(identity).collect();
+        let ids: Vec<NodeId> = chain.iter().map(NodeIdentity::node_id).collect();
+        let peers = Arc::new(RwLock::new(enrolled_store(&ids[0])));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicU64::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let peers = Arc::clone(&peers);
+            let ids = ids.clone();
+            let stop = Arc::clone(&stop);
+            let reads = Arc::clone(&reads);
+            readers.push(std::thread::spawn(move || {
+                let cap = capability_id();
+                while !stop.load(Ordering::Relaxed) {
+                    let now = unix_ms();
+                    let store = peers.read().expect("peers");
+                    for pair in ids.windows(2) {
+                        let (a, b) = (&pair[0], &pair[1]);
+                        let a_state = store.record(a).map(|record| record.state);
+                        let b_state = store.record(b).map(|record| record.state);
+                        let consistent = match (a_state, b_state) {
+                            // Whole pre-rotation: the old identity still holds
+                            // its grants and the successor does not exist.
+                            (Some(TrustState::Trusted), None) => {
+                                store.authorize(a, &cap, now).is_ok()
+                            }
+                            // Whole post-rotation: the old is revoked and the
+                            // successor holds the copied grants.
+                            (Some(TrustState::Revoked), Some(TrustState::Trusted)) => {
+                                store.authorize(b, &cap, now).is_ok()
+                            }
+                            // A later rotation retired the successor too.
+                            (Some(TrustState::Revoked), Some(TrustState::Revoked)) => true,
+                            // This rotation has not happened yet.
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        assert!(consistent, "torn snapshot for {a} -> {b}");
+                    }
+                    reads.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for pair in chain.windows(2) {
+            let record = RotationRecord::sign(&pair[0], &pair[1], unix_ms(), None);
+            let envelope = rotation_envelope(
+                &pair[1],
+                &provider.node_id(),
+                &record,
+                &format!("m-chain-{}", pair[1].node_id()),
+            );
+            let reply = serve(&provider, &peers, &Some(path.clone()), &None, &envelope).await;
+            assert_eq!(reply["ok"], json!(true), "{reply}");
+        }
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().expect("reader");
+        }
+        assert!(
+            reads.load(Ordering::Relaxed) > 0,
+            "the readers ran during the rotations"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #338: a refused record keeps the denied outcome and still names
+    /// both identities in the audit row.
+    #[tokio::test]
+    async fn a_refused_rotation_audits_denied_with_both_identities() {
+        let provider = identity(220);
+        let old = identity(221);
+        let new = identity(222);
+        let peers = Arc::new(RwLock::new(enrolled_store(&old.node_id())));
+        let sink = Arc::new(MemoryAudit::new());
+        let audit: Option<Arc<dyn FederationAudit>> = Some(sink.clone());
+        let mut record = RotationRecord::sign(&old, &new, unix_ms(), None);
+        record.signature = identity(223).sign(b"not the statement");
+        let envelope = rotation_envelope(&new, &provider.node_id(), &record, "m-forged");
+        let reply = serve(&provider, &peers, &None, &audit, &envelope).await;
+        assert_eq!(reply["ok"], json!(false));
+        assert_eq!(reply["error"]["kind"], json!("denied"));
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, "denied");
+        assert_eq!(
+            events[0].subject.as_deref(),
+            Some(format!("{} -> {}", old.node_id(), new.node_id()).as_str())
+        );
+        assert!(peers
+            .read()
+            .expect("peers")
+            .is_trusted(&old.node_id(), unix_ms()));
+    }
+}
+
+#[cfg(test)]
+mod knowledge_durability_tests {
+    use super::*;
+    use crate::audit::MemoryAudit;
+    use crate::knowledge::{knowledge_hash, KnowledgeClass, KnowledgePurpose, Provenance};
+    use capability::{MessageId, WorkspaceId};
+
+    struct Allow;
+
+    impl KnowledgeAuthorizer for Allow {
+        fn may_query(
+            &self,
+            _peer: &NodeId,
+            _class: KnowledgeClass,
+            _purpose: KnowledgePurpose,
+            _scope: Option<&WorkspaceId>,
+        ) -> bool {
+            true
+        }
+
+        fn may_publish(&self, _peer: &NodeId) -> bool {
+            true
+        }
+    }
+
+    fn identity(seed: u8) -> NodeIdentity {
+        NodeIdentity::from_seed([seed; 32])
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "federation-knowledge-durable-{label}-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn item(origin: &NodeId, id: &str) -> KnowledgeItem {
+        let payload = json!({ "fact": id });
+        KnowledgeItem {
+            id: id.to_string(),
+            class: KnowledgeClass::Public,
+            workspace: None,
+            payload: payload.clone(),
+            provenance: Provenance {
+                origin: origin.clone(),
+                source: format!("memory/{id}"),
+                issued_at_ms: unix_ms(),
+                expires_at_ms: None,
+                content_hash: knowledge_hash(&payload),
+            },
+            retention_ms: None,
+        }
+    }
+
+    fn publication_envelope(
+        sender: &NodeIdentity,
+        recipient: &NodeId,
+        publication: &KnowledgePublication,
+        message_id: &str,
+    ) -> Envelope {
+        let mut message = FederationMessage::new(
+            "knowledge_publication",
+            serde_json::to_vec(publication).expect("publication bytes"),
+        );
+        message.id = MessageId::new(message_id);
+        Envelope::seal(&message, sender, recipient).expect("sealed")
+    }
+
+    async fn serve(
+        provider: &NodeIdentity,
+        peers: &Arc<RwLock<PeerStore>>,
+        service: &Arc<RwLock<KnowledgeService>>,
+        knowledge_path: &Option<PathBuf>,
+        audit: &Option<Arc<dyn FederationAudit>>,
+        envelope: &Envelope,
+    ) -> Value {
+        let knowledge = Some(Arc::clone(service));
+        let authorizer: Option<Arc<dyn KnowledgeAuthorizer>> = Some(Arc::new(Allow));
+        let reply = serve_knowledge_publication(
+            provider,
+            peers,
+            &knowledge,
+            &authorizer,
+            knowledge_path,
+            audit,
+            envelope,
+        )
+        .await;
+        Envelope::decode(&reply)
+            .expect("reply envelope")
+            .payload
+            .clone()
+    }
+
+    fn enrolled(sender: &NodeId) -> Arc<RwLock<PeerStore>> {
+        let mut store = PeerStore::new();
+        store.enroll(sender.clone(), unix_ms(), None);
+        Arc::new(RwLock::new(store))
+    }
+
+    /// Issue #339: a publication whose snapshot commit fails answers a typed
+    /// unavailable error with no accepted count, keeps the live store without
+    /// the item, and audits the failure; a fresh retry after recovery commits.
+    #[tokio::test]
+    async fn a_failed_knowledge_commit_answers_unavailable_and_keeps_the_live_store() {
+        let dir = scratch("fail");
+        let path = dir.join("knowledge.json");
+        std::fs::create_dir_all(&path).expect("directory obstacle");
+        let provider = identity(230);
+        let sender = identity(231);
+        let peers = enrolled(&sender.node_id());
+        let service = Arc::new(RwLock::new(KnowledgeService::new()));
+        let sink = Arc::new(MemoryAudit::new());
+        let audit: Option<Arc<dyn FederationAudit>> = Some(sink.clone());
+        let publication = KnowledgePublication::new(vec![item(&sender.node_id(), "k-fail")]);
+        let envelope = publication_envelope(&sender, &provider.node_id(), &publication, "m-k-fail");
+
+        let reply = serve(
+            &provider,
+            &peers,
+            &service,
+            &Some(path.clone()),
+            &audit,
+            &envelope,
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(false), "{reply}");
+        assert_eq!(reply["error"]["kind"], json!("unavailable"), "{reply}");
+        assert!(
+            reply.get("accepted").is_none(),
+            "no accepted count on failure"
+        );
+        let message = reply["error"]["message"].as_str().expect("a message");
+        assert!(
+            message.contains("knowledge.json") && message.contains("replace"),
+            "names the path and stage: {message}"
+        );
+        assert!(service.read().expect("service").get("k-fail").is_none());
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, "knowledge_publication");
+        assert_eq!(events[0].outcome, "unavailable");
+        assert!(events[0].reason.is_some());
+
+        std::fs::remove_dir_all(&path).expect("unblock");
+        let retry = publication_envelope(&sender, &provider.node_id(), &publication, "m-k-retry");
+        let reply = serve(
+            &provider,
+            &peers,
+            &service,
+            &Some(path.clone()),
+            &audit,
+            &retry,
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        assert_eq!(reply["accepted"], json!(1));
+        assert!(service.read().expect("service").get("k-fail").is_some());
+        let text = std::fs::read_to_string(&path).expect("committed");
+        assert!(KnowledgeService::from_json(&text)
+            .expect("snapshot")
+            .get("k-fail")
+            .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #339: a committed publication survives a restart with the item,
+    /// publisher, scope, provenance, expiry and revoked state intact.
+    #[tokio::test]
+    async fn a_committed_publication_survives_a_restart_with_full_metadata() {
+        let dir = scratch("restart");
+        let path = dir.join("knowledge.json");
+        let provider = identity(232);
+        let peers = enrolled(&provider.node_id());
+        let service = Arc::new(RwLock::new(KnowledgeService::new()));
+        let workspace = WorkspaceId::new("ws:research").expect("a workspace");
+        let payload = json!({ "fact": "governed" });
+        let live = KnowledgeItem {
+            id: "k-live".to_string(),
+            class: KnowledgeClass::Workspace,
+            workspace: Some(workspace.clone()),
+            payload: payload.clone(),
+            provenance: Provenance {
+                origin: provider.node_id(),
+                source: "memory/k-live".to_string(),
+                issued_at_ms: unix_ms(),
+                expires_at_ms: Some(unix_ms() + 3_600_000),
+                content_hash: knowledge_hash(&payload),
+            },
+            retention_ms: Some(3_600_000),
+        };
+        let publication =
+            KnowledgePublication::new(vec![live.clone(), item(&provider.node_id(), "k-doomed")]);
+        let envelope =
+            publication_envelope(&provider, &provider.node_id(), &publication, "m-k-restart");
+        let reply = serve(
+            &provider,
+            &peers,
+            &service,
+            &Some(path.clone()),
+            &None,
+            &envelope,
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        assert_eq!(reply["accepted"], json!(2));
+
+        // Revoke through the node's durable path.
+        let network = Arc::new(crate::memory::InMemoryNetwork::new());
+        let (transport, _inbox) = network.join(provider.node_id());
+        let node = FederationNode::new(provider.clone(), Arc::new(transport))
+            .with_knowledge(Arc::clone(&service), Arc::new(Allow))
+            .with_knowledge_persistence(path.clone());
+        assert!(node.revoke_knowledge("k-doomed").expect("revoked"));
+
+        // Restart: only the file is read.
+        let text = std::fs::read_to_string(&path).expect("committed");
+        let mut restored = KnowledgeService::from_json(&text).expect("snapshot");
+        let kept = restored.get("k-live").expect("the item survived");
+        assert_eq!(kept, &live, "scope, provenance and expiry survive");
+        assert_eq!(kept.workspace.as_ref(), Some(&workspace));
+        assert!(restored.is_revoked("k-doomed"));
+        assert!(restored.get("k-doomed").is_none());
+        let stranger = identity(234).node_id();
+        assert!(matches!(
+            restored.revoke(&stranger, "k-live"),
+            Err(KnowledgeError::RevokeDenied { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #339: a failed publication cannot be followed by a successful
+    /// one that silently drops the failed item's predecessors.
+    #[tokio::test]
+    async fn a_failed_publication_keeps_predecessors_for_the_next_success() {
+        let dir = scratch("predecessors");
+        let path = dir.join("knowledge.json");
+        let provider = identity(235);
+        let sender = identity(236);
+        let peers = enrolled(&sender.node_id());
+        let service = Arc::new(RwLock::new(KnowledgeService::new()));
+
+        let first = KnowledgePublication::new(vec![item(&sender.node_id(), "k-a")]);
+        let envelope = publication_envelope(&sender, &provider.node_id(), &first, "m-k-a");
+        let reply = serve(
+            &provider,
+            &peers,
+            &service,
+            &Some(path.clone()),
+            &None,
+            &envelope,
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+
+        // Storage degrades: the committed file is replaced by a directory.
+        std::fs::remove_file(&path).expect("remove the committed file");
+        std::fs::create_dir_all(&path).expect("directory obstacle");
+        let second = KnowledgePublication::new(vec![item(&sender.node_id(), "k-b")]);
+        let envelope = publication_envelope(&sender, &provider.node_id(), &second, "m-k-b-fail");
+        let reply = serve(
+            &provider,
+            &peers,
+            &service,
+            &Some(path.clone()),
+            &None,
+            &envelope,
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(false), "{reply}");
+        {
+            let store = service.read().expect("service");
+            assert!(store.get("k-a").is_some(), "the predecessor stays live");
+            assert!(
+                store.get("k-b").is_none(),
+                "the failed item is not retained"
+            );
+        }
+
+        // Recovery: the retry commits BOTH the predecessor and the new item.
+        std::fs::remove_dir_all(&path).expect("unblock");
+        let envelope = publication_envelope(&sender, &provider.node_id(), &second, "m-k-b-retry");
+        let reply = serve(
+            &provider,
+            &peers,
+            &service,
+            &Some(path.clone()),
+            &None,
+            &envelope,
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        let store = service.read().expect("service");
+        assert!(store.get("k-a").is_some());
+        assert!(store.get("k-b").is_some());
+        drop(store);
+        let text = std::fs::read_to_string(&path).expect("committed");
+        let on_disk = KnowledgeService::from_json(&text).expect("snapshot");
+        assert!(
+            on_disk.get("k-a").is_some(),
+            "the predecessor survived durably"
+        );
+        assert!(on_disk.get("k-b").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #339: a revocation whose commit fails keeps the item live and
+    /// answers a typed storage error.
+    #[tokio::test]
+    async fn a_failed_revocation_commit_keeps_the_item_live() {
+        let dir = scratch("revoke-fail");
+        let path = dir.join("knowledge.json");
+        let provider = identity(237);
+        let network = Arc::new(crate::memory::InMemoryNetwork::new());
+        let (transport, _inbox) = network.join(provider.node_id());
+        let service = Arc::new(RwLock::new(KnowledgeService::new()));
+        let mut seeded = KnowledgeService::new();
+        seeded
+            .publish(
+                &provider.node_id(),
+                &KnowledgePublication::new(vec![item(&provider.node_id(), "k-r")]),
+                unix_ms(),
+            )
+            .expect("seed");
+        seeded.save(&path).expect("the seed is committed");
+        *service.write().expect("service") = seeded;
+        let node = FederationNode::new(provider.clone(), Arc::new(transport))
+            .with_knowledge(Arc::clone(&service), Arc::new(Allow))
+            .with_knowledge_persistence(path.clone());
+
+        std::fs::remove_file(&path).expect("remove the committed file");
+        std::fs::create_dir_all(&path).expect("directory obstacle");
+        let error = node.revoke_knowledge("k-r").expect_err("the commit fails");
+        assert!(
+            matches!(error, CapabilityError::Unavailable { .. }),
+            "{error:?}"
+        );
+        assert!(
+            service.read().expect("service").get("k-r").is_some(),
+            "the item stays live"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

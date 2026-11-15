@@ -34,11 +34,12 @@ pub struct FederationEvent {
     pub operation: String,
     /// The capability involved, when the operation names one.
     pub capability: Option<String>,
-    /// The delegation or lease a coordination or data operation acts on.
+    /// The delegation, lease, or identity pair a coordination or data
+    /// operation acts on; a rotation names it as "old -> new" (issue #338).
     #[serde(default)]
     pub subject: Option<String>,
     /// The outcome class: ok, denied, invalid, not_found, unavailable,
-    /// provider_failed, transport, unknown_outcome.
+    /// storage_failed, provider_failed, transport, unknown_outcome.
     pub outcome: String,
     /// Why it was refused or failed, when there is something to say.
     pub reason: Option<String>,

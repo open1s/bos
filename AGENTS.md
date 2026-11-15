@@ -155,10 +155,13 @@ const result = await agent.ask('What is 2+2?');
 - Use `#[tokio::test]` for async tests
 - Run with: `cargo test -p <crate> name -- --nocapture`
 - Set `RUST_LOG=debug` for tracing output
-- Current green baselines:
-  - Rust (excluding the binding crates): 443 passed, 0 failed, 8 ignored
-  - Python (`cd crates/nbos && pytest -m "not llm"`): 272 passed, 4 deselected
-  - JS (`cd crates/jsbos && npx ava`): 135 tests (13 parity, 3 native-binding, 21 API-doc, 9 content, 14 memory, 13 agentic, 6 ferris, 16 ferris-host, 4 ferris-parity)
+- Current green baselines (2026-11-15, durable-record-kernel work):
+  - Rust: hostkit 36; agent 579 lib + integration suites; federation 262;
+    bsh 1886 lib (9 ignored) - all 0 failed
+  - Python (`cd crates/nbos && pytest -m "not llm"`): 277 passed, 4 deselected,
+    1 pre-existing failure (`test_agent_builder_with_reasoning_methods`,
+    stale installed native build; unrelated to the memory kernel)
+  - JS (`cd crates/jsbos && npx ava`): 140 tests passed
 
 ---
 ## Key Patterns
@@ -194,6 +197,24 @@ const result = await agent.ask('What is 2+2?');
   bounded by a recall limit. `Memory.search` accepts a metadata filter and
   `with_max_items`/`withMaxItems` caps the store. `Memory.save`/`Memory.load`
   read and write the same JSON-lines format as the Rust `FileMemory`.
+  Since the durable-record-kernel work (issues #338-#346, see
+  `docs/durable-record-kernel.md`): `FileMemory` stores schema-2
+  `MemoryRecord`s (kind, scope, provenance, confidence, lifecycle, relations)
+  and migrates legacy lines on read; every handle to one canonical path shares
+  one coordinated store, and commits go through `hostkit::durable::commit`
+  (staged, typed errors, `CommitGate` fault injection) under a cross-process
+  `hostkit::coord::FileLock`. The fallible surface is `MemoryRepository` /
+  `MemoryStore::try_*` / `Agent::try_remember`; the legacy infallible methods
+  stay best-effort adapters. Recall has two seams: legacy `search`
+  (fixture-pinned) and hybrid `recall` (BM25 + CJK n-grams, scope filtering
+  before ranking, token budget, explanations). BSH resolves storage identity
+  and access scope through `bsh::memory_scope::MemoryScopeResolver`
+  (workspace store + legacy user store, composed by `ScopedMemory`), captures
+  knowledge at completed turns via `bsh::memory_capture::CaptureHandle`
+  (opt-in `memory_capture` setting), and derives context diagnostics from the
+  typed `Agent::assemble_prompt` snapshot, never from rendered strings.
+  Federation rotation and knowledge publication follow the same
+  clone-commit-publish rule under one write guard.
 - **Templates**: `react::template` renders `{{name}}` prompts with
   `PromptTemplate`/`render_template` and places recall with `with_memory`;
   the agent substitutes a `{{memory}}` placeholder in the system prompt and
@@ -216,4 +237,4 @@ const result = await agent.ask('What is 2+2?');
 
 ---
 
-## Last Updated: 2026-10-13
+## Last Updated: 2026-11-15

@@ -4490,6 +4490,7 @@ impl Shell {
         // ends, before it decides whether to continue.
         let goal_store = built.goal.clone();
         let memory_state = built.memory_state.clone();
+        let memory_capture = built.memory_capture.clone();
         let persona_complete = built.persona_complete;
         self.state
             .attach_turn_extensions(&id, built.extension_activations);
@@ -4544,6 +4545,7 @@ impl Shell {
             cap,
             memory_state,
             persona_complete,
+            memory_capture,
         );
         self.pump(id, rx, cx);
         change_set

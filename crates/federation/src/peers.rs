@@ -90,6 +90,22 @@ impl PeerRecord {
     }
 }
 
+/// One committed key rotation, recorded in the durable rotation log.
+///
+/// The log is what makes a rotation idempotent across restarts: a replayed
+/// record whose (old, new, at_ms) triple is already here is answered as a
+/// success without re-applying the transition (issue #338).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RotationEntry {
+    /// The identity that was retired.
+    pub old: NodeId,
+    /// The identity that took its grants.
+    pub new: NodeId,
+    /// When the old key signed the successor statement, in milliseconds
+    /// since the Unix epoch.
+    pub at_ms: u64,
+}
+
 /// Why an operation on the peer store was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum PeerError {
@@ -106,6 +122,19 @@ pub enum PeerError {
         path: String,
         /// The operating system's error.
         source: std::io::Error,
+    },
+    /// The peer file could not be durably committed (issue #338).
+    ///
+    /// The previous file is intact and the live store was not changed; a
+    /// retryable failure may succeed once storage recovers.
+    #[error("cannot commit the peer store at {path}: {detail}")]
+    Storage {
+        /// The file the commit targeted.
+        path: String,
+        /// The durable kernel's account, naming the failed stage.
+        detail: String,
+        /// Whether retrying the same commit later can succeed.
+        retryable: bool,
     },
     /// The peer file is not a valid peer document.
     #[error("the peer file is not valid JSON: {message}")]
@@ -135,6 +164,15 @@ pub enum PeerError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerStore {
     peers: BTreeMap<NodeId, PeerRecord>,
+    /// The durable log of committed key rotations (issue #338).
+    ///
+    /// An entry is appended only after the rotated store has been durably
+    /// committed, and it travels inside the committed snapshot, so a restart
+    /// still answers a replayed rotation record as an idempotent success.
+    /// The field is serde-defaulted: peer files written before the log
+    /// existed load unchanged, with an empty log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rotations: Vec<RotationEntry>,
 }
 
 impl PeerStore {
@@ -555,12 +593,35 @@ impl PeerStore {
     /// owner-only DACL, applied on creation and on replacement. A failure to
     /// establish the private policy fails the save.
     pub fn save(&self, path: &std::path::Path) -> Result<(), PeerError> {
+        self.save_with_gate(path, &hostkit::durable::NoFaults)
+    }
+
+    /// Commit the store through the durable kernel with a fault-injection
+    /// gate (issue #338).
+    ///
+    /// The commit walks create-dir, create-temp, write, sync, harden and
+    /// replace; a failure at any stage leaves the previous file intact and
+    /// is reported as a typed `PeerError::Storage` naming the stage and
+    /// whether a retry can succeed. Production callers pass
+    /// `hostkit::durable::NoFaults`; tests inject a stage failure.
+    pub fn save_with_gate(
+        &self,
+        path: &std::path::Path,
+        gate: &dyn hostkit::durable::CommitGate,
+    ) -> Result<(), PeerError> {
         let text = self.to_json().map_err(|error| PeerError::Json {
             message: error.to_string(),
         })?;
-        hostkit::fspriv::write_private(path, text.as_bytes()).map_err(|source| PeerError::Io {
+        hostkit::durable::commit(
+            path,
+            text.as_bytes(),
+            hostkit::durable::Privacy::OwnerOnly,
+            gate,
+        )
+        .map_err(|error| PeerError::Storage {
             path: path.display().to_string(),
-            source,
+            detail: error.to_string(),
+            retryable: error.is_retryable(),
         })
     }
 
@@ -833,5 +894,142 @@ mod tests {
         }
         assert!(!store.is_trusted(&peer, 1_000));
         assert!(store.authorize(&peer, &capability(), 1_000).is_err());
+    }
+
+    /// A gate that fails exactly one commit stage (issue #338).
+    struct FaultAt(hostkit::durable::IoStage);
+
+    impl hostkit::durable::CommitGate for FaultAt {
+        fn pass(
+            &self,
+            stage: hostkit::durable::IoStage,
+            _path: &std::path::Path,
+        ) -> std::io::Result<()> {
+            if stage == self.0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected commit failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn rotation_fixture() -> (PeerStore, NodeId, NodeId, RotationRecord) {
+        let old = NodeIdentity::from_seed([71u8; 32]);
+        let new = NodeIdentity::from_seed([72u8; 32]);
+        let mut store = PeerStore::new();
+        store.enroll(old.node_id(), 1_000, None);
+        store
+            .grant(&old.node_id(), capability(), 1_000, None)
+            .expect("grant");
+        let record = RotationRecord::sign(&old, &new, 2_000, None);
+        (store, old.node_id(), new.node_id(), record)
+    }
+
+    /// Issue #338: an injected failure at every commit stage leaves the
+    /// persisted file at the pre-rotation state and reports a typed,
+    /// retryable storage error naming the stage.
+    #[test]
+    fn a_failed_rotation_commit_keeps_the_previous_file() {
+        for stage in [
+            hostkit::durable::IoStage::CreateTemp,
+            hostkit::durable::IoStage::Write,
+            hostkit::durable::IoStage::Sync,
+            hostkit::durable::IoStage::Replace,
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "federation-rotation-fault-{}-{stage}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            let path = dir.join("peers.json");
+
+            let (store, old_id, new_id, record) = rotation_fixture();
+            store
+                .save(&path)
+                .expect("the pre-rotation state is committed");
+
+            let mut rotated = store.clone();
+            rotated
+                .rotate(&record, 2_000)
+                .expect("the rotation is valid");
+            rotated.rotations.push(RotationEntry {
+                old: old_id.clone(),
+                new: new_id.clone(),
+                at_ms: record.rotated_at_ms,
+            });
+            let error = rotated
+                .save_with_gate(&path, &FaultAt(stage))
+                .expect_err("the injected stage must fail");
+            match &error {
+                PeerError::Storage {
+                    path: failed,
+                    detail,
+                    retryable,
+                } => {
+                    assert_eq!(failed, &path.display().to_string());
+                    assert!(detail.contains(&stage.to_string()), "{detail}");
+                    assert!(retryable, "an injected I/O failure is retryable");
+                }
+                other => panic!("expected a Storage error at {stage}, got {other:?}"),
+            }
+
+            let on_disk = PeerStore::load(&path).expect("the previous file is intact");
+            assert_eq!(on_disk, store, "stage {stage} changed the durable state");
+            assert!(on_disk.is_trusted(&old_id, 2_000));
+            assert!(on_disk.record(&new_id).is_none());
+            assert!(on_disk.rotations.is_empty());
+
+            // Storage recovery: the same rotated store commits on retry.
+            rotated
+                .save_with_gate(&path, &hostkit::durable::NoFaults)
+                .expect("the retry commits once the fault is gone");
+            let recovered = PeerStore::load(&path).expect("load after retry");
+            assert!(recovered.is_trusted(&new_id, 2_000));
+            assert!(!recovered.is_trusted(&old_id, 2_000));
+            assert_eq!(recovered.rotations.len(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Issue #338: the rotation log travels inside the committed snapshot,
+    /// and peer files written before the log existed still load.
+    #[test]
+    fn the_rotation_log_survives_a_round_trip_and_defaults_for_legacy_files() {
+        let dir =
+            std::env::temp_dir().join(format!("federation-rotation-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("peers.json");
+
+        let (store, old_id, new_id, record) = rotation_fixture();
+        let mut rotated = store.clone();
+        rotated.rotate(&record, 2_000).expect("rotation");
+        rotated.rotations.push(RotationEntry {
+            old: old_id.clone(),
+            new: new_id.clone(),
+            at_ms: record.rotated_at_ms,
+        });
+        rotated.save(&path).expect("save");
+        let loaded = PeerStore::load(&path).expect("load");
+        assert_eq!(loaded, rotated);
+        assert_eq!(
+            loaded.rotations,
+            vec![RotationEntry {
+                old: old_id,
+                new: new_id,
+                at_ms: 2_000,
+            }]
+        );
+
+        // A legacy document without the rotations field is still readable.
+        let legacy = store.to_json().expect("serialize");
+        assert!(!legacy.contains("rotations"), "an empty log is not written");
+        let restored = PeerStore::from_json(&legacy).expect("legacy load");
+        assert!(restored.rotations.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

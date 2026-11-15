@@ -7,7 +7,7 @@
 //! `#[cfg(not(unix))]` no-op, which compiled everywhere but only worked on
 //! Unix (issues #312, #315, #316, #320). Every process-producing runtime now
 //! spawns through [`proc`], every untrusted package path through [`paths`],
-//! every child environment through [`env`], and every secret file through
+//! every child environment through [`mod@env`], and every secret file through
 //! [`fspriv`].
 //!
 //! # Platform contract
@@ -23,6 +23,8 @@
 
 #![warn(missing_docs)]
 
+pub mod coord;
+pub mod durable;
 pub mod env;
 pub mod fspriv;
 pub mod home;

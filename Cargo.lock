@@ -5593,8 +5593,10 @@ name = "hostkit"
 version = "0.1.0"
 dependencies = [
  "dirs 7.0.0",
+ "fs2",
  "libc",
  "tempfile",
+ "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]
 
