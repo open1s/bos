@@ -6,6 +6,11 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_budgets:
+        description: "Run the release-mode extension budgets (fat-LTO release build, ~30 min)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -26,14 +31,17 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # rust-cache prunes the target dir and falls back through restore-keys:
+      # the raw tree is over the repository's 10 GB cache budget (the old
+      # actions/cache entry was never saved), and a version bump rewrites
+      # Cargo.lock without changing a dependency, so a key-only cache rebuilt
+      # the whole graph on every release commit.
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: linux-core
+          cache-on-failure: true
+          workspaces: ". -> target"
 
       - name: Install Linux GUI dependencies
         run: |
@@ -94,12 +102,16 @@ jobs:
           cargo build -p bsh --bin bsh
           BSH_BIN=./target/debug/bsh bash scripts/ci/verify-bsh-examples.sh
 
+      # The functional gate runs on every push; the release-mode budgets are
+      # opt-in (workflow_dispatch -> release_budgets). One fat-LTO,
+      # codegen-units=1 release build of bsh measured 30+ minutes, turning a
+      # 35-minute job into a 65+ minute one for two budget assertions.
       - name: Extension gold standard
-        # The benchmark budget step is timing-sensitive under runner load; one
-        # retry keeps the gate meaningful without hiding a real failure.
+        env:
+          GOLD_STANDARD_RELEASE: ${{ inputs.release_budgets && '1' || '0' }}
         run: |
           for attempt in 1 2; do
-            if GOLD_STANDARD_RELEASE=1 bash scripts/ci/check-extension-gold-standard.sh; then
+            if bash scripts/ci/check-extension-gold-standard.sh; then
               exit 0
             fi
             if [ "$attempt" -eq 2 ]; then exit 1; fi
