@@ -67,6 +67,28 @@ pub struct FileLock {
     path: PathBuf,
 }
 
+/// Whether an OS lock call failed because another holder owns the lock.
+///
+/// Unix reports `WouldBlock` (EWOULDBLOCK) or `PermissionDenied` (EACCES).
+/// Windows reports `ERROR_LOCK_VIOLATION` (33), which std may surface as
+/// `Other`/`Uncategorized` depending on the version, so the raw code is
+/// checked too. Without this a Windows lock conflict would be a generic IO
+/// error and callers could not tell "someone else holds it" from "I/O broke".
+fn is_lock_conflict(error: &io::Error) -> bool {
+    let conflict = matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+    );
+    #[cfg(windows)]
+    {
+        conflict || error.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    {
+        conflict
+    }
+}
+
 impl FileLock {
     /// Acquire the lock for `store_path`, waiting for any current holder.
     pub fn acquire(store_path: &Path) -> Result<Self, DurableError> {
@@ -104,17 +126,9 @@ impl FileLock {
                 file,
                 path: lock_path,
             }),
-            Err(error)
-                if !blocking
-                    && matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
-                    ) =>
-            {
-                Err(DurableError::Locked {
-                    path: lock_path.display().to_string(),
-                })
-            }
+            Err(error) if !blocking && is_lock_conflict(&error) => Err(DurableError::Locked {
+                path: lock_path.display().to_string(),
+            }),
             Err(source) => Err(io_err(source)),
         }
     }

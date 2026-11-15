@@ -99,8 +99,11 @@ mod tests {
 
     #[test]
     fn absolute_override_wins() {
-        let root = resolve_root(Some(OsStr::new("/custom/root")), ".bos/bsh").unwrap();
-        assert_eq!(root, PathBuf::from("/custom/root"));
+        // A POSIX "/custom/root" is not absolute on Windows (it has a root but
+        // no prefix), so the fixture comes from the platform's temp dir.
+        let absolute = std::env::temp_dir().join("bsh-custom-root");
+        let root = resolve_root(Some(absolute.as_os_str()), ".bos/bsh").unwrap();
+        assert_eq!(root, absolute);
     }
 
     #[test]
