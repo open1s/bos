@@ -11,8 +11,11 @@
 //!   byte target, so the file count grows with history/(segment size), not with
 //!   the number of saves. The manifest is installed before old files are removed.
 //! * A manifest index. `manifest.json` holds every segment's start row, byte
-//!   size and row-group row counts. Opening a history reads that index instead
-//!   of every Parquet footer, and a page locates its segment by binary search.
+//!   size and row-group row counts, and a page locates its segment by binary
+//!   search instead of opening every file. Opening a history validates that
+//!   index against each listed segment's FOOTER - no payload is decoded, so the
+//!   cost is bounded by the segment count, not by the rows - and rebuilds it
+//!   from those footers when they disagree (issue #356).
 //! * Row groups are pages. A segment is written with at most PAGE rows and a
 //!   byte budget per row group, so one huge tool output does not make every
 //!   neighbouring page enormous. A page read decodes only the groups it needs.

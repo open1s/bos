@@ -77,7 +77,11 @@ segment is a diagnostic: losing an entry is survivable, reading garbage is not.
   compaction swap, manifest publication, recovery) holds `coord::FileLock` on
   `<history dir>.lock` before touching files. The in-process `RwLock` stays as
   the cheap first level; the file lock is taken only by writers, and always
-  before the write guard (one order, so no deadlock).
+  before the write guard (one order, so no deadlock). The acquire is BOUNDED
+  (`FileLock::acquire_bounded`, 250 ms) so a second process cannot stall the UI
+  thread: a busy directory becomes `HistoryError::Locked` for an append or
+  `Compaction::Busy` for a compaction, and `History::open` skips the repair
+  while someone else owns the lock and keeps reading.
 - **Collision-safe names**: `create_new(true)` for every temp file, and segment
   ids carry the pid and a per-process sequence beside the millisecond stamp
   (`msg-<stamp>-<pid>-<seq>.parquet`), so two processes never emit the same
@@ -93,13 +97,18 @@ segment is a diagnostic: losing an entry is survivable, reading garbage is not.
 `HistoryError` (thiserror) with the context each variant needs:
 
 ```text
-Read { segment, group, detail, source }        page/segment read failed
+Read { segment, group, detail }                page/row-group read failed
 Decode { segment, row, column, detail }        present column failed to decode
-Schema { segment, found, supported }           unsupported schema/column shape
-Manifest { path, problem, detail }             manifest invalid/unavailable
+Schema { segment, found, supported, detail }   unsupported version or column set
 Oversized { row, bytes, limit }                a row exceeds the inline limit
 Locked { path }                                another process holds the lock
 ```
+
+Manifest integrity is not an error variant because it is a `State`, not a
+failure: `IndexState::Valid | Rebuilt { reason } | Unavailable { reason }` is
+carried by the history itself, so "the index was rebuilt" and "rows are
+unavailable" are both visible without turning a recoverable repair into a
+refused read.
 
 - `Reader::messages`/`trajectory_page` and the store's page readers return
   `Result<_, HistoryError>`; a genuinely empty page is still `Ok(vec![])`, a
@@ -132,30 +141,47 @@ Recovery classifies a journal and never deletes what it cannot read:
 | truncated / empty / checksum mismatch / unknown version | **quarantine** |
 | base beyond the log (stale directory) | quarantine, not delete |
 
-Quarantine is `<history>/corrupt/inflight-<stamp>-<reason>.json` moved with one
-atomic rename, plus a ledger line in `<history>/corrupt/quarantine.json`
-(session, source, reason, version, timestamp — never message contents).
-`Store::recovery_report()` exposes the outcome so a caller can show it instead
-of claiming a clean start.
+Quarantine is one incident directory per journal, so concurrent processes never
+contend on a shared ledger:
+
+```text
+<history>/corrupt/<unix-ms>-<pid>-<reason>/journal.json   original bytes, one rename
+<history>/corrupt/<unix-ms>-<pid>-<reason>/report.json    session, source_path,
+                                                          reason, version, rows,
+                                                          quarantined_at
+```
+
+`report.json` records a row COUNT and never a message's contents.
+`Store::recovery_report()` exposes the outcome, and
+`store::recovery_notice(report)` turns it into the one startup line the shell
+shows (count, affected sessions, quarantine directory) instead of claiming a
+clean start.
 
 ## 6. Bounded memory (#354)
 
-- `PageCache` carries a byte budget beside the page ceiling and evicts until
-  both hold; the weight is the decoded row estimate, not the encoded size.
-- A single row above `MAX_INLINE_ROW_BYTES` is rejected at the append boundary
-  with `HistoryError::Oversized` (documented policy: large text/binary belongs
-  in a reference, not inline). Payload limits are named constants, not magic.
-- Window materialization is bounded by `MAX_WINDOW_ROWS`; whole-prefix reads go
-  through a page-walking stream instead of one allocation.
-- `History::cache_stats()` exposes bytes, pages, evictions and rejections.
+- `PageCache` carries a byte budget (`CACHE_BYTES = 32 MiB`) beside the page
+  ceiling (`CACHE_PAGES`) and evicts from the LRU end until both hold; the
+  weight is the decoded row estimate, not the encoded size. A page heavier than
+  the whole budget is served but not cached, so the cache itself never exceeds it.
+- A single row above `MAX_INLINE_ROW_BYTES` (32 MiB) is rejected at the append
+  boundary with `HistoryError::Oversized` BEFORE anything is written (documented
+  policy: large text/binary belongs in a reference, not inline; never truncated).
+- Window materialization is bounded by `MAX_WINDOW_ROWS` (8 x `PAGE` = 1024);
+  longer walks go through `Reader::for_each_page`, and `prefix`/compaction use
+  that walk instead of one allocation.
+- `History::cache_stats()` exposes `CacheStats { pages, bytes, evictions,
+  rejected }`.
 
 ## 7. Resource-stream lifecycle (federation, #347, #348)
 
 - `Open` carries a stream `attempt` (generation). `Cancel { lease, attempt }`
   is the new, idempotent, peer-authenticated message.
-- `Drop for RemoteStream` sends `Cancel` (bounded wait), then settles locally as
-  `cancelled` with `confirmed` true/false; an unconfirmed cancellation is
-  recorded as an unknown outcome, never as "the producer stopped".
+- `Drop for RemoteStream` sends `Cancel` for its exact attempt and settles
+  locally; `CancelConfirmation` records `cancelled` only when the frame was
+  accepted, and `cancel_unconfirmed` otherwise (a `Drop` cannot await, so the
+  frame is delivered under a bounded background send when it cannot go out on
+  the first poll). An unconfirmed cancellation is never reported as "the
+  producer stopped".
 - The provider keeps a per-session cancellation handle: a cancel with the
   current attempt wakes a producer waiting for credit, stops reads/charges/sends
   and releases the session slot; an older attempt is ignored.
