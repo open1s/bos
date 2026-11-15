@@ -176,6 +176,11 @@ pub(crate) struct ExtensionPanelView {
     /// Where the document and its revision come from.
     store: Arc<dyn SurfaceStore>,
     document: Option<UiDocument>,
+    /// The last raw card the runtime served, kept so the periodic refresh can
+    /// tell an unchanged card from a moved one without paying for a store
+    /// round-trip (the store may normalize the document, so its copy does not
+    /// compare equal to the raw one).
+    raw_document: Option<UiDocument>,
     loading: bool,
     error: Option<String>,
     message: Option<String>,
@@ -266,6 +271,7 @@ impl ExtensionPanelView {
             host_backed: false,
             store: Arc::new(HostSurfaceStore),
             document: None,
+            raw_document: None,
             loading: false,
             error: None,
             message: None,
@@ -356,6 +362,7 @@ impl ExtensionPanelView {
         self.revision = 0;
         self.host_backed = false;
         self.document = None;
+        self.raw_document = None;
         self.error = None;
         self.message = None;
         self.loading = false;
@@ -439,13 +446,16 @@ impl ExtensionPanelView {
     /// frame; without this the only way to see new rows was to switch panels or
     /// reopen the pane.
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        // The reader asked for the live card, so drop a drill-down even while
+        // another load is in flight: that load will then land the live card
+        // instead of leaving the reader on the detail they dismissed.
+        self.drilled = false;
+        self.error = None;
+        self.message = None;
         if self.loading {
             return;
         }
         self.attempted = false;
-        self.drilled = false;
-        self.error = None;
-        self.message = None;
         self.load(cx);
     }
 
@@ -455,7 +465,7 @@ impl ExtensionPanelView {
     fn tick_refresh(&mut self, cx: &mut Context<Self>) {
         if !self.loading {
             self.attempted = false;
-            self.load(cx);
+            self.load_with(cx, true);
         }
     }
 
@@ -570,6 +580,7 @@ impl ExtensionPanelView {
         self.revision = 0;
         self.host_backed = false;
         self.drilled = false;
+        self.raw_document = None;
         if let Some((document, revision)) = self.store.view(&panel.panel_id) {
             self.document = Some(document);
             self.revision = revision;
@@ -601,12 +612,14 @@ impl ExtensionPanelView {
     /// jitter the reader sees on every tick), so a card that did not move is
     /// left alone. Actions still go through apply_live directly.
     fn apply_refresh(&mut self, panel: &PanelSurface, document: UiDocument) {
-        if self.document.as_ref() != Some(&document) {
-            self.apply_live(panel, document);
+        if self.raw_document.as_ref() == Some(&document) {
+            return;
         }
+        self.apply_live(panel, document);
     }
 
     fn apply_live(&mut self, panel: &PanelSurface, document: UiDocument) {
+        self.raw_document = Some(document.clone());
         match self.store.apply(&panel.panel_id, &document) {
             Ok((document, revision)) => {
                 self.document = Some(document);
@@ -646,10 +659,19 @@ impl ExtensionPanelView {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
+        self.load_with(cx, false);
+    }
+
+    /// A quiet load is the periodic re-read: it must not flash the loading row
+    /// or otherwise disturb the frame, so the reader sees a steady card even
+    /// while the data underneath moves.
+    fn load_with(&mut self, cx: &mut Context<Self>, quiet: bool) {
         let Some(panel) = self.panels.get(self.selected).cloned() else {
             return;
         };
-        self.loading = true;
+        if !quiet {
+            self.loading = true;
+        }
         self.attempted = true;
         self.error = None;
         self.message = None;
