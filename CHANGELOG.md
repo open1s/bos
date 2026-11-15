@@ -1,5 +1,54 @@
 # Changelog
 
+## v4.1.10 (2026-11-15)
+
+- **Reliability kernel** (issues #347-#356): a transition is real only at the
+  durability level it promises, and anything that can no longer make progress
+  is stopped and accounted for rather than silently abandoned.
+  `hostkit::durable` gains `CommitLevel::{Accepted, Written, Durable}`, a
+  streaming `commit_stream()` and `IoStage::SyncDir`, so a segment or
+  manifest commit syncs the file AND the parent directory (the weaker Windows
+  guarantee is documented). `hostkit::coord` gains
+  `FileLock::acquire_bounded()`; every history mutation takes the cross-process
+  lock before the in-process guard (one order) with a bounded budget, so a busy
+  directory is a typed error instead of a stalled UI thread, and segment
+  ids/temp files are collision-safe across processes.
+  History carries `HistoryError` (Read, Decode, Schema, Oversized, Locked) and
+  `IndexState` (Valid, Rebuilt, Unavailable); the schema version is recorded
+  per segment and in the manifest; a present but malformed column names
+  segment, row and column while an absent legacy column keeps its documented
+  default; a manifest that disagrees with the footers is rebuilt from them and
+  one that references unavailable data is reported, not shortened; `diagnose()`
+  is the offline audit. The page cache is bounded by bytes as well as pages, a
+  row above the inline limit is refused before anything is written, and window
+  materialization is bounded with a page-walking stream.
+  Store journals carry a format version and checksum; recovery never deletes
+  what it cannot read and quarantines corrupt, truncated, unknown-version or
+  stale journals with a counts-only report surfaced as a startup notice; a
+  failed page read is a typed `PageFailure` instead of a valid-looking empty
+  page. Federation gains `Open.attempt` with an idempotent `Cancel` that stops
+  the exact provider producer, every source read is bounded by one absolute
+  deadline and the cancellation signal, a checkpoint survives cancellation, and
+  an unloadable replay store fails closed with an audited
+  `reset_replay_store()` operator recovery.
+  Design: `docs/reliability-kernel.md`; solution notes:
+  `docs/solutions/durability/reliability-kernel.md`.
+
+- **Launch provider refresh is atomic**: `refresh_plugin_providers` opened the
+  process-global extension host and then read the contributed provider and
+  preset caches in separate lock holds, so a concurrent host open (a workspace
+  switch, or another test in the same process) could swap the host in between
+  and cache the other host's - usually empty - surfaces. The new
+  `extension::launch_surfaces` reads statuses, providers and presets in ONE
+  lock hold.
+
+- **CI**: the rust workflow caches the workspace crate artifacts (not only the
+  dependencies), the release-mode extension budgets are opt-in via
+  `workflow_dispatch` instead of a fat-LTO release build on every push, and the
+  gold-standard gate no longer re-runs the fmt/clippy/extension suite the
+  workspace gate already ran. Together these cut a warm "Test and lint" run
+  from 45 minutes to roughly 10-12.
+
 ## v4.1.9 (2026-11-15)
 
 - **Durable Record Kernel** (issues #338-#346): one durable write path for the
