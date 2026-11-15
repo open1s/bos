@@ -155,9 +155,11 @@ const result = await agent.ask('What is 2+2?');
 - Use `#[tokio::test]` for async tests
 - Run with: `cargo test -p <crate> name -- --nocapture`
 - Set `RUST_LOG=debug` for tracing output
-- Current green baselines (2026-11-15, durable-record-kernel work):
+- Current green baselines (2026-11-15, durable-record-kernel + ferris memory work):
   - Rust: hostkit 36; agent 579 lib + integration suites; federation 262;
-    bsh 1886 lib (9 ignored) - all 0 failed
+    ferris-core 246, ferris-sdk 64, ferris-runtime 4; bsh 1906 lib
+    (9 ignored; the browser drag-selection test is load-sensitive and green
+    in isolation) - all 0 failed
   - Python (`cd crates/nbos && pytest -m "not llm"`): 277 passed, 4 deselected,
     1 pre-existing failure (`test_agent_builder_with_reasoning_methods`,
     stale installed native build; unrelated to the memory kernel)
