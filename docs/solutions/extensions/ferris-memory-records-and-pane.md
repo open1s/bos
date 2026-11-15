@@ -65,6 +65,28 @@ delete, each mutation on the GPUI background executor and reported through one
 activity log with the kernel's typed error label. The last capture summary is
 shown when present. i18n in both locales; theme accessors throughout.
 
+**Visual design (round 2).** The first cut was a flat list of grey boxes; the
+pane now follows the federation pane's card stack and the reference's own
+design language:
+
+- a gradient **hero** (icon tile, title, subtitle, live count pill, refresh
+  and add buttons), so the pane opens with an identity rather than a toolbar;
+- a **search card** whose kind filters are colour-coded chips (each kind owns
+  one hue; the selected chip wears the kind's tint);
+- **record cards** with a coloured left accent bar, a tinted kind glyph tile,
+  readable pills (kind with glyph, scope level + shortened id, provenance
+  source, lifecycle status), the revision and age, and hover-washed icon
+  actions with tooltips;
+- an **activity card** with one coloured dot per outcome;
+- the pane background is the soft page tint with white cards, the same
+  inversion the federation pane uses.
+
+Two layout defects were found and fixed while measuring the result: the
+scroll container and its content must be separate elements (folding them into
+one `flex_1` scroller floated the content in dead space), and a zero
+`updated_at_ms` must read as unknown instead of "20772d" measured from the
+epoch.
+
 The pane is host management UI (like the vault or the extension inventory);
 extension-facing functionality ships as the first-party extension. The DSH
 reference has no memory pane - this is a BOS-native surface in the reference's

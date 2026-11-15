@@ -19,9 +19,10 @@ use agent::memory::{
     EvidenceSource, FileMemory, Lifecycle, MemoryKind, MemoryRecord, MemoryRepository, MemoryScope,
     MemoryStore, Provenance, RecallRequest,
 };
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
-use super::federation_pane::{field, solid_button};
+use super::federation_pane::{card, dot, field, icon_tile, opaque, pill, solid_button};
 
 /// A solid button whose action receives the window (the shared helper's
 /// action does not, and the memory forms clear inputs, which needs it).
@@ -77,8 +78,10 @@ pub(crate) struct MemoryRow {
     pub(crate) content: String,
     /// The kind label (wire spelling).
     pub(crate) kind: String,
-    /// A short scope label.
-    pub(crate) scope: String,
+    /// The scope level (user/workspace/session/agent).
+    pub(crate) scope_kind: String,
+    /// The most specific scope id, shortened for display.
+    pub(crate) scope_short: String,
     /// The lifecycle label (wire spelling).
     pub(crate) status: String,
     /// The revision counter.
@@ -95,7 +98,8 @@ impl MemoryRow {
             id: record.id.clone(),
             content: record.content.clone(),
             kind: record.kind.label().to_string(),
-            scope: scope_label(&record.scope),
+            scope_kind: scope_kind(&record.scope).to_string(),
+            scope_short: scope_short(&record.scope),
             status: status_label(record.status).to_string(),
             revision: record.revision,
             source: source_label(record.provenance.source).to_string(),
@@ -193,16 +197,84 @@ const KINDS: [&str; 8] = [
     "exchange",
 ];
 
-fn scope_label(scope: &MemoryScope) -> String {
+/// The scope level, for the icon and the locale label.
+fn scope_kind(scope: &MemoryScope) -> &'static str {
     match scope {
-        MemoryScope::User { user } => format!("user:{user}"),
-        MemoryScope::Workspace { workspace } => format!("ws:{workspace}"),
-        MemoryScope::Session { workspace, session } => format!("ws:{workspace}/{session}"),
-        MemoryScope::Agent {
-            workspace,
-            session,
-            agent,
-        } => format!("ws:{workspace}/{session}/{agent}"),
+        MemoryScope::User { .. } => "user",
+        MemoryScope::Workspace { .. } => "workspace",
+        MemoryScope::Session { .. } => "session",
+        MemoryScope::Agent { .. } => "agent",
+    }
+}
+
+/// The most specific scope id, shortened so a UUID never floods the row.
+fn scope_short(scope: &MemoryScope) -> String {
+    let id = match scope {
+        MemoryScope::User { user } => user,
+        MemoryScope::Workspace { workspace } => workspace,
+        MemoryScope::Session { session, .. } => session,
+        MemoryScope::Agent { agent, .. } => agent,
+    };
+    id.chars().take(8).collect()
+}
+
+/// Each kind keeps one hue, the way the federation tabs do: colour is the
+/// fast path to the right record in a list the reader scans.
+fn kind_color(kind: &str) -> u32 {
+    match kind {
+        "fact" => 0x3B82F6,
+        "preference" => 0xEC4899,
+        "decision" => 0x0E9F9F,
+        "lesson" => 0xE8912D,
+        "procedure" => 0x10B981,
+        "task_state" => 0x6366F1,
+        "exchange" => 0x06B6D4,
+        _ => 0x6B7280,
+    }
+}
+
+/// The glyph that names each kind at a glance.
+fn kind_icon(kind: &str) -> IconName {
+    match kind {
+        "fact" => IconName::Info,
+        "preference" => IconName::Star,
+        "decision" => IconName::GitCommitHorizontal,
+        "lesson" => IconName::Lightbulb,
+        "procedure" => IconName::ListChecks,
+        "task_state" => IconName::ClipboardList,
+        "exchange" => IconName::MessageSquare,
+        _ => IconName::FileText,
+    }
+}
+
+/// The glyph for each scope level.
+fn scope_icon(kind: &str) -> IconName {
+    match kind {
+        "user" => IconName::User,
+        "session" => IconName::MessageSquare,
+        "agent" => IconName::BrainCircuit,
+        _ => IconName::Globe,
+    }
+}
+
+/// The static locale key for a scope level.
+fn scope_key(kind: &str) -> &'static str {
+    match kind {
+        "user" => "memory.scope.user",
+        "session" => "memory.scope.session",
+        "agent" => "memory.scope.agent",
+        _ => "memory.scope.workspace",
+    }
+}
+
+/// The static locale key for a provenance source.
+fn source_key(source: &str) -> &'static str {
+    match source {
+        "user_statement" => "memory.source.user_statement",
+        "model_inference" => "memory.source.model_inference",
+        "tool_evidence" => "memory.source.tool_evidence",
+        "legacy" => "memory.source.legacy",
+        _ => "memory.source.system",
     }
 }
 
@@ -264,14 +336,20 @@ fn status_key(status: &str) -> &'static str {
     }
 }
 
-/// A compact age label: 5m, 3h, 2d.
-fn age_label(updated_at_ms: u64) -> String {
+/// A compact age label: 5m, 3h, 2d. A zero timestamp is unknown, not an
+/// age measured from the epoch (which read as "20772d").
+fn age_label(updated_at_ms: u64, lang: crate::i18n::Lang) -> String {
+    if updated_at_ms == 0 {
+        return "—".to_string();
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mins = now.saturating_sub(updated_at_ms) / 60_000;
-    if mins < 60 {
+    if mins < 1 {
+        lang.tr("memory.justNow").to_string()
+    } else if mins < 60 {
         format!("{mins}m")
     } else if mins < 24 * 60 {
         format!("{}h", mins / 60)
@@ -713,19 +791,6 @@ impl Shell {
     pub(crate) fn memory_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let pane = &self.right.memory;
-        let mut column = div()
-            .id("memory-pane-scroll")
-            .debug_selector(|| "memory-pane".to_string())
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .px(px(theme::RIGHT_PAD * 2.0))
-            .py(px(12.0))
-            .overflow_y_scroll();
-
-        // Header: title, count, refresh and add.
         let count = if pane.show_history {
             pane.rows.len()
         } else {
@@ -734,44 +799,17 @@ impl Shell {
                 .filter(|row| row.status == "active")
                 .count()
         };
-        column = column.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .child(icon(IconName::BookOpen, 16.0, theme::accent()))
-                .child(
-                    txt(lang.tr("memory.title"), 14.0, theme::text())
-                        .font_weight(FontWeight::SEMIBOLD),
-                )
-                .child(txt(format!("{count}"), 12.0, theme::faint()))
-                .flex_1()
-                .child(
-                    div()
-                        .id("memory-refresh")
-                        .debug_selector(|| "memory-refresh".to_string())
-                        .cursor_pointer()
-                        .p(px(4.0))
-                        .child(icon(IconName::RefreshCw, 14.0, theme::faint()))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.memory_refresh(cx);
-                        })),
-                )
-                .child(
-                    div()
-                        .id("memory-add-toggle")
-                        .debug_selector(|| "memory-add-toggle".to_string())
-                        .cursor_pointer()
-                        .p(px(4.0))
-                        .child(icon(IconName::Plus, 14.0, theme::accent()))
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.memory_toggle_add(window, cx);
-                        })),
-                ),
-        );
 
-        // Search field + search action.
-        column = column.child(
+        // The scroll container and its content are separate: the container
+        // fills the pane and scrolls, the content keeps its natural height.
+        // Folding them into one flex_1 scroll div left the content floating in
+        // dead space instead of pinned to the top.
+        let mut content = div().flex().flex_col().gap(px(12.0)).p(px(14.0)).w_full();
+
+        content = content.child(self.memory_hero(count, cx));
+
+        // Search + kind filters, one card.
+        let mut search_card = card().child(
             div()
                 .flex()
                 .items_center()
@@ -780,14 +818,12 @@ impl Shell {
                 .child(solid_button(
                     "memory-search",
                     lang.tr("memory.search"),
-                    false,
+                    true,
                     true,
                     cx,
                     |this, cx| this.memory_search(cx),
                 )),
         );
-
-        // Kind filter chips.
         let mut kinds = div().flex().flex_wrap().gap(px(6.0));
         kinds = kinds.child(self.memory_kind_chip(None, lang.tr("memory.kind.all"), cx));
         for kind in KINDS {
@@ -797,26 +833,54 @@ impl Shell {
                 cx,
             ));
         }
-        column = column.child(kinds);
+        search_card = search_card.child(kinds);
+        content = content.child(search_card);
 
         // History toggle + capture summary.
-        let mut meta = div().flex().items_center().gap(px(8.0));
+        let mut meta = div().flex().items_center().gap(px(8.0)).flex_wrap();
+        let history_on = pane.show_history;
         meta = meta.child(
             div()
                 .id("memory-history-toggle")
                 .debug_selector(|| "memory-history-toggle".to_string())
                 .cursor_pointer()
-                .child(txt(
-                    format!(
-                        "{} {}",
-                        if pane.show_history { "✓" } else { "○" },
-                        lang.tr("memory.history")
-                    ),
+                .h(px(24.0))
+                .px(px(9.0))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .bg(rgb(if history_on {
+                    theme::soft(theme::accent())
+                } else {
+                    theme::page()
+                }))
+                .border_1()
+                .border_color(rgb(if history_on {
+                    theme::accent()
+                } else {
+                    theme::border_soft()
+                }))
+                .child(icon(
+                    if history_on {
+                        IconName::CircleCheck
+                    } else {
+                        IconName::Circle
+                    },
                     12.0,
-                    if pane.show_history {
+                    if history_on {
                         theme::accent()
                     } else {
                         theme::faint()
+                    },
+                ))
+                .child(txt(
+                    lang.tr("memory.history"),
+                    11.0,
+                    if history_on {
+                        theme::accent()
+                    } else {
+                        theme::muted()
                     },
                 ))
                 .on_click(cx.listener(|this, _event, _window, _cx| {
@@ -842,31 +906,67 @@ impl Shell {
                     lang.tr("memory.contradictions"),
                 ),
             };
-            meta = meta.child(txt(line, 11.0, theme::faint()).flex_1().min_w_0());
+            meta = meta.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(icon(IconName::Sparkles, 12.0, theme::faint()))
+                    .child(txt(line, 11.0, theme::faint()).flex_1().min_w_0()),
+            );
         }
-        column = column.child(meta);
+        content = content.child(meta);
 
-        // The add form.
         if pane.add_open {
-            column = column.child(self.memory_add_form(cx));
+            content = content.child(self.memory_add_form(cx));
         }
 
         // The list: hits while searching, records otherwise.
         if let Some(error) = &pane.load_error {
-            column = column.child(
-                div()
-                    .debug_selector(|| "memory-load-error".to_string())
-                    .child(txt(lang.tr("memory.loadFailed"), 13.0, theme::error()))
-                    .child(txt(error.clone(), 11.0, theme::faint())),
+            content = content.child(
+                card().child(
+                    div()
+                        .debug_selector(|| "memory-load-error".to_string())
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(icon(IconName::TriangleAlert, 16.0, theme::error()))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(txt(lang.tr("memory.loadFailed"), 13.0, theme::error()))
+                                .child(txt(error.clone(), 11.0, theme::faint())),
+                        ),
+                ),
             );
         } else if pane.loading && !pane.loaded {
-            column = column.child(txt(lang.tr("memory.loading"), 12.0, theme::faint()));
+            content = content.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(icon(IconName::RefreshCw, 14.0, theme::faint()))
+                    .child(txt(lang.tr("memory.loading"), 12.0, theme::faint())),
+            );
         } else if let Some(hits) = &pane.hits {
             if hits.is_empty() {
-                column = column.child(txt(lang.tr("memory.noHits"), 12.0, theme::faint()));
+                content = content.child(
+                    card().child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(6.0))
+                            .py(px(20.0))
+                            .child(icon(IconName::Search, 20.0, theme::faint()))
+                            .child(txt(lang.tr("memory.noHits"), 12.0, theme::faint())),
+                    ),
+                );
             } else {
                 for hit in hits {
-                    column = column.child(self.memory_hit_row(hit, cx));
+                    content = content.child(self.memory_hit_row(hit, cx));
                 }
             }
         } else {
@@ -881,59 +981,124 @@ impl Shell {
                 })
                 .collect();
             if rows.is_empty() {
-                column = column.child(
-                    div()
-                        .debug_selector(|| "memory-empty".to_string())
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap(px(6.0))
-                        .py(px(24.0))
-                        .child(icon(IconName::BookOpen, 22.0, theme::faint()))
-                        .child(txt(lang.tr("memory.empty"), 13.0, theme::faint()))
-                        .child(
-                            txt(lang.tr("memory.emptyHint"), 11.0, theme::faint()).text_center(),
-                        ),
+                content = content.child(
+                    card().child(
+                        div()
+                            .debug_selector(|| "memory-empty".to_string())
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(8.0))
+                            .py(px(28.0))
+                            .child(icon_tile(IconName::BookOpen, theme::accent()))
+                            .child(txt(lang.tr("memory.empty"), 13.0, theme::muted()))
+                            .child(
+                                txt(lang.tr("memory.emptyHint"), 11.0, theme::faint())
+                                    .text_center(),
+                            ),
+                    ),
                 );
             } else {
                 for row in rows {
-                    column = column.child(self.memory_record_row(row, cx));
+                    content = content.child(self.memory_record_row(row, cx));
                 }
             }
         }
 
-        // The activity log.
         if !pane.activity.is_empty() {
-            let mut log = div()
-                .debug_selector(|| "memory-activity".to_string())
-                .flex()
-                .flex_col()
-                .gap(px(4.0))
-                .pt(px(8.0));
-            for operation in pane.activity.iter().rev() {
-                let (mark, color) = match operation.state {
-                    MemoryActivityState::Pending => ("…", theme::faint()),
-                    MemoryActivityState::Succeeded => ("✓", theme::success()),
-                    MemoryActivityState::Failed => ("✗", theme::error()),
-                };
-                let mut line = format!(
-                    "{} {} {}",
-                    mark,
-                    lang.tr(operation.action),
-                    operation.target
-                );
-                if let Some(detail) = &operation.detail {
-                    line.push_str(&format!(" — {detail}"));
-                }
-                log = log.child(txt(line, 11.0, color));
-            }
-            column = column.child(log);
+            content = content.child(self.memory_activity_card());
         }
 
-        column.into_any_element()
+        div()
+            .id("memory-pane-scroll")
+            .debug_selector(|| "memory-pane".to_string())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .bg(rgb(theme::new_session_fill()))
+            .overflow_y_scroll()
+            .child(content)
+            .into_any_element()
     }
 
-    /// One kind filter chip.
+    /// The header: a gradient hero with the kind-mark, the title, the live
+    /// count and the refresh/add actions.
+    fn memory_hero(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let mark = div()
+            .size(px(46.0))
+            .flex_none()
+            .rounded(px(15.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(linear_gradient(
+                135.0,
+                linear_color_stop(opaque(theme::accent()), 0.0),
+                linear_color_stop(opaque(0x6366F1), 1.0),
+            ))
+            .child(icon(IconName::BookOpen, 23.0, 0xFFFFFF));
+        let titles = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .flex_1()
+            .min_w_0()
+            .child(
+                txt(lang.tr("memory.title"), 20.0, theme::text()).font_weight(FontWeight::SEMIBOLD),
+            )
+            .child(txt(lang.tr("memory.subtitle"), 12.0, theme::muted()).line_height(px(17.0)));
+        let actions = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(pill(
+                format!("{count} {}", lang.tr("memory.records")),
+                theme::accent(),
+                theme::soft(theme::accent()),
+            ))
+            .child(memory_icon_button(
+                "memory-refresh",
+                IconName::RefreshCw,
+                lang.tr("memory.tip.refresh"),
+                theme::muted(),
+                cx,
+                |this, _window, cx| this.memory_refresh(cx),
+            ))
+            .child(memory_icon_button(
+                "memory-add-toggle",
+                IconName::Plus,
+                lang.tr("memory.tip.add"),
+                theme::accent(),
+                cx,
+                |this, window, cx| this.memory_toggle_add(window, cx),
+            ));
+        div()
+            .relative()
+            .overflow_hidden()
+            .rounded(px(22.0))
+            .p(px(16.0))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .bg(linear_gradient(
+                135.0,
+                linear_color_stop(
+                    opaque(theme::blend_into(theme::accent(), theme::page(), 0.84)),
+                    0.0,
+                ),
+                linear_color_stop(opaque(theme::page()), 1.0),
+            ))
+            .child(mark)
+            .child(titles)
+            .child(actions)
+            .into_any_element()
+    }
+
+    /// One kind filter chip: a coloured dot names the kind, the selected chip
+    /// wears the kind's own tint.
     fn memory_kind_chip(
         &self,
         kind: Option<String>,
@@ -941,6 +1106,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = self.right.memory.kind_filter == kind;
+        let color = kind
+            .as_deref()
+            .map(kind_color)
+            .unwrap_or_else(theme::accent);
         let id = format!(
             "memory-kind-{}",
             kind.clone().unwrap_or_else(|| "all".into())
@@ -950,18 +1119,28 @@ impl Shell {
             .id(SharedString::from(id))
             .debug_selector(move || selector.clone())
             .cursor_pointer()
-            .px(px(8.0))
-            .py(px(3.0))
-            .rounded(px(999.0))
+            .h(px(26.0))
+            .px(px(10.0))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
             .bg(rgb(if selected {
-                theme::accent()
+                theme::soft(color)
             } else {
-                theme::new_session_fill()
+                theme::page()
             }))
+            .border_1()
+            .border_color(rgb(if selected {
+                color
+            } else {
+                theme::border_soft()
+            }))
+            .child(dot(color))
             .child(txt(
                 label,
                 11.0,
-                if selected { 0xFFFFFF } else { theme::faint() },
+                if selected { color } else { theme::muted() },
             ))
             .on_click(cx.listener(move |this, _event, _window, _cx| {
                 this.memory_set_kind_filter(kind.clone());
@@ -969,21 +1148,16 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The add form: content field, kind chips, commit/cancel.
+    /// The add form: content field, coloured kind chips, commit/cancel.
     fn memory_add_form(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
-        let mut card = div()
+        let mut form = card()
             .debug_selector(|| "memory-add-form".to_string())
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .p(px(12.0))
-            .rounded(px(12.0))
-            .bg(rgb(theme::new_session_fill()));
-        card = card.child(field(&self.memory_add_input, "memory-add-field"));
+            .child(field(&self.memory_add_input, "memory-add-field"));
         let mut kinds = div().flex().flex_wrap().gap(px(6.0));
         for kind in KINDS {
             let selected = self.right.memory.add_kind == kind;
+            let color = kind_color(kind);
             let id = format!("memory-add-kind-{kind}");
             let selector = id.clone();
             let kind_owned = kind.to_string();
@@ -992,26 +1166,36 @@ impl Shell {
                     .id(SharedString::from(id))
                     .debug_selector(move || selector.clone())
                     .cursor_pointer()
-                    .px(px(8.0))
-                    .py(px(3.0))
-                    .rounded(px(999.0))
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
                     .bg(rgb(if selected {
-                        theme::accent()
+                        theme::soft(color)
                     } else {
                         theme::page()
                     }))
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        color
+                    } else {
+                        theme::border_soft()
+                    }))
+                    .child(icon(kind_icon(kind), 12.0, color))
                     .child(txt(
                         lang.tr(kind_key(kind)),
                         11.0,
-                        if selected { 0xFFFFFF } else { theme::faint() },
+                        if selected { color } else { theme::muted() },
                     ))
                     .on_click(cx.listener(move |this, _event, _window, _cx| {
                         this.memory_set_add_kind(&kind_owned);
                     })),
             );
         }
-        card = card.child(kinds);
-        card = card.child(
+        form = form.child(kinds);
+        form = form.child(
             div()
                 .flex()
                 .gap(px(8.0))
@@ -1030,10 +1214,11 @@ impl Shell {
                     |this, window, cx| this.memory_toggle_add(window, cx),
                 )),
         );
-        card.into_any_element()
+        form.into_any_element()
     }
 
-    /// One record row, with its edit/supersede/delete actions or its editor.
+    /// One record card: a coloured kind mark, the content, readable scope and
+    /// source pills, and the edit/supersede/delete actions.
     fn memory_record_row(&self, row: &MemoryRow, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
         let editing = self
@@ -1042,14 +1227,8 @@ impl Shell {
             .edit
             .as_ref()
             .is_some_and(|edit| edit.id == row.id);
-        let mut card = div()
-            .debug_selector(|| format!("memory-row-{}", row.id))
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .p(px(12.0))
-            .rounded(px(12.0))
-            .bg(rgb(theme::new_session_fill()));
+        let color = kind_color(&row.kind);
+        let mut body = card().debug_selector(|| format!("memory-row-{}", row.id));
         if editing {
             let supersede = self
                 .right
@@ -1057,7 +1236,7 @@ impl Shell {
                 .edit
                 .as_ref()
                 .is_some_and(|edit| edit.supersede);
-            card = card
+            body = body
                 .child(field(&self.memory_edit_input, "memory-edit-field"))
                 .child(
                     div()
@@ -1083,31 +1262,9 @@ impl Shell {
                             |this, cx| this.memory_cancel_edit(cx),
                         )),
                 );
-            return card.into_any_element();
+            return body.into_any_element();
         }
-        let content: String = row.content.chars().take(240).collect();
-        card = card.child(txt(content, 13.0, theme::text()).line_height(px(19.0)));
-        let mut chips = div().flex().flex_wrap().items_center().gap(px(6.0));
-        chips = chips
-            .child(self.memory_chip(lang.tr(kind_key(&row.kind)), theme::accent()))
-            .child(self.memory_chip(row.scope.clone(), theme::faint()));
-        if row.status != "active" {
-            chips = chips.child(self.memory_chip(lang.tr(status_key(&row.status)), theme::warn()));
-        }
-        chips = chips
-            .child(txt(
-                format!(
-                    "{} {} · {} · {}",
-                    lang.tr("memory.rev"),
-                    row.revision,
-                    row.source,
-                    age_label(row.updated_at_ms)
-                ),
-                11.0,
-                theme::faint(),
-            ))
-            .flex_1()
-            .min_w_0();
+        let content: String = row.content.chars().take(280).collect();
         let id = row.id.clone();
         let id_edit_sel = id.clone();
         let id_edit = id.clone();
@@ -1115,99 +1272,271 @@ impl Shell {
         let id_supersede = id.clone();
         let id_delete_sel = id.clone();
         let id_delete = id.clone();
-        chips = chips
-            .child(
-                div()
-                    .id(SharedString::from(format!("memory-edit-{id}")))
-                    .debug_selector(move || format!("memory-edit-{id_edit_sel}"))
-                    .cursor_pointer()
-                    .p(px(3.0))
-                    .child(icon(IconName::Pencil, 13.0, theme::faint()))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        this.memory_begin_edit(&id_edit, false, window, cx);
-                    })),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("memory-supersede-{id}")))
-                    .debug_selector(move || format!("memory-supersede-{id_supersede_sel}"))
-                    .cursor_pointer()
-                    .p(px(3.0))
-                    .child(icon(IconName::ArrowUp, 13.0, theme::faint()))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        this.memory_begin_edit(&id_supersede, true, window, cx);
-                    })),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("memory-delete-{id}")))
-                    .debug_selector(move || format!("memory-delete-{id_delete_sel}"))
-                    .cursor_pointer()
-                    .p(px(3.0))
-                    .child(icon(IconName::Trash, 13.0, theme::error()))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.memory_delete(&id_delete, cx);
-                    })),
-            );
-        card = card.child(chips);
-        card.into_any_element()
-    }
-
-    /// One recall hit row: the record plus its score explanation.
-    fn memory_hit_row(&self, hit: &MemoryHit, cx: &mut Context<Self>) -> AnyElement {
-        let lang = self.state.lang;
-        let mut card = div()
-            .debug_selector(|| format!("memory-hit-{}", hit.row.id))
+        let mut pills = div().flex().flex_wrap().items_center().gap(px(6.0));
+        pills = pills
+            .child(memory_kind_pill(&row.kind, lang))
+            .child(memory_scope_pill(&row.scope_kind, &row.scope_short, lang))
+            .child(pill(
+                lang.tr(source_key(&row.source)),
+                theme::faint(),
+                theme::new_session_fill(),
+            ));
+        if row.status != "active" {
+            pills = pills.child(pill(
+                lang.tr(status_key(&row.status)),
+                theme::warn(),
+                theme::soft(theme::warn()),
+            ));
+        }
+        let column = div()
             .flex()
             .flex_col()
-            .gap(px(4.0))
-            .p(px(12.0))
-            .rounded(px(12.0))
-            .bg(rgb(theme::new_session_fill()));
-        let content: String = hit.row.content.chars().take(240).collect();
-        card = card.child(txt(content, 13.0, theme::text()).line_height(px(19.0)));
-        card = card.child(txt(
-            format!("{:.2} · {}", hit.score, hit.reasons),
-            11.0,
-            theme::accent(),
-        ));
-        let id = hit.row.id.clone();
-        let id_selector = id.clone();
-        let id_delete = id.clone();
-        card = card.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .child(self.memory_chip(lang.tr(kind_key(&hit.row.kind)), theme::faint()))
-                .child(
-                    txt(hit.row.scope.clone(), 11.0, theme::faint())
+            .gap(px(8.0))
+            .flex_1()
+            .min_w_0()
+            .child(txt(content, 13.0, theme::text()).line_height(px(20.0)))
+            .child(pills)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        txt(
+                            format!(
+                                "{} {} · {}",
+                                lang.tr("memory.rev"),
+                                row.revision,
+                                age_label(row.updated_at_ms, lang)
+                            ),
+                            11.0,
+                            theme::faint(),
+                        )
                         .flex_1()
                         .min_w_0(),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!("memory-hit-delete-{id}")))
-                        .debug_selector(move || format!("memory-hit-delete-{id_selector}"))
-                        .cursor_pointer()
-                        .p(px(3.0))
-                        .child(icon(IconName::Trash, 13.0, theme::error()))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                    )
+                    .child(memory_icon_button(
+                        format!("memory-edit-{id}"),
+                        IconName::Pencil,
+                        lang.tr("memory.tip.edit"),
+                        theme::muted(),
+                        cx,
+                        move |this, window, cx| {
+                            this.memory_begin_edit(&id_edit, false, window, cx);
+                        },
+                    ))
+                    .child(memory_icon_button(
+                        format!("memory-supersede-{id}"),
+                        IconName::ArrowUp,
+                        lang.tr("memory.tip.supersede"),
+                        theme::muted(),
+                        cx,
+                        move |this, window, cx| {
+                            this.memory_begin_edit(&id_supersede, true, window, cx);
+                        },
+                    ))
+                    .child(memory_icon_button(
+                        format!("memory-delete-{id}"),
+                        IconName::Trash,
+                        lang.tr("memory.tip.delete"),
+                        theme::error(),
+                        cx,
+                        move |this, _window, cx| {
                             this.memory_delete(&id_delete, cx);
-                        })),
-                ),
+                        },
+                    )),
+            );
+        body = body.child(
+            div()
+                .flex()
+                .items_stretch()
+                .gap(px(10.0))
+                .child(div().w(px(3.0)).flex_none().rounded_full().bg(rgb(color)))
+                .child(icon_tile(kind_icon(&row.kind), color))
+                .child(column),
         );
-        card.into_any_element()
+        let _ = (id_edit_sel, id_supersede_sel, id_delete_sel);
+        body.into_any_element()
     }
 
-    /// One small label chip.
-    fn memory_chip(&self, label: String, color: u32) -> AnyElement {
-        div()
-            .px(px(7.0))
-            .py(px(2.0))
-            .rounded(px(999.0))
-            .bg(rgb(theme::page()))
-            .child(txt(label, 10.0, color))
+    /// One recall hit card: the record plus its score and explanation.
+    fn memory_hit_row(&self, hit: &MemoryHit, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        let color = kind_color(&hit.row.kind);
+        let content: String = hit.row.content.chars().take(280).collect();
+        let id = hit.row.id.clone();
+        let id_delete = id.clone();
+        let column = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .flex_1()
+            .min_w_0()
+            .child(txt(content, 13.0, theme::text()).line_height(px(20.0)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(pill(
+                        format!("{:.2}", hit.score),
+                        theme::accent(),
+                        theme::soft(theme::accent()),
+                    ))
+                    .child(
+                        txt(hit.reasons.clone(), 11.0, theme::faint())
+                            .flex_1()
+                            .min_w_0()
+                            .text_ellipsis(),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(memory_kind_pill(&hit.row.kind, lang))
+                    .child(memory_scope_pill(
+                        &hit.row.scope_kind,
+                        &hit.row.scope_short,
+                        lang,
+                    ))
+                    .flex_1()
+                    .child(memory_icon_button(
+                        format!("memory-hit-delete-{id}"),
+                        IconName::Trash,
+                        lang.tr("memory.tip.delete"),
+                        theme::error(),
+                        cx,
+                        move |this, _window, cx| {
+                            this.memory_delete(&id_delete, cx);
+                        },
+                    )),
+            );
+        card()
+            .debug_selector(|| format!("memory-hit-{}", hit.row.id))
+            .child(
+                div()
+                    .flex()
+                    .items_stretch()
+                    .gap(px(10.0))
+                    .child(div().w(px(3.0)).flex_none().rounded_full().bg(rgb(color)))
+                    .child(icon_tile(kind_icon(&hit.row.kind), color))
+                    .child(column),
+            )
             .into_any_element()
     }
+
+    /// The operation log: one card, a coloured dot per outcome.
+    fn memory_activity_card(&self) -> AnyElement {
+        let lang = self.state.lang;
+        let pane = &self.right.memory;
+        let mut log = div()
+            .debug_selector(|| "memory-activity".to_string())
+            .flex()
+            .flex_col()
+            .gap(px(6.0));
+        for operation in pane.activity.iter().rev() {
+            let color = match operation.state {
+                MemoryActivityState::Pending => theme::faint(),
+                MemoryActivityState::Succeeded => theme::success(),
+                MemoryActivityState::Failed => theme::error(),
+            };
+            let mut line = format!("{} {}", lang.tr(operation.action), operation.target);
+            if let Some(detail) = &operation.detail {
+                line.push_str(&format!(" — {detail}"));
+            }
+            log = log.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(dot(color))
+                    .child(txt(line, 11.0, theme::muted()).flex_1().min_w_0()),
+            );
+        }
+        card()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(icon(IconName::Activity, 13.0, theme::faint()))
+                    .child(
+                        txt(lang.tr("memory.activity"), 12.0, theme::muted())
+                            .font_weight(FontWeight::MEDIUM),
+                    ),
+            )
+            .child(log)
+            .into_any_element()
+    }
+}
+
+/// A window-aware icon button with a tooltip and a hover wash.
+fn memory_icon_button<F>(
+    id: impl Into<SharedString>,
+    mark: IconName,
+    tip: String,
+    color: u32,
+    cx: &mut Context<Shell>,
+    action: F,
+) -> AnyElement
+where
+    F: Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
+{
+    let id = id.into();
+    let selector = id.to_string();
+    div()
+        .id(id)
+        .debug_selector(move || selector.clone())
+        .size(px(28.0))
+        .flex_none()
+        .rounded(px(8.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(theme::hover())))
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .child(icon(mark, 14.0, color))
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            cx.stop_propagation();
+            action(this, window, cx);
+        }))
+        .into_any_element()
+}
+
+/// The kind pill: a tinted chip with the kind's glyph and name.
+fn memory_kind_pill(kind: &str, lang: crate::i18n::Lang) -> Div {
+    let color = kind_color(kind);
+    div()
+        .flex_none()
+        .h(px(20.0))
+        .px(px(7.0))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .bg(rgb(theme::soft(color)))
+        .child(icon(kind_icon(kind), 11.0, color))
+        .child(txt(lang.tr(kind_key(kind)), 10.0, color).font_weight(FontWeight::MEDIUM))
+}
+
+/// The scope pill: a level glyph plus the shortened id, never a raw UUID.
+fn memory_scope_pill(kind: &str, short: &str, lang: crate::i18n::Lang) -> Div {
+    div()
+        .flex_none()
+        .h(px(20.0))
+        .px(px(7.0))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .bg(rgb(theme::new_session_fill()))
+        .child(icon(scope_icon(kind), 11.0, theme::muted()))
+        .child(txt(
+            format!("{} {}", lang.tr(scope_key(kind)), short),
+            10.0,
+            theme::muted(),
+        ))
 }

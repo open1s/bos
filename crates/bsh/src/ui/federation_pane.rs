@@ -205,7 +205,7 @@ pub(crate) fn pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
 /// shape every `theme` accessor returns) must be shifted up and given a full
 /// alpha byte; passing it directly made the first version of the hero render
 /// cyan, because the blue byte became the alpha and red became zero.
-fn opaque(color: u32) -> Rgba {
+pub(crate) fn opaque(color: u32) -> Rgba {
     rgba((color << 8) | 0xFF)
 }
 
@@ -571,7 +571,7 @@ fn tabs(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     row.into_any_element()
 }
 
-fn card() -> Div {
+pub(crate) fn card() -> Div {
     hairline_all(
         div()
             .flex()
@@ -585,7 +585,7 @@ fn card() -> Div {
     .shadow_sm()
 }
 
-fn card_header(
+pub(crate) fn card_header(
     mark: IconName,
     tint: u32,
     title: String,
@@ -610,7 +610,7 @@ fn card_header(
         .when_some(trailing, |header, trailing| header.child(trailing))
 }
 
-fn icon_tile(mark: IconName, tint: u32) -> Div {
+pub(crate) fn icon_tile(mark: IconName, tint: u32) -> Div {
     div()
         .size(px(32.0))
         .flex_none()
@@ -622,7 +622,7 @@ fn icon_tile(mark: IconName, tint: u32) -> Div {
         .child(icon(mark, 16.0, tint))
 }
 
-fn pill(label: impl Into<SharedString>, fg: u32, bg: u32) -> Div {
+pub(crate) fn pill(label: impl Into<SharedString>, fg: u32, bg: u32) -> Div {
     div()
         .flex_none()
         .h(px(20.0))
@@ -635,7 +635,7 @@ fn pill(label: impl Into<SharedString>, fg: u32, bg: u32) -> Div {
         .child(txt(label, 10.0, fg).font_weight(FontWeight::MEDIUM))
 }
 
-fn dot(color: u32) -> Div {
+pub(crate) fn dot(color: u32) -> Div {
     div()
         .size(px(6.0))
         .flex_none()
@@ -679,7 +679,7 @@ where
         .into_any_element()
 }
 
-fn icon_button<F>(
+pub(crate) fn icon_button<F>(
     id: impl Into<SharedString>,
     mark: IconName,
     tip: String,
