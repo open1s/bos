@@ -1,5 +1,58 @@
 # Changelog
 
+## v4.1.9 (2026-11-15)
+
+- **Durable Record Kernel** (issues #338-#346): one durable write path for the
+  whole system. `hostkit::durable` stages every commit (create dir, temp file,
+  write, sync, harden, replace) behind typed errors and a `CommitGate` fault
+  seam; `hostkit::coord` gives a canonical identity and a cross-process file
+  lock; `load` fails closed. Memory is rebuilt on it: `FileMemory` stores
+  schema-2 `MemoryRecord`s (kind, scope, provenance, confidence, lifecycle,
+  relations), migrates legacy JSON-lines on read, and every handle to one
+  canonical path shares one coordinated store. The fallible surface is
+  `MemoryRepository` / `MemoryStore::try_*` / `Agent::try_remember`; the
+  legacy infallible methods stay best-effort adapters. Recall keeps the
+  fixture-pinned legacy `search` and adds hybrid `recall` (BM25 + CJK n-grams,
+  scope filtering before ranking, token budget, explanations). BSH resolves
+  storage identity and access scope through `MemoryScopeResolver`, captures
+  knowledge at completed turns (the `memory_capture` setting), and derives
+  context diagnostics from the typed `AssemblySnapshot`, never from rendered
+  strings.
+
+- **Ferris memory contract** (`docs/ferris-memory-records.md`): extensions reach
+  the kernel through `ferris_sdk::memory` - schema-2 DTOs, a `MemoryRecords`
+  service, `dispatch_memory_json` for out-of-process runtimes, and the
+  `memory.read` / `memory.write` capabilities. BSH provides the service per
+  activation (declaration- and grant-gated, bound to the session scope, revoked
+  with the activation); writes are host-bound to the viewer scope and
+  attributed `extension:<id>`. `com.bos.bsh.memory-tools` is the first-party
+  worked example (`memory_recall` / `memory_remember` / `memory_forget`).
+
+- **Memory pane**: a new right-panel tab (deep link `--panel memory`) over the
+  same coordinated stores - list, hybrid search with score explanations, kind
+  filters, history toggle, add, edit, supersede and delete, with one activity
+  log reporting the kernel's typed error labels and the last capture summary.
+
+- **Memory pane design pass**: gradient hero with the live count and actions,
+  per-kind colour identity (accent bar, tinted glyph tile, kind/scope/source
+  pills), readable scope labels instead of raw UUIDs, and a card stack on the
+  soft page tint. Fixed the scroll layout that hid the hero at launch and a
+  zero timestamp that rendered as "20772d".
+
+- **CI and portability**: `ferris-runtime` imports the Windows `CommandExt`
+  trait where it builds suspended children (the MCP and bridge runtimes), so the
+  Windows lane compiles again; the Chrome tool-runner browser case skips on CI
+  hosts, where the shared Linux runner's Chrome under Xvfb is load-flaky and a
+  failed launch could abort the GPUI tests running beside it.
+
+- **Extension panel**: a periodic refresh is a quiet re-read, so the card no
+  longer flashes its loading row, and the input/row layout polish landed.
+
+- **Panels and context**: the Git panel gained a launcher tile, dedicated tabs,
+  workspace follow and a drill-down that survives refresh, plus a launch-crash
+  fix; the change-history list respects `.gitignore` and treats a clean commit
+  as a gentle notice; context injection deduplicates repeated injections.
+
 ## v4.1.8 (2026-11-12)
 
 - **Action-first hardening** (issue #293 residuals): the last limits are closed.
