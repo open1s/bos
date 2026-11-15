@@ -56,12 +56,127 @@ const INFLIGHT_LOCK: &str = "inflight.lock";
 /// half a JSON document.
 const INFLIGHT_TMP: &str = "inflight.json.tmp";
 
+/// Where unreadable journals are preserved instead of deleted.
+const CORRUPT: &str = "corrupt";
+
+/// The journal format this writer emits.
+///
+/// A journal written before the format carried integrity has version 0 and no
+/// checksum. It still parses, and its checksum is not verified. A version above
+/// this one is "unsupported", which is NOT corruption: its bytes are preserved
+/// for the build that knows how to read them.
+const INFLIGHT_VERSION: u32 = 1;
+
+/// FNV-1a 64-bit offset basis.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a 64-bit prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a, 64-bit, over `bytes`.
+///
+/// The journal needs a checksum that notices a torn or edited file, not a
+/// cryptographic one, so it is computed inline instead of adding a dependency.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// The journal's checksum: FNV-1a over the deterministic bytes of `(base, rows)`.
+fn checksum_of(base: usize, rows: &[ChatMessage]) -> serde_json::Result<String> {
+    let bytes = serde_json::to_vec(&(base, rows))?;
+    Ok(format!("{:016x}", fnv1a_64(&bytes)))
+}
+
+/// Why a journal cannot be replayed as written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalDefect {
+    /// The file holds no bytes at all.
+    Empty,
+    /// The JSON stops in the middle, as a kill during the write leaves it.
+    Truncated,
+    /// The bytes are not a journal.
+    Unreadable,
+    /// The declared checksum does not match the payload.
+    ChecksumMismatch,
+    /// A version this build does not know.
+    UnsupportedVersion,
+}
+
+impl JournalDefect {
+    /// The stable label the quarantine directory and record carry.
+    fn label(self) -> &'static str {
+        match self {
+            JournalDefect::Empty => "empty",
+            JournalDefect::Truncated => "truncated",
+            JournalDefect::Unreadable => "unreadable",
+            JournalDefect::ChecksumMismatch => "checksum-mismatch",
+            JournalDefect::UnsupportedVersion => "unsupported-version",
+        }
+    }
+}
+
 /// A turn's uncommitted rows: the log already holds its first `base` rows, and
 /// these supersede everything at or after that index.
 #[derive(Debug, Serialize, Deserialize)]
 struct Inflight {
+    /// The format version; 0 is a journal written before integrity existed.
+    #[serde(default)]
+    version: u32,
+    /// FNV-1a of `(base, rows)`, hex. Empty on a legacy (version 0) journal.
+    #[serde(default)]
+    checksum: String,
+    /// The global row index the journal's rows start at.
     base: usize,
+    /// The rows that supersede the log from `base` on.
     rows: Vec<ChatMessage>,
+}
+
+impl Inflight {
+    /// Journal `base` and `rows` at the current version, with its checksum.
+    fn new(base: usize, rows: Vec<ChatMessage>) -> serde_json::Result<Self> {
+        let checksum = checksum_of(base, &rows)?;
+        Ok(Self {
+            version: INFLIGHT_VERSION,
+            checksum,
+            base,
+            rows,
+        })
+    }
+
+    /// Parse a journal, classifying every way its bytes can be untrustworthy.
+    ///
+    /// A version 0 journal is legacy: it parses and replays, and its checksum is
+    /// not verified because it never carried one.
+    fn parse(bytes: &[u8]) -> Result<Self, JournalDefect> {
+        if bytes.is_empty() {
+            return Err(JournalDefect::Empty);
+        }
+        match serde_json::from_slice::<Self>(bytes) {
+            Ok(journal) => journal.verified(),
+            Err(error) if error.is_eof() => Err(JournalDefect::Truncated),
+            Err(_) => Err(JournalDefect::Unreadable),
+        }
+    }
+
+    /// Check the version and, at version 1, the checksum.
+    fn verified(self) -> Result<Self, JournalDefect> {
+        if self.version > INFLIGHT_VERSION {
+            return Err(JournalDefect::UnsupportedVersion);
+        }
+        if self.version == INFLIGHT_VERSION {
+            let expected =
+                checksum_of(self.base, &self.rows).map_err(|_| JournalDefect::Unreadable)?;
+            if self.checksum != expected {
+                return Err(JournalDefect::ChecksumMismatch);
+            }
+        }
+        Ok(self)
+    }
 }
 
 /// A chat window waiting to be read off the log.
@@ -94,19 +209,54 @@ impl OlderRead {
     /// Decode the window. Blocking: background executor only.
     pub(crate) fn read(self) -> OlderPage {
         let len = self.floor - self.from;
-        let rows = self.reader.messages(self.from, len).or_else(|_| {
-            // A compaction may have swapped the directory between the snapshot
-            // and this read. Reopening follows the installed manifest, and the
-            // rows are the same ones either way.
-            History::open(self.dir.clone())
-                .reader()
-                .messages(self.from, len)
-        });
+        let rows = match self.reader.messages(self.from, len) {
+            Ok(rows) => Ok(rows),
+            Err(first) => self.retry(first),
+        };
         OlderPage {
+            failure: rows.as_ref().err().cloned(),
             session: self.session,
             from: self.from,
             rows: rows.unwrap_or_default(),
         }
+    }
+
+    /// Reopen the history ONCE and retry, the compaction-swap retry.
+    ///
+    /// A compaction renames the directory aside and back, so a read that finds
+    /// its segment gone can be answered by the installed manifest. That is the
+    /// only case this may recover: the reopened index has to still cover the
+    /// rows the page asks for. A reopen that finds fewer rows (a segment that is
+    /// gone or unreadable, not swapped) is the page's failure, never an empty
+    /// window reported as success.
+    fn retry<E: std::fmt::Display>(&self, first: E) -> Result<Vec<ChatMessage>, PageFailure> {
+        let reopened = History::open(self.dir.clone());
+        let covered = reopened.len() >= self.from.saturating_add(self.len());
+        let mut second = None;
+        if covered {
+            match reopened.reader().messages(self.from, self.len()) {
+                Ok(rows) => return Ok(rows),
+                Err(error) => second = Some(error),
+            }
+        }
+        Err(PageFailure {
+            session: self.session.clone(),
+            at: self.from,
+            detail: failure_detail(
+                &self.dir,
+                self.from,
+                self.len(),
+                &first,
+                second.as_ref(),
+                covered,
+            ),
+            retried: true,
+        })
+    }
+
+    /// The number of rows the window asks for.
+    fn len(&self) -> usize {
+        self.floor - self.from
     }
 }
 
@@ -116,8 +266,86 @@ pub(crate) struct OlderPage {
     pub(crate) session: String,
     /// The first global row the window holds.
     pub(crate) from: usize,
-    /// The decoded rows, oldest first.
+    /// The decoded rows, oldest first. Empty when the read failed.
     pub(crate) rows: Vec<ChatMessage>,
+    /// Why the read failed, when it did.
+    failure: Option<PageFailure>,
+}
+
+impl OlderPage {
+    /// The failure this page carries, if the read did not succeed.
+    ///
+    /// A page that failed is not an empty page: the caller must surface this
+    /// instead of showing nothing.
+    pub(crate) fn failure(&self) -> Option<&PageFailure> {
+        self.failure.as_ref()
+    }
+}
+
+/// A page read that failed, carried by the page result.
+///
+/// The detail is the reader's own error text, which names the segment and the
+/// row group it could not read (`opening <path>`, `row group N of <path>`),
+/// prefixed with the window or page the caller asked for.
+#[derive(Debug, Clone)]
+pub(crate) struct PageFailure {
+    /// The session whose log could not be read.
+    pub(crate) session: String,
+    /// The first global row asked for (a message window), or the page counted
+    /// from the newest end (a trajectory page).
+    pub(crate) at: usize,
+    /// The reader's error text, naming the segment and the row group.
+    pub(crate) detail: String,
+    /// Whether the one bounded reopen-and-retry was attempted.
+    pub(crate) retried: bool,
+}
+
+impl std::fmt::Display for PageFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "session {}: the page at {} could not be read (retried: {}): {}",
+            self.session, self.at, self.retried, self.detail
+        )
+    }
+}
+
+/// Compose a page failure's detail from the reader's error.
+///
+/// The reader names the segment and the row group; the window is added here so
+/// the caller can see which page failed. The history directory is appended only
+/// when the error does not already name a path, so a bare footer or decode
+/// error still says where to look.
+fn failure_detail<F, S>(
+    dir: &Path,
+    at: usize,
+    len: usize,
+    first: &F,
+    second: Option<&S>,
+    covered: bool,
+) -> String
+where
+    F: std::fmt::Display,
+    S: std::fmt::Display,
+{
+    let mut detail = format!("rows {at}..{}: {first}", at.saturating_add(len));
+    let directory = dir.display().to_string();
+    if !detail.contains(&directory) {
+        detail.push_str(&format!(" (in {directory})"));
+    }
+    match second {
+        Some(second) if second.to_string() != first.to_string() => {
+            // The reopen reported something else; both are evidence about the log.
+            detail.push_str(&format!("; after reopening: {second}"));
+        }
+        Some(_) => {}
+        None if !covered => detail.push_str(
+            "; reopening the history found fewer rows than the page needs, \
+             so a compaction swap does not explain it",
+        ),
+        None => {}
+    }
+    detail
 }
 
 /// A trajectory page waiting to be read off the log.
@@ -132,16 +360,45 @@ pub(crate) struct TraceRead {
 impl TraceRead {
     /// Decode the page. Blocking: background executor only.
     pub(crate) fn read(self) -> TracePage {
-        let rows = self.reader.trajectory_page(self.page).or_else(|_| {
-            History::open(self.dir.clone())
-                .reader()
-                .trajectory_page(self.page)
-        });
+        let rows = match self.reader.trajectory_page(self.page) {
+            Ok(rows) => Ok(rows),
+            Err(first) => self.retry(first),
+        };
         TracePage {
+            failure: rows.as_ref().err().cloned(),
             session: self.session,
             page: self.page,
             rows: rows.unwrap_or_default(),
         }
+    }
+
+    /// Reopen the history ONCE and retry, the compaction-swap retry.
+    ///
+    /// Same bound as the chat window: one reopen, the reopened index has to
+    /// still hold the page, and only then is a second read attempted.
+    fn retry<E: std::fmt::Display>(&self, first: E) -> Result<Vec<ToolRow>, PageFailure> {
+        let reopened = History::open(self.dir.clone());
+        let covered = reopened.trajectory_pages() > self.page;
+        let mut second = None;
+        if covered {
+            match reopened.reader().trajectory_page(self.page) {
+                Ok(rows) => return Ok(rows),
+                Err(error) => second = Some(error),
+            }
+        }
+        Err(PageFailure {
+            session: self.session.clone(),
+            at: self.page,
+            detail: failure_detail(
+                &self.dir,
+                self.page,
+                crate::history::PAGE,
+                &first,
+                second.as_ref(),
+                covered,
+            ),
+            retried: true,
+        })
     }
 }
 
@@ -151,13 +408,179 @@ pub(crate) struct TracePage {
     pub(crate) session: String,
     /// The page counted from the newest end.
     pub(crate) page: usize,
-    /// The decoded rows, oldest first.
+    /// The decoded rows, oldest first. Empty when the read failed.
     pub(crate) rows: Vec<ToolRow>,
+    /// Why the read failed, when it did.
+    failure: Option<PageFailure>,
+}
+
+impl TracePage {
+    /// The failure this page carries, if the read did not succeed.
+    ///
+    /// A page that failed is not an empty page: the caller must surface this
+    /// instead of showing nothing.
+    pub(crate) fn failure(&self) -> Option<&PageFailure> {
+        self.failure.as_ref()
+    }
+}
+
+/// What one recovery pass did with one journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recovery {
+    /// The rows were folded into the log and the journal removed.
+    Replayed,
+    /// The log already held the journal's rows; the journal was removed.
+    AlreadyCovered,
+    /// The journal is valid but the replay failed; it stays for the next launch.
+    Kept,
+    /// The journal could not be trusted and was moved aside, bytes intact.
+    Quarantined(QuarantineReason),
+}
+
+/// Why a journal was quarantined.
+///
+/// Each label is also the last component of the incident directory's name, so a
+/// human can read the cause off the directory listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuarantineReason {
+    /// The file held no bytes.
+    Empty,
+    /// The JSON stopped in the middle.
+    Truncated,
+    /// The bytes were not a journal at all.
+    Unreadable,
+    /// The checksum did not match the payload.
+    ChecksumMismatch,
+    /// The declared format version is newer than this build knows.
+    UnsupportedVersion,
+    /// The journal's base row is beyond the log it belongs to.
+    BaseBeyondLog,
+    /// Only the pre-rename temporary was left, as a kill before the rename is.
+    InterruptedWrite,
+}
+
+impl QuarantineReason {
+    /// The stable label the incident directory and its record carry.
+    fn label(self) -> &'static str {
+        match self {
+            QuarantineReason::Empty => "empty",
+            QuarantineReason::Truncated => "truncated",
+            QuarantineReason::Unreadable => "unreadable",
+            QuarantineReason::ChecksumMismatch => "checksum-mismatch",
+            QuarantineReason::UnsupportedVersion => "unsupported-version",
+            QuarantineReason::BaseBeyondLog => "base-beyond-log",
+            QuarantineReason::InterruptedWrite => "interrupted-write",
+        }
+    }
+}
+
+impl From<JournalDefect> for QuarantineReason {
+    fn from(defect: JournalDefect) -> Self {
+        match defect {
+            JournalDefect::Empty => QuarantineReason::Empty,
+            JournalDefect::Truncated => QuarantineReason::Truncated,
+            JournalDefect::Unreadable => QuarantineReason::Unreadable,
+            JournalDefect::ChecksumMismatch => QuarantineReason::ChecksumMismatch,
+            JournalDefect::UnsupportedVersion => QuarantineReason::UnsupportedVersion,
+        }
+    }
+}
+
+/// One journal's outcome, as the recovery report records it.
+///
+/// The record carries metadata only - never a message's contents. Its shape is
+/// also what the `report.json` beside a quarantined journal holds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RecoveryRecord {
+    /// The session the journal belonged to.
+    pub(crate) session: String,
+    /// Where the journal was read from (or moved from).
+    pub(crate) source_path: String,
+    /// What this pass did, or why the journal was quarantined.
+    pub(crate) reason: String,
+    /// The journal's declared format version; 0 is a legacy journal.
+    pub(crate) version: u32,
+    /// How many message rows it held - a count, never contents.
+    pub(crate) rows: usize,
+    /// When this pass classified it, in milliseconds since the Unix epoch.
+    pub(crate) quarantined_at: u64,
+}
+
+/// What the last recovery pass found, so a caller can show it instead of
+/// claiming a clean start.
+///
+/// Filled by `recover_inflight` at open; read it through
+/// `Store::recovery_report`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RecoveryReport {
+    /// Journals folded into their log.
+    pub(crate) replayed: Vec<RecoveryRecord>,
+    /// Journals kept for the next launch because the replay failed.
+    pub(crate) kept: Vec<RecoveryRecord>,
+    /// Journals moved into `corrupt/`, original bytes intact.
+    pub(crate) quarantined: Vec<RecoveryRecord>,
 }
 
 /// The directory a workspace keeps its sessions in.
 pub(crate) fn sessions_dir(root: &Path) -> PathBuf {
     root.join(".bsh").join("sessions")
+}
+
+/// Milliseconds since the Unix epoch, for a quarantine stamp.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Create a fresh incident directory under `base`, never reusing a name.
+///
+/// A name another process already took is not an error: the next suffix is
+/// tried, so two processes quarantining in the same millisecond never contend.
+fn incident_dir(base: &Path, name: &str) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(base)?;
+    let mut attempt = 0;
+    loop {
+        let candidate = if attempt == 0 {
+            base.join(name)
+        } else {
+            base.join(format!("{name}-{attempt}"))
+        };
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+                if attempt > 64 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "no free incident directory name",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The version and row count a journal's bytes declare, best effort.
+///
+/// Used for a journal that cannot be trusted: a truncated or edited file still
+/// usually names its version and holds a `rows` array, and the report may only
+/// carry counts - never contents.
+fn partial_metadata(bytes: &[u8]) -> (u32, usize) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return (0, 0);
+    };
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default() as u32;
+    let rows = value
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |rows| rows.len());
+    (version, rows)
 }
 
 /// Read one session document in full, streaming from its file.
@@ -214,6 +637,10 @@ pub(crate) struct Store {
     /// directory. Dropping the handle releases the lock, which is how a crash
     /// becomes distinguishable from a live turn.
     inflight_locks: RefCell<HashMap<PathBuf, File>>,
+    /// What the last recovery pass did with every journal it found, so nothing
+    /// is silently dropped and a caller can show the state instead of claiming
+    /// a clean start.
+    recovery: RecoveryReport,
 }
 
 impl Store {
@@ -242,6 +669,7 @@ impl Store {
             histories: RefCell::new(HashMap::new()),
             secrets: Vec::new(),
             inflight_locks: RefCell::new(HashMap::new()),
+            recovery: RecoveryReport::default(),
         };
         let dirs: Vec<PathBuf> = store.roots.values().cloned().collect();
         store.read(&dirs);
@@ -281,6 +709,15 @@ impl Store {
         self.quarantine != crate::settings::dir().join("sessions")
     }
 
+    /// What the last recovery pass found: journals replayed, kept for the next
+    /// launch, and quarantined with their original bytes.
+    ///
+    /// The report is filled when the store opens, so a caller can show a real
+    /// state instead of claiming a clean start.
+    pub(crate) fn recovery_report(&self) -> &RecoveryReport {
+        &self.recovery
+    }
+
     /// Open a store over a scratch directory, for the tests: its roots come
     /// from the registry and its quarantine is a directory a test owns.
     #[cfg(test)]
@@ -292,6 +729,7 @@ impl Store {
             histories: RefCell::new(HashMap::new()),
             secrets: Vec::new(),
             inflight_locks: RefCell::new(HashMap::new()),
+            recovery: RecoveryReport::default(),
         };
         store.read(&[]);
         store.sort();
@@ -718,18 +1156,29 @@ impl Store {
 
     /// Write the JSON document, which never embeds the transcript.
     ///
-    /// The write is atomic: a kill between the old file and the new one must
-    /// leave the old document readable, because the loader silently skips a
-    /// file that does not parse and that would read as the whole session
-    /// disappearing.
+    /// The write is a durable commit, not a bare rename: the bytes are synced
+    /// and, on Unix, the parent directory is synced too, so a documented save
+    /// survives a power loss rather than only a process kill. (Windows cannot
+    /// sync a directory, so the stronger guarantee is Unix-only.) A kill between
+    /// the old file and the new one leaves the old document readable, because
+    /// the loader silently skips a file that does not parse and that would read
+    /// as the whole session disappearing.
     fn write_document(&self, session: &Session, dir: &Path) -> anyhow::Result<()> {
         let mut document = session.clone();
         document.messages.clear();
         let path = dir.join(format!("{}.json", session.id));
-        let temporary = path.with_extension("json.tmp");
+        // A temporary left by a crash of the pre-commit writer is debris; the
+        // commit below uses its own uniquely named one.
+        let _ = fs::remove_file(path.with_extension("json.tmp"));
         let text = self.redact(&serde_json::to_string_pretty(&document)?);
-        fs::write(&temporary, text)?;
-        fs::rename(&temporary, &path)?;
+        // A session document carries the transcript and plan, so it is
+        // owner-only on every host.
+        hostkit::durable::commit(
+            &path,
+            text.as_bytes(),
+            hostkit::durable::Privacy::OwnerOnly,
+            &hostkit::durable::NoFaults,
+        )?;
         Ok(())
     }
 
@@ -866,7 +1315,9 @@ impl Store {
             .collect();
         let dir = History::dir_for(self.dir_for(session), &session.id);
         self.lock_inflight(&dir)?;
-        let journal = Inflight { base, rows };
+        // The journal carries its own integrity: a torn or edited file is
+        // detected at recovery instead of being replayed as rows.
+        let journal = Inflight::new(base, rows)?;
         let temporary = dir.join(INFLIGHT_TMP);
         fs::write(&temporary, serde_json::to_vec(&journal)?)?;
         fs::rename(&temporary, dir.join(INFLIGHT))?;
@@ -877,6 +1328,8 @@ impl Store {
     ///
     /// A save that refuses or only partly writes (a metadata-only row, a full
     /// disk) must leave the journal in place: it is the only copy of the turn.
+    /// The store calls this only AFTER `save_history` returned Ok, so the
+    /// journal is released only once the log really carries its rows.
     fn release_inflight(&self, session: &Session, dir: &Path) {
         let history_dir = History::dir_for(dir, &session.id);
         let bytes = match fs::read(history_dir.join(INFLIGHT)) {
@@ -895,8 +1348,14 @@ impl Store {
                 return;
             }
         };
-        let Ok(journal) = serde_json::from_slice::<Inflight>(&bytes) else {
-            self.drop_inflight(&history_dir);
+        let Ok(journal) = Inflight::parse(&bytes) else {
+            // A journal that cannot be verified is not a journal we may delete:
+            // the save may not have covered the row it is the only copy of. It
+            // stays for the next launch, which quarantines it with its bytes.
+            log::warn!(
+                "session {}: the in-flight journal could not be verified; keeping it",
+                session.id
+            );
             return;
         };
         let len = self
@@ -951,6 +1410,11 @@ impl Store {
     /// A journal whose lock is still held belongs to a live turn - a second
     /// window must not append it early. The OS drops that lock when the owner
     /// dies, which is the one signal a pid cannot give reliably.
+    ///
+    /// Nothing unreadable is deleted here. A journal this pass cannot trust is
+    /// moved into `corrupt/` with its original bytes; a valid journal whose
+    /// replay fails stays where it is for the next launch. Both outcomes are
+    /// recorded in `Store::recovery_report`.
     fn recover_inflight(&mut self) {
         let mut histories: Vec<PathBuf> = Vec::new();
         for dir in self.session_dirs() {
@@ -968,7 +1432,13 @@ impl Store {
         histories.sort();
         histories.dedup();
         for history_dir in histories {
-            if !history_dir.join(INFLIGHT).is_file() {
+            let journal = history_dir.join(INFLIGHT);
+            let temporary = history_dir.join(INFLIGHT_TMP);
+            let has_journal = journal.is_file();
+            // A kill between writing the temporary and renaming it leaves only
+            // the temporary; its bytes are the only copy of that turn.
+            let has_temporary = temporary.is_file();
+            if !has_journal && !has_temporary {
                 continue;
             }
             let Some(id) = history_dir
@@ -990,61 +1460,196 @@ impl Store {
                     continue;
                 }
             }
-            if !self.sessions.iter().any(|session| session.id == id) {
+            if has_journal && !self.sessions.iter().any(|session| session.id == id) {
                 // The document is gone: a delete that crashed before removing
                 // the log. Nothing can be recovered onto a session nobody can
                 // select.
-                let _ = fs::remove_file(history_dir.join(INFLIGHT));
+                let _ = fs::remove_file(&journal);
+                let _ = fs::remove_file(&temporary);
                 drop(lock);
                 let _ = fs::remove_file(&lock_path);
                 continue;
             }
-            let recovered = self.recover_turn(&history_dir, &id);
+            let recovered = if has_journal {
+                self.recover_turn(&history_dir, &id)
+            } else {
+                let (version, rows) = partial_metadata(&fs::read(&temporary).unwrap_or_default());
+                let record = self.recovery_record(
+                    &id,
+                    &temporary,
+                    QuarantineReason::InterruptedWrite.label(),
+                    version,
+                    rows,
+                );
+                self.quarantine(
+                    &history_dir,
+                    &temporary,
+                    QuarantineReason::InterruptedWrite,
+                    record,
+                )
+            };
             drop(lock);
-            if recovered {
-                let _ = fs::remove_file(history_dir.join(INFLIGHT));
+            if let Recovery::Quarantined(reason) = recovered {
+                // The quarantine itself logged the one line a reader sees; this
+                // names the classification for a debug trace.
+                log::debug!("session {id}: journal classified as {}", reason.label());
+            }
+            if !matches!(recovered, Recovery::Kept) {
+                let _ = fs::remove_file(&journal);
             }
             let _ = fs::remove_file(&lock_path);
         }
+        let report = self.recovery_report();
+        if !report.replayed.is_empty() || !report.kept.is_empty() || !report.quarantined.is_empty()
+        {
+            log::info!(
+                "journal recovery: {} replayed, {} kept, {} quarantined",
+                report.replayed.len(),
+                report.kept.len(),
+                report.quarantined.len()
+            );
+        }
     }
 
-    /// Fold one interrupted turn's journal into its log.
+    /// The record one journal's outcome leaves behind.
+    fn recovery_record(
+        &self,
+        id: &str,
+        source: &Path,
+        reason: &str,
+        version: u32,
+        rows: usize,
+    ) -> RecoveryRecord {
+        RecoveryRecord {
+            session: id.to_string(),
+            source_path: source.display().to_string(),
+            reason: reason.to_string(),
+            version,
+            rows,
+            quarantined_at: unix_ms(),
+        }
+    }
+
+    /// Move one untrustworthy journal into a fresh incident directory.
     ///
-    /// Returns whether the journal may be removed. A failed write keeps it: a
-    /// journal that is still on disk gets another chance at the next launch,
-    /// while a removed one is gone forever.
-    fn recover_turn(&mut self, dir: &Path, id: &str) -> bool {
-        let Ok(bytes) = fs::read(dir.join(INFLIGHT)) else {
-            return true;
+    /// The order is the point: create the incident directory, move the journal
+    /// in with ONE rename (so its bytes are never copied or rewritten), then
+    /// write the report beside it through a temporary and a rename. A failure
+    /// to create the directory returns `None` and leaves the journal where it
+    /// is, because a journal that was not preserved must not be deleted.
+    fn quarantine(
+        &mut self,
+        dir: &Path,
+        source: &Path,
+        reason: QuarantineReason,
+        record: RecoveryRecord,
+    ) -> Recovery {
+        let name = format!("{}-{}-{}", unix_ms(), std::process::id(), reason.label());
+        let incident = match incident_dir(&dir.join(CORRUPT), &name) {
+            Ok(incident) => incident,
+            Err(error) => {
+                log::error!(
+                    "session {}: a journal could not be quarantined ({error}); it is left in place",
+                    record.session
+                );
+                return Recovery::Kept;
+            }
         };
-        let Ok(journal) = serde_json::from_slice::<Inflight>(&bytes) else {
-            log::warn!("session {id}: an interrupted turn's journal is unreadable; dropping it");
-            return true;
+        let target = incident.join("journal.json");
+        if let Err(error) = fs::rename(source, &target) {
+            log::error!(
+                "session {}: a journal could not be moved into {} ({error}); it is left in place",
+                record.session,
+                incident.display()
+            );
+            let _ = fs::remove_dir(&incident);
+            return Recovery::Kept;
+        }
+        let report = match serde_json::to_vec_pretty(&record) {
+            Ok(report) => report,
+            Err(error) => {
+                log::error!(
+                    "session {}: a quarantine report could not be serialized: {error}",
+                    record.session
+                );
+                let _ = fs::remove_dir(&incident);
+                return Recovery::Kept;
+            }
         };
+        let report_tmp = incident.join("report.json.tmp");
+        let installed = fs::write(&report_tmp, &report)
+            .and_then(|()| fs::rename(&report_tmp, incident.join("report.json")));
+        if let Err(error) = installed {
+            log::error!(
+                "session {}: a quarantine report could not be written: {error}",
+                record.session
+            );
+        }
+        log::warn!(
+            "session {}: quarantined an interrupted turn's journal ({}) at {}",
+            record.session,
+            reason.label(),
+            target.display()
+        );
+        self.recovery.quarantined.push(record);
+        Recovery::Quarantined(reason)
+    }
+
+    /// Fold one interrupted turn's journal into its log, or preserve it.
+    ///
+    /// A journal that cannot be trusted is quarantined; one whose replay fails
+    /// is kept where it is, because a journal still on disk gets another chance
+    /// at the next launch while a removed one is gone forever.
+    fn recover_turn(&mut self, dir: &Path, id: &str) -> Recovery {
+        let source = dir.join(INFLIGHT);
+        let bytes = match fs::read(&source) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!(
+                    "session {id}: an interrupted turn's journal could not be read: {error}"
+                );
+                let record =
+                    self.recovery_record(id, &source, QuarantineReason::Unreadable.label(), 0, 0);
+                return self.quarantine(dir, &source, QuarantineReason::Unreadable, record);
+            }
+        };
+        let journal = match Inflight::parse(&bytes) {
+            Ok(journal) => journal,
+            Err(defect) => {
+                let reason = QuarantineReason::from(defect);
+                let (version, rows) = partial_metadata(&bytes);
+                let record = self.recovery_record(id, &source, defect.label(), version, rows);
+                return self.quarantine(dir, &source, reason, record);
+            }
+        };
+        let version = journal.version;
+        let journal_rows = journal.rows.len();
         let mut history = History::open(dir.to_path_buf());
         let len = history.len();
         if journal.rows.is_empty() {
             // Only an older writer could produce this; there is nothing to
             // place, and rewriting would truncate a log at `base`.
-            return true;
+            return Recovery::AlreadyCovered;
         }
         // The journal can never reach past the log it was written against. A
         // base beyond the log is a journal from a directory that was replaced
-        // (a fork, a rehome, a compaction) - there is nothing to place it on.
+        // (a fork, a rehome, a compaction) - there is nothing to place it on,
+        // and it is evidence, so it is quarantined rather than dropped.
         if journal.base > len {
-            log::warn!(
-                "session {id}: an interrupted turn's journal starts at row {} but the log holds {len}; dropping it",
-                journal.base
+            let record = self.recovery_record(
+                id,
+                &source,
+                QuarantineReason::BaseBeyondLog.label(),
+                version,
+                journal_rows,
             );
-            return true;
+            return self.quarantine(dir, &source, QuarantineReason::BaseBeyondLog, record);
         }
         // A log that moved past the journal already carries newer rows. Rewriting
         // from the journal's base would delete them, so the log wins.
-        if len > journal.base.saturating_add(journal.rows.len()) {
-            log::info!(
-                "session {id}: an interrupted turn's journal is behind the log; dropping it"
-            );
-            return true;
+        if len > journal.base.saturating_add(journal_rows) {
+            log::info!("session {id}: an interrupted turn's journal is behind the log");
+            return Recovery::AlreadyCovered;
         }
         let mut rows = journal.rows;
         if let Some(last) = rows.last_mut() {
@@ -1064,7 +1669,6 @@ impl Store {
                 }
             }
         }
-        let recovered_rows = rows.len();
         let outcome = if len == journal.base {
             history.append(&rows)
         } else {
@@ -1080,15 +1684,20 @@ impl Store {
             Ok(()) => {
                 self.histories.borrow_mut().remove(dir);
                 log::info!(
-                    "session {id}: recovered {recovered_rows} row(s) from a turn the process died in"
+                    "session {id}: recovered {journal_rows} row(s) from a turn the process died in"
                 );
-                true
+                let record = self.recovery_record(id, &source, "replayed", version, journal_rows);
+                self.recovery.replayed.push(record);
+                Recovery::Replayed
             }
             Err(error) => {
                 log::warn!(
                     "session {id}: an interrupted turn could not be recovered ({error}); its journal is kept"
                 );
-                false
+                let record =
+                    self.recovery_record(id, &source, "replay-failed", version, journal_rows);
+                self.recovery.kept.push(record);
+                Recovery::Kept
             }
         }
     }
@@ -1254,8 +1863,18 @@ impl Store {
                 return false;
             }
             let from = rows.saturating_sub(WINDOW);
-            let Ok(window) = history.window(from, rows - from) else {
-                return false;
+            // The tail window could not be read. The row stays unhydrated, but
+            // the failure is recorded instead of reading as an empty
+            // conversation; the log's own error text names the segment and the
+            // row group.
+            let window = match history.window(from, rows - from) {
+                Ok(window) => window,
+                Err(error) => {
+                    log::warn!(
+                        "session {id}: the transcript window from row {from} of {rows} could not be read: {error}"
+                    );
+                    return false;
+                }
             };
             (from, window)
         };
@@ -2591,11 +3210,8 @@ mod raw_tests {
         std::fs::create_dir_all(&dir).expect("the log directory");
         std::fs::write(
             dir.join(super::INFLIGHT),
-            serde_json::to_vec(&super::Inflight {
-                base: 1,
-                rows: vec![settled],
-            })
-            .expect("the journal"),
+            serde_json::to_vec(&super::Inflight::new(1, vec![settled]).expect("the journal"))
+                .expect("the journal bytes"),
         )
         .expect("the journal file");
 
@@ -2604,6 +3220,561 @@ mod raw_tests {
         let rows = &reopened.session(&session.id).expect("the session").messages;
         assert_eq!(rows.len(), 2, "no duplicate assistant row");
         assert_eq!(rows[1].text, "the rest of the answer");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- #350: journal recovery classifies, and never deletes what it cannot read ----
+
+    /// A scratch root holding one crashed turn's journal, with its bytes.
+    fn crashed_journal(
+        name: &str,
+        answer: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+        let base = journal_scratch(name);
+        let (dir, bytes) = {
+            let mut store = super::Store::open_at(base.clone());
+            let session = crashed_turn(&mut store, answer);
+            let dir = crate::history::History::dir_for(&base, &session.id);
+            let bytes = std::fs::read(dir.join(super::INFLIGHT)).expect("the journal bytes");
+            (dir, bytes)
+        };
+        (base, dir, bytes)
+    }
+
+    /// Replace a crashed turn's journal bytes.
+    fn write_journal(dir: &std::path::Path, bytes: &[u8]) {
+        std::fs::write(dir.join(super::INFLIGHT), bytes).expect("the journal file");
+    }
+
+    /// The one incident directory a quarantine created, with its report.
+    fn only_quarantine(dir: &std::path::Path) -> (std::path::PathBuf, super::RecoveryRecord) {
+        let corrupt = dir.join(super::CORRUPT);
+        let mut incidents: Vec<std::path::PathBuf> = std::fs::read_dir(&corrupt)
+            .expect("a corrupt directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        incidents.sort();
+        assert_eq!(incidents.len(), 1, "one incident directory");
+        let incident = incidents.remove(0);
+        let text =
+            std::fs::read_to_string(incident.join("report.json")).expect("the report exists");
+        let report: super::RecoveryRecord = serde_json::from_str(&text).expect("the report parses");
+        assert!(
+            !incident.join("report.json.tmp").exists(),
+            "the report is installed by rename, not left as a temporary"
+        );
+        (incident, report)
+    }
+
+    /// Launch over `base` and assert one quarantine with the expected reason,
+    /// the original bytes intact beside a report naming the session.
+    fn opened_quarantine(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        bytes: &[u8],
+        reason: &str,
+    ) -> super::Store {
+        let store = super::Store::open_at(base.to_path_buf());
+        assert!(
+            !dir.join(super::INFLIGHT).exists(),
+            "the journal left its log directory"
+        );
+        let (incident, report) = only_quarantine(dir);
+        assert_eq!(
+            std::fs::read(incident.join("journal.json")).expect("the preserved journal"),
+            bytes,
+            "the original bytes are preserved"
+        );
+        assert_eq!(report.session, "crashed", "the report names the session");
+        assert_eq!(report.reason, reason, "the report names the reason");
+        assert_eq!(
+            store.recovery_report().quarantined.len(),
+            1,
+            "the launch reports the quarantine"
+        );
+        assert_eq!(store.recovery_report().quarantined[0].reason, reason);
+        store
+    }
+
+    #[test]
+    fn fnv1a_64_matches_the_published_vectors() {
+        assert_eq!(super::fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(super::fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(super::fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn a_corrupt_journal_is_quarantined_with_its_bytes() {
+        let (base, dir, _) = crashed_journal("corrupt", "half a reply");
+        let bytes = b"this is not a journal".to_vec();
+        write_journal(&dir, &bytes);
+        let store = opened_quarantine(&base, &dir, &bytes, "unreadable");
+        assert_eq!(store.recovery_report().quarantined[0].rows, 0);
+    }
+
+    #[test]
+    fn a_truncated_journal_is_quarantined() {
+        let (base, dir, original) = crashed_journal("truncated", "half a reply");
+        let bytes = original[..original.len() / 2].to_vec();
+        write_journal(&dir, &bytes);
+        let store = opened_quarantine(&base, &dir, &bytes, "truncated");
+        assert_eq!(
+            store.recovery_report().quarantined[0].source_path,
+            dir.join(super::INFLIGHT).display().to_string(),
+            "the record says where the bytes came from"
+        );
+    }
+
+    #[test]
+    fn an_empty_journal_is_quarantined() {
+        let (base, dir, _) = crashed_journal("empty", "half a reply");
+        let bytes = Vec::new();
+        write_journal(&dir, &bytes);
+        opened_quarantine(&base, &dir, &bytes, "empty");
+    }
+
+    #[test]
+    fn a_journal_whose_checksum_does_not_match_is_quarantined() {
+        let (base, dir, original) = crashed_journal("checksum", "half a reply");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&original).expect("the journal json");
+        let checksum = value["checksum"].as_str().expect("a checksum");
+        let flipped = u64::from_str_radix(checksum, 16).expect("hex") ^ 1;
+        value["checksum"] = serde_json::Value::String(format!("{flipped:016x}"));
+        let bytes = serde_json::to_vec(&value).expect("the edited journal");
+        write_journal(&dir, &bytes);
+        let store = opened_quarantine(&base, &dir, &bytes, "checksum-mismatch");
+        assert_eq!(
+            store.recovery_report().quarantined[0].version,
+            1,
+            "the record keeps the declared version"
+        );
+        assert_eq!(
+            store.recovery_report().quarantined[0].rows,
+            1,
+            "and the row COUNT, never the contents"
+        );
+    }
+
+    #[test]
+    fn a_journal_from_a_newer_version_is_quarantined_not_dropped() {
+        let (base, dir, original) = crashed_journal("version", "half a reply");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&original).expect("the journal json");
+        value["version"] = serde_json::json!(2);
+        let bytes = serde_json::to_vec(&value).expect("the edited journal");
+        write_journal(&dir, &bytes);
+        let store = opened_quarantine(&base, &dir, &bytes, "unsupported-version");
+        assert_eq!(
+            store.recovery_report().quarantined[0].version,
+            2,
+            "an unknown version is preserved, not guessed at"
+        );
+    }
+
+    #[test]
+    fn a_journal_crashing_before_its_rename_is_quarantined() {
+        let (base, dir, original) = crashed_journal("pre-rename", "half a reply");
+        std::fs::rename(dir.join(super::INFLIGHT), dir.join(super::INFLIGHT_TMP))
+            .expect("a kill before the rename");
+        let store = opened_quarantine(&base, &dir, &original, "interrupted-write");
+        assert!(
+            !dir.join(super::INFLIGHT_TMP).exists(),
+            "the temporary left the log directory"
+        );
+        assert!(
+            store.recovery_report().quarantined[0]
+                .source_path
+                .ends_with(super::INFLIGHT_TMP),
+            "the record names the temporary it preserved"
+        );
+    }
+
+    #[test]
+    fn a_valid_journal_replays_once_and_a_second_start_does_not_duplicate() {
+        let (base, dir, _) = crashed_journal("replay-once", "half a reply");
+        {
+            let mut store = super::Store::open_at(base.clone());
+            assert_eq!(
+                store.recovery_report().replayed.len(),
+                1,
+                "the valid journal replayed"
+            );
+            assert_eq!(store.recovery_report().replayed[0].rows, 1);
+            store.rehydrate("crashed");
+            assert_eq!(
+                store
+                    .session("crashed")
+                    .expect("the session")
+                    .messages
+                    .len(),
+                2,
+                "the prompt and its recovered answer"
+            );
+        }
+        assert!(
+            !dir.join(super::INFLIGHT).exists(),
+            "the journal is consumed by the replay"
+        );
+
+        let mut second = super::Store::open_at(base.clone());
+        assert!(
+            second.recovery_report().replayed.is_empty(),
+            "a second start has nothing to replay"
+        );
+        assert!(second.recovery_report().quarantined.is_empty());
+        second.rehydrate("crashed");
+        assert_eq!(
+            second
+                .session("crashed")
+                .expect("the session")
+                .messages
+                .len(),
+            2,
+            "the rows are not duplicated by the second start"
+        );
+        assert_eq!(crate::history::History::open(dir).len(), 2);
+    }
+
+    #[test]
+    fn a_legacy_journal_without_a_checksum_still_replays() {
+        let (base, dir, original) = crashed_journal("legacy", "an answer");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&original).expect("the journal json");
+        let object = value.as_object_mut().expect("an object");
+        object.remove("version");
+        object.remove("checksum");
+        write_journal(
+            &dir,
+            &serde_json::to_vec(&value).expect("the legacy journal"),
+        );
+        let mut store = super::Store::open_at(base.clone());
+        assert_eq!(
+            store.recovery_report().replayed.len(),
+            1,
+            "a version 0 journal is still replayed"
+        );
+        assert_eq!(
+            store.recovery_report().replayed[0].version,
+            0,
+            "and is reported as legacy"
+        );
+        store.rehydrate("crashed");
+        let session = store.session("crashed").expect("the session");
+        assert_eq!(session.messages[1].text, "an answer");
+    }
+
+    #[test]
+    fn a_journal_for_a_deleted_session_is_debris() {
+        let (base, dir, _) = crashed_journal("debris", "half a reply");
+        std::fs::remove_file(base.join("crashed.json")).expect("the document");
+        let store = super::Store::open_at(base.clone());
+        assert!(
+            !dir.join(super::INFLIGHT).exists(),
+            "a deleted session's journal is debris"
+        );
+        assert!(
+            !dir.join(super::CORRUPT).exists(),
+            "and is not reported as corruption"
+        );
+        assert!(store.recovery_report().quarantined.is_empty());
+        assert!(store.recovery_report().replayed.is_empty());
+    }
+
+    #[test]
+    fn a_quarantine_report_never_records_message_contents() {
+        let secret = "PRIVATE-ANSWER-DO-NOT-RECORD";
+        let (base, dir, original) = crashed_journal("no-contents", secret);
+        assert!(String::from_utf8_lossy(&original).contains(secret));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&original).expect("the journal json");
+        value["checksum"] = serde_json::Value::String("0000000000000000".to_string());
+        let bytes = serde_json::to_vec(&value).expect("the edited journal");
+        write_journal(&dir, &bytes);
+        let store = opened_quarantine(&base, &dir, &bytes, "checksum-mismatch");
+        let (incident, _) = only_quarantine(&dir);
+        let report = std::fs::read_to_string(incident.join("report.json")).expect("the report");
+        assert!(
+            !report.contains(secret),
+            "the report holds counts, never contents: {report}"
+        );
+        assert_eq!(
+            store.recovery_report().quarantined[0].rows,
+            1,
+            "but it does count the rows it could not replay"
+        );
+        let report: serde_json::Value = serde_json::from_str(&report).expect("the report json");
+        for field in [
+            "session",
+            "source_path",
+            "reason",
+            "version",
+            "quarantined_at",
+        ] {
+            assert!(report.get(field).is_some(), "the report carries {field}");
+        }
+    }
+
+    #[test]
+    fn a_journal_whose_replay_fails_is_kept_for_the_next_launch() {
+        let base = journal_scratch("replay-fails");
+        let mut session = crate::model::Session::new("w", "crashed");
+        session.id = "crashed".to_string();
+        {
+            let mut store = super::Store::open_at(base.clone());
+            store.insert(session.clone());
+            store.save(&session).expect("the document");
+            // One save of many rows seals one segment and lists it in the
+            // manifest, which is what the replay has to read.
+            for index in 0..600 {
+                session
+                    .messages
+                    .push(crate::model::ChatMessage::user(format!("m {index}")));
+            }
+            store.save(&session).expect("the sealed log");
+        }
+        let dir = crate::history::History::dir_for(&base, &session.id);
+        let mut settled = crate::model::ChatMessage::assistant();
+        settled.text = "the rest of the answer".to_string();
+        let bytes =
+            serde_json::to_vec(&super::Inflight::new(599, vec![settled]).expect("the journal"))
+                .expect("the journal bytes");
+        write_journal(&dir, &bytes);
+        // The listed segment is now a directory, so the replay's read of its
+        // footer cannot succeed.
+        let segment = listed_segment(&dir, "messages");
+        std::fs::remove_file(&segment).expect("the segment");
+        std::fs::create_dir(&segment).expect("a directory where the segment was");
+
+        let store = super::Store::open_at(base.clone());
+        assert!(
+            dir.join(super::INFLIGHT).is_file(),
+            "a failed replay keeps the journal for the next launch"
+        );
+        assert!(
+            !dir.join(super::CORRUPT).exists(),
+            "a retryable failure is not corruption"
+        );
+        let report = store.recovery_report();
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(report.kept[0].reason, "replay-failed");
+        assert_eq!(
+            std::fs::read(dir.join(super::INFLIGHT)).expect("the kept journal"),
+            bytes
+        );
+    }
+
+    // ---- #351: a failed page read is a failure, never an empty page ----
+
+    /// A session of `rows` assistant turns, each with one tool call, saved in
+    /// ONE append so both logs seal into a manifest-listed segment each.
+    fn sealed_session(name: &str, rows: usize) -> (std::path::PathBuf, String, std::path::PathBuf) {
+        let base = journal_scratch(name);
+        let mut session = crate::model::Session::new("w", "sealed");
+        session.id = "sealed".to_string();
+        for index in 0..rows {
+            let mut message = crate::model::ChatMessage::assistant();
+            message.text = format!("answer {index}");
+            message.tools.push(crate::model::ToolEvent {
+                name: "bash".to_string(),
+                args: "{}".to_string(),
+                output: Some(format!("out {index}")),
+                ms: Some(1),
+                at: Some(index as u64),
+            });
+            session.messages.push(message);
+        }
+        {
+            let mut store = super::Store::open_at(base.clone());
+            store.insert(session.clone());
+            store.save(&session).expect("the sealed save");
+        }
+        let dir = crate::history::History::dir_for(&base, &session.id);
+        (base, session.id, dir)
+    }
+
+    /// One segment a manifest lists, by log kind (`messages`/`trajectory`).
+    fn listed_segment(dir: &std::path::Path, kind: &str) -> std::path::PathBuf {
+        let text = std::fs::read_to_string(dir.join("manifest.json")).expect("a manifest");
+        let manifest: serde_json::Value = serde_json::from_str(&text).expect("manifest json");
+        let name = manifest[kind][0]["file"]
+            .as_str()
+            .expect("a listed segment")
+            .to_string();
+        dir.join(name)
+    }
+
+    /// Replace a segment with a Parquet file of a different schema.
+    fn write_foreign_parquet(path: &std::path::Path) {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(
+            (0..10)
+                .map(|index| Field::new(format!("col{index}"), DataType::Int64, false))
+                .collect::<Vec<_>>(),
+        ));
+        let columns: Vec<Arc<dyn arrow::array::Array>> = (0..10)
+            .map(|_| {
+                Arc::new(Int64Array::from((0..128).collect::<Vec<i64>>()))
+                    as Arc<dyn arrow::array::Array>
+            })
+            .collect();
+        let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), columns)
+            .expect("a foreign batch");
+        let file = std::fs::File::create(path).expect("the foreign segment");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("a foreign writer");
+        writer.write(&batch).expect("the foreign rows");
+        writer.close().expect("the foreign footer");
+    }
+
+    /// Corrupt every data page while leaving the file's footer readable.
+    fn corrupt_data_pages(path: &std::path::Path) {
+        let mut bytes = std::fs::read(path).expect("the segment bytes");
+        let len = bytes.len();
+        assert!(len > 1024, "the segment is big enough to have data pages");
+        let footer_len =
+            u32::from_le_bytes(bytes[len - 8..len - 4].try_into().expect("4 bytes")) as usize;
+        let footer_start = len - 8 - footer_len;
+        assert!(footer_start > 8, "the footer is not the whole file");
+        for byte in &mut bytes[4..footer_start] {
+            *byte = 0xff;
+        }
+        std::fs::write(path, &bytes).expect("the corrupted segment");
+    }
+
+    /// Truncate a segment so its footer is gone.
+    fn truncate_segment(path: &std::path::Path) {
+        let len = std::fs::metadata(path).expect("the segment").len();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("the segment handle");
+        file.set_len(len / 2).expect("the truncation");
+    }
+
+    /// One way a listed segment is damaged, by name.
+    type Damage = (&'static str, fn(&std::path::Path));
+
+    /// The failures injected into one segment, by name.
+    fn damages() -> Vec<Damage> {
+        vec![
+            ("missing", |path| {
+                std::fs::remove_file(path).expect("the segment");
+            }),
+            ("truncated", truncate_segment),
+            ("foreign-schema", write_foreign_parquet),
+            ("corrupt-row-group", corrupt_data_pages),
+        ]
+    }
+
+    #[test]
+    fn a_failed_message_window_is_a_page_failure_not_an_empty_page() {
+        for (name, damage) in damages() {
+            let (base, id, dir) = sealed_session("window-failure", 600);
+            let mut store = super::Store::open_at(base.clone());
+            store.rehydrate(&id);
+            let read = store.older_read(&id, super::WINDOW).expect("a window");
+            let segment = listed_segment(&dir, "messages");
+            damage(&segment);
+
+            let page = read.read();
+            assert!(
+                page.rows.is_empty(),
+                "{name}: a failed page carries no rows"
+            );
+            let failure = page
+                .failure()
+                .unwrap_or_else(|| panic!("{name}: a failure, not an empty success"));
+            assert!(failure.retried, "{name}: the one reopen was attempted");
+            assert_eq!(failure.session, id, "{name}: the failure names the session");
+            assert!(
+                failure.detail.contains(&dir.display().to_string()),
+                "{name}: the detail names the log: {}",
+                failure.detail
+            );
+            assert!(
+                failure.to_string().contains("could not be read"),
+                "{name}: the failure is shown to a caller: {failure}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
+    fn a_failed_trajectory_page_is_a_page_failure_not_an_empty_page() {
+        for (name, damage) in damages() {
+            let (base, id, dir) = sealed_session("trace-failure", 600);
+            let mut store = super::Store::open_at(base.clone());
+            store.rehydrate(&id);
+            // Page 4 is the OLDEST page, so it starts at row 0 and reads row
+            // group 0 - the group every damaged file below still describes.
+            // (Page 0 is the newest, i.e. the last group, and a file whose
+            // manifest claims more groups than it holds trips a panic inside
+            // the Parquet reader; that belongs to history.rs, not this page.)
+            let _ = store.trace_read(&id, 4).expect("a trajectory page");
+            let segment = listed_segment(&dir, "trajectory");
+            damage(&segment);
+
+            let page = store
+                .trace_read(&id, 4)
+                .unwrap_or_else(|| panic!("{name}: the page is still listed"))
+                .read();
+            assert!(
+                page.rows.is_empty(),
+                "{name}: a failed page carries no rows"
+            );
+            let failure = page
+                .failure()
+                .unwrap_or_else(|| panic!("{name}: a failure, not an empty success"));
+            assert!(failure.retried, "{name}: the one reopen was attempted");
+            assert_eq!(failure.session, id, "{name}: the failure names the session");
+            assert!(
+                failure.detail.contains(&dir.display().to_string()),
+                "{name}: the detail names the log: {}",
+                failure.detail
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
+    fn a_page_past_the_end_is_still_an_empty_success() {
+        let (base, id, dir) = sealed_session("past-end", 300);
+        let store = super::Store::open_at(base.clone());
+        let len = crate::history::History::open(dir.clone()).len();
+        assert_eq!(len, 300, "the log holds the rows");
+        let read = super::OlderRead {
+            session: id.clone(),
+            from: len,
+            floor: len + 64,
+            reader: crate::history::History::open(dir.clone()).reader(),
+            dir: dir.clone(),
+        };
+        let page = read.read();
+        assert!(
+            page.failure().is_none(),
+            "a page past the end is not a failure"
+        );
+        assert!(page.rows.is_empty(), "and it holds no rows");
+
+        let trace = super::TraceRead {
+            session: id,
+            page: 64,
+            reader: crate::history::History::open(dir.clone()).reader(),
+            dir,
+        };
+        let trace = trace.read();
+        assert!(
+            trace.failure().is_none(),
+            "a trajectory page past the end is not a failure either"
+        );
+        assert!(trace.rows.is_empty());
+        drop(store);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

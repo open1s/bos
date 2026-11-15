@@ -22,15 +22,32 @@
 //!
 //! The session document keeps what a session IS - title, workspace, flags, the
 //! plan - and this module keeps what was SAID.
+//!
+//! # Durability and coordination (issues #352, #353)
+//!
+//! Every segment and the manifest are committed at [`CommitLevel::Durable`]
+//! (docs/reliability-kernel.md section 2): the Parquet writer streams into the
+//! temp file the commit kernel created, and the kernel syncs it, renames it and
+//! syncs the parent directory. The in-flight journal and the session document
+//! are written elsewhere and document their own level there.
+//!
+//! Every mutation takes the directory's cross-process [`FileLock`] first and
+//! the in-process write guard second, which is the one order this module uses,
+//! so no two writers can deadlock. Segment names carry the pid and a
+//! per-process sequence beside the millisecond stamp, and every temp file is
+//! created with `create_new(true)`, so two processes never share a name.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use hostkit::coord::FileLock;
+use hostkit::durable::{self, CommitGate, CommitLevel, DurableError, IoStage, Privacy};
 
 use anyhow::{Context, Result};
 use arrow::array::{
@@ -65,8 +82,39 @@ const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 const SEGMENT_BYTES: u64 = 1024 * 1024;
 /// The metadata index written beside the Parquet segments.
 const MANIFEST: &str = "manifest.json";
-/// Bumped when the manifest shape changes; an older one falls back to a scan.
-const MANIFEST_VERSION: u32 = 1;
+/// Bumped when the manifest shape changes.
+///
+/// Version 2 records the history schema version and validates every entry
+/// against its Parquet footer (#356). A version 1 manifest is still read (its
+/// missing fields default), so an older history needs no rewrite.
+const MANIFEST_VERSION: u32 = 2;
+
+/// The history schema version: it names the COLUMN SET a segment carries.
+///
+/// 2 is the current message schema (index, role, text, reasoning, error, meta,
+/// tools, images, steering, parts) and the five-column trajectory schema. Every
+/// segment records it in its Parquet key/value metadata under [`SCHEMA_KEY`],
+/// and the manifest records it beside the segment lists, so a reader can tell
+/// a file it understands from one it does not (#355 extends the check to
+/// individual columns).
+pub(crate) const SCHEMA_VERSION: u32 = 2;
+
+/// The Parquet key/value metadata key carrying [`SCHEMA_VERSION`].
+const SCHEMA_KEY: &str = "bsh.schema";
+
+/// The schema version of a file written before the metadata existed.
+///
+/// Those files have the original seven columns; the reader decodes them with
+/// documented defaults, which is why the version is supported rather than
+/// unknown.
+const LEGACY_SCHEMA_VERSION: u32 = 1;
+
+/// How long a mutation waits for the cross-process history lock (#353).
+///
+/// Long enough to let a peer finish a commit, short enough that a UI thread
+/// never hangs on a process that has stopped responding; the wait then becomes
+/// the typed lock error below.
+const LOCK_BUDGET: Duration = Duration::from_millis(250);
 /// Unsealed save segments allowed before a history is rewritten whole.
 ///
 /// A legacy history - one save per segment, written before the manifest
@@ -79,6 +127,160 @@ const COMPACT_AFTER_SEGMENTS: usize = 8;
 const COMPACT_AFTER_SEGMENTS: usize = 2;
 /// A compaction marker older than this is debris from a killed process.
 const COMPACTION_STALE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// A typed history failure a caller can act on instead of parsing a string.
+///
+/// The reliability kernel's Primitive 3 (#351/#355) adds the read, decode,
+/// schema, manifest and oversized variants; the lock variant lives here because
+/// the bounded cross-process acquire (#353) has to be distinguishable from a
+/// generic I/O error, and a caller may retry it while another process works.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HistoryError {
+    /// Another process holds the history directory's cross-process lock.
+    #[error("history directory {path} is locked by another process")]
+    Locked {
+        /// The lock file that is held.
+        path: String,
+    },
+}
+
+/// What validating a history's index against its Parquet files concluded (#356).
+///
+/// The state is part of the history, so a caller can show "the log was rebuilt"
+/// or "rows are unavailable" instead of silently serving a shorter transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IndexState {
+    /// The manifest agrees with every segment file on disk.
+    Valid,
+    /// The index was rebuilt from the Parquet footers; no data file was changed.
+    Rebuilt {
+        /// Why the manifest could not be trusted.
+        reason: String,
+    },
+    /// Rows the manifest promised cannot be read; the manifest was kept and
+    /// reads of the missing rows fail explicitly instead of being shortened.
+    Unavailable {
+        /// What is missing or unreadable.
+        reason: String,
+    },
+}
+
+/// One segment's entry in a [`HistoryDiagnosis`] (#356).
+#[allow(dead_code)] // the diagnostics surface a caller shows; tests prove the fields
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SegmentDiagnosis {
+    /// The file name.
+    pub(crate) file: String,
+    /// The segment list the file belongs to: "msg" for messages, "traj" for
+    /// the trajectory.
+    pub(crate) kind: &'static str,
+    /// Whether the manifest lists this file.
+    pub(crate) listed: bool,
+    /// Whether the Parquet footer could be read.
+    pub(crate) readable: bool,
+    /// Rows the footer reports, when it could be read.
+    pub(crate) rows: Option<usize>,
+    /// The `bsh.schema` value in the footer; `None` for a legacy file.
+    pub(crate) schema: Option<u32>,
+    /// Whether this reader can decode the file's column set.
+    pub(crate) schema_supported: bool,
+    /// Whether the manifest's numbers agree with the footer. An unlisted file
+    /// has nothing to disagree with and is reported as consistent.
+    pub(crate) consistent: bool,
+}
+
+/// The offline validation report for one history directory (#356).
+///
+/// Built from the manifest and the Parquet footers only: no payload is
+/// decoded, so the cost is bounded by the segment count. `findings` is the
+/// seam #355 extends with malformed-column findings.
+#[allow(dead_code)] // the diagnostics surface a caller shows; tests prove the fields
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryDiagnosis {
+    /// What the walk concluded about the index.
+    pub(crate) state: IndexState,
+    /// One entry per segment file found on disk, messages first.
+    pub(crate) segments: Vec<SegmentDiagnosis>,
+    /// Human-readable problems, in discovery order.
+    pub(crate) findings: Vec<String>,
+}
+
+/// A [`CommitGate`] that forwards to the test gate registered for one directory.
+///
+/// Production registers nothing, so every stage passes. A test registers one
+/// gate for one history directory, which is what lets a specific stage fail for
+/// a specific history without racing the other tests in the process.
+struct DirectoryGate<'a> {
+    dir: &'a Path,
+}
+
+impl CommitGate for DirectoryGate<'_> {
+    fn pass(&self, stage: IoStage, path: &Path) -> io::Result<()> {
+        match fault_gate(self.dir) {
+            Some(gate) => gate.pass(stage, path),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The fault gate registered for a directory, if any (test builds only).
+#[cfg(test)]
+fn fault_gate(dir: &Path) -> Option<Arc<dyn CommitGate>> {
+    fault::registry().lock().ok()?.get(dir).cloned()
+}
+
+/// Production builds inject no faults.
+#[cfg(not(test))]
+fn fault_gate(_dir: &Path) -> Option<Arc<dyn CommitGate>> {
+    None
+}
+
+/// The test-only fault-injection seam for history writes (#352).
+///
+/// It is keyed by the history directory, so one test can fail, say, the
+/// manifest replacement for its own scratch directory while every other test
+/// (and every other directory) commits normally.
+#[cfg(test)]
+mod fault {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    use hostkit::durable::CommitGate;
+
+    type Registry = Mutex<HashMap<PathBuf, Arc<dyn CommitGate>>>;
+
+    /// The one process-wide registry.
+    pub(super) fn registry() -> &'static Registry {
+        static REGISTRY: OnceLock<Registry> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn lock() -> MutexGuard<'static, HashMap<PathBuf, Arc<dyn CommitGate>>> {
+        registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Register `gate` for `dir`; the guard clears it again on drop.
+    pub(super) fn install(dir: &Path, gate: Arc<dyn CommitGate>) -> Installed {
+        lock().insert(dir.to_path_buf(), gate);
+        Installed {
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    /// Clears the registration it created, even when the test panics.
+    pub(super) struct Installed {
+        dir: PathBuf,
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            lock().remove(&self.dir);
+        }
+    }
+}
 
 /// One written segment: its file and how many rows of the log it holds.
 #[derive(Debug, Clone)]
@@ -100,21 +302,36 @@ pub(crate) struct Segment {
     pub(crate) group_rows: Vec<usize>,
 }
 
-/// One segment as the manifest stores it.
+/// One segment as the manifest stores it: the per-segment integrity record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestSegment {
+    /// The file name, relative to the history directory.
     file: String,
+    /// Rows the segment holds.
     rows: usize,
+    /// Bytes the file occupied when the manifest was written.
     bytes: u64,
+    /// Whether the segment may still be merged into a sealed one.
     sealed: bool,
+    /// Rows in each row group, in read order.
     group_rows: Vec<usize>,
+    /// The schema version the writer recorded; 0 when an older manifest did
+    /// not record one per segment.
+    #[serde(default)]
+    schema_version: u32,
 }
 
 /// The per-directory metadata index.
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
+    /// The manifest shape; see [`MANIFEST_VERSION`].
     version: u32,
+    /// The history schema the listed segments were written with.
+    #[serde(default)]
+    schema_version: u32,
+    /// The message segments, in write order.
     messages: Vec<ManifestSegment>,
+    /// The trajectory segments, in write order.
     trajectory: Vec<ManifestSegment>,
     /// This index was created by scanning a directory that had none, so the
     /// files beside it are the old one-save-one-segment shape. A manifest
@@ -141,6 +358,8 @@ pub(crate) struct History {
     /// This history was first opened without a manifest, i.e. it was written by
     /// the code from before the index existed.
     legacy: bool,
+    /// Whether the live index agrees with the manifest's files (#356).
+    state: IndexState,
     /// The per-directory lock shared by every History opened on this path in
     /// the process: a save and a compaction's swap cannot interleave.
     lock: Arc<RwLock<()>>,
@@ -204,34 +423,158 @@ impl History {
 
     /// Open a history over its directory. Missing files are an empty history.
     ///
-    /// The manifest answers the common case without opening a single Parquet
-    /// footer. A missing or invalid manifest falls back to scanning the
-    /// directory, then writes a fresh one for the next launcher.
+    /// The manifest answers the common case, but every entry is validated
+    /// against its Parquet footer (#356). A stale or missing manifest is
+    /// rebuilt from the footers without touching a data file; rows that cannot
+    /// be accounted for leave the manifest in place and the history in
+    /// [`IndexState::Unavailable`].
+    ///
+    /// Repair is a mutation, so it needs the directory's cross-process lock. A
+    /// lock that is busy means another live process owns the directory: this
+    /// call keeps reading (from a scan) and lets the owner publish the repair.
+    /// The crash-recovery rename of an interrupted swap is part of the repair,
+    /// so it too is left to the live owner when the lock is busy.
     pub(crate) fn open(dir: PathBuf) -> Self {
-        recover_swap(&dir);
-        if let Some(mut index) = read_manifest(&dir) {
-            // Files not in the manifest are the unsealed tail written since the
-            // last commit. They are few (the seal target bounds them), so only
-            // their footers are opened.
-            index
-                .messages
-                .extend(scan_missing(&dir, "msg", &index.listed));
-            index
-                .trajectory
-                .extend(scan_missing(&dir, "traj", &index.listed));
+        let repair_lock = FileLock::try_acquire(&dir).ok();
+        let lock_held = repair_lock.is_some();
+        if lock_held {
+            recover_swap(&dir);
+        }
+        let history = match read_manifest(&dir) {
+            ManifestRead::Valid(index) => Self::with_tail(dir, index),
+            ManifestRead::Unavailable { index, reason } => {
+                let mut history = Self::with_tail(dir, index);
+                history.state = match &history.state {
+                    IndexState::Unavailable { reason: tail } => IndexState::Unavailable {
+                        reason: format!("{reason}; {tail}"),
+                    },
+                    _ => IndexState::Unavailable { reason },
+                };
+                history
+            }
+            ManifestRead::Repair(repair) => Self::rebuild(dir, repair, lock_held),
+        };
+        drop(repair_lock);
+        history
+    }
+
+    /// Build the index from a manifest verdict plus the unlisted tail files.
+    ///
+    /// Files the manifest does not list are the unsealed tail written since the
+    /// last commit. They are few (the seal target bounds them), so only their
+    /// footers are opened. An unreadable tail file is not skipped silently: the
+    /// history reports it as unavailable.
+    fn with_tail(dir: PathBuf, mut index: Index) -> Self {
+        let messages = scan_missing(&dir, "msg", &index.listed);
+        let trajectory = scan_missing(&dir, "traj", &index.listed);
+        let mut skipped = messages.skipped;
+        skipped.extend(trajectory.skipped);
+        index.messages.extend(messages.segments);
+        index.trajectory.extend(trajectory.segments);
+        let mut history = Self::from_segments(dir, index.messages, index.trajectory);
+        history.legacy = index.legacy;
+        if !skipped.is_empty() {
+            history.state = IndexState::Unavailable {
+                reason: format!(
+                    "unreadable segment files in the tail: {}",
+                    skipped.join(", ")
+                ),
+            };
+        }
+        history
+    }
+
+    /// Rebuild the index from Parquet footers after a repairable manifest.
+    ///
+    /// Footers are the only thing read and no data file is modified. When the
+    /// rebuild accounts for every row the manifest promised, a fresh manifest
+    /// is published atomically (when this call holds the cross-process lock).
+    /// When it cannot, the manifest is kept and the history reports
+    /// [`IndexState::Unavailable`] rather than silently shortening the log.
+    fn rebuild(dir: PathBuf, repair: Repair, lock_held: bool) -> Self {
+        let messages = scan_detailed(&dir, "msg", None, true);
+        let trajectory = scan_detailed(&dir, "traj", None, true);
+        let mut skipped = messages.skipped;
+        skipped.extend(trajectory.skipped);
+        let readable_rows = messages
+            .segments
+            .iter()
+            .chain(trajectory.segments.iter())
+            .map(|segment| segment.rows)
+            .sum::<usize>();
+        let promised = repair.promised_rows();
+        let lost = repair.lost && promised.is_some_and(|promised| readable_rows < promised);
+        if lost || !skipped.is_empty() {
+            let mut reason = repair.reason;
+            if lost {
+                if let Some(promised) = promised {
+                    reason.push_str(&format!(
+                        "; the manifest promised {promised} rows and only {readable_rows} are readable"
+                    ));
+                }
+            }
+            if !skipped.is_empty() {
+                reason.push_str(&format!(
+                    "; unreadable segment files: {}",
+                    skipped.join(", ")
+                ));
+            }
+            let index = repair.index.unwrap_or_else(|| Index {
+                messages: messages.segments,
+                trajectory: trajectory.segments,
+                listed: HashSet::new(),
+                legacy: repair.legacy,
+            });
             let mut history = Self::from_segments(dir, index.messages, index.trajectory);
             history.legacy = index.legacy;
+            history.state = IndexState::Unavailable { reason };
             return history;
         }
-        let messages = scan(&dir, "msg");
-        let trajectory = scan(&dir, "traj");
-        let mut history = Self::from_segments(dir, messages, trajectory);
-        // No index at all means the old writer produced these files. Record
-        // that in the index so the compacting decision survives a restart: the
-        // manifest is written here, before anything has rewritten the log.
-        history.legacy = history.rows > 0 || history.trajectory_rows > 0;
-        let _ = history.write_manifest();
+        let mut history = Self::from_segments(dir, messages.segments, trajectory.segments);
+        history.legacy = repair.legacy;
+        if lock_held {
+            let _ = history.write_manifest();
+        }
+        history.state = IndexState::Rebuilt {
+            reason: repair.reason,
+        };
         history
+    }
+
+    /// The live index verdict from opening this history (#356).
+    #[cfg(test)]
+    pub(crate) fn index_state(&self) -> &IndexState {
+        &self.state
+    }
+
+    /// The offline validation report for this history's directory (#356).
+    ///
+    /// The walk reads the manifest and each segment's Parquet footer, never a
+    /// payload, so its cost is bounded by the segment count. It runs under the
+    /// read guard, so it cannot observe a half-finished swap.
+    #[allow(dead_code)] // the diagnostics surface a caller shows; tests prove it
+    pub(crate) fn diagnosis(&self) -> HistoryDiagnosis {
+        let _guard = self.read_guard();
+        let mut report = diagnose(&self.dir);
+        // Keep the live verdict when it is the stronger one: a rebuild that
+        // could not account for the rows is not undone by a later walk.
+        if matches!(self.state, IndexState::Unavailable { .. }) {
+            report.state = self.state.clone();
+        }
+        report
+    }
+
+    /// Take the directory's cross-process lock, waiting at most [`LOCK_BUDGET`].
+    ///
+    /// Every mutation calls this BEFORE it takes the in-process write guard.
+    /// That is the module's one lock order (file lock, then write guard), so two
+    /// writers can never deadlock; a thread that will not get the file lock
+    /// returns the typed [`HistoryError::Locked`] instead of holding the guard.
+    fn lock_directory(&self) -> Result<FileLock> {
+        FileLock::acquire_bounded(&self.dir, LOCK_BUDGET).map_err(|error| match error {
+            DurableError::Locked { path } => anyhow::Error::new(HistoryError::Locked { path }),
+            other => anyhow::Error::new(other),
+        })
     }
 
     /// A snapshot a background thread can read pages from.
@@ -304,6 +647,7 @@ impl History {
             unsealed_trajectory_rows,
             unsealed_trajectory_bytes,
             legacy: false,
+            state: IndexState::Valid,
             cache: RefCell::new(PageCache::new(CACHE_PAGES)),
         }
     }
@@ -315,12 +659,16 @@ impl History {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Write the metadata manifest atomically.
+    /// Write the metadata manifest atomically and durably (level Durable).
     fn write_manifest(&self) -> Result<()> {
         self.write_manifest_with(&self.messages, &self.trajectory)
     }
 
-    /// Write the manifest for a candidate segment list before it is committed.
+    /// Write the manifest for a candidate list before it is committed.
+    ///
+    /// Level: Durable. Publishing is a mutation, so every caller already holds
+    /// the directory's cross-process lock (append/seal, compaction, rewrite) or
+    /// took it for the repair (open).
     fn write_manifest_with(&self, messages: &[Segment], trajectory: &[Segment]) -> Result<()> {
         write_manifest_at(&self.dir, messages, trajectory, self.legacy)
     }
@@ -437,6 +785,7 @@ impl History {
     /// being written. A crash now leaves either the original log or the
     /// finished one, never neither.
     pub(crate) fn rewrite(&mut self, messages: &[ChatMessage]) -> Result<()> {
+        let _file_lock = self.lock_directory()?;
         let lock = Arc::clone(&self.lock);
         let _guard = lock
             .write()
@@ -456,11 +805,15 @@ impl History {
             // builds.
             let mut fresh = History::open(temporary.clone());
             fresh.append(messages)?;
+            // The replacement is private to this build, but publishing its
+            // manifest is still a mutation and takes its own directory lock.
+            let _fresh_lock = fresh.lock_directory()?;
             fresh.write_manifest()?;
             Ok(())
         })();
         if let Err(error) = wrote {
             let _ = fs::remove_dir_all(&temporary);
+            drop_build_lock(&temporary);
             return Err(error);
         }
         let had_live = self.dir.exists();
@@ -477,20 +830,37 @@ impl History {
                 let _ = fs::rename(&backup, &self.dir);
             }
             let _ = fs::remove_dir_all(&temporary);
+            drop_build_lock(&temporary);
             return Err(error).with_context(|| format!("installing {}", self.dir.display()));
         }
         if had_live {
             let _ = fs::remove_dir_all(&backup);
         }
+        // The build directory is gone; its private lock file must not outlive
+        // it, because it sits beside the live history directory.
+        drop_build_lock(&temporary);
         *self = History::open(self.dir.clone());
         Ok(())
     }
 
     /// Append the messages written since the last save, in one segment.
+    ///
+    /// Durability: the message segment and the trajectory segment are committed
+    /// at [`CommitLevel::Durable`] before this returns (see
+    /// docs/reliability-kernel.md section 2), so their contents and the
+    /// directory entries that name them survive a power loss. The manifest is
+    /// only rewritten when the unsealed tail reaches a seal target, and that
+    /// publication is durable too.
+    ///
+    /// Locking: the directory's cross-process file lock is taken first and the
+    /// in-process write guard second, which is the one order every mutation
+    /// uses (#353). Another process holding the lock yields the typed
+    /// [`HistoryError::Locked`] after a bounded wait instead of blocking.
     pub(crate) fn append(&mut self, messages: &[ChatMessage]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
+        let _file_lock = self.lock_directory()?;
         let lock = Arc::clone(&self.lock);
         let _guard = lock
             .write()
@@ -505,8 +875,7 @@ impl History {
         }
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating {}", self.dir.display()))?;
-        let stamp = next_stamp();
-        let path = self.dir.join(format!("msg-{stamp:013}.parquet"));
+        let path = segment_path(&self.dir, "msg");
         let group_rows = write_messages(&path, self.rows, messages)?;
         let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         Arc::make_mut(&mut self.messages).push(Segment {
@@ -531,7 +900,7 @@ impl History {
             })
             .collect();
         if !tools.is_empty() {
-            let path = self.dir.join(format!("traj-{stamp:013}.parquet"));
+            let path = segment_path(&self.dir, "traj");
             let group_rows = write_tools(&path, &tools)?;
             let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
             Arc::make_mut(&mut self.trajectory).push(Segment {
@@ -549,7 +918,13 @@ impl History {
         // A save does not rewrite the whole manifest: the new segment is an
         // unlisted tail file that the next open discovers. Sealing is the only
         // operation that commits a manifest, so a save stays O(new rows).
-        let _ = self.seal_tail();
+        //
+        // A history whose index is unavailable does not seal: publishing a
+        // manifest from the readable tail would replace the manifest that still
+        // names the missing rows (#356).
+        if !matches!(self.state, IndexState::Unavailable { .. }) {
+            let _ = self.seal_tail();
+        }
         self.cache.borrow_mut().clear();
         Ok(())
     }
@@ -596,7 +971,7 @@ impl History {
         let start = tail[0].start;
         let messages = read_range(tail, start, rows)?;
         let old: Vec<PathBuf> = tail.iter().map(|segment| segment.path.clone()).collect();
-        let path = self.dir.join(format!("msg-{:013}.parquet", next_stamp()));
+        let path = segment_path(&self.dir, "msg");
         let group_rows = write_messages(&path, start, &messages)?;
         let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         let mut candidate = self.messages[..first].to_vec();
@@ -656,7 +1031,7 @@ impl History {
         let start = tail[0].start;
         let tools = read_tools_range(tail, start, rows)?;
         let old: Vec<PathBuf> = tail.iter().map(|segment| segment.path.clone()).collect();
-        let path = self.dir.join(format!("traj-{:013}.parquet", next_stamp()));
+        let path = segment_path(&self.dir, "traj");
         let group_rows = write_tools(&path, &tools)?;
         let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         let mut candidate = self.trajectory[..first].to_vec();
@@ -696,11 +1071,25 @@ impl History {
     /// are written. A compacted history is therefore already sealed: calling
     /// this again is a no-op.
     pub(crate) fn compact(&mut self) -> Result<Compaction> {
+        // The whole compaction - build, swap and marker - runs under the
+        // directory's cross-process lock. A peer that is already rewriting this
+        // history is not an error: compaction is an optimization, so this call
+        // stands down (Busy) instead of waiting on a possibly long rewrite.
+        let _file_lock = match self.lock_directory() {
+            Ok(lock) => lock,
+            Err(error) if is_locked(&error) => return Ok(Compaction::Busy),
+            Err(error) => return Err(error),
+        };
+        // A history whose rows cannot be accounted for is not rewritten: the
+        // rebuild would drop exactly the rows that are missing (#356).
+        if matches!(self.state, IndexState::Unavailable { .. }) {
+            return Ok(Compaction::Noop);
+        }
         // A seal that died between archiving and committing leaves .old files
-        // nothing lists; they are debris either way. The sweep removes
-        // `*.parquet.tmp` too, so it must run under the write lock: an append
-        // writes its segment to that exact temp name before renaming it, and
-        // sweeping without the lock deleted a save that was in flight.
+        // nothing lists; they are debris either way. The sweep removes temp and
+        // archive debris too, so it must run under both locks: every temp name
+        // carries a pid and a sequence, and a live writer holds the locks, so
+        // anything it finds here belongs to a process that is gone.
         {
             let lock = Arc::clone(&self.lock);
             let _guard = lock
@@ -836,7 +1225,16 @@ pub(crate) struct ToolRow {
     pub(crate) ms: Option<u64>,
 }
 
-/// Every segment of one kind in a session directory, in write order.
+/// One process-wide sequence for the names this module creates.
+///
+/// Segment ids, archive names and debris names carry it beside the pid, so two
+/// processes (and a clock that jumps backwards) cannot choose the same name.
+static NAME_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A millisecond stamp that never repeats within this process.
+///
+/// Wall clock alone is not enough: two saves in one millisecond, or a clock
+/// that steps backwards, would otherwise pick the same segment id.
 fn next_stamp() -> u64 {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
@@ -853,11 +1251,57 @@ fn next_stamp() -> u64 {
     }
 }
 
+/// A segment path no existing file occupies.
+///
+/// The name is `prefix-<stamp:013>-<pid:05>-<seq:03>.parquet`. The pid and the
+/// per-process sequence are what keep two processes apart; if the chosen path
+/// already exists (a copied directory, a clock anomaly) the sequence is bumped
+/// rather than letting the commit rename over an existing segment.
+fn segment_path(dir: &Path, prefix: &str) -> PathBuf {
+    loop {
+        let sequence = NAME_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "{prefix}-{:013}-{:05}-{:03}.parquet",
+            next_stamp(),
+            std::process::id(),
+            sequence
+        ));
+        if !path.exists() {
+            return path;
+        }
+    }
+}
+
+/// A pid and a per-process sequence for one debris name.
+fn unique_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NAME_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// The numeric first field of a segment name, legacy or current shape.
+///
+/// `msg-999.parquet` gives 999 and `msg-0000000000123-1234-000.parquet` gives
+/// 123, so a migrated history and the segments written after it still sort in
+/// write order. u64::MAX marks a name with no numeric first field, which sorts
+/// last and makes the manifest validator reject the entry instead of guessing.
 fn stamp_of(name: &str) -> u64 {
-    name.rsplit_once('-')
-        .map(|(_, rest)| rest.trim_end_matches(".parquet"))
+    let stem = name.strip_suffix(".parquet").unwrap_or(name);
+    let rest = stem.split_once('-').map_or(stem, |(_, rest)| rest);
+    rest.split('-')
+        .next()
         .and_then(|stamp| stamp.parse().ok())
         .unwrap_or(u64::MAX)
+}
+
+/// Whether an error is the typed "another process holds the lock" failure.
+fn is_locked(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<HistoryError>(),
+        Some(HistoryError::Locked { .. })
+    )
 }
 
 /// Move a seal's old files aside before its manifest is installed.
@@ -866,10 +1310,7 @@ fn stamp_of(name: &str) -> u64 {
 /// old `.parquet` files as unlisted tail files, which the next open would read
 /// as duplicate rows. `.parquet.old` is ignored by the scanners.
 fn archive_files(old: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let archived: Vec<PathBuf> = old
-        .iter()
-        .map(|path| path.with_extension("parquet.old"))
-        .collect();
+    let archived: Vec<PathBuf> = old.iter().map(|path| archive_path(path)).collect();
     for (index, (from, to)) in old.iter().zip(archived.iter()).enumerate() {
         if let Err(error) = fs::rename(from, to) {
             for (from, to) in old.iter().zip(archived.iter()).take(index) {
@@ -879,6 +1320,18 @@ fn archive_files(old: &[PathBuf]) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(archived)
+}
+
+/// The name one old segment is moved aside to.
+///
+/// `.msg-000001.parquet.old-<pid>-<seq>` is ignored by the scanners and unique
+/// per process, so a second process's debris never shares it.
+fn archive_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.old-{}", unique_suffix()))
 }
 
 /// Undo `archive_files` after a failed manifest commit.
@@ -908,6 +1361,15 @@ fn history_lock(dir: &Path) -> Arc<RwLock<()>> {
     lock
 }
 
+/// Remove the lock file of a private build directory.
+///
+/// A build sibling is named with the pid, so only this process can have locked
+/// it; the lock file is not shared with a live writer and must not outlive the
+/// directory, or it becomes debris beside the live history directory.
+fn drop_build_lock(build: &Path) {
+    let _ = fs::remove_file(sibling(build, "lock"));
+}
+
 /// A path beside one history directory: the sibling the swap builds in.
 fn sibling(dir: &Path, suffix: &str) -> PathBuf {
     let name = dir
@@ -924,10 +1386,11 @@ fn sweep_archived(dir: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".parquet.old")
+        let debris = name.ends_with(".parquet.old")
             || name.ends_with(".parquet.tmp")
-            || (name.starts_with(".manifest-") && name.ends_with(".tmp"))
-        {
+            || (name.starts_with('.') && (name.contains(".tmp-") || name.contains(".old-")))
+            || (name.starts_with(".manifest-") && name.ends_with(".tmp"));
+        if debris {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -943,8 +1406,15 @@ fn sweep_siblings(dir: &Path, suffix: &str) {
         return;
     };
     for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            let _ = fs::remove_dir_all(entry.path());
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        } else {
+            // A killed build can leave only its lock file behind.
+            let _ = fs::remove_file(&path);
         }
     }
 }
@@ -971,7 +1441,12 @@ fn sweep_stale_siblings(dir: &Path, suffix: &str) {
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > COMPACTION_STALE);
         if stale {
-            let _ = fs::remove_dir_all(entry.path());
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
         }
     }
 }
@@ -1083,7 +1558,7 @@ fn compact_messages(source: &History, dir: &Path) -> Result<Vec<Segment>> {
         if rows.is_empty() {
             break;
         }
-        let path = dir.join(format!("msg-{:013}.parquet", next_stamp()));
+        let path = segment_path(dir, "msg");
         let group_rows = write_messages(&path, from, &rows)?;
         let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         segments.push(Segment {
@@ -1129,7 +1604,7 @@ fn compact_trajectory(source: &History, dir: &Path) -> Result<Vec<Segment>> {
         if rows.is_empty() {
             break;
         }
-        let path = dir.join(format!("traj-{:013}.parquet", next_stamp()));
+        let path = segment_path(dir, "traj");
         let group_rows = write_tools(&path, &rows)?;
         let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         segments.push(Segment {
@@ -1155,7 +1630,13 @@ fn reindex(segments: &mut [Segment]) -> usize {
     start
 }
 
-/// Write the metadata index for a directory atomically.
+/// Write the metadata index for a directory atomically and durably.
+///
+/// Level: Durable (docs/reliability-kernel.md section 2). The bytes go through
+/// [durable::commit], so the manifest is synced, renamed over the previous one
+/// and its directory entry is synced; a failure at any stage leaves the
+/// previous manifest intact. Callers hold the directory's cross-process lock
+/// because publishing an index is a mutation (#353).
 fn write_manifest_at(
     dir: &Path,
     messages: &[Segment],
@@ -1168,16 +1649,15 @@ fn write_manifest_at(
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let manifest = Manifest {
         version: MANIFEST_VERSION,
+        schema_version: SCHEMA_VERSION,
         messages: messages.iter().map(manifest_segment).collect(),
         trajectory: trajectory.iter().map(manifest_segment).collect(),
         legacy,
     };
-    let temporary = dir.join(format!(".manifest-{}.tmp", std::process::id()));
     let bytes = serde_json::to_vec(&manifest)?;
-    fs::write(&temporary, bytes).with_context(|| format!("writing {}", temporary.display()))?;
-    fs::rename(&temporary, dir.join(MANIFEST))
-        .with_context(|| format!("installing {}", MANIFEST))?;
-    Ok(())
+    let path = dir.join(MANIFEST);
+    durable::commit(&path, &bytes, Privacy::Inherit, &DirectoryGate { dir })
+        .map_err(|error| anyhow::anyhow!("installing {}: {error}", path.display()))
 }
 
 /// What a directory's index says: both segment lists, the files it names and
@@ -1201,110 +1681,524 @@ fn manifest_segment(segment: &Segment) -> ManifestSegment {
         bytes: segment.bytes,
         sealed: segment.sealed,
         group_rows: segment.group_rows.clone(),
+        schema_version: SCHEMA_VERSION,
     }
 }
 
-/// Read and validate the manifest. Any inconsistency falls back to a scan.
-fn read_manifest(dir: &Path) -> Option<Index> {
-    let bytes = fs::read(dir.join(MANIFEST)).ok()?;
-    let manifest: Manifest = serde_json::from_slice(&bytes).ok()?;
-    if manifest.version != MANIFEST_VERSION {
-        return None;
+/// The verdict of reading the manifest against the segment files on disk.
+enum ManifestRead {
+    /// Every listed segment agrees with its footer.
+    Valid(Index),
+    /// The manifest cannot be trusted; the index must be rebuilt from footers.
+    Repair(Repair),
+    /// A listed segment exists but carries a column set this reader does not
+    /// know; the manifest is kept and reads of those rows fail explicitly.
+    Unavailable {
+        /// The manifest's own index, kept as the promise.
+        index: Index,
+        /// What makes the rows unreadable.
+        reason: String,
+    },
+}
+
+/// A repairable manifest problem: the files are the truth, the index is stale.
+struct Repair {
+    /// Why the manifest could not be trusted.
+    reason: String,
+    /// The legacy flag the manifest carried (or that the directory is old).
+    legacy: bool,
+    /// The manifest's own index, used to keep its promise when the rebuild
+    /// cannot account for the rows it listed.
+    index: Option<Index>,
+    /// A listed segment is missing or unreadable, so the rebuild has to prove
+    /// that its rows still exist somewhere before shortening the log.
+    lost: bool,
+}
+
+impl Repair {
+    /// Rows the manifest promised, when it could be parsed.
+    fn promised_rows(&self) -> Option<usize> {
+        self.index.as_ref().map(|index| {
+            index
+                .messages
+                .iter()
+                .chain(index.trajectory.iter())
+                .map(|segment| segment.rows)
+                .sum()
+        })
+    }
+}
+
+/// The verdict for one manifest list.
+enum ListCheck {
+    /// The list agrees with the files.
+    Agree,
+    /// The manifest's metadata is stale; a rebuild from the footers fixes it.
+    Rebuild(String),
+    /// A listed segment is missing or unreadable.
+    Lost(String),
+    /// A listed segment carries a schema version this reader does not know.
+    Unsupported(String),
+}
+
+/// Read the manifest and validate it against the segment files (#356).
+///
+/// Bounded cost: the manifest plus one Parquet footer per listed segment, never
+/// a payload decode. The manifest still saves decoding, not the footer reads.
+fn read_manifest(dir: &Path) -> ManifestRead {
+    let Some(manifest) = load_manifest(dir) else {
+        if !has_segments(dir) {
+            return ManifestRead::Valid(empty_index());
+        }
+        return ManifestRead::Repair(Repair {
+            reason: "the manifest is missing or unreadable".to_string(),
+            legacy: true,
+            index: None,
+            lost: false,
+        });
+    };
+    if manifest.version == 0 || manifest.version > MANIFEST_VERSION {
+        return ManifestRead::Repair(Repair {
+            reason: format!(
+                "manifest version {} is newer than the {} this build writes",
+                manifest.version, MANIFEST_VERSION
+            ),
+            legacy: manifest.legacy,
+            index: None,
+            lost: false,
+        });
+    }
+    if manifest.schema_version > SCHEMA_VERSION {
+        return ManifestRead::Repair(Repair {
+            reason: format!(
+                "manifest schema version {} is newer than the {} this build reads",
+                manifest.schema_version, SCHEMA_VERSION
+            ),
+            legacy: manifest.legacy,
+            index: None,
+            lost: false,
+        });
+    }
+    let mut listed = HashSet::new();
+    let mut rebuild = None;
+    let mut lost = None;
+    let mut unsupported = None;
+    for (prefix, entries) in [
+        ("msg", manifest.messages.as_slice()),
+        ("traj", manifest.trajectory.as_slice()),
+    ] {
+        match check_list(dir, prefix, entries, &mut listed) {
+            ListCheck::Agree => {}
+            ListCheck::Rebuild(reason) => {
+                rebuild.get_or_insert(reason);
+            }
+            ListCheck::Lost(reason) => {
+                lost.get_or_insert(reason);
+            }
+            ListCheck::Unsupported(reason) => {
+                unsupported.get_or_insert(reason);
+            }
+        }
     }
     let legacy = manifest.legacy;
-    let mut listed = HashSet::new();
-    let mut segments = |entries: Vec<ManifestSegment>| -> Option<Vec<Segment>> {
-        let mut segments = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let path = dir.join(&entry.file);
-            let bytes = fs::metadata(&path).ok()?.len();
-            if entry.rows != entry.group_rows.iter().sum::<usize>() {
-                return None;
-            }
-            listed.insert(entry.file.clone());
-            segments.push(Segment {
-                path,
-                start: 0,
-                rows: entry.rows,
-                bytes,
-                sealed: entry.sealed,
-                group_rows: entry.group_rows,
-            });
+    let index = index_from_manifest(dir, &manifest, listed);
+    if let Some(reason) = unsupported {
+        return ManifestRead::Unavailable { index, reason };
+    }
+    if let Some(reason) = lost {
+        return ManifestRead::Repair(Repair {
+            reason,
+            legacy,
+            index: Some(index),
+            lost: true,
+        });
+    }
+    if let Some(reason) = rebuild {
+        return ManifestRead::Repair(Repair {
+            reason,
+            legacy,
+            index: Some(index),
+            lost: false,
+        });
+    }
+    ManifestRead::Valid(index)
+}
+
+/// Validate one manifest list against the segment files.
+fn check_list(
+    dir: &Path,
+    prefix: &str,
+    entries: &[ManifestSegment],
+    listed: &mut HashSet<String>,
+) -> ListCheck {
+    let mut previous: Option<(u64, &str)> = None;
+    for entry in entries {
+        let name = entry.file.as_str();
+        let foreign = name.contains('/')
+            || name.contains('\\')
+            || !name.starts_with(prefix)
+            || !name.ends_with(".parquet");
+        let stamp = stamp_of(name);
+        if foreign || stamp == u64::MAX {
+            return ListCheck::Rebuild(format!(
+                "the manifest lists {name:?}, which is not a {prefix} segment name"
+            ));
         }
-        Some(segments)
+        if !listed.insert(entry.file.clone()) {
+            return ListCheck::Rebuild(format!("the manifest lists {name} twice"));
+        }
+        let key = (stamp, name);
+        if let Some(previous) = previous {
+            if key <= previous {
+                return ListCheck::Rebuild(format!("the manifest lists {name} out of order"));
+            }
+        }
+        previous = Some(key);
+        if entry.rows == 0
+            || entry.group_rows.is_empty()
+            || entry.group_rows.iter().sum::<usize>() != entry.rows
+        {
+            return ListCheck::Rebuild(format!("the manifest's row counts are stale for {name}"));
+        }
+        let path = dir.join(name);
+        let Some(footer) = footer_facts(&path) else {
+            return if path.exists() {
+                ListCheck::Lost(format!("segment {name} cannot be read"))
+            } else {
+                ListCheck::Lost(format!("segment {name} is missing"))
+            };
+        };
+        if !footer.schema_supported() {
+            return ListCheck::Unsupported(format!(
+                "segment {name} carries unsupported schema version {}",
+                footer.schema.unwrap_or(0)
+            ));
+        }
+        if footer.rows == 0 {
+            // The file exists but holds no rows while the manifest promises
+            // some: those rows cannot be accounted for, so this is not a
+            // repairable stale count.
+            return ListCheck::Lost(format!("segment {name} reports no rows"));
+        }
+        if footer.rows != entry.rows
+            || footer.group_rows != entry.group_rows
+            || footer.bytes != entry.bytes
+        {
+            return ListCheck::Rebuild(format!("the manifest's numbers are stale for {name}"));
+        }
+        let recorded = entry.schema_version;
+        let actual = footer.schema.unwrap_or(LEGACY_SCHEMA_VERSION);
+        if recorded != 0 && recorded != actual {
+            return ListCheck::Rebuild(format!(
+                "the manifest records schema {recorded} for {name} but the file carries {actual}"
+            ));
+        }
+    }
+    ListCheck::Agree
+}
+
+/// Parse the manifest without validating it against the files.
+fn load_manifest(dir: &Path) -> Option<Manifest> {
+    let bytes = fs::read(dir.join(MANIFEST)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Whether the directory holds any file that names a segment.
+fn has_segments(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
     };
-    let messages = segments(manifest.messages)?;
-    let trajectory = segments(manifest.trajectory)?;
-    Some(Index {
-        messages,
-        trajectory,
-        listed,
-        legacy,
+    entries.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().to_string();
+        (name.starts_with("msg-") || name.starts_with("traj-")) && name.ends_with(".parquet")
     })
 }
 
+/// An index with no segments.
+fn empty_index() -> Index {
+    Index {
+        messages: Vec::new(),
+        trajectory: Vec::new(),
+        listed: HashSet::new(),
+        legacy: false,
+    }
+}
+
+/// The manifest's own index, used as the promise even when its numbers are stale.
+fn index_from_manifest(dir: &Path, manifest: &Manifest, listed: HashSet<String>) -> Index {
+    let segments = |entries: &[ManifestSegment]| {
+        entries
+            .iter()
+            .map(|entry| Segment {
+                path: dir.join(&entry.file),
+                start: 0,
+                rows: entry.rows,
+                bytes: entry.bytes,
+                sealed: entry.sealed,
+                group_rows: entry.group_rows.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    Index {
+        messages: segments(&manifest.messages),
+        trajectory: segments(&manifest.trajectory),
+        listed,
+        legacy: manifest.legacy,
+    }
+}
+
+/// The footer facts one Parquet segment carries, read without decoding a payload.
+struct FooterFacts {
+    /// Rows the footer reports.
+    rows: usize,
+    /// Rows per row group, in read order.
+    group_rows: Vec<usize>,
+    /// The file's length in bytes.
+    bytes: u64,
+    /// The recorded `bsh.schema`; `None` for a file written before it existed.
+    schema: Option<u32>,
+}
+
+impl FooterFacts {
+    /// Whether this reader can decode the file's column set.
+    fn schema_supported(&self) -> bool {
+        match self.schema {
+            None => true,
+            Some(version) => version == SCHEMA_VERSION,
+        }
+    }
+}
+
+/// Read a segment's Parquet footer: row-group counts, byte length and the
+/// recorded schema version. No column data is read.
+fn footer_facts(path: &Path) -> Option<FooterFacts> {
+    let file = fs::File::open(path).ok()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+    let metadata = builder.metadata();
+    let groups = metadata.num_row_groups();
+    let group_rows: Vec<usize> = (0..groups)
+        .map(|group| metadata.row_group(group).num_rows() as usize)
+        .collect();
+    let schema = metadata
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|values| {
+            values
+                .iter()
+                .find(|value| value.key == SCHEMA_KEY)
+                .and_then(|value| value.value.as_deref())
+                .and_then(|value| value.parse().ok())
+        });
+    let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    Some(FooterFacts {
+        rows: group_rows.iter().sum(),
+        group_rows,
+        bytes,
+        schema,
+    })
+}
+
+/// What a directory scan found.
+struct Scanned {
+    /// The readable segments, in write order.
+    segments: Vec<Segment>,
+    /// Names of files that look like segments but cannot be read or decoded.
+    skipped: Vec<String>,
+}
+
+/// Every segment of one kind in a session directory, in write order.
+#[cfg(test)]
 fn scan(dir: &Path, prefix: &str) -> Vec<Segment> {
-    scan_where(dir, prefix, None, true)
+    scan_detailed(dir, prefix, None, true).segments
 }
 
 /// Scan only the files a manifest does not list, as the unsealed tail.
-fn scan_missing(dir: &Path, prefix: &str, listed: &HashSet<String>) -> Vec<Segment> {
-    scan_where(dir, prefix, Some(listed), false)
+fn scan_missing(dir: &Path, prefix: &str, listed: &HashSet<String>) -> Scanned {
+    scan_detailed(dir, prefix, Some(listed), false)
 }
 
-fn scan_where(
+/// Scan one segment list, sorting by the numeric stamp and keeping every file
+/// that cannot be read as a skip instead of dropping it silently (#356).
+fn scan_detailed(
     dir: &Path,
     prefix: &str,
     listed: Option<&HashSet<String>>,
     sealed: bool,
-) -> Vec<Segment> {
-    let mut segments: Vec<Segment> = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return segments;
+) -> Scanned {
+    let mut scanned = Scanned {
+        segments: Vec::new(),
+        skipped: Vec::new(),
     };
-    let mut paths: Vec<(String, PathBuf)> = entries
+    for (name, path) in segment_files(dir, prefix) {
+        if listed.is_some_and(|listed| listed.contains(&name)) {
+            continue;
+        }
+        let Some(footer) = footer_facts(&path) else {
+            scanned.skipped.push(name);
+            continue;
+        };
+        if !footer.schema_supported() {
+            scanned.skipped.push(name);
+            continue;
+        }
+        if footer.rows == 0 {
+            continue;
+        }
+        scanned.segments.push(Segment {
+            path,
+            start: 0,
+            rows: footer.rows,
+            bytes: footer.bytes,
+            sealed,
+            group_rows: footer.group_rows,
+        });
+    }
+    scanned
+}
+
+/// The segment files of one kind in a directory, in write order.
+///
+/// The key is the numeric stamp with the name as the tie-break, so a legacy
+/// three-digit name and a millisecond name sort correctly: text order alone put
+/// migrated history after the pages that followed it.
+fn segment_files(dir: &Path, prefix: &str) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(String, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !(name.starts_with(prefix) && name.ends_with(".parquet")) {
-                return None;
+            if name.starts_with(prefix) && name.ends_with(".parquet") {
+                Some((name, entry.path()))
+            } else {
+                None
             }
-            if listed.is_some_and(|listed| listed.contains(&name)) {
-                return None;
-            }
-            Some((name.clone(), entry.path()))
         })
         .collect();
-    // Numeric, not lexicographic: a legacy three-digit name and a millisecond
-    // name sort wrongly by text once the epoch digit passes 9, which put
-    // migrated history after the pages that followed it.
-    paths.sort_by_key(|(name, _)| stamp_of(name));
-    for (_, path) in paths {
-        let Ok(file) = fs::File::open(&path) else {
-            continue;
-        };
-        let Ok(builder) = ParquetRecordBatchReaderBuilder::try_new(file) else {
-            continue;
-        };
-        let groups = builder.metadata().num_row_groups();
-        let group_rows: Vec<usize> = (0..groups)
-            .map(|group| builder.metadata().row_group(group).num_rows() as usize)
-            .collect();
-        let rows: usize = group_rows.iter().sum();
-        if rows == 0 {
-            continue;
+    files.sort_by(|a, b| (stamp_of(&a.0), &a.0).cmp(&(stamp_of(&b.0), &b.0)));
+    files
+}
+
+/// Walk a history directory and report per-segment validity (#356).
+///
+/// This is the offline validation path: it reads the manifest and each
+/// segment's Parquet footer, never a payload, so its cost is bounded by the
+/// segment count. The `findings` list is where #355 adds malformed-column
+/// findings; today it reports the manifest, file, row-count and schema
+/// problems this module can prove from metadata alone.
+#[allow(dead_code)] // the diagnostics surface a caller shows; tests prove it
+pub(crate) fn diagnose(dir: &Path) -> HistoryDiagnosis {
+    let mut findings = Vec::new();
+    let mut unavailable = false;
+    let manifest = load_manifest(dir);
+    let mut expected: HashMap<String, ManifestSegment> = HashMap::new();
+    if let Some(manifest) = &manifest {
+        if manifest.version == 0 || manifest.version > MANIFEST_VERSION {
+            findings.push(format!(
+                "manifest version {} is not supported",
+                manifest.version
+            ));
         }
-        let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        segments.push(Segment {
-            path,
-            start: 0,
-            rows,
-            bytes,
-            sealed,
-            group_rows,
-        });
+        if manifest.schema_version > SCHEMA_VERSION {
+            findings.push(format!(
+                "manifest schema version {} is not supported",
+                manifest.schema_version
+            ));
+        }
+        for (prefix, entries) in [("msg", &manifest.messages), ("traj", &manifest.trajectory)] {
+            let mut previous: Option<(u64, &str)> = None;
+            for entry in entries {
+                if !entry.file.starts_with(prefix) || !entry.file.ends_with(".parquet") {
+                    findings.push(format!("{prefix} lists a foreign name {:?}", entry.file));
+                }
+                let key = (stamp_of(&entry.file), entry.file.as_str());
+                if let Some(previous) = previous {
+                    if key <= previous {
+                        findings.push(format!("{prefix} lists {} out of order", entry.file));
+                    }
+                }
+                previous = Some(key);
+                let name = entry.file.clone();
+                if expected.insert(name.clone(), entry.clone()).is_some() {
+                    findings.push(format!("the manifest lists {name} twice"));
+                }
+            }
+        }
+    } else if has_segments(dir) {
+        findings.push("the manifest is missing or unreadable".to_string());
     }
-    segments
+    let mut segments = Vec::new();
+    for (kind, prefix) in [("msg", "msg"), ("traj", "traj")] {
+        for (name, path) in segment_files(dir, prefix) {
+            let listed = expected.get(&name);
+            let mut diagnosis = SegmentDiagnosis {
+                file: name.clone(),
+                kind,
+                listed: listed.is_some(),
+                readable: false,
+                rows: None,
+                schema: None,
+                schema_supported: false,
+                consistent: true,
+            };
+            match footer_facts(&path) {
+                Some(footer) => {
+                    diagnosis.readable = true;
+                    diagnosis.rows = Some(footer.rows);
+                    diagnosis.schema = footer.schema;
+                    diagnosis.schema_supported = footer.schema_supported();
+                    if !diagnosis.schema_supported {
+                        unavailable = true;
+                        findings.push(format!(
+                            "{name} carries unsupported schema version {}",
+                            footer.schema.unwrap_or(0)
+                        ));
+                    }
+                    if let Some(listed) = listed {
+                        diagnosis.consistent = listed.rows == footer.rows
+                            && listed.group_rows == footer.group_rows
+                            && listed.bytes == footer.bytes;
+                        if !diagnosis.consistent {
+                            findings.push(format!("the manifest's numbers are stale for {name}"));
+                        }
+                        if footer.rows == 0 && listed.rows > 0 {
+                            unavailable = true;
+                            findings.push(format!(
+                                "{name} reports no rows but the manifest lists {}",
+                                listed.rows
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    unavailable = true;
+                    diagnosis.consistent = false;
+                    findings.push(format!("{name} cannot be read"));
+                }
+            }
+            segments.push(diagnosis);
+        }
+    }
+    for name in expected.keys() {
+        if !segments.iter().any(|segment| &segment.file == name) {
+            unavailable = true;
+            findings.push(format!("the manifest lists {name}, which is missing"));
+        }
+    }
+    let reason = findings.join("; ");
+    let state = if unavailable {
+        IndexState::Unavailable { reason }
+    } else if findings.is_empty() {
+        IndexState::Valid
+    } else {
+        IndexState::Rebuilt { reason }
+    };
+    HistoryDiagnosis {
+        state,
+        segments,
+        findings,
+    }
 }
 
 /// Read a global row range across segments and short row groups.
@@ -1429,41 +2323,65 @@ fn tool_schema() -> Arc<Schema> {
 }
 
 fn writer_props() -> WriterProperties {
-    // Compression is the one thing the writer properties are for; the row
-    // group boundaries come from flush(), below, because a row group is the
-    // page this store reads by.
+    // Compression is one purpose; the row group boundaries come from flush(),
+    // because a row group is the page this store reads by. The key/value
+    // metadata names the column set, so a reader can reject a schema it does
+    // not know instead of guessing (#356).
     WriterProperties::builder()
         .set_compression(parquet::basic::Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+            SCHEMA_KEY.to_string(),
+            SCHEMA_VERSION.to_string(),
+        )]))
         .build()
 }
 
-/// Write one segment, in row groups of at most PAGE rows.
+/// The fault-injection gate for the directory that holds `path` (#352).
+///
+/// Production registers no faults. Tests register one gate per history
+/// directory, so a specific stage fails for one history without racing the
+/// rest of the suite.
+fn directory_gate(path: &Path) -> DirectoryGate<'_> {
+    DirectoryGate {
+        dir: path.parent().unwrap_or_else(|| Path::new("")),
+    }
+}
+
+/// Write one message segment, in row groups of at most PAGE rows.
+///
+/// Level: Durable (docs/reliability-kernel.md section 2). The Arrow writer
+/// streams straight into the temp file the commit kernel created with
+/// create_new(true), so a 64 MB segment is never buffered here; the kernel
+/// then syncs the file, hardens it, renames it into place and syncs the parent
+/// directory. A failure at any stage removes the temp and leaves the previous
+/// segments untouched.
 ///
 /// Returns the rows in each group so the reader can locate a global row across
 /// short segments instead of assuming every group is PAGE rows.
 fn write_messages(path: &Path, base: usize, messages: &[ChatMessage]) -> Result<Vec<usize>> {
-    let temporary = path.with_extension("parquet.tmp");
-    let file = fs::File::create(&temporary)
-        .with_context(|| format!("creating {}", temporary.display()))?;
-    let mut writer =
-        ArrowWriter::try_new(BufWriter::new(file), message_schema(), Some(writer_props()))?;
     let mut group_rows = Vec::new();
-    let outcome = (|| -> Result<Vec<usize>> {
-        for chunk in message_chunks(messages) {
-            writer.write(&message_batch(chunk, base)?)?;
-            // A flush closes the row group: one page per group, which is what
-            // the reader addresses.
-            writer.flush()?;
-            group_rows.push(chunk.len());
-        }
-        writer.close()?;
-        fs::rename(&temporary, path).with_context(|| format!("installing {}", path.display()))?;
-        Ok(group_rows)
-    })();
-    if outcome.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    outcome
+    durable::commit_stream(
+        path,
+        Privacy::Inherit,
+        CommitLevel::Durable,
+        &directory_gate(path),
+        |file| {
+            let mut writer = ArrowWriter::try_new(file, message_schema(), Some(writer_props()))
+                .map_err(io::Error::other)?;
+            for chunk in message_chunks(messages) {
+                writer
+                    .write(&message_batch(chunk, base).map_err(io::Error::other)?)
+                    .map_err(io::Error::other)?;
+                // A flush closes the row group: one page per group, which is
+                // what the reader addresses.
+                writer.flush().map_err(io::Error::other)?;
+                group_rows.push(chunk.len());
+            }
+            writer.close().map_err(io::Error::other)?;
+            Ok(())
+        },
+    )?;
+    Ok(group_rows)
 }
 
 /// Split messages into row groups bounded by both rows and approximate bytes.
@@ -1571,55 +2489,60 @@ fn message_batch(messages: &[ChatMessage], base: usize) -> Result<RecordBatch> {
     )?)
 }
 
+/// Write one trajectory segment at [CommitLevel::Durable].
+///
+/// Same pipeline and promise as [write_messages]: the Arrow writer streams into
+/// the kernel's temp file, and the kernel syncs, renames and syncs the parent
+/// directory before this returns (docs/reliability-kernel.md section 2).
 fn write_tools(path: &Path, tools: &[ToolRow]) -> Result<Vec<usize>> {
-    let temporary = path.with_extension("parquet.tmp");
-    let file = fs::File::create(&temporary)
-        .with_context(|| format!("creating {}", temporary.display()))?;
-    let mut writer =
-        ArrowWriter::try_new(BufWriter::new(file), tool_schema(), Some(writer_props()))?;
     let mut group_rows = Vec::new();
-    for (chunk_index, chunk) in tool_chunks(tools).into_iter().enumerate() {
-        let mut index = Int64Builder::with_capacity(chunk.len());
-        let mut name = StringBuilder::new();
-        let mut args = StringBuilder::new();
-        let mut output = StringBuilder::new();
-        let mut ms = UInt64Builder::new();
-        for (offset, tool) in chunk.iter().enumerate() {
-            index.append_value((chunk_index * PAGE + offset) as i64);
-            name.append_value(&tool.name);
-            args.append_value(&tool.args);
-            match &tool.output {
-                Some(value) => output.append_value(value),
-                None => output.append_null(),
+    durable::commit_stream(
+        path,
+        Privacy::Inherit,
+        CommitLevel::Durable,
+        &directory_gate(path),
+        |file| {
+            let mut writer = ArrowWriter::try_new(file, tool_schema(), Some(writer_props()))
+                .map_err(io::Error::other)?;
+            for (chunk_index, chunk) in tool_chunks(tools).into_iter().enumerate() {
+                let mut index = Int64Builder::with_capacity(chunk.len());
+                let mut name = StringBuilder::new();
+                let mut args = StringBuilder::new();
+                let mut output = StringBuilder::new();
+                let mut ms = UInt64Builder::new();
+                for (offset, tool) in chunk.iter().enumerate() {
+                    index.append_value((chunk_index * PAGE + offset) as i64);
+                    name.append_value(&tool.name);
+                    args.append_value(&tool.args);
+                    match &tool.output {
+                        Some(value) => output.append_value(value),
+                        None => output.append_null(),
+                    }
+                    match tool.ms {
+                        Some(value) => ms.append_value(value),
+                        None => ms.append_null(),
+                    }
+                }
+                let batch = RecordBatch::try_new(
+                    tool_schema(),
+                    vec![
+                        Arc::new(index.finish()) as ArrayRef,
+                        Arc::new(name.finish()),
+                        Arc::new(args.finish()),
+                        Arc::new(output.finish()),
+                        Arc::new(ms.finish()),
+                    ],
+                )
+                .map_err(io::Error::other)?;
+                writer.write(&batch).map_err(io::Error::other)?;
+                writer.flush().map_err(io::Error::other)?;
+                group_rows.push(chunk.len());
             }
-            match tool.ms {
-                Some(value) => ms.append_value(value),
-                None => ms.append_null(),
-            }
-        }
-        let batch = RecordBatch::try_new(
-            tool_schema(),
-            vec![
-                Arc::new(index.finish()) as ArrayRef,
-                Arc::new(name.finish()),
-                Arc::new(args.finish()),
-                Arc::new(output.finish()),
-                Arc::new(ms.finish()),
-            ],
-        )?;
-        writer.write(&batch)?;
-        writer.flush()?;
-        group_rows.push(chunk.len());
-    }
-    let outcome = (|| -> Result<Vec<usize>> {
-        writer.close()?;
-        fs::rename(&temporary, path).with_context(|| format!("installing {}", path.display()))?;
-        Ok(group_rows)
-    })();
-    if outcome.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    outcome
+            writer.close().map_err(io::Error::other)?;
+            Ok(())
+        },
+    )?;
+    Ok(group_rows)
 }
 
 fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
@@ -2484,6 +3407,653 @@ mod tests {
         assert_eq!(tools.len(), 4, "every third message carries one tool");
         assert_eq!(tools[0].name, "bash");
         assert_eq!(tools[0].ms, Some(0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A gate that fails one stage for paths containing one needle (#352).
+    struct Injected {
+        stage: IoStage,
+        needle: &'static str,
+        seen: std::sync::Mutex<Vec<(IoStage, String)>>,
+    }
+
+    impl CommitGate for Injected {
+        fn pass(&self, stage: IoStage, path: &Path) -> io::Result<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((stage, path.display().to_string()));
+            if stage == self.stage && path.to_string_lossy().contains(self.needle) {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Register a failing gate for one history directory.
+    fn inject(
+        dir: &Path,
+        stage: IoStage,
+        needle: &'static str,
+    ) -> (fault::Installed, Arc<Injected>) {
+        let gate = Arc::new(Injected {
+            stage,
+            needle,
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let installed = fault::install(dir, Arc::clone(&gate) as Arc<dyn CommitGate>);
+        (installed, gate)
+    }
+
+    /// Rewrite the manifest in place, the way a stale or corrupt one arrives.
+    fn edit_manifest(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let path = dir.join(MANIFEST);
+        let bytes = fs::read(&path).expect("the manifest");
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("manifest json");
+        edit(&mut value);
+        fs::write(&path, serde_json::to_vec(&value).expect("json")).expect("the edit");
+    }
+
+    /// A failed segment commit leaves no segment file and no manifest entry.
+    #[test]
+    fn a_failed_segment_commit_leaves_no_segment_and_no_manifest_reference() {
+        let dir = scratch("segment-failure");
+        let mut history = History::open(dir.clone());
+        history
+            .append(&(0..4).map(message).collect::<Vec<_>>())
+            .expect("the first segment");
+        drop(history);
+        let mut history = History::open(dir.clone());
+        assert!(dir.join(MANIFEST).is_file(), "open publishes the index");
+        let before = scan(&dir, "msg").len();
+        let (installed, gate) = inject(&dir, IoStage::Sync, ".parquet");
+        let error = history
+            .append(&(4..8).map(message).collect::<Vec<_>>())
+            .expect_err("the injected sync fails the segment commit");
+        assert!(error.to_string().contains("sync"), "{error}");
+        drop(installed);
+        assert_eq!(history.len(), 4, "the failed save moved no row");
+        assert_eq!(scan(&dir, "msg").len(), before, "no segment was installed");
+        assert!(
+            gate.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(stage, _)| *stage == IoStage::Sync),
+            "the gate saw the sync stage"
+        );
+        let manifest = load_manifest(&dir).expect("the previous manifest");
+        for entry in &manifest.messages {
+            assert!(
+                dir.join(&entry.file).exists(),
+                "the manifest never references a failed segment"
+            );
+        }
+        let reopened = History::open(dir.clone());
+        assert_eq!(reopened.len(), 4, "the next open still reads the old log");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A failed manifest commit leaves the PREVIOUS manifest and its files.
+    #[test]
+    fn a_failed_manifest_commit_keeps_the_previous_manifest_and_its_files() {
+        let dir = scratch("manifest-failure");
+        let mut history = History::open(dir.clone());
+        history
+            .append(&(0..300).map(message).collect::<Vec<_>>())
+            .expect("the first segment");
+        drop(history);
+        let mut history = History::open(dir.clone());
+        let before = fs::read(dir.join(MANIFEST)).expect("the manifest");
+        let (installed, gate) = inject(&dir, IoStage::Replace, MANIFEST);
+        // 600 unsealed rows cross the seal target, so the save tries to publish
+        // a fresh manifest - the stage this test fails.
+        history
+            .append(&(300..900).map(message).collect::<Vec<_>>())
+            .expect("the save lands; the seal is best-effort");
+        drop(installed);
+        assert!(
+            gate.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(stage, path)| *stage == IoStage::Replace && path.contains(MANIFEST)),
+            "the gate saw the manifest replacement"
+        );
+        assert_eq!(
+            fs::read(dir.join(MANIFEST)).expect("the manifest"),
+            before,
+            "the previous manifest is untouched"
+        );
+        let manifest = load_manifest(&dir).expect("the previous manifest");
+        for entry in &manifest.messages {
+            assert!(
+                dir.join(&entry.file).exists(),
+                "the previous manifest still points at files that exist"
+            );
+        }
+        let reopened = History::open(dir.clone());
+        assert_eq!(reopened.len(), 900, "every saved row is readable");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A successful append is on disk for the next open, at the durable level.
+    #[test]
+    fn a_successful_append_is_seen_by_the_next_open() {
+        let dir = scratch("append-visible");
+        let mut history = History::open(dir.clone());
+        let rows: Vec<ChatMessage> = (0..5).map(message).collect();
+        history.append(&rows).expect("the append");
+        let segments = scan(&dir, "msg");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].rows, rows.len());
+        let name = segments[0]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let fields: Vec<&str> = name.trim_end_matches(".parquet").split('-').collect();
+        assert_eq!(fields[0], "msg");
+        assert_eq!(fields.len(), 4, "msg-stamp-pid-seq: {name}");
+        assert_eq!(fields[1].len(), 13, "the millisecond stamp: {name}");
+        assert_eq!(fields[2], format!("{:05}", std::process::id()));
+        assert!(fields[3].len() >= 3, "the per-process sequence: {name}");
+        drop(history);
+        let reopened = History::open(dir.clone());
+        assert_eq!(reopened.len(), rows.len());
+        assert_eq!(
+            reopened.window(0, rows.len()).expect("rows")[4].text,
+            rows[4].text
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Legacy and pid-carrying segment names parse and sort in write order.
+    #[test]
+    fn legacy_and_sequence_names_parse_and_sort_together() {
+        let mut names = vec![
+            "msg-1700000000002-12345-001.parquet".to_string(),
+            "msg-999.parquet".to_string(),
+            "msg-1700000000001-12345-000.parquet".to_string(),
+            "msg-1000.parquet".to_string(),
+        ];
+        names.sort_by(|a, b| (stamp_of(a), a).cmp(&(stamp_of(b), b)));
+        assert_eq!(
+            names,
+            vec![
+                "msg-999.parquet".to_string(),
+                "msg-1000.parquet".to_string(),
+                "msg-1700000000001-12345-000.parquet".to_string(),
+                "msg-1700000000002-12345-001.parquet".to_string(),
+            ],
+            "the numeric first field orders legacy and current names together"
+        );
+        assert_eq!(stamp_of("msg-000.parquet"), 0);
+        assert_eq!(
+            stamp_of("msg-1700000000001-12345-000.parquet"),
+            1_700_000_000_001
+        );
+        assert_eq!(stamp_of("not-a-segment"), u64::MAX);
+    }
+
+    /// A lock held by another process turns an append into the typed error.
+    #[test]
+    fn a_locked_history_directory_refuses_an_append_with_the_typed_error() {
+        let dir = scratch("locked-append");
+        let mut history = History::open(dir.clone());
+        let held = FileLock::acquire(&dir).expect("the other process's lock");
+        let error = history
+            .append(&[message(0)])
+            .expect_err("a locked append must not corrupt or hang");
+        assert!(
+            matches!(
+                error.downcast_ref::<HistoryError>(),
+                Some(HistoryError::Locked { .. })
+            ),
+            "a typed Locked error: {error}"
+        );
+        assert_eq!(history.len(), 0);
+        assert!(scan(&dir, "msg").is_empty(), "nothing was written");
+        drop(held);
+        history
+            .append(&[message(0)])
+            .expect("the append succeeds after the lock is released");
+        assert_eq!(history.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A second History (its own lock instance and sequence) cannot collide.
+    #[test]
+    fn two_histories_appending_to_one_directory_never_share_a_segment_name() {
+        let dir = scratch("two-histories");
+        let mut first = History::open(dir.clone());
+        let mut second = History::open(dir.clone());
+        for index in 0..4usize {
+            let history = if index.is_multiple_of(2) {
+                &mut first
+            } else {
+                &mut second
+            };
+            history.append(&[message(index)]).expect("the append");
+        }
+        let segments = scan(&dir, "msg");
+        let names: HashSet<String> = segments
+            .iter()
+            .map(|segment| {
+                segment
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(segments.len(), 4, "four appends, four segment files");
+        assert_eq!(names.len(), 4, "no two appends chose the same name");
+        let reopened = History::open(dir.clone());
+        assert_eq!(reopened.len(), 4);
+        let texts: Vec<String> = reopened
+            .window(0, 4)
+            .expect("rows")
+            .into_iter()
+            .map(|row| row.text)
+            .collect();
+        assert_eq!(
+            texts,
+            (0..4)
+                .map(|index| format!("turn {index} text"))
+                .collect::<Vec<_>>(),
+            "the name order is the write order"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pre-existing final segment path is skipped, never renamed over.
+    #[test]
+    fn a_preexisting_segment_path_is_never_overwritten() {
+        let dir = scratch("segment-collision");
+        fs::create_dir_all(&dir).expect("the history directory");
+        let first = segment_path(&dir, "msg");
+        fs::write(&first, b"sentinel").expect("the blocker");
+        let second = segment_path(&dir, "msg");
+        assert_ne!(first, second, "the sequence is bumped instead of reused");
+        write_messages(&second, 0, &[message(0)]).expect("the write");
+        assert_eq!(
+            fs::read(&first).unwrap(),
+            b"sentinel",
+            "nothing was overwritten"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A busy lock makes open read from a scan and skip the repair write.
+    #[test]
+    fn open_keeps_reading_while_another_holder_owns_the_lock() {
+        let dir = scratch("open-busy");
+        let expected = legacy(&dir, 3);
+        let held = FileLock::acquire(&dir).expect("the other process's lock");
+        let history = History::open(dir.clone());
+        assert_eq!(history.len(), expected.len());
+        assert!(
+            !dir.join(MANIFEST).is_file(),
+            "a busy lock skips the repair write"
+        );
+        drop(held);
+        let repaired = History::open(dir.clone());
+        assert!(
+            dir.join(MANIFEST).is_file(),
+            "the free lock lets the next open publish the index"
+        );
+        assert_eq!(repaired.len(), expected.len());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The sweep removes process-unique debris and never a live segment.
+    #[test]
+    fn sweep_archived_removes_process_debris_but_keeps_segments() {
+        let dir = scratch("sweep");
+        fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("msg-0000000000001-00001-000.parquet");
+        fs::write(&live, b"live").unwrap();
+        let debris = [
+            dir.join("msg-000.parquet.tmp"),
+            dir.join("msg-000.parquet.old"),
+            dir.join(".msg-0000000000002-00001-001.parquet.tmp-12345-0"),
+            dir.join(".msg-0000000000003-00001-002.parquet.old-12345-0"),
+        ];
+        for path in &debris {
+            fs::write(path, b"debris").unwrap();
+        }
+        sweep_archived(&dir);
+        assert!(live.exists(), "a live segment is not debris");
+        for path in &debris {
+            assert!(!path.exists(), "{} is debris", path.display());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A missing manifest is rebuilt from the footers and published at v2.
+    #[test]
+    fn a_missing_manifest_is_rebuilt_from_the_footers() {
+        let dir = scratch("missing-manifest");
+        let expected = legacy(&dir, 4);
+        assert!(!dir.join(MANIFEST).exists());
+        let history = History::open(dir.clone());
+        assert_eq!(history.len(), expected.len());
+        assert!(matches!(history.index_state(), IndexState::Rebuilt { .. }));
+        let manifest = load_manifest(&dir).expect("the rebuilt manifest");
+        assert_eq!(manifest.version, MANIFEST_VERSION);
+        assert_eq!(manifest.schema_version, SCHEMA_VERSION);
+        assert_eq!(manifest.messages.len(), 4);
+        for entry in &manifest.messages {
+            assert!(dir.join(&entry.file).exists());
+            assert_eq!(entry.schema_version, SCHEMA_VERSION);
+        }
+        let rows = history.window(0, expected.len()).expect("rows");
+        for (actual, expected) in rows.iter().zip(expected.iter()) {
+            same_row(actual, expected);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Stale row counts are rebuilt from the footers without losing a row.
+    #[test]
+    fn a_stale_manifest_is_rebuilt_from_the_footers() {
+        let dir = scratch("stale-manifest");
+        let expected = legacy(&dir, 3);
+        drop(History::open(dir.clone()));
+        edit_manifest(&dir, |value| {
+            let entries = value["messages"].as_array_mut().expect("messages");
+            entries[1]["rows"] = serde_json::json!(99);
+            entries[1]["group_rows"] = serde_json::json!([99]);
+        });
+        let history = History::open(dir.clone());
+        assert!(matches!(history.index_state(), IndexState::Rebuilt { .. }));
+        assert_eq!(history.len(), expected.len());
+        let rows = history.window(0, expected.len()).expect("rows");
+        for (actual, expected) in rows.iter().zip(expected.iter()) {
+            same_row(actual, expected);
+        }
+        let manifest = load_manifest(&dir).expect("the rebuilt manifest");
+        assert_eq!(
+            manifest
+                .messages
+                .iter()
+                .map(|entry| entry.rows)
+                .sum::<usize>(),
+            expected.len()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A listed segment that is gone means unavailable rows, not a shorter log.
+    #[test]
+    fn a_missing_listed_segment_is_unavailable_and_keeps_the_manifest() {
+        let dir = scratch("missing-segment");
+        let expected = legacy(&dir, 3);
+        drop(History::open(dir.clone()));
+        let before = fs::read(dir.join(MANIFEST)).expect("the manifest");
+        let victim = load_manifest(&dir).expect("the manifest").messages[1]
+            .file
+            .clone();
+        fs::remove_file(dir.join(&victim)).expect("remove a segment");
+        let history = History::open(dir.clone());
+        assert!(
+            matches!(history.index_state(), IndexState::Unavailable { .. }),
+            "a missing listed segment is diagnosed, not hidden"
+        );
+        assert_eq!(
+            history.len(),
+            expected.len(),
+            "the promised row count is kept, not shortened"
+        );
+        assert_eq!(
+            fs::read(dir.join(MANIFEST)).expect("the manifest"),
+            before,
+            "the manifest is kept while the rows are unavailable"
+        );
+        assert!(
+            history.window(0, expected.len()).is_err(),
+            "a read of the missing rows fails explicitly"
+        );
+        let report = diagnose(&dir);
+        assert!(matches!(report.state, IndexState::Unavailable { .. }));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.contains(&victim) && finding.contains("missing")),
+            "the diagnosis names the missing segment: {:?}",
+            report.findings
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An unlisted tail segment is read in order and never duplicated.
+    #[test]
+    fn an_extra_tail_segment_is_read_without_duplicating_rows() {
+        let dir = scratch("extra-tail");
+        let mut history = History::open(dir.clone());
+        history
+            .append(&(0..PAGE).map(message).collect::<Vec<_>>())
+            .expect("the first segment");
+        drop(history);
+        let mut history = History::open(dir.clone());
+        history
+            .append(&(PAGE..PAGE + 3).map(message).collect::<Vec<_>>())
+            .expect("the tail segment");
+        drop(history);
+        assert_eq!(
+            load_manifest(&dir).expect("the manifest").messages.len(),
+            1,
+            "the tail is not in the manifest yet"
+        );
+        let reopened = History::open(dir.clone());
+        assert_eq!(reopened.len(), PAGE + 3);
+        let texts: Vec<String> = reopened
+            .window(0, PAGE + 3)
+            .expect("rows")
+            .into_iter()
+            .map(|row| row.text)
+            .collect();
+        assert_eq!(texts.len(), PAGE + 3);
+        assert_eq!(texts[PAGE], format!("turn {PAGE} text"));
+        assert_eq!(texts.last().unwrap(), &format!("turn {} text", PAGE + 2));
+        let unique: HashSet<&String> = texts.iter().collect();
+        assert_eq!(unique.len(), texts.len(), "no row is read twice");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest whose row groups disagree with the file is rebuilt.
+    #[test]
+    fn invalid_row_group_metadata_is_rebuilt() {
+        let dir = scratch("invalid-row-groups");
+        let expected = legacy(&dir, 2);
+        drop(History::open(dir.clone()));
+        edit_manifest(&dir, |value| {
+            let entries = value["messages"].as_array_mut().expect("messages");
+            entries[0]["rows"] = serde_json::json!(2);
+            entries[0]["group_rows"] = serde_json::json!([1, 1]);
+        });
+        let history = History::open(dir.clone());
+        assert!(matches!(history.index_state(), IndexState::Rebuilt { .. }));
+        assert_eq!(history.len(), expected.len());
+        let manifest = load_manifest(&dir).expect("the rebuilt manifest");
+        assert!(
+            manifest
+                .messages
+                .iter()
+                .all(|entry| entry.rows > 0 && !entry.group_rows.is_empty()),
+            "the rebuilt entries describe the files"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An unknown manifest version is rebuilt, never guessed at.
+    #[test]
+    fn an_unsupported_manifest_version_is_rebuilt() {
+        let dir = scratch("manifest-version");
+        let expected = legacy(&dir, 2);
+        drop(History::open(dir.clone()));
+        edit_manifest(&dir, |value| value["version"] = serde_json::json!(99));
+        let history = History::open(dir.clone());
+        assert!(matches!(history.index_state(), IndexState::Rebuilt { .. }));
+        assert_eq!(history.len(), expected.len());
+        assert_eq!(
+            load_manifest(&dir).expect("the rebuilt manifest").version,
+            MANIFEST_VERSION
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A duplicated manifest entry adds no row when the index is rebuilt.
+    #[test]
+    fn duplicate_manifest_entries_are_rebuilt_without_duplicating_rows() {
+        let dir = scratch("duplicate-entries");
+        let expected = legacy(&dir, 3);
+        drop(History::open(dir.clone()));
+        edit_manifest(&dir, |value| {
+            let entries = value["messages"].as_array_mut().expect("messages");
+            let first = entries[0].clone();
+            entries.push(first);
+        });
+        let history = History::open(dir.clone());
+        assert!(matches!(history.index_state(), IndexState::Rebuilt { .. }));
+        assert_eq!(
+            history.len(),
+            expected.len(),
+            "a duplicate entry adds no row"
+        );
+        assert_eq!(
+            load_manifest(&dir)
+                .expect("the rebuilt manifest")
+                .messages
+                .len(),
+            3
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Misordered entries are rebuilt into the segment write order.
+    #[test]
+    fn misordered_manifest_entries_are_rebuilt_in_stamp_order() {
+        let dir = scratch("misordered-entries");
+        let expected = legacy(&dir, 3);
+        drop(History::open(dir.clone()));
+        edit_manifest(&dir, |value| {
+            let entries = value["messages"].as_array_mut().expect("messages");
+            entries.swap(0, 2);
+        });
+        let history = History::open(dir.clone());
+        assert!(matches!(history.index_state(), IndexState::Rebuilt { .. }));
+        let rows = history.window(0, expected.len()).expect("rows");
+        for (actual, expected) in rows.iter().zip(expected.iter()) {
+            same_row(actual, expected);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The offline walk names an unreadable unlisted segment (#356 seam).
+    #[test]
+    fn diagnose_reports_unlisted_unreadable_and_missing_segments() {
+        let dir = scratch("diagnose");
+        let expected = legacy(&dir, 2);
+        drop(History::open(dir.clone()));
+        let broken = "msg-0000000009999-00001-000.parquet";
+        fs::write(dir.join(broken), b"not parquet").expect("a broken segment");
+        let report = diagnose(&dir);
+        assert!(matches!(report.state, IndexState::Unavailable { .. }));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.contains(broken)),
+            "the walk reports the unreadable file: {:?}",
+            report.findings
+        );
+        let segment = report
+            .segments
+            .iter()
+            .find(|segment| segment.file == broken)
+            .expect("the broken segment is reported");
+        assert!(!segment.readable);
+        assert!(!segment.listed, "it was never in the manifest");
+        assert_eq!(
+            report
+                .segments
+                .iter()
+                .filter(|segment| segment.listed && segment.kind == "msg")
+                .count(),
+            2
+        );
+        let history = History::open(dir.clone());
+        assert!(matches!(
+            history.index_state(),
+            IndexState::Unavailable { .. }
+        ));
+        assert_eq!(history.len(), expected.len());
+        assert!(matches!(
+            history.diagnosis().state,
+            IndexState::Unavailable { .. }
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every segment records the schema version in its Parquet metadata.
+    #[test]
+    fn every_segment_records_the_schema_version() {
+        let dir = scratch("schema-metadata");
+        let mut history = History::open(dir.clone());
+        history
+            .append(&(0..3).map(message).collect::<Vec<_>>())
+            .expect("the append");
+        drop(history);
+        drop(History::open(dir.clone()));
+        let manifest = load_manifest(&dir).expect("the manifest");
+        assert_eq!(manifest.schema_version, SCHEMA_VERSION);
+        assert!(!manifest.messages.is_empty());
+        for entry in &manifest.messages {
+            assert_eq!(entry.schema_version, SCHEMA_VERSION);
+            let file = fs::File::open(dir.join(&entry.file)).expect("the segment");
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("the footer");
+            let values = builder
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .expect("key/value metadata");
+            let recorded = values
+                .iter()
+                .find(|value| value.key == SCHEMA_KEY)
+                .expect("bsh.schema");
+            let expected = SCHEMA_VERSION.to_string();
+            assert_eq!(recorded.value.as_deref(), Some(expected.as_str()));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A healthy history diagnoses as valid once the index is published.
+    #[test]
+    fn a_healthy_history_diagnoses_as_valid() {
+        let dir = scratch("diagnose-valid");
+        let mut history = History::open(dir.clone());
+        history
+            .append(&(0..PAGE).map(message).collect::<Vec<_>>())
+            .expect("the append");
+        drop(history);
+        let history = History::open(dir.clone());
+        assert!(matches!(history.index_state(), IndexState::Rebuilt { .. }));
+        let report = history.diagnosis();
+        assert_eq!(report.state, IndexState::Valid);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            report.segments.iter().all(|segment| segment.listed
+                && segment.readable
+                && segment.consistent
+                && segment.schema_supported),
+            "{:?}",
+            report.segments
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

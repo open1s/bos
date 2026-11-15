@@ -130,6 +130,17 @@ impl FederationEvent {
         self
     }
 
+    /// Name the lease and the stream attempt a resource event is about.
+    ///
+    /// The subject becomes [`stream_subject`]. A stream open is a distinct
+    /// generation even when it reuses a lease id, so the caller's cancellation
+    /// record and the provider's terminal record for one stream correlate on
+    /// this value, and an older attempt never reads as the live one.
+    pub fn with_stream_subject(mut self, lease: impl std::fmt::Display, attempt: u64) -> Self {
+        self.subject = Some(stream_subject(lease, attempt));
+        self
+    }
+
     /// Attach a byte count.
     pub fn with_bytes(mut self, bytes: u64) -> Self {
         self.bytes = Some(bytes);
@@ -140,6 +151,65 @@ impl FederationEvent {
     pub fn with_elapsed_ms(mut self, elapsed_ms: u64) -> Self {
         self.elapsed_ms = Some(elapsed_ms);
         self
+    }
+}
+
+/// The correlated audit subject of one resource stream: `<lease>#attempt=<n>`.
+///
+/// The same value is used by the caller's resource records and the provider's,
+/// so the two sides of one stream attempt can be joined.
+pub fn stream_subject(lease: impl std::fmt::Display, attempt: u64) -> String {
+    format!("{lease}#attempt={attempt}")
+}
+
+/// How a dropped resource stream's cancellation is accounted for.
+///
+/// Dropping a caller-side stream sends a best-effort `Cancel` for its exact
+/// (lease, attempt). The provider does not acknowledge a cancel, so the
+/// strongest fact available when the drop settles is whether the peer's
+/// transport accepted the signed frame:
+///
+/// - [CancelConfirmation::Confirmed] means the cancel frame left this node.
+///   The provider's own terminal record carries the same `lease#attempt=N`
+///   subject, so the two records can be tied together.
+/// - [CancelConfirmation::Unconfirmed] means the frame was not accepted (no
+///   runtime, an unreachable peer, or a send that did not complete at drop
+///   time), so the provider's outcome is unknown and is recorded as such. It is
+///   never recorded as "the producer stopped".
+///
+/// The choice is deterministic: it is derived from the transport's acceptance
+/// of the frame, not from timing or from a later inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelConfirmation {
+    /// The cancel frame was accepted by the peer's transport.
+    Confirmed,
+    /// The cancel frame was not accepted; the provider's outcome is unknown.
+    Unconfirmed,
+}
+
+impl CancelConfirmation {
+    /// The audit outcome class: `cancelled` or `cancel_unconfirmed`.
+    pub fn outcome(self) -> &'static str {
+        match self {
+            Self::Confirmed => "cancelled",
+            Self::Unconfirmed => "cancel_unconfirmed",
+        }
+    }
+
+    /// Whether the peer accepted the cancel frame.
+    pub fn is_confirmed(self) -> bool {
+        matches!(self, Self::Confirmed)
+    }
+
+    /// A sentence for the audit reason field.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Confirmed => "the peer's transport accepted the cancel frame",
+            Self::Unconfirmed => {
+                "the cancel frame was not accepted; the provider's outcome is unknown"
+            }
+        }
     }
 }
 

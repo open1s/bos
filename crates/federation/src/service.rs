@@ -29,7 +29,7 @@ use tokio::sync::oneshot;
 use crate::artifacts::{
     ArtifactCleanupRequest, ArtifactCleanupResponse, ArtifactFailure, ArtifactStore,
 };
-use crate::audit::{Direction, FederationAudit, FederationEvent};
+use crate::audit::{CancelConfirmation, Direction, FederationAudit, FederationEvent};
 use crate::delegation::{
     DelegationId, DelegationRecord, DelegationRequest, DelegationState, DelegationStore,
 };
@@ -59,6 +59,12 @@ const DISCOVERY_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many inbound stream messages buffer ahead of the consumer.
 const RESOURCE_QUEUE: usize = 32;
 
+/// How long the background delivery of a dropped stream's cancel may take
+/// (issue #347). The caller never waits: a frame the transport does not accept
+/// on the first poll is delivered in the background under this bound, and the
+/// caller's record already says the provider's outcome is unknown.
+const CANCEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// One inbound stream the caller owns.
 struct InboundStream {
     /// The peer this stream was opened with; only it may send stream messages.
@@ -73,6 +79,57 @@ struct InboundStream {
 
 /// How many accepted message identities are remembered at once.
 const REPLAY_CAPACITY: usize = 4096;
+
+/// What the persistent replay store was when this node started.
+///
+/// The state decides whether the node may run side-effectful requests at all:
+/// a store that exists but cannot be read is *not* replaced by an empty one
+/// (issue #349), because that would reopen a replay window after a startup
+/// failure. The node refuses such requests until an operator calls
+/// [`FederationNode::reset_replay_store`], which quarantines the unreadable
+/// file instead of overwriting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReplayStoreState {
+    /// No store file existed. The cache starts empty; a successful save makes
+    /// the state [`ReplayStoreState::Loaded`].
+    Missing,
+    /// The store loaded and its admitted identities are protected.
+    Loaded,
+    /// The store file exists but could not be read or parsed. Side-effectful
+    /// admissions are refused and the file is never overwritten.
+    Unavailable {
+        /// Why the store could not be loaded.
+        reason: String,
+    },
+}
+
+impl ReplayStoreState {
+    /// The load error, when the store is unavailable.
+    fn unavailable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable { reason } => Some(reason.as_str()),
+            Self::Missing | Self::Loaded => None,
+        }
+    }
+}
+
+/// Why a persistent replay store could not be reset (issue #349).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReplayResetError {
+    /// The node was not configured with a persistent replay store.
+    #[error("no persistent replay store is configured")]
+    NotConfigured,
+    /// The store loaded (or was absent); resetting it would discard history
+    /// that is still protecting admitted requests.
+    #[error("the replay store is not unavailable; a reset would discard protected history")]
+    Healthy,
+    /// The unreadable store could not be moved aside, so nothing was changed.
+    #[error("the replay store could not be moved aside: {message}")]
+    Move {
+        /// What the rename reported.
+        message: String,
+    },
+}
 
 /// Bounded, expiry-aware replay protection for inbound frames.
 ///
@@ -113,11 +170,23 @@ impl ReplayCache {
         }
     }
 
+    #[cfg(test)]
     fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        Self::load_reporting(path).map(|(cache, _)| cache)
+    }
+
+    /// Load a cache and report whether a store file existed.
+    ///
+    /// A missing file is an empty cache and `false`; anything else that cannot
+    /// be read or parsed is an error, which the node records as
+    /// [`ReplayStoreState::Unavailable`] instead of silently starting empty.
+    fn load_reporting(path: &std::path::Path) -> std::io::Result<(Self, bool)> {
         let cache = Self::new();
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(cache),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((cache, false))
+            }
             Err(error) => return Err(error),
         };
         let file: ReplayFile = serde_json::from_str(&text)
@@ -142,7 +211,17 @@ impl ReplayCache {
             }
         }
         drop(inner);
-        Ok(cache)
+        Ok((cache, true))
+    }
+
+    /// Forget every identity, as after an operator reset (issue #349).
+    fn clear(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.seen.clear();
+        inner.order.clear();
     }
 
     /// Commit the admitted identities durably.
@@ -642,6 +721,11 @@ pub struct FederationNode {
     replay: ReplayCache,
     /// Where the replay cache is persisted, when it is.
     replay_path: Option<PathBuf>,
+    /// The replay store's load state (issue #349). Shared with the routing task,
+    /// which refuses side-effectful admissions while it is `Unavailable`.
+    replay_state: Arc<Mutex<ReplayStoreState>>,
+    /// How long one produced resource stream may run (issue #348).
+    max_stream_duration: Duration,
     /// Where delegation records are persisted, when they are.
     delegation_path: Option<PathBuf>,
     /// Peer-owned tasks this node records for other nodes.
@@ -693,6 +777,8 @@ impl FederationNode {
             catalogue_seen: Arc::new(RwLock::new(HashMap::new())),
             replay: ReplayCache::new(),
             replay_path: None,
+            replay_state: Arc::new(Mutex::new(ReplayStoreState::Missing)),
+            max_stream_duration: MAX_STREAM_DURATION,
             delegation_path: None,
             tasks: Arc::new(RwLock::new(TaskQueue::new())),
             task_path: None,
@@ -901,17 +987,127 @@ impl FederationNode {
     ///
     /// Commits are atomic (private temp file + fsync + rename), owner-only on
     /// every host, and serialized against each other.
+    ///
+    /// A store that exists but cannot be read is not replaced by an empty one
+    /// (issue #349). The node records the load error, refuses every
+    /// side-effectful request with the same typed `unavailable` refusal used for
+    /// a failed replay commit, and never writes the unreadable file. The only
+    /// recovery is the explicit [`FederationNode::reset_replay_store`].
     pub fn with_replay_persistence(mut self, path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        match ReplayCache::load(&path) {
-            Ok(cache) => self.replay = cache,
-            Err(error) => tracing::warn!(
-                "federation: replay store {} was not loaded: {error}",
-                path.display()
-            ),
+        match ReplayCache::load_reporting(&path) {
+            Ok((cache, existed)) => {
+                self.replay = cache;
+                self.set_replay_state(if existed {
+                    ReplayStoreState::Loaded
+                } else {
+                    ReplayStoreState::Missing
+                });
+            }
+            Err(error) => {
+                self.replay = ReplayCache::new();
+                let reason = error.to_string();
+                tracing::warn!(
+                    "federation: replay store {} was not loaded: {reason}; side-effectful requests are refused until an operator resets the store",
+                    path.display()
+                );
+                self.set_replay_state(ReplayStoreState::Unavailable { reason });
+            }
         }
         self.replay_path = Some(path);
         self
+    }
+
+    /// Install one replay-store state.
+    fn set_replay_state(&self, state: ReplayStoreState) {
+        *self
+            .replay_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+    }
+
+    /// The replay store's load state, for crate-internal diagnostics and tests.
+    pub(crate) fn replay_store_state(&self) -> ReplayStoreState {
+        self.replay_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Move an unreadable replay store aside and start a fresh one (issue #349).
+    ///
+    /// This is the explicit operator recovery; it refuses
+    /// ([`ReplayResetError::Healthy`]) unless the store is `Unavailable`,
+    /// because a healthy store carries the identities that keep already
+    /// admitted requests from running twice.
+    ///
+    /// The recipe:
+    ///
+    /// 1. Confirm the refusal: the node answers every side-effectful request
+    ///    with a typed `unavailable` error and never overwrites the file.
+    /// 2. Read the warning log (or the `ReplayStoreState` diagnostic through a
+    ///    host that has one) for the exact load error.
+    /// 3. Call this method. The unreadable bytes are renamed atomically to
+    ///    `<name>.corrupt-<unix-ms>` in the same directory — nothing is deleted
+    ///    — the in-memory cache is emptied, and the state becomes `Missing`.
+    /// 4. The node serves again; the first successful replay commit creates a
+    ///    new store and its state becomes `Loaded`.
+    ///
+    /// The trade is explicit: identities admitted by the moved-aside store are
+    /// no longer protected, so an envelope replayed across the reset may run
+    /// again. The reset is audited with operation `replay_store_reset`, the
+    /// quarantine path as its subject, and a reason that says prior history was
+    /// discarded.
+    pub fn reset_replay_store(&mut self) -> Result<PathBuf, ReplayResetError> {
+        let Some(path) = self.replay_path.clone() else {
+            return Err(ReplayResetError::NotConfigured);
+        };
+        let Some(reason) = self
+            .replay_store_state()
+            .unavailable_reason()
+            .map(str::to_string)
+        else {
+            return Err(ReplayResetError::Healthy);
+        };
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "replay".to_string());
+        let directory = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let mut stamp = unix_ms();
+        let mut target = directory.join(format!("{name}.corrupt-{stamp}"));
+        while target.exists() {
+            stamp = stamp.saturating_add(1);
+            target = directory.join(format!("{name}.corrupt-{stamp}"));
+        }
+        std::fs::rename(&path, &target).map_err(|error| ReplayResetError::Move {
+            message: format!("{} -> {}: {error}", path.display(), target.display()),
+        })?;
+        self.set_replay_state(ReplayStoreState::Missing);
+        self.replay.clear();
+        tracing::warn!(
+            "federation: replay store {} was quarantined as {}; prior replay history is discarded: {reason}",
+            path.display(),
+            target.display()
+        );
+        self.audit(
+            FederationEvent::new(
+                Direction::Inbound,
+                self.identity.node_id().as_str(),
+                "replay_store_reset",
+                None,
+                "ok",
+            )
+            .with_subject(target.display().to_string())
+            .with_reason(format!(
+                "prior replay history was discarded; the unreadable store was moved to {}: {reason}",
+                target.display()
+            )),
+        );
+        Ok(target)
     }
 
     /// Advertise federation membership and the policy revision peers should see.
@@ -958,6 +1154,17 @@ impl FederationNode {
     /// Attach the byte source resource streams read from.
     pub fn with_resource_source(mut self, source: Arc<dyn ResourceSource>) -> Self {
         self.source = Some(source);
+        self
+    }
+
+    /// Bound each produced resource stream at `duration` (issue #348).
+    ///
+    /// The default is [`MAX_STREAM_DURATION`]. The producer computes ONE
+    /// absolute deadline when a stream starts and selects every source read
+    /// against it, so a read that never returns cannot outlive the bound. A
+    /// test injects a short duration here instead of waiting out the default.
+    pub fn with_max_stream_duration(mut self, duration: Duration) -> Self {
+        self.max_stream_duration = duration;
         self
     }
 
@@ -1259,6 +1466,8 @@ impl FederationNode {
         let in_flight = Arc::clone(&self.in_flight);
         let replay = self.replay.clone();
         let replay_path = self.replay_path.clone();
+        let replay_state = Arc::clone(&self.replay_state);
+        let max_stream_duration = self.max_stream_duration;
         let admission_limits = self.admission_limits;
         let admission = Admission::new(admission_limits);
         let stream_limit = admission_limits.resource_streams.max(1);
@@ -1341,7 +1550,53 @@ impl FederationNode {
                         continue;
                     }
                     if side_effectful_kind(&envelope.kind) || read_only_kind(&envelope.kind) {
-                        if let Some(path) = &replay_path {
+                        let state = replay_state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        if let Some(load_error) = state.unavailable_reason() {
+                            if side_effectful_kind(&envelope.kind) {
+                                // Fail closed (issue #349): the store that
+                                // would prove this identity was already
+                                // admitted cannot be read, so no durable
+                                // protection exists. Roll the admission back
+                                // and refuse with the same typed, retryable
+                                // error as a failed replay commit. The
+                                // unreadable file is never overwritten.
+                                replay.forget(&keys);
+                                let reason = format!(
+                                    "the replay store is unavailable ({load_error}); message {} was not admitted",
+                                    envelope.message_id
+                                );
+                                let refusal = CapabilityError::Unavailable {
+                                    reason: reason.clone(),
+                                };
+                                record(
+                                    &audit,
+                                    FederationEvent::new(
+                                        Direction::Inbound,
+                                        envelope.sender.as_str(),
+                                        envelope.kind.as_str(),
+                                        None,
+                                        error_kind(&refusal),
+                                    )
+                                    .with_subject(envelope.message_id.clone())
+                                    .with_reason(reason),
+                                );
+                                let reply =
+                                    seal_reply(&identity, &envelope, error_payload(refusal));
+                                let _ = transport.send(&envelope.sender, reply).await;
+                                continue;
+                            }
+                            // Documented degraded mode: a read-only request
+                            // cannot repeat a side effect, and its in-memory
+                            // admission still deduplicates within this
+                            // process. It proceeds, and nothing is written.
+                            tracing::warn!(
+                                "federation: replay store is unavailable ({load_error}); read-only {} proceeds in degraded mode",
+                                envelope.kind
+                            );
+                        } else if let Some(path) = &replay_path {
                             if let Err(error) = replay.save(path) {
                                 if side_effectful_kind(&envelope.kind) {
                                     // Fail closed (issue #303): the admission is
@@ -1383,6 +1638,13 @@ impl FederationNode {
                                     path.display(),
                                     envelope.kind
                                 );
+                            } else {
+                                // The first successful save creates a store that
+                                // was missing; from now on it is loadable.
+                                *replay_state
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    ReplayStoreState::Loaded;
                             }
                         }
                     }
@@ -1704,6 +1966,7 @@ impl FederationNode {
                             source.clone(),
                             &audit,
                             stream_limit,
+                            max_stream_duration,
                             envelope,
                         )
                         .await;
@@ -1729,6 +1992,18 @@ impl FederationNode {
     /// How many remote invocations this Node is running right now.
     pub fn in_flight_invocations(&self) -> usize {
         self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// How many resource streams this Node is producing right now (issue #347).
+    ///
+    /// A cancelled or timed-out stream must release its slot, so a caller can
+    /// compare this against its prior value to see that an abandoned stream
+    /// really stopped.
+    pub fn active_resource_sessions(&self) -> usize {
+        self.sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
@@ -2217,10 +2492,15 @@ impl FederationNode {
         credit: u64,
     ) -> Result<RemoteStream, CapabilityError> {
         let started = Instant::now();
-        let subject = lease.to_string();
         let result = self
             .open_resource_inner(peer, lease, uri, offset, credit)
             .await;
+        // A successful open is correlated by its generation, so the caller's
+        // record and the provider's name the same stream attempt.
+        let subject = match &result {
+            Ok(stream) => crate::audit::stream_subject(lease, stream.attempt()),
+            Err(_) => lease.to_string(),
+        };
         self.record_outcome("resource", peer, Some(subject), started, &result);
         result
     }
@@ -2296,6 +2576,10 @@ impl FederationNode {
             }
         }
 
+        // Every open is its own generation: a lease may be reused by a later
+        // stream, and a cancel must name exactly the generation it abandons
+        // (issue #347).
+        let attempt = crate::resource::next_stream_attempt();
         send_stream(
             &self.identity,
             &self.transport,
@@ -2305,6 +2589,7 @@ impl FederationNode {
                 uri: uri.to_string(),
                 offset: resume,
                 credit,
+                attempt,
             },
         )
         .await;
@@ -2323,6 +2608,7 @@ impl FederationNode {
             uri: uri.to_string(),
             transfers,
             transfer_path: self.transfer_path.clone(),
+            attempt,
         })
     }
 
@@ -4345,12 +4631,23 @@ pub struct RemoteStream {
     transfers: Option<Arc<Mutex<crate::resource::TransferStore>>>,
     /// Where the checkpoints are saved.
     transfer_path: Option<PathBuf>,
+    /// The generation this stream opened with.
+    attempt: u64,
 }
 
 impl RemoteStream {
     /// The lease this stream runs under.
     pub fn lease(&self) -> &LeaseId {
         &self.lease
+    }
+
+    /// The generation (stream attempt) this stream opened with.
+    ///
+    /// Two streams on the same lease are different generations, so a cancel
+    /// names exactly the one it abandons. The provider refuses a cancel whose
+    /// attempt is not its live session's attempt.
+    pub fn attempt(&self) -> u64 {
+        self.attempt
     }
 
     /// The next message: a chunk, a close, or an error.
@@ -4395,22 +4692,7 @@ impl RemoteStream {
             return;
         }
         self.settled = true;
-        self.streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.lease);
-        if let Some(store) = &self.transfers {
-            if let Ok(mut store) = store.lock() {
-                // Only a completed transfer forgets its checkpoint. An error or
-                // a reader that walked away leaves the position for a resume.
-                if outcome == "ok" {
-                    store.remove(&self.lease, &self.uri);
-                }
-                if let Some(path) = &self.transfer_path {
-                    let _ = store.save(path);
-                }
-            }
-        }
+        self.release_local(outcome == "ok");
         let mut event = FederationEvent::new(
             Direction::Outbound,
             self.peer.as_str(),
@@ -4418,12 +4700,79 @@ impl RemoteStream {
             None,
             outcome,
         )
-        .with_subject(self.lease.to_string())
+        .with_stream_subject(&self.lease, self.attempt)
         .with_bytes(self.received);
         if let Some(reason) = reason {
             event = event.with_reason(reason);
         }
         record(&self.audit, event);
+    }
+
+    /// Release the local stream slot and keep or drop the checkpoint.
+    ///
+    /// Only a verified successful completion removes the checkpoint (issue
+    /// #347): an error, a cancellation, or a reader that dropped the stream
+    /// leaves the position at the last acknowledged byte, so a resume continues
+    /// there instead of restarting the artifact.
+    fn release_local(&self, completed: bool) {
+        self.streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.lease);
+        if let Some(store) = &self.transfers {
+            if let Ok(mut store) = store.lock() {
+                if completed {
+                    store.remove(&self.lease, &self.uri);
+                }
+                if let Some(path) = &self.transfer_path {
+                    let _ = store.save(path);
+                }
+            }
+        }
+    }
+
+    /// Send `Cancel` for this stream's exact generation, best effort.
+    ///
+    /// Drop cannot await, so the confirmation is the peer transport accepting
+    /// the whole frame on the first poll (an in-process or already-writable
+    /// transport does). A frame that is not accepted immediately is handed to
+    /// the runtime to finish delivering, and the caller is told the provider's
+    /// outcome is unknown — never that the producer stopped.
+    fn cancel_best_effort(&self) -> CancelConfirmation {
+        use std::future::Future;
+
+        let lease = self.lease.clone();
+        let attempt = self.attempt;
+        let peer = self.peer.clone();
+        let identity = self.identity.clone();
+        let transport = Arc::clone(&self.transport);
+        let mut send = Box::pin(async move {
+            send_stream(
+                &identity,
+                &transport,
+                &peer,
+                ResourceStreamMessage::Cancel { lease, attempt },
+            )
+            .await
+        });
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return CancelConfirmation::Unconfirmed;
+        };
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        match send.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(true) => return CancelConfirmation::Confirmed,
+            std::task::Poll::Ready(false) => return CancelConfirmation::Unconfirmed,
+            std::task::Poll::Pending => {}
+        }
+        // A runtime that is shutting down cannot take the task; the frame has
+        // not left this node, so the outcome stays unconfirmed.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.spawn(async move {
+                let _ = tokio::time::timeout(CANCEL_SEND_TIMEOUT, send).await;
+            });
+        }));
+        CancelConfirmation::Unconfirmed
     }
 
     /// Grant the sender more credit.
@@ -4444,11 +4793,37 @@ impl RemoteStream {
 
 impl Drop for RemoteStream {
     fn drop(&mut self) {
-        // A reader that walks away before the stream ends leaves a record too:
-        // otherwise the provider's "0 bytes left" would look like the only fact.
-        self.settle(
-            "cancelled",
-            Some("the reader dropped the stream".to_string()),
+        // An already-ended stream has nothing to cancel: the close or error
+        // was its one terminal outcome.
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        // The checkpoint stays at the last acknowledged byte: only a verified
+        // close removes it.
+        self.release_local(false);
+        // A reader that walks away before the stream ends leaves a record on
+        // both sides. The provider gets the explicit cancel for this exact
+        // attempt; the caller records whether that frame was accepted, so
+        // "cancelled" never overstates what the provider did.
+        let confirmation = self.cancel_best_effort();
+        let reason = format!(
+            "attempt {}: the reader dropped the stream; {}",
+            self.attempt,
+            confirmation.detail()
+        );
+        record(
+            &self.audit,
+            FederationEvent::new(
+                Direction::Outbound,
+                self.peer.as_str(),
+                "resource",
+                None,
+                confirmation.outcome(),
+            )
+            .with_stream_subject(&self.lease, self.attempt)
+            .with_bytes(self.received)
+            .with_reason(reason),
         );
     }
 }
@@ -4470,15 +4845,19 @@ pub const STREAM_CHUNK: usize = 8 * 1024;
 
 struct ServerSession {
     peer: NodeId,
+    /// The generation this session produces. A cancel must name it exactly, so
+    /// a stale cancel never stops a newer stream on the same lease.
+    attempt: u64,
     credit: AtomicU64,
     open: AtomicBool,
     notify: tokio::sync::Notify,
 }
 
 impl ServerSession {
-    fn new(peer: NodeId, credit: u64) -> Self {
+    fn new(peer: NodeId, attempt: u64, credit: u64) -> Self {
         Self {
             peer,
+            attempt,
             credit: AtomicU64::new(credit),
             open: AtomicBool::new(true),
             notify: tokio::sync::Notify::new(),
@@ -4496,6 +4875,7 @@ async fn route_resource(
     source: Option<Arc<dyn ResourceSource>>,
     audit: &Option<Arc<dyn FederationAudit>>,
     stream_limit: usize,
+    max_stream_duration: Duration,
     envelope: Envelope,
 ) {
     let Ok(message) = serde_json::from_value::<ResourceStreamMessage>(envelope.payload.clone())
@@ -4572,6 +4952,7 @@ async fn route_resource(
             uri,
             offset,
             credit,
+            attempt,
             ..
         } => {
             let Some(source) = source else {
@@ -4584,7 +4965,7 @@ async fn route_resource(
                         None,
                         "unavailable",
                     )
-                    .with_subject(lease.to_string())
+                    .with_stream_subject(&lease, attempt)
                     .with_reason("this Node serves no resources"),
                 );
                 send_stream(
@@ -4613,7 +4994,7 @@ async fn route_resource(
                         None,
                         resource_kind(error),
                     )
-                    .with_subject(lease.to_string())
+                    .with_stream_subject(&lease, attempt)
                     .with_reason(error.to_string()),
                 );
                 send_stream(
@@ -4637,7 +5018,7 @@ async fn route_resource(
                     None,
                     "ok",
                 )
-                .with_subject(lease.to_string()),
+                .with_stream_subject(&lease, attempt),
             );
             let existing = sessions
                 .lock()
@@ -4655,7 +5036,7 @@ async fn route_resource(
                             None,
                             "rejected",
                         )
-                        .with_subject(lease.to_string())
+                        .with_stream_subject(&lease, attempt)
                         .with_reason("a stream for this lease is already open"),
                     );
                     send_stream(
@@ -4685,7 +5066,7 @@ async fn route_resource(
                         None,
                         "rate_limited",
                     )
-                    .with_subject(lease.to_string())
+                    .with_stream_subject(&lease, attempt)
                     .with_reason("too many concurrent resource streams"),
                 );
                 send_stream(
@@ -4700,7 +5081,7 @@ async fn route_resource(
                 .await;
                 return;
             }
-            let session = Arc::new(ServerSession::new(envelope.sender.clone(), credit));
+            let session = Arc::new(ServerSession::new(envelope.sender.clone(), attempt, credit));
             sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4717,6 +5098,7 @@ async fn route_resource(
                 offset,
                 session,
                 audit.clone(),
+                max_stream_duration,
             ));
         }
         ResourceStreamMessage::Credit { bytes, .. } => {
@@ -4745,6 +5127,98 @@ async fn route_resource(
                 session.notify.notify_waiters();
             }
         }
+        ResourceStreamMessage::Cancel { attempt, .. } => {
+            // A cancel stops only the live generation it names (issue #347).
+            // An older attempt, a duplicate cancel, and a cancel after the
+            // producer already ended are no-ops for the stream; they are
+            // audited as ignored so the caller's record can be reconciled.
+            let session = sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&lease)
+                .cloned();
+            let Some(session) = session else {
+                record(
+                    audit,
+                    FederationEvent::new(
+                        Direction::Inbound,
+                        envelope.sender.as_str(),
+                        "resource",
+                        None,
+                        "cancel_ignored",
+                    )
+                    .with_stream_subject(&lease, attempt)
+                    .with_reason("no live producer for this lease; the cancel is a duplicate"),
+                );
+                return;
+            };
+            if session.peer != envelope.sender {
+                record(
+                    audit,
+                    FederationEvent::new(
+                        Direction::Inbound,
+                        envelope.sender.as_str(),
+                        "resource",
+                        None,
+                        "denied",
+                    )
+                    .with_stream_subject(&lease, attempt)
+                    .with_reason("the cancel came from a peer that does not own the stream"),
+                );
+                return;
+            }
+            if !session.open.load(Ordering::SeqCst) {
+                record(
+                    audit,
+                    FederationEvent::new(
+                        Direction::Inbound,
+                        envelope.sender.as_str(),
+                        "resource",
+                        None,
+                        "cancel_ignored",
+                    )
+                    .with_stream_subject(&lease, attempt)
+                    .with_reason("the producer is already closing this stream"),
+                );
+                return;
+            }
+            if attempt != session.attempt {
+                record(
+                    audit,
+                    FederationEvent::new(
+                        Direction::Inbound,
+                        envelope.sender.as_str(),
+                        "resource",
+                        None,
+                        "cancel_ignored",
+                    )
+                    .with_stream_subject(&lease, attempt)
+                    .with_reason(format!(
+                        "the cancel names attempt {attempt}, the live stream is attempt {}",
+                        session.attempt
+                    )),
+                );
+                return;
+            }
+            // Close first, then wake: the producer re-checks `open` after every
+            // wait, so this order cannot lose the cancellation.
+            session.open.store(false, Ordering::SeqCst);
+            session.notify.notify_waiters();
+            record(
+                audit,
+                FederationEvent::new(
+                    Direction::Inbound,
+                    envelope.sender.as_str(),
+                    "resource",
+                    None,
+                    "cancel_accepted",
+                )
+                .with_stream_subject(&lease, attempt)
+                .with_reason(format!(
+                    "attempt {attempt} was cancelled; the producer was told to stop"
+                )),
+            );
+        }
         _ => {}
     }
 }
@@ -4762,37 +5236,57 @@ async fn produce(
     mut offset: u64,
     session: Arc<ServerSession>,
     audit: Option<Arc<dyn FederationAudit>>,
+    max_duration: Duration,
 ) {
     let mut seq = 0u64;
     // The checksum is updated per chunk; memory stays bounded by the chunk,
     // not by the total resource length.
     let mut streamed = Sha256::new();
-    let started = Instant::now();
+    // ONE absolute deadline for the whole stream (issue #348). Every read and
+    // every wait for credit is selected against it, so a source that never
+    // returns cannot outlive the bound.
+    let deadline = tokio::time::Instant::now() + max_duration;
     let mut outcome = "ok";
     let mut reason: Option<String> = None;
-    loop {
-        if started.elapsed() > MAX_STREAM_DURATION {
+
+    'stream: loop {
+        // Cancellation is checked before every step, so nothing is read,
+        // charged, or sent after the provider accepted a cancel (issue #347).
+        if !session.open.load(Ordering::SeqCst) {
+            outcome = "cancelled";
+            reason = Some(format!(
+                "attempt {}: the caller cancelled the stream",
+                session.attempt
+            ));
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
             outcome = "timeout";
-            reason = Some(format!("the stream exceeded {MAX_STREAM_DURATION:?}"));
-            send_stream(
-                &identity,
-                &transport,
-                &peer,
-                ResourceStreamMessage::Error {
-                    lease: lease.clone(),
-                    message: reason.clone().unwrap_or_default(),
-                },
-            )
-            .await;
+            reason = Some(format!("the stream exceeded {max_duration:?}"));
             break;
         }
         let credit = session.credit.load(Ordering::SeqCst);
         if credit == 0 {
+            // Register the waiter before re-checking the state: a credit grant
+            // or a cancel that lands in between cannot be lost.
+            let notified = session.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if !session.open.load(Ordering::SeqCst) {
-                break;
+                continue 'stream;
             }
-            session.notify.notified().await;
-            continue;
+            if session.credit.load(Ordering::SeqCst) > 0 {
+                continue 'stream;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut notified => continue 'stream,
+                _ = tokio::time::sleep_until(deadline) => {
+                    outcome = "timeout";
+                    reason = Some(format!("the stream exceeded {max_duration:?}"));
+                    break;
+                }
+            }
         }
         // Read no further than both the credit and the lease allow, so a
         // bounded lease streams its quota instead of failing the first chunk
@@ -4805,22 +5299,54 @@ async fn produce(
         if remaining == Some(0) {
             outcome = "quota_exceeded";
             reason = Some(format!("lease {lease} has 0 bytes left"));
-            send_stream(
-                &identity,
-                &transport,
-                &peer,
-                ResourceStreamMessage::Error {
-                    lease: lease.clone(),
-                    message: format!("lease {lease} has 0 bytes left"),
-                },
-            )
-            .await;
             break;
         }
         let limit = remaining
             .map_or(credit, |remaining| remaining.min(credit))
             .min(STREAM_CHUNK as u64);
-        match source.read(&uri, offset, limit as usize).await {
+
+        // The cancellation waiter is registered before the read starts, so a
+        // cancel that arrives while the read is pending wakes the select and
+        // drops the read future instead of waiting for it.
+        let notified = session.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !session.open.load(Ordering::SeqCst) {
+            continue 'stream;
+        }
+        let read = source.read(&uri, offset, limit as usize);
+        tokio::pin!(read);
+        let result = tokio::select! {
+            biased;
+            _ = &mut notified => {
+                // The wake is a cancel or newly granted credit. A cancel wins;
+                // credit only means the read is re-issued against the window.
+                if session.open.load(Ordering::SeqCst) {
+                    continue 'stream;
+                }
+                outcome = "cancelled";
+                reason = Some(format!(
+                    "attempt {}: the caller cancelled the stream",
+                    session.attempt
+                ));
+                break;
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                // The read result lost the race and is dropped, so nothing from
+                // it is charged or sent.
+                outcome = "timeout";
+                reason = Some(format!("the stream exceeded {max_duration:?}"));
+                break;
+            }
+            result = &mut read => result,
+        };
+        // A cancel that closed the session after the select returned still
+        // wins: the read result is not accepted, so it is neither charged nor
+        // sent.
+        if !session.open.load(Ordering::SeqCst) {
+            continue 'stream;
+        }
+        match result {
             Ok(Some(bytes)) if bytes.is_empty() => {
                 send_stream(
                     &identity,
@@ -4844,16 +5370,6 @@ async fn produce(
                 if let Err(error) = &charged {
                     outcome = resource_kind(error);
                     reason = Some(error.to_string());
-                    send_stream(
-                        &identity,
-                        &transport,
-                        &peer,
-                        ResourceStreamMessage::Error {
-                            lease: lease.clone(),
-                            message: error.to_string(),
-                        },
-                    )
-                    .await;
                     break;
                 }
                 session.credit.fetch_sub(length, Ordering::SeqCst);
@@ -4889,53 +5405,70 @@ async fn produce(
             Err(error) => {
                 outcome = "provider_failed";
                 reason = Some(error.to_string());
-                send_stream(
-                    &identity,
-                    &transport,
-                    &peer,
-                    ResourceStreamMessage::Error {
-                        lease: lease.clone(),
-                        message: error.to_string(),
-                    },
-                )
-                .await;
                 break;
             }
         }
     }
-    // One record when the stream ends, not one per chunk: the byte count and
-    // the stopping reason are the facts a reader needs, and no payload rides
-    // along.
+    // A terminal failure tells the caller why; a cancelled stream sends
+    // nothing, because its consumer walked away.
+    if outcome != "ok" && outcome != "cancelled" {
+        send_stream(
+            &identity,
+            &transport,
+            &peer,
+            ResourceStreamMessage::Error {
+                lease: lease.clone(),
+                message: reason.clone().unwrap_or_default(),
+            },
+        )
+        .await;
+    }
+    // One record when the stream ends, not one per chunk: the stream attempt,
+    // the byte count, and the stopping reason are the facts a reader needs, and
+    // no payload rides along.
     let mut event =
         FederationEvent::new(Direction::Inbound, peer.as_str(), "resource", None, outcome)
-            .with_subject(lease.to_string())
+            .with_stream_subject(&lease, session.attempt)
             .with_bytes(offset);
     if let Some(reason) = reason {
         event = event.with_reason(reason);
     }
     record(&audit, event);
     session.open.store(false, Ordering::SeqCst);
-    sessions
+    // Release exactly this session's slot: a newer open may already have
+    // replaced it on the same lease, and that one must survive.
+    let mut sessions = sessions
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&lease);
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if sessions
+        .get(&lease)
+        .is_some_and(|current| Arc::ptr_eq(current, &session))
+    {
+        sessions.remove(&lease);
+    }
 }
 
+/// Send one stream message. Returns whether the transport accepted the frame.
+///
+/// The caller's drop path uses the answer as its only available confirmation
+/// that a cancel actually left this node; every other caller ignores it.
 async fn send_stream(
     identity: &NodeIdentity,
     transport: &Arc<dyn FederationTransport>,
     peer: &NodeId,
     message: ResourceStreamMessage,
-) {
+) -> bool {
     let Ok(bytes) = serde_json::to_vec(&message) else {
-        return;
+        return false;
     };
     let message = FederationMessage::new("resource", bytes);
-    if let Ok(envelope) = Envelope::seal(&message, identity, peer) {
-        if let Ok(frame) = envelope.encode() {
-            let _ = transport.send(peer, frame).await;
-        }
-    }
+    let Ok(envelope) = Envelope::seal(&message, identity, peer) else {
+        return false;
+    };
+    let Ok(frame) = envelope.encode() else {
+        return false;
+    };
+    transport.send(peer, frame).await.is_ok()
 }
 
 fn decode_topology(reply: Value) -> Result<crate::coordinator::Topology, CapabilityError> {

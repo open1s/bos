@@ -928,12 +928,20 @@ async fn both_sides_audit_a_resource_open() {
     let sent = wait_for(&caller_audit, |event| event.operation == "resource").await;
     assert_eq!(sent.direction, Direction::Outbound);
     assert_eq!(sent.outcome, "ok");
-    assert_eq!(sent.subject.as_deref(), Some("lease-audit"));
+    assert!(
+        sent.subject
+            .as_deref()
+            .is_some_and(|subject| subject.starts_with("lease-audit#attempt=")),
+        "the caller names the stream attempt: {sent:?}"
+    );
 
     let served = wait_for(&provider_audit, |event| event.operation == "resource").await;
     assert_eq!(served.direction, Direction::Inbound);
     assert_eq!(served.outcome, "ok");
-    assert_eq!(served.subject.as_deref(), Some("lease-audit"));
+    assert_eq!(
+        served.subject, sent.subject,
+        "both sides correlate the same stream attempt"
+    );
 
     // A lease the provider never granted: the open is sent, the provider
     // refuses it, and the refusal is recorded with the lease id.
@@ -950,7 +958,11 @@ async fn both_sides_audit_a_resource_open() {
         .expect("the open is sent");
 
     let refusal = wait_for(&provider_audit, |event| {
-        event.operation == "resource" && event.subject.as_deref() == Some("lease-missing")
+        event.operation == "resource"
+            && event
+                .subject
+                .as_deref()
+                .is_some_and(|subject| subject.starts_with("lease-missing#attempt="))
     })
     .await;
     assert_eq!(refusal.outcome, "not_found");
@@ -996,7 +1008,11 @@ async fn a_quota_exhausted_stream_records_its_end() {
         event.operation == "resource" && event.outcome == "quota_exceeded"
     })
     .await;
-    assert_eq!(event.subject.as_deref(), Some("lease-quota"));
+    let provider_subject = event.subject.clone().expect("a correlated subject");
+    assert!(
+        provider_subject.starts_with("lease-quota#attempt="),
+        "{event:?}"
+    );
     assert_eq!(event.bytes, Some(4), "exactly the quota moved");
     assert!(
         event
@@ -1026,7 +1042,11 @@ async fn a_quota_exhausted_stream_records_its_end() {
     })
     .await;
     assert_eq!(event.direction, Direction::Outbound);
-    assert_eq!(event.subject.as_deref(), Some("lease-quota"));
+    assert_eq!(
+        event.subject.as_deref(),
+        Some(provider_subject.as_str()),
+        "the caller and the provider name the same stream attempt"
+    );
     assert_eq!(event.bytes, Some(4));
 }
 
@@ -1667,10 +1687,11 @@ async fn a_replayed_frame_is_not_dispatched_twice() {
 
 /// Issue #303: with replay persistence configured, a side-effectful request
 /// whose durable commit fails is refused with a typed error and never runs.
-/// Two real I/O failures are injected: a write-stage failure (the store's
-/// parent is a regular file) and a rename-stage failure (the store path is a
-/// directory). Once storage recovers, the rolled-back admission lets the same
-/// identity retry exactly once.
+/// Two real I/O failures are injected only after the node started, so the
+/// store itself loaded (Missing) and the failure is the commit's: a write-stage
+/// failure (the store's parent stops being a directory) and a rename-stage
+/// failure (a directory appears at the store path). Once storage recovers, the
+/// rolled-back admission lets the same identity retry exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_replay_commit_refuses_a_side_effectful_request() {
     use capability::MessageId;
@@ -1683,17 +1704,6 @@ async fn a_failed_replay_commit_refuses_a_side_effectful_request() {
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         let replay_path = dir.join("replay.json");
-        let obstacle = match case {
-            "write" => {
-                let blocker = dir.join("blocker");
-                std::fs::write(&blocker, b"not a directory").expect("blocker");
-                blocker.join("replay.json")
-            }
-            _ => {
-                std::fs::create_dir_all(&replay_path).expect("directory at the store path");
-                replay_path.clone()
-            }
-        };
 
         let network = Arc::new(InMemoryNetwork::new());
         let caller_identity = identity(131);
@@ -1705,7 +1715,7 @@ async fn a_failed_replay_commit_refuses_a_side_effectful_request() {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = FederationNode::new(provider_identity, Arc::new(provider_transport))
             .with_runtime(runtime(descriptor("echo"), Arc::clone(&calls)))
-            .with_replay_persistence(obstacle.clone());
+            .with_replay_persistence(replay_path.clone());
         let task = provider.start(provider_inbox);
         let now = capability::unix_ms();
         {
@@ -1717,6 +1727,15 @@ async fn a_failed_replay_commit_refuses_a_side_effectful_request() {
                 .expect("granted");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Inject the commit failure now that the startup load succeeded.
+        match case {
+            "write" => {
+                std::fs::remove_dir_all(&dir).expect("remove the store's directory");
+                std::fs::write(&dir, b"not a directory").expect("blocker");
+            }
+            _ => std::fs::create_dir_all(&replay_path).expect("directory at the store path"),
+        }
 
         let payload = json!({ "capability": "builtin/echo", "input": { "value": 1 } });
         let mut message =
@@ -1752,7 +1771,10 @@ async fn a_failed_replay_commit_refuses_a_side_effectful_request() {
         // Repair storage and retry the SAME identity: the rolled-back
         // admission lets it through exactly once.
         match case {
-            "write" => std::fs::remove_file(dir.join("blocker")).expect("unblock"),
+            "write" => {
+                std::fs::remove_file(&dir).expect("unblock");
+                std::fs::create_dir_all(&dir).expect("the store's directory is back");
+            }
             _ => std::fs::remove_dir_all(&replay_path).expect("unblock"),
         }
         caller_transport

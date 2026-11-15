@@ -6055,6 +6055,15 @@ impl Shell {
         {
             return false;
         }
+        if let Some(failure) = page.failure() {
+            // A page the log could not serve is reported through the notice
+            // seam instead of reading as the top of the trace. The flow is not
+            // latched done, so the next reach asks again.
+            let text = failure.to_string();
+            self.state.notice(text);
+            cx.notify();
+            return false;
+        }
         if page.rows.is_empty() {
             self.trace_done = true;
             return false;
@@ -6304,6 +6313,15 @@ impl Shell {
     /// place.
     fn land_older(&mut self, page: OlderPage, cx: &mut Context<Self>) -> bool {
         if self.state.active_id.as_deref() != Some(page.session.as_str()) {
+            return false;
+        }
+        if let Some(failure) = page.failure() {
+            // A window the log could not serve is reported instead of looking
+            // like the start of the conversation; the paging floor is
+            // untouched, so the reader can ask again.
+            let text = failure.to_string();
+            self.state.notice(text);
+            cx.notify();
             return false;
         }
         let added = self

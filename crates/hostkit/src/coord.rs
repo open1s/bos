@@ -89,6 +89,9 @@ fn is_lock_conflict(error: &io::Error) -> bool {
     }
 }
 
+/// How long a bounded acquire waits between two lock attempts.
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
 impl FileLock {
     /// Acquire the lock for `store_path`, waiting for any current holder.
     pub fn acquire(store_path: &Path) -> Result<Self, DurableError> {
@@ -98,6 +101,37 @@ impl FileLock {
     /// Acquire the lock or fail immediately with [`DurableError::Locked`].
     pub fn try_acquire(store_path: &Path) -> Result<Self, DurableError> {
         Self::open(store_path, false)
+    }
+
+    /// Acquire the lock, retrying for at most `budget` before giving up.
+    ///
+    /// This is the bounded form of a write-lock acquire: a caller that must not
+    /// block a UI thread (a history append) waits a short while for a peer to
+    /// finish and then gets the typed [`DurableError::Locked`] instead of
+    /// hanging. [`FileLock::acquire`] keeps its blocking semantics, so a
+    /// caller that wants to queue behind the holder still can.
+    ///
+    /// Only a lock conflict is retried; any other storage error (a directory
+    /// that cannot be created, a lock file that cannot be opened) is returned
+    /// immediately because waiting cannot fix it.
+    pub fn acquire_bounded(
+        store_path: &Path,
+        budget: std::time::Duration,
+    ) -> Result<Self, DurableError> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            match Self::try_acquire(store_path) {
+                Ok(lock) => return Ok(lock),
+                Err(error @ DurableError::Locked { .. }) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Err(error);
+                    }
+                    std::thread::sleep(LOCK_RETRY.min(deadline - now));
+                }
+                Err(other) => return Err(other),
+            }
+        }
     }
 
     fn open(store_path: &Path, blocking: bool) -> Result<Self, DurableError> {
@@ -220,5 +254,53 @@ mod tests {
             lock_path.exists(),
             "deleting the lock file would race with other lockers"
         );
+    }
+
+    /// A bounded acquire gives up with the typed error instead of blocking.
+    #[test]
+    fn a_bounded_acquire_gives_up_with_the_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("memory.jsonl");
+        let held = FileLock::acquire(&store).unwrap();
+        let started = std::time::Instant::now();
+        let outcome = FileLock::acquire_bounded(&store, std::time::Duration::from_millis(40));
+        let waited = started.elapsed();
+        assert!(
+            matches!(outcome, Err(DurableError::Locked { .. })),
+            "a held lock must surface the typed Locked error"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "the bounded acquire must not block: waited {waited:?}"
+        );
+        drop(held);
+    }
+
+    /// A zero budget is a single attempt, not a blocking wait.
+    #[test]
+    fn a_zero_budget_is_one_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("memory.jsonl");
+        let held = FileLock::acquire(&store).unwrap();
+        let outcome = FileLock::acquire_bounded(&store, std::time::Duration::ZERO);
+        assert!(matches!(outcome, Err(DurableError::Locked { .. })));
+        drop(held);
+        assert!(FileLock::acquire_bounded(&store, std::time::Duration::ZERO).is_ok());
+    }
+
+    /// A bounded acquire wins once the holder releases inside the budget.
+    #[test]
+    fn a_bounded_acquire_waits_out_a_short_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("memory.jsonl");
+        let held = FileLock::acquire(&store).unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(held);
+        });
+        let lock = FileLock::acquire_bounded(&store, std::time::Duration::from_secs(5))
+            .expect("the lock is free after the holder releases");
+        drop(lock);
+        holder.join().unwrap();
     }
 }

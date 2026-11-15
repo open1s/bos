@@ -9,14 +9,22 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-echo "==> format"
-cargo fmt -p bsh -- --check
+# A caller that already ran the workspace gate on this exact tree (the rust
+# workflow's Format/Lint/Test steps run fmt --all, clippy --all-targets and the
+# whole test suite) does not need the same answers twice. Setting this keeps
+# only the feature-gated cases the workspace test cannot reach.
+COVERED="${GOLD_STANDARD_COVERED:-0}"
 
-echo "==> clippy"
-cargo clippy -p bsh --lib --tests -- -D warnings
+if [[ "$COVERED" != "1" ]]; then
+  echo "==> format"
+  cargo fmt -p bsh -- --check
 
-echo "==> extension suite"
-cargo test -p bsh --lib extension::
+  echo "==> clippy"
+  cargo clippy -p bsh --lib --tests -- -D warnings
+
+  echo "==> extension suite"
+  cargo test -p bsh --lib extension::
+fi
 
 echo "==> framework runtime conformance"
 # The pure-compute cancellation tests race the epoch interrupt under CI load
@@ -30,8 +38,10 @@ for attempt in 1 2; do
   echo "::warning::runtime conformance attempt $attempt failed; retrying"
 done
 
-echo "==> SDK conformance"
-cargo test -p ferris-sdk
+if [[ "$COVERED" != "1" ]]; then
+  echo "==> SDK conformance"
+  cargo test -p ferris-sdk
+fi
 
 echo "==> composition conformance"
 cargo test -p ferris-core --features tokio --lib composable::
@@ -39,14 +49,16 @@ cargo test -p ferris-core --features tokio --lib composable::
 echo "==> budget smoke"
 cargo test -p ferris-core --features tokio --lib composable::tests::gold_standard
 
-echo "==> all-in-one contribution coverage"
-cargo test -p bsh --lib extension::e2e::the_allinone_example -- --nocapture
+if [[ "$COVERED" != "1" ]]; then
+  echo "==> all-in-one contribution coverage"
+  cargo test -p bsh --lib extension::e2e::the_allinone_example -- --nocapture
 
-echo "==> Cordis runtime coverage"
-cargo test -p bsh --lib extension::runtime::cordis -- --nocapture
-cargo test -p bsh --lib extension::e2e::the_cordis_example -- --nocapture
+  echo "==> Cordis runtime coverage"
+  cargo test -p bsh --lib extension::runtime::cordis -- --nocapture
+  cargo test -p bsh --lib extension::e2e::the_cordis_example -- --nocapture
+fi
 
-if [[ "${GOLD_STANDARD_RELEASE:-${CI:-0}}" == "1" || "${GOLD_STANDARD_RELEASE:-${CI:-0}}" == "true" ]]; then
+if [[ "${GOLD_STANDARD_RELEASE:-0}" == "1" || "${GOLD_STANDARD_RELEASE:-0}" == "true" ]]; then
   echo "==> release budgets"
   bash scripts/ci/bench-extension.sh
 fi

@@ -41,6 +41,12 @@ jobs:
         with:
           key: linux-core
           cache-on-failure: true
+          # The workspace crates are the expensive compile (bsh alone is
+          # minutes per run); by default rust-cache only keeps dependencies,
+          # so every unrelated push rebuilt bsh for clippy and again for the
+          # test binaries. Keeping the workspace artifacts too makes a warm
+          # run skip both.
+          cache-workspace-crates: true
           workspaces: ". -> target"
 
       - name: Install Linux GUI dependencies
@@ -109,6 +115,11 @@ jobs:
       - name: Extension gold standard
         env:
           GOLD_STANDARD_RELEASE: ${{ inputs.release_budgets && '1' || '0' }}
+          # The gate re-ran fmt, bsh clippy, the bsh extension suite and
+          # ferris-sdk, all of which the Format/Lint/Test steps above just
+          # ran on the same tree; the script skips them when this is set and
+          # keeps the feature-gated cases the workspace test cannot reach.
+          GOLD_STANDARD_COVERED: "1"
         run: |
           for attempt in 1 2; do
             if bash scripts/ci/check-extension-gold-standard.sh; then

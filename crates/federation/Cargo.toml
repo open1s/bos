@@ -29,6 +29,9 @@ tracing.workspace = true
 [dev-dependencies]
 semver.workspace = true
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# `#[tokio::test(start_paused = true)]`: the resource-stream deadline test runs
+# on tokio's paused clock instead of waiting out an injected duration.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

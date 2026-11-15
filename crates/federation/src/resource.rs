@@ -10,6 +10,8 @@
 //! module enforces the lease, the order, the quota, and the checksum.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use capability::{CapabilityId, NodeId};
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,23 @@ impl std::fmt::Display for LeaseId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+/// The per-process origin of stream attempts: the wall clock at the first open,
+/// in milliseconds. Mixed with a counter so two processes (or two runs of the
+/// same process) do not mint the same attempt sequence.
+static ATTEMPT_EPOCH_MS: OnceLock<u64> = OnceLock::new();
+static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+
+/// Allocate the attempt (generation) of one stream open.
+///
+/// An attempt is unique within this process and distinct across restarts: the
+/// process's first open fixes an epoch in milliseconds and every attempt is
+/// `epoch + counter`. A lease may be reused by a later stream, so the provider
+/// compares attempts exactly and a stale cancel cannot stop a newer stream.
+pub fn next_stream_attempt() -> u64 {
+    let epoch = *ATTEMPT_EPOCH_MS.get_or_init(capability::unix_ms);
+    epoch.wrapping_add(NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// One granted resource lease.
@@ -447,6 +466,12 @@ pub enum ResourceStreamMessage {
         offset: u64,
         /// Credit the receiver grants up front.
         credit: u64,
+        /// The stream's generation, unique per open (issue #347).
+        ///
+        /// A peer that predates generations sends no field and is given
+        /// attempt 0; it is then only cancellable by another attempt 0.
+        #[serde(default)]
+        attempt: u64,
     },
     /// One ordered chunk.
     Chunk {
@@ -480,6 +505,19 @@ pub enum ResourceStreamMessage {
         /// Why it stopped.
         message: String,
     },
+    /// The caller abandoned the stream (issue #347).
+    ///
+    /// Appended so the wire stays additive: a peer that does not know this
+    /// variant never receives one, because the caller's drop path is
+    /// best-effort. The provider stops the producer only when `attempt` is the
+    /// live session's attempt, so a stale cancel cannot kill a newer stream on
+    /// the same lease.
+    Cancel {
+        /// The lease.
+        lease: LeaseId,
+        /// The stream generation the cancel is for.
+        attempt: u64,
+    },
 }
 
 impl ResourceStreamMessage {
@@ -490,7 +528,8 @@ impl ResourceStreamMessage {
             | Self::Chunk { lease, .. }
             | Self::Credit { lease, .. }
             | Self::Close { lease, .. }
-            | Self::Error { lease, .. } => lease,
+            | Self::Error { lease, .. }
+            | Self::Cancel { lease, .. } => lease,
         }
     }
 }
@@ -594,6 +633,7 @@ pub struct StreamReceiver {
     bytes: Vec<u8>,
     credit: u64,
     window: u64,
+    attempt: u64,
 }
 
 impl StreamReceiver {
@@ -607,7 +647,13 @@ impl StreamReceiver {
             bytes: Vec::new(),
             credit: 0,
             window: window.max(1),
+            attempt: next_stream_attempt(),
         }
+    }
+
+    /// The generation this receiver's open carries.
+    pub fn attempt(&self) -> u64 {
+        self.attempt
     }
 
     /// Grant the initial credit window.
@@ -618,6 +664,7 @@ impl StreamReceiver {
             uri: self.uri.clone(),
             offset: self.offset,
             credit: self.window,
+            attempt: self.attempt,
         }
     }
 
@@ -760,6 +807,46 @@ mod tests {
         let reloaded = TransferStore::load(&path).expect("load");
         assert_eq!(reloaded.position(&lease, "file:///artifact"), 0);
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// Every open mints a fresh generation, and an open from a peer that
+    /// predates generations still parses (issue #347).
+    #[test]
+    fn a_stream_open_carries_a_fresh_attempt() {
+        let first = next_stream_attempt();
+        let second = next_stream_attempt();
+        assert!(second > first, "attempts increase within one process");
+
+        let mut receiver = StreamReceiver::new(LeaseId::new("l-attempt"), "file:///x", 0, 4);
+        match receiver.open() {
+            ResourceStreamMessage::Open { attempt, .. } => {
+                assert_eq!(attempt, receiver.attempt());
+                assert_ne!(attempt, 0, "a minted attempt is never the legacy zero");
+            }
+            other => panic!("expected an open, got {other:?}"),
+        }
+
+        let legacy =
+            r#"{"type":"open","lease":"l-legacy","uri":"file:///x","offset":0,"credit":4}"#;
+        match serde_json::from_str::<ResourceStreamMessage>(legacy).expect("legacy open parses") {
+            ResourceStreamMessage::Open { attempt, .. } => assert_eq!(attempt, 0),
+            other => panic!("expected an open, got {other:?}"),
+        }
+    }
+
+    /// Cancel is an additive wire variant and round-trips with its attempt.
+    #[test]
+    fn a_cancel_round_trips_with_its_attempt() {
+        let cancel = ResourceStreamMessage::Cancel {
+            lease: LeaseId::new("l-cancel"),
+            attempt: 7,
+        };
+        let text = serde_json::to_string(&cancel).expect("serialized");
+        assert_eq!(
+            serde_json::from_str::<ResourceStreamMessage>(&text).expect("parsed"),
+            cancel
+        );
+        assert_eq!(cancel.lease(), &LeaseId::new("l-cancel"));
     }
 
     /// A resume uses the stored position only when the caller did not name one.
