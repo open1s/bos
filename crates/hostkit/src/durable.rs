@@ -805,7 +805,12 @@ mod tests {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let base = TEMP_SEQ.load(Ordering::Relaxed);
         let mut sentinels = Vec::new();
-        for offset in 0..64 {
+        // Fewer sentinels than TEMP_ATTEMPTS: the commit must skip the taken
+        // names and still find a free one. Creating exactly TEMP_ATTEMPTS
+        // sentinels (the old 0..64) made the test fail whenever it ran alone -
+        // serially in the release gate - because the commit consumed its whole
+        // 64-name budget on the sentinels and reported AlreadyExists.
+        for offset in 0..8 {
             let candidate = dir.path().join(format!(
                 ".{name}.tmp-{}-{}",
                 std::process::id(),
