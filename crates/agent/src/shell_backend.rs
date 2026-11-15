@@ -114,7 +114,8 @@ fn resolve_windows() -> Result<BashRuntime, String> {
     for root in [
         std::env::var_os("ProgramFiles"),
         std::env::var_os("ProgramFiles(x86)"),
-        std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join("Programs")),
+        std::env::var_os("LOCALAPPDATA")
+            .map(|local| PathBuf::from(local).join("Programs").into_os_string()),
     ]
     .into_iter()
     .flatten()
