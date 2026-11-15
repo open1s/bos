@@ -264,7 +264,9 @@ pub fn descendants(pid: u32) -> Vec<u32> {
     platform::descendants(pid)
 }
 
-#[cfg(test)]
+// The cases drive POSIX shells and process groups, so they are Unix-only; the
+// Windows conformance lane only needs the lib to compile.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt as _;
