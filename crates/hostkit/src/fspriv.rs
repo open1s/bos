@@ -6,7 +6,9 @@
 //! fails closed: if the private policy cannot be established, the write
 //! errors instead of silently storing the secret world-readable.
 
-use std::fs::{self, OpenOptions};
+#[cfg(any(unix, test))]
+use std::fs;
+use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 

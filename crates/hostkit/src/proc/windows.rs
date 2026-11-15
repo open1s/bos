@@ -296,12 +296,8 @@ pub(super) fn adopt_suspended(
     memory_bytes: Option<u64>,
 ) -> io::Result<Owner> {
     let job = JobObject::new(memory_bytes)?;
-    if let Err(err) = job.assign(process) {
-        return Err(err);
-    }
-    if let Err(err) = resume_main_thread(pid) {
-        return Err(err);
-    }
+    job.assign(process)?;
+    resume_main_thread(pid)?;
     Ok(Owner::Job {
         job,
         pid,

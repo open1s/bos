@@ -338,14 +338,27 @@ mod tests {
     #[test]
     fn process_info_reads_the_command_line() {
         let mut child = OwnedChild::spawn(&mut sleeper_cmd("5")).expect("spawn");
-        let info = process_info(child.id()).expect("live process is inspectable");
-        assert_eq!(info.pid, child.id());
-        assert!(
-            info.command_line.as_deref().unwrap_or("").contains("sleep"),
-            "command line must be readable: {info:?}"
-        );
+        let pid = child.id();
+        // A freshly forked child can be caught mid-exec, when the kernel
+        // reports an empty /proc/<pid>/cmdline; the contract allows an
+        // unreadable line, so the test waits for the live one instead of
+        // failing a read that raced execve.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let info = loop {
+            let info = process_info(pid).expect("live process is inspectable");
+            assert_eq!(info.pid, pid);
+            if info.command_line.as_deref().unwrap_or("").contains("sleep") {
+                break info;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command line must be readable: {info:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(info);
         let _ = child.terminate(Duration::from_millis(500));
-        assert!(!pid_alive(child.id()));
+        assert!(!pid_alive(pid));
     }
 
     /// Cross-platform conformance guard (issue #313): the shared process
