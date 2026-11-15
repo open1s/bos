@@ -155,17 +155,19 @@ pub(crate) fn refresh_plugin_providers(settings: &mut Settings) {
     let mut keys: BTreeMap<String, bool> = BTreeMap::new();
     let mut owners: BTreeMap<String, String> = BTreeMap::new();
 
-    // Open (or refresh) the extension host before reading the contributed
-    // provider cache. At launch nothing has opened it yet - the shell's own
-    // theme and status queries run after this refresh - and
-    // `cached_model_providers` answers from the open host, so refreshing first
-    // cached an empty set for the whole session. That is what kept every
-    // model provider an installed BSH package declares out of the picker.
-    {
+    // Open (or refresh) the extension host and read the contributed surfaces
+    // in ONE host lock hold. At launch nothing has opened it yet - the shell's
+    // own theme and status queries run after this refresh - and the caches
+    // answer from the open host, so refreshing first cached an empty set for
+    // the whole session (which kept every provider an installed BSH package
+    // declares out of the picker). Reading them separately also let a
+    // concurrent host open (a workspace switch, or another test sharing the
+    // process) swap the host between the open and the read.
+    let (_statuses, host_providers, host_presets) = {
         let root = settings.active_workspace_root();
         let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
-        let _ = crate::extension::statuses(settings, workspace.as_deref());
-    }
+        crate::extension::launch_surfaces(settings, workspace.as_deref())
+    };
 
     // The inventory is read from the persisted global document, not from a
     // draft: a build describes what is installed, and the pane's unsaved edits
@@ -204,7 +206,7 @@ pub(crate) fn refresh_plugin_providers(settings: &mut Settings) {
         }
     }
 
-    for (id, provider) in crate::extension::cached_model_providers() {
+    for (id, provider) in host_providers {
         if settings.global.providers.contains_key(&id) || providers.contains_key(&id) {
             continue;
         }
@@ -216,9 +218,7 @@ pub(crate) fn refresh_plugin_providers(settings: &mut Settings) {
         keys.insert(id.clone(), requires_key);
         owners.insert(id, "extension".to_string());
     }
-    settings
-        .global
-        .set_plugin_presets(crate::extension::cached_presets());
+    settings.global.set_plugin_presets(host_presets);
     settings
         .global
         .set_plugin_providers(providers, keys, owners);

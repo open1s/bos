@@ -4442,6 +4442,32 @@ pub(crate) fn statuses(
     with_host(settings, workspace, |host| host.statuses()).unwrap_or_default()
 }
 
+/// Open (or refresh) the host and read the launch surfaces in ONE lock hold.
+///
+/// `statuses` opens the process-global host, and `cached_model_providers` /
+/// `cached_presets` read that same slot. Called as separate steps, a
+/// concurrent `with_host` (a workspace switch, or another test in the same
+/// process) can swap the host in between, so the launch refresh caches the
+/// other host's - usually empty - surfaces. One call makes the open and the
+/// reads atomic.
+pub(crate) fn launch_surfaces(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+) -> (
+    Vec<ExtensionStatus>,
+    std::collections::BTreeMap<String, crate::settings::global::Provider>,
+    std::collections::BTreeMap<String, crate::settings::global::Preset>,
+) {
+    with_host(settings, workspace, |host| {
+        (
+            host.statuses(),
+            host.model_provider_surfaces(),
+            host.preset_surfaces(),
+        )
+    })
+    .unwrap_or_default()
+}
+
 /// Approve one process executable from the settings pane.
 pub(crate) fn approve_process(
     settings: &crate::settings::Settings,

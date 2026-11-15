@@ -521,6 +521,45 @@ pub(crate) struct RecoveryReport {
     pub(crate) quarantined: Vec<RecoveryRecord>,
 }
 
+/// The one startup line a recovery report deserves, if any.
+///
+/// It names how many journals were untrustworthy, which sessions they belonged
+/// to and where their bytes were moved - never a message's contents. A clean
+/// start (nothing quarantined) stays silent, so the reader is told about a
+/// preserved journal instead of a recovery being reported as fully successful.
+pub(crate) fn recovery_notice(report: &RecoveryReport) -> Option<String> {
+    if report.quarantined.is_empty() {
+        return None;
+    }
+    let mut sessions: Vec<&str> = report
+        .quarantined
+        .iter()
+        .map(|record| record.session.as_str())
+        .collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    let mut dirs: Vec<String> = report
+        .quarantined
+        .iter()
+        .map(|record| {
+            let source = Path::new(&record.source_path);
+            source.parent().map_or_else(
+                || record.source_path.clone(),
+                |parent| parent.join(CORRUPT).display().to_string(),
+            )
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    Some(format!(
+        "{} interrupted journal(s) could not be trusted and were kept aside; session(s): {}; \
+         kept under {}",
+        report.quarantined.len(),
+        sessions.join(", "),
+        dirs.join(", ")
+    ))
+}
+
 /// The directory a workspace keeps its sessions in.
 pub(crate) fn sessions_dir(root: &Path) -> PathBuf {
     root.join(".bsh").join("sessions")
@@ -1535,8 +1574,8 @@ impl Store {
     /// The order is the point: create the incident directory, move the journal
     /// in with ONE rename (so its bytes are never copied or rewritten), then
     /// write the report beside it through a temporary and a rename. A failure
-    /// to create the directory returns `None` and leaves the journal where it
-    /// is, because a journal that was not preserved must not be deleted.
+    /// to create the directory leaves the journal where it is and returns
+    /// `Kept`, because a journal that was not preserved must not be deleted.
     fn quarantine(
         &mut self,
         dir: &Path,
@@ -1565,25 +1604,24 @@ impl Store {
             let _ = fs::remove_dir(&incident);
             return Recovery::Kept;
         }
-        let report = match serde_json::to_vec_pretty(&record) {
-            Ok(report) => report,
-            Err(error) => {
-                log::error!(
-                    "session {}: a quarantine report could not be serialized: {error}",
-                    record.session
-                );
-                let _ = fs::remove_dir(&incident);
-                return Recovery::Kept;
+        // The journal is already preserved, so a report failure is recorded but
+        // does not undo the quarantine: the bytes matter more than the report.
+        match serde_json::to_vec_pretty(&record) {
+            Ok(report) => {
+                let report_tmp = incident.join("report.json.tmp");
+                let installed = fs::write(&report_tmp, &report)
+                    .and_then(|()| fs::rename(&report_tmp, incident.join("report.json")));
+                if let Err(error) = installed {
+                    log::error!(
+                        "session {}: a quarantine report could not be written: {error}",
+                        record.session
+                    );
+                }
             }
-        };
-        let report_tmp = incident.join("report.json.tmp");
-        let installed = fs::write(&report_tmp, &report)
-            .and_then(|()| fs::rename(&report_tmp, incident.join("report.json")));
-        if let Err(error) = installed {
-            log::error!(
-                "session {}: a quarantine report could not be written: {error}",
+            Err(error) => log::error!(
+                "session {}: a quarantine report could not be serialized: {error}",
                 record.session
-            );
+            ),
         }
         log::warn!(
             "session {}: quarantined an interrupted turn's journal ({}) at {}",
@@ -3296,6 +3334,59 @@ mod raw_tests {
         );
         assert_eq!(store.recovery_report().quarantined[0].reason, reason);
         store
+    }
+
+    #[test]
+    fn a_recovery_notice_names_the_count_the_sessions_and_the_quarantine_directory() {
+        let base = journal_scratch("recovery-notice");
+        let incident = |session: &str, dir: &str| super::RecoveryRecord {
+            session: session.to_string(),
+            source_path: base.join(dir).join(super::INFLIGHT).display().to_string(),
+            reason: "checksum-mismatch".to_string(),
+            version: 1,
+            rows: 2,
+            quarantined_at: 1,
+        };
+        let report = super::RecoveryReport {
+            // Two incidents for one session and one for another: the count is
+            // per incident, the names and directories are deduplicated.
+            quarantined: vec![
+                incident("alpha", "one"),
+                incident("alpha", "one"),
+                incident("beta", "two"),
+            ],
+            ..Default::default()
+        };
+        let notice = super::recovery_notice(&report).expect("a quarantined journal is reported");
+        assert!(
+            notice.contains("3 interrupted journal(s)"),
+            "the notice counts the incidents: {notice}"
+        );
+        assert!(
+            notice.contains("session(s): alpha, beta"),
+            "and names each affected session once: {notice}"
+        );
+        assert_eq!(
+            notice.matches("alpha").count(),
+            1,
+            "a session named by two incidents is listed once: {notice}"
+        );
+        for dir in ["one", "two"] {
+            let quarantine = base.join(dir).join(super::CORRUPT).display().to_string();
+            assert!(
+                notice.contains(&quarantine),
+                "the notice names where the bytes were kept ({dir}): {notice}"
+            );
+        }
+        assert!(
+            !notice.contains("checksum-mismatch"),
+            "the notice carries no reason string and no contents: {notice}"
+        );
+        assert!(
+            super::recovery_notice(&super::RecoveryReport::default()).is_none(),
+            "a clean start stays silent"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

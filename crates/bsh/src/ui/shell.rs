@@ -1313,6 +1313,12 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Self {
         state.restore_session();
+        // Recovery ran when the store opened, before any window existed, so this
+        // is its one surface: a turn's journal that could not be trusted is
+        // named here instead of the launch claiming a clean start.
+        if let Some(text) = crate::store::recovery_notice(state.store.recovery_report()) {
+            state.notice(text);
+        }
         // Extension providers and presets are runtime state: refresh them from
         // the open extension host after the settings tree has loaded, so a
         // contributed model/preset is selectable without a relaunch.

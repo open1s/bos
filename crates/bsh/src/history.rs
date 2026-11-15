@@ -16,12 +16,50 @@
 //! * Row groups are pages. A segment is written with at most PAGE rows and a
 //!   byte budget per row group, so one huge tool output does not make every
 //!   neighbouring page enormous. A page read decodes only the groups it needs.
-//! * A page cache with a fixed ceiling. Decoded pages live in an LRU capped at
-//!   CACHE_PAGES; the Store keeps one History per session, so scrolling reuses
-//!   it rather than reopening the directory.
+//! * A page cache with a fixed ceiling, in pages AND bytes. Decoded pages live
+//!   in an LRU capped at CACHE_PAGES and at CACHE_BYTES; the Store keeps one
+//!   History per session, so scrolling reuses it rather than reopening the
+//!   directory.
 //!
 //! The session document keeps what a session IS - title, workspace, flags, the
 //! plan - and this module keeps what was SAID.
+//!
+//! # Bounded memory (issue #354)
+//!
+//! Three bounds keep a long conversation from growing the process without end:
+//!
+//! * The page cache holds at most CACHE_PAGES decoded pages AND at most
+//!   CACHE_BYTES bytes of them. A page's weight is the decoded-row estimate, not
+//!   the encoded Parquet size, and a write evicts from the least-recently-used
+//!   end until BOTH bounds hold. A single page above the whole budget is served
+//!   to its caller but not cached, so the cache itself never exceeds its budget.
+//! * A row above MAX_INLINE_ROW_BYTES is refused at the append boundary with a
+//!   typed [`HistoryError::Oversized`] BEFORE anything is written. The policy is
+//!   a reference, not a truncation: a payload that large must be carried by the
+//!   caller as a file path or an attachment id, and the row is never silently
+//!   shortened or silently inlined.
+//! * A window materializes at most MAX_WINDOW_ROWS rows. A longer walk goes
+//!   through [`Reader::for_each_page`], which hands over one page at a time, and
+//!   `prefix` uses the same walk, so no internal read allocates the history
+//!   whole.
+//!
+//! [`History::cache_stats`] is the report a caller or a metric exposes for the
+//! first two bounds.
+//!
+//! # Schema evolution and total decoding (issue #355)
+//!
+//! Every segment records the column set it carries in its Parquet key/value
+//! metadata under SCHEMA_KEY. The reader accepts exactly the versions in
+//! SUPPORTED_SCHEMA_VERSIONS and rejects anything else with
+//! [`HistoryError::Schema`] rather than guessing. It also validates the file's
+//! columns against what the version promises, so a current file that is missing
+//! a column is a schema error and not a default.
+//!
+//! Within a supported file, an ABSENT column is a documented legacy default (a
+//! file written before images, steering or the turn timeline). A PRESENT column
+//! that is null where the write schema says non-nullable, or whose JSON does not
+//! parse, is a typed [`HistoryError::Decode`] naming the segment, the row and the
+//! column. Nothing decodes to a default silently.
 //!
 //! # Durability and coordination (issues #352, #353)
 //!
@@ -61,12 +99,39 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ChatMessage, MessageMeta, Role};
+use crate::model::{ChatMessage, MessageMeta, Role, ToolEvent, TurnPart};
 
 /// Rows per page (and the row-count ceiling of one row group).
 pub(crate) const PAGE: usize = 128;
 /// Decoded pages kept at once.
 pub(crate) const CACHE_PAGES: usize = 8;
+/// The decoded-heap budget the page cache keeps beside [`CACHE_PAGES`].
+///
+/// A page's weight is [`message_size`] over its rows: a conservative estimate of
+/// the strings the decoded rows own, NOT the page's encoded Parquet size. The
+/// cache weighs what the process actually holds, and evicts from its
+/// least-recently-used end until both the page ceiling and this budget hold.
+///
+/// One in-flight page is the documented allowance: a page whose weight alone
+/// exceeds the budget is handed to its caller and NOT cached, so the cache's own
+/// byte total never exceeds this budget and at most that one page is resident.
+const CACHE_BYTES: usize = 32 * 1024 * 1024;
+/// The largest decoded row an append may write inline (#354).
+///
+/// 32 MiB is large enough for a screenshot carried as a data URL and small
+/// enough that one row cannot dominate its page. A larger row is REFUSED at the
+/// append boundary with [`HistoryError::Oversized`]; it is never truncated, and
+/// the caller must carry the payload as a reference (a file, an attachment id, a
+/// path) instead of inline in the log.
+pub(crate) const MAX_INLINE_ROW_BYTES: usize = 32 * 1024 * 1024;
+/// The largest window one read materializes (#354).
+///
+/// `window` and `Reader::messages` clamp a longer request to this many rows
+/// (eight decoded pages, four times the store's own window), and a caller that
+/// must walk more of the log goes through [`Reader::for_each_page`], which
+/// streams one page at a time. `prefix` uses the same page walk, so no internal
+/// read allocates the history whole.
+pub(crate) const MAX_WINDOW_ROWS: usize = 8 * PAGE;
 /// Row groups target this many bytes, so one huge tool output cannot make a
 /// multi-megabyte page group on its own.
 const ROW_GROUP_BYTES: usize = 4 * 1024 * 1024;
@@ -104,10 +169,201 @@ const SCHEMA_KEY: &str = "bsh.schema";
 
 /// The schema version of a file written before the metadata existed.
 ///
-/// Those files have the original seven columns; the reader decodes them with
-/// documented defaults, which is why the version is supported rather than
-/// unknown.
+/// Those files have the original seven message columns at least; the reader
+/// decodes them with documented defaults, which is why the version is supported
+/// rather than unknown.
 const LEGACY_SCHEMA_VERSION: u32 = 1;
+
+/// The schema versions this build reads (#355).
+///
+/// Version 1 is the original message schema - index, role, text, reasoning,
+/// error, meta and tools - and a file written between the later additions
+/// carries a PREFIX of the current set (the intermediate eight- and nine-column
+/// shapes are the same history, read with the same defaults). Version 2 is the
+/// current ten-column message schema. The trajectory schema has never changed:
+/// its first four columns from the first version, with `ms` appended, and a
+/// legacy five-column file. A version outside this set is rejected with
+/// [`HistoryError::Schema`], never guessed at.
+pub(crate) const SUPPORTED_SCHEMA_VERSIONS: [u32; 2] = [LEGACY_SCHEMA_VERSION, SCHEMA_VERSION];
+
+/// How [`SUPPORTED_SCHEMA_VERSIONS`] reads in a schema error or a diagnosis.
+pub(crate) const SUPPORTED_SCHEMA_DESCRIPTION: &str = "1, 2";
+
+/// The message columns schema version 1 promises, in file order.
+const MESSAGE_COLUMNS_V1: [&str; 7] = [
+    "index",
+    "role",
+    "text",
+    "reasoning",
+    "error",
+    "meta",
+    "tools",
+];
+
+/// The message columns schema version 2 promises, in file order.
+const MESSAGE_COLUMNS_V2: [&str; 10] = [
+    "index",
+    "role",
+    "text",
+    "reasoning",
+    "error",
+    "meta",
+    "tools",
+    "images",
+    "steering",
+    "parts",
+];
+
+/// The trajectory columns every version promises, in file order.
+const TRAJECTORY_COLUMNS: [&str; 5] = ["index", "name", "args", "output", "ms"];
+
+/// Which column set a segment carries: the message log or the trajectory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentKind {
+    /// A `msg-*` file: the message schema.
+    Messages,
+    /// A `traj-*` file: the trajectory schema.
+    Trajectory,
+}
+
+impl SegmentKind {
+    /// The kind a segment file name names, from its prefix.
+    fn of_file(name: &str) -> Self {
+        if name.starts_with("traj") {
+            Self::Trajectory
+        } else {
+            Self::Messages
+        }
+    }
+
+    /// The list prefix a diagnosis reports for this kind.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Messages => "msg",
+            Self::Trajectory => "traj",
+        }
+    }
+
+    /// The columns `version` promises for this kind, in file order.
+    fn promised(self, version: u32) -> &'static [&'static str] {
+        match (self, version) {
+            (Self::Messages, LEGACY_SCHEMA_VERSION) => &MESSAGE_COLUMNS_V1,
+            (Self::Messages, _) => &MESSAGE_COLUMNS_V2,
+            (Self::Trajectory, _) => &TRAJECTORY_COLUMNS,
+        }
+    }
+
+    /// Whether `columns` is a column set `version` promises for this kind.
+    ///
+    /// A legacy message file may carry any prefix of the current ten columns from
+    /// the original seven onwards (the eight- and nine-column shapes are the same
+    /// history); a current file must carry exactly the ten. The trajectory
+    /// accepts its first four columns as well as the full five, because `ms` was
+    /// appended to a file that already held the first four. No file may carry a
+    /// column the current set does not name, so a foreign schema is rejected even
+    /// when its first columns happen to match.
+    fn accepts(self, version: u32, columns: &[String]) -> bool {
+        let (expected, minimum, maximum) = match self {
+            Self::Messages if version == LEGACY_SCHEMA_VERSION => (
+                &MESSAGE_COLUMNS_V2[..],
+                MESSAGE_COLUMNS_V1.len(),
+                MESSAGE_COLUMNS_V2.len(),
+            ),
+            Self::Messages => (
+                &MESSAGE_COLUMNS_V2[..],
+                MESSAGE_COLUMNS_V2.len(),
+                MESSAGE_COLUMNS_V2.len(),
+            ),
+            Self::Trajectory => (
+                &TRAJECTORY_COLUMNS[..],
+                TRAJECTORY_COLUMNS.len() - 1,
+                TRAJECTORY_COLUMNS.len(),
+            ),
+        };
+        columns.len() >= minimum
+            && columns.len() <= maximum
+            && columns
+                .iter()
+                .zip(expected.iter())
+                .all(|(column, expected)| column == expected)
+    }
+}
+
+/// The schema problem a file's version and column set have, if any (#355).
+///
+/// `found` is the `bsh.schema` value; `None` means a file written before the
+/// metadata existed, which is the legacy version by definition. The tuple names
+/// the version a report shows and the detail that names the columns.
+fn schema_problem(
+    kind: SegmentKind,
+    found: Option<u32>,
+    columns: &[String],
+) -> Option<(u32, String)> {
+    let version = found.unwrap_or(LEGACY_SCHEMA_VERSION);
+    if !SUPPORTED_SCHEMA_VERSIONS.contains(&version) {
+        return Some((
+            version,
+            format!("the file's columns are {}", column_list(columns)),
+        ));
+    }
+    if !kind.accepts(version, columns) {
+        return Some((
+            version,
+            format!(
+                "version {version} promises the {} column set ({}), the file carries {}",
+                kind.label(),
+                column_list(kind.promised(version)),
+                column_list(columns)
+            ),
+        ));
+    }
+    None
+}
+
+/// The columns of one file, as a report names them.
+fn column_list<S: AsRef<str>>(columns: &[S]) -> String {
+    columns
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Validate one file's schema record and column set.
+///
+/// Returns the typed [`HistoryError::Schema`] a read reports, never a default.
+fn validate_schema(
+    kind: SegmentKind,
+    segment: &str,
+    found: Option<u32>,
+    columns: &[String],
+) -> Result<()> {
+    match schema_problem(kind, found, columns) {
+        None => Ok(()),
+        Some((found, detail)) => Err(anyhow::Error::new(HistoryError::Schema {
+            segment: segment.to_string(),
+            found,
+            supported: SUPPORTED_SCHEMA_DESCRIPTION,
+            detail,
+        })),
+    }
+}
+
+/// The `bsh.schema` value a segment's key/value metadata records.
+///
+/// A value that does not parse is treated as absent, so the file is validated
+/// against the legacy column set; the column check still rejects a foreign
+/// shape, so a corrupt version cannot make an unknown file readable.
+fn recorded_schema(metadata: &parquet::file::metadata::ParquetMetaData) -> Option<u32> {
+    metadata
+        .file_metadata()
+        .key_value_metadata()?
+        .iter()
+        .find(|value| value.key == SCHEMA_KEY)?
+        .value
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+}
 
 /// How long a mutation waits for the cross-process history lock (#353).
 ///
@@ -130,17 +386,76 @@ const COMPACTION_STALE: std::time::Duration = std::time::Duration::from_secs(15 
 
 /// A typed history failure a caller can act on instead of parsing a string.
 ///
-/// The reliability kernel's Primitive 3 (#351/#355) adds the read, decode,
-/// schema, manifest and oversized variants; the lock variant lives here because
-/// the bounded cross-process acquire (#353) has to be distinguishable from a
-/// generic I/O error, and a caller may retry it while another process works.
+/// The reliability kernel's Primitive 3 (#351/#355) adds the decode, schema and
+/// oversized variants; the lock variant lives here because the bounded
+/// cross-process acquire (#353) has to be distinguishable from a generic I/O
+/// error, and a caller may retry it while another process works.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HistoryError {
+    /// A present column carried a value this build cannot decode.
+    ///
+    /// The column is present, so its value is not a legacy default: it is
+    /// malformed and reported instead of silently decoded as empty (#355).
+    #[error("{segment}: row {row}, column {column}: {detail}")]
+    Decode {
+        /// The segment file the row lives in.
+        segment: String,
+        /// The row's index WITHIN that segment.
+        row: usize,
+        /// The column's name.
+        column: &'static str,
+        /// What is wrong with the value.
+        detail: String,
+    },
+    /// A segment's schema version or column set is not one this build reads.
+    ///
+    /// An unsupported version is never guessed at, and a supported version with
+    /// the wrong columns is not decoded with defaults (#355).
+    #[error("{segment}: schema {found} is not supported (supported: {supported}); {detail}")]
+    Schema {
+        /// The segment file.
+        segment: String,
+        /// The version the file records, or the legacy version for a file
+        /// written before the metadata existed.
+        found: u32,
+        /// The versions this build reads, for the report.
+        supported: &'static str,
+        /// Which columns the version promises and which the file carries.
+        detail: String,
+    },
+    /// A page or a row group could not be read.
+    ///
+    /// The group is named because a page read addresses one row group. A request
+    /// beyond the file's group count arrives here as a typed failure instead of a
+    /// panic inside the Parquet reader (#351).
+    #[error("segment {segment}, row group {group}: {detail}")]
+    Read {
+        /// The segment file.
+        segment: String,
+        /// The row group the read asked for.
+        group: usize,
+        /// What is wrong.
+        detail: String,
+    },
     /// Another process holds the history directory's cross-process lock.
     #[error("history directory {path} is locked by another process")]
     Locked {
         /// The lock file that is held.
         path: String,
+    },
+    /// One row is larger than the inline limit, so the append wrote nothing.
+    ///
+    /// The caller has to carry the payload as a reference (documented policy):
+    /// large text or binary belongs in a file or an attachment, not inline in
+    /// the log.
+    #[error("row {row} is {bytes} bytes, above the {limit}-byte inline limit")]
+    Oversized {
+        /// The global row index the rejected row would have occupied.
+        row: usize,
+        /// The decoded-size estimate of the row.
+        bytes: usize,
+        /// The limit it exceeded.
+        limit: usize,
     },
 }
 
@@ -189,11 +504,13 @@ pub(crate) struct SegmentDiagnosis {
     pub(crate) consistent: bool,
 }
 
-/// The offline validation report for one history directory (#356).
+/// The offline validation report for one history directory (#356/#355).
 ///
-/// Built from the manifest and the Parquet footers only: no payload is
-/// decoded, so the cost is bounded by the segment count. `findings` is the
-/// seam #355 extends with malformed-column findings.
+/// Built from the manifest and the Parquet footers, plus one decoded row group
+/// at a time to validate field JSON. Memory is bounded by a row group, never the
+/// history; time is O(segments) for the metadata checks and O(rows) for the
+/// payload checks. `findings` carries both the schema verdicts and the
+/// malformed-field reports.
 #[allow(dead_code)] // the diagnostics surface a caller shows; tests prove the fields
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HistoryDiagnosis {
@@ -300,6 +617,12 @@ pub(crate) struct Segment {
     /// reader uses these counts to locate a global row across those boundaries
     /// instead of assuming every group holds PAGE rows.
     pub(crate) group_rows: Vec<usize>,
+    /// The `bsh.schema` version the file records.
+    ///
+    /// The segment list carries it so a republished manifest reports each file's
+    /// own version instead of claiming the current one for a legacy file (#355).
+    /// Zero means an older manifest did not record it.
+    pub(crate) schema: u32,
 }
 
 /// One segment as the manifest stores it: the per-segment integrity record.
@@ -364,6 +687,13 @@ pub(crate) struct History {
     /// the process: a save and a compaction's swap cannot interleave.
     lock: Arc<RwLock<()>>,
     cache: RefCell<PageCache>,
+    /// Rows refused by [`MAX_INLINE_ROW_BYTES`] since this handle opened (#354).
+    rejected: u64,
+    /// The inline limit an append enforces.
+    ///
+    /// [`MAX_INLINE_ROW_BYTES`] in production; a test injects a small one so it
+    /// can prove the boundary without allocating the real limit.
+    inline_limit: usize,
 }
 
 /// An immutable snapshot of a history's segment index.
@@ -385,8 +715,31 @@ impl Reader {
     }
 
     /// A global row range of messages.
+    ///
+    /// A request longer than [`MAX_WINDOW_ROWS`] is clamped: one read
+    /// materializes at most that many rows, and a caller that must walk more of
+    /// the log uses [`Self::for_each_page`] (#354).
     pub(crate) fn messages(&self, from: usize, len: usize) -> Result<Vec<ChatMessage>> {
-        read_range(&self.messages, from, len)
+        read_range(&self.messages, from, len.min(MAX_WINDOW_ROWS))
+    }
+
+    /// Walk a range of messages one page at a time (#354).
+    ///
+    /// `f` receives the page's index and at most [`PAGE`] decoded rows, so a
+    /// caller can visit a history longer than [`MAX_WINDOW_ROWS`] without
+    /// materializing it. An error from `f` stops the walk and is returned.
+    pub(crate) fn for_each_page<F>(&self, from: usize, len: usize, f: F) -> Result<()>
+    where
+        F: FnMut(usize, Vec<ChatMessage>) -> Result<()>,
+    {
+        walk_pages(&self.messages, self.rows(), from, len, f)
+    }
+
+    /// Rows in the message log this snapshot covers.
+    fn rows(&self) -> usize {
+        self.messages
+            .last()
+            .map_or(0, |segment| segment.start + segment.rows)
     }
 
     /// The trajectory page counted from the newest end.
@@ -580,6 +933,11 @@ impl History {
     /// A snapshot a background thread can read pages from.
     pub(crate) fn reader(&self) -> Reader {
         let _guard = self.read_guard();
+        self.reader_unlocked()
+    }
+
+    /// A snapshot for a caller that already holds the read guard.
+    fn reader_unlocked(&self) -> Reader {
         Reader {
             messages: Arc::clone(&self.messages),
             trajectory: Arc::clone(&self.trajectory),
@@ -649,6 +1007,8 @@ impl History {
             legacy: false,
             state: IndexState::Valid,
             cache: RefCell::new(PageCache::new(CACHE_PAGES)),
+            rejected: 0,
+            inline_limit: MAX_INLINE_ROW_BYTES,
         }
     }
 
@@ -704,6 +1064,34 @@ impl History {
         self.cache.borrow().decoded
     }
 
+    /// What the page cache holds and what the append boundary refused (#354).
+    ///
+    /// The report a caller or a metric exposes, so cache bytes, evictions and
+    /// oversized-row behaviour are observable instead of inferred from a page
+    /// count.
+    #[allow(dead_code)] // the diagnostics surface a caller shows; tests prove it
+    pub(crate) fn cache_stats(&self) -> CacheStats {
+        let cache = self.cache.borrow();
+        CacheStats {
+            pages: cache.entries.len(),
+            bytes: cache.bytes,
+            evictions: cache.evictions,
+            rejected: self.rejected,
+        }
+    }
+
+    /// A handle whose append boundary enforces `limit` instead of
+    /// [`MAX_INLINE_ROW_BYTES`] (test-only).
+    ///
+    /// The production limit is 32 MiB, and a test must not allocate that much to
+    /// prove the boundary; this override keeps the test at a few kilobytes while
+    /// exercising the same check.
+    #[cfg(test)]
+    pub(crate) fn with_inline_limit(mut self, limit: usize) -> Self {
+        self.inline_limit = limit;
+        self
+    }
+
     /// One page of messages, decoded from its row group or from the cache.
     #[cfg(test)]
     pub(crate) fn page(&self, page: usize) -> Result<Vec<ChatMessage>> {
@@ -732,7 +1120,12 @@ impl History {
     }
 
     /// A window read with the caller already holding the read guard.
+    ///
+    /// A request longer than [`MAX_WINDOW_ROWS`] is clamped, so one window never
+    /// materializes more than that many rows (#354); `prefix` and
+    /// [`Reader::for_each_page`] are the streaming paths.
     fn window_at(&self, from: usize, len: usize) -> Result<Vec<ChatMessage>> {
+        let len = len.min(MAX_WINDOW_ROWS);
         let mut rows = Vec::with_capacity(len.min(PAGE));
         let mut index = from;
         while rows.len() < len && index < self.rows {
@@ -770,9 +1163,20 @@ impl History {
     /// A rewrite has to keep them: the in-memory window starts part way into the
     /// log, and rebuilding the log from the window alone would silently drop
     /// every page above it.
+    ///
+    /// The read streams through the page walk (#354): every row is decoded once,
+    /// one page at a time, and the cache is not filled with pages the caller has
+    /// already passed. The returned Vec is the caller's own materialization, so
+    /// the walk never allocates a second copy of the log.
     pub(crate) fn prefix(&self, rows: usize) -> Result<Vec<ChatMessage>> {
         let _guard = self.read_guard();
-        self.window_at(0, rows.min(self.rows))
+        let rows = rows.min(self.rows);
+        let mut all = Vec::with_capacity(rows.min(MAX_WINDOW_ROWS));
+        self.reader_unlocked().for_each_page(0, rows, |_, page| {
+            all.extend(page);
+            Ok(())
+        })?;
+        Ok(all)
     }
 
     /// Replace the whole log with these rows: a truncation, a compaction, or a
@@ -804,7 +1208,10 @@ impl History {
             // segments and index; the live directory is untouched while it
             // builds.
             let mut fresh = History::open(temporary.clone());
-            fresh.append(messages)?;
+            // The replacement re-appends rows the log already holds (or the
+            // caller's own replacement), so the inline limit is not re-applied:
+            // `append` checks it, `append_locked` is the write itself.
+            fresh.append_locked(messages)?;
             // The replacement is private to this build, but publishing its
             // manifest is still a mutation and takes its own directory lock.
             let _fresh_lock = fresh.lock_directory()?;
@@ -856,10 +1263,17 @@ impl History {
     /// in-process write guard second, which is the one order every mutation
     /// uses (#353). Another process holding the lock yields the typed
     /// [`HistoryError::Locked`] after a bounded wait instead of blocking.
+    ///
+    /// The inline limit is checked first (#354): a row above
+    /// [`MAX_INLINE_ROW_BYTES`] is refused with [`HistoryError::Oversized`]
+    /// before a lock is taken or a directory is created. A rewrite re-appends
+    /// rows the log already holds, so it deliberately skips this check: an older
+    /// history must stay rewritable even if it predates the limit.
     pub(crate) fn append(&mut self, messages: &[ChatMessage]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
+        self.check_inline_limit(messages)?;
         let _file_lock = self.lock_directory()?;
         let lock = Arc::clone(&self.lock);
         let _guard = lock
@@ -869,6 +1283,10 @@ impl History {
     }
 
     /// An append with the caller already holding the write guard.
+    ///
+    /// This is the WRITE; the inline limit is checked by [`Self::append`], the
+    /// public boundary. A rewrite calls this directly so a legacy row is carried
+    /// through unchanged instead of being refused by a limit it predates.
     fn append_locked(&mut self, messages: &[ChatMessage]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -885,6 +1303,7 @@ impl History {
             bytes,
             sealed: false,
             group_rows,
+            schema: SCHEMA_VERSION,
         });
         self.rows += messages.len();
         self.unsealed_rows += messages.len();
@@ -910,6 +1329,7 @@ impl History {
                 bytes,
                 sealed: false,
                 group_rows,
+                schema: SCHEMA_VERSION,
             });
             self.trajectory_rows += tools.len();
             self.unsealed_trajectory_rows += tools.len();
@@ -927,6 +1347,25 @@ impl History {
         }
         self.cache.borrow_mut().clear();
         Ok(())
+    }
+
+    /// Refuse an append whose rows exceed [`MAX_INLINE_ROW_BYTES`] (#354).
+    ///
+    /// The check runs BEFORE the directory's lock is taken, before its directory
+    /// is created and before a segment is named, so a refused append writes
+    /// nothing at all. The typed error's `row` is the
+    /// GLOBAL index the refused row would have taken, so a batch with one
+    /// oversized row points at that row rather than at the batch.
+    fn check_inline_limit(&mut self, messages: &[ChatMessage]) -> Result<()> {
+        let Some((offset, bytes)) = first_oversized(messages, self.inline_limit) else {
+            return Ok(());
+        };
+        self.rejected += 1;
+        Err(anyhow::Error::new(HistoryError::Oversized {
+            row: self.rows + offset,
+            bytes,
+            limit: self.inline_limit,
+        }))
     }
 
     /// Merge a small unsealed tail into one large sealed segment.
@@ -982,6 +1421,7 @@ impl History {
             bytes,
             sealed: true,
             group_rows,
+            schema: SCHEMA_VERSION,
         });
         let archived = archive_files(&old)?;
         // Install the candidate index before replacing the live list. If the
@@ -1042,6 +1482,7 @@ impl History {
             bytes,
             sealed: true,
             group_rows,
+            schema: SCHEMA_VERSION,
         });
         let archived = archive_files(&old)?;
         if let Err(error) = self.write_manifest_with(&self.messages, &candidate) {
@@ -1178,41 +1619,111 @@ pub(crate) fn compact_directory(dir: &Path) -> Result<Compaction> {
     history.compact()
 }
 
-/// Rows of decoded pages, least recently used first.
+/// What the page cache holds now, and what an append refused (#354).
+///
+/// `bytes` is the decoded-heap ESTIMATE of the resident pages, not the size of
+/// their Parquet bytes, so it is comparable to the budget the cache enforces.
+#[allow(dead_code)] // the diagnostics surface a caller shows; tests prove it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheStats {
+    /// Decoded pages resident now.
+    pub(crate) pages: usize,
+    /// Their decoded-heap estimate, in bytes.
+    pub(crate) bytes: usize,
+    /// Pages evicted since this handle opened, by page or byte pressure.
+    pub(crate) evictions: u64,
+    /// Rows refused by [`MAX_INLINE_ROW_BYTES`] since this handle opened.
+    pub(crate) rejected: u64,
+}
+
+/// One decoded page and the bytes it costs.
+struct CacheEntry {
+    /// The global page index.
+    page: usize,
+    /// The decoded rows.
+    rows: Vec<ChatMessage>,
+    /// [`message_size`] over the rows: the decoded-heap estimate.
+    weight: usize,
+}
+
+/// Decoded pages, least recently used first, bounded in pages AND bytes.
 struct PageCache {
-    entries: VecDeque<(usize, Vec<ChatMessage>)>,
+    entries: VecDeque<CacheEntry>,
     capacity: usize,
+    /// The decoded-heap budget the byte bound enforces.
+    budget: usize,
+    /// The exact sum of every resident entry's weight.
+    bytes: usize,
+    /// Pages evicted since construction.
+    evictions: u64,
+    /// Rows decoded since construction, whether or not they stayed cached.
     decoded: usize,
 }
 
 impl PageCache {
     fn new(capacity: usize) -> Self {
+        Self::with_budget(capacity, CACHE_BYTES)
+    }
+
+    /// A cache with an injected budget, so a unit test never allocates a page
+    /// the size of the real one.
+    fn with_budget(capacity: usize, budget: usize) -> Self {
         Self {
             entries: VecDeque::new(),
             capacity,
+            budget,
+            bytes: 0,
+            evictions: 0,
             decoded: 0,
         }
     }
 
+    /// A cached page, touching it to the newest end of the LRU.
     fn get(&mut self, page: usize) -> Option<Vec<ChatMessage>> {
-        let at = self.entries.iter().position(|(key, _)| *key == page)?;
+        let at = self.entries.iter().position(|entry| entry.page == page)?;
         let entry = self.entries.remove(at)?;
-        let rows = entry.1.clone();
+        let rows = entry.rows.clone();
         self.entries.push_back(entry);
         Some(rows)
     }
 
+    /// Cache one decoded page, then evict until both bounds hold.
+    ///
+    /// A page whose own weight exceeds the budget is not cached at all: it is
+    /// served to its caller as the single in-flight page, so the cache's byte
+    /// total never exceeds [`CACHE_BYTES`] even for one enormous page.
     fn put(&mut self, page: usize, rows: Vec<ChatMessage>, decoded: usize) {
         self.decoded += decoded;
-        self.entries.retain(|(key, _)| *key != page);
-        self.entries.push_back((page, rows));
-        while self.entries.len() > self.capacity {
-            self.entries.pop_front();
+        let weight = rows.iter().map(message_size).sum::<usize>();
+        // Replacing a page must not leave its old weight in the total.
+        let mut replaced = 0usize;
+        self.entries.retain(|entry| {
+            if entry.page == page {
+                replaced += entry.weight;
+                false
+            } else {
+                true
+            }
+        });
+        self.bytes = self.bytes.saturating_sub(replaced);
+        if weight > self.budget {
+            return;
+        }
+        self.bytes += weight;
+        self.entries.push_back(CacheEntry { page, rows, weight });
+        while self.entries.len() > self.capacity || self.bytes > self.budget {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.weight);
+            self.evictions += 1;
         }
     }
 
+    /// Drop every page (a save or a swap changed the log).
     fn clear(&mut self) {
         self.entries.clear();
+        self.bytes = 0;
     }
 }
 
@@ -1537,41 +2048,57 @@ impl Drop for CompactionGuard {
 }
 
 /// Write a history's messages as sealed segments into a fresh directory.
+///
+/// The source is walked one page at a time (#354), so the rewrite never reads
+/// the history whole: a pending segment bounded by SEGMENT_ROWS and
+/// SEGMENT_BYTES is the most it holds beside the page in hand.
 fn compact_messages(source: &History, dir: &Path) -> Result<Vec<Segment>> {
     let mut segments = Vec::new();
-    let mut from = 0usize;
-    while from < source.rows {
-        let mut rows = Vec::new();
-        let mut bytes = 0usize;
-        while rows.len() < SEGMENT_ROWS
-            && bytes < SEGMENT_BYTES as usize
-            && from + rows.len() < source.rows
-        {
-            let len = PAGE.min(source.rows - from - rows.len());
-            let page = read_range(&source.messages, from + rows.len(), len)?;
-            if page.is_empty() {
-                break;
+    let mut pending: Vec<ChatMessage> = Vec::new();
+    let mut pending_bytes = 0usize;
+    let mut start = 0usize;
+    walk_pages(&source.messages, source.rows, 0, source.rows, |_, page| {
+        for row in page {
+            let size = message_size(&row);
+            let full =
+                pending.len() >= SEGMENT_ROWS || pending_bytes + size > SEGMENT_BYTES as usize;
+            if full && !pending.is_empty() {
+                flush_messages(dir, &mut pending, &mut start, &mut segments)?;
+                pending_bytes = 0;
             }
-            bytes += page.iter().map(message_size).sum::<usize>();
-            rows.extend(page);
+            pending_bytes += size;
+            pending.push(row);
         }
-        if rows.is_empty() {
-            break;
-        }
-        let path = segment_path(dir, "msg");
-        let group_rows = write_messages(&path, from, &rows)?;
-        let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        segments.push(Segment {
-            path,
-            start: from,
-            rows: rows.len(),
-            bytes,
-            sealed: true,
-            group_rows,
-        });
-        from += rows.len();
+        Ok(())
+    })?;
+    if !pending.is_empty() {
+        flush_messages(dir, &mut pending, &mut start, &mut segments)?;
     }
     Ok(segments)
+}
+
+/// Write one pending message segment and advance the next segment's start row.
+fn flush_messages(
+    dir: &Path,
+    pending: &mut Vec<ChatMessage>,
+    start: &mut usize,
+    segments: &mut Vec<Segment>,
+) -> Result<()> {
+    let rows = std::mem::take(pending);
+    let path = segment_path(dir, "msg");
+    let group_rows = write_messages(&path, *start, &rows)?;
+    let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    segments.push(Segment {
+        path,
+        start: *start,
+        rows: rows.len(),
+        bytes,
+        sealed: true,
+        group_rows,
+        schema: SCHEMA_VERSION,
+    });
+    *start += rows.len();
+    Ok(())
 }
 
 /// Write a history's trajectory as sealed segments into a fresh directory.
@@ -1614,6 +2141,7 @@ fn compact_trajectory(source: &History, dir: &Path) -> Result<Vec<Segment>> {
             bytes,
             sealed: true,
             group_rows,
+            schema: SCHEMA_VERSION,
         });
         from += rows.len();
     }
@@ -1681,7 +2209,7 @@ fn manifest_segment(segment: &Segment) -> ManifestSegment {
         bytes: segment.bytes,
         sealed: segment.sealed,
         group_rows: segment.group_rows.clone(),
-        schema_version: SCHEMA_VERSION,
+        schema_version: segment.schema,
     }
 }
 
@@ -1868,10 +2396,10 @@ fn check_list(
                 ListCheck::Lost(format!("segment {name} is missing"))
             };
         };
-        if !footer.schema_supported() {
+        let kind = SegmentKind::of_file(name);
+        if let Some((found, detail)) = schema_problem(kind, footer.schema, &footer.columns) {
             return ListCheck::Unsupported(format!(
-                "segment {name} carries unsupported schema version {}",
-                footer.schema.unwrap_or(0)
+                "segment {name} carries an unsupported schema ({found}): {detail}"
             ));
         }
         if footer.rows == 0 {
@@ -1936,6 +2464,7 @@ fn index_from_manifest(dir: &Path, manifest: &Manifest, listed: HashSet<String>)
                 bytes: entry.bytes,
                 sealed: entry.sealed,
                 group_rows: entry.group_rows.clone(),
+                schema: entry.schema_version,
             })
             .collect::<Vec<_>>()
     };
@@ -1957,20 +2486,19 @@ struct FooterFacts {
     bytes: u64,
     /// The recorded `bsh.schema`; `None` for a file written before it existed.
     schema: Option<u32>,
+    /// The file's column names, in order.
+    columns: Vec<String>,
 }
 
 impl FooterFacts {
-    /// Whether this reader can decode the file's column set.
-    fn schema_supported(&self) -> bool {
-        match self.schema {
-            None => true,
-            Some(version) => version == SCHEMA_VERSION,
-        }
+    /// Whether this reader can decode the file's version and column set.
+    fn schema_supported(&self, kind: SegmentKind) -> bool {
+        schema_problem(kind, self.schema, &self.columns).is_none()
     }
 }
 
-/// Read a segment's Parquet footer: row-group counts, byte length and the
-/// recorded schema version. No column data is read.
+/// Read a segment's Parquet footer: row-group counts, byte length, the recorded
+/// schema version and the column names. No column data is read.
 fn footer_facts(path: &Path) -> Option<FooterFacts> {
     let file = fs::File::open(path).ok()?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
@@ -1979,22 +2507,20 @@ fn footer_facts(path: &Path) -> Option<FooterFacts> {
     let group_rows: Vec<usize> = (0..groups)
         .map(|group| metadata.row_group(group).num_rows() as usize)
         .collect();
-    let schema = metadata
-        .file_metadata()
-        .key_value_metadata()
-        .and_then(|values| {
-            values
-                .iter()
-                .find(|value| value.key == SCHEMA_KEY)
-                .and_then(|value| value.value.as_deref())
-                .and_then(|value| value.parse().ok())
-        });
+    let schema = recorded_schema(metadata);
+    let columns: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
     let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
     Some(FooterFacts {
         rows: group_rows.iter().sum(),
         group_rows,
         bytes,
         schema,
+        columns,
     })
 }
 
@@ -2037,7 +2563,7 @@ fn scan_detailed(
             scanned.skipped.push(name);
             continue;
         };
-        if !footer.schema_supported() {
+        if !footer.schema_supported(SegmentKind::of_file(&name)) {
             scanned.skipped.push(name);
             continue;
         }
@@ -2051,6 +2577,7 @@ fn scan_detailed(
             bytes: footer.bytes,
             sealed,
             group_rows: footer.group_rows,
+            schema: footer.schema.unwrap_or(LEGACY_SCHEMA_VERSION),
         });
     }
     scanned
@@ -2080,13 +2607,20 @@ fn segment_files(dir: &Path, prefix: &str) -> Vec<(String, PathBuf)> {
     files
 }
 
-/// Walk a history directory and report per-segment validity (#356).
+/// Walk a history directory and report per-segment validity (#356/#355).
 ///
-/// This is the offline validation path: it reads the manifest and each
-/// segment's Parquet footer, never a payload, so its cost is bounded by the
-/// segment count. The `findings` list is where #355 adds malformed-column
-/// findings; today it reports the manifest, file, row-count and schema
-/// problems this module can prove from metadata alone.
+/// This is the offline validation path, and its cost is stated honestly: the
+/// manifest, each segment's Parquet footer, and - for a supported file - every
+/// row group decoded once to validate its field JSON. Memory is bounded by one
+/// row group at a time, never the history, but the walk is O(rows) in time; the
+/// manifest check alone is O(segments). Every problem is a `findings` entry:
+///
+/// * a malformed field reads `<file>: row <n>, column <name>: <detail>`, the
+///   same text the typed [`HistoryError::Decode`] carries, and a later group
+///   still reports its own problem instead of being abandoned;
+/// * an unsupported schema version or column set is reported per segment;
+/// * a finding never stops the walk, so one bad row group does not hide the
+///   rest of the diagnosis.
 #[allow(dead_code)] // the diagnostics surface a caller shows; tests prove it
 pub(crate) fn diagnose(dir: &Path) -> HistoryDiagnosis {
     let mut findings = Vec::new();
@@ -2129,12 +2663,15 @@ pub(crate) fn diagnose(dir: &Path) -> HistoryDiagnosis {
         findings.push("the manifest is missing or unreadable".to_string());
     }
     let mut segments = Vec::new();
-    for (kind, prefix) in [("msg", "msg"), ("traj", "traj")] {
+    for (kind, prefix) in [
+        (SegmentKind::Messages, "msg"),
+        (SegmentKind::Trajectory, "traj"),
+    ] {
         for (name, path) in segment_files(dir, prefix) {
             let listed = expected.get(&name);
             let mut diagnosis = SegmentDiagnosis {
                 file: name.clone(),
-                kind,
+                kind: kind.label(),
                 listed: listed.is_some(),
                 readable: false,
                 rows: None,
@@ -2147,13 +2684,28 @@ pub(crate) fn diagnose(dir: &Path) -> HistoryDiagnosis {
                     diagnosis.readable = true;
                     diagnosis.rows = Some(footer.rows);
                     diagnosis.schema = footer.schema;
-                    diagnosis.schema_supported = footer.schema_supported();
-                    if !diagnosis.schema_supported {
+                    let problem = schema_problem(kind, footer.schema, &footer.columns);
+                    diagnosis.schema_supported = problem.is_none();
+                    if let Some((found, detail)) = problem {
                         unavailable = true;
-                        findings.push(format!(
-                            "{name} carries unsupported schema version {}",
-                            footer.schema.unwrap_or(0)
-                        ));
+                        findings.push(
+                            HistoryError::Schema {
+                                segment: name.clone(),
+                                found,
+                                supported: SUPPORTED_SCHEMA_DESCRIPTION,
+                                detail,
+                            }
+                            .to_string(),
+                        );
+                    } else if footer.rows > 0 {
+                        // A supported file is decoded one row group at a time,
+                        // so a malformed field is a finding instead of a silent
+                        // default (#355). Memory stays bounded by one row group;
+                        // time is O(rows), unlike the footer-only checks.
+                        for finding in payload_findings(&path, &name, &footer.group_rows, kind) {
+                            unavailable = true;
+                            findings.push(finding);
+                        }
                     }
                     if let Some(listed) = listed {
                         diagnosis.consistent = listed.rows == footer.rows
@@ -2201,6 +2753,31 @@ pub(crate) fn diagnose(dir: &Path) -> HistoryDiagnosis {
     }
 }
 
+/// The first malformed field of each row group of one supported segment.
+///
+/// Each group is decoded on its own, so the walk's memory is bounded by a
+/// single row group and a bad group does not hide the next one (#355).
+fn payload_findings(
+    path: &Path,
+    segment: &str,
+    group_rows: &[usize],
+    kind: SegmentKind,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut start = 0usize;
+    for (group, rows) in group_rows.iter().enumerate() {
+        let outcome = read_group_at(path, group, *rows).and_then(|batch| match kind {
+            SegmentKind::Messages => decode_messages(&batch, segment, start).map(|_| ()),
+            SegmentKind::Trajectory => decode_tools(&batch, segment, start).map(|_| ()),
+        });
+        if let Err(error) = outcome {
+            findings.push(error.to_string());
+        }
+        start += *rows;
+    }
+    findings
+}
+
 /// Read a global row range across segments and short row groups.
 ///
 /// A save appends a segment of its own, so most segments are shorter than PAGE
@@ -2219,14 +2796,21 @@ fn read_range(segments: &[Segment], first: usize, len: usize) -> Result<Vec<Chat
         } else {
             0
         };
+        let segment_name = file_name(&segment.path);
         let mut offset = local;
+        let mut group_start = 0usize;
         for (group, group_rows) in segment.group_rows.iter().enumerate() {
+            let begin = group_start;
+            group_start += *group_rows;
             if offset >= *group_rows {
                 offset -= *group_rows;
                 continue;
             }
             let batch = read_group_at(&segment.path, group, *group_rows)?;
-            for row in decode_messages(&batch)?.into_iter().skip(offset) {
+            for row in decode_messages(&batch, &segment_name, begin)?
+                .into_iter()
+                .skip(offset)
+            {
                 rows.push(row);
                 if rows.len() == len {
                     return Ok(rows);
@@ -2251,14 +2835,21 @@ fn read_tools_range(segments: &[Segment], first: usize, len: usize) -> Result<Ve
         } else {
             0
         };
+        let segment_name = file_name(&segment.path);
         let mut offset = local;
+        let mut group_start = 0usize;
         for (group, group_rows) in segment.group_rows.iter().enumerate() {
+            let begin = group_start;
+            group_start += *group_rows;
             if offset >= *group_rows {
                 offset -= *group_rows;
                 continue;
             }
             let batch = read_group_at(&segment.path, group, *group_rows)?;
-            for row in decode_tools(&batch)?.into_iter().skip(offset) {
+            for row in decode_tools(&batch, &segment_name, begin)?
+                .into_iter()
+                .skip(offset)
+            {
                 rows.push(row);
                 if rows.len() == len {
                     return Ok(rows);
@@ -2270,16 +2861,84 @@ fn read_tools_range(segments: &[Segment], first: usize, len: usize) -> Result<Ve
     Ok(rows)
 }
 
-/// Decode one row group, using its exact row count as the batch size.
+/// Walk `len` rows of a message log one page at a time (#354).
+///
+/// The closure receives the page's index and the page's rows INSIDE the range,
+/// at most [`PAGE`] at once, so a caller visiting a long history never holds
+/// more than one decoded page beside what it chooses to keep. An error from `f`
+/// stops the walk and is returned unchanged. The range is clipped to `total`.
+fn walk_pages<F>(
+    segments: &[Segment],
+    total: usize,
+    from: usize,
+    len: usize,
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(usize, Vec<ChatMessage>) -> Result<()>,
+{
+    let end = from.saturating_add(len).min(total);
+    let mut index = from;
+    while index < end {
+        let page = index / PAGE;
+        let page_start = page * PAGE;
+        let page_end = (page_start + PAGE).min(total);
+        let take_to = end.min(page_end);
+        let rows = read_range(segments, index, take_to - index)?;
+        f(page, rows)?;
+        // A page always advances by at least one row because index < total.
+        index = page_end.max(index + 1);
+    }
+    Ok(())
+}
+
+/// A segment file's name, as a decode error and a diagnosis report it.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Decode one row group, validating the file's schema first.
+///
+/// The file's `bsh.schema` version and column set are checked BEFORE a payload
+/// is decoded (#355), so an unsupported file is the typed
+/// [`HistoryError::Schema`] rather than a column-index guess. The group's exact
+/// row count is the batch size.
 fn read_group_at(path: &Path, group: usize, rows: usize) -> Result<RecordBatch> {
+    let segment = file_name(path);
     let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("reading the footer of {}", path.display()))?;
+    let kind = SegmentKind::of_file(&segment);
+    let found = recorded_schema(builder.metadata());
+    let columns: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    validate_schema(kind, &segment, found, &columns)?;
+    // A page read addresses ONE row group; a stale or damaged index that claims
+    // more groups than the file holds must be a typed failure. Building the
+    // reader for a group past the end panics inside Parquet (#351).
+    let groups = builder.metadata().num_row_groups();
+    if group >= groups {
+        return Err(anyhow::Error::new(HistoryError::Read {
+            segment,
+            group,
+            detail: format!("the file holds {groups} row group(s)"),
+        }));
+    }
+    let mut reader = builder
         .with_row_groups(vec![group])
-        .with_batch_size(rows.max(1));
-    let mut reader = builder.build()?;
+        .with_batch_size(rows.max(1))
+        .build()
+        .with_context(|| format!("row group {group} of {}", path.display()))?;
     let batch = reader
         .next()
-        .transpose()?
+        .transpose()
+        .with_context(|| format!("row group {group} of {}", path.display()))?
         .context("a row group that decodes to nothing")?;
     if batch.num_rows() != rows {
         anyhow::bail!(
@@ -2322,18 +2981,29 @@ fn tool_schema() -> Arc<Schema> {
     ]))
 }
 
-fn writer_props() -> WriterProperties {
-    // Compression is one purpose; the row group boundaries come from flush(),
-    // because a row group is the page this store reads by. The key/value
-    // metadata names the column set, so a reader can reject a schema it does
-    // not know instead of guessing (#356).
+/// The writer properties a segment (or a golden fixture) is written with.
+///
+/// Compression is one purpose; the row group boundaries come from flush(),
+/// because a row group is the page this store reads by. The key/value metadata
+/// names the column set, so a reader can reject a schema it does not know
+/// instead of guessing (#356/#355). `version` is `None` only for a golden
+/// fixture that imitates a file written before the key existed.
+fn writer_props_for(version: Option<u32>) -> WriterProperties {
+    let metadata = version.map(|version| {
+        vec![parquet::file::metadata::KeyValue::new(
+            SCHEMA_KEY.to_string(),
+            version.to_string(),
+        )]
+    });
     WriterProperties::builder()
         .set_compression(parquet::basic::Compression::SNAPPY)
-        .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
-            SCHEMA_KEY.to_string(),
-            SCHEMA_VERSION.to_string(),
-        )]))
+        .set_key_value_metadata(metadata)
         .build()
+}
+
+/// The properties every segment this module writes carries.
+fn writer_props() -> WriterProperties {
+    writer_props_for(Some(SCHEMA_VERSION))
 }
 
 /// The fault-injection gate for the directory that holds `path` (#352).
@@ -2404,7 +3074,13 @@ fn message_chunks(messages: &[ChatMessage]) -> Vec<&[ChatMessage]> {
     chunks
 }
 
-/// A cheap upper-bound estimate for one message's row-group weight.
+/// A cheap upper-bound estimate for one message's decoded size.
+///
+/// Three users share this one measure so they can never disagree about how big
+/// a row is: the page cache's byte budget (#354), the row-group splitter, and the
+/// append's inline limit. It counts the strings the decoded row owns plus a
+/// fixed per-row overhead, so it is an estimate of the decoded heap, not the
+/// encoded Parquet size.
 fn message_size(message: &ChatMessage) -> usize {
     128 + message.text.len()
         + message.reasoning.len()
@@ -2417,6 +3093,21 @@ fn message_size(message: &ChatMessage) -> usize {
                 tool.name.len() + tool.args.len() + tool.output.as_ref().map_or(0, String::len) + 48
             })
             .sum::<usize>()
+}
+
+/// The first row whose decoded-size estimate exceeds `limit`.
+///
+/// Returning the index and the size lets the append name the exact row in
+/// [`HistoryError::Oversized`]. The boundary is inclusive: a row of exactly
+/// `limit` bytes is allowed, and one byte more is refused. The helper takes the
+/// limit as an argument so a unit test can prove the boundary at a few
+/// kilobytes instead of allocating [`MAX_INLINE_ROW_BYTES`].
+fn first_oversized(messages: &[ChatMessage], limit: usize) -> Option<(usize, usize)> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (index, message_size(message)))
+        .find(|(_, bytes)| *bytes > limit)
 }
 
 /// Split trajectory rows into row groups bounded by rows and approximate bytes.
@@ -2505,36 +3196,9 @@ fn write_tools(path: &Path, tools: &[ToolRow]) -> Result<Vec<usize>> {
             let mut writer = ArrowWriter::try_new(file, tool_schema(), Some(writer_props()))
                 .map_err(io::Error::other)?;
             for (chunk_index, chunk) in tool_chunks(tools).into_iter().enumerate() {
-                let mut index = Int64Builder::with_capacity(chunk.len());
-                let mut name = StringBuilder::new();
-                let mut args = StringBuilder::new();
-                let mut output = StringBuilder::new();
-                let mut ms = UInt64Builder::new();
-                for (offset, tool) in chunk.iter().enumerate() {
-                    index.append_value((chunk_index * PAGE + offset) as i64);
-                    name.append_value(&tool.name);
-                    args.append_value(&tool.args);
-                    match &tool.output {
-                        Some(value) => output.append_value(value),
-                        None => output.append_null(),
-                    }
-                    match tool.ms {
-                        Some(value) => ms.append_value(value),
-                        None => ms.append_null(),
-                    }
-                }
-                let batch = RecordBatch::try_new(
-                    tool_schema(),
-                    vec![
-                        Arc::new(index.finish()) as ArrayRef,
-                        Arc::new(name.finish()),
-                        Arc::new(args.finish()),
-                        Arc::new(output.finish()),
-                        Arc::new(ms.finish()),
-                    ],
-                )
-                .map_err(io::Error::other)?;
-                writer.write(&batch).map_err(io::Error::other)?;
+                writer
+                    .write(&tool_batch(chunk, chunk_index * PAGE).map_err(io::Error::other)?)
+                    .map_err(io::Error::other)?;
                 writer.flush().map_err(io::Error::other)?;
                 group_rows.push(chunk.len());
             }
@@ -2545,7 +3209,53 @@ fn write_tools(path: &Path, tools: &[ToolRow]) -> Result<Vec<usize>> {
     Ok(group_rows)
 }
 
-fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
+/// One trajectory batch; `base` is the global row the chunk begins at.
+fn tool_batch(tools: &[ToolRow], base: usize) -> Result<RecordBatch> {
+    let mut index = Int64Builder::with_capacity(tools.len());
+    let mut name = StringBuilder::new();
+    let mut args = StringBuilder::new();
+    let mut output = StringBuilder::new();
+    let mut ms = UInt64Builder::new();
+    for (offset, tool) in tools.iter().enumerate() {
+        index.append_value((base + offset) as i64);
+        name.append_value(&tool.name);
+        args.append_value(&tool.args);
+        match &tool.output {
+            Some(value) => output.append_value(value),
+            None => output.append_null(),
+        }
+        match tool.ms {
+            Some(value) => ms.append_value(value),
+            None => ms.append_null(),
+        }
+    }
+    Ok(RecordBatch::try_new(
+        tool_schema(),
+        vec![
+            Arc::new(index.finish()) as ArrayRef,
+            Arc::new(name.finish()),
+            Arc::new(args.finish()),
+            Arc::new(output.finish()),
+            Arc::new(ms.finish()),
+        ],
+    )?)
+}
+
+/// Decode one message row group.
+///
+/// `segment` is the file's name and `group_start` the row index within that file
+/// the group begins at, so a malformed value can name both (#355).
+///
+/// Absence is a documented legacy default; presence is decoded strictly:
+/// `role`, `text`, `reasoning`, `tools`, `images`, `steering` and `parts` are
+/// non-nullable in the write schema, so a null there is malformed, while
+/// `error` and `meta` are nullable and a null is the legitimate absence. A
+/// present value whose JSON does not parse is a typed [`HistoryError::Decode`].
+fn decode_messages(
+    batch: &RecordBatch,
+    segment: &str,
+    group_start: usize,
+) -> Result<Vec<ChatMessage>> {
     let role = column::<StringArray>(batch, 1)?;
     let text = column::<StringArray>(batch, 2)?;
     let reasoning = column::<StringArray>(batch, 3)?;
@@ -2563,6 +3273,42 @@ fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
         .transpose()?;
     let mut rows = Vec::with_capacity(batch.num_rows());
     for index in 0..batch.num_rows() {
+        let row = group_start + index;
+        require_value(role, index, segment, row, "role")?;
+        require_value(text, index, segment, row, "text")?;
+        require_value(reasoning, index, segment, row, "reasoning")?;
+        require_value(tools, index, segment, row, "tools")?;
+        let tools_value: Vec<ToolEvent> = parse_column(tools.value(index), segment, row, "tools")?;
+        let images_value: Vec<String> = match images {
+            Some(images) => {
+                require_value(images, index, segment, row, "images")?;
+                parse_column(images.value(index), segment, row, "images")?
+            }
+            // A file written before images existed carries no column: those
+            // rows had no attachments.
+            None => Vec::new(),
+        };
+        let steering_value = match steering {
+            Some(steering) => {
+                require_value(steering, index, segment, row, "steering")?;
+                steering.value(index)
+            }
+            // A row written before steering existed is the turn's own prompt.
+            None => false,
+        };
+        let parts_value: Vec<TurnPart> = match parts {
+            Some(parts) => {
+                require_value(parts, index, segment, row, "parts")?;
+                parse_column(parts.value(index), segment, row, "parts")?
+            }
+            // A file written before the timeline draws in the older order.
+            None => Vec::new(),
+        };
+        let meta_value: Option<MessageMeta> = if meta.is_valid(index) {
+            Some(parse_column(meta.value(index), segment, row, "meta")?)
+        } else {
+            None
+        };
         rows.push(ChatMessage {
             role: if role.value(index) == "user" {
                 Role::User
@@ -2571,17 +3317,12 @@ fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
             },
             text: text.value(index).to_string(),
             reasoning: reasoning.value(index).to_string(),
-            tools: serde_json::from_str(tools.value(index)).unwrap_or_default(),
-            images: images
-                .and_then(|images| serde_json::from_str(images.value(index)).ok())
-                .unwrap_or_default(),
+            tools: tools_value,
+            images: images_value,
             error: error
                 .is_valid(index)
                 .then(|| error.value(index).to_string()),
-            meta: meta
-                .is_valid(index)
-                .then(|| serde_json::from_str::<MessageMeta>(meta.value(index)).ok())
-                .flatten(),
+            meta: meta_value,
             // The invoked-skill blocks are display-only and never ride the
             // request; the log does not carry them.
             skills: Vec::new(),
@@ -2589,35 +3330,86 @@ fn decode_messages(batch: &RecordBatch) -> Result<Vec<ChatMessage>> {
             // The question card is display-only, like the skill blocks: the
             // log does not carry it.
             question: None,
-            steering: steering.as_ref().is_some_and(|column| column.value(index)),
-            // A file written before the timeline had no column: its rows draw
-            // in the older reasoning-then-text-then-steps order.
-            parts: parts
-                .and_then(|column| serde_json::from_str(column.value(index)).ok())
-                .unwrap_or_default(),
+            steering: steering_value,
+            parts: parts_value,
         });
     }
     Ok(rows)
 }
 
-fn decode_tools(batch: &RecordBatch) -> Result<Vec<ToolRow>> {
+/// Decode one trajectory row group, with the same cell-level strictness.
+fn decode_tools(batch: &RecordBatch, segment: &str, group_start: usize) -> Result<Vec<ToolRow>> {
     use arrow::array::UInt64Array;
     let name = column::<StringArray>(batch, 1)?;
     let args = column::<StringArray>(batch, 2)?;
     let output = column::<StringArray>(batch, 3)?;
-    let ms = column::<UInt64Array>(batch, 4)?;
+    // `ms` is the fifth column; a legacy file with the first four reads it as
+    // an unavailable duration rather than failing the page.
+    let ms = (batch.num_columns() > 4)
+        .then(|| column::<UInt64Array>(batch, 4))
+        .transpose()?;
     let mut rows = Vec::with_capacity(batch.num_rows());
     for index in 0..batch.num_rows() {
+        let row = group_start + index;
+        require_value(name, index, segment, row, "name")?;
+        require_value(args, index, segment, row, "args")?;
         rows.push(ToolRow {
             name: name.value(index).to_string(),
             args: args.value(index).to_string(),
+            // output and ms are nullable by design: a call with no result, or a
+            // file written before the duration existed.
             output: output
                 .is_valid(index)
                 .then(|| output.value(index).to_string()),
-            ms: ms.is_valid(index).then(|| ms.value(index)),
+            ms: ms.and_then(|column| column.is_valid(index).then(|| column.value(index))),
         });
     }
     Ok(rows)
+}
+
+/// Refuse a null in a column the write schema says is non-nullable.
+fn require_value<A: Array>(
+    array: &A,
+    index: usize,
+    segment: &str,
+    row: usize,
+    column: &'static str,
+) -> Result<()> {
+    if array.is_valid(index) {
+        return Ok(());
+    }
+    Err(decode_error(
+        segment,
+        row,
+        column,
+        "the value is null but the write schema says non-nullable",
+    ))
+}
+
+/// Decode one JSON column value, naming the segment, row and column on failure.
+fn parse_column<T: serde::de::DeserializeOwned>(
+    value: &str,
+    segment: &str,
+    row: usize,
+    column: &'static str,
+) -> Result<T> {
+    serde_json::from_str(value)
+        .map_err(|error| decode_error(segment, row, column, error.to_string()))
+}
+
+/// The typed decode failure for one cell.
+fn decode_error(
+    segment: &str,
+    row: usize,
+    column: &'static str,
+    detail: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(HistoryError::Decode {
+        segment: segment.to_string(),
+        row,
+        column,
+        detail: detail.into(),
+    })
 }
 
 fn column<T: 'static>(batch: &RecordBatch, index: usize) -> Result<&T> {
@@ -2631,7 +3423,10 @@ fn column<T: 'static>(batch: &RecordBatch, index: usize) -> Result<&T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ToolEvent, TurnPart};
+    use crate::model::{
+        ContextInjection, LogMarker, MessageTiming, MessageUsage, QuestionBlock, QuestionItem,
+        SkillInvocation,
+    };
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bsh-history-{name}-{}", std::process::id()));
@@ -3035,6 +3830,98 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// The message columns a golden fixture carries for one schema version.
+    fn fixture_columns(version: u32) -> usize {
+        match version {
+            LEGACY_SCHEMA_VERSION => MESSAGE_COLUMNS_V1.len(),
+            _ => MESSAGE_COLUMNS_V2.len(),
+        }
+    }
+
+    /// Write one message segment with an explicit column count, schema record
+    /// and column set, the way an older writer left one (#355).
+    ///
+    /// `version: None` writes no `bsh.schema`, imitating a file from before the
+    /// metadata existed; `columns` lets a test build a current file that is
+    /// missing a column, which the reader must reject instead of defaulting.
+    fn write_fixture(
+        path: &Path,
+        version: Option<u32>,
+        columns: usize,
+        rows: &[ChatMessage],
+    ) -> Vec<usize> {
+        let full = message_batch(rows, 0).expect("a message batch");
+        let schema = Arc::new(Schema::new(message_schema().fields()[..columns].to_vec()));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), full.columns()[..columns].to_vec())
+            .expect("the historical shape");
+        let file = fs::File::create(path).expect("the fixture file");
+        let mut writer = ArrowWriter::try_new(file, schema, Some(writer_props_for(version)))
+            .expect("the fixture writer");
+        writer.write(&batch).expect("the fixture rows");
+        writer.flush().expect("the fixture row group");
+        writer.close().expect("the fixture footer");
+        vec![rows.len()]
+    }
+
+    /// Write one trajectory segment with an explicit schema record.
+    fn write_tool_fixture(path: &Path, version: Option<u32>, tools: &[ToolRow]) {
+        let batch = tool_batch(tools, 0).expect("a trajectory batch");
+        let file = fs::File::create(path).expect("the fixture file");
+        let mut writer = ArrowWriter::try_new(file, tool_schema(), Some(writer_props_for(version)))
+            .expect("the fixture writer");
+        writer.write(&batch).expect("the fixture rows");
+        writer.flush().expect("the fixture row group");
+        writer.close().expect("the fixture footer");
+    }
+
+    /// Write one batch as a segment with an explicit schema record.
+    fn write_batch(path: &Path, batch: &RecordBatch, version: Option<u32>) {
+        let file = fs::File::create(path).expect("the segment");
+        let mut writer =
+            ArrowWriter::try_new(file, batch.schema(), Some(writer_props_for(version)))
+                .expect("the writer");
+        writer.write(batch).expect("the rows");
+        writer.flush().expect("the row group");
+        writer.close().expect("the footer");
+    }
+
+    /// Replace one string column of a batch with raw values, row by row.
+    fn with_raw_column(batch: &RecordBatch, index: usize, values: &[Option<&str>]) -> RecordBatch {
+        let mut columns = batch.columns().to_vec();
+        let mut builder = StringBuilder::new();
+        for value in values {
+            match value {
+                Some(text) => builder.append_value(text),
+                None => builder.append_null(),
+            }
+        }
+        columns[index] = Arc::new(builder.finish());
+        RecordBatch::try_new(batch.schema(), columns).expect("the replaced column")
+    }
+
+    /// Replace one string column with nulls under a nullable schema, so the null
+    /// can be written into a column the real writer declares non-nullable.
+    fn with_null_column(batch: &RecordBatch, index: usize) -> RecordBatch {
+        let mut fields = message_schema().fields()[..batch.num_columns()].to_vec();
+        fields[index] = Arc::new(Field::new(
+            fields[index].name().clone(),
+            fields[index].data_type().clone(),
+            true,
+        ));
+        let mut columns = batch.columns().to_vec();
+        let mut builder = StringBuilder::new();
+        for _ in 0..batch.num_rows() {
+            builder.append_null();
+        }
+        columns[index] = Arc::new(builder.finish());
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("the nullable column")
+    }
+
+    /// A one-row page whose decoded estimate is the text plus the row overhead.
+    fn sized_row(text: &str) -> ChatMessage {
+        ChatMessage::user(text)
     }
 
     /// The rewrite keeps every row in order, with every field and the log's
@@ -4054,6 +4941,715 @@ mod tests {
             "{:?}",
             report.segments
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Highly variable page sizes stay inside the cache's byte budget, and the
+    /// byte total is the exact sum of the resident pages (#354).
+    #[test]
+    fn variable_page_weights_stay_within_the_page_cache_byte_budget() {
+        let budget = 1000usize;
+        let mut cache = PageCache::with_budget(CACHE_PAGES, budget);
+        for (page, text) in [200usize, 300, 400, 50].into_iter().enumerate() {
+            let rows = vec![sized_row(&"x".repeat(text))];
+            let weight = rows.iter().map(message_size).sum::<usize>();
+            assert!(weight <= budget, "the fixture page fits the budget");
+            cache.put(page, rows, 1);
+            assert!(cache.bytes <= budget, "page {page}: {} bytes", cache.bytes);
+            assert!(cache.entries.len() <= CACHE_PAGES);
+        }
+        let exact: usize = cache.entries.iter().map(|entry| entry.weight).sum();
+        assert_eq!(cache.bytes, exact, "the byte total is exact");
+        assert_eq!(cache.evictions, 2, "two pages went by byte pressure");
+        let resident: Vec<usize> = cache.entries.iter().map(|entry| entry.page).collect();
+        assert_eq!(
+            resident,
+            vec![2, 3],
+            "the least-recently-used pages went first"
+        );
+    }
+
+    /// A hit touches the page to the newest end of the LRU, so the eviction order
+    /// and the byte total are exact (#354).
+    #[test]
+    fn the_page_cache_evicts_the_least_recently_used_page_and_keeps_bytes_exact() {
+        let mut cache = PageCache::with_budget(CACHE_PAGES, 1000);
+        cache.put(0, vec![sized_row(&"a".repeat(100))], 1); // 228
+        cache.put(1, vec![sized_row(&"b".repeat(100))], 1); // 228
+        assert_eq!(cache.bytes, 456);
+        assert!(cache.get(0).is_some(), "touch page 0");
+        cache.put(2, vec![sized_row(&"c".repeat(272))], 1); // 400
+        assert_eq!(cache.bytes, 856);
+        cache.put(3, vec![sized_row(&"d".repeat(172))], 1); // 300
+                                                            // 856 + 300 > 1000, so the front - page 1, never touched - is evicted,
+                                                            // not page 0, which is older but was read again.
+        assert_eq!(cache.evictions, 1);
+        assert!(cache.get(1).is_none(), "the untouched page went first");
+        assert!(cache.get(0).is_some(), "the touched page stayed");
+        assert_eq!(cache.entries.len(), 3);
+        assert_eq!(cache.bytes, 928);
+        // Page 0 was read again, so the next write evicts page 2, not page 0.
+        cache.put(4, vec![sized_row(&"e".repeat(100))], 1); // 228
+        assert_eq!(cache.evictions, 2);
+        assert!(
+            cache.get(2).is_none(),
+            "the LRU tail is exact after a touch"
+        );
+        assert!(cache.get(0).is_some());
+        assert!(cache.get(4).is_some());
+        let exact: usize = cache.entries.iter().map(|entry| entry.weight).sum();
+        assert_eq!(cache.bytes, exact);
+        assert_eq!(exact, 756);
+    }
+
+    /// A page bigger than the whole budget is served but not cached: the
+    /// documented single in-flight allowance (#354).
+    #[test]
+    fn a_page_larger_than_the_whole_budget_is_served_but_not_cached() {
+        let mut cache = PageCache::with_budget(CACHE_PAGES, 1000);
+        cache.put(0, vec![sized_row(&"x".repeat(500))], 1); // 628
+        cache.put(1, vec![sized_row(&"y".repeat(2000))], 1); // 2128
+        assert_eq!(cache.bytes, 628, "the oversized page adds no bytes");
+        assert!(cache.get(1).is_none(), "so its next read is a miss");
+        assert!(cache.get(0).is_some(), "and the resident page is untouched");
+        assert_eq!(cache.decoded, 2, "the decode was still counted");
+    }
+
+    /// The cache report names bytes, evictions and refused rows (#354).
+    #[test]
+    fn cache_stats_report_pages_bytes_evictions_and_rejections() {
+        let dir = scratch("cache-stats");
+        let mut history = History::open(dir.clone());
+        let rows: Vec<ChatMessage> = (0..(PAGE * 10)).map(message).collect();
+        history.append(&rows).expect("the append");
+        assert_eq!(
+            history.cache_stats(),
+            CacheStats {
+                pages: 0,
+                bytes: 0,
+                evictions: 0,
+                rejected: 0,
+            }
+        );
+        for page in 0..10 {
+            let _ = history.page(page).expect("a page");
+        }
+        let stats = history.cache_stats();
+        assert_eq!(stats.pages, CACHE_PAGES);
+        assert_eq!(stats.evictions, 2, "ten pages into a ceiling of eight");
+        let expected: usize = rows[(10 - CACHE_PAGES) * PAGE..]
+            .iter()
+            .map(message_size)
+            .sum();
+        assert_eq!(stats.bytes, expected, "the resident pages, weighed exactly");
+        let mut refused = history.with_inline_limit(64);
+        let error = refused
+            .append(&[message(0)])
+            .expect_err("the row is over 64 bytes");
+        assert!(matches!(
+            error.downcast_ref::<HistoryError>(),
+            Some(HistoryError::Oversized { .. })
+        ));
+        assert_eq!(refused.cache_stats().rejected, 1);
+        assert_eq!(
+            refused.cache_stats().pages,
+            CACHE_PAGES,
+            "a refusal keeps the cache"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The inline limit is checked before anything is written, and the typed
+    /// error names the global row (#354).
+    #[test]
+    fn an_oversized_row_is_refused_before_anything_is_written() {
+        let dir = scratch("oversized-row");
+        let mut history = History::open(dir.clone()).with_inline_limit(4096);
+        let small: Vec<ChatMessage> = (0..3).map(message).collect();
+        history.append(&small).expect("the small rows");
+        let mut huge = message(10);
+        huge.text = "x".repeat(5000);
+        let error = history
+            .append(&[message(3), huge])
+            .expect_err("the second row is over the limit");
+        match error.downcast_ref::<HistoryError>() {
+            Some(HistoryError::Oversized { row, bytes, limit }) => {
+                assert_eq!(*row, 4, "the global row the refused row would have taken");
+                assert!(*bytes > *limit);
+                assert_eq!(*limit, 4096);
+            }
+            other => panic!("a typed Oversized error, got {other:?}"),
+        }
+        assert_eq!(history.len(), 3, "the refused batch moved no row");
+        assert_eq!(scan(&dir, "msg").len(), 1, "and wrote no segment");
+        assert_eq!(history.window(0, 3).expect("the saved rows").len(), 3);
+        assert_eq!(history.cache_stats().rejected, 1);
+        let _ = fs::remove_dir_all(&dir);
+
+        // A refused FIRST append creates no history directory at all.
+        let empty = scratch("oversized-first");
+        let mut fresh = History::open(empty.clone()).with_inline_limit(4096);
+        let mut huge = message(0);
+        huge.text = "x".repeat(5000);
+        fresh
+            .append(&[huge])
+            .expect_err("the first row is over the limit");
+        assert!(!empty.exists(), "nothing was created for a refused append");
+    }
+
+    /// The limit helper accepts exactly the limit and refuses one byte more,
+    /// checked without allocating the real limit (#354).
+    #[test]
+    fn the_inline_limit_accepts_the_boundary_and_refuses_one_byte_more() {
+        let row = sized_row("1234");
+        let size = message_size(&row);
+        assert_eq!(first_oversized(std::slice::from_ref(&row), size), None);
+        assert_eq!(
+            first_oversized(std::slice::from_ref(&row), size - 1),
+            Some((0, size))
+        );
+        let batch = vec![sized_row("a"), row];
+        assert_eq!(
+            first_oversized(&batch, size),
+            None,
+            "a small first row does not hide a later one within the limit"
+        );
+        assert_eq!(
+            first_oversized(&batch, size - 1),
+            Some((1, size)),
+            "the later row is the one named"
+        );
+    }
+
+    /// A whole-history walk visits every page once and never holds more than one
+    /// page of rows (#354).
+    #[test]
+    fn a_whole_history_walk_visits_pages_and_keeps_peak_rows_bounded() {
+        let dir = scratch("page-walk");
+        let mut history = History::open(dir.clone());
+        let total = PAGE * 20 + 7;
+        let rows: Vec<ChatMessage> = (0..total).map(message).collect();
+        history.append(&rows).expect("the append");
+        let reader = history.reader();
+        let mut pages = Vec::new();
+        let mut peak = 0usize;
+        reader
+            .for_each_page(0, total, |page, rows| {
+                assert!(rows.len() <= PAGE, "one page at a time");
+                peak = peak.max(rows.len());
+                pages.push(page);
+                Ok(())
+            })
+            .expect("the walk");
+        assert_eq!(
+            pages,
+            (0..21).collect::<Vec<_>>(),
+            "every page is visited once, in order"
+        );
+        assert_eq!(peak, PAGE, "peak rows in hand is one page");
+        let mut seen = 0usize;
+        reader
+            .for_each_page(3, total - 3, |_, rows| {
+                seen += rows.len();
+                Ok(())
+            })
+            .expect("the offset walk");
+        assert_eq!(
+            seen,
+            total - 3,
+            "an offset range covers every requested row"
+        );
+        assert_eq!(
+            history.prefix(total).expect("the prefix").len(),
+            total,
+            "the prefix walk reaches the whole log"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One window materializes at most MAX_WINDOW_ROWS rows; the streaming helper
+    /// is how a longer walk stays bounded (#354).
+    #[test]
+    fn a_window_longer_than_max_window_rows_is_capped() {
+        let dir = scratch("window-cap");
+        let mut history = History::open(dir.clone());
+        let total = MAX_WINDOW_ROWS + PAGE * 2;
+        let rows: Vec<ChatMessage> = (0..total).map(message).collect();
+        history.append(&rows).expect("the append");
+        let window = history.window(0, total).expect("the window");
+        assert_eq!(
+            window.len(),
+            MAX_WINDOW_ROWS,
+            "one read materializes at most {MAX_WINDOW_ROWS} rows"
+        );
+        assert_eq!(window[0].text, "turn 0 text");
+        let reader = history.reader();
+        assert_eq!(
+            reader.messages(0, total).expect("the reader window").len(),
+            MAX_WINDOW_ROWS,
+            "Reader::messages applies the same cap"
+        );
+        let mut last = None;
+        reader
+            .for_each_page(MAX_WINDOW_ROWS, total - MAX_WINDOW_ROWS, |_, rows| {
+                last = rows.last().cloned();
+                Ok(())
+            })
+            .expect("the tail walk");
+        assert_eq!(
+            last.expect("a last row").text,
+            format!("turn {} text", total - 1),
+            "the uncapped walk still reaches the end"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every supported schema version has a golden fixture: a v1 file carries the
+    /// original columns and reads with the documented defaults, a v2 file carries
+    /// the current ones and round-trips them (#355).
+    #[test]
+    fn every_supported_schema_version_reads_with_its_documented_defaults() {
+        for version in SUPPORTED_SCHEMA_VERSIONS {
+            let dir = scratch(&format!("golden-v{version}"));
+            fs::create_dir_all(&dir).expect("the history directory");
+            let mut rows: Vec<ChatMessage> = (0..3).map(message).collect();
+            rows[1].images = vec!["data:image/png;base64,golden".to_string()];
+            rows[2].steering = true;
+            rows[1].parts = vec![TurnPart::Thinking(3), TurnPart::Content(9)];
+            write_fixture(
+                &dir.join(format!("msg-000{version}.parquet")),
+                Some(version),
+                fixture_columns(version),
+                &rows,
+            );
+            let history = History::open(dir.clone());
+            assert_eq!(history.len(), rows.len(), "v{version}: every row reads");
+            let read = history.window(0, rows.len()).expect("the rows");
+            for (actual, expected) in read.iter().zip(rows.iter()) {
+                assert_eq!(actual.text, expected.text);
+                assert_eq!(actual.reasoning, expected.reasoning);
+                assert_eq!(actual.error, expected.error);
+                assert_eq!(actual.tools.len(), expected.tools.len());
+                assert_eq!(actual.meta.is_some(), expected.meta.is_some());
+                if version == LEGACY_SCHEMA_VERSION {
+                    assert!(actual.images.is_empty(), "v1 has no images column: empty");
+                    assert!(!actual.steering, "v1 has no steering column: a turn prompt");
+                    assert!(
+                        actual.parts.is_empty(),
+                        "v1 has no parts column: the older draw order"
+                    );
+                } else {
+                    assert_eq!(actual.images, expected.images);
+                    assert_eq!(actual.steering, expected.steering);
+                    assert_eq!(actual.parts, expected.parts);
+                }
+            }
+            let manifest = load_manifest(&dir).expect("the rebuilt manifest");
+            assert_eq!(
+                manifest.messages[0].schema_version, version,
+                "the index records the file's own version"
+            );
+            assert!(
+                matches!(History::open(dir.clone()).index_state(), IndexState::Valid),
+                "v{version}: the next open trusts the index instead of rebuilding"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Every field the log persists round-trips, and the display-only fields it
+    /// does not carry come back empty instead of being invented (#355).
+    #[test]
+    fn a_round_trip_covers_every_persisted_message_and_trajectory_field() {
+        let dir = scratch("round-trip-fields");
+        let mut history = History::open(dir.clone());
+        let row = ChatMessage {
+            role: Role::Assistant,
+            text: "answer".to_string(),
+            reasoning: "because".to_string(),
+            tools: vec![ToolEvent {
+                name: "bash".to_string(),
+                args: "{\"command\":\"true\"}".to_string(),
+                output: Some("out".to_string()),
+                ms: Some(7),
+                at: Some(11),
+            }],
+            parts: vec![
+                TurnPart::Thinking(7),
+                TurnPart::Tool(0),
+                TurnPart::Content(6),
+            ],
+            images: vec!["data:image/png;base64,AAA".to_string()],
+            error: Some("failed".to_string()),
+            meta: Some(MessageMeta {
+                marker: Some(LogMarker {
+                    kind: "goal".to_string(),
+                    at: 3,
+                }),
+                feedback: Some("good".to_string()),
+                usage: Some(MessageUsage {
+                    prompt_tokens: 5,
+                    completion_tokens: 6,
+                    cached_tokens: 2,
+                    model: "model".to_string(),
+                }),
+                timing: Some(MessageTiming {
+                    start: Some(1),
+                    first_output: Some(2),
+                    ms: Some(9),
+                }),
+                cancelled: true,
+            }),
+            skills: vec![SkillInvocation {
+                name: "skill".to_string(),
+                content: "block".to_string(),
+            }],
+            injections: vec![ContextInjection {
+                kind: "persona".to_string(),
+                content: "injected".to_string(),
+                source: "AGENTS.md".to_string(),
+            }],
+            steering: true,
+            question: Some(QuestionBlock {
+                questions: vec![QuestionItem {
+                    question: "which?".to_string(),
+                    options: vec!["a".to_string(), "b".to_string()],
+                    multi_select: true,
+                }],
+                answered: Some("a".to_string()),
+            }),
+        };
+        history
+            .append(std::slice::from_ref(&row))
+            .expect("the append");
+        let read = history.window(0, 1).expect("the row")[0].clone();
+        assert_eq!(read.role, Role::Assistant);
+        assert_eq!(read.text, row.text);
+        assert_eq!(read.reasoning, row.reasoning);
+        assert_eq!(read.error, row.error);
+        assert_eq!(read.images, row.images);
+        assert_eq!(read.steering, row.steering);
+        assert_eq!(read.parts, row.parts);
+        assert_eq!(read.tools.len(), 1);
+        assert_eq!(read.tools[0].name, row.tools[0].name);
+        assert_eq!(read.tools[0].args, row.tools[0].args);
+        assert_eq!(read.tools[0].output, row.tools[0].output);
+        assert_eq!(read.tools[0].ms, row.tools[0].ms);
+        assert_eq!(
+            read.tools[0].at, row.tools[0].at,
+            "the call's start time rides the tools JSON"
+        );
+        let actual = read.meta.as_ref().expect("the meta block");
+        assert_eq!(actual.feedback, Some("good".to_string()));
+        assert!(actual.cancelled);
+        let marker = actual.marker.as_ref().expect("the marker");
+        assert_eq!((marker.kind.as_str(), marker.at), ("goal", 3));
+        let usage = actual.usage.as_ref().expect("the usage");
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.completion_tokens, 6);
+        assert_eq!(usage.cached_tokens, 2);
+        assert_eq!(usage.model, "model");
+        let timing = actual.timing.as_ref().expect("the timing");
+        assert_eq!(
+            (timing.start, timing.first_output, timing.ms),
+            (Some(1), Some(2), Some(9))
+        );
+        // Documented behaviour, not storage: the log carries none of these.
+        assert!(
+            read.skills.is_empty(),
+            "skills are display-only and are not stored"
+        );
+        assert!(
+            read.injections.is_empty(),
+            "injections are display-only and are not stored"
+        );
+        assert!(
+            read.question.is_none(),
+            "the question card is display-only and is not stored"
+        );
+        // The trajectory carries name, args, output and ms; `at` is not a
+        // trajectory column and is not invented from one.
+        let tools = history.trajectory_page_from_end(0).expect("the trajectory");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "bash");
+        assert_eq!(tools[0].args, "{\"command\":\"true\"}");
+        assert_eq!(tools[0].output.as_deref(), Some("out"));
+        assert_eq!(tools[0].ms, Some(7));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A present-but-malformed JSON column is a typed Decode error naming the
+    /// segment, the row and the column, instead of decoding as its default (#355).
+    #[test]
+    fn a_malformed_json_column_names_the_segment_row_and_column() {
+        for (index, name, valid) in [
+            (5usize, "meta", "{}"),
+            (6, "tools", "[]"),
+            (7, "images", "[]"),
+            (9, "parts", "[]"),
+        ] {
+            let dir = scratch(&format!("malformed-{name}"));
+            fs::create_dir_all(&dir).expect("the history directory");
+            let rows: Vec<ChatMessage> = (0..4).map(message).collect();
+            let batch = message_batch(&rows, 0).expect("the batch");
+            let values: Vec<Option<&str>> = (0..rows.len())
+                .map(|row| Some(if row == 2 { "not json" } else { valid }))
+                .collect();
+            let batch = with_raw_column(&batch, index, &values);
+            let path = dir.join("msg-000.parquet");
+            write_batch(&path, &batch, Some(SCHEMA_VERSION));
+
+            let history = History::open(dir.clone());
+            let error = history
+                .window(0, rows.len())
+                .expect_err("the malformed field must fail the read");
+            match error.downcast_ref::<HistoryError>() {
+                Some(HistoryError::Decode {
+                    segment,
+                    row,
+                    column,
+                    detail,
+                }) => {
+                    assert_eq!(segment, "msg-000.parquet");
+                    assert_eq!(*row, 2, "{name}: the row within the segment");
+                    assert_eq!(*column, name);
+                    assert!(!detail.is_empty(), "{name}: the detail says why");
+                    assert!(
+                        error.to_string().contains(&format!("row 2, column {name}")),
+                        "{name}: {error}"
+                    );
+                }
+                other => panic!("{name}: a typed Decode error, got {other:?}"),
+            }
+            // The offline walk reports the same field without failing.
+            let report = diagnose(&dir);
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding
+                        .contains(&format!("msg-000.parquet: row 2, column {name}"))),
+                "{name}: {:?}",
+                report.findings
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A present column that is null where the write schema says non-nullable is
+    /// malformed, not a default (#355).
+    #[test]
+    fn a_present_but_null_non_nullable_column_is_malformed() {
+        let dir = scratch("null-tools");
+        fs::create_dir_all(&dir).expect("the history directory");
+        let rows: Vec<ChatMessage> = (0..3).map(message).collect();
+        let batch = message_batch(&rows, 0).expect("the batch");
+        let batch = with_null_column(&batch, 6);
+        let path = dir.join("msg-000.parquet");
+        write_batch(&path, &batch, Some(SCHEMA_VERSION));
+        let history = History::open(dir.clone());
+        let error = history
+            .window(0, rows.len())
+            .expect_err("a null tools cell is malformed");
+        match error.downcast_ref::<HistoryError>() {
+            Some(HistoryError::Decode {
+                row,
+                column,
+                detail,
+                ..
+            }) => {
+                assert_eq!(*row, 0);
+                assert_eq!(*column, "tools");
+                assert!(detail.contains("null"), "{detail}");
+            }
+            other => panic!("a typed Decode error, got {other:?}"),
+        }
+        let report = diagnose(&dir);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.contains("msg-000.parquet: row 0, column tools")),
+            "{:?}",
+            report.findings
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An unsupported `bsh.schema` version is a typed Schema error, a per-segment
+    /// diagnosis finding and an unavailable history - never a guess (#355).
+    #[test]
+    fn an_unsupported_schema_version_is_rejected_with_the_typed_error() {
+        let dir = scratch("schema-unsupported");
+        fs::create_dir_all(&dir).expect("the history directory");
+        let rows: Vec<ChatMessage> = (0..2).map(message).collect();
+        let name = "msg-0000000000099-00001-000.parquet";
+        let path = dir.join(name);
+        write_fixture(&path, Some(99), 10, &rows);
+
+        let error = read_group_at(&path, 0, rows.len()).expect_err("version 99 is not supported");
+        match error.downcast_ref::<HistoryError>() {
+            Some(HistoryError::Schema {
+                segment,
+                found,
+                supported,
+                detail,
+            }) => {
+                assert_eq!(segment, name);
+                assert_eq!(*found, 99);
+                assert_eq!(*supported, SUPPORTED_SCHEMA_DESCRIPTION);
+                assert!(!detail.is_empty());
+            }
+            other => panic!("a typed Schema error, got {other:?}"),
+        }
+        let report = diagnose(&dir);
+        assert!(!report.segments.is_empty());
+        assert!(!report.segments[0].schema_supported);
+        assert_eq!(report.segments[0].schema, Some(99));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.contains(name) && finding.contains("99")),
+            "{:?}",
+            report.findings
+        );
+        let history = History::open(dir.clone());
+        assert!(matches!(
+            history.index_state(),
+            IndexState::Unavailable { .. }
+        ));
+        assert_eq!(history.len(), 0, "the rows are unavailable, not defaulted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A current file whose column set is missing a column is a Schema error, not
+    /// a default (#355).
+    #[test]
+    fn a_v2_column_set_missing_a_column_is_a_schema_error() {
+        let dir = scratch("schema-missing-column");
+        fs::create_dir_all(&dir).expect("the history directory");
+        let rows: Vec<ChatMessage> = (0..2).map(message).collect();
+        let path = dir.join("msg-000.parquet");
+        write_fixture(
+            &path,
+            Some(SCHEMA_VERSION),
+            MESSAGE_COLUMNS_V2.len() - 1,
+            &rows,
+        );
+        let error = read_group_at(&path, 0, rows.len()).expect_err("v2 promises ten columns");
+        match error.downcast_ref::<HistoryError>() {
+            Some(HistoryError::Schema { found, detail, .. }) => {
+                assert_eq!(*found, SCHEMA_VERSION);
+                assert!(
+                    detail.contains("parts"),
+                    "the missing column is named: {detail}"
+                );
+            }
+            other => panic!("a typed Schema error, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A history written before the schema metadata existed still reads: the
+    /// legacy version is supported and its absent columns take the documented
+    /// defaults (#355).
+    #[test]
+    fn a_legacy_v1_history_still_reads_after_the_schema_checks() {
+        let dir = scratch("legacy-v1");
+        fs::create_dir_all(&dir).expect("the history directory");
+        let mut expected = Vec::new();
+        for segment in 0..3usize {
+            let rows: Vec<ChatMessage> = (segment * 2..segment * 2 + 2).map(message).collect();
+            write_fixture(
+                &dir.join(format!("msg-{segment:03}.parquet")),
+                None,
+                MESSAGE_COLUMNS_V1.len(),
+                &rows,
+            );
+            expected.extend(rows);
+        }
+        let tools: Vec<ToolRow> = expected
+            .iter()
+            .flat_map(|row| row.tools.iter())
+            .map(|tool| ToolRow {
+                name: tool.name.clone(),
+                args: tool.args.clone(),
+                output: tool.output.clone(),
+                ms: tool.ms,
+            })
+            .collect();
+        write_tool_fixture(&dir.join("traj-000.parquet"), None, &tools);
+
+        let history = History::open(dir.clone());
+        assert_eq!(history.len(), expected.len());
+        let read = history.window(0, expected.len()).expect("the legacy rows");
+        for (actual, expected) in read.iter().zip(expected.iter()) {
+            assert_eq!(actual.text, expected.text);
+            assert_eq!(actual.reasoning, expected.reasoning);
+            assert_eq!(actual.tools.len(), expected.tools.len());
+            assert!(actual.images.is_empty());
+            assert!(!actual.steering);
+            assert!(actual.parts.is_empty());
+        }
+        assert_eq!(
+            history
+                .trajectory_page_from_end(0)
+                .expect("the legacy trajectory"),
+            tools,
+            "the five-column trajectory reads without its duration metadata"
+        );
+        let manifest = load_manifest(&dir).expect("the rebuilt manifest");
+        assert!(
+            manifest
+                .messages
+                .iter()
+                .chain(manifest.trajectory.iter())
+                .all(|entry| entry.schema_version == LEGACY_SCHEMA_VERSION),
+            "the repaired index records the files' legacy version"
+        );
+        assert!(
+            matches!(History::open(dir.clone()).index_state(), IndexState::Valid),
+            "the next open trusts the repaired index instead of rebuilding again"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A read whose index claims more row groups than the file holds returns the
+    /// typed read error instead of panicking inside the Parquet reader (#351).
+    #[test]
+    fn a_group_past_the_end_is_a_typed_read_error() {
+        let dir = scratch("group-past-end");
+        fs::create_dir_all(&dir).expect("the history directory");
+        let rows: Vec<ChatMessage> = (0..PAGE).map(message).collect();
+        let path = dir.join("msg-000.parquet");
+        let group_rows = write_messages(&path, 0, &rows).expect("the segment");
+        assert_eq!(group_rows, vec![PAGE], "the fixture is one row group");
+        // The index a stale manifest (or a damaged file) leaves: the file has one
+        // group, the index claims two.
+        let segment = Segment {
+            path,
+            start: 0,
+            rows: PAGE,
+            bytes: 0,
+            sealed: true,
+            group_rows: vec![PAGE / 2, PAGE / 2],
+            schema: SCHEMA_VERSION,
+        };
+        let error = read_range(std::slice::from_ref(&segment), 0, PAGE)
+            .expect_err("the second group does not exist");
+        match error.downcast_ref::<HistoryError>() {
+            Some(HistoryError::Read {
+                segment,
+                group,
+                detail,
+            }) => {
+                assert!(segment.ends_with("msg-000.parquet"), "{segment}");
+                assert_eq!(*group, 1);
+                assert!(detail.contains("1 row group"), "{detail}");
+            }
+            other => panic!("a typed Read error, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }
