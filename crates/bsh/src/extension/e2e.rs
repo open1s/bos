@@ -35,6 +35,7 @@ fn config(root: &Path) -> HostConfig {
         workspace: Some(root.join("workspace")),
         disabled: std::collections::BTreeSet::new(),
         preset_allowed: None,
+        memory: None,
     }
 }
 

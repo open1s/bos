@@ -360,6 +360,14 @@ impl FileMemory {
             .collect()
     }
 
+    /// Records visible to this handle's viewer (issue #340): history included,
+    /// tombstones excluded, scope enforced. The public read seam hosts and
+    /// extension adapters use when they need full records, not bare items.
+    #[must_use]
+    pub fn visible_records(&self) -> Vec<MemoryRecord> {
+        self.scoped_records()
+    }
+
     /// Records visible to this handle's viewer, for scoped composition.
     pub(crate) fn scoped_records(&self) -> Vec<MemoryRecord> {
         self.shared

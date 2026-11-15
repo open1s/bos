@@ -33,6 +33,17 @@ pub(crate) struct CaptureSummary {
     pub(crate) failure: Option<String>,
 }
 
+/// The most recent capture summary, for the memory pane's diagnostic row.
+static LAST_CAPTURE: std::sync::Mutex<Option<CaptureSummary>> = std::sync::Mutex::new(None);
+
+/// The last completed capture run, when one has happened in this process.
+pub(crate) fn last_capture_summary() -> Option<CaptureSummary> {
+    LAST_CAPTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// The capture handle a build attaches to its turns.
 pub(crate) struct CaptureHandle {
     workspace: Arc<FileMemory>,
@@ -108,6 +119,9 @@ impl CaptureHandle {
         }
         *self
             .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(summary.clone());
+        *LAST_CAPTURE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(summary.clone());
         summary

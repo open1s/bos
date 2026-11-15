@@ -434,6 +434,8 @@ pub(crate) enum RightTab {
     Federation,
     /// Durable tasks: running, queued, scheduled and settled.
     Tasks,
+    /// Durable memory records: browse, search and manage the kernel's store.
+    Memory,
 }
 
 impl RightTab {
@@ -447,6 +449,7 @@ impl RightTab {
             "extensions" | "plugins" => Some(Self::Extensions),
             "federation" => Some(Self::Federation),
             "tasks" => Some(Self::Tasks),
+            "memory" => Some(Self::Memory),
             _ => None,
         }
     }
@@ -461,6 +464,7 @@ impl RightTab {
             RightTab::Extensions => "right.tab.extensions",
             RightTab::Federation => "right.tab.federation",
             RightTab::Tasks => "right.tab.tasks",
+            RightTab::Memory => "right.tab.memory",
         }
     }
 
@@ -474,6 +478,7 @@ impl RightTab {
             RightTab::Extensions => IconName::Puzzle,
             RightTab::Federation => IconName::GitBranch,
             RightTab::Tasks => IconName::ClipboardList,
+            RightTab::Memory => IconName::BookOpen,
         }
     }
 
@@ -487,6 +492,7 @@ impl RightTab {
             RightTab::Extensions => "right.start.extensionsHint",
             RightTab::Federation => "right.start.federationHint",
             RightTab::Tasks => "right.start.tasksHint",
+            RightTab::Memory => "right.start.memoryHint",
         }
     }
 
@@ -502,6 +508,7 @@ impl RightTab {
             RightTab::Extensions => "extensions",
             RightTab::Federation => "federation",
             RightTab::Tasks => "tasks",
+            RightTab::Memory => "memory",
         }
     }
 
@@ -512,7 +519,7 @@ impl RightTab {
 
     /// Every pane the panel can show, in the order the Start screen lists the
     /// ones it offers.
-    const ALL: [RightTab; 7] = [
+    const ALL: [RightTab; 8] = [
         RightTab::Files,
         RightTab::Diff,
         RightTab::Terminal,
@@ -520,6 +527,7 @@ impl RightTab {
         RightTab::Extensions,
         RightTab::Federation,
         RightTab::Tasks,
+        RightTab::Memory,
     ];
 
     /// Whether the Start screen offers this pane as a card.
@@ -582,6 +590,8 @@ pub(crate) struct RightPanel {
     pub(crate) diff: super::diff_pane::DiffView,
     /// The federation pane's peers and drafts.
     pub(crate) federation: FederationPane,
+    /// The memory pane's records, drafts and operation log.
+    pub(crate) memory: super::memory_pane::MemoryPane,
     /// The Tasks board's records, read once per open so a frame never touches
     /// the store.
     ///
@@ -2664,6 +2674,7 @@ impl Shell {
                 Some(RightTab::Browser) => body.child(self.browser_pane(cx)),
                 Some(RightTab::Federation) => body.child(self.federation_pane(cx)),
                 Some(RightTab::Tasks) => body.child(self.tasks_pane(cx)),
+                Some(RightTab::Memory) => body.child(self.memory_pane(cx)),
                 Some(RightTab::Extensions) => body.child(match &self.right_extension_panels {
                     Some(view) => view.clone().into_any_element(),
                     None => div()
@@ -6451,6 +6462,7 @@ impl Shell {
             RightTab::Extensions => (IconName::Puzzle, AMBER),
             RightTab::Federation => (IconName::GitBranch, TEAL),
             RightTab::Tasks => (IconName::ClipboardList, 0x3B82F6),
+            RightTab::Memory => (IconName::BookOpen, 0x8B5CF6),
         }
     }
 
@@ -6480,6 +6492,7 @@ impl Shell {
             RightTab::Extensions => None,
             RightTab::Federation => None,
             RightTab::Tasks => None,
+            RightTab::Memory => None,
         };
         let tip = match hint {
             Some(hint) => format!("{label}  {hint}"),
@@ -8982,6 +8995,9 @@ impl Shell {
         if tab != RightTab::Terminal {
             self.hide_terminal_view(cx);
         }
+        if tab == RightTab::Memory {
+            self.memory_load(cx);
+        }
     }
 
     /// Bring one already-open tab to the front.
@@ -9171,6 +9187,9 @@ impl Shell {
         }
         if tab == RightTab::Federation {
             self.reload_federation();
+        }
+        if tab == RightTab::Memory {
+            self.memory_load(cx);
         }
         if tab == RightTab::Terminal {
             if self.right.terminal.is_none() {

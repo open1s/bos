@@ -31,6 +31,13 @@ pub use ferris_core::manifest::{
     ConfigurationSpec, ResourcesSpec, ServiceProvideSpec, ServiceRequireSpec, ServiceScope,
     ServicesSpec,
 };
+/// The memory records contract: extensions on the Durable Record Kernel.
+///
+/// Host-neutral DTOs, the `MemoryRecords` service trait and the JSON transport
+/// seam. Hosts implement the trait over their kernel; extensions acquire it
+/// through the service registry (name `memory`, contract `bos.memory-records`)
+/// or call it over the JSON transport. See `docs/ferris-memory-records.md`.
+pub use ferris_core::memory;
 pub use ferris_core::types::{ExtensionId, Requirement, StartupPolicy, TrustLevel};
 pub use ferris_core::{Contribution, ContributionRef, InvokeContext, RuntimeContext};
 pub use semver::Version;
@@ -46,6 +53,11 @@ pub mod prelude {
     pub use crate::contribution::{kinds, ContributionSpec};
     pub use crate::error::{ErrorCode, ExtError, Result};
     pub use crate::manifest::{ExtensionManifest, ManifestBuilder};
+    pub use crate::memory::{
+        dispatch_memory_json, memory_error, MemoryKindDto, MemoryRecordDto, MemoryRecords,
+        MemoryScopeDto, RecallHitDto, RecallOutcomeDto, RecallRequestDto, MEMORY_CONTRACT,
+        MEMORY_CONTRACT_VERSION, MEMORY_SERVICE,
+    };
     pub use crate::runtime::{Call, Extension, ExtensionContext, ExtensionRuntime, TestHarness};
     pub use crate::{
         ConfigurationSpec, Contribution, ContributionRef, ExtensionId, InvokeContext, Requirement,

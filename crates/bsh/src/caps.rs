@@ -8731,9 +8731,10 @@ mod tests {
             vec![
                 "com.bos.bsh.diagnostics".to_string(),
                 "com.bos.bsh.extensions".to_string(),
+                "com.bos.bsh.memory-tools".to_string(),
                 "shell".to_string()
             ],
-            "the preset allows bash and the enabled built-in extension, so every other bundle keeps no tool"
+            "the preset allows bash and the enabled built-in extensions, so every other bundle keeps no tool"
         );
         let shell = built
             .plugins
@@ -9130,6 +9131,9 @@ mod tests {
                 "job_list".to_string(),
                 "job_output".to_string(),
                 "list_dir".to_string(),
+                "memory-tools__memory_forget".to_string(),
+                "memory-tools__memory_recall".to_string(),
+                "memory-tools__memory_remember".to_string(),
                 "patch_surface".to_string(),
                 "present_surface".to_string(),
                 "read_file".to_string(),
@@ -9162,6 +9166,9 @@ mod tests {
                 "glob".to_string(),
                 "grep".to_string(),
                 "list_dir".to_string(),
+                "memory-tools__memory_forget".to_string(),
+                "memory-tools__memory_recall".to_string(),
+                "memory-tools__memory_remember".to_string(),
                 "read_file".to_string(),
                 "read_files".to_string(),
                 "update_plan".to_string(),

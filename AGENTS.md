@@ -214,7 +214,14 @@ const result = await agent.ask('What is 2+2?');
   (opt-in `memory_capture` setting), and derives context diagnostics from the
   typed `Agent::assemble_prompt` snapshot, never from rendered strings.
   Federation rotation and knowledge publication follow the same
-  clone-commit-publish rule under one write guard.
+  clone-commit-publish rule under one write guard. Extensions reach the
+  kernel through the ferris contract `ferris_sdk::memory` (capability
+  `memory.read`/`memory.write`, service `bos.memory-records`, provided
+  per activation and bound to the session scope; see
+  `docs/ferris-memory-records.md`); the first-party
+  `com.bos.bsh.memory-tools` builtin is the worked example. The reader
+  manages records in the right panel's Memory pane (`ui/memory_pane.rs`,
+  deep link `--panel memory`), which shares the same coordinated stores.
 - **Templates**: `react::template` renders `{{name}}` prompts with
   `PromptTemplate`/`render_template` and places recall with `with_memory`;
   the agent substitutes a `{{memory}}` placeholder in the system prompt and

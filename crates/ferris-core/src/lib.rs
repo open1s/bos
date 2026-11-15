@@ -23,6 +23,7 @@ pub mod lifecycle;
 pub mod manager;
 pub mod manifest;
 pub mod manifest_v2;
+pub mod memory;
 pub mod package;
 pub mod resolver;
 pub mod signing;

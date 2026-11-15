@@ -53,6 +53,49 @@ impl ResolvedMemory {
     }
 }
 
+/// The storage half of a resolution, carried by the extension host.
+///
+/// The host binds one of these per build; each activation narrows the viewer
+/// to its own session when the memory service is provided.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryBinding {
+    /// The workspace-scoped store file.
+    pub(crate) workspace_store: PathBuf,
+    /// The scope the store holds and migrates legacy lines into.
+    pub(crate) storage_scope: MemoryScope,
+    /// The stable workspace identity.
+    pub(crate) workspace_id: String,
+}
+
+/// Resolve the storage binding for a workspace path (no session yet).
+///
+/// The workspace registry id is matched by root path; a path no registry
+/// entry names resolves as the default workspace, the same fallback the
+/// session resolver uses.
+pub(crate) fn binding_for(
+    settings: &Settings,
+    workspace: Option<&std::path::Path>,
+) -> MemoryBinding {
+    let id = workspace.and_then(|path| {
+        settings
+            .global
+            .workspaces
+            .iter()
+            .find(|entry| std::path::Path::new(&entry.root) == path)
+            .map(|entry| entry.id.clone())
+    });
+    let choice = SessionChoice {
+        workspace: id,
+        ..Default::default()
+    };
+    let resolved = MemoryScopeResolver::resolve(settings, &choice, "");
+    MemoryBinding {
+        workspace_store: resolved.workspace_store,
+        storage_scope: resolved.storage_scope,
+        workspace_id: resolved.workspace_id,
+    }
+}
+
 /// The one place storage identity and access scope are resolved.
 pub(crate) struct MemoryScopeResolver;
 

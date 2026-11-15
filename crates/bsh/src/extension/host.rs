@@ -48,6 +48,13 @@ pub(crate) struct HostConfig {
     pub(crate) disabled: BTreeSet<String>,
     /// The preset's explicit allowlist, if it has one.
     pub(crate) preset_allowed: Option<BTreeSet<String>>,
+    /// The workspace's memory storage binding, when memory is enabled.
+    ///
+    /// Resolved once per build from the settings; each activation narrows it
+    /// to its own session when the host memory service is provided. Excluded
+    /// from the identity comparison like the preset allowlist: it filters what
+    /// one build provides, not which host owns the store.
+    pub(crate) memory: Option<crate::memory_scope::MemoryBinding>,
 }
 
 impl PartialEq for HostConfig {
@@ -74,6 +81,14 @@ impl HostConfig {
         preset_allowed: Option<&[String]>,
     ) -> Self {
         let root = extension_root(settings);
+        let memory = if settings.workspace.agent.memory_enabled {
+            Some(crate::memory_scope::binding_for(
+                settings,
+                workspace.as_deref(),
+            ))
+        } else {
+            None
+        };
         Self {
             root,
             workspace,
@@ -85,6 +100,7 @@ impl HostConfig {
                 .cloned()
                 .collect(),
             preset_allowed: preset_allowed.map(|ids| ids.iter().cloned().collect()),
+            memory,
         }
     }
 
@@ -681,6 +697,59 @@ impl AppliedExtension {
         let token = service.publish(&self.services);
         self.service_tokens.push(token.clone());
         Some(token)
+    }
+
+    /// Provide the host memory service for this activation (ferris memory
+    /// contract, docs/ferris-memory-records.md).
+    ///
+    /// Only when the manifest declares a matching requirement AND the consumer
+    /// holds at least one memory capability grant. The service is bound to this
+    /// build's workspace store and this activation's session viewer, attributed
+    /// to the extension, and revoked with the activation's other tokens - it
+    /// never outlives the build that provided it.
+    pub(crate) fn provide_host_memory(
+        &mut self,
+        binding: Option<&crate::memory_scope::MemoryBinding>,
+        policy: &ferris_sdk::capability::PolicyEngine,
+        trust: TrustLevel,
+    ) {
+        let Some(binding) = binding else {
+            return;
+        };
+        let scope = ferris_sdk::composable::Scope::Extension(self.extension_id.clone());
+        let (name, contract, version) = super::memory::service_identity();
+        let declared = self.service_requires.iter().any(|requirement| {
+            requirement.name == name
+                && requirement.contract == contract
+                && service_scope_matches(
+                    &requirement.scope,
+                    &scope,
+                    &self.extension_id,
+                    self.workspace.as_deref(),
+                    &self.session_id,
+                )
+        });
+        if !declared {
+            return;
+        }
+        let (read, write) =
+            super::memory::grants(policy, trust, &self.extension_id, self.workspace.as_deref());
+        if !read && !write {
+            log::debug!(
+                "extension {}: memory service not provided (no memory grant)",
+                self.extension_id
+            );
+            return;
+        }
+        let Some(service) =
+            super::memory::build_service(binding, &self.session_id, &self.extension_id, write)
+        else {
+            return;
+        };
+        let token = self
+            .services
+            .provide_contract(scope, name, contract, version, service);
+        self.service_tokens.push(token);
     }
 
     /// Acquire a typed service only when this extension declared a matching
@@ -1579,8 +1648,210 @@ impl ExtensionHost {
             }
             Err(error) => log::warn!("built-in annotations was not registered: {error}"),
         }
+        self.register_memory_tools();
         #[cfg(test)]
         self.register_service_test_builtin();
+    }
+
+    /// The first-party memory tools extension: the reference consumer of the
+    /// host memory service (docs/ferris-memory-records.md).
+    ///
+    /// It declares the memory capabilities and the service requirement like any
+    /// third-party package, and its tools acquire the typed service through the
+    /// registry at call time - the same path an external extension uses.
+    fn register_memory_tools(&mut self) {
+        let services = Arc::clone(&self.services);
+        let extension = ClosureExtension::new_with_context(
+            MEMORY_TOOLS_MANIFEST,
+            vec![
+                ToolDescriptor {
+                    id: ContributionId::parse("memory_recall").expect("tool id"),
+                    description:
+                        "Recall durable memory records relevant to a query (multilingual hybrid search). Returns records with provenance and score explanations."
+                            .to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" },
+                            "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
+                        },
+                        "required": ["query"]
+                    }),
+                    capabilities: Vec::new(),
+                },
+                ToolDescriptor {
+                    id: ContributionId::parse("memory_remember").expect("tool id"),
+                    description:
+                        "Commit one durable memory record (fact, preference, decision, lesson, procedure or task state). The record is scoped to this session and attributed to the extension."
+                            .to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string" },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["fact", "preference", "decision", "lesson", "procedure", "task_state", "note"]
+                            }
+                        },
+                        "required": ["content"]
+                    }),
+                    capabilities: Vec::new(),
+                },
+                ToolDescriptor {
+                    id: ContributionId::parse("memory_forget").expect("tool id"),
+                    description:
+                        "Tombstone one durable memory record by id. The record stays in history but is no longer recallable."
+                            .to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "id": { "type": "string" } },
+                        "required": ["id"]
+                    }),
+                    capabilities: Vec::new(),
+                },
+            ],
+            move |name, arguments, context| {
+                let scope = ferris_sdk::composable::Scope::Extension(
+                    "com.bos.bsh.memory-tools".to_string(),
+                );
+                let requirement = semver::VersionReq::parse("^1.0")
+                    .map_err(|e| ExtensionError::Runtime {
+                        extension: "com.bos.bsh.memory-tools".to_string(),
+                        message: e.to_string(),
+                    })?;
+                let lease = services
+                    .acquire_contract::<ferris_sdk::memory::MemoryServiceHandle>(
+                        &scope,
+                        ferris_sdk::memory::MEMORY_SERVICE,
+                        ferris_sdk::memory::MEMORY_CONTRACT,
+                        &requirement,
+                    )
+                    .ok_or_else(|| ExtensionError::Runtime {
+                        extension: "com.bos.bsh.memory-tools".to_string(),
+                        message:
+                            "the memory service is not available for this build (memory disabled, no grant, or store unavailable)"
+                                .to_string(),
+                    })?;
+                match name {
+                    "memory_recall" => {
+                        let query = arguments
+                            .get("query")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let limit = arguments
+                            .get("limit")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(5)
+                            .clamp(1, 20) as usize;
+                        let request = ferris_sdk::memory::RecallRequestDto {
+                            query,
+                            limit,
+                            token_budget: None,
+                            kinds: None,
+                            now_ms: 0,
+                        };
+                        let outcome = super::block_on_tokio_scoped(lease.recall(request))?;
+                        serde_json::to_value(outcome).map_err(|e| ExtensionError::Runtime {
+                            extension: "com.bos.bsh.memory-tools".to_string(),
+                            message: e.to_string(),
+                        })
+                    }
+                    "memory_remember" => {
+                        let content = arguments
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| ExtensionError::Runtime {
+                                extension: "com.bos.bsh.memory-tools".to_string(),
+                                message: "memory_remember needs content".to_string(),
+                            })?
+                            .to_string();
+                        let kind = arguments
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or("fact");
+                        let kind: ferris_sdk::memory::MemoryKindDto =
+                            serde_json::from_value(Value::String(kind.to_string())).map_err(
+                                |e| ExtensionError::Runtime {
+                                    extension: "com.bos.bsh.memory-tools".to_string(),
+                                    message: format!("unknown memory kind: {e}"),
+                                },
+                            )?;
+                        let record = ferris_sdk::memory::MemoryRecordDto {
+                            schema: 2,
+                            id: String::new(),
+                            revision: 1,
+                            kind,
+                            // Advisory: the host binds the record to this
+                            // activation's viewer scope.
+                            scope: ferris_sdk::memory::MemoryScopeDto::Workspace {
+                                workspace: "host-bound".to_string(),
+                            },
+                            content,
+                            metadata: None,
+                            provenance: ferris_sdk::memory::ProvenanceDto {
+                                source: ferris_sdk::memory::EvidenceSourceDto::ToolEvidence,
+                                session: context.session.clone(),
+                                turn: None,
+                                evidence: Vec::new(),
+                            },
+                            confidence: ferris_sdk::memory::ConfidenceDto {
+                                level: ferris_sdk::memory::ConfidenceLevelDto::Medium,
+                                verified: false,
+                            },
+                            status: ferris_sdk::memory::LifecycleDto::Active,
+                            created_at_ms: 0,
+                            updated_at_ms: 0,
+                            expires_at_ms: None,
+                            relations: ferris_sdk::memory::RelationsDto::default(),
+                        };
+                        let committed = super::block_on_tokio_scoped(lease.add(record))?;
+                        serde_json::to_value(committed).map_err(|e| ExtensionError::Runtime {
+                            extension: "com.bos.bsh.memory-tools".to_string(),
+                            message: e.to_string(),
+                        })
+                    }
+                    "memory_forget" => {
+                        let id = arguments
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| ExtensionError::Runtime {
+                                extension: "com.bos.bsh.memory-tools".to_string(),
+                                message: "memory_forget needs an id".to_string(),
+                            })?;
+                        let removed = super::block_on_tokio_scoped(lease.remove(id))?;
+                        Ok(serde_json::json!({ "removed": removed }))
+                    }
+                    other => Err(ExtensionError::UnsupportedRuntime {
+                        kind: format!("memory tool {other}"),
+                    }),
+                }
+            },
+        );
+        match BuiltinRuntime::new(Arc::new(extension)) {
+            Ok(runtime) => {
+                let package = Package {
+                    root: PathBuf::from("<builtin>"),
+                    manifest: runtime.manifest().clone(),
+                    report: ValidationReport::default(),
+                    source: ExtensionSource::Builtin,
+                    trust: TrustLevel::Builtin,
+                    hash: String::new(),
+                    installed_at: 0,
+                    signature: None,
+                    verification: ferris_sdk::signing::SignatureVerification::Missing,
+                    source_path: None,
+                };
+                let tools = runtime.descriptors();
+                let id = package.id().to_string();
+                self.builtins.push(BuiltinLoaded {
+                    package,
+                    runtime: Arc::new(LazyRuntime::new(id, Arc::new(runtime))),
+                    tools,
+                });
+            }
+            Err(error) => log::warn!("built-in memory tools was not registered: {error}"),
+        }
     }
 
     /// Test-only first-party extension that publishes a typed service, so the
@@ -2524,6 +2795,14 @@ impl ExtensionHost {
                     }
                 }
             }
+            // The host memory service: provided per activation, declaration-
+            // and grant-gated, revoked with the activation (ferris memory
+            // contract).
+            activation_ext.provide_host_memory(
+                self.config.memory.as_ref(),
+                &self.policy,
+                entry.package.trust,
+            );
             applied.push(activation_ext);
         }
         applied
@@ -2728,6 +3007,12 @@ impl ExtensionHost {
             .entry("terminal".to_string())
             .or_default()
             .push(Capability::ProcessExecute);
+        // The host memory service requires at least the read grant at
+        // acquisition; the write grant is re-checked at the service boundary.
+        capabilities
+            .entry(ferris_sdk::memory::MEMORY_SERVICE.to_string())
+            .or_default()
+            .push(Capability::MemoryRead);
         capabilities
     }
 
@@ -4519,6 +4804,44 @@ required = ["agent.tools.register"]
 tools = ["graph", "why"]
 "#;
 
+/// The manifest of the first-party memory tools package: the reference
+/// consumer of the host memory service (docs/ferris-memory-records.md).
+const MEMORY_TOOLS_MANIFEST: &str = r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.bos.bsh.memory-tools"
+name = "Memory Tools"
+version = "1.0.0"
+description = "Recall, remember and forget durable memory records through the host memory service"
+authors = ["BrickOS Team"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "builtin"
+entry = "memory-tools"
+startup = "on-startup"
+
+[capabilities]
+required = ["agent.tools.register", "memory.read", "memory.write"]
+
+[[services.requires]]
+name = "memory"
+contract = "bos.memory-records"
+version = "^1.0"
+scope = "extension"
+# The HOST provides this service at activation time, and memory may be
+# disabled: an optional requirement plans cleanly and acquires when present.
+optional = true
+
+[contributes]
+tools = ["memory_recall", "memory_remember", "memory_forget"]
+"#;
+
 /// Test-only first-party extension that publishes a typed counter service at
 /// Host scope, so the production activation path's service publication is
 /// exercised end to end (issue #302).
@@ -4607,6 +4930,7 @@ mod tests {
             workspace: Some(root.join("workspace")),
             disabled: BTreeSet::new(),
             preset_allowed: None,
+            memory: None,
         }
     }
 
@@ -4650,6 +4974,303 @@ mod tests {
             !host.services().has_name("com.bos.bsh.counter"),
             "unload revoked the provider's service"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn memory_binding(root: &Path) -> crate::memory_scope::MemoryBinding {
+        crate::memory_scope::MemoryBinding {
+            workspace_store: root.join("memory").join("ws-test.jsonl"),
+            storage_scope: agent::memory::MemoryScope::workspace("ws-test"),
+            workspace_id: "ws-test".to_string(),
+        }
+    }
+
+    fn memory_dto(content: &str) -> ferris_sdk::memory::MemoryRecordDto {
+        ferris_sdk::memory::MemoryRecordDto {
+            schema: 2,
+            id: String::new(),
+            revision: 1,
+            kind: ferris_sdk::memory::MemoryKindDto::Fact,
+            scope: ferris_sdk::memory::MemoryScopeDto::Workspace {
+                workspace: "advisory".into(),
+            },
+            content: content.into(),
+            metadata: None,
+            provenance: ferris_sdk::memory::ProvenanceDto {
+                source: ferris_sdk::memory::EvidenceSourceDto::ToolEvidence,
+                session: None,
+                turn: None,
+                evidence: Vec::new(),
+            },
+            confidence: ferris_sdk::memory::ConfidenceDto {
+                level: ferris_sdk::memory::ConfidenceLevelDto::Medium,
+                verified: false,
+            },
+            status: ferris_sdk::memory::LifecycleDto::Active,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            expires_at_ms: None,
+            relations: ferris_sdk::memory::RelationsDto::default(),
+        }
+    }
+
+    /// The host memory service flows through the production activation path:
+    /// declaration + grant gated, acquired typed through the registry, bound
+    /// to the session viewer, attributed, and revoked on unload.
+    #[test]
+    fn the_memory_service_is_provided_acquired_and_revoked_per_activation() {
+        let root = scratch("memory-service");
+        let mut config = config(&root);
+        config.memory = Some(memory_binding(&root));
+        let host = ExtensionHost::open(config).expect("host");
+        let mut agent = ::agent::Agent::from_config(::agent::AgentConfig::default());
+        let mut registry = ::agent::plugins::PluginRegistry::new();
+        let applied = host.apply_with_fibers(&mut agent, &mut registry, None, "session-mem");
+
+        let scope =
+            ferris_sdk::composable::Scope::Extension("com.bos.bsh.memory-tools".to_string());
+        let requirement = semver::VersionReq::parse("^1.0").unwrap();
+        let lease = host
+            .services()
+            .acquire_contract::<ferris_sdk::memory::MemoryServiceHandle>(
+                &scope,
+                ferris_sdk::memory::MEMORY_SERVICE,
+                ferris_sdk::memory::MEMORY_CONTRACT,
+                &requirement,
+            )
+            .expect("the activation provides the memory service");
+
+        // Commit through the contract; the host binds scope and attribution.
+        let committed = super::super::block_on_tokio_scoped(
+            lease.add(memory_dto("the release gate runs clippy")),
+        )
+        .expect("commit");
+        assert_eq!(
+            committed.scope,
+            ferris_sdk::memory::MemoryScopeDto::Session {
+                workspace: "ws-test".into(),
+                session: "session-mem".into()
+            },
+            "writes land at the activation's viewer scope"
+        );
+        assert!(committed
+            .provenance
+            .evidence
+            .contains(&"extension:com.bos.bsh.memory-tools".to_string()));
+
+        // Recall through the same contract.
+        let outcome = super::super::block_on_tokio_scoped(lease.recall(
+            ferris_sdk::memory::RecallRequestDto {
+                query: "clippy".into(),
+                limit: 5,
+                token_budget: None,
+                kinds: None,
+                now_ms: 0,
+            },
+        ))
+        .expect("recall");
+        assert_eq!(outcome.hits.len(), 1);
+        drop(lease);
+
+        // The first-party tools reach the same service through the agent
+        // registry: remember then recall.
+        // Extension tools live in the agent's live overlay.
+        let (remember, recall_tool) = {
+            let live = agent
+                .live_tools()
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let names = live.async_tool_names();
+            let remember_name = names
+                .iter()
+                .find(|name| name.ends_with("memory_remember"))
+                .expect("memory_remember is registered");
+            let recall_name = names
+                .iter()
+                .find(|name| name.ends_with("memory_recall"))
+                .expect("memory_recall is registered");
+            (
+                live.get_async(remember_name).expect("remember tool"),
+                live.get_async(recall_name).expect("recall tool"),
+            )
+        };
+        let tool_result = super::super::block_on_tokio_scoped(
+            remember.run(&serde_json::json!({"content": "tool-written note", "kind": "decision"})),
+        )
+        .expect("memory_remember tool");
+        assert!(tool_result["id"].as_str().is_some());
+        let recalled = super::super::block_on_tokio_scoped(
+            recall_tool.run(&serde_json::json!({"query": "tool-written"})),
+        )
+        .expect("memory_recall tool");
+        assert!(!recalled["hits"].as_array().unwrap().is_empty());
+
+        // Unloading the activation revokes its service.
+        let activation = applied
+            .into_iter()
+            .find(|activation| activation.extension_id() == "com.bos.bsh.memory-tools")
+            .expect("memory tools applied");
+        activation
+            .unload(&mut agent, &mut registry)
+            .expect("unload");
+        assert!(
+            host.services()
+                .acquire_contract::<ferris_sdk::memory::MemoryServiceHandle>(
+                    &scope,
+                    ferris_sdk::memory::MEMORY_SERVICE,
+                    ferris_sdk::memory::MEMORY_CONTRACT,
+                    &requirement,
+                )
+                .is_none(),
+            "unload revoked the memory service"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With memory disabled there is no binding, so no activation gets the
+    /// service - the tools report unavailable rather than inventing a store.
+    #[test]
+    fn memory_disabled_means_no_service() {
+        let root = scratch("memory-disabled");
+        let host = ExtensionHost::open(config(&root)).expect("host");
+        let mut agent = ::agent::Agent::from_config(::agent::AgentConfig::default());
+        let mut registry = ::agent::plugins::PluginRegistry::new();
+        let _applied = host.apply_with_fibers(&mut agent, &mut registry, None, "session-mem");
+        let scope =
+            ferris_sdk::composable::Scope::Extension("com.bos.bsh.memory-tools".to_string());
+        assert!(
+            host.services()
+                .acquire_contract::<ferris_sdk::memory::MemoryServiceHandle>(
+                    &scope,
+                    ferris_sdk::memory::MEMORY_SERVICE,
+                    ferris_sdk::memory::MEMORY_CONTRACT,
+                    &semver::VersionReq::parse("^1.0").unwrap(),
+                )
+                .is_none(),
+            "no binding, no service"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A community package that requires the service but holds no memory grant
+    /// is not provided one; with the grants, it is.
+    #[test]
+    fn the_memory_service_follows_the_capability_grants() {
+        let root = scratch("memory-grants");
+        std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+        let source = root.join("consumer-pkg");
+        std::fs::create_dir_all(source.join("tools")).expect("tools");
+        write_manifest(
+            &source,
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.memory-consumer"
+name = "Memory Consumer"
+version = "1.0.0"
+description = "Requires the host memory service"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[capabilities]
+required = ["agent.tools.register", "memory.read", "memory.write"]
+
+[[services.requires]]
+name = "memory"
+contract = "bos.memory-records"
+version = "^1.0"
+scope = "extension"
+optional = true
+
+[contributes]
+tools = ["echo"]
+"#,
+        );
+        std::fs::write(
+            source.join("tools/echo.json"),
+            r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
+        )
+        .expect("tool");
+        let store = ExtensionStore::open(&root).expect("store");
+        let package = store.install(&source).expect("install");
+        let policy =
+            PolicyEngine::open(store.grants_path(), store.audit_path(), PolicyMode::Enforce)
+                .expect("policy");
+        // Only the tool registration is granted - no memory grants yet.
+        policy
+            .grant(
+                package.id().as_str(),
+                ferris_sdk::capability::Capability::AgentToolsRegister,
+                GrantScope::Any,
+                None,
+            )
+            .expect("grant");
+        drop(policy);
+
+        let mut host_config = config(&root);
+        host_config.memory = Some(memory_binding(&root));
+        let host = ExtensionHost::open(host_config).expect("host");
+        let mut agent = ::agent::Agent::from_config(::agent::AgentConfig::default());
+        let mut registry = ::agent::plugins::PluginRegistry::new();
+        let applied = host.apply_with_fibers(&mut agent, &mut registry, None, "session-grant");
+        let scope =
+            ferris_sdk::composable::Scope::Extension("com.example.memory-consumer".to_string());
+        let requirement = semver::VersionReq::parse("^1.0").unwrap();
+        assert!(
+            host.services()
+                .acquire_contract::<ferris_sdk::memory::MemoryServiceHandle>(
+                    &scope,
+                    ferris_sdk::memory::MEMORY_SERVICE,
+                    ferris_sdk::memory::MEMORY_CONTRACT,
+                    &requirement,
+                )
+                .is_none(),
+            "no memory grant, no service"
+        );
+        for activation in applied {
+            let _ = activation.unload(&mut agent, &mut registry);
+        }
+        drop(host);
+
+        // Grant the memory capabilities and reapply: the service appears.
+        let policy =
+            PolicyEngine::open(store.grants_path(), store.audit_path(), PolicyMode::Enforce)
+                .expect("policy");
+        for capability in [
+            ferris_sdk::capability::Capability::MemoryRead,
+            ferris_sdk::capability::Capability::MemoryWrite,
+        ] {
+            policy
+                .grant(package.id().as_str(), capability, GrantScope::Any, None)
+                .expect("grant");
+        }
+        drop(policy);
+        let mut host_config = config(&root);
+        host_config.memory = Some(memory_binding(&root));
+        let host = ExtensionHost::open(host_config).expect("host");
+        let _applied = host.apply_with_fibers(&mut agent, &mut registry, None, "session-grant");
+        let lease = host
+            .services()
+            .acquire_contract::<ferris_sdk::memory::MemoryServiceHandle>(
+                &scope,
+                ferris_sdk::memory::MEMORY_SERVICE,
+                ferris_sdk::memory::MEMORY_CONTRACT,
+                &requirement,
+            )
+            .expect("granted consumer gets the service");
+        let committed =
+            super::super::block_on_tokio_scoped(lease.add(memory_dto("granted consumer note")))
+                .expect("commit");
+        assert!(committed
+            .provenance
+            .evidence
+            .contains(&"extension:com.example.memory-consumer".to_string()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5015,8 +5636,8 @@ tools = ["echo"]
         let host = ExtensionHost::open(config(&root)).expect("host");
         let metrics = host.metrics();
         assert_eq!(
-            metrics.applied, 5,
-            "the builtin inspector, diagnostics, annotations, service-test and good package still apply"
+            metrics.applied, 6,
+            "the builtin inspector, diagnostics, annotations, memory-tools, service-test and good package still apply"
         );
         let statuses = host.statuses();
         assert!(

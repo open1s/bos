@@ -13,6 +13,7 @@ pub(crate) mod frame_trace;
 pub(crate) mod header;
 pub(crate) mod hero;
 pub(crate) mod lane;
+pub(crate) mod memory_pane;
 pub(crate) mod meter;
 pub(crate) mod paging;
 pub(crate) mod permission;

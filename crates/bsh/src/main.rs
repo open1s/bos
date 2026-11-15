@@ -103,7 +103,7 @@ fn main() {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
             "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]] [--panel=PANE] [--browser=URL] [--federation-profile=NAME]\n       bsh ext <command> [options]\n       bsh federation [--profile NAME] <command> [options]\n\n  --settings  open the settings dialog on launch\n  SECTION     a rail cell - account | vault | general | models | web-search |\n              extensions | agent-presets - or a hosted view: tools |\n              plugin-inventory | shell | agent-loop | mcp | archived-sessions |\n              workspaces | context | plugins | automation | policy | extensions\n              (default: account)\n  --panel     open a right-hand pane on launch: files | terminal | diff |
-              browser | extensions | federation | tasks
+              browser | extensions | federation | tasks | memory
   --browser   open the Browser pane on URL (http or https)
   --federation-profile NAME
               run this instance's federation node under NAME, so several BSH

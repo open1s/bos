@@ -37879,3 +37879,272 @@ fn the_title_bar_grips_are_clear_of_the_window_buttons(cx: &mut TestAppContext) 
         "the grip ends where the fold control starts: grip {side:?}, fold {fold:?}"
     );
 }
+
+/// Seed one record into the workspace store the pane will resolve, and return
+/// the settings the shell must carry so the binding points at the scratch.
+fn memory_seed(state: &mut AppState, dir: &std::path::Path, id: &str, content: &str) {
+    use agent::memory::MemoryRepository as _;
+    state.settings.save_root = Some(dir.to_path_buf());
+    state.settings.workspace.agent.memory_enabled = true;
+    state.settings.global.workspaces = vec![crate::settings::global::WorkspaceRef {
+        id: "ws-mem".to_string(),
+        name: "Memory".to_string(),
+        root: dir.to_string_lossy().to_string(),
+        created_at: 0,
+        updated_at: 0,
+    }];
+    state.settings.global.general.active_workspace = "ws-mem".to_string();
+    let session = state.active_id.clone().expect("session");
+    if let Some(session) = state.store.session_mut(&session) {
+        session.workspace = "ws-mem".to_string();
+    }
+    let binding = crate::memory_scope::binding_for(&state.settings, Some(dir));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let store = agent::memory::FileMemory::open_scoped(
+            &binding.workspace_store,
+            binding.storage_scope.clone(),
+            Some(binding.storage_scope.clone()),
+        )
+        .await
+        .expect("store");
+        let mut record = agent::memory::MemoryRecord::new(
+            agent::memory::MemoryKind::Fact,
+            binding.storage_scope.clone(),
+            content,
+            agent::memory::Provenance::default(),
+        );
+        record.id = id.to_string();
+        store.repository().add_record(record).await.expect("seed");
+    });
+}
+
+/// The memory pane lists the kernel's records, adds one through the form, and
+/// deletes it - every mutation durably committed and reported in the log.
+#[gpui::test]
+fn the_memory_pane_lists_adds_and_deletes(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-memory-pane-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let mut state = state_with_turns("memory-pane", 1);
+    memory_seed(&mut state, &dir, "seed-1", "the seeded record about clippy");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Memory, window, cx);
+        })
+    });
+    // The load runs on the runner runtime; wait for the seeded row to paint.
+    draw_until_settled(cx, "the seeded memory row", |cx| {
+        cx.debug_bounds("memory-row-seed-1").is_some()
+    });
+    let rows = cx.update(|_, cx| shell.read(cx).right.memory.rows.len());
+    assert_eq!(rows, 1, "the pane lists the kernel's record");
+
+    // Open the add form, type, commit.
+    let add = cx
+        .debug_bounds("memory-add-toggle")
+        .expect("the add control");
+    cx.simulate_click(add.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("memory-add-form").is_some(),
+        "the add form opens"
+    );
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.memory_add_input.update(cx, |input, cx| {
+                input.set_value("the pane adds this note", window, cx)
+            });
+        })
+    });
+    let commit = cx
+        .debug_bounds("memory-add-commit")
+        .expect("the commit control");
+    cx.simulate_click(commit.center(), Modifiers::default());
+    draw_until_settled(cx, "the added memory row", |cx| {
+        cx.update(|_, cx| shell.read(cx).right.memory.rows.len()) == 2
+    });
+    let added_id = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .right
+            .memory
+            .rows
+            .iter()
+            .find(|row| row.content.contains("the pane adds this"))
+            .map(|row| row.id.clone())
+            .expect("the added row")
+    });
+
+    // Delete the added record: the row goes, the tombstone stays in the store.
+    let delete_selector: &'static str =
+        Box::leak(format!("memory-delete-{added_id}").into_boxed_str());
+    let delete = cx
+        .debug_bounds(delete_selector)
+        .expect("the delete control");
+    cx.simulate_click(delete.center(), Modifiers::default());
+    draw_until_settled(cx, "the deleted memory row", |cx| {
+        cx.update(|_, cx| shell.read(cx).right.memory.rows.len()) == 1
+    });
+    let binding = crate::memory_scope::binding_for(
+        &cx.update(|_, cx| shell.read(cx).state.settings.clone()),
+        Some(&dir),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let visible = rt.block_on(async {
+        let store = agent::memory::FileMemory::open_scoped(
+            &binding.workspace_store,
+            binding.storage_scope.clone(),
+            Some(binding.storage_scope.clone()),
+        )
+        .await
+        .expect("store");
+        store.visible_records().len()
+    });
+    assert_eq!(visible, 1, "the delete committed a tombstone, not a loss");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The memory pane searches with the hybrid recall, and supersedes a record
+/// while keeping its history.
+#[gpui::test]
+fn the_memory_pane_searches_and_supersedes(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let dir = std::env::temp_dir().join(format!("bsh-memory-search-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    let mut state = state_with_turns("memory-search", 1);
+    memory_seed(&mut state, &dir, "seed-a", "the deploy gate runs clippy");
+    // A second record the search must NOT surface.
+    {
+        use agent::memory::MemoryRepository as _;
+        let binding = crate::memory_scope::binding_for(&state.settings, Some(&dir));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let store = agent::memory::FileMemory::open_scoped(
+                &binding.workspace_store,
+                binding.storage_scope.clone(),
+                Some(binding.storage_scope.clone()),
+            )
+            .await
+            .expect("store");
+            let mut record = agent::memory::MemoryRecord::new(
+                agent::memory::MemoryKind::Note,
+                binding.storage_scope.clone(),
+                "an unrelated shopping list",
+                agent::memory::Provenance::default(),
+            );
+            record.id = "seed-b".to_string();
+            store.repository().add_record(record).await.expect("seed");
+        });
+    }
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.open_right_tab(RightTab::Memory, window, cx);
+        })
+    });
+    draw_until_settled(cx, "the seeded memory rows", |cx| {
+        cx.update(|_, cx| shell.read(cx).right.memory.rows.len()) == 2
+    });
+
+    // Search: only the matching record surfaces, with its score explanation.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.memory_query
+                .update(cx, |input, cx| input.set_value("clippy", window, cx));
+        })
+    });
+    let search = cx
+        .debug_bounds("memory-search")
+        .expect("the search control");
+    cx.simulate_click(search.center(), Modifiers::default());
+    draw_until_settled(cx, "the search hit", |cx| {
+        cx.debug_bounds("memory-hit-seed-a").is_some()
+    });
+    assert!(
+        cx.debug_bounds("memory-hit-seed-b").is_none(),
+        "the unrelated record is not a hit"
+    );
+
+    // Clear the search, then supersede the seeded record.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.memory_query
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        })
+    });
+    let search = cx
+        .debug_bounds("memory-search")
+        .expect("the search control");
+    cx.simulate_click(search.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let supersede = cx
+        .debug_bounds("memory-supersede-seed-a")
+        .expect("the supersede control");
+    cx.simulate_click(supersede.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("memory-edit-field").is_some(),
+        "the supersede editor opens"
+    );
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.memory_edit_input.update(cx, |input, cx| {
+                input.set_value("the deploy gate runs clippy and fmt", window, cx)
+            });
+        })
+    });
+    let save = cx
+        .debug_bounds("memory-edit-save")
+        .expect("the save control");
+    cx.simulate_click(save.center(), Modifiers::default());
+    draw_until_settled(cx, "the supersede commit", |cx| {
+        cx.update(|_, cx| {
+            shell.read(cx).right.memory.activity.iter().any(|op| {
+                op.action == "memory.act.supersede"
+                    && op.state == crate::ui::memory_pane::MemoryActivityState::Succeeded
+            })
+        })
+    });
+    // History shows the superseded predecessor alongside the successor.
+    let history = cx
+        .debug_bounds("memory-history-toggle")
+        .expect("the history toggle");
+    cx.simulate_click(history.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let statuses = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .right
+            .memory
+            .rows
+            .iter()
+            .map(|row| row.status.clone())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        statuses.iter().any(|status| status == "superseded"),
+        "the predecessor is kept as history: {statuses:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

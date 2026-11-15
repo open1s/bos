@@ -36,6 +36,7 @@ mod framework;
 pub(crate) mod hooks;
 pub(crate) mod host;
 pub(crate) mod live;
+pub(crate) mod memory;
 pub(crate) mod notes;
 pub(crate) mod runs;
 pub(crate) mod surface;

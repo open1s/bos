@@ -355,6 +355,12 @@ pub(crate) struct Shell {
     pub(crate) federation_knowledge: Entity<InputState>,
     /// The federation pane's knowledge publication payload.
     pub(crate) federation_knowledge_payload: Entity<InputState>,
+    /// The memory pane's search field.
+    pub(crate) memory_query: Entity<InputState>,
+    /// The memory pane's add-record field.
+    pub(crate) memory_add_input: Entity<InputState>,
+    /// The memory pane's edit/supersede field.
+    pub(crate) memory_edit_input: Entity<InputState>,
     /// The browser pane's view, rebuilt only when the browser changed.
     pub(crate) browser_pane: Option<crate::browser::PaneView>,
     /// The URL the address bar was last filled from, so a frame that did not
@@ -1498,6 +1504,16 @@ impl Shell {
                 "right.federation.knowledgePayloadPlaceholder",
             ))
         });
+        let memory_query = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::tr(lang, "memory.searchPlaceholder"))
+        });
+        let memory_add_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "memory.addPlaceholder"))
+        });
+        let memory_edit_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "memory.editPlaceholder"))
+        });
         let mcp_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::i18n::tr(lang, "settings.mcpSearch"))
         });
@@ -2103,6 +2119,9 @@ impl Shell {
             federation_capability_search,
             federation_knowledge,
             federation_knowledge_payload,
+            memory_query,
+            memory_add_input,
+            memory_edit_input,
             browser_pane: None,
             browser_shown_url: String::new(),
             browser_rev: 0,

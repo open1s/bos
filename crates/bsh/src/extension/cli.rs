@@ -223,6 +223,7 @@ fn config(root: Option<PathBuf>) -> HostConfig {
         workspace: std::env::current_dir().ok(),
         disabled: BTreeSet::new(),
         preset_allowed: None,
+        memory: None,
     }
 }
 
@@ -1725,6 +1726,7 @@ fn command_metrics(root: Option<PathBuf>) -> Result<i32, String> {
         workspace: None,
         disabled: BTreeSet::new(),
         preset_allowed: None,
+        memory: None,
     })
     .map_err(|error| error.to_string())?;
     let metrics = host.metrics();
@@ -1742,6 +1744,7 @@ fn command_providers(root: Option<PathBuf>) -> Result<i32, String> {
         workspace: None,
         disabled: BTreeSet::new(),
         preset_allowed: None,
+        memory: None,
     })
     .map_err(|error| error.to_string())?;
     let providers = host.provider_descriptors();
@@ -1759,6 +1762,7 @@ fn command_languages(root: Option<PathBuf>) -> Result<i32, String> {
         workspace: None,
         disabled: BTreeSet::new(),
         preset_allowed: None,
+        memory: None,
     })
     .map_err(|error| error.to_string())?;
     for entry in host.languages() {
@@ -1782,6 +1786,7 @@ fn command_integrations(root: Option<PathBuf>) -> Result<i32, String> {
         workspace: None,
         disabled: BTreeSet::new(),
         preset_allowed: None,
+        memory: None,
     })
     .map_err(|error| error.to_string())?;
     for entry in host.integrations() {
@@ -1814,6 +1819,7 @@ fn command_language_check(args: &[String], root: Option<PathBuf>) -> Result<i32,
         workspace: Some(std::env::current_dir().unwrap_or_default()),
         disabled: BTreeSet::new(),
         preset_allowed: None,
+        memory: None,
     })
     .map_err(|error| error.to_string())?;
     let value = tokio::runtime::Builder::new_current_thread()
@@ -1847,6 +1853,7 @@ fn command_integrate(args: &[String], root: Option<PathBuf>) -> Result<i32, Stri
         workspace: Some(std::env::current_dir().unwrap_or_default()),
         disabled: BTreeSet::new(),
         preset_allowed: None,
+        memory: None,
     })
     .map_err(|error| error.to_string())?;
     let value = tokio::runtime::Builder::new_current_thread()

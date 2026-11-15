@@ -216,9 +216,17 @@ scope. The complete vocabulary is:
 | ui.theme | low | Contribute visual theme resources |
 | hooks.observe | high | Receive observe-hook batches |
 | agent.intercept | high | Intercept and rewrite host events or requests |
+| memory.read | medium | List and recall durable memory records in the granted scope |
+| memory.write | high | Commit, update, supersede and tombstone durable memory records |
 
 terminal.execute is accepted as a historical alias for process.execute. Run
 bsh ext capabilities for the live list.
+
+The memory capabilities gate the host memory service (contract
+`bos.memory-records`): the host provides it per activation, bound to the
+build's workspace store and the activation's session scope. See
+[ferris-memory-records.md](ferris-memory-records.md) for the contract, the
+JSON transport and the first-party `com.bos.bsh.memory-tools` example.
 
 ### 3.6 Contributions
 

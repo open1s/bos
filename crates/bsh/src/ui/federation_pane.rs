@@ -753,7 +753,7 @@ fn empty_state(label: String, mark: IconName) -> AnyElement {
         .into_any_element()
 }
 
-fn field(input: &Entity<InputState>, id: &'static str) -> AnyElement {
+pub(crate) fn field(input: &Entity<InputState>, id: &'static str) -> AnyElement {
     div()
         .id(SharedString::from(id))
         .debug_selector(move || id.to_string())
@@ -771,7 +771,7 @@ fn field(input: &Entity<InputState>, id: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-fn solid_button<F>(
+pub(crate) fn solid_button<F>(
     id: impl Into<SharedString>,
     label: String,
     primary: bool,

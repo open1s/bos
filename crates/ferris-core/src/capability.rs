@@ -80,11 +80,15 @@ pub enum Capability {
     HooksObserve,
     /// Register an event interceptor that may rewrite or short-circuit a host seam.
     AgentIntercept,
+    /// List and recall durable memory records in the granted scope.
+    MemoryRead,
+    /// Commit, update, supersede and tombstone durable memory records.
+    MemoryWrite,
 }
 
 impl Capability {
     /// Every capability, in declaration order.
-    pub const ALL: [Capability; 21] = [
+    pub const ALL: [Capability; 23] = [
         Self::WorkspaceRead,
         Self::WorkspaceWrite,
         Self::NetworkHttp,
@@ -106,6 +110,8 @@ impl Capability {
         Self::UiTheme,
         Self::HooksObserve,
         Self::AgentIntercept,
+        Self::MemoryRead,
+        Self::MemoryWrite,
     ];
 
     /// The stable manifest string.
@@ -132,6 +138,8 @@ impl Capability {
             Self::UiTheme => "ui.theme",
             Self::HooksObserve => "hooks.observe",
             Self::AgentIntercept => "agent.intercept",
+            Self::MemoryRead => "memory.read",
+            Self::MemoryWrite => "memory.write",
         }
     }
 
@@ -159,6 +167,8 @@ impl Capability {
             Self::UiTheme => "contribute visual theme resources",
             Self::HooksObserve => "receive observe-hook batches from host seams",
             Self::AgentIntercept => "intercept and rewrite host events and requests",
+            Self::MemoryRead => "list and recall durable memory records in the granted scope",
+            Self::MemoryWrite => "commit, update, supersede and tombstone durable memory records",
         }
     }
 
@@ -178,11 +188,13 @@ impl Capability {
             Self::AgentModelsProvide
             | Self::AgentAgentsProvide
             | Self::AgentWorkflowsProvide
-            | Self::AgentSkillsProvide => Risk::Medium,
+            | Self::AgentSkillsProvide
+            | Self::MemoryRead => Risk::Medium,
             Self::WorkspaceWrite
             | Self::NetworkHttp
             | Self::HooksObserve
-            | Self::AgentIntercept => Risk::High,
+            | Self::AgentIntercept
+            | Self::MemoryWrite => Risk::High,
             Self::ProcessExecute | Self::ComputerUse | Self::SecretsRead => Risk::Critical,
         }
     }
