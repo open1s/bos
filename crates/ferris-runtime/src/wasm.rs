@@ -1116,6 +1116,13 @@ impl WasmRuntime {
             }
         });
         store.set_epoch_deadline(1);
+        // Instantiation and initialize are guest entry points too. A
+        // cancellation that dropped the previous instance is still set here,
+        // so without this reset the new store's epoch callback interrupts
+        // initialize's argument marshalling and the fresh instance traps in
+        // cabi_realloc. The scope is fresh: the call's own prepare_call below
+        // re-arms the deadline and fuel.
+        self.cancelled.store(false, Ordering::SeqCst);
         let mut linker = Linker::new(engine);
         add_wasi_to_linker(&mut linker).map_err(|error| ExtensionError::Runtime {
             extension: self.extension.to_string(),
