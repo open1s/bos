@@ -427,12 +427,32 @@ mod tests {
     }
 
     fn make_graph(id: WorkspaceId, nodes: Vec<RustModuleNode>) -> RustModuleGraph {
+        make_graph_with_edges(id, nodes, Vec::new())
+    }
+
+    fn make_graph_with_edges(
+        id: WorkspaceId,
+        nodes: Vec<RustModuleNode>,
+        edges: Vec<RustModuleEdge>,
+    ) -> RustModuleGraph {
         RustModuleGraph {
             workspace_id: id,
             crate_roots: vec![PathBuf::from("src/lib.rs")],
             nodes,
-            edges: Vec::<RustModuleEdge>::new(),
+            edges,
             status: crate::RustModuleGraphStatus::Complete,
+        }
+    }
+
+    fn edge(module_path: &[&str], status: RustModuleEdgeStatus) -> RustModuleEdge {
+        RustModuleEdge {
+            crate_root: PathBuf::from("src/lib.rs"),
+            parent_module_path: Vec::new(),
+            child_module_path: module_path.iter().map(|item| (*item).to_owned()).collect(),
+            declaration_source: PathBuf::from("src/lib.rs"),
+            range: SourceRange { start_byte: 1, end_byte: 2 },
+            candidate_paths: Vec::new(),
+            status,
         }
     }
 
@@ -496,6 +516,52 @@ mod tests {
         ]);
         let report = resolve_rust_import_module_candidates(&[parsed], &graph).expect("imports");
         assert_eq!(report.imports[0].status, RustImportResolutionStatus::AmbiguousModuleTarget);
+    }
+
+    #[test]
+    fn propagates_ambiguous_module_declaration_edges() {
+        let id = WorkspaceId::new();
+        let parsed = parse_result(
+            "src/lib.rs",
+            vec![import(&["crate", "shared", "Thing"], &[])],
+            Vec::new(),
+            id,
+        );
+        let graph = make_graph_with_edges(
+            id,
+            vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)],
+            vec![edge(&["shared"], RustModuleEdgeStatus::AmbiguousCandidates)],
+        );
+        let report = resolve_rust_import_module_candidates(&[parsed], &graph).expect("imports");
+        assert_eq!(report.imports[0].status, RustImportResolutionStatus::AmbiguousModuleTarget);
+    }
+
+    #[test]
+    fn propagates_uncertain_unparsed_and_depth_limited_module_edges() {
+        let id = WorkspaceId::new();
+        let parsed = parse_result(
+            "src/lib.rs",
+            vec![
+                import(&["crate", "optional", "Item"], &[]),
+                import(&["crate", "missing_parse", "Item"], &[]),
+                import(&["crate", "deep", "Item"], &[]),
+            ],
+            Vec::new(),
+            id,
+        );
+        let graph = make_graph_with_edges(
+            id,
+            vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)],
+            vec![
+                edge(&["optional"], RustModuleEdgeStatus::SkippedAttributedDeclaration),
+                edge(&["missing_parse"], RustModuleEdgeStatus::UniqueCandidateUnparsed),
+                edge(&["deep"], RustModuleEdgeStatus::DepthLimit),
+            ],
+        );
+        let report = resolve_rust_import_module_candidates(&[parsed], &graph).expect("imports");
+        assert!(report.imports.iter().any(|item| item.import_path[1] == "optional" && item.status == RustImportResolutionStatus::UncertainModuleTarget));
+        assert!(report.imports.iter().any(|item| item.import_path[1] == "missing_parse" && item.status == RustImportResolutionStatus::UnparsedModuleTarget));
+        assert!(report.imports.iter().any(|item| item.import_path[1] == "deep" && item.status == RustImportResolutionStatus::DepthLimitedModuleTarget));
     }
 
     #[test]
