@@ -12,9 +12,22 @@ use std::{
 use crate::fs::WorkspaceEntryKind;
 
 const BUILTIN_IGNORED_DIRECTORY_NAMES: &[&str] = &[
-    ".git", ".hg", ".svn", ".next", ".turbo", ".cache", ".venv",
-    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
-    "target", "node_modules", "dist", "build",
+    ".git",
+    ".hg",
+    ".svn",
+    ".next",
+    ".turbo",
+    ".cache",
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
 ];
 
 /// Whether an ignore rule excludes or explicitly includes a matching path.
@@ -397,6 +410,7 @@ mod tests {
         let policy = IgnorePolicy::without_builtins();
         assert!(!policy.is_ignored(Path::new("target"), WorkspaceEntryKind::Directory));
     }
+
     #[test]
     fn excludes_git_worktree_marker_file() {
         let policy = IgnorePolicy::default();
