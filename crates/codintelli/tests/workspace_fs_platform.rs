@@ -40,12 +40,7 @@ fn directory_listing_never_returns_file_symlinks() {
     let root = tempdir().expect("create workspace");
     std::fs::write(root.path().join("target.rs"), "source").expect("write target");
 
-    if create_file_symlink(
-        Path::new("target.rs"),
-        &root.path().join("alias.rs"),
-    )
-    .is_err()
-    {
+    if create_file_symlink(Path::new("target.rs"), &root.path().join("alias.rs")).is_err() {
         // Windows may require Developer Mode or an elevated test runner.
         #[cfg(windows)]
         return;
@@ -86,5 +81,7 @@ fn absolute_workspace_paths_are_rejected_on_the_host_platform() {
     let workspace = workspace_fs(root.path());
 
     assert!(workspace.read_dir(root.path(), 16).is_err());
-    assert!(workspace.read_file(root.path().join("outside"), 1024).is_err());
+    assert!(workspace
+        .read_file(root.path().join("outside"), 1024)
+        .is_err());
 }

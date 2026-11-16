@@ -200,7 +200,10 @@ per-language table:
 
 That order is what keeps a manager's configuration effective in an app launched
 without a shell, and why a macOS `/usr/bin/python3` stub does not shadow the
-reader's installed interpreter. The manifest name stays the capability subject
+reader's installed interpreter. The same `PATH` is handed to every child an
+extension spawns - the host terminal's shell, the `process`/`mcp` children, and
+the Cordis bridge process - so a package that runs `jj`, a Homebrew `git` or a
+version-managed tool finds it even when BSH itself was started from Finder. The manifest name stays the capability subject
 (`program:python3`); only the executable that answers to it changes. The
 `cordis` bridge additionally honours `$BOS_BRIDGE_NODE` and the Node runtime
 shipped beside the BSH executable, and never probes another application's

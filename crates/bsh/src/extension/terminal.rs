@@ -15,6 +15,12 @@ pub(crate) struct HostTerminal;
 impl TerminalService for HostTerminal {
     fn run(&self, command: &str, cwd: Option<PathBuf>) -> Result<TerminalOutput, String> {
         let mut process = host_shell_command(command);
+        // The shell is the reader's, not the launching app's: give it the
+        // extended `PATH` so a tool installed outside a Finder launch (jj,
+        // git from Homebrew, a version-managed binary) is found.
+        if let Some(path) = hostkit::programs::extended_path() {
+            process.env("PATH", path);
+        }
         if let Some(cwd) = cwd {
             process.current_dir(cwd);
         }
@@ -80,6 +86,23 @@ mod tests {
             .expect("the host shell runs");
         assert_eq!(output.code, 0, "{output:?}");
         assert!(output.stdout.contains("hello"), "{output:?}");
+    }
+
+    /// A tool installed outside the launching app's `PATH` (Homebrew's jj is
+    /// the reported case) is reachable from the extension shell.
+    #[test]
+    fn a_tool_outside_the_launch_path_is_reachable() {
+        if hostkit::programs::executable("jj").is_none() {
+            return;
+        }
+        let output = HostTerminal
+            .run("jj --version", None)
+            .expect("the host shell runs");
+        assert_eq!(output.code, 0, "{output:?}");
+        assert!(
+            output.stdout.contains("jj"),
+            "the tool answered: {output:?}"
+        );
     }
 
     #[test]

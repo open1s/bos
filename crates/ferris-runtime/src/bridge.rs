@@ -442,6 +442,11 @@ impl BridgeSession {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // A plugin may run a shell of its own; give it the host's extended
+        // `PATH` so a tool outside the launching app's environment is found.
+        if let Some(path) = hostkit::programs::extended_path() {
+            command.env("PATH", path);
+        }
         // The ownership boundary exists before extension code can run: a
         // fresh process group on Unix, a suspended-create/assign/resume Job
         // Object on Windows (issue #320).

@@ -23,6 +23,7 @@
 //! that is absent, fails, or does not answer in time falls through to the
 //! directory scan.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -180,6 +181,31 @@ fn run_bounded(mut command: Command, timeout: Duration) -> Option<Output> {
             }
         }
     }
+}
+
+/// The `PATH` a child process should see.
+///
+/// The launching process's `PATH` keeps its order - a shell launch is the
+/// reader's choice - and the per-platform program directories follow, so a
+/// shell command an extension runs (`sh -c "jj status"`) finds a tool
+/// installed outside the launching application's own environment. Entries are
+/// deduplicated, and a value that cannot be encoded as a `PATH` returns
+/// `None` so the caller leaves the inherited value alone.
+pub fn extended_path() -> Option<OsString> {
+    let mut entries: Vec<PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&path) {
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
+        }
+    }
+    for directory in program_directories() {
+        if !entries.contains(&directory) {
+            entries.push(directory);
+        }
+    }
+    std::env::join_paths(entries).ok()
 }
 
 /// The per-platform directories a shellless launch does not inherit, most
@@ -654,6 +680,35 @@ mod tests {
             bins.last(),
             Some(&scratch.path().join("v9.11.2").join("bin"))
         );
+    }
+
+    /// The extended `PATH` keeps the launching process's order first,
+    /// appends every program directory, and never repeats an entry.
+    #[test]
+    fn the_extended_path_keeps_the_parent_order_first() {
+        let Some(path) = super::extended_path() else {
+            return;
+        };
+        let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        let parent: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|value| std::env::split_paths(&value).collect())
+            .unwrap_or_default();
+        let mut parent_unique: Vec<PathBuf> = Vec::new();
+        for entry in parent {
+            if !parent_unique.contains(&entry) {
+                parent_unique.push(entry);
+            }
+        }
+        assert_eq!(&entries[..parent_unique.len()], &parent_unique[..]);
+
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            entries.iter().all(|entry| seen.insert(entry.clone())),
+            "an entry is repeated"
+        );
+        for directory in program_directories() {
+            assert!(entries.contains(&directory), "{directory:?} is not on PATH");
+        }
     }
 
     /// A distribution directory that prefixes the version (`cpython-3.12.11-`)

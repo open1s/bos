@@ -832,6 +832,11 @@ impl McpCore {
         for (key, value) in hostkit::env::EnvMap::baseline().iter() {
             command.env(key, value);
         }
+        // The child may run a shell of its own; give it the same extended
+        // `PATH` the host uses, not only the launching app's environment.
+        if let Some(path) = hostkit::programs::extended_path() {
+            command.env("PATH", path);
+        }
         for (key, value) in &self.env {
             command.env(key, value);
         }

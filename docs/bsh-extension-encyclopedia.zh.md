@@ -955,6 +955,8 @@ guest 应解析 envelope、遍历 batch、逐条做有界工作、返回合法 J
 
 **entry 解析**：任何白名单启动器（`python3`、`node`、`bun`、`sh`…）都走同一个跨平台程序解析（`hostkit::programs::executable`）：`$BOS_<PROGRAM>`（如 `BOS_PYTHON3`）、`VIRTUAL_ENV`、版本管理器自己的选择、已安装版本与 shim、`PATH`、系统前缀；capability 仍按 manifest 的名字校验（`program:python3`），换的只是执行文件。
 
+同一份扩展 `PATH` 也会交给扩展派生的每个子进程——宿主终端的 shell、`process`/`mcp` 子进程、Cordis bridge 进程——所以包里 `sh -c "jj status"`、Homebrew 的 `git` 或版本管理器装的工具，即使 BSH 由 Finder 启动也能找到。
+
 ### 11.5 WASM component
 
 **契约**（`crates/bsh/wit/extension.wit`）：world `bsh-extension` 导入 `host`、导出 `extension`。导出调用顺序：`initialize → activate → tools → call-tool → command → panel → on-event → deactivate → shutdown`。

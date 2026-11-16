@@ -383,19 +383,24 @@ impl BridgeSession {
             reason: error.to_string(),
         })?;
 
-        let mut child = Command::new(&options.interpreter)
+        let mut command = Command::new(&options.interpreter);
+        command
             .arg("--no-warnings")
             .arg(&shim_path)
             .current_dir(&options.root)
             .env("NODE_ENV", "production")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| BridgeRefusal::Spawn {
-                program: options.interpreter.display().to_string(),
-                reason: error.to_string(),
-            })?;
+            .stderr(Stdio::piped());
+        // A plugin may run a shell of its own; give it the host's extended
+        // `PATH` so a tool outside the launching app's environment is found.
+        if let Some(path) = hostkit::programs::extended_path() {
+            command.env("PATH", path);
+        }
+        let mut child = command.spawn().map_err(|error| BridgeRefusal::Spawn {
+            program: options.interpreter.display().to_string(),
+            reason: error.to_string(),
+        })?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = Some(BufReader::new(child.stdout.take().expect("piped stdout")));
         let mut session = BridgeSession {
