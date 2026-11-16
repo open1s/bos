@@ -494,6 +494,8 @@ mod tests {
             facts: vec![SyntaxFact {
                 kind: SyntaxFactKind::Module,
                 name: None,
+                scope_path: Vec::new(),
+                is_module_scope: true,
                 range: SourceRange { start_byte: 0, end_byte: 1 },
             }],
             imports: Vec::new(),

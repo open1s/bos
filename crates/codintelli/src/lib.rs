@@ -27,6 +27,7 @@ pub mod resolution;
 pub mod rust_modules;
 pub mod module_graph;
 pub mod rust_imports;
+pub mod rust_symbols;
 pub mod syntax;
 pub mod workspace;
 
@@ -46,6 +47,10 @@ pub use module_graph::{
 pub use rust_imports::{
     resolve_rust_import_module_candidates, RustImportResolution, RustImportResolutionError,
     RustImportResolutionReport, RustImportResolutionStatus,
+};
+pub use rust_symbols::{
+    build_rust_scoped_symbols, RustScopedSymbol, RustScopedSymbolError,
+    RustScopedSymbolId, RustScopedSymbolKind, RustScopedSymbolReport,
 };
 pub use rust_modules::{
     resolve_rust_module_candidates, RustModuleResolution, RustModuleResolutionError,
