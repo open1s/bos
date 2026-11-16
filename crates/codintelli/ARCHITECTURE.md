@@ -151,7 +151,7 @@ The Rust provider emits typed module declarations in addition to generic syntax 
 
 ### 4.7 Rust module path candidates (CI-09E)
 
-The module candidate mapper consumes typed module declarations and the caller-provided workspace inventory. It checks both conventional layouts (`name.rs` and `name/mod.rs`) using the source-file directory rules. Crate roots are explicit host input; codintelli does not guess Cargo targets or execute Cargo metadata commands. Inline module scopes are reflected in candidate paths. If both conventional files exist, ambiguity is preserved. If neither exists, the result is `NoCandidate`, not a compiler error. Any declaration with outer attributes is skipped as uncertain because `cfg`, `cfg_attr`, and `path` require configuration-aware handling. A unique filesystem candidate is still only a path candidate, not a semantic or compiler-resolved module edge.
+The module candidate mapper consumes typed module declarations and the caller-provided workspace inventory. It checks both conventional layouts (`name.rs` and `name/mod.rs`) using the source-file directory rules. Crate roots are explicit host input; codintelli does not guess Cargo targets or execute Cargo metadata commands. Inline module scopes are reflected in candidate paths. If both conventional files exist, ambiguity is preserved. If neither exists, the result is `NoCandidate`, not a compiler error. Declarations with module-resolution-affecting `cfg`, `cfg_attr`, or `path` attributes are skipped as uncertain; unrelated documentation or lint attributes do not suppress conventional lookup. A unique filesystem candidate is still only a path candidate, not a semantic or compiler-resolved module edge.
 
 ### 4.8 Crate-root-anchored module graph (CI-09F)
 
