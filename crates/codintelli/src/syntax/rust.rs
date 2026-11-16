@@ -520,6 +520,7 @@ pub(super) fn parent_visible() {}
 pub(self) const SELF_VALUE: u8 = 1;
 pub(in crate::outer) type ScopedAlias = u8;
 pub use crate::public_mod::Thing as PublicThing;
+pub trait Api { fn trait_method(&self); const TRAIT_CONST: u8; type Output; }
 fn private_fn() {}
 "#);
         let visibility = |name: &str| {
@@ -540,6 +541,14 @@ fn private_fn() {}
             super::super::RustVisibility::InPath(vec!["crate".to_owned(), "outer".to_owned()])
         );
         assert_eq!(visibility("private_fn"), super::super::RustVisibility::Private);
+        for trait_member in ["trait_method", "TRAIT_CONST", "Output"] {
+            let fact = result
+                .facts
+                .iter()
+                .find(|fact| fact.name.as_deref() == Some(trait_member))
+                .expect("trait member syntax fact");
+            assert_eq!(fact.visibility, None);
+        }
         let import = result
             .facts
             .iter()
