@@ -75,6 +75,8 @@ pub enum RustModuleEdgeStatus {
     NoCandidate,
     /// Attribute interpretation is required (for example cfg or path).
     SkippedAttributedDeclaration,
+    /// Declaration is nested beneath an inline module whose cfg/path is unknown.
+    SkippedUncertainParentScope,
     /// Candidate exists but traversal stopped at the configured depth limit.
     DepthLimit,
 }
@@ -257,6 +259,14 @@ pub fn build_rust_module_graph(
             if parsed.status != ParseStatus::Complete && graph.status == RustModuleGraphStatus::Complete {
                 graph.status = RustModuleGraphStatus::Partial;
             }
+            let uncertain_inline_scopes: Vec<Vec<String>> = parsed.modules.iter()
+                .filter(|fact| fact.is_inline && fact.has_resolution_attributes)
+                .map(|fact| {
+                    let mut scope = fact.scope_path.clone();
+                    scope.push(fact.name.clone());
+                    scope
+                })
+                .collect();
 
             for fact in &parsed.modules {
                 if !valid_module_segment(&fact.name)
@@ -268,6 +278,26 @@ pub fn build_rust_module_graph(
                 parent_path.extend(fact.scope_path.iter().cloned());
                 let mut child_path = parent_path.clone();
                 child_path.push(fact.name.clone());
+
+                if uncertain_inline_scopes.iter().any(|scope| fact.scope_path.starts_with(scope)) {
+                    if graph.status == RustModuleGraphStatus::Complete {
+                        graph.status = RustModuleGraphStatus::Partial;
+                    }
+                    if graph.edges.len() >= limits.max_edges {
+                        graph.status = RustModuleGraphStatus::Limited;
+                        break;
+                    }
+                    graph.edges.push(RustModuleEdge {
+                        crate_root: root.clone(),
+                        parent_module_path: parent_path,
+                        child_module_path: child_path,
+                        declaration_source: source_path.clone(),
+                        range: fact.range,
+                        candidate_paths: Vec::new(),
+                        status: RustModuleEdgeStatus::SkippedUncertainParentScope,
+                    });
+                    continue;
+                }
 
                 if graph.edges.len() >= limits.max_edges {
                     graph.status = RustModuleGraphStatus::Limited;
@@ -549,6 +579,32 @@ mod tests {
         assert_eq!(graph.status, RustModuleGraphStatus::Partial);
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.edges[0].status, RustModuleEdgeStatus::SkippedAttributedDeclaration);
+    }
+
+    #[test]
+    fn does_not_traverse_children_of_cfg_gated_inline_modules() {
+        let id = WorkspaceId::new();
+        let mut optional = module("optional", &[], true);
+        optional.has_resolution_attributes = true;
+        let child = module("child", &["optional"], false);
+        let results = vec![
+            parsed("src/lib.rs", vec![optional, child], id),
+            parsed("src/optional/child.rs", Vec::new(), id),
+        ];
+        let graph = build_rust_module_graph(
+            &results,
+            &[
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("src/optional/child.rs"),
+            ],
+            &[PathBuf::from("src/lib.rs")],
+            RustModuleGraphLimits::default(),
+        ).expect("module graph");
+        assert_eq!(graph.status, RustModuleGraphStatus::Partial);
+        assert_eq!(graph.nodes.len(), 1);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.status == RustModuleEdgeStatus::SkippedUncertainParentScope
+        }));
     }
 
     #[test]
