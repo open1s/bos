@@ -309,6 +309,15 @@ fn make_unresolved(
     }
 }
 
+fn valid_import_identifier(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_alphabetic())
+        && chars.all(|character| character == '_' || character.is_alphanumeric())
+}
+
 trait ImportFactValidation {
     fn import_path_is_invalid(&self) -> bool;
 }
