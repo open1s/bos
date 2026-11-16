@@ -324,19 +324,8 @@ trait ImportFactValidation {
 
 impl ImportFactValidation for ImportFact {
     fn import_path_is_invalid(&self) -> bool {
-        self.path.iter().any(|segment| {
-            segment.is_empty()
-                || segment == "."
-                || segment == ".."
-                || segment.contains('/')
-                || segment.contains('\\\\')
-        }) || self.scope_path.iter().any(|segment| {
-            segment.is_empty()
-                || segment == "."
-                || segment == ".."
-                || segment.contains('/')
-                || segment.contains('\\\\')
-        })
+        self.path.iter().any(|segment| !valid_import_identifier(segment))
+            || self.scope_path.iter().any(|segment| !valid_import_identifier(segment))
     }
 }
 
