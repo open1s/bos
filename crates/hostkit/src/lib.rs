@@ -30,3 +30,4 @@ pub mod fspriv;
 pub mod home;
 pub mod paths;
 pub mod proc;
+pub mod programs;

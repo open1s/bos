@@ -1009,6 +1009,8 @@ manifest：`kind = "mcp"`，`entry`/`args`/`protocol = "mcp"`；仍需 `process.
 
 `kind = "cordis"`，`entry` 是 JS 文件，以 `apply(ctx, config)` 在既有能力门控的 Node bridge 子进程中运行。bridge 把注册物映射为 BSH 贡献：
 
+解释器按固定顺序解析：`$BOS_BRIDGE_NODE`、`PATH` 中的 `node`/`nodejs`、BSH 可执行文件旁自带的 Node runtime，再问已安装的版本管理器自己选了哪个解释器（`mise which node`、`asdf which node`、`volta which node`，均有超时；nvm 的 `alias/default` 能解析到本地版本时也先采用），再到按平台解析的版本管理器与系统目录（mise、nvm、asdf、fnm、pnpm、Volta；Windows 上为 `%LOCALAPPDATA%\mise`、`%APPDATA%\nvm`、`%ProgramFiles%\nodejs`）——Finder 启动的应用不继承 shell 的 `PATH`，而资源管理器启动的进程只继承机器级变量。受版本管理器控制的 Node 先取它安装的版本目录里的真实二进制，再退回 shim：shim 依赖管理器自己的配置解析版本，离开 shell 可能拒绝运行；数据目录则读取管理器自己的变量（`MISE_DATA_DIR`、`NVM_DIR`、`ASDF_DATA_DIR`、`FNM_DIR`、`VOLTA_HOME`、`XDG_DATA_HOME`，Windows 上还有 `NVM_HOME`/`NVM_SYMLINK`）。它不借用其它应用的启动器：DeepSeek Harness 的 `runtime/bin/node` 会 exec 只有该应用才设置的环境变量，在 BSH 里运行会以状态 127 退出。
+
 | 注册 | 贡献 |
 |---|---|
 | `ctx.tools.register` | tool |

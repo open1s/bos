@@ -5,11 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Host-neutral OS services: process-tree ownership, path safety, environment baselines, private files"
+description = "Host-neutral OS services: process-tree ownership, path safety, environment baselines, private files, program search"
 
 [dependencies]
 dirs = "7.0.0"
 fs2 = { workspace = true }
+semver = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

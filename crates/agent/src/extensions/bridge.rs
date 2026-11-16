@@ -51,6 +51,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hostkit::programs::{executable_names, find_in, managed_interpreter, program_directories};
 use serde_json::{json, Value};
 
 use react::tool::ToolError;
@@ -141,7 +142,7 @@ impl std::fmt::Display for BridgeRefusal {
         match self {
             BridgeRefusal::NoInterpreter => write!(
                 f,
-                "no Node interpreter was found (looked for `{NODE_ENV_VAR}`, `node`, `nodejs`, and the DeepSeek Harness runtime), so the package JavaScript host entry cannot be executed"
+                "no Node interpreter was found (looked for `{NODE_ENV_VAR}`, `node`, `nodejs`, a version manager's own selection, and the version managers' bin directories), so the package JavaScript host entry cannot be executed"
             ),
             BridgeRefusal::BadEntry { path, reason } => write!(
                 f,
@@ -313,10 +314,19 @@ impl BridgeOptions {
 ///
 /// 1. `$BOS_BRIDGE_NODE`, when it names an existing file.
 /// 2. `node` / `nodejs` on `PATH`.
-/// 3. The DeepSeek Harness application own bundled runtime.
+/// 3. The interpreter an installed version manager selects (`mise which node`,
+///    `asdf which node`, `volta which node`), with a bounded wait.
+/// 4. The per-platform user and system directories a shellless launch does
+///    not inherit on `PATH` (`hostkit::programs::program_directories`).
 ///
 /// The search is a filesystem probe, never an execution: a host that finds
 /// nothing records [`BridgeRefusal::NoInterpreter`] and starts no process.
+///
+/// No other application's bundle is probed. The DeepSeek Harness
+/// `runtime/bin/node` is a launcher that execs
+/// `$DSH_DESKTOP_NODE_EXECUTABLE`, a variable only that application sets, so
+/// borrowing it made a Cordis package exit with status 127 wherever BSH or a
+/// test ran without that environment.
 pub fn find_interpreter() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var(NODE_ENV_VAR) {
         let path = PathBuf::from(explicit);
@@ -327,21 +337,32 @@ pub fn find_interpreter() -> Option<PathBuf> {
     if let Some(path) = which("node").or_else(|| which("nodejs")) {
         return Some(path);
     }
-    let bundled =
-        PathBuf::from("/Applications/DeepSeek Harness.app/Contents/Resources/runtime/bin/node");
-    bundled.is_file().then_some(bundled)
+    // A version manager's own selection stays in charge: it may come from a
+    // configuration or environment this process never inherited.
+    if let Some(path) = managed_interpreter("node") {
+        return Some(path);
+    }
+    let mut names = executable_names("node");
+    names.extend(executable_names("nodejs"));
+    find_in(&fallback_directories(), &names)
 }
 
 /// Resolve one executable name against `PATH`.
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    let directories: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    find_in(&directories, &executable_names(name))
+}
+
+/// The directories searched after `PATH`, most specific first.
+///
+/// The host-neutral per-platform list in
+/// [`hostkit::programs::program_directories`]: a Finder-launched macOS app
+/// inherits launchd's minimal `PATH`, and a Windows process started from
+/// Explorer inherits only the machine variables, so the version managers' own
+/// directories are probed explicitly.
+fn fallback_directories() -> Vec<PathBuf> {
+    program_directories()
 }
 
 /// Whether an interpreter is available at all.

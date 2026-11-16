@@ -181,6 +181,25 @@ startup values are on-startup, on-demand, on-workspace-open and manual. The defa
 is on-demand. runtime.config is opaque to the manifest parser and validated by the
 runtime adapter.
 
+The `cordis` adapter runs the entry with Node in a subprocess, resolving the
+interpreter in one fixed order: `$BOS_BRIDGE_NODE`, then `node`/`nodejs` on
+`PATH`, then the Node runtime shipped beside the BSH executable, then the
+interpreter the installed manager itself selects (`mise which node`,
+`asdf which node`, `volta which node`, each bounded; nvm's `alias/default`
+when it resolves to a local install), then the
+per-platform version-manager and system directories (mise, nvm, asdf, fnm, pnpm,
+Volta; `%LOCALAPPDATA%\mise`, `%APPDATA%\nvm` and `%ProgramFiles%\nodejs` on
+Windows) - a Finder-launched app does not inherit a shell `PATH`, and an app
+started from Explorer inherits only the machine variables. A managed Node is
+taken from the manager's installed version directory before its shim, because a
+shim resolves the version from the manager's own configuration and can refuse
+outside a shell; the manager's data directory is read from its own variable
+(`MISE_DATA_DIR`, `NVM_DIR`, `ASDF_DATA_DIR`, `FNM_DIR`, `VOLTA_HOME`,
+`XDG_DATA_HOME`, and `NVM_HOME`/`NVM_SYMLINK` on Windows). It never
+borrows another application's bundled launcher: the DeepSeek Harness one execs a
+variable only that application sets, so running it from BSH exited with status
+127.
+
 A `wasm-component` guest also gets WASI preview 2's standard **clock and random**
 interfaces, so `std::time` and `getrandom` work without the host bridge. Its
 stdout/stderr are inherited. The filesystem, environment, sockets and stdin are
