@@ -378,6 +378,25 @@ mod tests {
     }
 
     #[test]
+    fn preserves_explicit_cancellation_in_overall_index_status() {
+        let root = tempdir().expect("create workspace");
+        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
+            .expect("create descriptor");
+        let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
+        let budget = ScanBudget::new(limits());
+        budget.cancel();
+
+        let report = index_rust_workspace(
+            &workspace,
+            &budget,
+            &IgnorePolicy::default(),
+        );
+
+        assert_eq!(report.status, SourceIndexStatus::Cancelled);
+        assert_eq!(report.scan.status, ScanStatus::Cancelled);
+    }
+
+    #[test]
     fn reports_unsupported_languages_without_dropping_inventory() {
         let root = tempdir().expect("create workspace");
         fs::write(root.path().join("main.py"), "print('hello')").expect("write Python source");
