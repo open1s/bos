@@ -43,7 +43,7 @@ pub struct RustScopedSymbol {
     pub id: RustScopedSymbolId,
     pub name: String,
     /// Visibility modifier written at the declaration; not effective accessibility.
-    pub visibility: RustVisibility,
+    pub visibility: Option<RustVisibility>,
 }
 
 /// Catalog coverage and diagnostics for one workspace module graph.
@@ -144,7 +144,7 @@ pub fn build_rust_scoped_symbols(
                     kind,
                 },
                 name: name.to_owned(),
-                visibility: fact.visibility.clone().unwrap_or(RustVisibility::Private),
+                visibility: fact.visibility.clone(),
             });
         }
     }
