@@ -28,8 +28,8 @@ pub struct WorkspaceEntry {
 }
 
 impl WorkspaceFs {
-    /// Enumerate one directory, returning at most max_entries regular files
-    /// and directories. The empty path selects the workspace root.
+    /// Enumerate one directory, inspecting at most max_entries entries.
+    /// The empty path selects the workspace root.
     ///
     /// Symbolic links and non-regular special files are omitted. Results are
     /// sorted by their workspace-relative path for deterministic indexing.
@@ -39,7 +39,7 @@ impl WorkspaceFs {
     /// # Errors
     ///
     /// Returns an error for invalid paths, inaccessible directories, or when
-    /// the number of eligible entries exceeds max_entries.
+    /// the directory contains more entries than max_entries.
     pub fn read_dir(
         &self,
         relative_path: impl AsRef<Path>,
@@ -74,7 +74,16 @@ impl WorkspaceFs {
         })?;
 
         let mut result = Vec::new();
+        let mut inspected_entries = 0usize;
         for entry in entries {
+            if inspected_entries == max_entries {
+                return Err(WorkspaceFsError::EntryLimitExceeded {
+                    path: relative_path.to_path_buf(),
+                    max_entries,
+                });
+            }
+            inspected_entries += 1;
+
             let entry = entry.map_err(|source| WorkspaceFsError::Io {
                 path: relative_path.to_path_buf(),
                 source,
@@ -99,13 +108,6 @@ impl WorkspaceFs {
                 // are not eligible for indexing.
                 continue;
             };
-
-            if result.len() == max_entries {
-                return Err(WorkspaceFsError::EntryLimitExceeded {
-                    path: relative_path.to_path_buf(),
-                    max_entries,
-                });
-            }
 
             result.push(WorkspaceEntry {
                 relative_path: relative_path.join(name),
