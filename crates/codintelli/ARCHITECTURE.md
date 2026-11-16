@@ -87,7 +87,7 @@ Responsibilities:
 
 - Traverse only through `WorkspaceFs` no-follow APIs.
 - Apply configurable ignore rules and built-in exclusions.
-- Classify files by path, extension, and bounded content sniffing where necessary.
+- Classify files deterministically from workspace-relative names and extensions in the inventory stage. Content sniffing, when needed for ambiguous formats, belongs to a later bounded source-reading stage.
 - Enforce one shared `ScanBudget` for the entire scan.
 - Produce deterministic workspace-relative file records.
 
