@@ -95,18 +95,20 @@ Initial built-in exclusions include VCS internals and common generated/dependenc
 
 The scanner must return a typed completion state: `Complete`, `Partial`, `Cancelled`, or `Failed`, with usage and diagnostics. A budget-exceeded scan is partial, never complete.
 
-### 4.2 Source snapshot and fingerprints
+### 4.2 Bounded source loading and syntax extraction
 
-Each file record should include:
+The initial source pipeline is implemented as a synchronous, sequential operation intended to run on a bounded host worker:
 
-- normalized workspace-relative path;
-- detected language/provider;
-- byte length;
-- content fingerprint (cryptographic digest);
-- last successful extraction version;
-- extraction status and diagnostic summary.
+1. Run the inventory scanner with the same shared ScanBudget.
+2. Classify accepted files using workspace-relative names and extensions.
+3. Select a registered LanguageProvider for source files.
+4. Reserve the no-follow metadata size against the aggregate byte budget before reading.
+5. Read through WorkspaceFs with a per-file limit equal to the reserved size.
+6. Parse only the bounded in-memory bytes and retain workspace identity, relative path, provider version, schema version, facts, and diagnostics.
 
-Fingerprints are content-derived, not absolute-path-derived. File identity for graph nodes must remain stable across moving the same workspace to another machine.
+A file that grows between enumeration and reading is rejected by the bounded read. Byte reservations are conservative and are not refunded after read or parse failure. Unsupported languages remain visible as unsupported results; they are not silently dropped from coverage accounting. Documentation, configuration, data, markup, style, and asset files remain in inventory but are not sent to source parsers by the initial pipeline.
+
+The first pipeline checks cancellation and deadlines between files. A parser currently processing one bounded file is not preempted by the orchestration layer; this is an explicit limitation until provider-level cancellation is wired and tested. No project commands, compilers, build scripts, package managers, or tests are executed.
 
 ### 4.3 Language provider registry
 
@@ -323,7 +325,7 @@ The engine should expose host-neutral operations similar to:
 - query graph snapshots and evidence;
 - export a versioned snapshot.
 
-The exact sync/async boundary is intentionally not frozen here. The core indexing pipeline should be usable from synchronous library callers while allowing hosts to run it on bounded background workers. A future Ferris/Builtin adapter can map these operations into host tools without making the engine depend on Ferris.
+The source pipeline is synchronous and sequential today. Hosts must run it on bounded background workers; a future worker-pool API must preserve one shared budget, deterministic result ordering, cooperative cancellation, and explicit partial coverage. A future Ferris/Builtin adapter can map these operations into host tools without making the engine depend on Ferris.
 
 ## 10. Delivery sequence
 
