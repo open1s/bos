@@ -953,7 +953,7 @@ guest 应解析 envelope、遍历 batch、逐条做有界工作、返回合法 J
 
 **宿主强制**：环境清空后只加白名单与 manifest 变量；cwd 为包根；可执行文件必须包内相对或白名单启动器；需要 `process.execute`（可按程序/参数限定）；进程组与 RLIMIT；macOS 仅文件写沙箱；Linux 的 process/MCP 默认启用 bubblewrap，缺 bubblewrap 或 namespace 失败即 fail closed，绝不无沙箱回退；`--share-net` 意味着子进程网络仍共享；stdout/stderr 截断。
 
-**Python 解析**：`entry = "python"`/`"python3"` 先按 `$BOS_PYTHON`、激活的 `VIRTUAL_ENV`、版本管理器自己的选择（`mise`/asdf/`pyenv`/`uv python find`）、管理器已安装版本、`PATH`、系统前缀的顺序换成真实解释器；capability 仍按 manifest 的名字校验（`program:python3`），换的只是执行文件。
+**entry 解析**：任何白名单启动器（`python3`、`node`、`bun`、`sh`…）都走同一个跨平台程序解析（`hostkit::programs::executable`）：`$BOS_<PROGRAM>`（如 `BOS_PYTHON3`）、`VIRTUAL_ENV`、版本管理器自己的选择、已安装版本与 shim、`PATH`、系统前缀；capability 仍按 manifest 的名字校验（`program:python3`），换的只是执行文件。
 
 ### 11.5 WASM component
 
@@ -1011,7 +1011,7 @@ manifest：`kind = "mcp"`，`entry`/`args`/`protocol = "mcp"`；仍需 `process.
 
 `kind = "cordis"`，`entry` 是 JS 文件，以 `apply(ctx, config)` 在既有能力门控的 Node bridge 子进程中运行。bridge 把注册物映射为 BSH 贡献：
 
-解释器按固定顺序解析：`$BOS_BRIDGE_NODE`、`PATH` 中的 `node`/`nodejs`、BSH 可执行文件旁自带的 Node runtime，再问已安装的版本管理器自己选了哪个解释器（`mise which node`、`asdf which node`、`volta which node`，均有超时；nvm 的 `alias/default` 能解析到本地版本时也先采用），再到按平台解析的版本管理器与系统目录（mise、nvm、asdf、fnm、pnpm、Volta；Windows 上为 `%LOCALAPPDATA%\mise`、`%APPDATA%\nvm`、`%ProgramFiles%\nodejs`）——Finder 启动的应用不继承 shell 的 `PATH`，而资源管理器启动的进程只继承机器级变量。受版本管理器控制的 Node 先取它安装的版本目录里的真实二进制，再退回 shim：shim 依赖管理器自己的配置解析版本，离开 shell 可能拒绝运行；数据目录则读取管理器自己的变量（`MISE_DATA_DIR`、`NVM_DIR`、`ASDF_DATA_DIR`、`FNM_DIR`、`VOLTA_HOME`、`XDG_DATA_HOME`，Windows 上还有 `NVM_HOME`/`NVM_SYMLINK`）。它不借用其它应用的启动器：DeepSeek Harness 的 `runtime/bin/node` 会 exec 只有该应用才设置的环境变量，在 BSH 里运行会以状态 127 退出。
+解释器走宿主统一的跨平台程序解析（`hostkit::programs::executable`，见 §11.4）：先 `$BOS_BRIDGE_NODE` 与 BSH 可执行文件旁自带的 Node runtime，再 `$BOS_<PROGRAM>`、`VIRTUAL_ENV`、版本管理器自己的选择（mise/asdf/pyenv/volta 的 `which <program>`，带超时，且仅当存在对应 shim）、已安装版本（优先版本目录而非 shim，最新在前）与 shim、管理器自己的数据目录变量（`MISE_DATA_DIR`、`NVM_DIR`、`ASDF_DATA_DIR`、`FNM_DIR`、`PYENV_ROOT`、`UV_PYTHON_INSTALL_DIR`、`VOLTA_HOME`、`XDG_DATA_HOME`、`CONDA_PREFIX`，Windows 上还有 `NVM_HOME`/`NVM_SYMLINK`）、`PATH`、系统前缀。这样无 shell 启动时管理器配置仍然生效，macOS 的 `/usr/bin/python3` 桩也不会盖过读者安装的解释器。它不借用其它应用的启动器：DeepSeek Harness 的 `runtime/bin/node` 会 exec 只有该应用才设置的环境变量，在 BSH 里运行会以状态 127 退出。
 
 | 注册 | 贡献 |
 |---|---|

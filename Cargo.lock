@@ -1634,18 +1634,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cap-std"
-version = "4.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1ec78e242cfa2cfe276807ac2ecc00315a6c97786977414bcd1c3963b6c91b8"
-dependencies = [
- "cap-primitives",
- "io-extras",
- "io-lifetimes 3.0.1",
- "rustix",
-]
-
-[[package]]
 name = "cap-primitives"
 version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1661,6 +1649,18 @@ dependencies = [
  "rustix-linux-procfs",
  "windows-sys 0.61.2",
  "winx",
+]
+
+[[package]]
+name = "cap-std"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1ec78e242cfa2cfe276807ac2ecc00315a6c97786977414bcd1c3963b6c91b8"
+dependencies = [
+ "cap-primitives",
+ "io-extras",
+ "io-lifetimes 3.0.1",
+ "rustix",
 ]
 
 [[package]]
@@ -1984,6 +1984,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "codintelli"
+version = "4.1.12"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tree-sitter",
+ "tree-sitter-rust",
+ "uuid",
+]
+
+[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2012,19 +2025,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
-]
-
-[[package]]
-name = "codintelli"
-version = "4.1.12"
-dependencies = [
- "cap-fs-ext",
- "cap-std",
- "tempfile",
- "thiserror 2.0.21",
- "tree-sitter 0.26.13",
- "tree-sitter-rust",
- "uuid",
 ]
 
 [[package]]

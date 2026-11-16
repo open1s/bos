@@ -53,7 +53,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hostkit::programs::{executable_names, find_in, managed_interpreter, program_directories};
+use hostkit::programs::{executable, executable_names, find_in};
 use serde_json::{json, Value};
 
 /// The shim source, embedded so a load needs no file on the host side.
@@ -312,21 +312,19 @@ impl BridgeOptions {
     }
 }
 
-/// Find a Node interpreter, in a fixed, documented order.
+/// Find a Node interpreter.
 ///
 /// 1. `$BOS_BRIDGE_NODE`, when it names an existing file.
-/// 2. `node` / `nodejs` on `PATH`.
-/// 3. The Node runtime BSH itself ships, beside the running executable.
-/// 4. The interpreter an installed version manager selects (`mise which node`,
-///    `asdf which node`, `volta which node`), with a bounded wait.
-/// 5. The per-platform user and system directories a shellless launch does
-///    not inherit on `PATH` (`hostkit::programs::program_directories`).
+/// 2. The Node runtime BSH itself ships, beside the running executable.
+/// 3. [`hostkit::programs::executable`]: the one cross-platform program
+///    search (`$BOS_NODE`, manager selection, installed versions, shims,
+///    `PATH`, system prefixes).
 ///
-/// The search is a filesystem probe, never an execution: a host that finds
-/// nothing records [`BridgeRefusal::NoInterpreter`] and starts no process.
+/// The search is a filesystem probe: a host that finds nothing records
+/// [`BridgeRefusal::NoInterpreter`] and starts no process.
 ///
-/// Only BSH's own runtime is probed. Another product's bundled `node` file is
-/// not necessarily an interpreter - the DeepSeek Harness one execs
+/// Only BSH's own runtime is probed as a bundle. Another product's `node`
+/// launcher is not an interpreter - the DeepSeek Harness one execs
 /// `$DSH_DESKTOP_NODE_EXECUTABLE`, a variable only that application sets - so
 /// treating it as one made a Cordis package exit with status 127 whenever BSH
 /// ran outside the other application.
@@ -337,38 +335,12 @@ pub fn find_interpreter() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    if let Some(path) = which("node").or_else(|| which("nodejs")) {
-        return Some(path);
-    }
-    // A version manager's own selection stays in charge: it may come from a
-    // configuration or environment this process never inherited.
-    if let Some(path) = managed_interpreter("node") {
-        return Some(path);
-    }
     let mut names = executable_names("node");
     names.extend(executable_names("nodejs"));
-    find_in(&fallback_directories(), &names)
-}
-
-/// Resolve one executable name against `PATH`.
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let directories: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    find_in(&directories, &executable_names(name))
-}
-
-/// The directories searched after `PATH`, most specific first.
-///
-/// BSH's own runtime comes first, then the host-neutral per-platform list in
-/// [`hostkit::programs::program_directories`]: a Finder-launched macOS app
-/// inherits launchd's minimal `PATH`, and a Windows process started from
-/// Explorer inherits only the machine variables, so the version managers' own
-/// directories are probed explicitly. This is the same rule the marketplace
-/// installer applies to `pnpm`/`npm`.
-fn fallback_directories() -> Vec<PathBuf> {
-    let mut directories = runtime_bins();
-    directories.extend(program_directories());
-    directories
+    if let Some(path) = find_in(&runtime_bins(), &names) {
+        return Some(path);
+    }
+    executable("node").or_else(|| executable("nodejs"))
 }
 
 /// The `bin` directory of the Node runtime BSH ships, when it ships one.
@@ -1138,7 +1110,7 @@ fn shutdown_shared(session: Arc<Mutex<BridgeSession>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fallback_directories, strip_verbatim};
+    use super::strip_verbatim;
 
     /// The verbatim device prefix Node mangles is stripped back to an ordinary
     /// drive/UNC path, and an ordinary path is unchanged (issue #304).
@@ -1154,19 +1126,6 @@ mod tests {
         assert_eq!(
             strip_verbatim(r"C:\a dir with spaces\entry.js"),
             r"C:\a dir with spaces\entry.js"
-        );
-    }
-
-    /// The fallback list is BSH's own: it never names another application's
-    /// bundle, whose launcher needs an environment only that app provides (the
-    /// status-127 symptom this fixes).
-    #[test]
-    fn the_fallback_directories_belong_to_bsh() {
-        assert!(
-            fallback_directories()
-                .iter()
-                .all(|directory| !directory.to_string_lossy().contains("DeepSeek Harness")),
-            "another application's bundle is not a BSH runtime"
         );
     }
 }

@@ -51,7 +51,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hostkit::programs::{executable_names, find_in, managed_interpreter, program_directories};
+use hostkit::programs::executable;
 use serde_json::{json, Value};
 
 use react::tool::ToolError;
@@ -310,17 +310,15 @@ impl BridgeOptions {
     }
 }
 
-/// Find a Node interpreter, in a fixed, documented order.
+/// Find a Node interpreter.
 ///
 /// 1. `$BOS_BRIDGE_NODE`, when it names an existing file.
-/// 2. `node` / `nodejs` on `PATH`.
-/// 3. The interpreter an installed version manager selects (`mise which node`,
-///    `asdf which node`, `volta which node`), with a bounded wait.
-/// 4. The per-platform user and system directories a shellless launch does
-///    not inherit on `PATH` (`hostkit::programs::program_directories`).
+/// 2. [`hostkit::programs::executable`]: the one cross-platform program
+///    search (`$BOS_NODE`, manager selection, installed versions, shims,
+///    `PATH`, system prefixes).
 ///
-/// The search is a filesystem probe, never an execution: a host that finds
-/// nothing records [`BridgeRefusal::NoInterpreter`] and starts no process.
+/// The search is a filesystem probe: a host that finds nothing records
+/// [`BridgeRefusal::NoInterpreter`] and starts no process.
 ///
 /// No other application's bundle is probed. The DeepSeek Harness
 /// `runtime/bin/node` is a launcher that execs
@@ -334,35 +332,7 @@ pub fn find_interpreter() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    if let Some(path) = which("node").or_else(|| which("nodejs")) {
-        return Some(path);
-    }
-    // A version manager's own selection stays in charge: it may come from a
-    // configuration or environment this process never inherited.
-    if let Some(path) = managed_interpreter("node") {
-        return Some(path);
-    }
-    let mut names = executable_names("node");
-    names.extend(executable_names("nodejs"));
-    find_in(&fallback_directories(), &names)
-}
-
-/// Resolve one executable name against `PATH`.
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let directories: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    find_in(&directories, &executable_names(name))
-}
-
-/// The directories searched after `PATH`, most specific first.
-///
-/// The host-neutral per-platform list in
-/// [`hostkit::programs::program_directories`]: a Finder-launched macOS app
-/// inherits launchd's minimal `PATH`, and a Windows process started from
-/// Explorer inherits only the machine variables, so the version managers' own
-/// directories are probed explicitly.
-fn fallback_directories() -> Vec<PathBuf> {
-    program_directories()
+    executable("node").or_else(|| executable("nodejs"))
 }
 
 /// Whether an interpreter is available at all.
