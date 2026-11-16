@@ -11,7 +11,7 @@ use crate::classification::LanguageId;
 
 use super::{
     valid_relative_path, LanguageProvider, ParseDiagnostic, ParseInput, ParseResult, ParseStatus,
-    ParseControl, ParseLimits, ProviderError, SourceRange, SyntaxFact, SyntaxFactKind,
+    ParseControl, ParseLimitKind, ParseLimits, ProviderError, SourceRange, SyntaxFact, SyntaxFactKind,
 };
 
 /// Rust provider using the upstream Tree-sitter Rust grammar.
@@ -86,7 +86,7 @@ impl RustProvider {
         };
         let options = ParseOptions::new().progress_callback(&mut progress);
         let tree = parser.parse_with_options(
-            &mut |offset, _| &input.source[offset..],
+            &mut |offset, _| input.source.get(offset..).unwrap_or(&[]),
             None,
             Some(options),
         );
@@ -110,7 +110,7 @@ impl RustProvider {
         let mut diagnostics = Vec::new();
         let mut pending = vec![root];
         let mut visited_nodes = 0usize;
-        let mut limited = false;
+        let mut limit_reason = None;
 
         // Iterative traversal avoids adding another recursive walk over
         // potentially adversarially nested source syntax. The pending stack,
@@ -121,13 +121,13 @@ impl RustProvider {
             }
             visited_nodes = visited_nodes.saturating_add(1);
             if visited_nodes > limits.max_nodes {
-                limited = true;
+                limit_reason = Some(ParseLimitKind::SyntaxNodes);
                 break;
             }
 
             if node.is_error() || node.is_missing() {
                 if diagnostics.len() >= limits.max_diagnostics {
-                    limited = true;
+                    limit_reason = Some(ParseLimitKind::Diagnostics);
                     break;
                 }
                 diagnostics.push(ParseDiagnostic {
@@ -143,7 +143,7 @@ impl RustProvider {
             if let Some((kind, name)) = classify_node(node, source) {
                 if let Some(range) = source_range(node, source.len()) {
                     if facts.len() >= limits.max_facts {
-                        limited = true;
+                        limit_reason = Some(ParseLimitKind::Facts);
                         break;
                     }
                     facts.push(SyntaxFact { kind, name, range });
@@ -152,7 +152,7 @@ impl RustProvider {
 
             let child_count = node.child_count();
             if pending.len().saturating_add(child_count) > limits.max_nodes {
-                limited = true;
+                limit_reason = Some(ParseLimitKind::SyntaxNodes);
                 break;
             }
             for index in (0..child_count).rev() {
@@ -167,7 +167,7 @@ impl RustProvider {
         });
         diagnostics.sort_unstable_by_key(|diagnostic| diagnostic.range);
 
-        let status = if limited {
+        let status = if limit_reason.is_some() {
             ParseStatus::Limited
         } else if diagnostics.is_empty() {
             ParseStatus::Complete
@@ -183,6 +183,7 @@ impl RustProvider {
             provider_version: Self::VERSION.to_owned(),
             schema_version: 1,
             status,
+            limit_reason,
             facts,
             diagnostics,
         })
@@ -383,6 +384,7 @@ fn helper() {}
             .expect("parse within limits");
 
         assert_eq!(result.status, ParseStatus::Limited);
+        assert_eq!(result.limit_reason, Some(ParseLimitKind::Facts));
         assert_eq!(result.facts.len(), 1);
     }
 
@@ -406,6 +408,31 @@ fn helper() {}
             .expect("parse within node limit");
 
         assert_eq!(result.status, ParseStatus::Limited);
+        assert_eq!(result.limit_reason, Some(ParseLimitKind::SyntaxNodes));
+    }
+
+    #[test]
+    fn bounds_diagnostic_output() {
+        let budget = ScanBudget::new(ScanLimits::default());
+        let limits = ParseLimits {
+            max_nodes: 1000,
+            max_facts: 100,
+            max_diagnostics: 0,
+        };
+        let result = RustProvider
+            .parse_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"fn broken( {",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect("parse within diagnostic limit");
+
+        assert_eq!(result.status, ParseStatus::Limited);
+        assert_eq!(result.limit_reason, Some(ParseLimitKind::Diagnostics));
+        assert!(result.diagnostics.is_empty());
     }
 
     #[test]
