@@ -52,7 +52,11 @@ impl WorkspaceFs {
             }
         })?;
 
-        Ok(Self {\n            root,\n            root_path,\n            workspace_id: workspace.id(),\n        })
+        Ok(Self {
+            root,
+            root_path,
+            workspace_id: workspace.id(),
+        })
     }
 
     /// Read a regular file beneath the workspace root, enforcing a byte limit.
