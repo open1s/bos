@@ -208,18 +208,23 @@ pub fn build_rust_module_graph(
         }
     }
 
-    let candidate_report =
-        resolve_rust_module_candidates(parse_results, inventory_paths, &roots)?;
+    // Candidate path rules depend on which root is active: a source file
+    // can be a crate root in one namespace and an external module in another.
     let mut candidate_by_declaration = HashMap::new();
-    for candidate in &candidate_report.modules {
-        candidate_by_declaration.insert(
-            (
-                candidate.source_path.clone(),
-                candidate.range.start_byte,
-                candidate.range.end_byte,
-            ),
-            candidate,
-        );
+    for root in &roots {
+        let candidate_report =
+            resolve_rust_module_candidates(parse_results, inventory_paths, std::slice::from_ref(root))?;
+        for candidate in candidate_report.modules {
+            candidate_by_declaration.insert(
+                (
+                    root.clone(),
+                    candidate.source_path.clone(),
+                    candidate.range.start_byte,
+                    candidate.range.end_byte,
+                ),
+                candidate,
+            );
+        }
     }
 
     let mut graph = RustModuleGraph {
@@ -361,6 +366,7 @@ pub fn build_rust_module_graph(
                 }
 
                 let candidate = candidate_by_declaration.get(&(
+                    root.clone(),
                     source_path.clone(),
                     fact.range.start_byte,
                     fact.range.end_byte,
