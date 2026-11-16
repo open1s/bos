@@ -23,6 +23,7 @@ pub mod ignore;
 pub mod index;
 pub mod scan_budget;
 pub mod scanner;
+pub mod resolution;
 pub mod syntax;
 pub mod workspace;
 
@@ -33,6 +34,10 @@ pub use fs::{
 pub use index::{
     index_rust_workspace, index_workspace, index_workspace_with_limits, SourceFileResult, SourceFileStatus,
     SourceIndexDiagnostic, SourceIndexDiagnosticKind, SourceIndexReport, SourceIndexStatus,
+};
+pub use resolution::{
+    build_symbol_candidates, CandidateState, ReferenceCandidates, ReferenceKind,
+    SymbolCandidateError, SymbolCandidateReport, SymbolId, SymbolKind, SymbolRecord,
 };
 pub use scan_budget::{ScanBudget, ScanBudgetError, ScanLimits, ScanUsage};
 pub use scanner::{
