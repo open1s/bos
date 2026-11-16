@@ -199,7 +199,13 @@ impl RustProvider {
                         limit_reason = Some(ParseLimitKind::Facts);
                         break;
                     }
-                    facts.push(SyntaxFact { kind, name, range });
+                    facts.push(SyntaxFact {
+                        kind,
+                        name,
+                        scope_path: enclosing_module_path(node, source),
+                        is_module_scope: is_module_scope(node),
+                        range,
+                    });
                 }
             }
 
@@ -290,6 +296,17 @@ fn enclosing_module_path(node: Node<'_>, source: &str) -> Vec<String> {
     }
     modules.reverse();
     modules
+}
+
+fn is_module_scope(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if matches!(current.kind(), "function_item" | "function_signature_item" | "closure_expression" | "block") {
+            return false;
+        }
+        ancestor = current.parent();
+    }
+    true
 }
 
 fn flatten_use_tree(
