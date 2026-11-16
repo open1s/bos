@@ -32,7 +32,7 @@ pub use fs::{
 };
 pub use index::{
     index_rust_workspace, index_workspace, SourceFileResult, SourceFileStatus,
-    SourceIndexDiagnostic, SourceIndexDiagnosticKind, SourceIndexReport,
+    SourceIndexDiagnostic, SourceIndexDiagnosticKind, SourceIndexReport, SourceIndexStatus,
 };
 pub use scan_budget::{ScanBudget, ScanBudgetError, ScanLimits, ScanUsage};
 pub use scanner::{
