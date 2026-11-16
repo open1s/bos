@@ -327,7 +327,7 @@ pub fn index_rust_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RustProvider, ScanLimits, WorkspaceDescriptor, WorkspaceId};
+    use crate::{ScanLimits, WorkspaceDescriptor, WorkspaceId};
     use std::{fs, time::Duration};
     use tempfile::tempdir;
 
