@@ -115,6 +115,15 @@ pub fn resolve_rust_import_module_candidates(
     let mut imports = Vec::new();
     for result in parse_results.iter().filter(|result| result.language == LanguageId::Rust) {
         for fact in &result.imports {
+            if fact.import_path_is_invalid() {
+                imports.push(make_unresolved(
+                    None,
+                    result,
+                    fact,
+                    RustImportResolutionStatus::InvalidImportPath,
+                ));
+                continue;
+            }
             let contexts: Vec<_> = graph.nodes.iter().filter(|base| {
                 base.source_path == result.relative_path
                     && base.kind != RustModuleNodeKind::Inline
@@ -445,6 +454,20 @@ mod tests {
         let graph = make_graph(id, vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)]);
         let report = resolve_rust_import_module_candidates(&[parsed], &graph).expect("imports");
         assert_eq!(report.imports[0].status, RustImportResolutionStatus::UnsupportedUnqualifiedPath);
+    }
+
+    #[test]
+    fn rejects_invalid_import_path_segments() {
+        let id = WorkspaceId::new();
+        let parsed = parse_result(
+            "src/lib.rs",
+            vec![import(&["crate", "..", "outside"], &[])],
+            Vec::new(),
+            id,
+        );
+        let graph = make_graph(id, vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)]);
+        let report = resolve_rust_import_module_candidates(&[parsed], &graph).expect("imports");
+        assert_eq!(report.imports[0].status, RustImportResolutionStatus::InvalidImportPath);
     }
 
     #[test]
