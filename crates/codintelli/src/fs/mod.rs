@@ -18,7 +18,7 @@ use cap_fs_ext::{
 };
 use cap_std::fs::{Dir, File, OpenOptions};
 
-use crate::WorkspaceDescriptor;
+use crate::{WorkspaceDescriptor, WorkspaceId};
 
 mod read_dir;
 
@@ -30,6 +30,7 @@ const MAX_PATH_DEPTH: usize = 256;
 pub struct WorkspaceFs {
     root: Dir,
     root_path: PathBuf,
+    workspace_id: WorkspaceId,
 }
 
 impl WorkspaceFs {
@@ -51,7 +52,7 @@ impl WorkspaceFs {
             }
         })?;
 
-        Ok(Self { root, root_path })
+        Ok(Self {\n            root,\n            root_path,\n            workspace_id: workspace.id(),\n        })
     }
 
     /// Read a regular file beneath the workspace root, enforcing a byte limit.
@@ -162,6 +163,12 @@ impl WorkspaceFs {
         }
 
         Ok(contents)
+    }
+
+    /// Return the host-supplied identity associated with this filesystem capability.
+    #[must_use]
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
     }
 
     /// Return the canonical root path used to open this capability.
