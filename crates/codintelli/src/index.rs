@@ -287,16 +287,20 @@ pub fn index_workspace(
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     diagnostics.sort_unstable_by(|left, right| left.path.cmp(&right.path));
 
-    let status = match scan.status {
-        ScanStatus::Cancelled => SourceIndexStatus::Cancelled,
-        ScanStatus::Failed => SourceIndexStatus::Failed,
-        ScanStatus::Partial => SourceIndexStatus::Partial,
-        ScanStatus::Complete
+    let was_cancelled = scan.status == ScanStatus::Cancelled
+        || diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SourceIndexDiagnosticKind::Budget(ScanBudgetError::Cancelled)
+        });
+    let status = match (was_cancelled, scan.status) {
+        (true, _) => SourceIndexStatus::Cancelled,
+        (false, ScanStatus::Failed) => SourceIndexStatus::Failed,
+        (false, ScanStatus::Partial) => SourceIndexStatus::Partial,
+        (false, ScanStatus::Complete)
             if failed_files > 0 || unsupported_files > 0 || recovered_files > 0 =>
         {
             SourceIndexStatus::Partial
         }
-        ScanStatus::Complete => SourceIndexStatus::Complete,
+        (false, ScanStatus::Complete) => SourceIndexStatus::Complete,
     };
 
     SourceIndexReport {
