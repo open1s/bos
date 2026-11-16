@@ -297,12 +297,7 @@ mod tests {
         graph_status: RustModuleGraphStatus,
         incomplete: Vec<PathBuf>,
     ) -> RustSymbolImportResolutionReport {
-        let workspace_id = WorkspaceId::new();
-        // Keep fixture identities aligned with the report identity.
-        let mut symbols = symbols;
-        for symbol in &mut symbols {
-            symbol.id.workspace_id = workspace_id;
-        }
+        let workspace_id = symbols.first().map(|symbol| symbol.id.workspace_id).unwrap_or_else(WorkspaceId::new);
         resolve_rust_import_symbols(
             &RustImportResolutionReport {
                 workspace_id,
@@ -335,10 +330,10 @@ mod tests {
     #[test]
     fn retains_ambiguity_for_duplicate_names_in_one_module() {
         let id = WorkspaceId::new();
-        let mut first = symbol("src/lib.rs", &["model"], "src/model.rs", "Widget", 10);
-        let mut second = symbol("src/lib.rs", &["model"], "src/model.rs", "Widget", 40);
+        let first = symbol(id, "src/lib.rs", &["model"], "src/model.rs", "Widget", 10);
+        let second = symbol(id, "src/lib.rs", &["model"], "src/model.rs", "Widget", 40);
         let report = resolve(
-            vec![module_import(id, &["Widget"], false, None)],
+            vec![module_import(&["Widget"], false, None)],
             vec![first, second],
             RustModuleGraphStatus::Complete,
             Vec::new(),
@@ -350,8 +345,8 @@ mod tests {
     #[test]
     fn glob_import_returns_only_direct_module_candidates() {
         let id = WorkspaceId::new();
-        let mut direct = symbol("src/lib.rs", &["model"], "src/model.rs", "Widget", 10);
-        let mut nested = symbol("src/lib.rs", &["model", "inner"], "src/model.rs", "Hidden", 40);
+        let direct = symbol(id, "src/lib.rs", &["model"], "src/model.rs", "Widget", 10);
+        let nested = symbol(id, "src/lib.rs", &["model", "inner"], "src/model.rs", "Hidden", 40);
         let report = resolve(
             vec![module_import(id, &[], true, None)],
             vec![direct, nested],
