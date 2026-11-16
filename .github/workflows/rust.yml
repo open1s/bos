@@ -1,10 +1,12 @@
 name: rust workspace
 
 on:
+  # Release-tag CI only. A main push or pull request no longer queues the full
+  # workspace suite; the release pipeline re-runs the same tests on the tagged
+  # tree, and workflow_dispatch remains for an explicit run.
   push:
-    branches:
-      - main
-  pull_request:
+    tags:
+      - "v[0-9]*"
   workflow_dispatch:
     inputs:
       release_budgets:

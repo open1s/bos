@@ -73,9 +73,10 @@ jj git push                    # the release commit onto main
 jj git push --tag v1.1.1       # starts all three pipelines
 ```
 
-Only a tag of the form `vX.Y.Z` releases. A push to `main` runs the tests but
-never publishes. `scripts/ci/release-precondition.sh` runs first in all three
-pipelines: it requires the tag to be `vMAJOR.MINOR.PATCH` and to match the
+Only a tag of the form `vX.Y.Z` releases. Main pushes and pull requests run
+no CI: the tag is also the CI trigger, so the workspace suite runs once, on the
+tree that is about to publish. `scripts/ci/release-precondition.sh` runs first
+in all three pipelines: it requires the tag to be `vMAJOR.MINOR.PATCH` and to match the
 Cargo, jsbos, nbos and Python versions. When either check fails it warns and
 sets `should_release=false`, so the build and publish jobs are **skipped** -
 the run goes green with no artifacts rather than publishing a partial or
@@ -92,10 +93,12 @@ best-effort, then a single `release` job downloads every artifact, checks every
 expected artifact is present, writes `SHA256SUMS`, and creates the GitHub
 release with notes generated from the changelog.
 
-Tag a commit whose `rust` workflow is green. The pipeline's `verify` job
+Pushing the tag starts the workspace, binding-parity, platform-conformance and
+Windows-extension checks as well as this pipeline. The pipeline's `verify` job
 re-runs the workspace test suite on the tagged tree before anything is
 published, and each platform job builds and smoke-tests its own binary, so a
-tag cannot publish a tree that does not compile or test.
+tag cannot publish a tree that does not compile or test. A failing check is
+fixed by tagging the corrected commit; the release tag is not moved.
 
 ## Dry run
 

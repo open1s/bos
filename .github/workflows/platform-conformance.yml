@@ -1,28 +1,17 @@
 name: platform conformance
 
 # The shared OS-service conformance suite (hostkit) runs on every supported
-# operating system, so a platform-specific regression in process ownership,
-# path safety, environment baselines, private files or root resolution cannot
-# land silently (issue #313). The process-lifecycle contract is the same on all
-# three hosts because every runtime spawns through hostkit.
+# operating system at release time, so a platform-specific regression in
+# process ownership, path safety, environment baselines, private files or root
+# resolution cannot ship silently (issue #313). The process-lifecycle contract
+# is the same on all three hosts because every runtime spawns through hostkit.
 
 on:
+  # Release-tag CI only; workflow_dispatch remains for an explicit run. Path
+  # filters are omitted because tag pushes do not evaluate them.
   push:
-    branches:
-      - main
-    paths:
-      - "crates/hostkit/**"
-      - "crates/agent/src/jobs.rs"
-      - "crates/agent/src/shell_backend.rs"
-      - "crates/agent/src/security/**"
-      - ".github/workflows/platform-conformance.yml"
-  pull_request:
-    paths:
-      - "crates/hostkit/**"
-      - "crates/agent/src/jobs.rs"
-      - "crates/agent/src/shell_backend.rs"
-      - "crates/agent/src/security/**"
-      - ".github/workflows/platform-conformance.yml"
+    tags:
+      - "v[0-9]*"
   workflow_dispatch:
 
 permissions:

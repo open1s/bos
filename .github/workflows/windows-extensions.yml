@@ -1,22 +1,11 @@
 name: windows extensions
 
 on:
+  # Release-tag CI only; workflow_dispatch remains for an explicit run. Path
+  # filters are omitted because tag pushes do not evaluate them.
   push:
-    branches:
-      - main
-    paths:
-      - "crates/ferris-core/**"
-      - "crates/ferris-runtime/**"
-      - "crates/bsh/src/terminal*.rs"
-      - "crates/bsh/src/ui/terminal_view.rs"
-      - ".github/workflows/windows-extensions.yml"
-  pull_request:
-    paths:
-      - "crates/ferris-core/**"
-      - "crates/ferris-runtime/**"
-      - "crates/bsh/src/terminal*.rs"
-      - "crates/bsh/src/ui/terminal_view.rs"
-      - ".github/workflows/windows-extensions.yml"
+    tags:
+      - "v[0-9]*"
   workflow_dispatch:
 
 permissions:

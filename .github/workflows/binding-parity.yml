@@ -1,10 +1,10 @@
 name: binding parity
 
 on:
-  pull_request:
+  # Release-tag CI only; workflow_dispatch remains for an explicit run.
   push:
-    branches:
-      - main
+    tags:
+      - "v[0-9]*"
   workflow_dispatch:
 
 permissions:
@@ -37,8 +37,8 @@ jobs:
 
       # All three guards read the binding sources and the API reference
       # statically, so they need no Rust toolchain and no native addon. Running
-      # them on every pull request keeps the Python and JavaScript surfaces from
-      # drifting before merge; the heavier jsbos pipeline only runs on pushes to
-      # main.
+      # them on the release tag keeps the Python and JavaScript surfaces from
+      # drifting before a package is published; workflow_dispatch covers an
+      # explicit check.
       - name: Run the static binding guards
         run: npx ava test/parity.test.js test/native-bindings.test.js test/api-docs.test.js

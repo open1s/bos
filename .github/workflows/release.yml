@@ -126,8 +126,9 @@ jobs:
             libfontconfig1-dev libfreetype6-dev libssl-dev libasound2-dev libxdo-dev \
             libc++-dev libc++abi-dev libxml2-dev xvfb bubblewrap
 
-      # The same gate the main branch runs. A release is a tagged commit, so
-      # the tagged tree must pass the suite before any artifact is published;
+      # The same gate the rust workflow runs on this tag. A release is a
+      # tagged commit, so the tagged tree must pass the suite before any
+      # artifact is published;
       # the browser engine tests are skipped for the same load-flakiness
       # reason rust.yml skips them. One retry covers the Ghostty native fetch
       # resetting; a real test failure still fails on the second attempt.

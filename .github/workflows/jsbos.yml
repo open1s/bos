@@ -6,7 +6,8 @@ env:
   CARGO_INCREMENTAL: '1'
 
 on:
-  # Tags only: main pushes are tested by the rust workflow, not published.
+  # Tags only: the release tag runs every pipeline and publishes; nothing
+  # else triggers this workflow.
   push:
     tags:
       - "v[0-9]*"
@@ -199,8 +200,8 @@ jobs:
   publish:
     name: Publish
     runs-on: ubuntu-latest
-    # The workflow-level group is per-ref, so a version commit on main and
-    # its v* tag run concurrently. Publishes must not: the second run would
+    # The workflow-level group is per-ref, so a manual dispatch and its v* tag
+    # can run concurrently. Publishes must not: the second run would
     # race this job past the already-published guard and fail on an
     # EPUBLISHCONFLICT. Serialize publish jobs across every ref, and never
     # cancel one in progress — a cancelled publish leaves a half-published

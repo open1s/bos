@@ -1,12 +1,11 @@
 name: nbos pipeline
 
 on:
-  # Tags only: main pushes are tested by the rust workflow, not published.
+  # Tags only: a tag publishes, and workflow_dispatch is the dry-run path.
   push:
     tags:
       - "v[0-9]*"
   workflow_dispatch:
-  pull_request:
 
 permissions:
   contents: read
@@ -25,9 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # A release happens only when a vX.Y.Z tag matches every manifest. Any
-      # other run skips publishing (pull requests and dispatches still build),
-      # so a mismatched tag can never publish a partial set.
+      # A release happens only when a vX.Y.Z tag matches every manifest. A
+      # manual dispatch still builds without publishing, so a mismatched
+      # version can never publish a partial set.
       - id: check
         name: Check the release precondition
         shell: bash
@@ -40,8 +39,8 @@ jobs:
   build:
     name: Build bindings for ${{ matrix.target }}
     needs: release
-    # Pull requests and dispatches still build (a dry run); a tag releases
-    # only when the precondition passes.
+    # A dispatch still builds (a dry run); a tag releases only when the
+    # precondition passes.
     if: needs.release.outputs.should_release == 'true' || github.event_name != 'push'
     strategy:
       fail-fast: false
