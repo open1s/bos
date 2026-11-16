@@ -181,7 +181,7 @@ fn classification(
 fn classify_well_known_name(name: &str) -> Option<FileClassification> {
     use ClassificationReason::WellKnownFileName;
     use FileCategory::{Configuration, Documentation};
-    use LanguageId::{Dockerfile, GitMetadata, Makefile, Markdown, Ruby, Toml, Yaml};
+    use LanguageId::{Dockerfile, GitMetadata, Justfile, Makefile, Ruby, Toml, Yaml};
 
     let value = match name {
         "dockerfile" => classification(Configuration, Some(Dockerfile), WellKnownFileName),
@@ -404,4 +404,16 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn classifies_justfiles_and_jsonc_as_configuration() {
+        assert_eq!(
+            classify("Justfile").language,
+            Some(LanguageId::Justfile)
+        );
+        assert_eq!(
+            classify("tsconfig.jsonc").category,
+            FileCategory::Configuration
+        );
+    }
+
 }
