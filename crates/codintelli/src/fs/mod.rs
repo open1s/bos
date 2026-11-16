@@ -23,6 +23,7 @@ use crate::WorkspaceDescriptor;
 mod read_dir;
 
 pub use read_dir::{DirectoryListing, WorkspaceEntry, WorkspaceEntryKind};
+pub use read_dir::{WorkspaceEntry, WorkspaceEntryKind};
 
 const MAX_PATH_DEPTH: usize = 256;
 

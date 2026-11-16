@@ -120,6 +120,12 @@ impl WorkspaceFs {
             if inspected_entries == max_entries {
                 truncated = true;
                 break;
+        for entry in entries {
+            if inspected_entries == max_entries {
+                return Err(WorkspaceFsError::EntryLimitExceeded {
+                    path: relative_path.to_path_buf(),
+                    max_entries,
+                });
             }
             inspected_entries += 1;
 
@@ -142,6 +148,10 @@ impl WorkspaceFs {
                 (WorkspaceEntryKind::File, Some(metadata.len()))
             } else if metadata.is_dir() {
                 (WorkspaceEntryKind::Directory, None)
+            let kind = if metadata.is_file() {
+                WorkspaceEntryKind::File
+            } else if metadata.is_dir() {
+                WorkspaceEntryKind::Directory
             } else {
                 // Symlinks, sockets, pipes, devices, and other special entries
                 // are not eligible for indexing.
@@ -161,6 +171,7 @@ impl WorkspaceFs {
             inspected_entries,
             truncated,
         })
+        Ok(result)
     }
 }
 
