@@ -274,7 +274,7 @@ pub fn build_rust_module_graph(
                     break;
                 }
 
-                if fact.has_attributes {
+                if fact.has_resolution_attributes {
                     if graph.status == RustModuleGraphStatus::Complete {
                         graph.status = RustModuleGraphStatus::Partial;
                     }
@@ -539,7 +539,7 @@ mod tests {
     fn does_not_assume_attributed_inline_modules_are_active() {
         let id = WorkspaceId::new();
         let mut optional = module("optional", &[], true);
-        optional.has_attributes = true;
+        optional.has_resolution_attributes = true;
         let graph = build_rust_module_graph(
             &[parsed("src/lib.rs", vec![optional], id)],
             &[PathBuf::from("src/lib.rs")],
