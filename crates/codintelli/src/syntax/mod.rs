@@ -120,6 +120,23 @@ pub struct ImportFact {
     pub range: SourceRange,
 }
 
+/// One Rust module declaration extracted from the syntax tree.
+///
+/// `is_inline` distinguishes a module body in this file from an external
+/// `mod name;` declaration. This is syntactic evidence only; it does not
+/// establish that a corresponding module file exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustModuleFact {
+    /// Lexical module scope containing the declaration, outermost first.
+    pub scope_path: Vec<String>,
+    /// Declared module name, with raw-identifier prefix removed.
+    pub name: String,
+    /// Whether the declaration has an inline module body.
+    pub is_inline: bool,
+    /// Exact source byte range of the module declaration.
+    pub range: SourceRange,
+}
+
 /// Result of parsing one source file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseResult {
@@ -143,6 +160,8 @@ pub struct ParseResult {
     pub facts: Vec<SyntaxFact>,
     /// Structured import paths when the provider can extract them.
     pub imports: Vec<ImportFact>,
+    /// Rust module declarations when the provider can extract them.
+    pub modules: Vec<RustModuleFact>,
     /// Parse diagnostics.
     pub diagnostics: Vec<ParseDiagnostic>,
 }
