@@ -1,5 +1,25 @@
 # Changelog
 
+## v4.1.14 (2026-11-16)
+
+- **MCP stdio servers start from the program you installed.** A server
+  configured as `npx -y …` was spawned as a literal name against a
+  Finder-launch `PATH` and failed with `No such file or directory (os error
+  2)`. The stdio transport now resolves the configured command through the
+  same cross-platform program search as every other runtime, and gives the
+  child the extended `PATH` so `npx`'s `#!/usr/bin/env node` resolves too.
+- **MCP two-way exchange is correct on both transports.** The client no longer
+  advertises `roots`/`sampling` capabilities it never implements; a
+  server-initiated request is answered (`ping` with `{}`, anything else with
+  JSON-RPC `-32601`) instead of being dropped; a server that closes its stdout
+  is reported immediately instead of being polled. Over HTTP the status is
+  checked before the content type, the SSE response is selected by request id
+  (notifications and multi-line events included), and `MCP-Protocol-Version`
+  is sent.
+- **The workspace resolves again.** codintelli's Tree-sitter pin follows BSH's
+  (`0.26.13`), removing the `links = "tree-sitter"` conflict that blocked a
+  whole-workspace build.
+
 ## v4.1.13 (2026-11-16)
 
 - **Extension runtimes resolve the interpreter you actually installed.** Every
