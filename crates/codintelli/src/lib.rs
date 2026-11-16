@@ -20,5 +20,5 @@
 pub mod fs;
 pub mod workspace;
 
-pub use fs::{WorkspaceFs, WorkspaceFsError};
+pub use fs::{WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs, WorkspaceFsError};
 pub use workspace::{WorkspaceDescriptor, WorkspaceError, WorkspaceId, WorkspaceRegistry};
