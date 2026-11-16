@@ -40,7 +40,7 @@ pub use scanner::{
     WorkspaceScanReport,
 };
 pub use syntax::{
-    LanguageProvider, ParseControl, ParseDiagnostic, ParseInput, ParseLimits, ParseResult, ParseStatus, ProviderError,
+    LanguageProvider, ParseControl, ParseDiagnostic, ParseInput, ParseLimitKind, ParseLimits, ParseResult, ParseStatus, ProviderError,
     SourceRange, SyntaxFact, SyntaxFactKind,
 };
 pub use syntax::rust::RustProvider;
