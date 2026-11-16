@@ -17,6 +17,8 @@
 //! root. Callers that need identity to survive restarts must persist the ID in
 //! host-managed metadata and supply it again when opening the workspace.
 
+pub mod fs;
 pub mod workspace;
 
+pub use fs::{WorkspaceFs, WorkspaceFsError};
 pub use workspace::{WorkspaceDescriptor, WorkspaceError, WorkspaceId, WorkspaceRegistry};

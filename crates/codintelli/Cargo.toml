@@ -8,6 +8,8 @@ license.workspace = true
 description = "Host-independent code intelligence engine"
 
 [dependencies]
+cap-fs-ext = "=4.0.3"
+cap-std = "=4.0.3"
 thiserror.workspace = true
 uuid.workspace = true
 
