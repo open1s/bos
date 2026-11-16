@@ -116,23 +116,28 @@ impl WorkspaceFs {
         let mut result = Vec::new();
         let mut inspected_entries = 0usize;
         let mut truncated = false;
-        for entry in entries {
-            if inspected_entries == max_entries {
-                truncated = true;
-                break;
-        for entry in entries {
-            if inspected_entries == max_entries {
-                return Err(WorkspaceFsError::EntryLimitExceeded {
-                    path: relative_path.to_path_buf(),
-                    max_entries,
-                });
-            }
-            inspected_entries += 1;
 
-            let entry = entry.map_err(|source| WorkspaceFsError::Io {
+        for entry_result in entries {
+            if inspected_entries == max_entries {
+                // Consume one item only to distinguish an exactly-full
+                // directory from a truncated one. Surface iterator errors.
+                match entry_result {
+                    Ok(_) => truncated = true,
+                    Err(source) => {
+                        return Err(WorkspaceFsError::Io {
+                            path: relative_path.to_path_buf(),
+                            source,
+                        });
+                    }
+                }
+                break;
+            }
+
+            let entry = entry_result.map_err(|source| WorkspaceFsError::Io {
                 path: relative_path.to_path_buf(),
                 source,
             })?;
+            inspected_entries += 1;
             let name = entry.file_name();
 
             // Query metadata relative to the already-open directory capability.
@@ -148,10 +153,6 @@ impl WorkspaceFs {
                 (WorkspaceEntryKind::File, Some(metadata.len()))
             } else if metadata.is_dir() {
                 (WorkspaceEntryKind::Directory, None)
-            let kind = if metadata.is_file() {
-                WorkspaceEntryKind::File
-            } else if metadata.is_dir() {
-                WorkspaceEntryKind::Directory
             } else {
                 // Symlinks, sockets, pipes, devices, and other special entries
                 // are not eligible for indexing.
@@ -171,7 +172,6 @@ impl WorkspaceFs {
             inspected_entries,
             truncated,
         })
-        Ok(result)
     }
 }
 
@@ -224,6 +224,7 @@ mod tests {
         );
         assert_eq!(entries[0].kind, WorkspaceEntryKind::File);
         assert_eq!(entries[1].kind, WorkspaceEntryKind::Directory);
+        assert_eq!(entries[0].size_bytes, Some(1));
     }
 
     #[test]
@@ -238,6 +239,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].relative_path, Path::new("src/lib.rs"));
         assert_eq!(entries[0].kind, WorkspaceEntryKind::File);
+        assert_eq!(entries[0].size_bytes, Some(3));
     }
 
     #[test]
@@ -275,6 +277,19 @@ mod tests {
         let listing = workspace.read_dir_report("", 1).expect("bounded list");
 
         assert!(listing.truncated);
+        assert_eq!(listing.inspected_entries, 1);
+        assert_eq!(listing.entries.len(), 1);
+    }
+
+    #[test]
+    fn exactly_full_directory_is_not_truncated() {
+        let root = tempdir().expect("create workspace");
+        fs::write(root.path().join("only"), "x").expect("write only");
+
+        let workspace = workspace_fs(root.path());
+        let listing = workspace.read_dir_report("", 1).expect("list exactly one");
+
+        assert!(!listing.truncated);
         assert_eq!(listing.inspected_entries, 1);
         assert_eq!(listing.entries.len(), 1);
     }
@@ -353,6 +368,10 @@ mod tests {
         assert!(workspace.read_dir("", 0).expect("empty root").is_empty());
 
         fs::write(root.path().join("one"), "1").expect("write one");
+        let listing = workspace.read_dir_report("", 0).expect("bounded empty result");
+        assert!(listing.truncated);
+        assert_eq!(listing.inspected_entries, 0);
+        assert!(listing.entries.is_empty());
         assert!(matches!(
             workspace.read_dir("", 0),
             Err(WorkspaceFsError::EntryLimitExceeded { max_entries: 0, .. })
