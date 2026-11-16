@@ -133,6 +133,11 @@ pub struct RustModuleFact {
     pub name: String,
     /// Whether the declaration has an inline module body.
     pub is_inline: bool,
+    /// Whether the declaration carries outer attributes such as `cfg` or `path`.
+    ///
+    /// The resolver treats attributed declarations as uncertain until those
+    /// attributes are interpreted with the correct crate configuration.
+    pub has_attributes: bool,
     /// Exact source byte range of the module declaration.
     pub range: SourceRange,
 }
