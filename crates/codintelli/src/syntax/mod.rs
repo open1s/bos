@@ -1,6 +1,6 @@
 //! Host-neutral syntax facts and language-provider contracts.
 
-use std::{ops::ControlFlow, path::{Path, PathBuf}};
+use std::path::{Path, PathBuf};
 
 use crate::{classification::LanguageId, ScanBudget, ScanBudgetError, WorkspaceId};
 
@@ -92,6 +92,17 @@ pub struct ParseDiagnostic {
     pub message: String,
 }
 
+/// Which per-file extraction limit stopped syntax-fact projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParseLimitKind {
+    /// Maximum visited syntax nodes was reached.
+    SyntaxNodes,
+    /// Maximum retained syntax facts was reached.
+    Facts,
+    /// Maximum retained diagnostics was reached.
+    Diagnostics,
+}
+
 /// Result of parsing one source file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseResult {
@@ -109,6 +120,8 @@ pub struct ParseResult {
     pub schema_version: u32,
     /// Parse completion state.
     pub status: ParseStatus,
+    /// Limit that stopped extraction, when status is Limited.
+    pub limit_reason: Option<ParseLimitKind>,
     /// Deterministically ordered facts.
     pub facts: Vec<SyntaxFact>,
     /// Parse diagnostics.
