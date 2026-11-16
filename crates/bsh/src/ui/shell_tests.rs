@@ -292,6 +292,27 @@ fn visible_switch(cx: &mut VisualTestContext, selectors: &[&'static str]) -> &'s
         .expect("a switch inside the pane")
 }
 
+/// Wheel the settings pane until one named row paints inside the options box.
+///
+/// The Agent loop pane is taller than the box at the test window, so a switch
+/// near its foot is laid out below the fold; a click at its painted center is
+/// then a silent no-op. Scroll the way a reader would, in whichever direction
+/// the row is, and name the selector if the pane never brings it into view.
+fn scroll_settings_row_into_view(cx: &mut VisualTestContext, selector: &'static str) {
+    for _ in 0..12 {
+        let pane = cx.debug_bounds("settings-pane").expect("the options box");
+        let bounds = cx.debug_bounds(selector).expect("the named row");
+        let center = bounds.center();
+        let top = pane.origin.y + px(8.0);
+        let bottom = pane.origin.y + pane.size.height - px(8.0);
+        if center.y >= top && center.y <= bottom {
+            return;
+        }
+        wheel_settings_pane(cx, if center.y > bottom { -160.0 } else { 160.0 });
+    }
+    panic!("{selector} never reached the visible part of the settings pane");
+}
+
 /// A store with one session carrying that many user turns, so the transcript is
 /// tall enough to scroll.
 fn state_with_turns(label: &str, turns: usize) -> AppState {
@@ -8098,6 +8119,7 @@ fn parallel_tool_calls_switch_flips_the_setting(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
 
+    scroll_settings_row_into_view(cx, "parallel-tool-calls");
     let row = cx
         .debug_bounds("parallel-tool-calls")
         .expect("the switch row");
@@ -8114,6 +8136,7 @@ fn parallel_tool_calls_switch_flips_the_setting(cx: &mut TestAppContext) {
     });
     assert!(on, "the switch must turn concurrent dispatch on");
 
+    scroll_settings_row_into_view(cx, "parallel-tool-calls");
     let row = cx
         .debug_bounds("parallel-tool-calls")
         .expect("the switch row again");
@@ -8151,6 +8174,7 @@ fn the_memory_capture_switch_writes_and_needs_memory(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
 
+    scroll_settings_row_into_view(cx, "settings-memory-capture");
     let capture = cx
         .debug_bounds("settings-memory-capture")
         .expect("the capture switch draws");
@@ -8161,11 +8185,13 @@ fn the_memory_capture_switch_writes_and_needs_memory(cx: &mut TestAppContext) {
     );
 
     // Memory off: capture has nowhere to write, so the press is refused out loud.
+    scroll_settings_row_into_view(cx, "settings-memory");
     let memory = cx
         .debug_bounds("settings-memory")
         .expect("the memory switch draws");
     cx.simulate_click(memory.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    scroll_settings_row_into_view(cx, "settings-memory-capture");
     let capture = cx
         .debug_bounds("settings-memory-capture")
         .expect("the capture switch stays drawn");
