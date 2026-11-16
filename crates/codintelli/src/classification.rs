@@ -49,6 +49,8 @@ pub enum LanguageId {
     C,
     /// C++.
     Cpp,
+    /// C or C++ header; the extension alone is ambiguous.
+    CHeader,
     /// C#.
     CSharp,
     /// Swift.
@@ -194,9 +196,10 @@ fn classify_well_known_name(name: &str) -> Option<FileClassification> {
             classification(Configuration, Some(LanguageId::Json), WellKnownFileName)
         }
         "package-lock.json" => classification(Configuration, Some(LanguageId::Json), WellKnownFileName),
-        "pnpm-lock.yaml" | "yarn.lock" => {
+        "pnpm-lock.yaml" => {
             classification(Configuration, Some(Yaml), WellKnownFileName)
         }
+        "yarn.lock" => classification(Configuration, None, WellKnownFileName),
         "go.mod" | "go.sum" => {
             classification(Configuration, Some(LanguageId::Go), WellKnownFileName)
         }
@@ -216,9 +219,6 @@ fn classify_well_known_name(name: &str) -> Option<FileClassification> {
         _ if name.starts_with("dockerfile.") => {
             classification(Configuration, Some(Dockerfile), WellKnownFileName)
         }
-        _ if name.starts_with("readme.") || name.starts_with("license.") => {
-            classification(Documentation, Some(Markdown), WellKnownFileName)
-        }
         _ => return None,
     };
     Some(value)
@@ -237,7 +237,7 @@ fn classify_extension(extension: &str) -> FileClassification {
         "go" => classification(Source, Some(Go), Extension),
         "java" => classification(Source, Some(Java), Extension),
         "c" => classification(Source, Some(C), Extension),
-        "h" => classification(Source, Some(C), Extension),
+        "h" => classification(Source, Some(CHeader), Extension),
         "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => {
             classification(Source, Some(Cpp), Extension)
         }
