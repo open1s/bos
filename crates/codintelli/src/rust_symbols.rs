@@ -1,0 +1,150 @@
+//! Crate-root-aware Rust symbol catalog built from syntax facts and the module graph.
+//!
+//! This catalog preserves source scope and crate-root context. It deliberately
+//! does not perform compiler-equivalent name resolution, visibility checking,
+//! cfg evaluation, re-export expansion, or type-based method resolution.
+
+use std::path::PathBuf;
+
+use crate::{
+    module_graph::{RustModuleGraph, RustModuleGraphStatus},
+    syntax::{ParseResult, ParseStatus, SourceRange, SyntaxFactKind},
+    WorkspaceId,
+};
+
+/// Declaration category retained by the crate-root-aware Rust symbol catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustScopedSymbolKind {
+    Function,
+    Method,
+    Struct,
+    Enum,
+    Union,
+    Trait,
+    TypeAlias,
+    Constant,
+    Static,
+}
+
+/// Identity of a declaration in one crate-root-specific module namespace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustScopedSymbolId {
+    pub workspace_id: WorkspaceId,
+    pub crate_root: PathBuf,
+    pub module_path: Vec<String>,
+    pub source_path: PathBuf,
+    pub range: SourceRange,
+    pub kind: RustScopedSymbolKind,
+}
+
+/// Source-backed Rust declaration with its logical crate/module path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustScopedSymbol {
+    pub id: RustScopedSymbolId,
+    pub name: String,
+}
+
+/// Catalog coverage and diagnostics for one workspace module graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustScopedSymbolReport {
+    pub workspace_id: WorkspaceId,
+    pub graph_status: RustModuleGraphStatus,
+    pub symbols: Vec<RustScopedSymbol>,
+    /// Files whose parse output is recovered or limited.
+    pub incomplete_source_paths: Vec<PathBuf>,
+}
+
+/// Invalid input to scoped Rust symbol catalog construction.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RustScopedSymbolError {
+    #[error("parse results and module graph have different workspace identities")]
+    WorkspaceMismatch,
+    #[error("duplicate parse result path: {0}")]
+    DuplicateParsePath(PathBuf),
+}
+
+/// Build symbols in crate-root-specific module contexts.
+///
+/// A source file shared by multiple crate roots intentionally produces distinct
+/// symbol identities. Facts in function/block-local scopes are excluded because
+/// this module-level catalog cannot model their lexical visibility accurately.
+pub fn build_rust_scoped_symbols(
+    parse_results: &[ParseResult],
+    graph: &RustModuleGraph,
+) -> Result<RustScopedSymbolReport, RustScopedSymbolError> {
+    if parse_results.iter().any(|result| result.workspace_id != graph.workspace_id) {
+        return Err(RustScopedSymbolError::WorkspaceMismatch);
+    }
+
+    let mut by_path = std::collections::HashMap::new();
+    let mut incomplete_source_paths = Vec::new();
+    for result in parse_results {
+        if by_path.insert(result.relative_path.clone(), result).is_some() {
+            return Err(RustScopedSymbolError::DuplicateParsePath(result.relative_path.clone()));
+        }
+        if matches!(result.status, ParseStatus::Recovered | ParseStatus::Limited | ParseStatus::Failed) {
+            incomplete_source_paths.push(result.relative_path.clone());
+        }
+    }
+
+    let mut symbols = Vec::new();
+    for node in &graph.nodes {
+        let Some(parse) = by_path.get(&node.source_path) else {
+            continue;
+        };
+        if parse.language != crate::classification::LanguageId::Rust {
+            continue;
+        }
+        for fact in &parse.facts {
+            if !fact.is_module_scope {
+                continue;
+            }
+            let Some(name) = fact.name.as_deref().filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let kind = match fact.kind {
+                SyntaxFactKind::Function => RustScopedSymbolKind::Function,
+                SyntaxFactKind::Method => RustScopedSymbolKind::Method,
+                SyntaxFactKind::Struct => RustScopedSymbolKind::Struct,
+                SyntaxFactKind::Enum => RustScopedSymbolKind::Enum,
+                SyntaxFactKind::Union => RustScopedSymbolKind::Union,
+                SyntaxFactKind::Trait => RustScopedSymbolKind::Trait,
+                SyntaxFactKind::TypeAlias => RustScopedSymbolKind::TypeAlias,
+                SyntaxFactKind::Constant => RustScopedSymbolKind::Constant,
+                SyntaxFactKind::Static => RustScopedSymbolKind::Static,
+                SyntaxFactKind::Module
+                | SyntaxFactKind::Impl
+                | SyntaxFactKind::Import
+                | SyntaxFactKind::Call
+                | SyntaxFactKind::MethodCall => continue,
+            };
+            let mut module_path = node.module_path.clone();
+            module_path.extend(fact.scope_path.iter().cloned());
+            symbols.push(RustScopedSymbol {
+                id: RustScopedSymbolId {
+                    workspace_id: graph.workspace_id,
+                    crate_root: node.crate_root.clone(),
+                    module_path,
+                    source_path: node.source_path.clone(),
+                    range: fact.range,
+                    kind,
+                },
+                name: name.to_owned(),
+            });
+        }
+    }
+
+    symbols.sort_unstable_by(|left, right| {
+        (&left.id.crate_root, &left.id.module_path, &left.name, &left.id.source_path, left.id.range)
+            .cmp(&(&right.id.crate_root, &right.id.module_path, &right.name, &right.id.source_path, right.id.range))
+    });
+    incomplete_source_paths.sort();
+    incomplete_source_paths.dedup();
+
+    Ok(RustScopedSymbolReport {
+        workspace_id: graph.workspace_id,
+        graph_status: graph.status,
+        symbols,
+        incomplete_source_paths,
+    })
+}
