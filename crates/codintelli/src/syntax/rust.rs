@@ -395,6 +395,16 @@ fn rust_visibility(node: Node<'_>, source: &str) -> Option<super::RustVisibility
         return None;
     }
 
+    // Trait members are part of the trait's public interface and do not
+    // declare an independent visibility modifier.
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "trait_item" {
+            return None;
+        }
+        ancestor = current.parent();
+    }
+
     let modifier = (0..node.named_child_count())
         .filter_map(|index| node.named_child(index as u32))
         .find(|child| child.kind() == "visibility_modifier");
