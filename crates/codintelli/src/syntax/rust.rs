@@ -249,7 +249,7 @@ impl RustProvider {
             language: LanguageId::Rust,
             provider_id: Self::ID.to_owned(),
             provider_version: Self::VERSION.to_owned(),
-            schema_version: 2,
+            schema_version: 3,
             status,
             limit_reason,
             facts,
