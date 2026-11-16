@@ -157,6 +157,7 @@ impl RustProvider {
                             scope_path: enclosing_module_path(node, source),
                             name: name.trim_start_matches("r#").to_owned(),
                             is_inline: node.child_by_field_name("body").is_some(),
+                            has_attributes: has_outer_attributes(node),
                             range,
                         });
                     }
@@ -250,6 +251,13 @@ impl RustProvider {
             diagnostics,
         })
     }
+}
+
+fn has_outer_attributes(node: Node<'_>) -> bool {
+    (0..node.child_count()).any(|index| {
+        node.child(index as u32)
+            .is_some_and(|child| child.kind() == "attribute_item")
+    })
 }
 
 fn enclosing_module_path(node: Node<'_>, source: &str) -> Vec<String> {
@@ -490,6 +498,17 @@ mod external_child;
         assert!(result.modules.iter().any(|item| item.name == "inline_child" && item.is_inline && item.scope_path.is_empty()));
         assert!(result.modules.iter().any(|item| item.name == "nested" && !item.is_inline && item.scope_path == vec!["inline_child".to_owned()]));
         assert!(result.modules.iter().any(|item| item.name == "external_child" && !item.is_inline && item.scope_path.is_empty()));
+    }
+
+    #[test]
+    fn marks_attributed_module_declarations_as_uncertain() {
+        let result = parse(r#"#[cfg(feature = "optional")]
+mod optional;
+#[path = "custom/location.rs"]
+mod custom;
+"#);
+        assert!(result.modules.iter().any(|item| item.name == "optional" && item.has_attributes));
+        assert!(result.modules.iter().any(|item| item.name == "custom" && item.has_attributes));
     }
 
     #[test]
