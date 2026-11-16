@@ -665,16 +665,17 @@ mod tests {
         let budget = ScanBudget::new(ScanLimits::default());
         budget.cancel();
         let limits = ParseLimits::default();
-        let error = RustProvider
-            .parse_document_with_control(
-                ParseInput {
-                    workspace_id: WorkspaceId::new(),
-                    relative_path: Path::new("src/lib.rs"),
-                    source: b"fn main() {}",
-                },
-                &ParseControl::new(&budget, &limits),
-            )
-            .expect_err("cancelled budget must stop native parsing");
+        let error = match RustProvider.parse_document_with_control(
+            ParseInput {
+                workspace_id: WorkspaceId::new(),
+                relative_path: Path::new("src/lib.rs"),
+                source: b"fn main() {}",
+            },
+            &ParseControl::new(&budget, &limits),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled budget must stop native parsing"),
+        };
 
         assert!(matches!(
             error,
