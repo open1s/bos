@@ -252,6 +252,10 @@ pub(crate) struct VerificationReport {
     /// The verification state.
     #[serde(default)]
     pub(crate) status: VerificationStatus,
+    /// The immutable attempt this report belongs to (issue #417). A report
+    /// from an earlier attempt can never satisfy a later one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attempt_id: Option<String>,
     /// Who verified: a runtime verifier, a review, or a human.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verifier: Option<String>,
@@ -470,8 +474,13 @@ impl Attempt {
     }
 
     /// Whether this attempt finished execution and verification independently.
+    ///
+    /// The report must name this attempt, so a pasted or inherited report from
+    /// another attempt never counts (issue #417).
     pub(crate) fn verified_success(&self) -> bool {
-        self.status == AttemptStatus::Succeeded && self.verification.is_verified()
+        self.status == AttemptStatus::Succeeded
+            && self.verification.is_verified()
+            && self.verification.attempt_id.as_deref() == Some(self.id.as_str())
     }
 }
 
@@ -611,19 +620,37 @@ impl Task {
         self.status == TaskStatus::Succeeded
     }
 
+    /// The verification report that belongs to the current attempt.
+    ///
+    /// Task-level status is derived, never inherited: without an attempt the
+    /// record's own report is used; with one, only that attempt's report counts
+    /// (issue #417).
+    pub(crate) fn current_verification(&self) -> &VerificationReport {
+        self.attempts
+            .last()
+            .map(|attempt| &attempt.verification)
+            .unwrap_or(&self.verification)
+    }
+
     /// Whether the task is both execution-succeeded and independently verified.
     ///
     /// A completion claim must use this, not [`Self::execution_succeeded`],
     /// whenever a verification contract was requested.
     pub(crate) fn verified_completion(&self) -> bool {
-        self.execution_succeeded() && self.verification.is_verified()
+        if !self.execution_succeeded() {
+            return false;
+        }
+        match self.attempts.last() {
+            Some(attempt) => attempt.verified_success(),
+            None => self.verification.is_verified(),
+        }
     }
 
     /// Whether verification is still owed for a successful execution.
     pub(crate) fn verification_owed(&self) -> bool {
         self.execution_succeeded()
             && matches!(
-                self.verification.status,
+                self.current_verification().status,
                 VerificationStatus::Pending | VerificationStatus::Inconclusive
             )
     }
@@ -1393,23 +1420,29 @@ mod tests {
 
         record.verification = VerificationReport {
             status: VerificationStatus::Pending,
+            attempt_id: Some("att-1".to_string()),
             ..VerificationReport::default()
         };
+        record.attempts[0].verification = record.verification.clone();
         assert!(record.verification_owed());
 
         // A passed status with no verifier or evidence is self-attestation,
         // not verification (issue #414).
         record.verification = VerificationReport {
             status: VerificationStatus::Passed,
+            attempt_id: Some("att-1".to_string()),
             verifier: Some("model".to_string()),
             ..VerificationReport::default()
         };
+        record.attempts[0].verification = record.verification.clone();
         assert!(!record.verified_completion());
         record.verification = VerificationReport {
             status: VerificationStatus::Passed,
+            attempt_id: Some("att-1".to_string()),
             verifier: Some("cargo test".to_string()),
             ..VerificationReport::default()
         };
+        record.attempts[0].verification = record.verification.clone();
         assert!(
             !record.verified_completion(),
             "a verifier with no evidence is not enough"
@@ -1417,6 +1450,7 @@ mod tests {
 
         record.verification = VerificationReport {
             status: VerificationStatus::Passed,
+            attempt_id: Some("att-1".to_string()),
             verifier: Some("cargo test".to_string()),
             evidence: vec![VerificationEvidence {
                 kind: "command".to_string(),
@@ -1426,7 +1460,13 @@ mod tests {
             }],
             ..VerificationReport::default()
         };
+        record.attempts[0].verification = record.verification.clone();
         assert!(record.verified_completion());
+
+        // A report that names an older attempt cannot satisfy the current one
+        // (issue #417).
+        record.attempts[0].verification.attempt_id = Some("old-attempt".to_string());
+        assert!(!record.verified_completion());
     }
 
     /// The board carries the latest attempt's verification state, so an

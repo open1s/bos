@@ -188,6 +188,11 @@ pub(crate) fn compact_failure_text(
             &[("error", detail.clone())],
         ),
         CompactionFailure::EmptySummary => lang.tr("slash.compactEmpty"),
+        CompactionFailure::IncompleteCheckpoint { reason } => crate::i18n::tr_args(
+            lang,
+            "slash.compactIncomplete",
+            &[("reason", reason.clone())],
+        ),
         CompactionFailure::NotSmaller {
             framed_tokens,
             span_tokens,

@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use agent::tools::{AsyncFunctionTool, DeclaredAsyncTool};
 use agent::{Agent, ToolError};
-use ferris_sdk::terminal::TerminalService as _;
 use serde_json::{json, Value};
 
 use crate::extension::runs::{Limits, RunSpec, RunState, RunTier, Runs};
@@ -97,6 +96,17 @@ fn attach_create(agent: &mut Agent, context: TaskToolsContext) {
                         "every_seconds": { "type": "integer", "minimum": 60 },
                         "at_ms": { "type": "integer", "minimum": 0 }
                     }
+                },
+                "verification_contract": {
+                    "type": "object",
+                    "description": "Optional independent verification. command runs a command (exit 0 passes); artifact checks a workspace-relative file and optional SHA-256; review or human needs an external approval reference. Not available on peer-task.",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["command", "artifact", "review", "human"] },
+                        "command": { "type": "string" },
+                        "path": { "type": "string" },
+                        "digest": { "type": "string" }
+                    },
+                    "required": ["kind"]
                 }
             },
             "required": ["intent"]
@@ -492,6 +502,14 @@ pub(crate) async fn retry_with(
             "the task has used all of its attempts".to_string(),
         ));
     }
+    // Retrying an execution whose verification is still owed could repeat a
+    // non-idempotent side effect while the original outcome is unproven.
+    // Verify, cancel, or wait instead of blindly re-running (issue #417).
+    if record.execution_succeeded() && record.verification_owed() {
+        return Err(ToolError::Failed(
+            "the task executed but its verification is still owed; re-verify the current attempt instead of retrying a non-idempotent execution".to_string(),
+        ));
+    }
     let now = crate::settings::unix_now().saturating_mul(1_000);
     let run = match record.tier {
         Tier::Turn => {
@@ -573,6 +591,7 @@ pub(crate) async fn retry_with(
     attempt.status = AttemptStatus::Running;
     attempt.started_ms = Some(now);
     record.attempts.push(attempt);
+    mark_attempt_pending(&mut record);
     record.status = TaskStatus::Running;
     record.updated_ms = now;
     FileTasksStore
@@ -990,6 +1009,140 @@ fn parse_trigger(args: &Value, now: u64) -> Result<Trigger, ToolError> {
     ))
 }
 
+/// Parse and validate a verification contract from the tool input.
+///
+/// Invalid input is refused before any task is created or executed. A
+/// contract is not offered for peer-owned tasks: the owner's runtime verifies
+/// on its own side (issue #416).
+fn parse_verification_contract(
+    args: &Value,
+    tier: Tier,
+) -> Result<Option<VerificationContract>, ToolError> {
+    let Some(value) = args
+        .get("verification_contract")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    if tier == Tier::PeerTask {
+        return Err(ToolError::InvalidInput(
+            "a peer-owned task cannot carry a local verification contract".to_string(),
+        ));
+    }
+    let object = value.as_object().ok_or_else(|| {
+        ToolError::InvalidInput("verification_contract must be an object".to_string())
+    })?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .ok_or_else(|| {
+            ToolError::InvalidInput(
+                "verification_contract.kind must be command, artifact, review or human".to_string(),
+            )
+        })?;
+    let contract = match kind {
+        "command" => {
+            let command = object
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .ok_or_else(|| {
+                    ToolError::InvalidInput(
+                        "a command verification contract needs a command".to_string(),
+                    )
+                })?;
+            if command.contains('\0') {
+                return Err(ToolError::InvalidInput(
+                    "the verification command must not contain NUL".to_string(),
+                ));
+            }
+            VerificationContract::Command {
+                command: command.to_string(),
+            }
+        }
+        "artifact" => {
+            let path = object
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| {
+                    ToolError::InvalidInput(
+                        "an artifact verification contract needs a path".to_string(),
+                    )
+                })?;
+            validate_workspace_relative(path)?;
+            let digest = match object.get("digest") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let digest = value.as_str().ok_or_else(|| {
+                        ToolError::InvalidInput(
+                            "verification_contract.digest must be a SHA-256 hex string".to_string(),
+                        )
+                    })?;
+                    let digest = digest.trim().to_ascii_lowercase();
+                    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err(ToolError::InvalidInput(
+                            "verification_contract.digest must be 64 hex characters".to_string(),
+                        ));
+                    }
+                    Some(digest)
+                }
+            };
+            VerificationContract::Artifact {
+                path: path.to_string(),
+                digest,
+            }
+        }
+        "review" => VerificationContract::Review,
+        "human" => VerificationContract::Human,
+        other => {
+            return Err(ToolError::InvalidInput(format!(
+                "unknown verification_contract.kind {other}; use command, artifact, review or human"
+            )));
+        }
+    };
+    Ok(Some(contract))
+}
+
+/// Reject absolute paths and parent traversal before any verifier runs.
+fn validate_workspace_relative(path: &str) -> Result<(), ToolError> {
+    use std::path::Component;
+    let candidate = std::path::Path::new(path);
+    if candidate.is_absolute()
+        || candidate.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ToolError::InvalidInput(
+            "verification_contract artifact paths must be workspace-relative and may not traverse outside it".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Mark the latest attempt's verification pending when a contract was asked
+/// for; previous attempt reports are never reused (issue #417).
+fn mark_attempt_pending(task: &mut Task) {
+    if task.verification_contract.is_none() {
+        return;
+    }
+    if let Some(attempt) = task.attempts.last_mut() {
+        attempt.verification = VerificationReport {
+            status: VerificationStatus::Pending,
+            attempt_id: Some(attempt.id.clone()),
+            ..VerificationReport::default()
+        };
+        task.verification = attempt.verification.clone();
+    }
+}
+
 /// Create a task record and start its run.
 pub(crate) async fn create_with(
     runs: &Runs,
@@ -1040,6 +1193,7 @@ pub(crate) async fn create_with(
     };
     let now = crate::settings::unix_now().saturating_mul(1_000);
     let trigger = parse_trigger(args, now)?;
+    let verification_contract = parse_verification_contract(args, tier)?;
     if !deps.is_empty() && (tier != Tier::Turn || matches!(trigger, Trigger::Now)) {
         return Err(ToolError::InvalidInput(
             "dependencies are supported on scheduled turn tasks".to_string(),
@@ -1064,6 +1218,13 @@ pub(crate) async fn create_with(
         now,
     )
     .map_err(|refusal| ToolError::Failed(refusal.message().to_string()))?;
+    if let Some(contract) = verification_contract {
+        task.verification_contract = Some(contract);
+        task.verification = VerificationReport {
+            status: VerificationStatus::Pending,
+            ..VerificationReport::default()
+        };
+    }
     if tier == Tier::PeerTask {
         let Some(target) = args
             .get("target")
@@ -1144,6 +1305,7 @@ pub(crate) async fn create_with(
         attempt.status = AttemptStatus::Running;
         attempt.started_ms = Some(now);
         task.attempts.push(attempt);
+        mark_attempt_pending(&mut task);
         task.status = TaskStatus::Running;
         task.updated_ms = now;
         FileTasksStore
@@ -1153,6 +1315,8 @@ pub(crate) async fn create_with(
             "task": id,
             "run": job,
             "state": "running",
+            "verification_contract": task.verification_contract,
+            "verification": task.verification.status,
         }));
     }
     task.deps = deps.clone();
@@ -1208,6 +1372,8 @@ pub(crate) async fn create_with(
             "task": id,
             "state": "scheduled",
             "next_fire_ms": task.trigger.next_fire_ms(),
+            "verification_contract": task.verification_contract,
+            "verification": task.verification.status,
         }));
     }
     if tier == Tier::Subagent {
@@ -1223,6 +1389,7 @@ pub(crate) async fn create_with(
         attempt.status = AttemptStatus::Running;
         attempt.started_ms = Some(now);
         task.attempts.push(attempt);
+        mark_attempt_pending(&mut task);
         task.status = TaskStatus::Running;
         task.updated_ms = now;
         FileTasksStore
@@ -1232,6 +1399,8 @@ pub(crate) async fn create_with(
             "task": id,
             "run": run,
             "state": "running",
+            "verification_contract": task.verification_contract,
+            "verification": task.verification.status,
         }));
     }
     if tier == Tier::Delegation && !trigger.is_scheduled() {
@@ -1264,6 +1433,7 @@ pub(crate) async fn create_with(
         attempt.status = AttemptStatus::Running;
         attempt.started_ms = Some(now);
         task.attempts.push(attempt);
+        mark_attempt_pending(&mut task);
         task.status = TaskStatus::Running;
         task.updated_ms = now;
         FileTasksStore
@@ -1273,6 +1443,8 @@ pub(crate) async fn create_with(
             "task": id,
             "run": run,
             "state": "running",
+            "verification_contract": task.verification_contract,
+            "verification": task.verification.status,
         }));
     }
     let run = runs
@@ -1295,6 +1467,7 @@ pub(crate) async fn create_with(
     attempt.status = AttemptStatus::Running;
     attempt.started_ms = Some(now);
     task.attempts.push(attempt);
+    mark_attempt_pending(&mut task);
     task.status = TaskStatus::Running;
     task.updated_ms = now;
     FileTasksStore
@@ -1304,6 +1477,8 @@ pub(crate) async fn create_with(
         "task": id,
         "run": run.id,
         "state": "running",
+        "verification_contract": task.verification_contract,
+        "verification": task.verification.status,
     }))
 }
 
@@ -1402,6 +1577,36 @@ pub(crate) async fn join_with(
                     .and_then(|jobs| job_snapshot(jobs, id))
             })
     };
+    // The verifier runs through the turn's controlled shell: the same sandbox,
+    // policy, working directory and resource limits as normal execution
+    // (issue #418). Without one, command verification is inconclusive.
+    let verification_shell: Option<VerificationShell> = context.bash.clone().map(|bash| {
+        std::sync::Arc::new(move |command: &str| {
+            let response = bash
+                .run(&json!({ "command": command }))
+                .map_err(|error| format!("{error:?}"))?;
+            let code = response
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| {
+                    if response
+                        .get("success")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        0
+                    } else {
+                        -1
+                    }
+                }) as i32;
+            let stdout = response
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Ok((code, stdout))
+        }) as VerificationShell
+    });
     let report = tasks::join(observe, &local, timeout).await;
     for row in &report.rows {
         let Some(record) = local.iter_mut().find(|task| task.id == row.task) else {
@@ -1436,7 +1641,12 @@ pub(crate) async fn join_with(
             )
         {
             if let Some(contract) = record.verification_contract.clone() {
-                let report = verify_contract(&contract, &context.workspace).await;
+                let mut report =
+                    verify_contract(&contract, &context.workspace, verification_shell.as_ref())
+                        .await;
+                // Bind the report to the attempt that produced this outcome:
+                // a previous attempt's report can never satisfy it (issue #417).
+                report.attempt_id = record.attempts.last().map(|attempt| attempt.id.clone());
                 record.verification = report.clone();
                 if let Some(attempt) = record.attempts.last_mut() {
                     attempt.verification = report;
@@ -1487,41 +1697,48 @@ fn file_sha256(path: &std::path::Path) -> std::io::Result<String> {
 /// checked for existence and, when pinned, SHA-256. Review and human contracts
 /// need an external reference, so they conclude inconclusive here rather than
 /// accepting a model's self-attestation.
+/// A controlled shell runner: commands go through the same sandbox, policy,
+/// working directory and resource limits as normal task execution (issue #418).
+pub(crate) type VerificationShell =
+    std::sync::Arc<dyn Fn(&str) -> Result<(i32, String), String> + Send + Sync>;
+
 pub(crate) async fn verify_contract(
     contract: &VerificationContract,
     workspace: &std::path::Path,
+    shell: Option<&VerificationShell>,
 ) -> VerificationReport {
     let verifier = Some("bsh-runtime".to_string());
     let verifier_version = Some(env!("CARGO_PKG_VERSION").to_string());
     match contract {
         VerificationContract::Command { command } => {
+            // The command must run through the controlled process runtime; a
+            // host-shell fallback is not an acceptable verifier boundary.
+            let Some(shell) = shell.cloned() else {
+                return VerificationReport {
+                    status: VerificationStatus::Inconclusive,
+                    attempt_id: None,
+                    verifier,
+                    verifier_version,
+                    verified_ms: Some(crate::settings::unix_now().saturating_mul(1_000)),
+                    evidence: Vec::new(),
+                    message: Some(
+                        "no sandboxed shell is available for command verification".to_string(),
+                    ),
+                };
+            };
             let runner_command = command.clone();
-            let workspace = workspace.to_path_buf();
-            let outcome = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                tokio::task::spawn_blocking(move || {
-                    crate::extension::terminal::HostTerminal.run(&runner_command, Some(workspace))
-                }),
-            )
-            .await;
+            let outcome = tokio::task::spawn_blocking(move || shell(&runner_command))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
             let (status, detail) = match outcome {
-                Ok(Ok(Ok(output))) if output.code == 0 => (
-                    VerificationStatus::Passed,
-                    Some(format!("exit {}", output.code)),
-                ),
-                Ok(Ok(Ok(output))) => (
-                    VerificationStatus::Failed,
-                    Some(format!("exit {}", output.code)),
-                ),
-                Ok(Ok(Err(error))) => (VerificationStatus::Inconclusive, Some(error)),
-                Ok(Err(error)) => (VerificationStatus::Inconclusive, Some(error.to_string())),
-                Err(_) => (
-                    VerificationStatus::Inconclusive,
-                    Some("the verifier command timed out".to_string()),
-                ),
+                Ok((0, _)) => (VerificationStatus::Passed, Some("exit 0".to_string())),
+                Ok((code, _)) => (VerificationStatus::Failed, Some(format!("exit {code}"))),
+                Err(error) => (VerificationStatus::Inconclusive, Some(error)),
             };
             VerificationReport {
                 status,
+                attempt_id: None,
                 verifier,
                 verifier_version,
                 verified_ms: Some(crate::settings::unix_now().saturating_mul(1_000)),
@@ -1540,6 +1757,34 @@ pub(crate) async fn verify_contract(
             } else {
                 workspace.join(path)
             };
+            // Resolve symlinks and refuse anything outside the workspace: a
+            // path that lexically looked relative can still escape (issue #418).
+            let root = workspace.canonicalize();
+            let canonical = target.canonicalize();
+            let escaped = match (&root, &canonical) {
+                (Ok(root), Ok(target)) => !target.starts_with(root),
+                _ => true,
+            };
+            if escaped {
+                return VerificationReport {
+                    status: VerificationStatus::Failed,
+                    attempt_id: None,
+                    verifier,
+                    verifier_version,
+                    verified_ms: Some(crate::settings::unix_now().saturating_mul(1_000)),
+                    evidence: vec![VerificationEvidence {
+                        kind: "artifact".to_string(),
+                        reference: target.display().to_string(),
+                        digest: None,
+                        detail: Some("outside the workspace or missing".to_string()),
+                    }],
+                    message: Some(format!(
+                        "{} is outside the task workspace",
+                        target.display()
+                    )),
+                };
+            }
+            let target = canonical.expect("checked above");
             let metadata = std::fs::metadata(&target);
             let (status, actual_digest, detail, message) = match metadata {
                 Ok(metadata) if !metadata.is_file() => (
@@ -1574,6 +1819,7 @@ pub(crate) async fn verify_contract(
             };
             VerificationReport {
                 status,
+                attempt_id: None,
                 verifier,
                 verifier_version,
                 verified_ms: Some(crate::settings::unix_now().saturating_mul(1_000)),
@@ -1588,6 +1834,7 @@ pub(crate) async fn verify_contract(
         }
         VerificationContract::Review | VerificationContract::Human => VerificationReport {
             status: VerificationStatus::Inconclusive,
+            attempt_id: None,
             verifier: Some("external".to_string()),
             verifier_version,
             verified_ms: Some(crate::settings::unix_now().saturating_mul(1_000)),
@@ -1817,6 +2064,237 @@ mod tests {
         assert_eq!(stored.tier, Tier::Turn);
         assert_eq!(stored.title, "Review the diff");
         assert_eq!(stored.origin.session, "ses-1");
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// task_create exposes and persists every supported verification
+    /// contract, and marks the first attempt pending with its own id (#416).
+    #[tokio::test]
+    async fn create_accepts_each_supported_verification_contract() {
+        let context = context("contracts");
+        let fake = Fake::new();
+        let runs = Runs::with(fake);
+        let cases = vec![
+            (
+                json!({"kind": "command", "command": "cargo test"}),
+                "command",
+            ),
+            (
+                json!({"kind": "artifact", "path": "target/out.txt", "digest": "a".repeat(64)}),
+                "artifact",
+            ),
+            (json!({"kind": "review"}), "review"),
+            (json!({"kind": "human"}), "human"),
+        ];
+        for (contract, kind) in cases {
+            let value = create_with(
+                &runs,
+                &context,
+                &json!({"intent": "Verify the result", "verification_contract": contract}),
+            )
+            .await
+            .expect("created");
+            assert_eq!(value["verification_contract"]["kind"], kind);
+            assert_eq!(value["verification"], "pending");
+            let id = value["task"].as_str().expect("id");
+            let task = FileTasksStore
+                .load(&context.workspace, id)
+                .expect("load")
+                .expect("record");
+            assert!(task.verification_contract.is_some(), "{kind} persisted");
+            assert_eq!(task.verification.status, VerificationStatus::Pending);
+            let attempt = task.attempts.last().expect("attempt");
+            assert_eq!(attempt.verification.status, VerificationStatus::Pending);
+            assert_eq!(
+                attempt.verification.attempt_id.as_deref(),
+                Some(attempt.id.as_str())
+            );
+        }
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// Malformed, unsafe or peer-owned contracts are refused before a task is
+    /// created or executed (#416).
+    #[tokio::test]
+    async fn create_refuses_invalid_verification_contracts() {
+        let context = context("bad-contracts");
+        let runs = Runs::with(Fake::new());
+        let invalid = vec![
+            json!({"kind": "artifact", "path": "/etc/passwd"}),
+            json!({"kind": "artifact", "path": "../outside"}),
+            json!({"kind": "artifact", "path": "ok", "digest": "not-hex"}),
+            json!({"kind": "command", "command": "   "}),
+            json!({"kind": "unknown"}),
+            json!(["not-an-object"]),
+        ];
+        for contract in invalid {
+            let error = create_with(
+                &runs,
+                &context,
+                &json!({"intent": "Verify", "verification_contract": contract}),
+            )
+            .await
+            .expect_err("refused");
+            assert!(format!("{error:?}").contains("verification"), "{error:?}");
+        }
+        let peer = create_with(
+            &runs,
+            &context,
+            &json!({
+                "intent": "Remote",
+                "tier": "peer-task",
+                "target": "peer-1",
+                "trigger": {"every_seconds": 60},
+                "verification_contract": {"kind": "review"}
+            }),
+        )
+        .await
+        .expect_err("peer contract refused");
+        assert!(format!("{peer:?}").contains("peer-owned"), "{peer:?}");
+        assert!(FileTasksStore
+            .list(&context.workspace)
+            .expect("list")
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// A retry starts a new pending attempt; the previous attempt's Passed
+    /// report never satisfies it, and re-verification binds to the new id
+    /// (#417).
+    #[tokio::test]
+    async fn a_retry_never_reuses_the_previous_verification_report() {
+        let context = context("retry-verify");
+        std::fs::write(context.workspace.join("artifact.txt"), "done").expect("artifact");
+        let fake = Fake::new();
+        let runs = Runs::with(fake.clone());
+        let value = create_with(
+            &runs,
+            &context,
+            &json!({
+                "intent": "Verify the artifact",
+                "verification_contract": {"kind": "artifact", "path": "artifact.txt"}
+            }),
+        )
+        .await
+        .expect("created");
+        let id = value["task"].as_str().expect("id").to_string();
+        {
+            let mut runs = fake.runs.lock().expect("runs");
+            let snapshot = runs.get_mut("run-1").expect("run");
+            snapshot.state = RunState::Succeeded;
+            snapshot.result = Some("done".to_string());
+        }
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let settled = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        let first_id = settled.attempts[0].id.clone();
+        assert_eq!(
+            settled.attempts[0].verification.status,
+            VerificationStatus::Passed
+        );
+        assert_eq!(
+            settled.attempts[0].verification.attempt_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        assert!(settled.verified_completion());
+
+        retry_with(&runs, &context, &json!({"task": id}))
+            .await
+            .expect("retry");
+        let retried = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        let second = retried.attempts.last().expect("second attempt");
+        assert_ne!(second.id, first_id);
+        assert_eq!(second.verification.status, VerificationStatus::Pending);
+        assert_eq!(
+            second.verification.attempt_id.as_deref(),
+            Some(second.id.as_str())
+        );
+        assert_eq!(
+            retried.attempts[0].verification.status,
+            VerificationStatus::Passed
+        );
+        assert!(!retried.verified_completion(), "pending, not verified");
+
+        // A stale report naming the first attempt cannot verify the second.
+        let mut stale = retried.clone();
+        let second_index = stale.attempts.len() - 1;
+        stale.attempts[second_index].status = AttemptStatus::Succeeded;
+        stale.attempts[second_index].verification = VerificationReport {
+            status: VerificationStatus::Passed,
+            attempt_id: Some(first_id.clone()),
+            verifier: Some("cargo test".to_string()),
+            evidence: vec![VerificationEvidence {
+                kind: "artifact".to_string(),
+                reference: "artifact.txt".to_string(),
+                digest: None,
+                detail: None,
+            }],
+            ..VerificationReport::default()
+        };
+        assert!(!stale.verified_completion());
+
+        // Re-verification at the new attempt's settle makes it verified.
+        {
+            let mut runs = fake.runs.lock().expect("runs");
+            let snapshot = runs.get_mut("run-2").expect("second run");
+            snapshot.state = RunState::Succeeded;
+            snapshot.result = Some("done again".to_string());
+        }
+        join_with(&runs, &context, &json!({"tasks": [id]}))
+            .await
+            .expect("join again");
+        let reverified = FileTasksStore
+            .load(&context.workspace, &retried.id)
+            .expect("load")
+            .expect("record");
+        let second = reverified.attempts.last().expect("second attempt");
+        assert_eq!(second.verification.status, VerificationStatus::Passed);
+        assert_eq!(
+            second.verification.attempt_id.as_deref(),
+            Some(second.id.as_str())
+        );
+        assert!(reverified.verified_completion());
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// A successful execution whose verification is still owed is not blindly
+    /// retried: that could repeat a non-idempotent side effect (#417).
+    #[tokio::test]
+    async fn retry_refuses_an_unverified_successful_execution() {
+        let context = context("retry-unverified");
+        let fake = Fake::new();
+        let runs = Runs::with(fake.clone());
+        let value = create_with(
+            &runs,
+            &context,
+            &json!({"intent": "Review", "verification_contract": {"kind": "review"}}),
+        )
+        .await
+        .expect("created");
+        let id = value["task"].as_str().expect("id").to_string();
+        {
+            let mut runs = fake.runs.lock().expect("runs");
+            let snapshot = runs.get_mut("run-1").expect("run");
+            snapshot.state = RunState::Succeeded;
+            snapshot.result = Some("done".to_string());
+        }
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let error = retry_with(&runs, &context, &json!({"task": id}))
+            .await
+            .expect_err("retry refused");
+        assert!(
+            format!("{error:?}").contains("verification is still owed"),
+            "{error:?}"
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -2827,6 +3305,7 @@ mod tests {
                 digest: Some(digest),
             },
             &root,
+            None,
         )
         .await;
         assert_eq!(passed.status, VerificationStatus::Passed);
@@ -2840,16 +3319,51 @@ mod tests {
                 digest: None,
             },
             &root,
+            None,
         )
         .await;
         assert_eq!(missing.status, VerificationStatus::Failed);
         assert!(!missing.is_verified());
 
+        #[cfg(unix)]
+        {
+            // A symlink inside the workspace that points outside it must not
+            // widen the verifier's boundary (issue #418).
+            let outside =
+                std::env::temp_dir().join(format!("bsh-verify-outside-{}", std::process::id()));
+            std::fs::create_dir_all(&outside).expect("outside");
+            let secret = outside.join("secret.txt");
+            std::fs::write(&secret, "secret").expect("secret");
+            let link = root.join("escape.txt");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&secret, &link).expect("symlink");
+            let escaped = verify_contract(
+                &VerificationContract::Artifact {
+                    path: "escape.txt".to_string(),
+                    digest: None,
+                },
+                &root,
+                None,
+            )
+            .await;
+            assert_eq!(escaped.status, VerificationStatus::Failed);
+            assert!(
+                escaped.evidence[0].detail.as_deref() == Some("outside the workspace or missing")
+            );
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+
+        let shell: VerificationShell = std::sync::Arc::new(|command: &str| match command {
+            "exit 0" => Ok((0, String::new())),
+            "exit 3" => Ok((3, String::new())),
+            other => Err(format!("unexpected command {other}")),
+        });
         let zero = verify_contract(
             &VerificationContract::Command {
                 command: "exit 0".to_string(),
             },
             &root,
+            Some(&shell),
         )
         .await;
         assert_eq!(zero.status, VerificationStatus::Passed, "{zero:?}");
@@ -2858,11 +3372,21 @@ mod tests {
                 command: "exit 3".to_string(),
             },
             &root,
+            Some(&shell),
         )
         .await;
         assert_eq!(non_zero.status, VerificationStatus::Failed);
+        let unsandboxed = verify_contract(
+            &VerificationContract::Command {
+                command: "exit 0".to_string(),
+            },
+            &root,
+            None,
+        )
+        .await;
+        assert_eq!(unsandboxed.status, VerificationStatus::Inconclusive);
 
-        let review = verify_contract(&VerificationContract::Review, &root).await;
+        let review = verify_contract(&VerificationContract::Review, &root, None).await;
         assert_eq!(review.status, VerificationStatus::Inconclusive);
         assert!(!review.is_verified());
 

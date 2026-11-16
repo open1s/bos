@@ -829,6 +829,49 @@ impl ReactContext for LlmContext {
     }
 }
 
+/// One source named by the typed provider request (issue #421).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProviderRequestSource {
+    /// The source label: persona, host-runtime, retrieved-memory, ...
+    pub source: String,
+    /// The trust class the host assigned.
+    pub trust: String,
+    /// Optional provenance detail.
+    pub provenance: Option<String>,
+    /// Estimated tokens in the block.
+    pub tokens: usize,
+}
+
+/// The immutable, typed description of the context that produced a request
+/// (issue #421).
+///
+/// It rides on LlmRequest but is never serialized to a provider: adapters
+/// flatten it into roles and text, and the recording seam can prove the request
+/// came from one snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProviderRequest {
+    /// Composition identity (SHA-256 hex, no block text).
+    pub composition: String,
+    /// Keyed content identity, when the host configured a key.
+    pub content: Option<String>,
+    /// Non-content execution identity.
+    pub execution: String,
+    /// The key id used for the content identity.
+    pub content_key_id: Option<String>,
+    /// The machine-readable block manifest.
+    pub manifest: String,
+    /// Every block's typed metadata.
+    pub sources: Vec<ProviderRequestSource>,
+    /// The model this request asks for.
+    pub model: String,
+    /// The system prompt the provider will receive.
+    pub system_prompt: Option<String>,
+    /// The conversation history as it will be serialized.
+    pub messages: Vec<LlmMessage>,
+    /// Advertised tool names, in wire order.
+    pub tool_names: Vec<String>,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 /// A request to an LLM provider.
 pub struct LlmRequest {
@@ -868,6 +911,10 @@ pub struct LlmRequest {
     /// [`ActionIntent`]).
     #[serde(skip)]
     pub intent: ActionIntent,
+    /// The typed context request this call was assembled from (issue #421).
+    /// Not serialized: the provider wire carries the flattened form.
+    #[serde(skip)]
+    pub provider_request: Option<ProviderRequest>,
 }
 
 /// Selects the protocol used for a single LLM request.
@@ -949,6 +996,7 @@ impl LlmRequest {
             api_mode: ApiMode::Chat,
             request_id: None,
             intent: ActionIntent::Unknown,
+            provider_request: None,
         }
     }
 

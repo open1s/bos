@@ -1246,6 +1246,7 @@ mod tests {
             api_mode: crate::llm::ApiMode::Responses,
             request_id: None,
             intent: Default::default(),
+            provider_request: None,
         };
 
         let built = build_request(None, &req, &session, &context, false, true);

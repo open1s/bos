@@ -222,6 +222,7 @@ mod tests {
             api_mode: crate::llm::ApiMode::Chat,
             request_id: None,
             intent: Default::default(),
+            provider_request: None,
         };
         let result = match vendor
             .complete(None, request, &mut LlmSession::new(), &mut ())

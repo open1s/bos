@@ -122,6 +122,14 @@ pub enum CompactionFailure {
         /// Estimated tokens in the span it would replace.
         span_tokens: usize,
     },
+    /// The summary failed the semantic gate (missing sections, an empty
+    /// required section, or a dropped explicit constraint). The history was
+    /// left untouched.
+    #[error("checkpoint rejected: {reason}")]
+    IncompleteCheckpoint {
+        /// The actionable reason shown to the reader/model.
+        reason: String,
+    },
 }
 
 impl CompactionFailure {
@@ -412,7 +420,27 @@ pub struct Checkpoint {
     /// Whether every required section was present.
     #[serde(default)]
     pub complete: bool,
+    /// Whether the source span lives in the session's deduplicated archive
+    /// (issue #424) instead of being copied into this record.
+    #[serde(default)]
+    pub source_archived: bool,
+    /// Whether the source span exceeded its byte budget and was not stored.
+    /// Such a checkpoint is explicit, not silently unrecoverable.
+    #[serde(default)]
+    pub source_omitted: bool,
+    /// Whether the original span can still be rebuilt.
+    #[serde(default = "checkpoint_recoverable_default")]
+    pub recoverable: bool,
 }
+
+fn checkpoint_recoverable_default() -> bool {
+    true
+}
+
+/// Default total archive budget for checkpoint source spans (issue #424).
+pub const DEFAULT_CHECKPOINT_ARCHIVE_BYTES: usize = 8 * 1024 * 1024;
+/// Default per-checkpoint source-span budget (issue #424).
+pub const DEFAULT_CHECKPOINT_SPAN_BYTES: usize = 2 * 1024 * 1024;
 
 /// The sections the compaction contract requires, in order.
 pub const CHECKPOINT_SECTIONS: [&str; 8] = [
@@ -452,9 +480,87 @@ fn parse_checkpoint_sections(summary: &str) -> std::collections::BTreeMap<String
     sections
 }
 
+/// The section bodies that must be non-empty for a checkpoint to pass the
+/// semantic gate (issue #420).
+const REQUIRED_NON_EMPTY_SECTIONS: [&str; 3] = [
+    "Primary Request and Intent",
+    "Current Work",
+    "Critical Context",
+];
+
+/// Validate a model-written checkpoint before it replaces history.
+///
+/// Rejects missing required sections, empty required bodies, and summaries that
+/// drop an explicit user constraint found in the shadowed span. The caller must
+/// not install a checkpoint when this returns an error.
+pub fn validate_checkpoint(summary: &str, source: &[Message]) -> Result<(), String> {
+    let sections = parse_checkpoint_sections(summary);
+    let missing: Vec<&str> = CHECKPOINT_SECTIONS
+        .iter()
+        .filter(|name| !sections.contains_key(**name))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "the summary is missing required section(s): {}",
+            missing.join(", ")
+        ));
+    }
+    for name in REQUIRED_NON_EMPTY_SECTIONS {
+        let body = sections.get(name).map(String::as_str).unwrap_or("").trim();
+        if body.is_empty() || body.eq_ignore_ascii_case("(none)") {
+            return Err(format!("the required section \"{name}\" has no content"));
+        }
+    }
+    let summary_lower = summary.to_ascii_lowercase();
+    for constraint in explicit_constraints(source) {
+        if !summary_lower.contains(&constraint.to_ascii_lowercase()) {
+            return Err(format!(
+                "the summary dropped an explicit constraint from the shadowed span: {constraint}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Explicit constraints in a span, for the semantic gate.
+///
+/// Only the documented marker is treated as authoritative; broader prose
+/// heuristics would reject high-quality summaries for wording differences.
+fn explicit_constraints(source: &[Message]) -> Vec<String> {
+    let mut constraints = Vec::new();
+    for message in source {
+        let text = match message {
+            Message::System { content } => content.as_str(),
+            Message::User { content } => match content {
+                Content::Text(text) => text.as_str(),
+                Content::Parts(_) => "",
+            },
+            Message::Assistant { content } => content.as_str(),
+            Message::AssistantToolCall { .. } | Message::ToolResult { .. } => "",
+        };
+        for line in text.lines() {
+            let trimmed = line.trim().trim_start_matches(&['-', '*', ' '][..]).trim();
+            if trimmed.to_ascii_lowercase().starts_with("constraint:") {
+                constraints.push(trimmed.to_string());
+            }
+        }
+    }
+    constraints
+}
+
 impl Checkpoint {
     /// Whether the preserved source still matches its digest.
+    ///
+    /// An archived span was verified when it entered the session archive; an
+    /// omitted span is explicitly not recoverable.
     pub fn source_is_intact(&self) -> bool {
+        if self.source_omitted {
+            return false;
+        }
+        if self.source_archived {
+            return true;
+        }
         digest_messages(&self.source_span) == self.source_digest
     }
 
@@ -484,11 +590,36 @@ pub struct AgentSession {
     messages: Vec<Message>,
     context: JsonValue,
     metadata: SessionMetadata,
+    /// Schema generation of this serialized session (issue #419). Files from
+    /// before the field load as 0 and are treated as generation 1.
+    #[serde(default)]
+    schema_version: u32,
     /// Compaction checkpoints, oldest first (issue #413). Older session files
     /// have no field and load with none.
     #[serde(default)]
     checkpoints: Vec<Checkpoint>,
+    /// Deduplicated checkpoint source spans, keyed by their digest
+    /// (issue #424): repeated or identical spans are stored once.
+    #[serde(default)]
+    archive: std::collections::BTreeMap<String, Vec<Message>>,
+    /// The total archive byte budget.
+    #[serde(default = "checkpoint_archive_budget_default")]
+    checkpoint_archive_budget: usize,
+    /// The per-checkpoint source-span byte budget.
+    #[serde(default = "checkpoint_span_budget_default")]
+    checkpoint_span_budget: usize,
 }
+
+fn checkpoint_archive_budget_default() -> usize {
+    DEFAULT_CHECKPOINT_ARCHIVE_BYTES
+}
+
+fn checkpoint_span_budget_default() -> usize {
+    DEFAULT_CHECKPOINT_SPAN_BYTES
+}
+
+/// The current serialized session schema (issue #419).
+pub const SESSION_SCHEMA_VERSION: u32 = 3;
 
 /// Timestamps and counters stored with an [`AgentSession`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -512,7 +643,11 @@ impl AgentSession {
                 updated_at: current_timestamp(),
                 message_count: 0,
             },
+            schema_version: SESSION_SCHEMA_VERSION,
             checkpoints: Vec::new(),
+            archive: std::collections::BTreeMap::new(),
+            checkpoint_archive_budget: DEFAULT_CHECKPOINT_ARCHIVE_BYTES,
+            checkpoint_span_budget: DEFAULT_CHECKPOINT_SPAN_BYTES,
         }
     }
 
@@ -611,9 +746,49 @@ impl AgentSession {
     /// Load the session from a JSON string.
     pub fn restore_from_json(&mut self, json: &str) -> Result<(), std::io::Error> {
         let restored: AgentSession = serde_json::from_str(json).map_err(std::io::Error::other)?;
+        // Validate before mutating: a rejected file must leave the caller's
+        // session exactly as it was.
+        if restored.schema_version > SESSION_SCHEMA_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "session schema {} is newer than this build supports ({SESSION_SCHEMA_VERSION})",
+                    restored.schema_version
+                ),
+            ));
+        }
+        for checkpoint in &restored.checkpoints {
+            if checkpoint.source_omitted {
+                continue;
+            }
+            let intact = if checkpoint.source_archived {
+                restored.archive.contains_key(&checkpoint.source_digest)
+            } else {
+                checkpoint.source_is_intact()
+            };
+            if !intact {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "checkpoint at source {}..{} failed its source check",
+                        checkpoint.source_start, checkpoint.source_end
+                    ),
+                ));
+            }
+        }
         self.messages = restored.messages;
         self.context = restored.context;
         self.metadata = restored.metadata;
+        self.schema_version = if restored.schema_version == 0 {
+            // Generation 1 files predate the field; adopt the current schema.
+            SESSION_SCHEMA_VERSION
+        } else {
+            restored.schema_version
+        };
+        self.checkpoints = restored.checkpoints;
+        self.archive = restored.archive;
+        self.checkpoint_archive_budget = restored.checkpoint_archive_budget;
+        self.checkpoint_span_budget = restored.checkpoint_span_budget;
         Ok(())
     }
 
@@ -782,11 +957,66 @@ impl AgentSession {
         if !checkpoint.source_is_intact() {
             return false;
         }
+        let Some(source) = self.checkpoint_source(index).map(<[Message]>::to_vec) else {
+            return false;
+        };
         let mut restored = checkpoint.head.clone();
-        restored.extend(checkpoint.source_span.clone());
+        restored.extend(source);
         restored.extend(checkpoint.retained_tail.clone());
         self.restore_messages(restored);
         true
+    }
+
+    /// The preserved source span for checkpoint `index`, from the archive or a
+    /// legacy inline copy (issue #424).
+    pub fn checkpoint_source(&self, index: usize) -> Option<&[Message]> {
+        let checkpoint = self.checkpoints.get(index)?;
+        if checkpoint.source_archived {
+            self.archive
+                .get(&checkpoint.source_digest)
+                .map(Vec::as_slice)
+        } else {
+            Some(checkpoint.source_span.as_slice())
+        }
+    }
+
+    /// Bytes currently retained by checkpoint source archives, including legacy
+    /// inline spans.
+    pub fn archive_bytes(&self) -> usize {
+        let archived: usize = self
+            .archive
+            .values()
+            .map(|messages| {
+                serde_json::to_vec(messages)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        let inline: usize = self
+            .checkpoints
+            .iter()
+            .filter(|checkpoint| !checkpoint.source_span.is_empty())
+            .map(|checkpoint| {
+                serde_json::to_vec(&checkpoint.source_span)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        archived + inline
+    }
+
+    /// Whether the archive is over its configured budget because the newest
+    /// checkpoint is the only recoverable copy (the trade-off is reported, not
+    /// hidden).
+    pub fn archive_budget_exceeded(&self) -> bool {
+        self.archive_bytes() > self.checkpoint_archive_budget
+    }
+
+    /// Set the archive and per-checkpoint span budgets (issue #424).
+    pub fn with_checkpoint_budgets(mut self, archive_bytes: usize, span_bytes: usize) -> Self {
+        self.checkpoint_archive_budget = archive_bytes;
+        self.checkpoint_span_budget = span_bytes;
+        self
     }
 
     /// Put one checkpoint, framed in tags, in place of `removed` and ahead of
@@ -813,19 +1043,38 @@ impl AgentSession {
             .map(|name| (*name).to_string())
             .collect();
         let complete = missing_sections.is_empty();
+        let digest = digest_messages(&removed);
+        let span_bytes = serde_json::to_vec(&removed)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        // Refer the source span once, keyed by digest, instead of copying it
+        // into every checkpoint. A span over its budget is explicitly omitted
+        // and marked unrecoverable (issue #424).
+        let (source_span, source_archived, source_omitted, recoverable) =
+            if span_bytes > self.checkpoint_span_budget {
+                (Vec::new(), false, true, false)
+            } else {
+                self.archive
+                    .entry(digest.clone())
+                    .or_insert_with(|| removed.clone());
+                (Vec::new(), true, false, true)
+            };
         let record = Checkpoint {
             model,
             created_at: current_timestamp(),
             source_start,
             source_end,
-            source_digest: digest_messages(&removed),
-            source_span: removed.clone(),
+            source_digest: digest,
+            source_span,
             retained_tail: recent.clone(),
             head: self.messages[..head].to_vec(),
             summary: summary.to_string(),
             sections,
             missing_sections,
             complete,
+            source_archived,
+            source_omitted,
+            recoverable,
         };
         let mut compacted: Vec<Message> = self.messages[..head].to_vec();
         compacted.push(checkpoint_message);
@@ -834,9 +1083,7 @@ impl AgentSession {
         // Bound the archive so a long session cannot grow without limit; the
         // newest checkpoints are the ones a rebuild is likely to need.
         self.checkpoints.push(record);
-        if self.checkpoints.len() > 8 {
-            self.checkpoints.remove(0);
-        }
+        self.prune_checkpoints();
 
         match &mut self.context {
             JsonValue::Object(map) => {
@@ -857,6 +1104,31 @@ impl AgentSession {
         }
         self.update_metadata();
         removed.len()
+    }
+
+    /// Retain at most eight checkpoints and the configured archive bytes,
+    /// evicting oldest first. The newest checkpoint is never evicted, so the
+    /// only recoverable copy of the most recent fold is preserved (issue #424).
+    fn prune_checkpoints(&mut self) {
+        while self.checkpoints.len() > 8 {
+            let oldest = self.checkpoints.remove(0);
+            self.drop_archive_if_unreferenced(&oldest);
+        }
+        while self.archive_bytes() > self.checkpoint_archive_budget && self.checkpoints.len() > 1 {
+            let oldest = self.checkpoints.remove(0);
+            self.drop_archive_if_unreferenced(&oldest);
+        }
+    }
+
+    /// Drop an archived span once no surviving checkpoint references it.
+    fn drop_archive_if_unreferenced(&mut self, checkpoint: &Checkpoint) {
+        if !self
+            .checkpoints
+            .iter()
+            .any(|other| other.source_digest == checkpoint.source_digest)
+        {
+            self.archive.remove(&checkpoint.source_digest);
+        }
     }
 
     /// Summarize all but the most recent `keep_recent` messages and prepend a summary.
@@ -2231,7 +2503,11 @@ mod budget_tests {
 
         let checkpoint = session.checkpoints().last().expect("checkpoint").clone();
         assert_eq!(checkpoint.model.as_deref(), Some("vendor/model-1"));
-        assert_eq!(checkpoint.source_span.len(), replaced);
+        let index = session.checkpoints().len() - 1;
+        assert_eq!(
+            session.checkpoint_source(index).map(<[Message]>::len),
+            Some(replaced)
+        );
         assert_eq!(checkpoint.source_start, 1, "the system head is not source");
         assert_eq!(checkpoint.source_end, 1 + replaced);
         assert!(checkpoint.source_is_intact());
@@ -2247,6 +2523,132 @@ mod budget_tests {
         );
     }
 
+    /// Restoring a saved session restores its checkpoints and validates the
+    /// schema generation (issue #419).
+    #[test]
+    fn a_checkpoint_survives_restore_from_json() {
+        let mut session = AgentSession::new();
+        for index in 0..4 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        assert!(session.install_priced_checkpoint(0, "summary") > 0);
+        let json = session.to_json_string().expect("serializes");
+        let mut restored = AgentSession::new();
+        restored.restore_from_json(&json).expect("restores");
+        assert_eq!(restored.schema_version, SESSION_SCHEMA_VERSION);
+        assert_eq!(restored.checkpoints().len(), 1, "checkpoint survives");
+        let index = restored.checkpoints().len() - 1;
+        assert!(restored.restore_checkpoint(index), "it can still rebuild");
+    }
+
+    /// A tampered checkpoint or an unknown newer schema is rejected before the
+    /// target session is mutated (issue #419).
+    #[test]
+    fn a_tampered_or_future_session_is_rejected_without_mutation() {
+        let mut session = AgentSession::new();
+        for index in 0..4 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        assert!(session.install_priced_checkpoint(0, "summary") > 0);
+        let json = session.to_json_string().expect("serializes");
+
+        let mut tampered: serde_json::Value = serde_json::from_str(&json).expect("json");
+        tampered["checkpoints"][0]["source_digest"] = serde_json::json!("00");
+        let mut target = AgentSession::new();
+        target.add_user("keep me".to_string());
+        let error = target
+            .restore_from_json(&tampered.to_string())
+            .expect_err("tampered checkpoint refused");
+        assert!(error.to_string().contains("source check"), "{error}");
+        assert_eq!(
+            target.messages().len(),
+            1,
+            "the rejected restore left the target untouched"
+        );
+
+        let mut future: serde_json::Value = serde_json::from_str(&json).expect("json");
+        future["schema_version"] = serde_json::json!(SESSION_SCHEMA_VERSION + 1);
+        let error = target
+            .restore_from_json(&future.to_string())
+            .expect_err("future schema refused");
+        assert!(error.to_string().contains("newer"), "{error}");
+    }
+
+    /// Identical source spans are stored once in the archive, not copied into
+    /// every checkpoint (issue #424).
+    #[test]
+    fn repeated_identical_spans_are_archived_once() {
+        let mut session = AgentSession::new();
+        for index in 0..4 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        assert!(session.install_priced_checkpoint(0, "summary") > 0);
+        let first_bytes = session.archive_bytes();
+        assert!(first_bytes > 0);
+        assert!(session.checkpoints()[0].source_archived);
+        assert!(session.checkpoints()[0].source_span.is_empty());
+
+        assert!(session.restore_checkpoint(0));
+        assert!(session.install_priced_checkpoint(0, "summary") > 0);
+        assert_eq!(
+            session.archive_bytes(),
+            first_bytes,
+            "the same span is referenced, not copied again"
+        );
+        assert_eq!(session.archive.len(), 1, "one archived span");
+        assert_eq!(session.checkpoints().len(), 2);
+    }
+
+    /// The archive is bounded by bytes, evicts oldest checkpoints first, and
+    /// never evicts the newest recoverable copy (issue #424).
+    #[test]
+    fn the_archive_is_byte_bounded_and_keeps_the_newest_span() {
+        let mut session = AgentSession::new().with_checkpoint_budgets(1, usize::MAX);
+        for index in 0..4 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        assert!(session.install_priced_checkpoint(0, "first") > 0);
+        assert!(session.archive_budget_exceeded());
+        assert_eq!(session.checkpoints().len(), 1, "the only copy is kept");
+
+        session.add_user("more".to_string());
+        session.add_assistant("more reply".to_string());
+        assert!(session.install_priced_checkpoint(0, "second") > 0);
+        assert_eq!(
+            session.checkpoints().len(),
+            1,
+            "the older checkpoint was evicted"
+        );
+        let newest = session.checkpoints()[0].clone();
+        assert!(newest.recoverable);
+        assert!(
+            session.restore_checkpoint(0),
+            "the newest span is still recoverable"
+        );
+    }
+
+    /// A span over its per-checkpoint budget is explicitly omitted and marked
+    /// unrecoverable, not silently truncated (issue #424).
+    #[test]
+    fn an_over_budget_span_is_explicitly_unrecoverable() {
+        let mut session = AgentSession::new().with_checkpoint_budgets(usize::MAX, 1);
+        for index in 0..4 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        assert!(session.install_priced_checkpoint(0, "summary") > 0);
+        let checkpoint = session.checkpoints().last().expect("checkpoint");
+        assert!(checkpoint.source_omitted);
+        assert!(!checkpoint.recoverable);
+        assert!(!checkpoint.source_is_intact());
+        assert!(!session.restore_checkpoint(0));
+        assert_eq!(session.archive_bytes(), 0);
+    }
+
     /// A checkpoint whose preserved span no longer matches its digest is
     /// refused rather than rebuilding from corrupt history (issue #413).
     #[test]
@@ -2258,6 +2660,9 @@ mod budget_tests {
         }
         let replaced = session.install_priced_checkpoint(0, "summary");
         assert!(replaced > 0);
+        // Force the legacy inline path with a tampered span: the digest no
+        // longer matches, so the rebuild is refused.
+        session.checkpoints[0].source_archived = false;
         session.checkpoints[0].source_span.clear();
         assert!(!session.restore_checkpoint(0));
     }

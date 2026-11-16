@@ -402,6 +402,9 @@ impl Runner {
                     .ok()
                     .filter(|value| !value.is_empty())
                     .map(String::into_bytes);
+                let content_key_id = std::env::var("BSH_CONTEXT_CONTENT_KEY_ID")
+                    .ok()
+                    .filter(|value| !value.is_empty());
                 // The persona is private text, so its version input is a keyed
                 // digest when a key is configured, and a coarse length label
                 // otherwise: the log never carries an unkeyed persona hash.
@@ -431,11 +434,16 @@ impl Runner {
                 let snapshot = crate::context_assembly::AssemblySnapshot::build(
                     blocks,
                     versions,
-                    content_key.as_deref(),
+                    content_key
+                        .as_deref()
+                        .map(|key| (key, content_key_id.as_deref())),
                 );
                 // Inject from the immutable snapshot, after the checkpoint and
-                // before the first request.
+                // before the first request. The same snapshot becomes the
+                // typed request the engine attaches to every provider call
+                // (issue #421).
                 crate::context::inject_snapshot(&agent, &snapshot);
+                agent.set_provider_request(Some(snapshot.typed_provider_request()));
 
                 // Per-request assembly diagnostics (issues #336/#346): counts,
                 // labels and token estimates derived from the typed assembly,
@@ -776,7 +784,16 @@ mod tests {
             _session: &mut agent::agent::AgentSession,
             _context: &mut agent::agent::AgentReactContext,
         ) -> react::llm::LlmResponseResult {
-            Ok(summary_response("## Current Work\n- auto checkpoint"))
+            Ok(summary_response(
+                "## Primary Request and Intent\n- finish the turn\n\n\
+                 ## Key Technical Concepts\n- compaction\n\n\
+                 ## Files and Code\n- runner\n\n\
+                 ## Errors and Fixes\n- none\n\n\
+                 ## Pending Jobs\n- none\n\n\
+                 ## Current Work\n- auto checkpoint\n\n\
+                 ## Next Step\n- stream\n\n\
+                 ## Critical Context\n- auto checkpoint",
+            ))
         }
 
         async fn stream_complete(

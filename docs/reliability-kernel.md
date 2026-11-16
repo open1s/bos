@@ -203,9 +203,26 @@ A deterministic smoke subset lives in `crates/agent/src/agent/agentic/tests.rs`
 and is driven by the checked-in corpus
 `crates/agent/src/agent/agentic/reliability_corpus.json` (version 1). It covers
 constraint retention through compaction, explicit contradictory decisions, and
-checkpoint recovery across a restart boundary; no provider credentials or
-network are used. An on-demand long-history variant is marked `#[ignore]` and
-runs with `cargo test -p agent --lib reliability_horizon_extended -- --ignored`.
+checkpoint recovery across a restart boundary, rejection of a lossy checkpoint,
+and byte-bounded archive storage; no provider credentials or network are used.
+An on-demand long-history variant is marked `#[ignore]` and runs with
+`cargo test -p agent --lib reliability_horizon_extended -- --ignored`.
+
+The harness reports counters for constraint retention, conflict visibility,
+recovery, rejected lossy checkpoints and archive bytes. The task-side scenarios
+(contract creation, attempt-bound verification, safe retry, sandboxed verifier)
+are covered by the task suites in `crates/bsh`.
+
+## Session schema and checkpoint archive (issues #419, #424)
+
+Serialized sessions carry a schema generation (current 3) and are validated
+before mutation: a newer schema or a checkpoint whose archived source is missing
+is rejected, leaving the caller's session unchanged. Checkpoint source spans are
+stored once in a digest-keyed archive and referenced by checkpoints. The archive
+has a total byte budget and a per-span budget; over-budget spans are explicitly
+omitted and marked unrecoverable, eviction is oldest-first and never removes the
+newest checkpoint, and the trade-off is reported through `archive_bytes` and
+`archive_budget_exceeded`.
 
 ## 9. Compatibility policies
 

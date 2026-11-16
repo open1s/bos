@@ -12,6 +12,14 @@
     {
       "id": "restart_preserves_checkpoint",
       "description": "Checkpoint and rebuilt history survive serialization"
+    },
+    {
+      "id": "lossy_checkpoint_rejected",
+      "description": "A summary missing required sections is rejected and leaves history intact"
+    },
+    {
+      "id": "checkpoint_archive_bounded",
+      "description": "A successful checkpoint stores its source by reference within budget"
     }
   ]
 }

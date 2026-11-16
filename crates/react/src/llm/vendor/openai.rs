@@ -1256,6 +1256,7 @@ mod tests {
             api_mode: crate::llm::ApiMode::Chat,
             request_id: None,
             intent: Default::default(),
+            provider_request: None,
         };
         let outcome = vendor
             .complete(

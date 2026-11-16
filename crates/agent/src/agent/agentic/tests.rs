@@ -3498,7 +3498,7 @@ async fn a_custom_prefix_honors_the_anthropic_protocol_on_the_wire() {
 /// checkpoint, replacing the older span and keeping the newest message.
 #[tokio::test]
 async fn compact_now_installs_a_model_written_checkpoint() {
-    let agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    let agent = agent_with_summary("mock response");
     {
         let mut session = agent.session();
         // Long enough that the framed checkpoint (the preamble alone is ~75
@@ -3515,7 +3515,12 @@ async fn compact_now_installs_a_model_written_checkpoint() {
         .expect("the compaction request")
         .expect("a checkpoint");
     assert_eq!(outcome.replaced, 3, "all but the last message");
-    assert_eq!(outcome.summary, "mock response");
+    assert!(
+        outcome.summary.contains("mock response")
+            && outcome.summary.contains("## Critical Context"),
+        "a complete summary is recorded: {}",
+        outcome.summary
+    );
     let session = agent.session();
     assert_eq!(
         session.messages().len(),
@@ -3540,6 +3545,63 @@ async fn compact_now_installs_a_model_written_checkpoint() {
         ),
         "the newest message is kept verbatim"
     );
+}
+
+/// A summary missing required sections is rejected before installation and
+/// the history is left untouched (issue #420).
+#[tokio::test]
+async fn compact_now_refuses_a_summary_missing_required_sections() {
+    let agent = agent_with_summary("## Primary Request and Intent\n- work");
+    four_messages(&agent);
+    let before = agent.session().messages().len();
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("missing sections are rejected");
+    assert!(
+        matches!(
+            error,
+            AgentError::Compaction(CompactionFailure::IncompleteCheckpoint { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        agent.session().messages().len(),
+        before,
+        "the history was not replaced"
+    );
+    assert!(agent.session().checkpoints().is_empty());
+}
+
+/// An explicit constraint in the shadowed span must survive into the summary;
+/// dropping it rejects the checkpoint (issue #420).
+#[tokio::test]
+async fn compact_now_refuses_a_summary_that_drops_an_explicit_constraint() {
+    let agent = agent_with_summary(&complete_summary("- no constraints retained"));
+    four_messages(&agent);
+    agent
+        .session()
+        .add_user("CONSTRAINT: never force-push to main".to_string());
+    agent.session().add_assistant("Understood.".to_string());
+    let before = agent.session().messages().len();
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("a dropped constraint is rejected");
+    assert!(
+        matches!(
+            error,
+            AgentError::Compaction(CompactionFailure::IncompleteCheckpoint { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("constraint"),
+        "the refusal names the dropped constraint: {error}"
+    );
+    assert_eq!(agent.session().messages().len(), before);
 }
 
 /// The overflow request carries the pinned compaction instruction, not a copy
@@ -3641,11 +3703,34 @@ impl LlmClient<AgentSession, AgentReactContext> for FixedSummaryMock {
     }
 }
 
+/// A complete checkpoint summary for the semantic gate: every required
+/// section, with the caller's Critical Context.
+fn complete_summary(critical: &str) -> String {
+    format!(
+        "## Primary Request and Intent\n- complete the work\n\n\
+         ## Key Technical Concepts\n- rust\n\n\
+         ## Files and Code\n- crates/agent\n\n\
+         ## Errors and Fixes\n- none\n\n\
+         ## Pending Jobs\n- none\n\n\
+         ## Current Work\n- testing\n\n\
+         ## Next Step\n- continue\n\n\
+         ## Critical Context\n{critical}"
+    )
+}
+
+fn ensure_complete(summary: &str) -> String {
+    if summary.trim().is_empty() || summary.contains("## ") {
+        summary.to_string()
+    } else {
+        complete_summary(summary)
+    }
+}
+
 fn agent_with_summary(summary: &str) -> Agent {
     let mut provider = LlmProvider::new();
     provider.register_vendor(
         "mock".to_string(),
-        Box::new(FixedSummaryMock(summary.to_string())),
+        Box::new(FixedSummaryMock(ensure_complete(summary))),
     );
     Agent::new(AgentConfig::default(), Arc::new(provider))
 }
@@ -3679,7 +3764,7 @@ impl LlmClient<AgentSession, AgentReactContext> for ScriptedSummaryMock {
         };
         self.seen.lock().unwrap().push(text);
         match &self.answer {
-            Ok(summary) => Ok(make_text_response(summary.clone())),
+            Ok(summary) => Ok(make_text_response(ensure_complete(summary))),
             Err(error) => Err(error.clone()),
         }
     }
@@ -4357,6 +4442,8 @@ struct ReliabilityMetrics {
     constraint_retention: usize,
     conflict_visibility: usize,
     recovery: usize,
+    lossy_checkpoint_rejected: usize,
+    archive_bytes: usize,
 }
 
 fn debug_messages(messages: &[react::llm::LlmMessage]) -> String {
@@ -4372,6 +4459,8 @@ async fn reliability_horizon_smoke_subset() {
             "constraint_survives_compaction".to_string(),
             "conflicting_decisions_visible".to_string(),
             "restart_preserves_checkpoint".to_string(),
+            "lossy_checkpoint_rejected".to_string(),
+            "checkpoint_archive_bounded".to_string(),
         ],
         "the checked-in corpus is the scenario list this smoke run executes"
     );
@@ -4379,7 +4468,7 @@ async fn reliability_horizon_smoke_subset() {
 
     // Scenario 1: an explicit user constraint survives compaction in the
     // recoverable source span, and a rebuild restores it.
-    let agent = agent_with_summary("summary keeps the work");
+    let agent = agent_with_summary(&complete_summary("- CONSTRAINT: never force-push to main"));
     four_messages(&agent);
     {
         let mut session = agent.session();
@@ -4399,7 +4488,17 @@ async fn reliability_horizon_smoke_subset() {
         "the checkpoint records the model that wrote it"
     );
     assert!(checkpoint.source_is_intact(), "the source digest matches");
-    let source = debug_messages(&checkpoint.source_span);
+    let index = {
+        let session = agent.session();
+        session.checkpoints().len() - 1
+    };
+    let source = {
+        let session = agent.session();
+        session
+            .checkpoint_source(index)
+            .map(debug_messages)
+            .unwrap_or_default()
+    };
     assert!(
         source.contains("CONSTRAINT: never force-push to main"),
         "the constraint is preserved in the source span: {source}"
@@ -4420,7 +4519,7 @@ async fn reliability_horizon_smoke_subset() {
 
     // Scenario 2: contradictory decisions remain explicitly present in the
     // recoverable source instead of being silently resolved by the summary.
-    let agent = agent_with_summary("decisions were merged");
+    let agent = agent_with_summary(&complete_summary("- DECISION A and B recorded"));
     four_messages(&agent);
     {
         let mut session = agent.session();
@@ -4434,8 +4533,18 @@ async fn reliability_horizon_smoke_subset() {
         .await
         .expect("compaction runs")
         .expect("a checkpoint");
-    let checkpoint = outcome.checkpoint.expect("checkpoint metadata");
-    let source = debug_messages(&checkpoint.source_span);
+    let _checkpoint = outcome.checkpoint.expect("checkpoint metadata");
+    let index = {
+        let session = agent.session();
+        session.checkpoints().len() - 1
+    };
+    let source = {
+        let session = agent.session();
+        session
+            .checkpoint_source(index)
+            .map(debug_messages)
+            .unwrap_or_default()
+    };
     assert!(source.contains("DECISION A"), "{source}");
     assert!(source.contains("DECISION B"), "{source}");
     metrics.conflict_visibility += 1;
@@ -4456,11 +4565,52 @@ async fn reliability_horizon_smoke_subset() {
     assert!(reloaded.restore_checkpoint(0), "restore after restart");
     metrics.recovery += 1;
 
-    metrics.scenarios = 3;
-    assert_eq!(metrics.scenarios, 3);
+    // Scenario 4: a lossy checkpoint is rejected before it can replace the
+    // history, so an unsupported claim never becomes the active record.
+    let agent = agent_with_summary("## Primary Request and Intent\n- only one section");
+    four_messages(&agent);
+    let before = agent.session().messages().len();
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("lossy checkpoint rejected");
+    assert!(
+        matches!(
+            error,
+            AgentError::Compaction(CompactionFailure::IncompleteCheckpoint { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(agent.session().messages().len(), before);
+    metrics.lossy_checkpoint_rejected += 1;
+
+    // Scenario 5: the source span is archived by reference and the archive is
+    // inside its byte budget.
+    let agent = agent_with_summary(&complete_summary("- budgeted archive"));
+    four_messages(&agent);
+    let outcome = agent
+        .compact_now(0, &signal)
+        .await
+        .expect("compaction runs")
+        .expect("a checkpoint");
+    let checkpoint = outcome.checkpoint.expect("checkpoint");
+    assert!(checkpoint.source_archived);
+    assert!(checkpoint.recoverable);
+    let archive_bytes = {
+        let session = agent.session();
+        assert!(!session.archive_budget_exceeded());
+        session.archive_bytes()
+    };
+    assert!(archive_bytes > 0);
+    metrics.archive_bytes = archive_bytes;
+
+    metrics.scenarios = 5;
+    assert_eq!(metrics.scenarios, 5);
     assert_eq!(metrics.constraint_retention, 1);
     assert_eq!(metrics.conflict_visibility, 1);
     assert_eq!(metrics.recovery, 2);
+    assert_eq!(metrics.lossy_checkpoint_rejected, 1);
+    assert!(metrics.archive_bytes > 0);
 }
 
 /// On-demand larger run: a long history crosses the compaction boundary and
@@ -4469,7 +4619,9 @@ async fn reliability_horizon_smoke_subset() {
 #[tokio::test]
 #[ignore = "on-demand long-horizon run: cargo test -p agent --lib reliability_horizon_extended -- --ignored"]
 async fn reliability_horizon_extended_long_history() {
-    let agent = agent_with_summary("long summary");
+    let agent = agent_with_summary(&complete_summary(
+        "- CONSTRAINT: keep the public API stable",
+    ));
     {
         let mut session = agent.session();
         for index in 0..20 {
@@ -4485,8 +4637,18 @@ async fn reliability_horizon_extended_long_history() {
         .await
         .expect("compaction runs")
         .expect("a checkpoint");
-    let checkpoint = outcome.checkpoint.expect("checkpoint");
-    let source = format!("{:?}", checkpoint.source_span);
+    let _checkpoint = outcome.checkpoint.expect("checkpoint");
+    let index = {
+        let session = agent.session();
+        session.checkpoints().len() - 1
+    };
+    let source = {
+        let session = agent.session();
+        session
+            .checkpoint_source(index)
+            .map(debug_messages)
+            .unwrap_or_default()
+    };
     assert!(
         source.contains("CONSTRAINT: keep the public API stable"),
         "the constraint survives a long history"

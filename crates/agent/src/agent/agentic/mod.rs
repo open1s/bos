@@ -344,6 +344,10 @@ pub struct Agent {
     /// action contract; `Unknown` leaves the behaviour unchanged.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     action_intent: std::sync::Mutex<ActionIntent>,
+    /// The immutable typed request the host assembled for this turn
+    /// (issue #421). The same snapshot feeds diagnostics and the request.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    provider_request: std::sync::Mutex<Option<react::llm::ProviderRequest>>,
     /// Token usage from auxiliary requests this agent made on the host's
     /// behalf (the model-assisted intent classifier).
     ///
@@ -489,6 +493,7 @@ impl Agent {
             config,
             context_budget: 0,
             action_intent: std::sync::Mutex::new(ActionIntent::Unknown),
+            provider_request: std::sync::Mutex::new(None),
             auxiliary_usage: std::sync::Mutex::new(react::telemetry::TokenUsage::default()),
             llm,
             registry: Some(Arc::new(ToolRegistry::new())),
@@ -594,6 +599,41 @@ impl Agent {
             .lock()
             .map(|intent| *intent)
             .unwrap_or_default()
+    }
+
+    /// Attach the immutable typed request for this turn (issue #421).
+    ///
+    /// One snapshot feeds diagnostics and every request's `provider_request`
+    /// field, so the recorded request cannot drift from the assembly report.
+    pub fn set_provider_request(&self, request: Option<react::llm::ProviderRequest>) {
+        if let Ok(mut slot) = self.provider_request.lock() {
+            *slot = request;
+        }
+    }
+
+    /// The typed request currently attached to this agent, if any.
+    pub fn provider_request(&self) -> Option<react::llm::ProviderRequest> {
+        self.provider_request
+            .lock()
+            .ok()
+            .and_then(|request| request.clone())
+    }
+
+    /// Complete the typed request with the exact system prompt, history, model
+    /// and advertised tools of the call being built (issue #421). The returned
+    /// value describes the request the provider will receive, not only the
+    /// context metadata.
+    pub fn describe_provider_request(
+        &self,
+        system_prompt: &str,
+        tools: &[react::llm::LlmTool],
+    ) -> Option<react::llm::ProviderRequest> {
+        let mut request = self.provider_request()?;
+        request.model = self.config.model.clone();
+        request.system_prompt = Some(system_prompt.to_string());
+        request.messages = self.session().messages().to_vec();
+        request.tool_names = tools.iter().map(|tool| tool.name.clone()).collect();
+        Some(request)
     }
 
     /// Ask the configured model to classify one reader message.
@@ -2300,6 +2340,7 @@ impl Clone for Agent {
             config: self.config.clone(),
             context_budget: self.context_budget,
             action_intent: std::sync::Mutex::new(self.action_intent()),
+            provider_request: std::sync::Mutex::new(self.provider_request()),
             auxiliary_usage: std::sync::Mutex::new(react::telemetry::TokenUsage::default()),
             llm: self.llm.clone(),
             registry: self.registry.clone(),

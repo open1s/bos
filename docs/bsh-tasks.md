@@ -116,11 +116,23 @@ Status rules:
   verification is pending is forbidden.
 
 Verification execution: a task's `verification_contract` is run by the host
-runtime after a successful settle — a command through the host shell with a
+runtime after a successful settle. The contract is created through
+`task_create`'s structured `verification_contract` field (command, artifact,
+review or human) and is validated before execution; peer-owned tasks cannot
+carry a local contract. Each report names the immutable attempt that produced
+it, task-level status is derived from the current attempt, and a retry starts a
+new pending attempt without reusing the prior report. A successful execution
+whose verification is still owed is not blindly retried.
+ — a command through the host shell with a
 60-second deadline, or an artifact existence/digest check. Review and human
 contracts need an external approval reference and conclude `inconclusive`;
 they are never satisfied by model self-attestation. A passed report is only
 accepted when it names a non-model verifier and carries evidence.
+
+The verifier command runs through the turn's controlled shell (the same
+sandbox, policy, working directory and resource limits as normal execution),
+not a parallel host-shell path. Artifact paths are confined to the task
+workspace and resolved through symlinks, so a relative path cannot escape it.
 
 ## Tiers and dispatch
 

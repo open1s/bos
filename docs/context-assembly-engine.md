@@ -112,6 +112,17 @@ list at this layer), the session id (not known to the assembly call), and the
 content of persona, workspace and memory blocks from the composition identity.
 Logs distinguish the two values; the content one is `-` unless keyed.
 
+### Typed provider request (issue #421)
+
+Every provider call carries an immutable `ProviderRequest` built from the same
+snapshot as the assembly report: composition/content/execution identities, the
+content key id, the block manifest, and each block's source/trust/provenance and
+token estimate. It is attached to the request but never serialized to the
+provider; adapters flatten it into roles and text, and a recording provider can
+prove the wire request came from that snapshot. A content edit cannot change the
+execution identity, and a key rotation changes only the content identity while
+recording the new key id.
+
 ### Adapter flattening (documented)
 
 A provider protocol here carries only roles and text, so the host uses an

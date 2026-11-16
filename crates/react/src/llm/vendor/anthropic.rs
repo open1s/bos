@@ -737,6 +737,7 @@ mod tests {
             api_mode: ApiMode::Anthropic,
             request_id: None,
             intent: Default::default(),
+            provider_request: None,
         }
     }
 

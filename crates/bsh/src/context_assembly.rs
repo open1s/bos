@@ -233,22 +233,32 @@ pub(crate) struct SourceVersions {
 /// low-entropy private blocks cannot be recovered by hashing guesses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContextFingerprint {
+    /// The identity format generation (issue #422).
+    pub(crate) version: u32,
     /// A stable composition identity (SHA-256, lowercase hex).
     pub(crate) composition: String,
     /// A keyed content identity, when a key was supplied.
     pub(crate) content: Option<String>,
+    /// A non-content execution identity: provider, tool guidance, turn and
+    /// session (issue #422).
+    pub(crate) execution: String,
+    /// The key id used for the content identity, so a rotation is visible.
+    pub(crate) content_key_id: Option<String>,
 }
+
+/// The current request-identity format (issue #422).
+pub(crate) const CONTEXT_FINGERPRINT_VERSION: u32 = 2;
 
 impl ContextFingerprint {
     /// Compute both identities; `content_key` enables the content one.
     pub(crate) fn compute(
         blocks: &[ContextBlock],
         versions: &SourceVersions,
-        content_key: Option<&[u8]>,
+        content_key: Option<(&[u8], Option<&str>)>,
     ) -> Self {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(b"bsh-context-composition-v1\0");
+        hasher.update(b"bsh-context-composition-v2\0");
         for block in blocks {
             hash_part(&mut hasher, block.source.label().as_bytes());
             hash_part(&mut hasher, trust_label(block.trust).as_bytes());
@@ -276,7 +286,25 @@ impl ContextFingerprint {
         );
         let composition = hex(&hasher.finalize());
 
-        let content = content_key.map(|key| {
+        let mut execution_hasher = Sha256::new();
+        execution_hasher.update(b"bsh-context-execution-v2\0");
+        for part in [
+            versions.provider.as_deref(),
+            versions.tool_guidance.as_deref(),
+            versions.session.as_deref(),
+        ] {
+            hash_part(&mut execution_hasher, part.unwrap_or("").as_bytes());
+        }
+        hash_part(
+            &mut execution_hasher,
+            &versions.turn.unwrap_or_default().to_le_bytes(),
+        );
+        let execution = hex(&execution_hasher.finalize());
+
+        let content_key_id = content_key
+            .as_ref()
+            .and_then(|(_, key_id)| key_id.map(str::to_string));
+        let content = content_key.map(|(key, _)| {
             let mut payload = Vec::new();
             for block in blocks {
                 payload.extend_from_slice(block.source.label().as_bytes());
@@ -289,8 +317,11 @@ impl ContextFingerprint {
             hmac_sha256(key, &payload)
         });
         Self {
+            version: CONTEXT_FINGERPRINT_VERSION,
             composition,
             content,
+            execution,
+            content_key_id,
         }
     }
 
@@ -384,13 +415,9 @@ pub(crate) struct ContextBlock {
 impl ContextBlock {
     /// The explicit provider encoding for a protocol that cannot carry typed
     /// roles (issue #411): the block's own text, followed by a machine-readable
-    /// source/trust footer. The footer is generated from the typed block, so
-    /// the request text cannot drift from the snapshot.
-    pub(crate) fn provider_text(&self) -> String {
-        self.provider_text_with(None)
-    }
-
-    /// [`Self::provider_text`], optionally carrying the request manifest.
+    /// source/trust footer, optionally carrying the request manifest. The
+    /// footer is generated from the typed block, so the request text cannot
+    /// drift from the snapshot.
     pub(crate) fn provider_text_with(&self, manifest: Option<&str>) -> String {
         let mut text = self.text.clone();
         if let Some(manifest) = manifest {
@@ -425,7 +452,7 @@ impl AssemblySnapshot {
     pub(crate) fn build(
         blocks: Vec<ContextBlock>,
         versions: SourceVersions,
-        content_key: Option<&[u8]>,
+        content_key: Option<(&[u8], Option<&str>)>,
     ) -> Self {
         let fingerprint = ContextFingerprint::compute(&blocks, &versions, content_key);
         Self {
@@ -437,6 +464,30 @@ impl AssemblySnapshot {
     /// The blocks, in composition order.
     pub(crate) fn blocks(&self) -> &[ContextBlock] {
         &self.blocks
+    }
+
+    /// The immutable typed request built from this snapshot (issue #421).
+    /// The recording seam and diagnostics read the same fields, so a provider
+    /// request cannot be assembled from a second, drifting path.
+    pub(crate) fn typed_provider_request(&self) -> react::llm::ProviderRequest {
+        react::llm::ProviderRequest {
+            composition: self.fingerprint.composition.clone(),
+            content: self.fingerprint.content.clone(),
+            execution: self.fingerprint.execution.clone(),
+            content_key_id: self.fingerprint.content_key_id.clone(),
+            manifest: self.provider_manifest(),
+            sources: self
+                .blocks
+                .iter()
+                .map(|block| react::llm::ProviderRequestSource {
+                    source: block.source.label().to_string(),
+                    trust: trust_label(block.trust).to_string(),
+                    provenance: block.provenance.clone(),
+                    tokens: block.token_estimate,
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 
     /// A machine-readable manifest of every block's identity, trust,
@@ -690,21 +741,59 @@ mod tests {
             tool_guidance: Some("tool-guidance@1".to_string()),
             ..SourceVersions::default()
         };
-        let a = ContextFingerprint::compute(&blocks, &versions, Some(b"test-key"));
-        let b = ContextFingerprint::compute(&blocks, &versions, Some(b"test-key"));
-        assert_eq!(a, b, "equivalent inputs share both identities");
+        let a = ContextFingerprint::compute(&blocks, &versions, Some((b"test-key", None)));
+        let b = ContextFingerprint::compute(&blocks, &versions, Some((b"test-key", None)));
+        assert_eq!(a, b, "equivalent inputs share every identity");
+        assert_eq!(a.version, CONTEXT_FINGERPRINT_VERSION);
         assert!(a.content.is_some());
+        assert!(!a.execution.is_empty());
+        assert_eq!(a.content_key_id, None, "no key id without an explicit id");
+
+        // Key rotation changes the content identity and is visible in the id;
+        // the composition and execution identities stay stable (issue #422).
+        let keyed =
+            ContextFingerprint::compute(&blocks, &versions, Some((b"test-key", Some("k1"))));
+        assert_eq!(keyed.content_key_id.as_deref(), Some("k1"));
+        assert_eq!(keyed.content, a.content);
+        let rotated =
+            ContextFingerprint::compute(&blocks, &versions, Some((b"other-key", Some("k2"))));
+        assert_ne!(keyed.content, rotated.content);
+        assert_eq!(keyed.content_key_id.as_deref(), Some("k1"));
+        assert_eq!(keyed.composition, rotated.composition);
+        assert_eq!(keyed.execution, rotated.execution);
+
+        // Execution identity ignores block bytes but follows provider/tool/turn.
+        let edited_bytes = ContextFingerprint::compute(
+            &[persona_block("persona v2")],
+            &versions,
+            Some((b"test-key", None)),
+        );
+        assert_eq!(
+            a.execution, edited_bytes.execution,
+            "content edits do not move the execution identity"
+        );
+        let moved_execution = ContextFingerprint::compute(
+            &blocks,
+            &SourceVersions {
+                provider: Some("vendor/other-model".to_string()),
+                ..versions.clone()
+            },
+            Some((b"test-key", None)),
+        );
+        assert_ne!(a.execution, moved_execution.execution);
 
         let mut moved = versions.clone();
         moved.persona = Some("rev-2".to_string());
-        let changed_version = ContextFingerprint::compute(&blocks, &moved, Some(b"test-key"));
+        let changed_version =
+            ContextFingerprint::compute(&blocks, &moved, Some((b"test-key", None)));
         assert_ne!(
             a.composition, changed_version.composition,
             "a persona revision changes the composition"
         );
 
         let edited = vec![persona_block("persona v2")];
-        let changed_content = ContextFingerprint::compute(&edited, &versions, Some(b"test-key"));
+        let changed_content =
+            ContextFingerprint::compute(&edited, &versions, Some((b"test-key", None)));
         assert_eq!(
             a.composition, changed_content.composition,
             "composition names the shape and versions, not the bytes"
@@ -923,7 +1012,7 @@ mod tests {
         let snapshot = AssemblySnapshot::build(
             vec![host, memory],
             SourceVersions::default(),
-            Some(b"test-key"),
+            Some((b"test-key", None)),
         );
         let retrieved = snapshot.block(ContextSource::RetrievedMemory).unwrap();
         assert_eq!(retrieved.trust, Trust::UntrustedData);
@@ -946,7 +1035,7 @@ mod tests {
                 memory_block(&recall, Some(injection)).unwrap(),
             ],
             SourceVersions::default(),
-            Some(b"test-key"),
+            Some((b"test-key", None)),
         );
         assert_eq!(
             snapshot.fingerprint().composition,
@@ -958,6 +1047,38 @@ mod tests {
             again.fingerprint().content,
             "edited bytes change the keyed content identity"
         );
+    }
+
+    /// The typed provider request is derived from the same snapshot as the
+    /// manifest and fingerprints (issue #421).
+    #[test]
+    fn the_typed_provider_request_is_derived_from_the_snapshot() {
+        let snapshot = AssemblySnapshot::build(
+            vec![persona_block("persona text"), persona_block("second")],
+            SourceVersions {
+                tool_guidance: Some("tool-guidance@1".to_string()),
+                provider: Some("vendor/model".to_string()),
+                turn: Some(7),
+                ..SourceVersions::default()
+            },
+            Some((b"key", Some("key-1"))),
+        );
+        let request = snapshot.typed_provider_request();
+        assert_eq!(request.composition, snapshot.fingerprint.composition);
+        assert_eq!(request.content, snapshot.fingerprint.content);
+        assert_eq!(request.execution, snapshot.fingerprint.execution);
+        assert_eq!(request.content_key_id.as_deref(), Some("key-1"));
+        assert_eq!(request.manifest, snapshot.provider_manifest());
+        assert_eq!(request.sources.len(), 2);
+        assert_eq!(request.sources[0].source, "persona");
+        // The wire never carries the typed envelope.
+        let llm = react::llm::LlmRequest {
+            provider_request: Some(request.clone()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&llm).expect("serializes");
+        assert!(!json.contains("composition"), "{json}");
+        assert!(!json.contains("provider_request"), "{json}");
     }
 
     /// Every block is named in the request manifest with its trust boundary,

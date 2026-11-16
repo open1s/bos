@@ -646,6 +646,7 @@ impl Agent {
         let system_prompt = self.system_prompt_for(&task_content, tools).await;
         let prompt_text = task_content.as_text().unwrap_or_default().to_string();
 
+        let provider_request = self.describe_provider_request(&system_prompt, tools);
         let request = LlmRequest {
             model: self.config.model.clone(),
             input: task_content,
@@ -660,6 +661,7 @@ impl Agent {
             // What the host classified this turn as: the engine applies the
             // action contract from it, and never sends it to the provider.
             intent: self.action_intent(),
+            provider_request,
             ..Default::default()
         };
 
@@ -964,6 +966,16 @@ impl Agent {
             ));
         }
 
+        // Semantic gate (issue #420): a summary that misses required sections
+        // or drops an explicit constraint never replaces history. The original
+        // span is still intact at this point.
+        if let Err(reason) = crate::agent::context::validate_checkpoint(&summary, &span) {
+            log::warn!("compaction checkpoint rejected by the semantic gate: {reason}");
+            return Err(AgentError::Compaction(
+                crate::agent::context::CompactionFailure::IncompleteCheckpoint { reason },
+            ));
+        }
+
         // Install only now: a failed or cancelled request must leave the
         // session exactly as it was.
         let after_tokens;
@@ -1066,6 +1078,8 @@ impl Agent {
                 .system_prompt_for(&task_content, context.tools.as_slice())
                 .await;
             let prompt_text = task_content.as_text().unwrap_or_default().to_string();
+            let provider_request =
+                self.describe_provider_request(&system_prompt, context.tools.as_slice());
             let request = LlmRequest {
                 model: self.config.model.clone(),
                 input: task_content,
@@ -1078,6 +1092,7 @@ impl Agent {
                     .map(react::llm::ReasoningEffort::from_name),
                 api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
                 intent: self.action_intent(),
+                provider_request,
                 ..Default::default()
             };
 
