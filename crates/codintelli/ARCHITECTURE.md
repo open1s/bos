@@ -87,6 +87,28 @@ Native Tree + Bounded Source Snapshot
                  Evidence-backed Agent Context
 ```
 
+### TS-01 implementation: native parsed document
+
+The first native document API is implemented for the Rust provider. A
+ParsedDocument owns an immutable shared source snapshot and the native
+Tree-sitter Tree, together with workspace/file identity, language, provider
+version, and a Complete/Recovered status. It exposes the native Tree, root
+Node, source bytes, and a helper for reading a node's text from the matching
+snapshot. It does not expose or persist a codintelli syntax AST.
+
+Both ordinary parsing and parsing with shared cancellation are available.
+Cancellation uses Tree-sitter's parse-progress callback; an aborted parser is
+reset before it can be reused. The existing ParseResult projection remains
+temporarily available as a compatibility path for the current index/resolver
+pipeline. New language-intelligence work must target ParsedDocument and
+Tree-sitter queries, not add fields to that projection.
+
+The native tree is retained in memory for the lifetime of ParsedDocument.
+Persist only source fingerprints and parser/grammar metadata; rebuild the tree
+from the bounded source snapshot when reopening an indexed file. A future
+incremental parser may pass the previous native Tree to Tree-sitter, but must
+publish the replacement document atomically.
+
 ### 4.0 Normative decision: Tree-sitter-native syntax access
 
 This decision supersedes the custom syntax-fact projection and Rust-specific
