@@ -141,7 +141,7 @@ pub fn resolve_rust_module_candidates(
                 .collect();
             existing_candidates.sort();
 
-            let status = if fact.has_attributes {
+            let status = if fact.has_resolution_attributes {
                 RustModuleResolutionStatus::SkippedAttributedDeclaration
             } else {
                 match existing_candidates.len() {
@@ -227,12 +227,12 @@ mod tests {
         parsed_with_id(path, modules, WorkspaceId::new())
     }
 
-    fn module(name: &str, scope: &[&str], inline: bool, has_attributes: bool) -> RustModuleFact {
+    fn module(name: &str, scope: &[&str], inline: bool, has_resolution_attributes: bool) -> RustModuleFact {
         RustModuleFact {
             scope_path: scope.iter().map(|part| (*part).to_owned()).collect(),
             name: name.to_owned(),
             is_inline: inline,
-            has_attributes,
+            has_resolution_attributes,
             range: SourceRange { start_byte: 0, end_byte: 1 },
         }
     }
