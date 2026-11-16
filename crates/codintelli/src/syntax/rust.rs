@@ -24,7 +24,7 @@ impl RustProvider {
     pub const ID: &'static str = "codintelli.rust.tree-sitter";
 
     /// Parser and grammar versions used by this provider.
-    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2";
+    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2/facts-v2";
 }
 
 impl LanguageProvider for RustProvider {
@@ -248,7 +248,7 @@ impl RustProvider {
             language: LanguageId::Rust,
             provider_id: Self::ID.to_owned(),
             provider_version: Self::VERSION.to_owned(),
-            schema_version: 1,
+            schema_version: 2,
             status,
             limit_reason,
             facts,
@@ -504,6 +504,25 @@ fn helper() {}
         }
     }
 
+
+    #[test]
+    fn records_lexical_module_scope_and_excludes_block_local_items() {
+        let result = parse(r#"
+mod nested {
+    fn visible_in_module() {}
+    fn outer() {
+        fn local_only() {}
+    }
+}
+"#);
+        let module_fn = result.facts.iter().find(|fact| fact.name.as_deref() == Some("visible_in_module")).expect("module function");
+        assert_eq!(module_fn.scope_path, vec!["nested".to_owned()]);
+        assert!(module_fn.is_module_scope);
+
+        let local_fn = result.facts.iter().find(|fact| fact.name.as_deref() == Some("local_only")).expect("local function");
+        assert_eq!(local_fn.scope_path, vec!["nested".to_owned()]);
+        assert!(!local_fn.is_module_scope);
+    }
 
     #[test]
     fn extracts_grouped_alias_glob_self_and_nested_module_imports() {
