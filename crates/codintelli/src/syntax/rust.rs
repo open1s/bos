@@ -254,10 +254,16 @@ impl RustProvider {
 }
 
 fn has_outer_attributes(node: Node<'_>) -> bool {
-    (0..node.child_count()).any(|index| {
-        node.child(index as u32)
-            .is_some_and(|child| child.kind() == "attribute_item")
-    })
+    // In tree-sitter-rust 0.24.x, outer attribute_item nodes are siblings
+    // immediately preceding the declaration, not children of mod_item.
+    let mut previous = node.prev_named_sibling();
+    while let Some(sibling) = previous {
+        if sibling.kind() != "attribute_item" {
+            break;
+        }
+        return true;
+    }
+    false
 }
 
 fn enclosing_module_path(node: Node<'_>, source: &str) -> Vec<String> {
