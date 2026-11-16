@@ -280,6 +280,17 @@ mod tests {
     }
 
     #[test]
+    fn preserves_host_supplied_workspace_identity() {
+        let root = tempdir().expect("create workspace");
+        let id = crate::WorkspaceId::new();
+        let descriptor = WorkspaceDescriptor::new(id, root.path())
+            .expect("create workspace descriptor");
+        let workspace = WorkspaceFs::open(&descriptor).expect("open workspace capability");
+
+        assert_eq!(workspace.workspace_id(), id);
+    }
+
+    #[test]
     fn reads_regular_file_beneath_workspace() {
         let root = tempdir().expect("create workspace");
         fs::create_dir(root.path().join("src")).expect("create src");
