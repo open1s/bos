@@ -106,6 +106,11 @@ pub fn resolve_rust_module_candidates(
 
     for result in parse_results.iter().filter(|result| result.language == LanguageId::Rust) {
         for fact in &result.modules {
+            if !valid_module_segment(&fact.name)
+                || fact.scope_path.iter().any(|segment| !valid_module_segment(segment))
+            {
+                return Err(RustModuleResolutionError::InvalidPath);
+            }
             if fact.is_inline {
                 continue;
             }
@@ -163,6 +168,14 @@ pub fn resolve_rust_module_candidates(
     });
 
     Ok(RustModuleResolutionReport { workspace_id, modules })
+}
+
+fn valid_module_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.contains('/')
+        && !segment.contains('\\\\')
 }
 
 fn module_directory(
@@ -276,6 +289,16 @@ mod tests {
         ).expect("module candidates");
         assert_eq!(report.modules[0].status, RustModuleResolutionStatus::SkippedAttributedDeclaration);
         assert!(report.modules[0].existing_candidates.is_empty());
+    }
+
+    #[test]
+    fn rejects_module_names_that_could_escape_the_workspace() {
+        let error = resolve_rust_module_candidates(
+            &[parsed("src/lib.rs", vec![module("../outside", &[], false, false)])],
+            &[],
+            &[PathBuf::from("src/lib.rs")],
+        ).expect_err("unsafe module path");
+        assert!(matches!(error, RustModuleResolutionError::InvalidPath));
     }
 
     #[test]
