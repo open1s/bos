@@ -103,6 +103,23 @@ pub enum ParseLimitKind {
     Diagnostics,
 }
 
+/// One structured Rust-style import path extracted from grammar nodes.
+///
+/// The path is syntactic evidence, not a resolved module or symbol identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportFact {
+    /// Lexical module scope containing the import, from outermost to innermost.
+    pub scope_path: Vec<String>,
+    /// Import path segments, with raw-identifier prefixes removed.
+    pub path: Vec<String>,
+    /// Optional local alias introduced by an `as` clause.
+    pub alias: Option<String>,
+    /// Whether the import ends in a glob (`*`).
+    pub is_glob: bool,
+    /// Exact source byte range of the complete import declaration.
+    pub range: SourceRange,
+}
+
 /// Result of parsing one source file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseResult {
@@ -122,8 +139,10 @@ pub struct ParseResult {
     pub status: ParseStatus,
     /// Limit that stopped extraction, when status is Limited.
     pub limit_reason: Option<ParseLimitKind>,
-    /// Deterministically ordered facts.
+    /// Deterministically ordered language-neutral syntax facts.
     pub facts: Vec<SyntaxFact>,
+    /// Structured import paths when the provider can extract them.
+    pub imports: Vec<ImportFact>,
     /// Parse diagnostics.
     pub diagnostics: Vec<ParseDiagnostic>,
 }
