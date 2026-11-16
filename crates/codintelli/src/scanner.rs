@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::{
     fs::{WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs},
-    ScanBudget, ScanBudgetError, ScanUsage,
+    IgnorePolicy, ScanBudget, ScanBudgetError, ScanUsage,
 };
 
 /// Final state of a workspace inventory scan.
@@ -48,6 +48,10 @@ pub struct WorkspaceScanReport {
     pub entries: Vec<WorkspaceEntry>,
     /// Number of directories successfully enumerated.
     pub directories_scanned: u64,
+    /// Number of entries excluded by the ignore policy.
+    pub ignored_entries: u64,
+    /// Number of ignored directories pruned without traversal.
+    pub directories_pruned: u64,
     /// Completion state.
     pub status: ScanStatus,
     /// Reasons for partial or failed coverage.
@@ -67,10 +71,25 @@ pub fn scan_workspace(
     workspace: &WorkspaceFs,
     budget: &ScanBudget,
 ) -> WorkspaceScanReport {
+    scan_workspace_with_policy(workspace, budget, &IgnorePolicy::default())
+}
+
+/// Scan a workspace using an explicit ignore policy and shared resource budget.
+///
+/// Later matching policy rules override earlier rules. Ignored entries still
+/// consume the directory-entry budget because they must be enumerated to apply
+/// the policy. Excluded files do not consume the accepted-file budget.
+pub fn scan_workspace_with_policy(
+    workspace: &WorkspaceFs,
+    budget: &ScanBudget,
+    ignore: &IgnorePolicy,
+) -> WorkspaceScanReport {
     let mut pending = vec![(PathBuf::new(), 0usize)];
     let mut entries = Vec::new();
     let mut diagnostics = Vec::new();
     let mut directories_scanned = 0u64;
+    let mut ignored_entries = 0u64;
+    let mut directories_pruned = 0u64;
     let mut status = ScanStatus::Complete;
 
     while let Some((directory, depth)) = pending.pop() {
@@ -135,6 +154,28 @@ pub fn scan_workspace(
                 break;
             }
 
+            if ignore.is_ignored(&entry.relative_path, entry.kind) {
+                ignored_entries = ignored_entries.saturating_add(1);
+                if entry.kind == WorkspaceEntryKind::Directory {
+                    if ignore.should_descend(&entry.relative_path) {
+                        let child_depth = depth.saturating_add(1);
+                        if child_depth > budget.limits().max_depth {
+                            record_budget_stop(
+                                &mut status,
+                                &mut diagnostics,
+                                entry.relative_path,
+                                ScanBudgetError::DepthLimitExceeded,
+                            );
+                        } else {
+                            pending.push((entry.relative_path, child_depth));
+                        }
+                    } else {
+                        directories_pruned = directories_pruned.saturating_add(1);
+                    }
+                }
+                continue;
+            }
+
             match entry.kind {
                 WorkspaceEntryKind::File => {
                     if file_limit_reported {
@@ -194,6 +235,8 @@ pub fn scan_workspace(
     WorkspaceScanReport {
         entries,
         directories_scanned,
+        ignored_entries,
+        directories_pruned,
         status,
         diagnostics,
         usage: budget.usage(),
