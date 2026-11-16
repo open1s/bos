@@ -20,6 +20,10 @@ use cap_std::fs::{Dir, File, OpenOptions};
 
 use crate::WorkspaceDescriptor;
 
+mod read_dir;
+
+pub use read_dir::{WorkspaceEntry, WorkspaceEntryKind};
+
 const MAX_PATH_DEPTH: usize = 256;
 
 /// Read-only filesystem capability for one workspace root.
@@ -240,6 +244,15 @@ pub enum WorkspaceFsError {
     /// The caller supplied an unrepresentable read limit.
     #[error("workspace file read limit is too large")]
     InvalidLimit,
+
+    /// A directory contains more entries than the configured inspection budget.
+    #[error("workspace directory exceeds the {max_entries}-entry limit: {path}")]
+    EntryLimitExceeded {
+        /// Directory whose entries exceeded the budget.
+        path: PathBuf,
+        /// Maximum number of directory entries inspected.
+        max_entries: usize,
+    },
 }
 
 #[cfg(test)]
