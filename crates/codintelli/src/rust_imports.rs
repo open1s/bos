@@ -310,12 +310,12 @@ fn make_unresolved(
 }
 
 fn valid_import_identifier(segment: &str) -> bool {
-    let mut chars = segment.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_alphabetic())
-        && chars.all(|character| character == '_' || character.is_alphanumeric())
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.chars().any(|character| {
+            matches!(character, '/' | '\\\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' | '\\0')
+        })
 }
 
 trait ImportFactValidation {
