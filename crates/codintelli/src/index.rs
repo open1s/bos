@@ -387,7 +387,6 @@ mod tests {
         let budget = ScanBudget::new(limits());
 
         let report = index_rust_workspace(
-            &descriptor,
             &workspace,
             &budget,
             &IgnorePolicy::default(),
@@ -414,7 +413,6 @@ mod tests {
         });
 
         let report = index_rust_workspace(
-            &descriptor,
             &workspace,
             &budget,
             &IgnorePolicy::default(),
@@ -439,7 +437,6 @@ mod tests {
         let budget = ScanBudget::new(limits());
 
         let report = index_rust_workspace(
-            &descriptor,
             &workspace,
             &budget,
             &IgnorePolicy::default(),
