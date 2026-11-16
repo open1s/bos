@@ -228,7 +228,11 @@ mod tests {
         assert_eq!(report.status, ScanStatus::Complete);
         assert_eq!(report.directories_scanned, 3);
         assert_eq!(
-            report.entries.iter().map(|entry| entry.relative_path.as_path()).collect::<Vec<_>>(),
+            report
+                .entries
+                .iter()
+                .map(|entry| entry.relative_path.as_path())
+                .collect::<Vec<_>>(),
             vec![
                 std::path::Path::new("src"),
                 std::path::Path::new("src/lib.rs"),
@@ -281,7 +285,14 @@ mod tests {
 
         assert_eq!(report.status, ScanStatus::Partial);
         assert_eq!(report.usage.files, 1);
-        assert_eq!(report.entries.iter().filter(|entry| entry.kind == WorkspaceEntryKind::File).count(), 1);
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == WorkspaceEntryKind::File)
+                .count(),
+            1
+        );
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == ScanDiagnosticKind::Budget(ScanBudgetError::FileLimitExceeded)
         }));
@@ -338,6 +349,9 @@ mod tests {
         assert_eq!(report.status, ScanStatus::Complete);
         assert_eq!(report.usage.entries, 2);
         assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].relative_path, std::path::Path::new("target"));
+        assert_eq!(
+            report.entries[0].relative_path,
+            std::path::Path::new("target")
+        );
     }
 }
