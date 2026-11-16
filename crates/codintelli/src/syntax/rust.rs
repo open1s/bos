@@ -259,16 +259,17 @@ fn has_resolution_attributes(node: Node<'_>, source: &str) -> bool {
     // conventional path mapping unsafe; doc/lint/derive-style attributes do not.
     let mut previous = node.prev_named_sibling();
     while let Some(sibling) = previous {
-        if sibling.kind() != "attribute_item" {
+        if sibling.kind() == "attribute_item" {
+            let attribute = source.get(sibling.byte_range()).unwrap_or_default().trim_start();
+            if attribute.starts_with("#[cfg") || attribute.starts_with("#[path") {
+                return true;
+            }
+            previous = sibling.prev_named_sibling();
+        } else if sibling.kind().contains("comment") {
+            previous = sibling.prev_named_sibling();
+        } else {
             break;
         }
-        let attribute = source.get(sibling.byte_range()).unwrap_or_default().trim_start();
-        if attribute.starts_with("#[cfg")
-            || attribute.starts_with("#[path")
-        {
-            return true;
-        }
-        previous = sibling.prev_named_sibling();
     }
     false
 }
@@ -519,9 +520,12 @@ mod external_child;
 mod optional;
 #[path = "custom/location.rs"]
 mod custom;
+#[doc = "documented module"]
+mod documented;
 "#);
         assert!(result.modules.iter().any(|item| item.name == "optional" && item.has_resolution_attributes));
         assert!(result.modules.iter().any(|item| item.name == "custom" && item.has_resolution_attributes));
+        assert!(result.modules.iter().any(|item| item.name == "documented" && !item.has_resolution_attributes));
     }
 
     #[test]
