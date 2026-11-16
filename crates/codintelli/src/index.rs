@@ -10,7 +10,7 @@ use crate::{
     classification::{classify_entry, FileCategory, LanguageId},
     fs::{WorkspaceEntryKind, WorkspaceFs},
     scanner::{scan_workspace_with_policy, ScanStatus, WorkspaceScanReport},
-    syntax::{LanguageProvider, ParseInput, ParseResult},
+    syntax::{LanguageProvider, ParseControl, ParseInput, ParseLimits, ParseResult, ProviderError},
     IgnorePolicy, ScanBudget, ScanBudgetError,
 };
 
@@ -23,6 +23,8 @@ pub enum SourceFileStatus {
     Recovered,
     /// No installed provider supports the classified language.
     Unsupported,
+    /// Parsing stopped at a configured per-file output limit.
+    Limited,
     /// The file could not be safely read or parsed.
     Failed,
 }
@@ -96,6 +98,8 @@ pub struct SourceIndexReport {
     pub unsupported_files: u64,
     /// Files parsed with error recovery.
     pub recovered_files: u64,
+    /// Files whose extraction reached a configured parser output limit.
+    pub limited_files: u64,
     /// Files that failed during source loading or parsing.
     pub failed_files: u64,
 }
@@ -118,12 +122,30 @@ pub fn index_workspace(
     ignore: &IgnorePolicy,
     providers: &[&dyn LanguageProvider],
 ) -> SourceIndexReport {
+    index_workspace_with_limits(
+        workspace,
+        budget,
+        ignore,
+        providers,
+        &ParseLimits::default(),
+    )
+}
+
+/// Index a workspace with explicit per-file syntax extraction limits.
+pub fn index_workspace_with_limits(
+    workspace: &WorkspaceFs,
+    budget: &ScanBudget,
+    ignore: &IgnorePolicy,
+    providers: &[&dyn LanguageProvider],
+    parse_limits: &ParseLimits,
+) -> SourceIndexReport {
     let scan = scan_workspace_with_policy(workspace, budget, ignore);
     let mut files = Vec::new();
     let mut diagnostics = Vec::new();
     let mut parsed_files = 0u64;
     let mut unsupported_files = 0u64;
     let mut recovered_files = 0u64;
+    let mut limited_files = 0u64;
     let mut failed_files = 0u64;
 
     for entry in scan.entries.iter().filter(|entry| entry.kind == WorkspaceEntryKind::File) {
@@ -241,15 +263,19 @@ pub fn index_workspace(
             }
         };
 
-        match provider.parse(ParseInput {
-            workspace_id: workspace.workspace_id(),
-            relative_path: &entry.relative_path,
-            source: &source,
-        }) {
+        match provider.parse_with_control(
+            ParseInput {
+                workspace_id: workspace.workspace_id(),
+                relative_path: &entry.relative_path,
+                source: &source,
+            },
+            &ParseControl::new(budget, parse_limits),
+        ) {
             Ok(parse) => {
                 let status = match parse.status {
                     crate::ParseStatus::Complete => SourceFileStatus::Parsed,
                     crate::ParseStatus::Recovered => SourceFileStatus::Recovered,
+                    crate::ParseStatus::Limited => SourceFileStatus::Limited,
                     crate::ParseStatus::Failed => SourceFileStatus::Failed,
                 };
                 if status == SourceFileStatus::Failed {
@@ -258,6 +284,9 @@ pub fn index_workspace(
                     parsed_files = parsed_files.saturating_add(1);
                     if status == SourceFileStatus::Recovered {
                         recovered_files = recovered_files.saturating_add(1);
+                    }
+                    if status == SourceFileStatus::Limited {
+                        limited_files = limited_files.saturating_add(1);
                     }
                 }
                 files.push(SourceFileResult {
@@ -268,9 +297,17 @@ pub fn index_workspace(
                 });
             }
             Err(error) => {
+                let budget_error = match error {
+                    ProviderError::Budget(error) => Some(error),
+                    _ => None,
+                };
                 diagnostics.push(SourceIndexDiagnostic {
                     path: entry.relative_path.clone(),
-                    kind: SourceIndexDiagnosticKind::Provider(error.to_string()),
+                    kind: if let Some(error) = budget_error {
+                        SourceIndexDiagnosticKind::Budget(error)
+                    } else {
+                        SourceIndexDiagnosticKind::Provider(error.to_string())
+                    },
                 });
                 failed_files = failed_files.saturating_add(1);
                 files.push(SourceFileResult {
@@ -279,6 +316,9 @@ pub fn index_workspace(
                     status: SourceFileStatus::Failed,
                     parse: None,
                 });
+                if matches!(budget_error, Some(ScanBudgetError::Cancelled | ScanBudgetError::DeadlineExceeded)) {
+                    break;
+                }
             }
         }
     }
@@ -295,7 +335,7 @@ pub fn index_workspace(
         (false, ScanStatus::Failed) => SourceIndexStatus::Failed,
         (false, ScanStatus::Partial) => SourceIndexStatus::Partial,
         (false, ScanStatus::Complete)
-            if failed_files > 0 || unsupported_files > 0 || recovered_files > 0 =>
+            if failed_files > 0 || unsupported_files > 0 || recovered_files > 0 || limited_files > 0 =>
         {
             SourceIndexStatus::Partial
         }
@@ -310,6 +350,7 @@ pub fn index_workspace(
         parsed_files,
         unsupported_files,
         recovered_files,
+        limited_files,
         failed_files,
     }
 }
