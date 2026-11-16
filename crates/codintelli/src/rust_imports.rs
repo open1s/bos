@@ -413,7 +413,7 @@ mod tests {
             import(&["self", "Item"], &["inner"]),
             import(&["super", "sibling"], &["inner"]),
         ], Vec::new(), id);
-        let graph = graph(id, vec![
+        let graph = make_graph(id, vec![
             node(&["parent"], "src/parent.rs", RustModuleNodeKind::External),
             node(&["parent", "inner"], "src/parent.rs", RustModuleNodeKind::Inline),
             node(&["parent", "sibling"], "src/parent/sibling.rs", RustModuleNodeKind::External),
@@ -429,7 +429,7 @@ mod tests {
     fn preserves_ambiguous_module_paths() {
         let id = WorkspaceId::new();
         let parsed = parse_result("src/lib.rs", vec![import(&["crate", "shared"], &[])], Vec::new(), id);
-        let graph = graph(id, vec![
+        let graph = make_graph(id, vec![
             node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot),
             node(&["shared"], "src/shared.rs", RustModuleNodeKind::External),
             node(&["shared"], "src/shared/mod.rs", RustModuleNodeKind::External),
@@ -442,7 +442,7 @@ mod tests {
     fn leaves_bare_external_paths_unresolved() {
         let id = WorkspaceId::new();
         let parsed = parse_result("src/lib.rs", vec![import(&["serde", "Serialize"], &[])], Vec::new(), id);
-        let graph = graph(id, vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)]);
+        let graph = make_graph(id, vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)]);
         let report = resolve_rust_import_module_candidates(&[parsed], &graph).expect("imports");
         assert_eq!(report.imports[0].status, RustImportResolutionStatus::UnsupportedUnqualifiedPath);
     }
@@ -451,7 +451,7 @@ mod tests {
     fn reports_invalid_super_traversal_and_workspace_mismatch() {
         let id = WorkspaceId::new();
         let parsed = parse_result("src/lib.rs", vec![import(&["super", "Thing"], &[])], Vec::new(), id);
-        let graph = graph(id, vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)]);
+        let graph = make_graph(id, vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)]);
         let report = resolve_rust_import_module_candidates(&[parsed.clone()], &graph).expect("imports");
         assert_eq!(report.imports[0].status, RustImportResolutionStatus::InvalidSuperTraversal);
 
