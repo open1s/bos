@@ -24,7 +24,8 @@ pub mod scanner;
 pub mod workspace;
 
 pub use classification::{
-    classify_entry, classify_path, ClassificationReason, FileCategory, FileClassification, LanguageId,
+    classify_entry, classify_path, ClassificationReason, FileCategory, FileClassification,
+    LanguageId,
 };
 pub use fs::{
     DirectoryListing, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs, WorkspaceFsError,
