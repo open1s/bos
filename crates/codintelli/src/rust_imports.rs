@@ -325,8 +325,8 @@ impl ImportFactValidation for ImportFact {
 mod tests {
     use super::*;
     use crate::{
-        ParseStatus, RustModuleEdge, RustModuleEdgeStatus, RustModuleGraphLimits,
-        RustModuleNode, RustModuleNodeKind, RustModuleFact, SyntaxFact, SyntaxFactKind,
+        ParseStatus, RustModuleEdge, RustModuleFact, RustModuleNode, RustModuleNodeKind,
+        SyntaxFact, SyntaxFactKind,
     };
 
     fn parse_result(
