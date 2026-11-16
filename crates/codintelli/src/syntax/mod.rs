@@ -59,6 +59,28 @@ pub enum SyntaxFactKind {
     MethodCall,
 }
 
+/// Rust visibility written on a declaration or import.
+///
+/// This records the syntactic visibility modifier only. It does not calculate
+/// effective accessibility through ancestor modules, cfg selection, or re-exports.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RustVisibility {
+    /// No explicit visibility modifier was present.
+    Private,
+    /// `pub`.
+    Public,
+    /// `pub(crate)`.
+    Crate,
+    /// `pub(super)`.
+    Super,
+    /// `pub(self)`.
+    SelfScope,
+    /// `pub(in path)`, with source path segments and raw-identifier prefixes removed.
+    InPath(Vec<String>),
+    /// A visibility form the provider did not recognize; source spelling is retained.
+    Unknown(String),
+}
+
 /// One syntax fact with a source-backed location.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyntaxFact {
@@ -71,6 +93,8 @@ pub struct SyntaxFact {
     pub scope_path: Vec<String>,
     /// Whether this fact is in module scope rather than a function/block-local scope.
     pub is_module_scope: bool,
+    /// Explicit or implicit Rust visibility for declarations/imports; absent for references.
+    pub visibility: Option<RustVisibility>,
     /// Exact source byte range.
     pub range: SourceRange,
 }

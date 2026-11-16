@@ -72,7 +72,7 @@ pub use scanner::{
 };
 pub use syntax::{
     ImportFact, RustModuleFact, LanguageProvider, ParseControl, ParseDiagnostic, ParseInput, ParseLimitKind, ParseLimits, ParseResult, ParseStatus, ProviderError,
-    SourceRange, SyntaxFact, SyntaxFactKind,
+    RustVisibility, SourceRange, SyntaxFact, SyntaxFactKind,
 };
 pub use syntax::rust::RustProvider;
 pub use workspace::{WorkspaceDescriptor, WorkspaceError, WorkspaceId, WorkspaceRegistry};

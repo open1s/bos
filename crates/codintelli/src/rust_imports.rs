@@ -428,6 +428,7 @@ mod tests {
                 name: None,
                 scope_path: Vec::new(),
                 is_module_scope: true,
+                visibility: None,
                 range: SourceRange { start_byte: 0, end_byte: 1 },
             }],
             imports,

@@ -273,6 +273,7 @@ mod tests {
                 kind: RustScopedSymbolKind::Struct,
             },
             name: name.to_owned(),
+            visibility: crate::syntax::RustVisibility::Public,
         }
     }
 

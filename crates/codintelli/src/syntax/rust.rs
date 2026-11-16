@@ -24,7 +24,7 @@ impl RustProvider {
     pub const ID: &'static str = "codintelli.rust.tree-sitter";
 
     /// Parser and grammar versions used by this provider.
-    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2/facts-v2";
+    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2/facts-v3";
 }
 
 impl LanguageProvider for RustProvider {
@@ -204,6 +204,7 @@ impl RustProvider {
                         name,
                         scope_path: enclosing_module_path(node, source),
                         is_module_scope: is_module_scope(node),
+                        visibility: rust_visibility(node, source),
                         range,
                     });
                 }
@@ -248,7 +249,7 @@ impl RustProvider {
             language: LanguageId::Rust,
             provider_id: Self::ID.to_owned(),
             provider_version: Self::VERSION.to_owned(),
-            schema_version: 2,
+            schema_version: 3,
             status,
             limit_reason,
             facts,
@@ -376,6 +377,59 @@ fn path_segments(node: Node<'_>, source: &str) -> Vec<String> {
         .collect()
 }
 
+fn rust_visibility(node: Node<'_>, source: &str) -> Option<super::RustVisibility> {
+    if !matches!(
+        node.kind(),
+        "mod_item"
+            | "function_item"
+            | "function_signature_item"
+            | "struct_item"
+            | "enum_item"
+            | "union_item"
+            | "trait_item"
+            | "type_item"
+            | "const_item"
+            | "static_item"
+            | "use_declaration"
+    ) {
+        return None;
+    }
+
+    // Trait members are part of the trait's public interface and do not
+    // declare an independent visibility modifier.
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "trait_item" {
+            return None;
+        }
+        ancestor = current.parent();
+    }
+
+    let modifier = (0..node.named_child_count())
+        .filter_map(|index| node.named_child(index as u32))
+        .find(|child| child.kind() == "visibility_modifier");
+    let Some(modifier) = modifier else {
+        return Some(super::RustVisibility::Private);
+    };
+    let spelling = text_for_node(modifier, source).unwrap_or_default();
+    Some(match spelling.as_str() {
+        "pub" => super::RustVisibility::Public,
+        "pub(crate)" => super::RustVisibility::Crate,
+        "pub(super)" => super::RustVisibility::Super,
+        "pub(self)" => super::RustVisibility::SelfScope,
+        value if value.starts_with("pub(in ") && value.ends_with(')') => {
+            let path = value[7..value.len() - 1]
+                .split("::")
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| segment.trim_start_matches("r#").to_owned())
+                .collect();
+            super::RustVisibility::InPath(path)
+        }
+        _ => super::RustVisibility::Unknown(spelling),
+    })
+}
+
 fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option<String>)> {
     let kind = match node.kind() {
         "mod_item" => SyntaxFactKind::Module,
@@ -454,6 +508,53 @@ mod tests {
                 source: source.as_bytes(),
             })
             .expect("provider accepts UTF-8 source")
+    }
+
+    #[test]
+    fn extracts_explicit_and_implicit_visibility_from_grammar_nodes() {
+        let result = parse(r#"
+mod private_mod {}
+pub mod public_mod {}
+pub(crate) struct CrateType;
+pub(super) fn parent_visible() {}
+pub(self) const SELF_VALUE: u8 = 1;
+pub(in crate::outer) type ScopedAlias = u8;
+pub use crate::public_mod::Thing as PublicThing;
+pub trait Api { fn trait_method(&self); const TRAIT_CONST: u8; type Output; }
+fn private_fn() {}
+"#);
+        let visibility = |name: &str| {
+            result
+                .facts
+                .iter()
+                .find(|fact| fact.name.as_deref() == Some(name))
+                .and_then(|fact| fact.visibility.clone())
+                .expect("declaration visibility fact")
+        };
+        assert_eq!(visibility("private_mod"), super::super::RustVisibility::Private);
+        assert_eq!(visibility("public_mod"), super::super::RustVisibility::Public);
+        assert_eq!(visibility("CrateType"), super::super::RustVisibility::Crate);
+        assert_eq!(visibility("parent_visible"), super::super::RustVisibility::Super);
+        assert_eq!(visibility("SELF_VALUE"), super::super::RustVisibility::SelfScope);
+        assert_eq!(
+            visibility("ScopedAlias"),
+            super::super::RustVisibility::InPath(vec!["crate".to_owned(), "outer".to_owned()])
+        );
+        assert_eq!(visibility("private_fn"), super::super::RustVisibility::Private);
+        for trait_member in ["trait_method", "TRAIT_CONST", "Output"] {
+            let fact = result
+                .facts
+                .iter()
+                .find(|fact| fact.name.as_deref() == Some(trait_member))
+                .expect("trait member syntax fact");
+            assert_eq!(fact.visibility, None);
+        }
+        let import = result
+            .facts
+            .iter()
+            .find(|fact| fact.kind == SyntaxFactKind::Import)
+            .expect("pub use syntax fact");
+        assert_eq!(import.visibility, Some(super::super::RustVisibility::Public));
     }
 
     #[test]

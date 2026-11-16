@@ -201,7 +201,32 @@ compiler-resolved symbol. Visibility, cfg selection, re-exports, macro
 expansion, extern-prelude lookup, trait scope, enum-variant imports, and
 type-dependent associated-item resolution remain future work.
 
-### 4.12 Cross-file resolution
+### 4.12 Declared Rust visibility facts (CI-09J)
+
+The Tree-sitter provider records the visibility modifier attached to Rust
+declarations and `use` declarations: implicit private visibility,
+`pub`, `pub(crate)`, `pub(super)`, `pub(self)`, and `pub(in path)`. Unknown
+modifier spellings are retained as unknown evidence rather than silently
+converted to private. The provider schema version is bumped when this fact
+contract changes.
+
+The scoped symbol catalog carries the declaration's written visibility. This
+is deliberately not an effective-accessibility result: a public declaration
+can still be unreachable through a private ancestor module, and `cfg`,
+conditional compilation, re-exports, and the importing module's lexical
+position still affect accessibility. The import candidate resolver therefore
+continues to report source-backed candidates, not valid or compiler-resolved
+imports. Visibility-aware accessibility is a separate stage and must account
+for every ancestor module and the complete path from the crate root.
+
+Trait members have no independent visibility modifier; their visibility fact
+remains absent rather than being mislabeled as private. The first visibility
+slice does not yet model field visibility, enum-variant visibility, macro
+visibility, or effective privacy across re-export chains.
+Those require explicit namespace and containment facts rather than inference
+from declaration names alone.
+
+### 4.13 Cross-file resolution
 
 Resolution is a separate stage over extracted facts and workspace metadata. It may resolve:
 
@@ -212,7 +237,7 @@ Resolution is a separate stage over extracted facts and workspace metadata. It m
 
 Resolution output must retain its own provenance and diagnostics. Ambiguous candidates remain ambiguous; they are not collapsed to an arbitrary target.
 
-### 4.13 Relationship analysis and query
+### 4.14 Relationship analysis and query
 
 Relationship analysis is a deterministic transformation over extracted facts. A graph-shaped view may be built when it helps a query, but the underlying index must not require all records to be represented as graph nodes and edges. This stage must not perform parsing or filesystem access.
 

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::{
     module_graph::{RustModuleGraph, RustModuleGraphStatus, RustModuleNodeKind},
-    syntax::{ParseResult, ParseStatus, SourceRange, SyntaxFactKind},
+    syntax::{ParseResult, ParseStatus, RustVisibility, SourceRange, SyntaxFactKind},
     WorkspaceId,
 };
 
@@ -42,6 +42,8 @@ pub struct RustScopedSymbolId {
 pub struct RustScopedSymbol {
     pub id: RustScopedSymbolId,
     pub name: String,
+    /// Visibility modifier written at the declaration; not effective accessibility.
+    pub visibility: Option<RustVisibility>,
 }
 
 /// Catalog coverage and diagnostics for one workspace module graph.
@@ -142,6 +144,7 @@ pub fn build_rust_scoped_symbols(
                     kind,
                 },
                 name: name.to_owned(),
+                visibility: fact.visibility.clone(),
             });
         }
     }
@@ -200,6 +203,7 @@ mod tests {
                 name: Some("run".to_owned()),
                 scope_path: vec!["inner".to_owned()],
                 is_module_scope: true,
+                visibility: Some(RustVisibility::Public),
                 range: SourceRange { start_byte: 0, end_byte: 12 },
             }],
             imports: Vec::new(),
