@@ -229,6 +229,24 @@ mod tests {
         assert_eq!(entries[0].relative_path, Path::new("target.rs"));
     }
 
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_also_consume_the_enumeration_budget() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().expect("create workspace");
+        fs::write(root.path().join("target"), "source").expect("write target");
+        symlink(root.path().join("target"), root.path().join("link"))
+            .expect("create symlink");
+
+        let workspace = workspace_fs(root.path());
+        assert!(matches!(
+            workspace.read_dir("", 1),
+            Err(WorkspaceFsError::EntryLimitExceeded { max_entries: 1, .. })
+        ));
+    }
+
     #[test]
     fn zero_entry_budget_accepts_only_empty_directories() {
         let root = tempdir().expect("create workspace");
