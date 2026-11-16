@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use crate::{
     classification::LanguageId,
-    module_graph::{RustModuleGraph, RustModuleNodeKind},
+    module_graph::{RustModuleEdge, RustModuleEdgeStatus, RustModuleGraph, RustModuleNodeKind},
     syntax::valid_relative_path,
     ImportFact, ParseResult, SourceRange, WorkspaceId,
 };
@@ -21,8 +21,14 @@ pub enum RustImportResolutionStatus {
     ModuleTarget,
     /// A known module prefix exists; remaining segments may name an item.
     ModulePrefixForMember,
-    /// Multiple source nodes share the longest matching module path.
+    /// Multiple source nodes or declaration candidates share the longest module path.
     AmbiguousModuleTarget,
+    /// The module declaration is conditional or otherwise attribute-dependent.
+    UncertainModuleTarget,
+    /// A unique file candidate exists but its source was not parsed.
+    UnparsedModuleTarget,
+    /// A candidate exists but graph traversal stopped at its depth limit.
+    DepthLimitedModuleTarget,
     /// No non-root module prefix matches the path.
     NoModuleCandidate,
     /// The path uses an unqualified first segment; extern-prelude and lexical
@@ -150,6 +156,7 @@ pub fn resolve_rust_import_module_candidates(
             for (crate_root, context_path) in contexts {
                 imports.push(resolve_one_import(
                     &graph.nodes,
+                    &graph.edges,
                     crate_root,
                     context_path,
                     result,
@@ -183,6 +190,7 @@ pub fn resolve_rust_import_module_candidates(
 
 fn resolve_one_import(
     nodes: &[crate::RustModuleNode],
+    edges: &[RustModuleEdge],
     crate_root: PathBuf,
     context_path: Vec<String>,
     source: &ParseResult,
@@ -241,6 +249,54 @@ fn resolve_one_import(
             && is_prefix(&node.module_path, &target_path)
             && (!node.module_path.is_empty() || target_path.is_empty())
     }).collect();
+    let longest_node = matches.iter().map(|node| node.module_path.len()).max().unwrap_or(0);
+    matches.retain(|node| node.module_path.len() == longest_node);
+
+    let mut unresolved_edges: Vec<_> = edges.iter().filter(|edge| {
+        edge.crate_root == crate_root
+            && is_prefix(&edge.child_module_path, &target_path)
+            && matches!(
+                edge.status,
+                RustModuleEdgeStatus::UniqueCandidateUnparsed
+                    | RustModuleEdgeStatus::AmbiguousCandidates
+                    | RustModuleEdgeStatus::NoCandidate
+                    | RustModuleEdgeStatus::SkippedAttributedDeclaration
+                    | RustModuleEdgeStatus::SkippedUncertainParentScope
+                    | RustModuleEdgeStatus::DepthLimit
+            )
+    }).collect();
+    let longest_edge = unresolved_edges.iter()
+        .map(|edge| edge.child_module_path.len())
+        .max()
+        .unwrap_or(0);
+
+    if !unresolved_edges.is_empty() && longest_edge >= longest_node {
+        unresolved_edges.retain(|edge| edge.child_module_path.len() == longest_edge);
+        let status = if unresolved_edges.len() > 1
+            || unresolved_edges.iter().any(|edge| edge.status == RustModuleEdgeStatus::AmbiguousCandidates)
+        {
+            RustImportResolutionStatus::AmbiguousModuleTarget
+        } else {
+            match unresolved_edges[0].status {
+                RustModuleEdgeStatus::SkippedAttributedDeclaration
+                | RustModuleEdgeStatus::SkippedUncertainParentScope => {
+                    RustImportResolutionStatus::UncertainModuleTarget
+                }
+                RustModuleEdgeStatus::UniqueCandidateUnparsed => {
+                    RustImportResolutionStatus::UnparsedModuleTarget
+                }
+                RustModuleEdgeStatus::DepthLimit => {
+                    RustImportResolutionStatus::DepthLimitedModuleTarget
+                }
+                RustModuleEdgeStatus::NoCandidate => {
+                    RustImportResolutionStatus::NoModuleCandidate
+                }
+                _ => RustImportResolutionStatus::NoModuleCandidate,
+            }
+        };
+        return make_unresolved(Some(crate_root), source, fact, status);
+    }
+
     if matches.is_empty() {
         return make_unresolved(
             Some(crate_root),
@@ -249,9 +305,6 @@ fn resolve_one_import(
             RustImportResolutionStatus::NoModuleCandidate,
         );
     }
-
-    let longest = matches.iter().map(|node| node.module_path.len()).max().unwrap_or(0);
-    matches.retain(|node| node.module_path.len() == longest);
     if matches.len() != 1 {
         return make_unresolved(
             Some(crate_root),
@@ -333,7 +386,7 @@ impl ImportFactValidation for ImportFact {
 mod tests {
     use super::*;
     use crate::{
-        ParseStatus, RustModuleEdge, RustModuleFact, RustModuleNode, RustModuleNodeKind,
+        ParseStatus, RustModuleEdge, RustModuleEdgeStatus, RustModuleFact, RustModuleNode, RustModuleNodeKind,
         SyntaxFact, SyntaxFactKind,
     };
 
