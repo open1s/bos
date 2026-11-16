@@ -106,12 +106,10 @@ impl WorkspaceFs {
         }
 
         let directory = current.as_ref().unwrap_or(&self.root);
-        let entries = directory
-            .entries()
-            .map_err(|source| WorkspaceFsError::Io {
-                path: relative_path.to_path_buf(),
-                source,
-            })?;
+        let entries = directory.entries().map_err(|source| WorkspaceFsError::Io {
+            path: relative_path.to_path_buf(),
+            source,
+        })?;
 
         let mut result = Vec::new();
         let mut inspected_entries = 0usize;
@@ -142,12 +140,13 @@ impl WorkspaceFs {
 
             // Query metadata relative to the already-open directory capability.
             // symlink_metadata does not follow a final symbolic link.
-            let metadata = directory
-                .symlink_metadata(&name)
-                .map_err(|source| WorkspaceFsError::Io {
-                    path: relative_path.join(&name),
-                    source,
-                })?;
+            let metadata =
+                directory
+                    .symlink_metadata(&name)
+                    .map_err(|source| WorkspaceFsError::Io {
+                        path: relative_path.join(&name),
+                        source,
+                    })?;
 
             let (kind, size_bytes) = if metadata.is_file() {
                 (WorkspaceEntryKind::File, Some(metadata.len()))
@@ -351,8 +350,7 @@ mod tests {
 
         let root = tempdir().expect("create workspace");
         fs::write(root.path().join("target"), "source").expect("write target");
-        symlink(root.path().join("target"), root.path().join("link"))
-            .expect("create symlink");
+        symlink(root.path().join("target"), root.path().join("link")).expect("create symlink");
 
         let workspace = workspace_fs(root.path());
         assert!(matches!(
@@ -368,7 +366,9 @@ mod tests {
         assert!(workspace.read_dir("", 0).expect("empty root").is_empty());
 
         fs::write(root.path().join("one"), "1").expect("write one");
-        let listing = workspace.read_dir_report("", 0).expect("bounded empty result");
+        let listing = workspace
+            .read_dir_report("", 0)
+            .expect("bounded empty result");
         assert!(listing.truncated);
         assert_eq!(listing.inspected_entries, 0);
         assert!(listing.entries.is_empty());

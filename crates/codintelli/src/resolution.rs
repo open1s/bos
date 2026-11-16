@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use crate::{
-    index::{SourceIndexReport, SourceFileStatus},
+    index::{SourceFileStatus, SourceIndexReport},
     syntax::SyntaxFactKind,
     WorkspaceId,
 };
@@ -16,40 +16,60 @@ use crate::{
 /// Kind of declaration represented in the candidate symbol catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SymbolKind {
+    /// A module declaration.
     Module,
+    /// A free function.
     Function,
+    /// A method or associated function.
     Method,
+    /// A struct.
     Struct,
+    /// An enum.
     Enum,
+    /// A union.
     Union,
+    /// A trait.
     Trait,
+    /// A type alias.
     TypeAlias,
+    /// A constant.
     Constant,
+    /// A static item.
     Static,
 }
 
 /// Stable identity of one declaration within one workspace snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SymbolId {
+    /// Workspace identity shared by the indexed snapshot.
     pub workspace_id: WorkspaceId,
+    /// Workspace-relative source path.
     pub path: PathBuf,
+    /// First declaration byte.
     pub start_byte: usize,
+    /// First byte after the declaration.
     pub end_byte: usize,
+    /// Declaration category.
     pub kind: SymbolKind,
 }
 
 /// A declaration indexed for conservative candidate lookup.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SymbolRecord {
+    /// Deterministic declaration identity.
     pub id: SymbolId,
+    /// Declared name.
     pub name: String,
 }
 
 /// Kind of source reference collected from syntax facts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReferenceKind {
+    /// A direct function-call expression.
     FunctionCall,
+    /// A method-call expression; the receiver type is unknown.
     MethodCall,
+    /// A `use` declaration.
     Import,
 }
 
@@ -69,30 +89,45 @@ pub enum CandidateState {
 /// A source reference and its possible declaration targets.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceCandidates {
+    /// Workspace-relative source path containing the reference.
     pub path: PathBuf,
+    /// First reference byte.
     pub start_byte: usize,
+    /// First byte after the reference.
     pub end_byte: usize,
+    /// Reference category.
     pub kind: ReferenceKind,
+    /// Source spelling of the reference target.
     pub spelling: String,
+    /// Candidate outcome; never a resolved target.
     pub state: CandidateState,
+    /// Same-name declaration candidates.
     pub candidates: Vec<SymbolId>,
 }
 
 /// Candidate catalog and references for one workspace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SymbolCandidateReport {
+    /// Workspace identity shared by the catalog.
     pub workspace_id: WorkspaceId,
+    /// Deterministically ordered declaration catalog.
     pub symbols: Vec<SymbolRecord>,
+    /// Deterministically ordered reference candidates.
     pub references: Vec<ReferenceCandidates>,
+    /// References with exactly one same-name candidate.
     pub unique_candidate_references: u64,
+    /// References with multiple same-name candidates.
     pub ambiguous_references: u64,
+    /// References with no same-name candidate.
     pub unresolved_references: u64,
+    /// References whose syntax is outside the supported subset.
     pub unsupported_references: u64,
 }
 
 /// Errors that make candidate indexing unsafe or internally inconsistent.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SymbolCandidateError {
+    /// Input reports mix workspace identities.
     #[error("source index contains facts from more than one workspace")]
     MixedWorkspaces,
 }
@@ -120,9 +155,7 @@ pub fn build_symbol_candidates(
         }
         if !matches!(
             file.status,
-            SourceFileStatus::Parsed
-                | SourceFileStatus::Recovered
-                | SourceFileStatus::Limited
+            SourceFileStatus::Parsed | SourceFileStatus::Recovered | SourceFileStatus::Limited
         ) {
             continue;
         }
@@ -180,8 +213,18 @@ pub fn build_symbol_candidates(
     }
 
     symbols.sort_by(|left, right| {
-        (&left.name, &left.id.path, left.id.start_byte, left.id.kind as u8)
-            .cmp(&(&right.name, &right.id.path, right.id.start_byte, right.id.kind as u8))
+        (
+            &left.name,
+            &left.id.path,
+            left.id.start_byte,
+            left.id.kind as u8,
+        )
+            .cmp(&(
+                &right.name,
+                &right.id.path,
+                right.id.start_byte,
+                right.id.kind as u8,
+            ))
     });
 
     let mut references = Vec::with_capacity(raw_references.len());
@@ -252,8 +295,12 @@ pub fn build_symbol_candidates(
     }
 
     references.sort_by(|left, right| {
-        (&left.path, left.start_byte, left.end_byte, left.kind as u8)
-            .cmp(&(&right.path, right.start_byte, right.end_byte, right.kind as u8))
+        (&left.path, left.start_byte, left.end_byte, left.kind as u8).cmp(&(
+            &right.path,
+            right.start_byte,
+            right.end_byte,
+            right.kind as u8,
+        ))
     });
 
     Ok(SymbolCandidateReport {
@@ -279,7 +326,9 @@ fn import_leaf(import: &str) -> Option<&str> {
         .strip_suffix(';')?
         .trim();
     if declaration.is_empty()
-        || declaration.chars().any(|character| matches!(character, '{' | '}' | '*' | ','))
+        || declaration
+            .chars()
+            .any(|character| matches!(character, '{' | '}' | '*' | ','))
         || declaration.contains(" as ")
     {
         return None;
@@ -308,7 +357,10 @@ mod tests {
 
     #[test]
     fn builds_unique_and_ambiguous_candidates_from_real_rust_facts() {
-        use crate::{index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor, WorkspaceFs};
+        use crate::{
+            index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor,
+            WorkspaceFs,
+        };
         use std::{fs, time::Duration};
         use tempfile::tempdir;
 
@@ -318,8 +370,8 @@ mod tests {
             "fn helper() {} fn caller() { helper(); }",
         )
         .expect("write source");
-        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
-            .expect("create descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(WorkspaceId::new(), root.path()).expect("create descriptor");
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(ScanLimits {
             max_duration: Duration::from_secs(10),
@@ -337,7 +389,10 @@ mod tests {
 
     #[test]
     fn duplicate_names_remain_ambiguous_instead_of_selecting_arbitrarily() {
-        use crate::{index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor, WorkspaceFs};
+        use crate::{
+            index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor,
+            WorkspaceFs,
+        };
         use std::{fs, time::Duration};
         use tempfile::tempdir;
 
@@ -347,8 +402,8 @@ mod tests {
             "fn helper() {} mod nested { fn helper() {} } fn caller() { helper(); }",
         )
         .expect("write source");
-        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
-            .expect("create descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(WorkspaceId::new(), root.path()).expect("create descriptor");
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(ScanLimits {
             max_duration: Duration::from_secs(10),
@@ -359,20 +414,26 @@ mod tests {
             .expect("same workspace identity");
 
         assert_eq!(report.ambiguous_references, 1);
-        assert_eq!(report.references[0].state, CandidateState::AmbiguousCandidates);
+        assert_eq!(
+            report.references[0].state,
+            CandidateState::AmbiguousCandidates
+        );
         assert_eq!(report.references[0].candidates.len(), 2);
     }
 
     #[test]
     fn rejects_facts_from_another_workspace() {
-        use crate::{index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor, WorkspaceFs};
+        use crate::{
+            index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor,
+            WorkspaceFs,
+        };
         use std::{fs, time::Duration};
         use tempfile::tempdir;
 
         let root = tempdir().expect("create workspace");
         fs::write(root.path().join("lib.rs"), "fn helper() {}").expect("write source");
-        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
-            .expect("create descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(WorkspaceId::new(), root.path()).expect("create descriptor");
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(ScanLimits {
             max_duration: Duration::from_secs(10),

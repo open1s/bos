@@ -90,10 +90,7 @@ impl IgnoreRule {
         self.action
     }
 
-    fn path_rule(
-        path: impl AsRef<Path>,
-        action: IgnoreAction,
-    ) -> Result<Self, IgnorePolicyError> {
+    fn path_rule(path: impl AsRef<Path>, action: IgnoreAction) -> Result<Self, IgnorePolicyError> {
         let path = path.as_ref();
         let mut normalized = PathBuf::new();
         let mut count = 0usize;
@@ -247,8 +244,7 @@ impl IgnorePolicy {
     /// include rule that targets content beneath it.
     #[must_use]
     pub fn should_descend(&self, path: &Path) -> bool {
-        let (ignored, last_matching_index) =
-            self.decision(path, WorkspaceEntryKind::Directory);
+        let (ignored, last_matching_index) = self.decision(path, WorkspaceEntryKind::Directory);
         if !ignored {
             return true;
         }
@@ -317,7 +313,10 @@ mod tests {
             "web/.next/cache",
             "python/.venv/lib/site.py",
         ] {
-            assert!(policy.is_ignored(Path::new(path), WorkspaceEntryKind::File), "{path}");
+            assert!(
+                policy.is_ignored(Path::new(path), WorkspaceEntryKind::File),
+                "{path}"
+            );
         }
 
         assert!(!policy.is_ignored(Path::new("src/main.rs"), WorkspaceEntryKind::File));
@@ -332,10 +331,7 @@ mod tests {
             Path::new("fixtures/generated/data.json"),
             WorkspaceEntryKind::File
         ));
-        assert!(!policy.is_ignored(
-            Path::new("fixtures/source.json"),
-            WorkspaceEntryKind::File
-        ));
+        assert!(!policy.is_ignored(Path::new("fixtures/source.json"), WorkspaceEntryKind::File));
     }
 
     #[test]
@@ -343,14 +339,8 @@ mod tests {
         let mut policy = IgnorePolicy::without_builtins();
         policy.push(IgnoreRule::exclude_directory("cache").unwrap());
 
-        assert!(policy.is_ignored(
-            Path::new("src/cache/output.bin"),
-            WorkspaceEntryKind::File
-        ));
-        assert!(policy.is_ignored(
-            Path::new("src/cache"),
-            WorkspaceEntryKind::Directory
-        ));
+        assert!(policy.is_ignored(Path::new("src/cache/output.bin"), WorkspaceEntryKind::File));
+        assert!(policy.is_ignored(Path::new("src/cache"), WorkspaceEntryKind::Directory));
     }
 
     #[test]
@@ -382,10 +372,7 @@ mod tests {
         assert!(policy.should_descend(Path::new("target")));
         assert!(policy.is_ignored(Path::new("target/keep"), WorkspaceEntryKind::Directory));
         assert!(policy.should_descend(Path::new("target/keep")));
-        assert!(!policy.is_ignored(
-            Path::new("target/keep/main.rs"),
-            WorkspaceEntryKind::File
-        ));
+        assert!(!policy.is_ignored(Path::new("target/keep/main.rs"), WorkspaceEntryKind::File));
     }
 
     #[test]
@@ -394,10 +381,7 @@ mod tests {
         policy.push(IgnoreRule::include_path("target/keep/main.rs").unwrap());
         policy.push(IgnoreRule::exclude_path("target/keep").unwrap());
 
-        assert!(policy.is_ignored(
-            Path::new("target/keep/main.rs"),
-            WorkspaceEntryKind::File
-        ));
+        assert!(policy.is_ignored(Path::new("target/keep/main.rs"), WorkspaceEntryKind::File));
         assert!(!policy.should_descend(Path::new("target/keep")));
     }
 
@@ -422,4 +406,3 @@ mod tests {
         assert!(policy.is_ignored(Path::new(".git"), WorkspaceEntryKind::File));
     }
 }
-

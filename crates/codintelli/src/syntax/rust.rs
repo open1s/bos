@@ -5,14 +5,14 @@
 
 use std::{ops::ControlFlow, sync::Arc};
 
-use tree_sitter::{Node, ParseOptions, Parser, ParseState};
+use tree_sitter::{Node, ParseOptions, ParseState, Parser};
 
 use crate::classification::LanguageId;
 
 use super::{
-    valid_relative_path, ImportFact, RustModuleFact, LanguageProvider, ParseDiagnostic, ParseInput, ParseResult,
-    ParseStatus, ParseControl, ParseLimitKind, ParseLimits, ProviderError, SourceRange,
-    ParsedDocument, SyntaxFact, SyntaxFactKind,
+    valid_relative_path, ImportFact, LanguageProvider, ParseControl, ParseDiagnostic, ParseInput,
+    ParseLimitKind, ParseLimits, ParseResult, ParseStatus, ParsedDocument, ProviderError,
+    RustModuleFact, SourceRange, SyntaxFact, SyntaxFactKind,
 };
 
 /// Rust provider using the upstream Tree-sitter Rust grammar.
@@ -40,6 +40,10 @@ impl LanguageProvider for RustProvider {
         Self::VERSION
     }
 
+    fn tree_sitter_language(&self) -> Option<tree_sitter::Language> {
+        Some(tree_sitter_rust::LANGUAGE.into())
+    }
+
     fn parse(&self, input: ParseInput<'_>) -> Result<ParseResult, ProviderError> {
         self.parse_bounded(input, None)
     }
@@ -58,10 +62,7 @@ impl RustProvider {
     ///
     /// Unlike the compatibility fact-projection API, this returns no custom
     /// syntax representation. Consumers query and traverse the native tree.
-    pub fn parse_document(
-        &self,
-        input: ParseInput<'_>,
-    ) -> Result<ParsedDocument, ProviderError> {
+    pub fn parse_document(&self, input: ParseInput<'_>) -> Result<ParsedDocument, ProviderError> {
         self.parse_document_bounded(input, None)
     }
 
@@ -229,7 +230,12 @@ impl RustProvider {
                     source_range(node, source.len()),
                     node.child_by_field_name("name"),
                 ) {
-                    if facts.len().saturating_add(imports.len()).saturating_add(modules.len()) >= limits.max_facts {
+                    if facts
+                        .len()
+                        .saturating_add(imports.len())
+                        .saturating_add(modules.len())
+                        >= limits.max_facts
+                    {
                         limit_reason = Some(ParseLimitKind::Facts);
                         break;
                     }
@@ -248,14 +254,19 @@ impl RustProvider {
             if node.kind() == "use_declaration" {
                 if let Some(range) = source_range(node, source.len()) {
                     let scope_path = enclosing_module_path(node, source);
-                    let argument = node
-                        .child_by_field_name("argument")
-                        .or_else(|| node.named_child(node.named_child_count().saturating_sub(1) as u32));
+                    let argument = node.child_by_field_name("argument").or_else(|| {
+                        node.named_child(node.named_child_count().saturating_sub(1) as u32)
+                    });
                     if let Some(argument) = argument {
                         let mut expanded = Vec::new();
                         flatten_use_tree(argument, &[], source, &mut expanded);
                         for (path, alias, is_glob) in expanded {
-                            if facts.len().saturating_add(imports.len()).saturating_add(modules.len()) >= limits.max_facts {
+                            if facts
+                                .len()
+                                .saturating_add(imports.len())
+                                .saturating_add(modules.len())
+                                >= limits.max_facts
+                            {
                                 limit_reason = Some(ParseLimitKind::Facts);
                                 break;
                             }
@@ -276,7 +287,12 @@ impl RustProvider {
 
             if let Some((kind, name)) = classify_node(node, source) {
                 if let Some(range) = source_range(node, source.len()) {
-                    if facts.len().saturating_add(imports.len()).saturating_add(modules.len()) >= limits.max_facts {
+                    if facts
+                        .len()
+                        .saturating_add(imports.len())
+                        .saturating_add(modules.len())
+                        >= limits.max_facts
+                    {
                         limit_reason = Some(ParseLimitKind::Facts);
                         break;
                     }
@@ -297,6 +313,9 @@ impl RustProvider {
                 break;
             }
             for index in (0..child_count).rev() {
+                let Ok(index) = u32::try_from(index) else {
+                    break;
+                };
                 if let Some(child) = node.child(index) {
                     pending.push(child);
                 }
@@ -308,12 +327,28 @@ impl RustProvider {
         });
         diagnostics.sort_unstable_by_key(|diagnostic| diagnostic.range);
         imports.sort_unstable_by(|left, right| {
-            (&left.scope_path, &left.path, &left.alias, left.is_glob, left.range)
-                .cmp(&(&right.scope_path, &right.path, &right.alias, right.is_glob, right.range))
+            (
+                &left.scope_path,
+                &left.path,
+                &left.alias,
+                left.is_glob,
+                left.range,
+            )
+                .cmp(&(
+                    &right.scope_path,
+                    &right.path,
+                    &right.alias,
+                    right.is_glob,
+                    right.range,
+                ))
         });
         modules.sort_unstable_by(|left, right| {
-            (&left.scope_path, &left.name, left.is_inline, left.range)
-                .cmp(&(&right.scope_path, &right.name, right.is_inline, right.range))
+            (&left.scope_path, &left.name, left.is_inline, left.range).cmp(&(
+                &right.scope_path,
+                &right.name,
+                right.is_inline,
+                right.range,
+            ))
         });
 
         let status = if limit_reason.is_some() {
@@ -348,7 +383,10 @@ fn has_resolution_attributes(node: Node<'_>, source: &str) -> bool {
     let mut previous = node.prev_named_sibling();
     while let Some(sibling) = previous {
         if sibling.kind() == "attribute_item" {
-            let attribute = source.get(sibling.byte_range()).unwrap_or_default().trim_start();
+            let attribute = source
+                .get(sibling.byte_range())
+                .unwrap_or_default()
+                .trim_start();
             if attribute.starts_with("#[cfg") || attribute.starts_with("#[path") {
                 return true;
             }
@@ -409,8 +447,8 @@ fn flatten_use_tree(
             }
         }
         "scoped_use_list" => {
-            let mut named = (0..node.named_child_count())
-                .filter_map(|index| node.named_child(index as u32));
+            let mut named =
+                (0..node.named_child_count()).filter_map(|index| node.named_child(index as u32));
             if let (Some(path_node), Some(list_node)) = (named.next(), named.next()) {
                 let mut path = prefix.to_vec();
                 path.extend(path_segments(path_node, source));
@@ -418,8 +456,8 @@ fn flatten_use_tree(
             }
         }
         "use_as_clause" => {
-            let mut named = (0..node.named_child_count())
-                .filter_map(|index| node.named_child(index as u32));
+            let mut named =
+                (0..node.named_child_count()).filter_map(|index| node.named_child(index as u32));
             if let (Some(path_node), Some(alias_node)) = (named.next(), named.next()) {
                 let mut path = prefix.to_vec();
                 path.extend(path_segments(path_node, source));
@@ -523,7 +561,7 @@ fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option
         "union_item" => SyntaxFactKind::Union,
         "trait_item" => SyntaxFactKind::Trait,
         "impl_item" => SyntaxFactKind::Impl,
-        "type_item" => SyntaxFactKind::TypeAlias,
+        "type_item" | "associated_type" => SyntaxFactKind::TypeAlias,
         "const_item" => SyntaxFactKind::Constant,
         "static_item" => SyntaxFactKind::Static,
         "use_declaration" => SyntaxFactKind::Import,
@@ -578,8 +616,8 @@ fn source_range(node: Node<'_>, source_len: usize) -> Option<SourceRange> {
 mod tests {
     use super::*;
     use crate::{ParseControl, ParseLimits, ScanBudget, ScanLimits, WorkspaceId};
-    use std::time::Duration;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     fn parse(source: &str) -> ParseResult {
         RustProvider
@@ -602,7 +640,10 @@ mod tests {
             })
             .expect("parse native document");
 
-        assert_eq!(document.status(), super::super::ParsedDocumentStatus::Complete);
+        assert_eq!(
+            document.status(),
+            super::super::ParsedDocumentStatus::Complete
+        );
         assert_eq!(document.source(), source);
         assert_eq!(document.root_node().kind(), "source_file");
 
@@ -623,7 +664,10 @@ mod tests {
             })
             .expect("tree-sitter should return a recovered tree");
 
-        assert_eq!(document.status(), super::super::ParsedDocumentStatus::Recovered);
+        assert_eq!(
+            document.status(),
+            super::super::ParsedDocumentStatus::Recovered
+        );
         assert!(document.root_node().has_error());
     }
 
@@ -652,7 +696,8 @@ mod tests {
 
     #[test]
     fn extracts_explicit_and_implicit_visibility_from_grammar_nodes() {
-        let result = parse(r#"
+        let result = parse(
+            r#"
 mod private_mod {}
 pub mod public_mod {}
 pub(crate) struct CrateType;
@@ -662,7 +707,8 @@ pub(in crate::outer) type ScopedAlias = u8;
 pub use crate::public_mod::Thing as PublicThing;
 pub trait Api { fn trait_method(&self); const TRAIT_CONST: u8; type Output; }
 fn private_fn() {}
-"#);
+"#,
+        );
         let visibility = |name: &str| {
             result
                 .facts
@@ -671,16 +717,31 @@ fn private_fn() {}
                 .and_then(|fact| fact.visibility.clone())
                 .expect("declaration visibility fact")
         };
-        assert_eq!(visibility("private_mod"), super::super::RustVisibility::Private);
-        assert_eq!(visibility("public_mod"), super::super::RustVisibility::Public);
+        assert_eq!(
+            visibility("private_mod"),
+            super::super::RustVisibility::Private
+        );
+        assert_eq!(
+            visibility("public_mod"),
+            super::super::RustVisibility::Public
+        );
         assert_eq!(visibility("CrateType"), super::super::RustVisibility::Crate);
-        assert_eq!(visibility("parent_visible"), super::super::RustVisibility::Super);
-        assert_eq!(visibility("SELF_VALUE"), super::super::RustVisibility::SelfScope);
+        assert_eq!(
+            visibility("parent_visible"),
+            super::super::RustVisibility::Super
+        );
+        assert_eq!(
+            visibility("SELF_VALUE"),
+            super::super::RustVisibility::SelfScope
+        );
         assert_eq!(
             visibility("ScopedAlias"),
             super::super::RustVisibility::InPath(vec!["crate".to_owned(), "outer".to_owned()])
         );
-        assert_eq!(visibility("private_fn"), super::super::RustVisibility::Private);
+        assert_eq!(
+            visibility("private_fn"),
+            super::super::RustVisibility::Private
+        );
         for trait_member in ["trait_method", "TRAIT_CONST", "Output"] {
             let fact = result
                 .facts
@@ -694,7 +755,10 @@ fn private_fn() {}
             .iter()
             .find(|fact| fact.kind == SyntaxFactKind::Import)
             .expect("pub use syntax fact");
-        assert_eq!(import.visibility, Some(super::super::RustVisibility::Public));
+        assert_eq!(
+            import.visibility,
+            Some(super::super::RustVisibility::Public)
+        );
     }
 
     #[test]
@@ -719,7 +783,10 @@ fn helper() {}
         assert_eq!(result.status, ParseStatus::Complete);
         assert_eq!(result.imports.len(), 1);
         assert_eq!(result.imports[0].path, vec!["std", "fmt", "Debug"]);
-        assert!(result.modules.iter().any(|item| item.name == "nested" && item.is_inline));
+        assert!(result
+            .modules
+            .iter()
+            .any(|item| item.name == "nested" && item.is_inline));
         for kind in [
             SyntaxFactKind::Module,
             SyntaxFactKind::Import,
@@ -748,17 +815,18 @@ fn helper() {}
         }
     }
 
-
     #[test]
     fn records_lexical_module_scope_and_excludes_block_local_items() {
-        let result = parse(r#"
+        let result = parse(
+            r#"
 mod nested {
     fn visible_in_module() {}
     fn outer() {
         fn local_only() {}
     }
 }
-"#);
+"#,
+        );
         let module_fn = result
             .facts
             .iter()
@@ -778,42 +846,79 @@ mod nested {
 
     #[test]
     fn extracts_grouped_alias_glob_self_and_nested_module_imports() {
-        let result = parse(r#"
+        let result = parse(
+            r#"
 use crate::model::{Widget, self, State as CurrentState, nested::*};
 mod nested {
     use super::Widget;
 }
-"#);
-        assert!(result.imports.iter().any(|item| item.path == vec!["crate".to_owned(), "model".to_owned(), "Widget".to_owned()]));
-        assert!(result.imports.iter().any(|item| item.path == vec!["crate".to_owned(), "model".to_owned()] && item.alias.is_none() && !item.is_glob));
-        assert!(result.imports.iter().any(|item| item.path == vec!["crate".to_owned(), "model".to_owned(), "State".to_owned()] && item.alias.as_deref() == Some("CurrentState")));
-        assert!(result.imports.iter().any(|item| item.path == vec!["crate".to_owned(), "model".to_owned(), "nested".to_owned()] && item.is_glob));
-        assert!(result.imports.iter().any(|item| item.path == vec!["super".to_owned(), "Widget".to_owned()] && item.scope_path == vec!["nested".to_owned()]));
+"#,
+        );
+        assert!(result
+            .imports
+            .iter()
+            .any(|item| item.path
+                == vec!["crate".to_owned(), "model".to_owned(), "Widget".to_owned()]));
+        assert!(result.imports.iter().any(|item| item.path
+            == vec!["crate".to_owned(), "model".to_owned()]
+            && item.alias.is_none()
+            && !item.is_glob));
+        assert!(result.imports.iter().any(|item| item.path
+            == vec!["crate".to_owned(), "model".to_owned(), "State".to_owned()]
+            && item.alias.as_deref() == Some("CurrentState")));
+        assert!(result.imports.iter().any(|item| item.path
+            == vec!["crate".to_owned(), "model".to_owned(), "nested".to_owned()]
+            && item.is_glob));
+        assert!(result.imports.iter().any(|item| item.path
+            == vec!["super".to_owned(), "Widget".to_owned()]
+            && item.scope_path == vec!["nested".to_owned()]));
     }
 
     #[test]
     fn distinguishes_inline_and_external_module_declarations() {
-        let result = parse(r#"
+        let result = parse(
+            r#"
 mod inline_child { mod nested; }
 mod external_child;
-"#);
-        assert!(result.modules.iter().any(|item| item.name == "inline_child" && item.is_inline && item.scope_path.is_empty()));
-        assert!(result.modules.iter().any(|item| item.name == "nested" && !item.is_inline && item.scope_path == vec!["inline_child".to_owned()]));
-        assert!(result.modules.iter().any(|item| item.name == "external_child" && !item.is_inline && item.scope_path.is_empty()));
+"#,
+        );
+        assert!(result.modules.iter().any(|item| item.name == "inline_child"
+            && item.is_inline
+            && item.scope_path.is_empty()));
+        assert!(result.modules.iter().any(|item| item.name == "nested"
+            && !item.is_inline
+            && item.scope_path == vec!["inline_child".to_owned()]));
+        assert!(result
+            .modules
+            .iter()
+            .any(|item| item.name == "external_child"
+                && !item.is_inline
+                && item.scope_path.is_empty()));
     }
 
     #[test]
     fn marks_attributed_module_declarations_as_uncertain() {
-        let result = parse(r#"#[cfg(feature = "optional")]
+        let result = parse(
+            r#"#[cfg(feature = "optional")]
 mod optional;
 #[path = "custom/location.rs"]
 mod custom;
 #[doc = "documented module"]
 mod documented;
-"#);
-        assert!(result.modules.iter().any(|item| item.name == "optional" && item.has_resolution_attributes));
-        assert!(result.modules.iter().any(|item| item.name == "custom" && item.has_resolution_attributes));
-        assert!(result.modules.iter().any(|item| item.name == "documented" && !item.has_resolution_attributes));
+"#,
+        );
+        assert!(result
+            .modules
+            .iter()
+            .any(|item| item.name == "optional" && item.has_resolution_attributes));
+        assert!(result
+            .modules
+            .iter()
+            .any(|item| item.name == "custom" && item.has_resolution_attributes));
+        assert!(result
+            .modules
+            .iter()
+            .any(|item| item.name == "documented" && !item.has_resolution_attributes));
     }
 
     #[test]

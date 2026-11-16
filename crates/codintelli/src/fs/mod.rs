@@ -87,11 +87,12 @@ impl WorkspaceFs {
             return Err(WorkspaceFsError::InvalidLimit);
         }
 
-        let (file_name, parents) = components
-            .split_last()
-            .ok_or_else(|| WorkspaceFsError::InvalidRelativePath {
-                path: relative_path.to_path_buf(),
-            })?;
+        let (file_name, parents) =
+            components
+                .split_last()
+                .ok_or_else(|| WorkspaceFsError::InvalidRelativePath {
+                    path: relative_path.to_path_buf(),
+                })?;
 
         let mut current: Option<Dir> = None;
         for component in parents {
@@ -107,12 +108,13 @@ impl WorkspaceFs {
         }
 
         let parent = current.as_ref().unwrap_or(&self.root);
-        let entry_metadata = parent
-            .symlink_metadata(file_name)
-            .map_err(|source| WorkspaceFsError::Io {
-                path: relative_path.to_path_buf(),
-                source,
-            })?;
+        let entry_metadata =
+            parent
+                .symlink_metadata(file_name)
+                .map_err(|source| WorkspaceFsError::Io {
+                    path: relative_path.to_path_buf(),
+                    source,
+                })?;
         if !entry_metadata.is_file() {
             return Err(WorkspaceFsError::NotRegularFile {
                 path: relative_path.to_path_buf(),
@@ -126,12 +128,13 @@ impl WorkspaceFs {
             .maybe_dir(true)
             .nonblock(true);
 
-        let file: File = parent
-            .open_with(file_name, &options)
-            .map_err(|source| WorkspaceFsError::Io {
-                path: relative_path.to_path_buf(),
-                source,
-            })?;
+        let file: File =
+            parent
+                .open_with(file_name, &options)
+                .map_err(|source| WorkspaceFsError::Io {
+                    path: relative_path.to_path_buf(),
+                    source,
+                })?;
 
         let metadata = file.metadata().map_err(|source| WorkspaceFsError::Io {
             path: relative_path.to_path_buf(),
@@ -190,7 +193,10 @@ fn normal_components(path: &Path) -> Result<Vec<OsString>, WorkspaceFsError> {
     for component in path.components() {
         match component {
             Component::Normal(name) => components.push(name.to_os_string()),
-            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
                 return Err(WorkspaceFsError::InvalidRelativePath {
                     path: path.to_path_buf(),
                 });
@@ -283,8 +289,8 @@ mod tests {
     fn preserves_host_supplied_workspace_identity() {
         let root = tempdir().expect("create workspace");
         let id = crate::WorkspaceId::new();
-        let descriptor = WorkspaceDescriptor::new(id, root.path())
-            .expect("create workspace descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(id, root.path()).expect("create workspace descriptor");
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace capability");
 
         assert_eq!(workspace.workspace_id(), id);
@@ -355,8 +361,11 @@ mod tests {
         let root = tempdir().expect("create workspace");
         let outside = tempdir().expect("create outside directory");
         fs::write(outside.path().join("secret.txt"), "secret").expect("write outside file");
-        symlink(outside.path().join("secret.txt"), root.path().join("link.txt"))
-            .expect("create symlink");
+        symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("link.txt"),
+        )
+        .expect("create symlink");
 
         let workspace = workspace_fs(root.path());
         assert!(workspace.read_file("link.txt", 1024).is_err());
@@ -399,6 +408,9 @@ mod tests {
         fs::write(root.path().join("empty.txt"), b"").expect("write empty file");
         let workspace = workspace_fs(root.path());
 
-        assert_eq!(workspace.read_file("empty.txt", 0).expect("read empty"), b"");
+        assert_eq!(
+            workspace.read_file("empty.txt", 0).expect("read empty"),
+            b""
+        );
     }
 }

@@ -83,10 +83,13 @@ pub struct RustSymbolImportResolutionReport {
 /// Invalid inputs to scoped symbol import resolution.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RustSymbolImportResolutionError {
+    /// The import report and symbol catalog mix workspace identities.
     #[error("module import report and symbol catalog have different workspace identities")]
     WorkspaceMismatch,
+    /// The import report and symbol catalog disagree about graph completeness.
     #[error("module import report and symbol catalog have different graph completeness states")]
     GraphStatusMismatch,
+    /// A symbol belongs to a different workspace.
     #[error("symbol catalog contains a symbol from another workspace")]
     SymbolWorkspaceMismatch,
 }
@@ -125,8 +128,18 @@ pub fn resolve_rust_import_symbols(
     }
 
     imports.sort_unstable_by(|left, right| {
-        (&left.source_path, left.range, &left.crate_root, &left.import_path)
-            .cmp(&(&right.source_path, right.range, &right.crate_root, &right.import_path))
+        (
+            &left.source_path,
+            left.range,
+            &left.crate_root,
+            &left.import_path,
+        )
+            .cmp(&(
+                &right.source_path,
+                right.range,
+                &right.crate_root,
+                &right.import_path,
+            ))
     });
 
     Ok(RustSymbolImportResolutionReport {
@@ -164,9 +177,10 @@ fn resolve_one_import(
         return result;
     }
 
-    let (Some(crate_root), Some(module_path)) =
-        (import.crate_root.as_ref(), import.target_module_path.as_ref())
-    else {
+    let (Some(crate_root), Some(module_path)) = (
+        import.crate_root.as_ref(),
+        import.target_module_path.as_ref(),
+    ) else {
         return result;
     };
 
@@ -232,10 +246,7 @@ fn absence_status(
     }
 }
 
-fn make_candidate(
-    symbol: &RustScopedSymbol,
-    alias: Option<&str>,
-) -> RustSymbolImportCandidate {
+fn make_candidate(symbol: &RustScopedSymbol, alias: Option<&str>) -> RustSymbolImportCandidate {
     RustSymbolImportCandidate {
         symbol_id: symbol.id.clone(),
         symbol_name: symbol.name.clone(),
@@ -273,7 +284,7 @@ mod tests {
                 kind: RustScopedSymbolKind::Struct,
             },
             name: name.to_owned(),
-            visibility: crate::syntax::RustVisibility::Public,
+            visibility: Some(crate::syntax::RustVisibility::Public),
         }
     }
 
@@ -317,7 +328,7 @@ mod tests {
         let workspace_id = symbols
             .first()
             .map(|symbol| symbol.id.workspace_id)
-            .unwrap_or_else(WorkspaceId::new);
+            .unwrap_or_default();
         resolve_rust_import_symbols(
             &RustImportResolutionReport {
                 workspace_id,
@@ -373,7 +384,14 @@ mod tests {
     fn glob_import_returns_only_direct_module_candidates() {
         let id = WorkspaceId::new();
         let direct = symbol(id, "src/lib.rs", &["model"], "src/model.rs", "Widget", 10);
-        let nested = symbol(id, "src/lib.rs", &["model", "inner"], "src/model.rs", "Hidden", 40);
+        let nested = symbol(
+            id,
+            "src/lib.rs",
+            &["model", "inner"],
+            "src/model.rs",
+            "Hidden",
+            40,
+        );
         let report = resolve(
             vec![module_import(&[], true, None)],
             vec![direct, nested],
@@ -429,7 +447,10 @@ mod tests {
             RustModuleGraphStatus::Partial,
             Vec::new(),
         );
-        assert_eq!(report.imports[0].status, RustSymbolImportStatus::UnresolvedModule);
+        assert_eq!(
+            report.imports[0].status,
+            RustSymbolImportStatus::UnresolvedModule
+        );
         assert_eq!(
             report.imports[0].module_status,
             RustImportResolutionStatus::UncertainModuleTarget

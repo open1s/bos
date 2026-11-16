@@ -15,32 +15,49 @@ use crate::{
 /// Declaration category retained by the crate-root-aware Rust symbol catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RustScopedSymbolKind {
+    /// A free function in module scope.
     Function,
+    /// A method or associated function.
     Method,
+    /// A struct.
     Struct,
+    /// An enum.
     Enum,
+    /// A union.
     Union,
+    /// A trait.
     Trait,
+    /// A type alias.
     TypeAlias,
+    /// A constant.
     Constant,
+    /// A static item.
     Static,
 }
 
 /// Identity of a declaration in one crate-root-specific module namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustScopedSymbolId {
+    /// Workspace identity shared by the catalog.
     pub workspace_id: WorkspaceId,
+    /// Host-supplied crate root owning this namespace.
     pub crate_root: PathBuf,
+    /// Logical module path relative to the crate root.
     pub module_path: Vec<String>,
+    /// Workspace-relative source file.
     pub source_path: PathBuf,
+    /// Exact declaration source range.
     pub range: SourceRange,
+    /// Declaration category.
     pub kind: RustScopedSymbolKind,
 }
 
 /// Source-backed Rust declaration with its logical crate/module path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustScopedSymbol {
+    /// Deterministic crate-root-scoped declaration identity.
     pub id: RustScopedSymbolId,
+    /// Declared name.
     pub name: String,
     /// Visibility modifier written at the declaration; not effective accessibility.
     pub visibility: Option<RustVisibility>,
@@ -49,8 +66,11 @@ pub struct RustScopedSymbol {
 /// Catalog coverage and diagnostics for one workspace module graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustScopedSymbolReport {
+    /// Workspace identity shared by the catalog.
     pub workspace_id: WorkspaceId,
+    /// Completeness of the module graph used to scope declarations.
     pub graph_status: RustModuleGraphStatus,
+    /// Deterministically ordered scoped symbols.
     pub symbols: Vec<RustScopedSymbol>,
     /// Files whose parse output is recovered or limited.
     pub incomplete_source_paths: Vec<PathBuf>,
@@ -59,8 +79,10 @@ pub struct RustScopedSymbolReport {
 /// Invalid input to scoped Rust symbol catalog construction.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RustScopedSymbolError {
+    /// Parse results and the module graph mix workspace identities.
     #[error("parse results and module graph have different workspace identities")]
     WorkspaceMismatch,
+    /// Two parse results describe the same relative path.
     #[error("duplicate parse result path: {0}")]
     DuplicateParsePath(PathBuf),
 }
@@ -84,8 +106,13 @@ pub fn build_rust_scoped_symbols(
     let mut by_path = std::collections::HashMap::new();
     let mut incomplete_source_paths = Vec::new();
     for result in parse_results {
-        if by_path.insert(result.relative_path.clone(), result).is_some() {
-            return Err(RustScopedSymbolError::DuplicateParsePath(result.relative_path.clone()));
+        if by_path
+            .insert(result.relative_path.clone(), result)
+            .is_some()
+        {
+            return Err(RustScopedSymbolError::DuplicateParsePath(
+                result.relative_path.clone(),
+            ));
         }
         if matches!(
             result.status,
@@ -204,7 +231,10 @@ mod tests {
                 scope_path: vec!["inner".to_owned()],
                 is_module_scope: true,
                 visibility: Some(RustVisibility::Public),
-                range: SourceRange { start_byte: 0, end_byte: 12 },
+                range: SourceRange {
+                    start_byte: 0,
+                    end_byte: 12,
+                },
             }],
             imports: Vec::new(),
             modules: Vec::new(),
@@ -238,6 +268,9 @@ mod tests {
             report.symbols[1].id.module_path,
             vec!["shared".to_owned(), "inner".to_owned()]
         );
-        assert_ne!(report.symbols[0].id.crate_root, report.symbols[1].id.crate_root);
+        assert_ne!(
+            report.symbols[0].id.crate_root,
+            report.symbols[1].id.crate_root
+        );
     }
 }

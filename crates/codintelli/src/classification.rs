@@ -201,26 +201,20 @@ fn classify_well_known_name(name: &str) -> Option<FileClassification> {
         "package-lock.json" => {
             classification(Configuration, Some(LanguageId::Json), WellKnownFileName)
         }
-        "pnpm-lock.yaml" => {
-            classification(Configuration, Some(Yaml), WellKnownFileName)
-        }
+        "pnpm-lock.yaml" => classification(Configuration, Some(Yaml), WellKnownFileName),
         "yarn.lock" => classification(Configuration, None, WellKnownFileName),
         "go.mod" | "go.sum" => {
             classification(Configuration, Some(LanguageId::Go), WellKnownFileName)
         }
-        "gemfile" | "rakefile" => {
-            classification(Configuration, Some(Ruby), WellKnownFileName)
-        }
+        "gemfile" | "rakefile" => classification(Configuration, Some(Ruby), WellKnownFileName),
         ".gitignore" | ".gitattributes" => {
             classification(Configuration, Some(GitMetadata), WellKnownFileName)
         }
         ".editorconfig" | ".env" | ".env.example" | "requirements.txt" => {
             classification(Configuration, None, WellKnownFileName)
         }
-        "readme" | "license" | "changelog" | "contributing" | "authors"
-        | "code_of_conduct" | "security" => {
-            classification(Documentation, None, WellKnownFileName)
-        }
+        "readme" | "license" | "changelog" | "contributing" | "authors" | "code_of_conduct"
+        | "security" => classification(Documentation, None, WellKnownFileName),
         _ if name.starts_with("dockerfile.") => {
             classification(Configuration, Some(Dockerfile), WellKnownFileName)
         }
@@ -234,7 +228,7 @@ fn classify_extension(extension: &str) -> FileClassification {
     use FileCategory::{Asset, Configuration, Data, Documentation, Markup, Source, Style};
     use LanguageId::*;
 
-    let value = match extension {
+    match extension {
         "rs" => classification(Source, Some(Rust), Extension),
         "ts" | "tsx" | "mts" | "cts" => classification(Source, Some(TypeScript), Extension),
         "js" | "jsx" | "mjs" | "cjs" => classification(Source, Some(JavaScript), Extension),
@@ -243,9 +237,7 @@ fn classify_extension(extension: &str) -> FileClassification {
         "java" => classification(Source, Some(Java), Extension),
         "c" => classification(Source, Some(C), Extension),
         "h" => classification(Source, Some(CHeader), Extension),
-        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => {
-            classification(Source, Some(Cpp), Extension)
-        }
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => classification(Source, Some(Cpp), Extension),
         "cs" => classification(Source, Some(CSharp), Extension),
         "swift" => classification(Source, Some(Swift), Extension),
         "kt" | "kts" => classification(Source, Some(Kotlin), Extension),
@@ -264,9 +256,7 @@ fn classify_extension(extension: &str) -> FileClassification {
         "json" | "jsonl" | "ndjson" | "csv" | "tsv" | "parquet" | "ipynb" => {
             classification(Data, Some(Json), Extension)
         }
-        "md" | "mdx" | "rst" | "adoc" => {
-            classification(Documentation, Some(Markdown), Extension)
-        }
+        "md" | "mdx" | "rst" | "adoc" => classification(Documentation, Some(Markdown), Extension),
         "html" | "htm" | "xhtml" => classification(Markup, Some(Html), Extension),
         "xml" => classification(Markup, Some(Xml), Extension),
         "vue" => classification(Markup, Some(Vue), Extension),
@@ -276,12 +266,10 @@ fn classify_extension(extension: &str) -> FileClassification {
         "sass" => classification(Style, Some(Sass), Extension),
         "less" => classification(Style, Some(Less), Extension),
         "svg" => classification(Asset, Some(Svg), Extension),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "tif"
-        | "tiff" | "pdf" | "woff" | "woff2" | "ttf" | "otf" | "eot" | "zip"
-        | "gz" | "wasm" | "exe" | "dll" | "so" | "dylib" | "a" | "lib"
-        | "o" | "obj" | "class" | "jar" | "war" | "ear" | "bin" | "dat" => {
-            classification(Asset, None, Extension)
-        }
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "tif" | "tiff" | "pdf"
+        | "woff" | "woff2" | "ttf" | "otf" | "eot" | "zip" | "gz" | "wasm" | "exe" | "dll"
+        | "so" | "dylib" | "a" | "lib" | "o" | "obj" | "class" | "jar" | "war" | "ear" | "bin"
+        | "dat" => classification(Asset, None, Extension),
         "txt" => classification(Documentation, None, Extension),
         _ => classification(
             FileCategory::Unknown,
@@ -292,8 +280,7 @@ fn classify_extension(extension: &str) -> FileClassification {
                 UnknownExtension
             },
         ),
-    };
-    value
+    }
 }
 
 #[cfg(test)]
@@ -365,10 +352,7 @@ mod tests {
             classify("data/custom.blob").reason,
             ClassificationReason::UnknownExtension
         );
-        assert_eq!(
-            classify("LICENSE").category,
-            FileCategory::Documentation
-        );
+        assert_eq!(classify("LICENSE").category, FileCategory::Documentation);
         assert_eq!(
             classify("LICENSE").reason,
             ClassificationReason::WellKnownFileName
@@ -406,14 +390,10 @@ mod tests {
 
     #[test]
     fn classifies_justfiles_and_jsonc_as_configuration() {
-        assert_eq!(
-            classify("Justfile").language,
-            Some(LanguageId::Justfile)
-        );
+        assert_eq!(classify("Justfile").language, Some(LanguageId::Justfile));
         assert_eq!(
             classify("tsconfig.jsonc").category,
             FileCategory::Configuration
         );
     }
-
 }

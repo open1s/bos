@@ -109,6 +109,23 @@ from the bounded source snapshot when reopening an indexed file. A future
 incremental parser may pass the previous native Tree to Tree-sitter, but must
 publish the replacement document atomically.
 
+### TS-02 implementation: native query registry and execution
+
+The TS-02 layer is implemented in `src/syntax/query.rs`. A provider may expose
+its native grammar through `LanguageProvider::tree_sitter_language`; the
+default `None` keeps existing providers source compatible but ineligible for
+query registration. `QueryRegistry` compiles and versions native Tree-sitter
+`Query` values against the provider grammar, binds each to
+`(language, provider id, provider version, query id, query version)`, and never
+holds a cursor. `execute_query` validates that identity against a
+`ParsedDocument`, creates a fresh `QueryCursor`, observes the shared
+`ScanBudget` through the cursor progress callback, enforces retained match and
+capture caps, and returns generic capture records (capture index and byte
+range) with an explicit complete, cancelled, deadline, output-limited, or
+match-limit status. Recovered documents remain queryable without upgrading
+their parse coverage. Query results are syntax evidence only, never
+compiler-resolved semantics.
+
 ### 4.0 Normative decision: Tree-sitter-native syntax access
 
 This decision supersedes the custom syntax-fact projection and Rust-specific

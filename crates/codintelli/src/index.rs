@@ -151,7 +151,11 @@ pub fn index_workspace_with_limits(
     let mut limited_files = 0u64;
     let mut failed_files = 0u64;
 
-    for entry in scan.entries.iter().filter(|entry| entry.kind == WorkspaceEntryKind::File) {
+    for entry in scan
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == WorkspaceEntryKind::File)
+    {
         if let Err(error) = budget.check() {
             diagnostics.push(SourceIndexDiagnostic {
                 path: entry.relative_path.clone(),
@@ -182,7 +186,11 @@ pub fn index_workspace_with_limits(
             continue;
         };
 
-        let Some(provider) = providers.iter().copied().find(|provider| provider.language() == language) else {
+        let Some(provider) = providers
+            .iter()
+            .copied()
+            .find(|provider| provider.language() == language)
+        else {
             diagnostics.push(SourceIndexDiagnostic {
                 path: entry.relative_path.clone(),
                 kind: SourceIndexDiagnosticKind::UnsupportedLanguage(language),
@@ -242,7 +250,10 @@ pub fn index_workspace_with_limits(
                 status: SourceFileStatus::Failed,
                 parse: None,
             });
-            if matches!(error, ScanBudgetError::Cancelled | ScanBudgetError::DeadlineExceeded) {
+            if matches!(
+                error,
+                ScanBudgetError::Cancelled | ScanBudgetError::DeadlineExceeded
+            ) {
                 break;
             }
             continue;
@@ -319,7 +330,10 @@ pub fn index_workspace_with_limits(
                     status: SourceFileStatus::Failed,
                     parse: None,
                 });
-                if matches!(budget_error, Some(ScanBudgetError::Cancelled | ScanBudgetError::DeadlineExceeded)) {
+                if matches!(
+                    budget_error,
+                    Some(ScanBudgetError::Cancelled | ScanBudgetError::DeadlineExceeded)
+                ) {
                     break;
                 }
             }
@@ -333,16 +347,23 @@ pub fn index_workspace_with_limits(
         || diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == SourceIndexDiagnosticKind::Budget(ScanBudgetError::Cancelled)
         });
-    let status = match (was_cancelled, scan.status) {
-        (true, _) => SourceIndexStatus::Cancelled,
-        (false, ScanStatus::Failed) => SourceIndexStatus::Failed,
-        (false, ScanStatus::Partial) => SourceIndexStatus::Partial,
-        (false, ScanStatus::Complete)
-            if failed_files > 0 || unsupported_files > 0 || recovered_files > 0 || limited_files > 0 =>
-        {
-            SourceIndexStatus::Partial
+    let status = if was_cancelled {
+        SourceIndexStatus::Cancelled
+    } else {
+        match scan.status {
+            ScanStatus::Cancelled => SourceIndexStatus::Cancelled,
+            ScanStatus::Failed => SourceIndexStatus::Failed,
+            ScanStatus::Partial => SourceIndexStatus::Partial,
+            ScanStatus::Complete
+                if failed_files > 0
+                    || unsupported_files > 0
+                    || recovered_files > 0
+                    || limited_files > 0 =>
+            {
+                SourceIndexStatus::Partial
+            }
+            ScanStatus::Complete => SourceIndexStatus::Complete,
         }
-        (false, ScanStatus::Complete) => SourceIndexStatus::Complete,
     };
 
     SourceIndexReport {
@@ -394,15 +415,11 @@ mod tests {
         fs::write(root.path().join("src/lib.rs"), source).expect("write Rust source");
         fs::write(root.path().join("README.md"), "# Example").expect("write documentation");
 
-        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
-            .expect("create descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(WorkspaceId::new(), root.path()).expect("create descriptor");
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(limits());
-        let report = index_rust_workspace(
-            &workspace,
-            &budget,
-            &IgnorePolicy::default(),
-        );
+        let report = index_rust_workspace(&workspace, &budget, &IgnorePolicy::default());
 
         assert_eq!(report.scan.status, ScanStatus::Complete);
         assert_eq!(report.status, SourceIndexStatus::Complete);
@@ -414,27 +431,24 @@ mod tests {
         assert_eq!(parse.workspace_id, workspace.workspace_id());
         assert_eq!(parse.relative_path, PathBuf::from("src/lib.rs"));
         assert!(parse.facts.iter().any(|fact| {
-            fact.kind == crate::SyntaxFactKind::Function
-                && fact.name.as_deref() == Some("answer")
+            fact.kind == crate::SyntaxFactKind::Function && fact.name.as_deref() == Some("answer")
         }));
-        assert_eq!(budget.usage().files, 1);
+        // The scanner accounts every accepted inventory file, including the
+        // non-source README; only the Rust source is read and byte-reserved.
+        assert_eq!(budget.usage().files, 2);
         assert_eq!(budget.usage().total_bytes, source.len() as u64);
     }
 
     #[test]
     fn preserves_explicit_cancellation_in_overall_index_status() {
         let root = tempdir().expect("create workspace");
-        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
-            .expect("create descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(WorkspaceId::new(), root.path()).expect("create descriptor");
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(limits());
         budget.cancel();
 
-        let report = index_rust_workspace(
-            &workspace,
-            &budget,
-            &IgnorePolicy::default(),
-        );
+        let report = index_rust_workspace(&workspace, &budget, &IgnorePolicy::default());
 
         assert_eq!(report.status, SourceIndexStatus::Cancelled);
         assert_eq!(report.scan.status, ScanStatus::Cancelled);
@@ -444,16 +458,12 @@ mod tests {
     fn reports_unsupported_languages_without_dropping_inventory() {
         let root = tempdir().expect("create workspace");
         fs::write(root.path().join("main.py"), "print('hello')").expect("write Python source");
-        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
-            .expect("create descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(WorkspaceId::new(), root.path()).expect("create descriptor");
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(limits());
 
-        let report = index_rust_workspace(
-            &workspace,
-            &budget,
-            &IgnorePolicy::default(),
-        );
+        let report = index_rust_workspace(&workspace, &budget, &IgnorePolicy::default());
 
         assert_eq!(report.scan.entries.len(), 1);
         assert_eq!(report.unsupported_files, 1);
@@ -466,8 +476,8 @@ mod tests {
     fn refuses_to_read_files_over_per_file_or_aggregate_byte_limits() {
         let root = tempdir().expect("create workspace");
         fs::write(root.path().join("main.rs"), "fn main() {}").expect("write Rust source");
-        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
-            .expect("create descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(WorkspaceId::new(), root.path()).expect("create descriptor");
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(ScanLimits {
             max_total_bytes: 4,
@@ -475,11 +485,7 @@ mod tests {
             ..limits()
         });
 
-        let report = index_rust_workspace(
-            &workspace,
-            &budget,
-            &IgnorePolicy::default(),
-        );
+        let report = index_rust_workspace(&workspace, &budget, &IgnorePolicy::default());
 
         assert_eq!(report.failed_files, 1);
         assert!(matches!(
@@ -497,8 +503,8 @@ mod tests {
             "fn first() {} fn second() {} fn third() {}",
         )
         .expect("write Rust source");
-        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
-            .expect("create descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(WorkspaceId::new(), root.path()).expect("create descriptor");
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(limits());
         let parse_limits = ParseLimits {
@@ -528,16 +534,12 @@ mod tests {
         let root = tempdir().expect("create workspace");
         fs::write(root.path().join("main.rs"), "fn good() {} fn broken( {")
             .expect("write malformed Rust source");
-        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
-            .expect("create descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(WorkspaceId::new(), root.path()).expect("create descriptor");
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(limits());
 
-        let report = index_rust_workspace(
-            &workspace,
-            &budget,
-            &IgnorePolicy::default(),
-        );
+        let report = index_rust_workspace(&workspace, &budget, &IgnorePolicy::default());
 
         assert_eq!(report.parsed_files, 1);
         assert_eq!(report.recovered_files, 1);

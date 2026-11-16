@@ -67,10 +67,7 @@ pub struct WorkspaceScanReport {
 /// callbacks. The supplied budget should be dedicated to this scan; clones may
 /// be used for cancellation, but concurrent scanners sharing one budget are
 /// not supported by this sequential implementation.
-pub fn scan_workspace(
-    workspace: &WorkspaceFs,
-    budget: &ScanBudget,
-) -> WorkspaceScanReport {
+pub fn scan_workspace(workspace: &WorkspaceFs, budget: &ScanBudget) -> WorkspaceScanReport {
     scan_workspace_with_policy(workspace, budget, &IgnorePolicy::default())
 }
 
@@ -130,12 +127,7 @@ pub fn scan_workspace_with_policy(
         let mut accounting_failed = false;
         for _ in 0..listing.inspected_entries {
             if let Err(error) = budget.record_entry(depth) {
-                record_budget_stop(
-                    &mut status,
-                    &mut diagnostics,
-                    directory.clone(),
-                    error,
-                );
+                record_budget_stop(&mut status, &mut diagnostics, directory.clone(), error);
                 accounting_failed = true;
                 break;
             }
@@ -147,12 +139,7 @@ pub fn scan_workspace_with_policy(
         let mut file_limit_reported = false;
         for entry in listing.entries {
             if let Err(error) = budget.check() {
-                record_budget_stop(
-                    &mut status,
-                    &mut diagnostics,
-                    directory.clone(),
-                    error,
-                );
+                record_budget_stop(&mut status, &mut diagnostics, directory.clone(), error);
                 accounting_failed = true;
                 break;
             }
@@ -266,7 +253,7 @@ fn record_budget_stop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IgnoreRule, IgnorePolicy, ScanLimits, WorkspaceDescriptor, WorkspaceId};
+    use crate::{IgnorePolicy, IgnoreRule, ScanLimits, WorkspaceDescriptor, WorkspaceId};
     use std::{fs, time::Duration};
     use tempfile::tempdir;
 
@@ -347,9 +334,10 @@ mod tests {
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == ScanDiagnosticKind::Budget(ScanBudgetError::DepthLimitExceeded)
         }));
-        assert!(!report.entries.iter().any(|entry| {
-            entry.relative_path == std::path::Path::new("src/nested/file.rs")
-        }));
+        assert!(!report
+            .entries
+            .iter()
+            .any(|entry| { entry.relative_path == std::path::Path::new("src/nested/file.rs") }));
     }
 
     #[test]
@@ -405,8 +393,8 @@ mod tests {
     #[test]
     fn cancellation_is_reported_without_panicking() {
         let root = tempdir().expect("create workspace");
-        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
-            .expect("create descriptor");
+        let descriptor =
+            WorkspaceDescriptor::new(WorkspaceId::new(), root.path()).expect("create descriptor");
         let fs = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(limits());
         budget.cancel();
@@ -424,8 +412,7 @@ mod tests {
 
         let root = tempdir().expect("create workspace");
         fs::write(root.path().join("target"), "x").expect("write target");
-        symlink(root.path().join("target"), root.path().join("link"))
-            .expect("create symlink");
+        symlink(root.path().join("target"), root.path().join("link")).expect("create symlink");
 
         let report = scan(root.path(), limits());
 
@@ -485,7 +472,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn default_policy_prunes_generated_directories_but_counts_their_entries() {
         let root = tempdir().expect("create workspace");
@@ -504,9 +490,10 @@ mod tests {
         assert_eq!(report.usage.files, 1);
         assert_eq!(report.usage.entries, 4);
         assert_eq!(report.entries.len(), 2);
-        assert!(report.entries.iter().any(|entry| {
-            entry.relative_path == std::path::Path::new("src/main.rs")
-        }));
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| { entry.relative_path == std::path::Path::new("src/main.rs") }));
         assert!(!report.entries.iter().any(|entry| {
             entry.relative_path.starts_with("target")
                 || entry.relative_path.starts_with("node_modules")
@@ -558,5 +545,4 @@ mod tests {
             std::path::Path::new("main.rs")
         );
     }
-
 }

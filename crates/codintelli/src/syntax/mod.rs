@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::{classification::LanguageId, ScanBudget, ScanBudgetError, WorkspaceId};
 
 pub mod document;
+pub mod query;
 pub mod rust;
 
 pub use document::{ParsedDocument, ParsedDocumentStatus};
@@ -294,6 +295,16 @@ pub trait LanguageProvider: Send + Sync {
 
     /// Version string that invalidates prior extraction results when changed.
     fn provider_version(&self) -> &'static str;
+
+    /// Native Tree-sitter grammar used to compile queries for this provider.
+    ///
+    /// The default returns `None`, which keeps existing providers source
+    /// compatible but makes them ineligible for query registration. A provider
+    /// that returns a grammar must return the same grammar it uses to parse
+    /// documents.
+    fn tree_sitter_language(&self) -> Option<tree_sitter::Language> {
+        None
+    }
 
     /// Parse one already-bounded source file.
     fn parse(&self, input: ParseInput<'_>) -> Result<ParseResult, ProviderError>;

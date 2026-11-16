@@ -123,7 +123,10 @@ impl ScanBudget {
             return Err(ScanBudgetError::DepthLimitExceeded);
         }
 
-        let mut usage = self.usage.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.check()?;
         let next = usage.entries.saturating_add(1);
         if next > self.limits.max_entries {
@@ -138,7 +141,10 @@ impl ScanBudget {
     /// This is used by inventory-only scans that do not read source contents.
     pub fn record_file(&self) -> Result<(), ScanBudgetError> {
         self.check()?;
-        let mut usage = self.usage.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.check()?;
         let next_files = usage.files.saturating_add(1);
         if next_files > self.limits.max_files {
@@ -158,7 +164,10 @@ impl ScanBudget {
         if size_bytes > self.limits.max_file_bytes {
             return Err(ScanBudgetError::FileTooLarge);
         }
-        let mut usage = self.usage.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.check()?;
         let next_bytes = usage.total_bytes.saturating_add(size_bytes);
         if next_bytes > self.limits.max_total_bytes {
@@ -179,7 +188,10 @@ impl ScanBudget {
             return Err(ScanBudgetError::FileTooLarge);
         }
 
-        let mut usage = self.usage.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.check()?;
         let next_files = usage.files.saturating_add(1);
         if next_files > self.limits.max_files {
@@ -196,7 +208,10 @@ impl ScanBudget {
 
     /// Return a consistent snapshot of aggregate usage.
     pub fn usage(&self) -> ScanUsage {
-        *self.usage.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        *self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Return the configured limits.
@@ -211,7 +226,9 @@ impl ScanBudget {
 
     /// Return the remaining aggregate byte allowance.
     pub fn remaining_bytes(&self) -> u64 {
-        self.limits.max_total_bytes.saturating_sub(self.usage().total_bytes)
+        self.limits
+            .max_total_bytes
+            .saturating_sub(self.usage().total_bytes)
     }
 }
 
@@ -237,8 +254,14 @@ mod tests {
         budget.record_entry(0).unwrap();
         budget.record_entry(2).unwrap();
         budget.record_entry(1).unwrap();
-        assert_eq!(budget.record_entry(1), Err(ScanBudgetError::EntryLimitExceeded));
-        assert_eq!(budget.record_entry(3), Err(ScanBudgetError::DepthLimitExceeded));
+        assert_eq!(
+            budget.record_entry(1),
+            Err(ScanBudgetError::EntryLimitExceeded)
+        );
+        assert_eq!(
+            budget.record_entry(3),
+            Err(ScanBudgetError::DepthLimitExceeded)
+        );
         assert_eq!(budget.usage().entries, 3);
     }
 
@@ -327,5 +350,4 @@ mod tests {
         assert_eq!(budget.remaining_bytes(), 4);
         assert_eq!(budget.usage().files, 1);
     }
-
 }

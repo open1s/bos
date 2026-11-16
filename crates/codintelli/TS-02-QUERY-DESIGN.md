@@ -1,6 +1,6 @@
 # TS-02 — Tree-sitter Query Registry and Execution Requirements
 
-Status: Proposed design  
+Status: Implemented (TS-02A and TS-02B)  
 Crate: `crates/codintelli`  
 Architecture prerequisite: TS-01 native `ParsedDocument`  
 Scope: Native Tree-sitter query registration and bounded query execution  
@@ -223,38 +223,38 @@ Registration errors must distinguish invalid identity, duplicate ID, missing gra
 
 ### TS-02A — Registry
 
-- [ ] A Rust query compiles against the grammar exposed by `RustProvider`.
-- [ ] A syntactically invalid query returns a structured compilation error with useful location metadata when available.
-- [ ] A provider with the default `None` grammar accessor is rejected for query registration.
-- [ ] Empty/invalid query IDs and versions are rejected.
-- [ ] Duplicate IDs are rejected without replacing the original registration.
-- [ ] Query ID, query version, language, provider ID, and provider version are observable through documented metadata accessors.
-- [ ] The registry contains no `QueryCursor`.
-- [ ] Multiple registered queries can coexist.
-- [ ] Existing `LanguageProvider` implementations that do not override the new optional method continue to compile.
+- [x] A Rust query compiles against the grammar exposed by `RustProvider`.
+- [x] A syntactically invalid query returns a structured compilation error with useful location metadata when available.
+- [x] A provider with the default `None` grammar accessor is rejected for query registration.
+- [x] Empty/invalid query IDs and versions are rejected.
+- [x] Duplicate IDs are rejected without replacing the original registration.
+- [x] Query ID, query version, language, provider ID, and provider version are observable through documented metadata accessors.
+- [x] The registry contains no `QueryCursor`.
+- [x] Multiple registered queries can coexist.
+- [x] Existing `LanguageProvider` implementations that do not override the new optional method continue to compile.
 
 ### TS-02B — Execution
 
-- [ ] A registered query matches expected Rust syntax using the native Tree-sitter tree.
-- [ ] Captures expose the original capture names and exact byte ranges.
-- [ ] A query registered for another provider/version is rejected before execution.
-- [ ] Each execution owns a fresh cursor; independent executions can run concurrently against compatible immutable documents/queries.
-- [ ] Match and capture caps are enforced incrementally and produce an explicit limited state.
-- [ ] Match-limit exhaustion is distinguishable from total output-cap exhaustion.
-- [ ] An already-cancelled budget prevents execution.
-- [ ] Cancellation during a sufficiently large query is observed through the progress callback.
-- [ ] Deadline/budget exhaustion is not reported as complete.
-- [ ] Byte-range and containing-byte-range behavior are tested separately, including boundary-crossing nodes.
-- [ ] Recovered documents remain queryable, with their parse coverage status retained and not silently upgraded to complete.
-- [ ] Query execution does not access the filesystem or execute project code.
+- [x] A registered query matches expected Rust syntax using the native Tree-sitter tree.
+- [x] Captures expose the original capture names and exact byte ranges.
+- [x] A query registered for another provider/version is rejected before execution.
+- [x] Each execution owns a fresh cursor; independent executions can run concurrently against compatible immutable documents/queries.
+- [x] Match and capture caps are enforced incrementally and produce an explicit limited state.
+- [x] Match-limit exhaustion is distinguishable from total output-cap exhaustion.
+- [x] An already-cancelled budget prevents execution.
+- [x] Cancellation during a sufficiently large query is observed through the progress callback.
+- [x] Deadline/budget exhaustion is not reported as complete.
+- [x] Byte-range and containing-byte-range behavior are tested separately, including boundary-crossing nodes.
+- [x] Recovered documents remain queryable, with their parse coverage status retained and not silently upgraded to complete.
+- [x] Query execution does not access the filesystem or execute project code.
 
 ### Crate quality
 
-- [ ] Public APIs have documentation and satisfy the crate's missing-docs policy.
-- [ ] Tests are deterministic and do not rely on timing-only assertions where a controlled large input can be used.
-- [ ] No new AST, language-specific syntax DTO, or persisted Tree-sitter node representation is introduced.
-- [ ] Existing scanner, parser, and `ParsedDocument` tests remain unchanged and pass.
-- [ ] Formatting, crate tests, clippy, and declared MSRV checks pass in CI.
+- [x] Public APIs have documentation and satisfy the crate's missing-docs policy.
+- [x] Tests are deterministic and do not rely on timing-only assertions where a controlled large input can be used.
+- [x] No new AST, language-specific syntax DTO, or persisted Tree-sitter node representation is introduced.
+- [x] Existing scanner, parser, and `ParsedDocument` tests remain unchanged and pass.
+- [x] Formatting, crate tests, clippy, and declared MSRV checks pass in CI.
 
 ## 8. Implementation plan
 
@@ -289,3 +289,35 @@ TS-02A should not add query-result DTOs or migrate the old `ParseResult` project
 TS-02 is complete only when TS-02A and TS-02B meet their acceptance criteria, CI validates the declared MSRV and core workspace, and the public API documentation makes provider compatibility, query lifetime, cancellation, range semantics, and partial-result behavior unambiguous.
 
 A successful query match is syntax evidence only. It must never be represented as compiler-resolved semantics without an independent resolution mechanism and explicit supporting evidence.
+
+## 12. Implementation notes
+
+TS-02A and TS-02B are implemented in `src/syntax/query.rs`.
+
+- `LanguageProvider::tree_sitter_language` is the backward-compatible
+  grammar accessor; `RustProvider` returns `tree_sitter_rust::LANGUAGE`.
+- `QueryRegistry` compiles queries eagerly against the provider grammar and
+  stores only identity metadata plus an `Arc<tree_sitter::Query>`.
+  Registration requires exclusive mutation; lookup and execution share
+  immutable queries.
+- `RegisteredQuery` exposes the query ID/version, language, provider
+  ID/version, capture names, pattern count, and the native `Query`.
+- `execute_query` validates language, provider ID, and provider version
+  before creating a fresh `QueryCursor`, applies `QueryExecutionOptions`,
+  and returns a bounded `QueryExecution`.
+- `QueryExecutionStatus` distinguishes complete, cancelled, deadline expiry,
+  retained-output caps (`Matches` and `Captures`), and Tree-sitter
+  match-limit exhaustion. `QueryExecution::document_status` preserves a
+  recovered document's parse coverage.
+- `QueryRangeMode` exposes `set_byte_range` and
+  `set_containing_byte_range` as distinct modes. Ranges are validated
+  against the document snapshot before the cursor runs.
+- Registration errors distinguish invalid identity, duplicate ID, missing
+  grammar, and Tree-sitter compilation failures with kind, row, column, and
+  offset. Query source is neither retained nor echoed.
+
+The open decisions in section 10 are resolved as follows: registration stays
+exclusively mutable; IDs use the simple namespaced convention; execution
+returns bounded generic match/capture records because a native query iterator
+cannot outlive the local cursor it borrows; query source is not retained; and
+query limits do not change the memory already owned by the parsed tree.

@@ -86,12 +86,17 @@ pub fn resolve_rust_module_candidates(
     inventory_paths: &[PathBuf],
     crate_roots: &[PathBuf],
 ) -> Result<RustModuleResolutionReport, RustModuleResolutionError> {
-    let first = parse_results.first().ok_or(RustModuleResolutionError::EmptyInput)?;
+    let first = parse_results
+        .first()
+        .ok_or(RustModuleResolutionError::EmptyInput)?;
     let workspace_id = first.workspace_id;
     if crate_roots.len() > 1 {
         return Err(RustModuleResolutionError::MultipleCrateRoots);
     }
-    if parse_results.iter().any(|result| result.workspace_id != workspace_id) {
+    if parse_results
+        .iter()
+        .any(|result| result.workspace_id != workspace_id)
+    {
         return Err(RustModuleResolutionError::MixedWorkspace);
     }
 
@@ -110,10 +115,16 @@ pub fn resolve_rust_module_candidates(
     let crate_roots: HashSet<PathBuf> = crate_roots.iter().cloned().collect();
     let mut modules = Vec::new();
 
-    for result in parse_results.iter().filter(|result| result.language == LanguageId::Rust) {
+    for result in parse_results
+        .iter()
+        .filter(|result| result.language == LanguageId::Rust)
+    {
         for fact in &result.modules {
             if !valid_module_segment(&fact.name)
-                || fact.scope_path.iter().any(|segment| !valid_module_segment(segment))
+                || fact
+                    .scope_path
+                    .iter()
+                    .any(|segment| !valid_module_segment(segment))
             {
                 return Err(RustModuleResolutionError::InvalidPath);
             }
@@ -140,11 +151,18 @@ pub fn resolve_rust_module_candidates(
             mod_candidate.push(&fact.name);
             mod_candidate.push("mod.rs");
             let expected_paths = vec![file_candidate, mod_candidate];
-            let mut existing_candidates: Vec<PathBuf> = expected_paths
-                .iter()
-                .filter(|path| inventory.contains(*path))
-                .cloned()
-                .collect();
+            // An attributed declaration is not eligible for conventional lookup:
+            // cfg/path semantics are unknown, so an existing file is not evidence
+            // that this declaration refers to it.
+            let mut existing_candidates: Vec<PathBuf> = if fact.has_resolution_attributes {
+                Vec::new()
+            } else {
+                expected_paths
+                    .iter()
+                    .filter(|path| inventory.contains(*path))
+                    .cloned()
+                    .collect()
+            };
             existing_candidates.sort();
 
             let status = if fact.has_resolution_attributes {
@@ -169,11 +187,17 @@ pub fn resolve_rust_module_candidates(
     }
 
     modules.sort_unstable_by(|left, right| {
-        (&left.source_path, left.range, &left.module_name)
-            .cmp(&(&right.source_path, right.range, &right.module_name))
+        (&left.source_path, left.range, &left.module_name).cmp(&(
+            &right.source_path,
+            right.range,
+            &right.module_name,
+        ))
     });
 
-    Ok(RustModuleResolutionReport { workspace_id, modules })
+    Ok(RustModuleResolutionReport {
+        workspace_id,
+        modules,
+    })
 }
 
 fn valid_module_segment(segment: &str) -> bool {
@@ -181,7 +205,10 @@ fn valid_module_segment(segment: &str) -> bool {
         && segment != "."
         && segment != ".."
         && !segment.chars().any(|character| {
-            matches!(character, '/' | '\\\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' | '\\0')
+            matches!(
+                character,
+                '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' | '\0'
+            )
         })
 }
 
@@ -190,12 +217,16 @@ fn module_directory(
     crate_roots: &HashSet<PathBuf>,
 ) -> Result<PathBuf, RustModuleResolutionError> {
     let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
-    let file_name = source_path.file_name().and_then(|name| name.to_str())
+    let file_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
         .ok_or(RustModuleResolutionError::InvalidPath)?;
     if crate_roots.contains(source_path) || file_name == "mod.rs" {
         return Ok(parent.to_path_buf());
     }
-    let stem = source_path.file_stem().ok_or(RustModuleResolutionError::InvalidPath)?;
+    let stem = source_path
+        .file_stem()
+        .ok_or(RustModuleResolutionError::InvalidPath)?;
     let mut directory = parent.to_path_buf();
     directory.push(stem);
     if !valid_relative_path(&directory) {
@@ -209,7 +240,11 @@ mod tests {
     use super::*;
     use crate::{ParseStatus, RustModuleFact, SyntaxFact, SyntaxFactKind};
 
-    fn parsed_with_id(path: &str, modules: Vec<RustModuleFact>, workspace_id: WorkspaceId) -> ParseResult {
+    fn parsed_with_id(
+        path: &str,
+        modules: Vec<RustModuleFact>,
+        workspace_id: WorkspaceId,
+    ) -> ParseResult {
         ParseResult {
             workspace_id,
             relative_path: PathBuf::from(path),
@@ -225,7 +260,10 @@ mod tests {
                 scope_path: Vec::new(),
                 is_module_scope: true,
                 visibility: None,
-                range: SourceRange { start_byte: 0, end_byte: 1 },
+                range: SourceRange {
+                    start_byte: 0,
+                    end_byte: 1,
+                },
             }],
             imports: Vec::new(),
             modules,
@@ -237,13 +275,21 @@ mod tests {
         parsed_with_id(path, modules, WorkspaceId::new())
     }
 
-    fn module(name: &str, scope: &[&str], inline: bool, has_resolution_attributes: bool) -> RustModuleFact {
+    fn module(
+        name: &str,
+        scope: &[&str],
+        inline: bool,
+        has_resolution_attributes: bool,
+    ) -> RustModuleFact {
         RustModuleFact {
             scope_path: scope.iter().map(|part| (*part).to_owned()).collect(),
             name: name.to_owned(),
             is_inline: inline,
             has_resolution_attributes,
-            range: SourceRange { start_byte: 0, end_byte: 1 },
+            range: SourceRange {
+                start_byte: 0,
+                end_byte: 1,
+            },
         }
     }
 
@@ -251,12 +297,22 @@ mod tests {
     fn resolves_crate_root_and_inline_scope_candidates() {
         let root = PathBuf::from("src/lib.rs");
         let report = resolve_rust_module_candidates(
-            &[parsed("src/lib.rs", vec![module("model", &["nested"], false, false)])],
+            &[parsed(
+                "src/lib.rs",
+                vec![module("model", &["nested"], false, false)],
+            )],
             &[PathBuf::from("src/nested/model.rs")],
             &[root],
-        ).expect("module candidates");
-        assert_eq!(report.modules[0].status, RustModuleResolutionStatus::UniqueCandidate);
-        assert_eq!(report.modules[0].existing_candidates, vec![PathBuf::from("src/nested/model.rs")]);
+        )
+        .expect("module candidates");
+        assert_eq!(
+            report.modules[0].status,
+            RustModuleResolutionStatus::UniqueCandidate
+        );
+        assert_eq!(
+            report.modules[0].existing_candidates,
+            vec![PathBuf::from("src/nested/model.rs")]
+        );
     }
 
     #[test]
@@ -265,49 +321,87 @@ mod tests {
         let report = resolve_rust_module_candidates(
             &[
                 parsed_with_id("src/mod.rs", vec![module("child", &[], false, false)], id),
-                parsed_with_id("src/parent.rs", vec![module("child", &[], false, false)], id),
+                parsed_with_id(
+                    "src/parent.rs",
+                    vec![module("child", &[], false, false)],
+                    id,
+                ),
             ],
             &[
                 PathBuf::from("src/child/mod.rs"),
                 PathBuf::from("src/parent/child.rs"),
             ],
             &[],
-        ).expect("module candidates");
-        assert_eq!(report.modules[0].expected_paths[0], PathBuf::from("src/child.rs"));
-        assert_eq!(report.modules[0].status, RustModuleResolutionStatus::UniqueCandidate);
-        assert_eq!(report.modules[1].expected_paths[0], PathBuf::from("src/parent/child.rs"));
-        assert_eq!(report.modules[1].status, RustModuleResolutionStatus::UniqueCandidate);
+        )
+        .expect("module candidates");
+        assert_eq!(
+            report.modules[0].expected_paths[0],
+            PathBuf::from("src/child.rs")
+        );
+        assert_eq!(
+            report.modules[0].status,
+            RustModuleResolutionStatus::UniqueCandidate
+        );
+        assert_eq!(
+            report.modules[1].expected_paths[0],
+            PathBuf::from("src/parent/child.rs")
+        );
+        assert_eq!(
+            report.modules[1].status,
+            RustModuleResolutionStatus::UniqueCandidate
+        );
     }
 
     #[test]
     fn preserves_ambiguity_when_both_module_forms_exist() {
         let report = resolve_rust_module_candidates(
-            &[parsed("src/lib.rs", vec![module("model", &[], false, false)])],
-            &[PathBuf::from("src/model.rs"), PathBuf::from("src/model/mod.rs")],
+            &[parsed(
+                "src/lib.rs",
+                vec![module("model", &[], false, false)],
+            )],
+            &[
+                PathBuf::from("src/model.rs"),
+                PathBuf::from("src/model/mod.rs"),
+            ],
             &[PathBuf::from("src/lib.rs")],
-        ).expect("module candidates");
-        assert_eq!(report.modules[0].status, RustModuleResolutionStatus::AmbiguousCandidates);
+        )
+        .expect("module candidates");
+        assert_eq!(
+            report.modules[0].status,
+            RustModuleResolutionStatus::AmbiguousCandidates
+        );
         assert_eq!(report.modules[0].existing_candidates.len(), 2);
     }
 
     #[test]
     fn attributed_declarations_are_not_resolved() {
         let report = resolve_rust_module_candidates(
-            &[parsed("src/lib.rs", vec![module("optional", &[], false, true)])],
+            &[parsed(
+                "src/lib.rs",
+                vec![module("optional", &[], false, true)],
+            )],
             &[PathBuf::from("src/optional.rs")],
             &[PathBuf::from("src/lib.rs")],
-        ).expect("module candidates");
-        assert_eq!(report.modules[0].status, RustModuleResolutionStatus::SkippedAttributedDeclaration);
+        )
+        .expect("module candidates");
+        assert_eq!(
+            report.modules[0].status,
+            RustModuleResolutionStatus::SkippedAttributedDeclaration
+        );
         assert!(report.modules[0].existing_candidates.is_empty());
     }
 
     #[test]
     fn rejects_module_names_that_could_escape_the_workspace() {
         let error = resolve_rust_module_candidates(
-            &[parsed("src/lib.rs", vec![module("outside:drive", &[], false, false)])],
+            &[parsed(
+                "src/lib.rs",
+                vec![module("outside:drive", &[], false, false)],
+            )],
             &[],
             &[PathBuf::from("src/lib.rs")],
-        ).expect_err("unsafe module path");
+        )
+        .expect_err("unsafe module path");
         assert!(matches!(error, RustModuleResolutionError::InvalidPath));
     }
 
@@ -317,8 +411,12 @@ mod tests {
             &[parsed("src/lib.rs", Vec::new())],
             &[],
             &[PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")],
-        ).expect_err("multiple roots");
-        assert!(matches!(error, RustModuleResolutionError::MultipleCrateRoots));
+        )
+        .expect_err("multiple roots");
+        assert!(matches!(
+            error,
+            RustModuleResolutionError::MultipleCrateRoots
+        ));
     }
 
     #[test]
@@ -330,7 +428,8 @@ mod tests {
             ],
             &[],
             &[],
-        ).expect_err("mixed workspaces");
+        )
+        .expect_err("mixed workspaces");
         assert!(matches!(error, RustModuleResolutionError::MixedWorkspace));
     }
 }
