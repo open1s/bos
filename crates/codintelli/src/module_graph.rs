@@ -414,7 +414,11 @@ pub fn build_rust_module_graph(
                     child_module_path: child_path.clone(),
                     declaration_source: source_path.clone(),
                     range: fact.range,
-                    candidate_paths: candidate.existing_candidates.clone(),
+                    candidate_paths: if candidate.status == RustModuleResolutionStatus::SkippedAttributedDeclaration {
+                        Vec::new()
+                    } else {
+                        candidate.existing_candidates.clone()
+                    },
                     status: edge_status,
                 });
 
@@ -611,6 +615,21 @@ mod tests {
         assert_eq!(graph.status, RustModuleGraphStatus::Partial);
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.edges[0].status, RustModuleEdgeStatus::SkippedAttributedDeclaration);
+    }
+
+    #[test]
+    fn does_not_publish_conventional_candidates_for_path_or_cfg_modules() {
+        let id = WorkspaceId::new();
+        let mut optional = module("optional", &[], false);
+        optional.has_resolution_attributes = true;
+        let graph = build_rust_module_graph(
+            &[parsed("src/lib.rs", vec![optional], id)],
+            &[PathBuf::from("src/lib.rs"), PathBuf::from("src/optional.rs")],
+            &[PathBuf::from("src/lib.rs")],
+            RustModuleGraphLimits::default(),
+        ).expect("module graph");
+        assert_eq!(graph.edges[0].status, RustModuleEdgeStatus::SkippedAttributedDeclaration);
+        assert!(graph.edges[0].candidate_paths.is_empty());
     }
 
     #[test]
