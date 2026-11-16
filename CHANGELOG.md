@@ -1,5 +1,29 @@
 # Changelog
 
+## v4.1.13 (2026-11-16)
+
+- **Extension runtimes resolve the interpreter you actually installed.** Every
+  runtime that spawns an external program - `process`, `mcp` and the
+  `cordis` Node bridge - now uses one cross-platform program search instead of
+  a per-language table: `$BOS_<PROGRAM>`, an activated `VIRTUAL_ENV`, the
+  manager's own choice (`mise`, `asdf`, `pyenv`, `volta`), the managers'
+  installed versions and data directories, `PATH`, then the system prefixes. A
+  Finder- or Explorer-launched BSH therefore still honours mise/asdf/volta/nvm
+  configuration, and the macOS `/usr/bin/python3` stub no longer shadows the
+  reader's installed interpreter. The manifest name remains the capability
+  subject (`program:python3`); only the executable that answers to it changes.
+- **The extended PATH is handed to every child.** The host terminal's shell,
+  `process`/`mcp` children and the Cordis bridge inherit the PATH BSH built,
+  so a package that runs `jj`, a Homebrew `git` or a version-managed tool
+  finds it even when BSH itself was started from Finder.
+- **codintelli, the host-independent code-intelligence engine, lands as a
+  compiling, documented workspace crate.** It confines every read to a
+  host-supplied workspace, bounds scans with one shared budget, parses Rust with
+  upstream Tree-sitter, and exposes native `ParsedDocument`s with a versioned
+  Tree-sitter query registry and bounded, cancellable query execution (TS-02).
+  It stores no custom AST and never executes project code; the architecture and
+  TS-02 design documents live in `crates/codintelli/`.
+
 ## v4.1.12 (2026-11-16)
 
 - **The extensions Grant button works for Cordis packages, and a grant
