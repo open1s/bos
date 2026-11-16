@@ -764,7 +764,7 @@ impl McpCore {
     fn start(&self) -> Result<Session, ExtensionError> {
         self.ensure_running()?;
         let program = if is_allowlisted_command(&self.entry) {
-            PathBuf::from(&self.entry)
+            crate::resolve::program(&self.entry)
         } else {
             let relative =
                 validate_relative_path(&self.entry).map_err(|reason| ExtensionError::Manifest {

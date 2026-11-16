@@ -7,7 +7,10 @@
 //! shellless launch never sees, so every runtime that resolves an external
 //! program would otherwise repeat - and drift on - the same platform list.
 //!
-//! This module is that one list. A version-managed interpreter is resolved to
+//! This module is that one list, for Node (`managed_interpreter`,
+//! `program_directories`) and for Python (`python_interpreter`).
+//!
+//! A version-managed interpreter is resolved to
 //! the **versioned binary** the manager installed, not first to its shim: a
 //! shim reads the manager's own configuration and can refuse to run when it is
 //! spawned outside a shell, while the versioned binary it would have selected
@@ -49,15 +52,74 @@ fn managed_interpreter_with(
     program: &str,
     env: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    for manager in ["mise", "asdf", "volta"] {
+    manager_selection(program, &["mise", "asdf", "volta"], env)
+}
+
+/// Ask each of `managers`, in order, which `program` it selects.
+fn manager_selection(
+    program: &str,
+    managers: &[&str],
+    env: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    for manager in managers {
         let Some(executable) = find_manager(manager, env) else {
             continue;
         };
-        if let Some(path) = ask_manager(&executable, program) {
+        if let Some(path) = ask_manager(manager, &executable, program) {
             return Some(path);
         }
     }
     None
+}
+
+/// The Python interpreter a shellless launch should run.
+///
+/// Precedence: `$BOS_PYTHON`, an activated virtual environment, the version
+/// manager's own selection (`mise which python`, asdf, `pyenv which python`,
+/// `uv python find`), the managers' installed versions, `PATH`, then the
+/// system prefixes. The manager comes before `PATH` because a macOS
+/// `/usr/bin/python3` is a Command Line Tools stub, not the interpreter the
+/// reader installed.
+pub fn python_interpreter() -> Option<PathBuf> {
+    python_interpreter_with(&environment)
+}
+
+/// [`python_interpreter`] with the environment lookup injected for tests.
+fn python_interpreter_with(env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(explicit) = env("BOS_PYTHON") {
+        if explicit.is_file() {
+            return Some(explicit);
+        }
+    }
+    if let Some(venv) = env("VIRTUAL_ENV") {
+        #[cfg(windows)]
+        let bin = venv.join("Scripts");
+        #[cfg(not(windows))]
+        let bin = venv.join("bin");
+        if let Some(path) = find_in(&[bin], &python_names()) {
+            return Some(path);
+        }
+    }
+    for program in ["python3", "python"] {
+        if let Some(path) = manager_selection(program, &["mise", "asdf", "pyenv", "uv"], env) {
+            return Some(path);
+        }
+    }
+    let mut directories = user_python_directories(env);
+    if let Some(path) = env("PATH") {
+        directories.extend(std::env::split_paths(&path));
+    }
+    #[cfg(not(windows))]
+    directories.extend(system_python_directories());
+    directories.retain(|directory| directory.is_absolute());
+    find_in(&directories, &python_names())
+}
+
+/// The names a Python 3 interpreter answers to, in preference order.
+fn python_names() -> Vec<String> {
+    let mut names = executable_names("python3");
+    names.extend(executable_names("python"));
+    names
 }
 
 /// The manager executable itself, found the same way an interpreter is.
@@ -73,16 +135,25 @@ fn find_manager(name: &str, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<Pat
 }
 
 /// Ask one manager, bounded, and accept only an existing file.
-fn ask_manager(manager: &Path, program: &str) -> Option<PathBuf> {
-    ask_manager_with_timeout(manager, program, MANAGER_TIMEOUT)
+fn ask_manager(manager: &str, executable: &Path, program: &str) -> Option<PathBuf> {
+    ask_manager_with_timeout(manager, executable, program, MANAGER_TIMEOUT)
 }
 
 /// [`ask_manager`] with the deadline exposed for tests.
-fn ask_manager_with_timeout(manager: &Path, program: &str, timeout: Duration) -> Option<PathBuf> {
-    let mut command = Command::new(manager);
+fn ask_manager_with_timeout(
+    manager: &str,
+    executable: &Path,
+    program: &str,
+    timeout: Duration,
+) -> Option<PathBuf> {
+    let mut command = Command::new(executable);
+    if manager == "uv" {
+        // uv spells the same question differently.
+        command.arg("python").arg("find");
+    } else {
+        command.arg("which").arg(program);
+    }
     command
-        .arg("which")
-        .arg(program)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -217,6 +288,88 @@ fn user_directories(home: &Path, env: &dyn Fn(&str) -> Option<PathBuf>) -> Vec<P
     directories.push(data_home.join("pnpm"));
     if cfg!(target_os = "macos") {
         directories.push(home.join("Library").join("pnpm"));
+    }
+    directories
+}
+
+/// The per-user Python install directories, most specific first.
+#[cfg(not(windows))]
+fn user_python_directories(env: &dyn Fn(&str) -> Option<PathBuf>) -> Vec<PathBuf> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let data_home = env("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local").join("share"));
+    let mise = env("MISE_DATA_DIR").unwrap_or_else(|| data_home.join("mise"));
+    let asdf = env("ASDF_DATA_DIR").unwrap_or_else(|| home.join(".asdf"));
+    let pyenv = env("PYENV_ROOT").unwrap_or_else(|| home.join(".pyenv"));
+    let uv = env("UV_PYTHON_INSTALL_DIR").unwrap_or_else(|| data_home.join("uv").join("python"));
+
+    let mut directories = Vec::new();
+    directories.extend(nested_bins(&mise.join("installs").join("python"), &["bin"]));
+    directories.extend(nested_bins(&asdf.join("installs").join("python"), &["bin"]));
+    directories.extend(nested_bins(&pyenv.join("versions"), &["bin"]));
+    directories.extend(nested_bins(&uv, &["bin"]));
+    if let Some(conda) = env("CONDA_PREFIX") {
+        directories.push(conda.join("bin"));
+    }
+    for base in ["miniconda3", "anaconda3", "miniforge3"] {
+        directories.push(home.join(base).join("bin"));
+    }
+    directories.push(home.join(".local").join("bin"));
+    directories
+}
+
+/// The system-wide Python prefixes, last.
+#[cfg(not(windows))]
+fn system_python_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if cfg!(target_os = "macos") {
+        directories.push(PathBuf::from("/opt/homebrew/bin"));
+    } else {
+        directories.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
+    }
+    directories.push(PathBuf::from("/usr/local/bin"));
+    directories.push(PathBuf::from("/usr/bin"));
+    directories
+}
+
+/// The per-user Python install directories, most specific first.
+#[cfg(windows)]
+fn user_python_directories(env: &dyn Fn(&str) -> Option<PathBuf>) -> Vec<PathBuf> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let local = env("LOCALAPPDATA");
+    let mise = env("MISE_DATA_DIR").or_else(|| local.as_ref().map(|dir| dir.join("mise")));
+    let asdf = env("ASDF_DATA_DIR").unwrap_or_else(|| home.join(".asdf"));
+    let pyenv = env("PYENV_ROOT").unwrap_or_else(|| home.join(".pyenv").join("pyenv-win"));
+    let uv = env("UV_PYTHON_INSTALL_DIR")
+        .or_else(|| local.as_ref().map(|dir| dir.join("uv").join("python")));
+
+    let mut directories = Vec::new();
+    if let Some(mise) = &mise {
+        directories.extend(version_directories_with_bin(
+            &mise.join("installs").join("python"),
+        ));
+    }
+    directories.extend(version_directories_with_bin(
+        &asdf.join("installs").join("python"),
+    ));
+    directories.extend(version_directories_with_bin(&pyenv.join("versions")));
+    directories.push(pyenv.join("shims"));
+    if let Some(uv) = &uv {
+        directories.extend(version_directories_with_bin(uv));
+    }
+    if let Some(local) = &local {
+        directories.extend(version_directories_with_bin(
+            &local.join("Programs").join("Python"),
+        ));
+    }
+    if let Some(conda) = env("CONDA_PREFIX") {
+        directories.push(conda);
+    }
+    for base in ["miniconda3", "anaconda3", "miniforge3"] {
+        directories.push(home.join(base));
     }
     directories
 }
@@ -398,7 +551,10 @@ fn version_key(path: &Path) -> Option<semver::Version> {
 mod tests {
     #[cfg(unix)]
     use super::managed_interpreter_with;
-    use super::{executable_names, find_in, nested_bins, program_directories, user_directories};
+    use super::{
+        executable_names, find_in, nested_bins, program_directories, python_interpreter_with,
+        user_directories,
+    };
 
     /// A directory is not a program, so a `node/` directory cannot pass for
     /// the interpreter a package needs.
@@ -649,12 +805,89 @@ mod tests {
         let manager = manager_script(&scratch.path().join("bin"), "sleep 5");
         let started = std::time::Instant::now();
         assert!(super::ask_manager_with_timeout(
+            "mise",
             &manager,
             "node",
             std::time::Duration::from_millis(150)
         )
         .is_none());
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    /// An explicit override is the reader's decision, before any manager.
+    #[test]
+    fn an_explicit_python_override_wins() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let chosen = scratch.path().join("python3");
+        std::fs::write(&chosen, "#!/bin/sh\n").expect("python");
+        let env = {
+            let chosen = chosen.clone();
+            move |name: &str| (name == "BOS_PYTHON").then(|| chosen.clone())
+        };
+        assert_eq!(python_interpreter_with(&env), Some(chosen));
+    }
+
+    /// An activated virtual environment wins next: a shell that exported
+    /// `VIRTUAL_ENV` must not be overridden by a manager's global version.
+    #[cfg(unix)]
+    #[test]
+    fn an_activated_virtual_environment_wins() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let venv = scratch.path().join("venv");
+        let bin = venv.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::write(bin.join("python3"), "#!/bin/sh\n").expect("python");
+        let env = {
+            let venv = venv.clone();
+            move |name: &str| (name == "VIRTUAL_ENV").then(|| venv.clone())
+        };
+        assert_eq!(python_interpreter_with(&env), Some(bin.join("python3")));
+    }
+
+    /// A Python manager answers the same `which` question as a Node manager,
+    /// so a mise-selected Python is effective in a shellless launch.
+    #[cfg(unix)]
+    #[test]
+    fn a_python_manager_selection_wins() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let chosen = scratch.path().join("python3");
+        std::fs::write(&chosen, "#!/bin/sh\n").expect("python");
+        let manager_dir = scratch.path().join("bin");
+        manager_script(
+            &manager_dir,
+            &format!("printf '%s\\n' '{}'", chosen.display()),
+        );
+        let env = {
+            let manager_dir = manager_dir.clone();
+            move |name: &str| (name == "PATH").then(|| manager_dir.clone())
+        };
+        assert_eq!(python_interpreter_with(&env), Some(chosen));
+    }
+
+    /// A manager's installed Python is found when the manager cannot answer:
+    /// mise, asdf, pyenv, uv and conda each keep it in their own layout.
+    #[cfg(not(windows))]
+    #[test]
+    fn python_install_directories_are_probed() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let mise = scratch.path().join("mise");
+        let install = mise
+            .join("installs")
+            .join("python")
+            .join("3.12.3")
+            .join("bin");
+        std::fs::create_dir_all(&install).expect("install");
+        std::fs::write(install.join("python3"), "#!/bin/sh\n").expect("python");
+
+        let env = {
+            let mise = mise.clone();
+            move |name: &str| (name == "MISE_DATA_DIR").then(|| mise.clone())
+        };
+        let directories = super::user_python_directories(&env);
+        assert_eq!(
+            find_in(&directories, &super::python_names()),
+            Some(install.join("python3"))
+        );
     }
 
     /// nvm's default alias is effective when it names a locally installed

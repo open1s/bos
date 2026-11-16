@@ -953,6 +953,8 @@ guest 应解析 envelope、遍历 batch、逐条做有界工作、返回合法 J
 
 **宿主强制**：环境清空后只加白名单与 manifest 变量；cwd 为包根；可执行文件必须包内相对或白名单启动器；需要 `process.execute`（可按程序/参数限定）；进程组与 RLIMIT；macOS 仅文件写沙箱；Linux 的 process/MCP 默认启用 bubblewrap，缺 bubblewrap 或 namespace 失败即 fail closed，绝不无沙箱回退；`--share-net` 意味着子进程网络仍共享；stdout/stderr 截断。
 
+**Python 解析**：`entry = "python"`/`"python3"` 先按 `$BOS_PYTHON`、激活的 `VIRTUAL_ENV`、版本管理器自己的选择（`mise`/asdf/`pyenv`/`uv python find`）、管理器已安装版本、`PATH`、系统前缀的顺序换成真实解释器；capability 仍按 manifest 的名字校验（`program:python3`），换的只是执行文件。
+
 ### 11.5 WASM component
 
 **契约**（`crates/bsh/wit/extension.wit`）：world `bsh-extension` 导入 `host`、导出 `extension`。导出调用顺序：`initialize → activate → tools → call-tool → command → panel → on-event → deactivate → shutdown`。

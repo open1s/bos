@@ -181,6 +181,13 @@ startup values are on-startup, on-demand, on-workspace-open and manual. The defa
 is on-demand. runtime.config is opaque to the manifest parser and validated by the
 runtime adapter.
 
+A `process` or `mcp` entry that names `python`/`python3` is resolved to the
+interpreter BSH's program search selects: `$BOS_PYTHON`, an activated
+`VIRTUAL_ENV`, the manager's own choice (`mise`, asdf, `pyenv`, `uv python
+find`), the manager's installed versions, `PATH`, then the system prefixes.
+The manifest name stays the capability subject (`program:python3`); only the
+executable that answers to it changes.
+
 The `cordis` adapter runs the entry with Node in a subprocess, resolving the
 interpreter in one fixed order: `$BOS_BRIDGE_NODE`, then `node`/`nodejs` on
 `PATH`, then the Node runtime shipped beside the BSH executable, then the
