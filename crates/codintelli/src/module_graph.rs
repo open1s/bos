@@ -287,6 +287,11 @@ pub fn build_rust_module_graph(
                         });
                         continue;
                     }
+                    let key = (root.clone(), child_path.clone(), source_path.clone());
+                    if !node_keys.contains(&key) && graph.nodes.len() >= limits.max_nodes {
+                        graph.status = RustModuleGraphStatus::Limited;
+                        break;
+                    }
                     graph.edges.push(RustModuleEdge {
                         crate_root: root.clone(),
                         parent_module_path: parent_path,
@@ -296,12 +301,7 @@ pub fn build_rust_module_graph(
                         candidate_paths: Vec::new(),
                         status: RustModuleEdgeStatus::Inline,
                     });
-                    let key = (root.clone(), child_path.clone(), source_path.clone());
                     if node_keys.insert(key) {
-                        if graph.nodes.len() >= limits.max_nodes {
-                            graph.status = RustModuleGraphStatus::Limited;
-                            break;
-                        }
                         graph.nodes.push(RustModuleNode {
                             crate_root: root.clone(),
                             module_path: child_path,
@@ -355,6 +355,13 @@ pub fn build_rust_module_graph(
                     }
                 }
 
+                if let Some(target) = unique_target.as_ref() {
+                    let key = (root.clone(), child_path.clone(), target.clone());
+                    if !node_keys.contains(&key) && graph.nodes.len() >= limits.max_nodes {
+                        graph.status = RustModuleGraphStatus::Limited;
+                        break;
+                    }
+                }
                 graph.edges.push(RustModuleEdge {
                     crate_root: root.clone(),
                     parent_module_path: parent_path,
@@ -368,10 +375,6 @@ pub fn build_rust_module_graph(
                 if let Some(target) = unique_target {
                     let key = (root.clone(), child_path.clone(), target.clone());
                     if node_keys.insert(key) {
-                        if graph.nodes.len() >= limits.max_nodes {
-                            graph.status = RustModuleGraphStatus::Limited;
-                            break;
-                        }
                         graph.nodes.push(RustModuleNode {
                             crate_root: root.clone(),
                             module_path: child_path.clone(),
@@ -540,6 +543,6 @@ mod tests {
         ).expect("limited graph");
         assert_eq!(graph.status, RustModuleGraphStatus::Limited);
         assert_eq!(graph.nodes.len(), 1);
-        assert_eq!(graph.edges.len(), 1);
+        assert!(graph.edges.is_empty());
     }
 }
