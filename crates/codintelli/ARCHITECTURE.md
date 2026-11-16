@@ -121,7 +121,7 @@ Initial implementation order:
 3. JSON, TOML, YAML and common manifest/config formats as data sources, not executable inputs.
 4. Additional languages through independently testable providers.
 
-Tree-sitter is a strong candidate for the parser substrate, but the parser API and grammar dependency strategy must be evaluated before freezing the public provider contract. A provider must declare its language ID, supported file kinds, parser version, and extraction schema version.
+Tree-sitter is the selected parser substrate for the first Rust provider. Additional language grammars should be added behind the same provider contract and evaluated independently for build portability, grammar maintenance, and resource behavior. A provider must declare its language ID, supported file kinds, parser version, and extraction schema version.
 
 ### 4.4 Structural extraction
 
@@ -338,10 +338,11 @@ The source pipeline is synchronous and sequential today. Hosts must run it on bo
 | CI-05 | Ignore rules and file classification | Configurable exclusions; deterministic classification |
 | CI-06 | Typed source facts and relationship contracts | Versioned declarations/references/evidence; optional graph projection; validation tests |
 | CI-07 | Parser/provider seam + Rust provider | Deterministic source facts with source evidence |
-| CI-08 | Symbol/import resolution | Resolved edges with ambiguity preserved |
-| CI-09 | Incremental graph store | Atomic per-file replacement; last-known-good preservation |
-| CI-10 | Query API | File/symbol search, source retrieval, explain, references, optional neighbors/path/impact |
-| CI-11 | Optional export and host adapter | Versioned exports; integration remains outside engine |
+| CI-08 | Bounded source-to-facts pipeline | Inventory, classification, reserved reads, provider dispatch, explicit coverage |
+| CI-09 | Symbol/import resolution | Resolved edges with ambiguity preserved |
+| CI-10 | Incremental extraction store | Atomic per-file replacement; last-known-good preservation |
+| CI-11 | Query API | File/symbol search, source retrieval, explain, references, optional neighbors/path/impact |
+| CI-12 | Optional export and host adapter | Versioned exports; integration remains outside engine |
 
 Each stage should be independently reviewable and normally fit within a small PR. Do not implement graph persistence, semantic LLM extraction, clustering, or visualization before concrete query requirements justify them. Stabilize source-fact and evidence contracts first.
 
