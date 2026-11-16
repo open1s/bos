@@ -1,5 +1,22 @@
 # Changelog
 
+## v4.1.12 (2026-11-16)
+
+- **The extensions Grant button works for Cordis packages, and a grant
+  written from the CLI reaches the running app.** A Cordis runtime has no process
+  executable to scope `process.execute` to — its entry is the JavaScript
+  module it loads, and the commands it runs are chosen per `terminal.run`
+  call — so the button refused with "process extension has no declared
+  executable" and wrote nothing; reported against `com.open1s.vcs` 1.4.0,
+  whose required `process.execute` could not be granted from the UI at all.
+  It now grants `process.execute` as `any` for Cordis, the same scope
+  `bsh ext grant` already derives, and the runtime keeps gating every command
+  at call time. Grants and revokes written by `bsh ext grant` (another
+  process, its own policy engine) are re-read at every rebuild, so following
+  the error row's own hint no longer leaves the pane failing until a restart.
+  MCP capability rows now carry the declared program too, matching the scope
+  the activation check already used.
+
 ## v4.1.11 (2026-11-16)
 
 - **A slow model is waited out, and the wait is a setting.** The vendor read
