@@ -311,4 +311,21 @@ mod tests {
         assert_eq!(accepted, 3);
         assert_eq!(budget.usage().entries, 3);
     }
+
+    #[test]
+    fn tracks_remaining_entries_and_inventory_files_separately_from_bytes() {
+        let budget = ScanBudget::new(limits());
+        assert_eq!(budget.remaining_entries(), 3);
+        budget.record_entry(0).unwrap();
+        assert_eq!(budget.remaining_entries(), 2);
+
+        budget.record_file().unwrap();
+        assert_eq!(budget.usage().files, 1);
+        assert_eq!(budget.usage().total_bytes, 0);
+
+        budget.reserve_file_bytes(6).unwrap();
+        assert_eq!(budget.remaining_bytes(), 4);
+        assert_eq!(budget.usage().files, 1);
+    }
+
 }
