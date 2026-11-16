@@ -179,7 +179,29 @@ items, extern-prelude lookup, trait scope, and receiver/type-based method
 resolution remain unresolved. The next slice should connect structured imports
 to these scoped declarations while preserving candidate and uncertainty states.
 
-### 4.10 Cross-file resolution
+### 4.11 Rust import-to-scoped-symbol candidates (CI-09I)
+
+The import-symbol layer joins `RustImportResolutionReport` with
+`RustScopedSymbolReport`. For a module-prefix import with exactly one remaining
+member segment, it matches the declaration name inside the exact crate-root and
+module-path namespace. Explicit aliases become the candidate's local import
+name. Duplicate declarations remain ambiguous.
+
+Glob imports return direct module-scope declarations as a candidate set; they
+do not claim those declarations are actually imported because visibility and
+re-export rules are not evaluated. Impl methods are excluded from module-level
+matching because the current syntax facts do not yet preserve their containing
+type/impl namespace. Multi-segment member paths remain unsupported rather than
+being guessed as associated-item resolution.
+
+Every result retains the underlying module-resolution status. A missing symbol
+is reported as conclusive only when the target source and graph are complete;
+otherwise the result is marked incomplete. A unique candidate is not a
+compiler-resolved symbol. Visibility, cfg selection, re-exports, macro
+expansion, extern-prelude lookup, trait scope, enum-variant imports, and
+type-dependent associated-item resolution remain future work.
+
+### 4.12 Cross-file resolution
 
 Resolution is a separate stage over extracted facts and workspace metadata. It may resolve:
 
@@ -190,7 +212,7 @@ Resolution is a separate stage over extracted facts and workspace metadata. It m
 
 Resolution output must retain its own provenance and diagnostics. Ambiguous candidates remain ambiguous; they are not collapsed to an arbitrary target.
 
-### 4.11 Relationship analysis and query
+### 4.13 Relationship analysis and query
 
 Relationship analysis is a deterministic transformation over extracted facts. A graph-shaped view may be built when it helps a query, but the underlying index must not require all records to be represented as graph nodes and edges. This stage must not perform parsing or filesystem access.
 
