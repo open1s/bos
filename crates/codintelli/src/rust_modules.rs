@@ -71,7 +71,7 @@ pub enum RustModuleResolutionError {
 
 /// Build conservative file-path candidates for external Rust module declarations.
 ///
-/// `crate_roots` must be supplied by the host from trusted workspace context.
+/// `crate_roots` must contain zero or one path supplied by the host from trusted workspace context. Call once per root; a multi-root graph builder performs this scoping automatically.
 /// The engine does not infer Cargo targets or execute Cargo metadata commands.
 /// For a crate root, child module lookup starts in the root file's parent
 /// directory. For `mod.rs`, lookup starts in its parent directory. For other
