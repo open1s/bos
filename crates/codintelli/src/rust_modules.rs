@@ -61,6 +61,9 @@ pub enum RustModuleResolutionError {
     /// Parse results belong to more than one workspace.
     #[error("parse results contain mixed workspace identities")]
     MixedWorkspace,
+    /// Candidate mapping is scoped to exactly one crate root at a time.
+    #[error("module candidate mapping accepts at most one crate root")]
+    MultipleCrateRoots,
     /// A supplied path is not a normal workspace-relative path.
     #[error("module resolver paths must be normal workspace-relative paths")]
     InvalidPath,
@@ -85,6 +88,9 @@ pub fn resolve_rust_module_candidates(
 ) -> Result<RustModuleResolutionReport, RustModuleResolutionError> {
     let first = parse_results.first().ok_or(RustModuleResolutionError::EmptyInput)?;
     let workspace_id = first.workspace_id;
+    if crate_roots.len() > 1 {
+        return Err(RustModuleResolutionError::MultipleCrateRoots);
+    }
     if parse_results.iter().any(|result| result.workspace_id != workspace_id) {
         return Err(RustModuleResolutionError::MixedWorkspace);
     }
@@ -300,6 +306,16 @@ mod tests {
             &[PathBuf::from("src/lib.rs")],
         ).expect_err("unsafe module path");
         assert!(matches!(error, RustModuleResolutionError::InvalidPath));
+    }
+
+    #[test]
+    fn requires_one_crate_root_per_candidate_mapping() {
+        let error = resolve_rust_module_candidates(
+            &[parsed("src/lib.rs", Vec::new())],
+            &[],
+            &[PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")],
+        ).expect_err("multiple roots");
+        assert!(matches!(error, RustModuleResolutionError::MultipleCrateRoots));
     }
 
     #[test]
