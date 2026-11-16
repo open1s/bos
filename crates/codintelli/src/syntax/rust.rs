@@ -109,16 +109,10 @@ impl LanguageProvider for RustProvider {
 fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option<String>)> {
     let kind = match node.kind() {
         "mod_item" => SyntaxFactKind::Module,
-        "function_item"
-            if node
-                .parent()
-                .and_then(|parent| parent.parent())
-                .is_some_and(|grandparent| grandparent.kind() == "impl_item") =>
-        {
-            SyntaxFactKind::Method
-        }
+        "function_item" if is_associated_method(node) => SyntaxFactKind::Method,
         "function_item" => SyntaxFactKind::Function,
-        "function_signature_item" => SyntaxFactKind::Method,
+        "function_signature_item" if is_associated_method(node) => SyntaxFactKind::Method,
+        "function_signature_item" => SyntaxFactKind::Function,
         "struct_item" => SyntaxFactKind::Struct,
         "enum_item" => SyntaxFactKind::Enum,
         "union_item" => SyntaxFactKind::Union,
@@ -154,6 +148,12 @@ fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option
             .and_then(|value| text_for_node(value, source)),
     };
     Some((kind, name))
+}
+
+fn is_associated_method(node: Node<'_>) -> bool {
+    node.parent()
+        .and_then(|parent| parent.parent())
+        .is_some_and(|ancestor| matches!(ancestor.kind(), "impl_item" | "trait_item"))
 }
 
 fn text_for_node(node: Node<'_>, source: &str) -> Option<String> {
