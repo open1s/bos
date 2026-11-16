@@ -151,33 +151,42 @@ mod tests {
     /// grid (issue #296). Runs on the Windows CI lane.
     #[test]
     fn a_conpty_spawn_reaches_the_screen() {
-        // Spawn the interactive shell the pane spawns, then type the command.
-        // A one-shot `echo ...` command can exit before the pseudoconsole
-        // reader attaches; its output then goes to the inherited console (it
-        // showed up in the CI log) and never reaches the grid.
-        let mut terminal = ConPtyTerminal::spawn(&default_shell(), 24, 80).expect("spawn");
+        // Spawn an interactive shell and type the command, rather than running
+        // a one-shot `echo ...`: a short-lived child can exit before the
+        // pseudoconsole reader attaches. `cmd` is used because the CI
+        // runner's PowerShell needs ~10s for its first prompt (AMSI/JIT on a
+        // cold image), which consumed the whole wait window and made the test
+        // look like a pty failure.
+        let mut terminal = ConPtyTerminal::spawn("cmd", 24, 80).expect("spawn");
         terminal
             .write_input(b"echo bsh-conpty-ok\r\n")
             .expect("write the command");
-        // Give the shell a moment to start, run, and the reader to drain it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut found = false;
+        let mut text = String::new();
         while std::time::Instant::now() < deadline {
             // The console echoes the typed line with the prompt in front, so
             // the grid proves real output only when a row IS the marker.
-            found = terminal.cells().iter().any(|row| {
-                row.iter()
-                    .map(|cell| cell.text.as_str())
-                    .collect::<String>()
-                    .trim()
-                    == "bsh-conpty-ok"
-            });
+            text = terminal
+                .cells()
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            found = text.lines().any(|line| line.trim() == "bsh-conpty-ok");
             if found {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         terminal.kill();
-        assert!(found, "the command output reached the screen grid");
+        assert!(
+            found,
+            "the command output reached the screen grid; grid was {text:?}"
+        );
     }
 }
