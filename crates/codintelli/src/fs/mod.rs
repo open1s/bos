@@ -98,6 +98,18 @@ impl WorkspaceFs {
         }
 
         let parent = current.as_ref().unwrap_or(&self.root);
+        let entry_metadata = parent
+            .symlink_metadata(file_name)
+            .map_err(|source| WorkspaceFsError::Io {
+                path: relative_path.to_path_buf(),
+                source,
+            })?;
+        if !entry_metadata.is_file() {
+            return Err(WorkspaceFsError::NotRegularFile {
+                path: relative_path.to_path_buf(),
+            });
+        }
+
         let mut options = OpenOptions::new();
         options
             .read(true)
@@ -323,10 +335,27 @@ mod tests {
         let root = tempdir().expect("create workspace");
         let outside = tempdir().expect("create outside directory");
         fs::write(outside.path().join("secret.txt"), "secret").expect("write outside file");
-        symlink(outside.path(), root.path().join("escape")).expect("create directory symlink");
+        let target_with_trailing_slash = PathBuf::from(format!("{}/", outside.path().display()));
+        symlink(target_with_trailing_slash, root.path().join("escape"))
+            .expect("create directory symlink");
 
         let workspace = workspace_fs(root.path());
         assert!(workspace.read_file("escape/secret.txt", 1024).is_err());
+    }
+
+    #[test]
+    fn rejects_paths_exceeding_component_depth_limit() {
+        let root = tempdir().expect("create workspace");
+        let workspace = workspace_fs(root.path());
+        let mut path = PathBuf::new();
+        for _ in 0..=MAX_PATH_DEPTH {
+            path.push("segment");
+        }
+
+        assert!(matches!(
+            workspace.read_file(path, 1024),
+            Err(WorkspaceFsError::PathTooDeep { .. })
+        ));
     }
 
     #[test]
