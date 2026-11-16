@@ -21,6 +21,8 @@ pub mod fs;
 pub mod scan_budget;
 pub mod workspace;
 
-pub use fs::{WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs, WorkspaceFsError};
+pub use fs::{
+    DirectoryListing, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs, WorkspaceFsError,
+};
 pub use scan_budget::{ScanBudget, ScanBudgetError, ScanLimits, ScanUsage};
 pub use workspace::{WorkspaceDescriptor, WorkspaceError, WorkspaceId, WorkspaceRegistry};
