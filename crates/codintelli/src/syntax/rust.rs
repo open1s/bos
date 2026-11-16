@@ -10,8 +10,9 @@ use tree_sitter::{Node, ParseOptions, Parser, ParseState};
 use crate::classification::LanguageId;
 
 use super::{
-    valid_relative_path, LanguageProvider, ParseDiagnostic, ParseInput, ParseResult, ParseStatus,
-    ParseControl, ParseLimitKind, ParseLimits, ProviderError, SourceRange, SyntaxFact, SyntaxFactKind,
+    valid_relative_path, ImportFact, LanguageProvider, ParseDiagnostic, ParseInput, ParseResult,
+    ParseStatus, ParseControl, ParseLimitKind, ParseLimits, ProviderError, SourceRange,
+    SyntaxFact, SyntaxFactKind,
 };
 
 /// Rust provider using the upstream Tree-sitter Rust grammar.
@@ -107,6 +108,7 @@ impl RustProvider {
 
         let root = tree.root_node();
         let mut facts = Vec::new();
+        let mut imports = Vec::new();
         let mut diagnostics = Vec::new();
         let mut pending = vec![root];
         let mut visited_nodes = 0usize;
@@ -140,6 +142,35 @@ impl RustProvider {
                 });
             }
 
+            if node.kind() == "use_declaration" {
+                if let Some(range) = source_range(node, source.len()) {
+                    let scope_path = enclosing_module_path(node, source);
+                    let argument = node
+                        .child_by_field_name("argument")
+                        .or_else(|| node.named_child(node.named_child_count().saturating_sub(1) as u32));
+                    if let Some(argument) = argument {
+                        let mut expanded = Vec::new();
+                        flatten_use_tree(argument, &[], source, &mut expanded);
+                        for (path, alias, is_glob) in expanded {
+                            if imports.len() >= limits.max_facts {
+                                limit_reason = Some(ParseLimitKind::Facts);
+                                break;
+                            }
+                            imports.push(ImportFact {
+                                scope_path: scope_path.clone(),
+                                path,
+                                alias,
+                                is_glob,
+                                range,
+                            });
+                        }
+                    }
+                    if limit_reason.is_some() {
+                        break;
+                    }
+                }
+            }
+
             if let Some((kind, name)) = classify_node(node, source) {
                 if let Some(range) = source_range(node, source.len()) {
                     if facts.len() >= limits.max_facts {
@@ -166,6 +197,10 @@ impl RustProvider {
             (left.range, left.kind, &left.name).cmp(&(right.range, right.kind, &right.name))
         });
         diagnostics.sort_unstable_by_key(|diagnostic| diagnostic.range);
+        imports.sort_unstable_by(|left, right| {
+            (&left.scope_path, &left.path, &left.alias, left.is_glob, left.range)
+                .cmp(&(&right.scope_path, &right.path, &right.alias, right.is_glob, right.range))
+        });
 
         let status = if limit_reason.is_some() {
             ParseStatus::Limited
@@ -185,9 +220,92 @@ impl RustProvider {
             status,
             limit_reason,
             facts,
+            imports,
             diagnostics,
         })
     }
+}
+
+fn enclosing_module_path(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "mod_item" {
+            if let Some(name) = current
+                .child_by_field_name("name")
+                .and_then(|name| text_for_node(name, source))
+            {
+                modules.push(name.trim_start_matches("r#").to_owned());
+            }
+        }
+        ancestor = current.parent();
+    }
+    modules.reverse();
+    modules
+}
+
+fn flatten_use_tree(
+    node: Node<'_>,
+    prefix: &[String],
+    source: &str,
+    output: &mut Vec<(Vec<String>, Option<String>, bool)>,
+) {
+    match node.kind() {
+        "use_list" => {
+            for index in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(index as u32) {
+                    flatten_use_tree(child, prefix, source, output);
+                }
+            }
+        }
+        "scoped_use_list" => {
+            let mut named = (0..node.named_child_count())
+                .filter_map(|index| node.named_child(index as u32));
+            if let (Some(path_node), Some(list_node)) = (named.next(), named.next()) {
+                let mut path = prefix.to_vec();
+                path.extend(path_segments(path_node, source));
+                flatten_use_tree(list_node, &path, source, output);
+            }
+        }
+        "use_as_clause" => {
+            let mut named = (0..node.named_child_count())
+                .filter_map(|index| node.named_child(index as u32));
+            if let (Some(path_node), Some(alias_node)) = (named.next(), named.next()) {
+                let mut path = prefix.to_vec();
+                path.extend(path_segments(path_node, source));
+                let alias = text_for_node(alias_node, source)
+                    .map(|value| value.trim_start_matches("r#").to_owned());
+                output.push((path, alias, false));
+            }
+        }
+        "use_wildcard" => {
+            let mut path = prefix.to_vec();
+            if let Some(path_node) = node.named_child(0) {
+                path.extend(path_segments(path_node, source));
+            }
+            output.push((path, None, true));
+        }
+        "self" => {
+            output.push((prefix.to_vec(), None, false));
+        }
+        _ => {
+            let mut path = prefix.to_vec();
+            path.extend(path_segments(node, source));
+            if !path.is_empty() {
+                output.push((path, None, false));
+            }
+        }
+    }
+}
+
+fn path_segments(node: Node<'_>, source: &str) -> Vec<String> {
+    text_for_node(node, source)
+        .unwrap_or_default()
+        .split("::")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.trim_start_matches("r#").to_owned())
+        .collect()
 }
 
 fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option<String>)> {
@@ -290,6 +408,8 @@ fn helper() {}
 "#;
         let result = parse(source);
         assert_eq!(result.status, ParseStatus::Complete);
+        assert_eq!(result.imports.len(), 1);
+        assert_eq!(result.imports[0].path, vec!["std", "fmt", "Debug"]);
         for kind in [
             SyntaxFactKind::Module,
             SyntaxFactKind::Import,
@@ -316,6 +436,22 @@ fn helper() {}
             assert!(source.is_char_boundary(fact.range.start_byte));
             assert!(source.is_char_boundary(fact.range.end_byte));
         }
+    }
+
+
+    #[test]
+    fn extracts_grouped_alias_glob_self_and_nested_module_imports() {
+        let result = parse(r#"
+use crate::model::{Widget, self, State as CurrentState, nested::*};
+mod nested {
+    use super::Widget;
+}
+"#);
+        assert!(result.imports.iter().any(|item| item.path == ["crate", "model", "Widget"]));
+        assert!(result.imports.iter().any(|item| item.path == ["crate", "model"] && item.alias.is_none() && !item.is_glob));
+        assert!(result.imports.iter().any(|item| item.path == ["crate", "model", "State"] && item.alias.as_deref() == Some("CurrentState")));
+        assert!(result.imports.iter().any(|item| item.path == ["crate", "model", "nested"] && item.is_glob));
+        assert!(result.imports.iter().any(|item| item.path == ["super", "Widget"] && item.scope_path == ["nested"]));
     }
 
     #[test]
