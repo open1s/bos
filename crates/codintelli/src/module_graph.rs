@@ -75,6 +75,8 @@ pub enum RustModuleEdgeStatus {
     NoCandidate,
     /// Attribute interpretation is required (for example cfg or path).
     SkippedAttributedDeclaration,
+    /// Declaration is nested beneath an inline module whose cfg/path is unknown.
+    SkippedUncertainParentScope,
     /// Candidate exists but traversal stopped at the configured depth limit.
     DepthLimit,
 }
@@ -206,20 +208,6 @@ pub fn build_rust_module_graph(
         }
     }
 
-    let candidate_report =
-        resolve_rust_module_candidates(parse_results, inventory_paths, &roots)?;
-    let mut candidate_by_declaration = HashMap::new();
-    for candidate in &candidate_report.modules {
-        candidate_by_declaration.insert(
-            (
-                candidate.source_path.clone(),
-                candidate.range.start_byte,
-                candidate.range.end_byte,
-            ),
-            candidate,
-        );
-    }
-
     let mut graph = RustModuleGraph {
         workspace_id,
         crate_roots: roots.clone(),
@@ -257,6 +245,27 @@ pub fn build_rust_module_graph(
             if parsed.status != ParseStatus::Complete && graph.status == RustModuleGraphStatus::Complete {
                 graph.status = RustModuleGraphStatus::Partial;
             }
+            let uncertain_inline_scopes: Vec<Vec<String>> = parsed.modules.iter()
+                .filter(|fact| fact.is_inline && fact.has_resolution_attributes)
+                .map(|fact| {
+                    let mut scope = fact.scope_path.clone();
+                    scope.push(fact.name.clone());
+                    scope
+                })
+                .collect();
+            // Resolve only the current reachable file, not every file in the
+            // workspace. This keeps candidate projection proportional to the
+            // bounded graph traversal and preserves root-specific path rules.
+            let candidate_report = resolve_rust_module_candidates(
+                std::slice::from_ref(*parsed),
+                inventory_paths,
+                std::slice::from_ref(root),
+            )?;
+            let candidates_by_range: HashMap<_, _> = candidate_report.modules.iter()
+                .map(|candidate| {
+                    ((candidate.range.start_byte, candidate.range.end_byte), candidate)
+                })
+                .collect();
 
             for fact in &parsed.modules {
                 if !valid_module_segment(&fact.name)
@@ -269,9 +278,47 @@ pub fn build_rust_module_graph(
                 let mut child_path = parent_path.clone();
                 child_path.push(fact.name.clone());
 
+                if uncertain_inline_scopes.iter().any(|scope| fact.scope_path.starts_with(scope)) {
+                    if graph.status == RustModuleGraphStatus::Complete {
+                        graph.status = RustModuleGraphStatus::Partial;
+                    }
+                    if graph.edges.len() >= limits.max_edges {
+                        graph.status = RustModuleGraphStatus::Limited;
+                        break;
+                    }
+                    graph.edges.push(RustModuleEdge {
+                        crate_root: root.clone(),
+                        parent_module_path: parent_path,
+                        child_module_path: child_path,
+                        declaration_source: source_path.clone(),
+                        range: fact.range,
+                        candidate_paths: Vec::new(),
+                        status: RustModuleEdgeStatus::SkippedUncertainParentScope,
+                    });
+                    continue;
+                }
+
                 if graph.edges.len() >= limits.max_edges {
                     graph.status = RustModuleGraphStatus::Limited;
                     break;
+                }
+
+                if fact.has_resolution_attributes {
+                    if graph.status == RustModuleGraphStatus::Complete {
+                        graph.status = RustModuleGraphStatus::Partial;
+                    }
+                    if fact.is_inline {
+                        graph.edges.push(RustModuleEdge {
+                            crate_root: root.clone(),
+                            parent_module_path: parent_path,
+                            child_module_path: child_path,
+                            declaration_source: source_path.clone(),
+                            range: fact.range,
+                            candidate_paths: Vec::new(),
+                            status: RustModuleEdgeStatus::SkippedAttributedDeclaration,
+                        });
+                        continue;
+                    }
                 }
 
                 if fact.is_inline {
@@ -287,6 +334,11 @@ pub fn build_rust_module_graph(
                         });
                         continue;
                     }
+                    let key = (root.clone(), child_path.clone(), source_path.clone());
+                    if !node_keys.contains(&key) && graph.nodes.len() >= limits.max_nodes {
+                        graph.status = RustModuleGraphStatus::Limited;
+                        break;
+                    }
                     graph.edges.push(RustModuleEdge {
                         crate_root: root.clone(),
                         parent_module_path: parent_path,
@@ -296,12 +348,7 @@ pub fn build_rust_module_graph(
                         candidate_paths: Vec::new(),
                         status: RustModuleEdgeStatus::Inline,
                     });
-                    let key = (root.clone(), child_path.clone(), source_path.clone());
                     if node_keys.insert(key) {
-                        if graph.nodes.len() >= limits.max_nodes {
-                            graph.status = RustModuleGraphStatus::Limited;
-                            break;
-                        }
                         graph.nodes.push(RustModuleNode {
                             crate_root: root.clone(),
                             module_path: child_path,
@@ -312,8 +359,7 @@ pub fn build_rust_module_graph(
                     continue;
                 }
 
-                let candidate = candidate_by_declaration.get(&(
-                    source_path.clone(),
+                let candidate = candidates_by_range.get(&(
                     fact.range.start_byte,
                     fact.range.end_byte,
                 ));
@@ -355,6 +401,13 @@ pub fn build_rust_module_graph(
                     }
                 }
 
+                if let Some(target) = unique_target.as_ref() {
+                    let key = (root.clone(), child_path.clone(), target.clone());
+                    if !node_keys.contains(&key) && graph.nodes.len() >= limits.max_nodes {
+                        graph.status = RustModuleGraphStatus::Limited;
+                        break;
+                    }
+                }
                 graph.edges.push(RustModuleEdge {
                     crate_root: root.clone(),
                     parent_module_path: parent_path,
@@ -368,10 +421,6 @@ pub fn build_rust_module_graph(
                 if let Some(target) = unique_target {
                     let key = (root.clone(), child_path.clone(), target.clone());
                     if node_keys.insert(key) {
-                        if graph.nodes.len() >= limits.max_nodes {
-                            graph.status = RustModuleGraphStatus::Limited;
-                            break;
-                        }
                         graph.nodes.push(RustModuleNode {
                             crate_root: root.clone(),
                             module_path: child_path.clone(),
@@ -418,8 +467,9 @@ fn valid_module_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment != "."
         && segment != ".."
-        && !segment.contains('/')
-        && !segment.contains('\\')
+        && !segment.chars().any(|character| {
+            matches!(character, '/' | '\\\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' | '\\0')
+        })
 }
 
 #[cfg(test)]
@@ -453,7 +503,7 @@ mod tests {
             scope_path: scope.iter().map(|part| (*part).to_owned()).collect(),
             name: name.to_owned(),
             is_inline: inline,
-            has_attributes: false,
+            has_resolution_attributes: false,
             range: SourceRange { start_byte: 10, end_byte: 20 },
         }
     }
@@ -501,6 +551,39 @@ mod tests {
     }
 
     #[test]
+    fn applies_file_directory_rules_per_crate_root_context() {
+        let id = WorkspaceId::new();
+        let results = vec![
+            parsed("src/lib.rs", vec![module("foo", &[], false)], id),
+            parsed("src/foo.rs", vec![module("child", &[], false)], id),
+            parsed("src/foo/child.rs", Vec::new(), id),
+            parsed("src/child.rs", Vec::new(), id),
+        ];
+        let graph = build_rust_module_graph(
+            &results,
+            &[
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("src/foo.rs"),
+                PathBuf::from("src/foo/child.rs"),
+                PathBuf::from("src/child.rs"),
+            ],
+            &[PathBuf::from("src/lib.rs"), PathBuf::from("src/foo.rs")],
+            RustModuleGraphLimits::default(),
+        ).expect("multi-root module graph");
+
+        assert!(graph.nodes.iter().any(|node| {
+            node.crate_root == PathBuf::from("src/lib.rs")
+                && node.module_path == vec!["foo".to_owned(), "child".to_owned()]
+                && node.source_path == PathBuf::from("src/foo/child.rs")
+        }));
+        assert!(graph.nodes.iter().any(|node| {
+            node.crate_root == PathBuf::from("src/foo.rs")
+                && node.module_path == vec!["child".to_owned()]
+                && node.source_path == PathBuf::from("src/child.rs")
+        }));
+    }
+
+    #[test]
     fn preserves_ambiguous_candidates_without_traversing_them() {
         let id = WorkspaceId::new();
         let results = vec![parsed("src/lib.rs", vec![module("model", &[], false)], id)];
@@ -512,6 +595,48 @@ mod tests {
         ).expect("module graph");
         assert_eq!(graph.edges[0].status, RustModuleEdgeStatus::AmbiguousCandidates);
         assert_eq!(graph.edges[0].candidate_paths.len(), 2);
+    }
+
+    #[test]
+    fn does_not_assume_attributed_inline_modules_are_active() {
+        let id = WorkspaceId::new();
+        let mut optional = module("optional", &[], true);
+        optional.has_resolution_attributes = true;
+        let graph = build_rust_module_graph(
+            &[parsed("src/lib.rs", vec![optional], id)],
+            &[PathBuf::from("src/lib.rs")],
+            &[PathBuf::from("src/lib.rs")],
+            RustModuleGraphLimits::default(),
+        ).expect("module graph");
+        assert_eq!(graph.status, RustModuleGraphStatus::Partial);
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.edges[0].status, RustModuleEdgeStatus::SkippedAttributedDeclaration);
+    }
+
+    #[test]
+    fn does_not_traverse_children_of_cfg_gated_inline_modules() {
+        let id = WorkspaceId::new();
+        let mut optional = module("optional", &[], true);
+        optional.has_resolution_attributes = true;
+        let child = module("child", &["optional"], false);
+        let results = vec![
+            parsed("src/lib.rs", vec![optional, child], id),
+            parsed("src/optional/child.rs", Vec::new(), id),
+        ];
+        let graph = build_rust_module_graph(
+            &results,
+            &[
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("src/optional/child.rs"),
+            ],
+            &[PathBuf::from("src/lib.rs")],
+            RustModuleGraphLimits::default(),
+        ).expect("module graph");
+        assert_eq!(graph.status, RustModuleGraphStatus::Partial);
+        assert_eq!(graph.nodes.len(), 1);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.status == RustModuleEdgeStatus::SkippedUncertainParentScope
+        }));
     }
 
     #[test]
@@ -540,6 +665,6 @@ mod tests {
         ).expect("limited graph");
         assert_eq!(graph.status, RustModuleGraphStatus::Limited);
         assert_eq!(graph.nodes.len(), 1);
-        assert_eq!(graph.edges.len(), 1);
+        assert!(graph.edges.is_empty());
     }
 }

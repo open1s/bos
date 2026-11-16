@@ -61,6 +61,9 @@ pub enum RustModuleResolutionError {
     /// Parse results belong to more than one workspace.
     #[error("parse results contain mixed workspace identities")]
     MixedWorkspace,
+    /// Candidate mapping is scoped to exactly one crate root at a time.
+    #[error("module candidate mapping accepts at most one crate root")]
+    MultipleCrateRoots,
     /// A supplied path is not a normal workspace-relative path.
     #[error("module resolver paths must be normal workspace-relative paths")]
     InvalidPath,
@@ -68,7 +71,7 @@ pub enum RustModuleResolutionError {
 
 /// Build conservative file-path candidates for external Rust module declarations.
 ///
-/// `crate_roots` must be supplied by the host from trusted workspace context.
+/// `crate_roots` must contain zero or one path supplied by the host from trusted workspace context. Call once per root; a multi-root graph builder performs this scoping automatically.
 /// The engine does not infer Cargo targets or execute Cargo metadata commands.
 /// For a crate root, child module lookup starts in the root file's parent
 /// directory. For `mod.rs`, lookup starts in its parent directory. For other
@@ -85,6 +88,9 @@ pub fn resolve_rust_module_candidates(
 ) -> Result<RustModuleResolutionReport, RustModuleResolutionError> {
     let first = parse_results.first().ok_or(RustModuleResolutionError::EmptyInput)?;
     let workspace_id = first.workspace_id;
+    if crate_roots.len() > 1 {
+        return Err(RustModuleResolutionError::MultipleCrateRoots);
+    }
     if parse_results.iter().any(|result| result.workspace_id != workspace_id) {
         return Err(RustModuleResolutionError::MixedWorkspace);
     }
@@ -141,7 +147,7 @@ pub fn resolve_rust_module_candidates(
                 .collect();
             existing_candidates.sort();
 
-            let status = if fact.has_attributes {
+            let status = if fact.has_resolution_attributes {
                 RustModuleResolutionStatus::SkippedAttributedDeclaration
             } else {
                 match existing_candidates.len() {
@@ -174,8 +180,9 @@ fn valid_module_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment != "."
         && segment != ".."
-        && !segment.contains('/')
-        && !segment.contains('\\\\')
+        && !segment.chars().any(|character| {
+            matches!(character, '/' | '\\\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' | '\\0')
+        })
 }
 
 fn module_directory(
@@ -227,12 +234,12 @@ mod tests {
         parsed_with_id(path, modules, WorkspaceId::new())
     }
 
-    fn module(name: &str, scope: &[&str], inline: bool, has_attributes: bool) -> RustModuleFact {
+    fn module(name: &str, scope: &[&str], inline: bool, has_resolution_attributes: bool) -> RustModuleFact {
         RustModuleFact {
             scope_path: scope.iter().map(|part| (*part).to_owned()).collect(),
             name: name.to_owned(),
             is_inline: inline,
-            has_attributes,
+            has_resolution_attributes,
             range: SourceRange { start_byte: 0, end_byte: 1 },
         }
     }
@@ -294,11 +301,21 @@ mod tests {
     #[test]
     fn rejects_module_names_that_could_escape_the_workspace() {
         let error = resolve_rust_module_candidates(
-            &[parsed("src/lib.rs", vec![module("../outside", &[], false, false)])],
+            &[parsed("src/lib.rs", vec![module("outside:drive", &[], false, false)])],
             &[],
             &[PathBuf::from("src/lib.rs")],
         ).expect_err("unsafe module path");
         assert!(matches!(error, RustModuleResolutionError::InvalidPath));
+    }
+
+    #[test]
+    fn requires_one_crate_root_per_candidate_mapping() {
+        let error = resolve_rust_module_candidates(
+            &[parsed("src/lib.rs", Vec::new())],
+            &[],
+            &[PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")],
+        ).expect_err("multiple roots");
+        assert!(matches!(error, RustModuleResolutionError::MultipleCrateRoots));
     }
 
     #[test]
