@@ -68,10 +68,12 @@ impl WorkspaceFs {
         }
 
         let directory = current.as_ref().unwrap_or(&self.root);
-        let entries = directory.entries().map_err(|source| WorkspaceFsError::Io {
-            path: relative_path.to_path_buf(),
-            source,
-        })?;
+        let entries = directory
+            .entries()
+            .map_err(|source| WorkspaceFsError::Io {
+                path: relative_path.to_path_buf(),
+                source,
+            })?;
 
         let mut result = Vec::new();
         let mut inspected_entries = 0usize;
@@ -125,7 +127,10 @@ fn directory_components(path: &Path) -> Result<Vec<std::ffi::OsString>, Workspac
     for component in path.components() {
         match component {
             Component::Normal(name) => components.push(name.to_os_string()),
-            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
                 return Err(WorkspaceFsError::InvalidRelativePath {
                     path: path.to_path_buf(),
                 });
@@ -158,7 +163,10 @@ mod tests {
         let entries = workspace.read_dir("", 10).expect("list root");
 
         assert_eq!(
-            entries.iter().map(|entry| entry.relative_path.as_path()).collect::<Vec<_>>(),
+            entries
+                .iter()
+                .map(|entry| entry.relative_path.as_path())
+                .collect::<Vec<_>>(),
             vec![Path::new("a.rs"), Path::new("src"), Path::new("z.rs")]
         );
         assert_eq!(entries[0].kind, WorkspaceEntryKind::File);
@@ -228,7 +236,6 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].relative_path, Path::new("target.rs"));
     }
-
 
     #[cfg(unix)]
     #[test]
