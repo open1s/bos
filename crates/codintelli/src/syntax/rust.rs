@@ -152,7 +152,7 @@ impl RustProvider {
                         let mut expanded = Vec::new();
                         flatten_use_tree(argument, &[], source, &mut expanded);
                         for (path, alias, is_glob) in expanded {
-                            if imports.len() >= limits.max_facts {
+                            if facts.len().saturating_add(imports.len()) >= limits.max_facts {
                                 limit_reason = Some(ParseLimitKind::Facts);
                                 break;
                             }
@@ -447,11 +447,11 @@ mod nested {
     use super::Widget;
 }
 "#);
-        assert!(result.imports.iter().any(|item| item.path == ["crate", "model", "Widget"]));
-        assert!(result.imports.iter().any(|item| item.path == ["crate", "model"] && item.alias.is_none() && !item.is_glob));
-        assert!(result.imports.iter().any(|item| item.path == ["crate", "model", "State"] && item.alias.as_deref() == Some("CurrentState")));
-        assert!(result.imports.iter().any(|item| item.path == ["crate", "model", "nested"] && item.is_glob));
-        assert!(result.imports.iter().any(|item| item.path == ["super", "Widget"] && item.scope_path == ["nested"]));
+        assert!(result.imports.iter().any(|item| item.path == vec!["crate".to_owned(), "model".to_owned(), "Widget".to_owned()]));
+        assert!(result.imports.iter().any(|item| item.path == vec!["crate".to_owned(), "model".to_owned()] && item.alias.is_none() && !item.is_glob));
+        assert!(result.imports.iter().any(|item| item.path == vec!["crate".to_owned(), "model".to_owned(), "State".to_owned()] && item.alias.as_deref() == Some("CurrentState")));
+        assert!(result.imports.iter().any(|item| item.path == vec!["crate".to_owned(), "model".to_owned(), "nested".to_owned()] && item.is_glob));
+        assert!(result.imports.iter().any(|item| item.path == vec!["super".to_owned(), "Widget".to_owned()] && item.scope_path == vec!["nested".to_owned()]));
     }
 
     #[test]
