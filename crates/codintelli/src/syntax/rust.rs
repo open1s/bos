@@ -24,7 +24,7 @@ impl RustProvider {
     pub const ID: &'static str = "codintelli.rust.tree-sitter";
 
     /// Parser and grammar versions used by this provider.
-    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2/facts-v4";
+    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2/facts-v3";
 }
 
 impl LanguageProvider for RustProvider {
@@ -286,7 +286,6 @@ impl RustProvider {
                         scope_path: enclosing_module_path(node, source),
                         is_module_scope: is_module_scope(node),
                         visibility: rust_visibility(node, source),
-                        namespace: rust_namespace(node, kind),
                         range,
                     });
                 }
@@ -512,38 +511,6 @@ fn rust_visibility(node: Node<'_>, source: &str) -> Option<super::RustVisibility
     })
 }
 
-fn rust_namespace(node: Node<'_>, kind: SyntaxFactKind) -> Option<super::RustNamespace> {
-    match kind {
-        SyntaxFactKind::Module
-        | SyntaxFactKind::Struct
-        | SyntaxFactKind::Enum
-        | SyntaxFactKind::Union
-        | SyntaxFactKind::Trait
-        | SyntaxFactKind::TypeAlias => Some(super::RustNamespace::Type),
-        SyntaxFactKind::Function if !is_associated_item(node) => {
-            Some(super::RustNamespace::Value)
-        }
-        SyntaxFactKind::Function | SyntaxFactKind::Method => {
-            Some(super::RustNamespace::Associated)
-        }
-        SyntaxFactKind::Constant | SyntaxFactKind::Static if is_associated_item(node) => {
-            Some(super::RustNamespace::Associated)
-        }
-        SyntaxFactKind::Constant | SyntaxFactKind::Static => Some(super::RustNamespace::Value),
-        SyntaxFactKind::Macro => Some(super::RustNamespace::Macro),
-        SyntaxFactKind::Impl
-        | SyntaxFactKind::Import
-        | SyntaxFactKind::Call
-        | SyntaxFactKind::MethodCall => None,
-    }
-}
-
-fn is_associated_item(node: Node<'_>) -> bool {
-    node.parent()
-        .and_then(|parent| parent.parent())
-        .is_some_and(|ancestor| matches!(ancestor.kind(), "impl_item" | "trait_item"))
-}
-
 fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option<String>)> {
     let kind = match node.kind() {
         "mod_item" => SyntaxFactKind::Module,
@@ -558,7 +525,7 @@ fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option
         "impl_item" => SyntaxFactKind::Impl,
         "type_item" => SyntaxFactKind::TypeAlias,
         "const_item" => SyntaxFactKind::Constant,
-        "static_item" => SyntaxFactKind::Static,\n        "macro_definition" => SyntaxFactKind::Macro,
+        "static_item" => SyntaxFactKind::Static,
         "use_declaration" => SyntaxFactKind::Import,
         "call_expression" => {
             let function = node.child_by_field_name("function")?;
