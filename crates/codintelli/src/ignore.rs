@@ -397,10 +397,10 @@ mod tests {
         let policy = IgnorePolicy::without_builtins();
         assert!(!policy.is_ignored(Path::new("target"), WorkspaceEntryKind::Directory));
     }
-}
     #[test]
     fn excludes_git_worktree_marker_file() {
         let policy = IgnorePolicy::default();
         assert!(policy.is_ignored(Path::new(".git"), WorkspaceEntryKind::File));
     }
+}
 
