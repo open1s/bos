@@ -24,6 +24,7 @@ pub mod index;
 pub mod scan_budget;
 pub mod scanner;
 pub mod resolution;
+pub mod rust_modules;
 pub mod syntax;
 pub mod workspace;
 
@@ -34,6 +35,10 @@ pub use fs::{
 pub use index::{
     index_rust_workspace, index_workspace, index_workspace_with_limits, SourceFileResult, SourceFileStatus,
     SourceIndexDiagnostic, SourceIndexDiagnosticKind, SourceIndexReport, SourceIndexStatus,
+};
+pub use rust_modules::{
+    resolve_rust_module_candidates, RustModuleResolution, RustModuleResolutionError,
+    RustModuleResolutionReport, RustModuleResolutionStatus,
 };
 pub use resolution::{
     build_symbol_candidates, CandidateState, ReferenceCandidates, ReferenceKind,
