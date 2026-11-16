@@ -348,7 +348,7 @@ The source pipeline is synchronous and sequential today. Hosts must run it on bo
 | CI-07 | Parser/provider seam + Rust provider | Deterministic source facts with source evidence |
 | CI-08 | Bounded source-to-facts pipeline | Inventory, classification, reserved reads, provider dispatch, explicit coverage |
 | CI-09A | Cooperative parser cancellation and output budgets | Tree-sitter progress cancellation; bounded nodes/facts/diagnostics; explicit limit reasons |
-| CI-09B | Symbol candidate catalog and conservative references | Deterministic declaration IDs; unique/ambiguous/unresolved candidates; no false resolved edges |
+| CI-09B | Symbol candidate catalog and conservative references | Deterministic declaration IDs; unique/ambiguous/unresolved candidates; no false resolved edges |\n| CI-09C | Structured Rust import and inline module-scope facts | Tree-sitter import paths, grouped expansion, aliases, globs, lexical scope and source evidence |
 | CI-10 | Incremental extraction store | Atomic per-file replacement; last-known-good preservation |
 | CI-11 | Query API | File/symbol search, source retrieval, explain, references, optional neighbors/path/impact |
 | CI-12 | Optional export and host adapter | Versioned exports; integration remains outside engine |
