@@ -108,7 +108,9 @@ The initial source pipeline is implemented as a synchronous, sequential operatio
 
 A file that grows between enumeration and reading is rejected by the bounded read. Byte reservations are conservative and are not refunded after read or parse failure. Unsupported languages remain visible as unsupported results; they are not silently dropped from coverage accounting. Documentation, configuration, data, markup, style, and asset files remain in inventory but are not sent to source parsers by the initial pipeline.
 
-The first pipeline checks cancellation and deadlines between files. A parser currently processing one bounded file is not preempted by the orchestration layer; this is an explicit limitation until provider-level cancellation is wired and tested. No project commands, compilers, build scripts, package managers, or tests are executed.
+The Rust provider observes the shared cancellation flag and deadline through Tree-sitter's parse-progress callback, then checks them again during iterative syntax-tree projection. If Tree-sitter aborts, its parser state is reset before reuse. Other providers that rely on the default trait method are checked before and after parsing; they must override the controlled-parse method to provide mid-parse cancellation.
+
+Per-file ParseLimits bound visited syntax nodes (1,000,000 by default), retained facts (100,000), and retained diagnostics (10,000). A limit produces an explicit Limited parse status, preserves facts already extracted, and records the exact limit reason. The iterative traversal also bounds its pending-node stack. The input byte limit remains the first bound on Tree-sitter's native syntax-tree allocation; the node/fact limits bound codintelli's projection and retained output. No project commands, compilers, build scripts, package managers, or tests are executed.
 
 ### 4.3 Language provider registry
 
@@ -339,7 +341,8 @@ The source pipeline is synchronous and sequential today. Hosts must run it on bo
 | CI-06 | Typed source facts and relationship contracts | Versioned declarations/references/evidence; optional graph projection; validation tests |
 | CI-07 | Parser/provider seam + Rust provider | Deterministic source facts with source evidence |
 | CI-08 | Bounded source-to-facts pipeline | Inventory, classification, reserved reads, provider dispatch, explicit coverage |
-| CI-09 | Symbol/import resolution | Resolved edges with ambiguity preserved |
+| CI-09A | Cooperative parser cancellation and output budgets | Tree-sitter progress cancellation; bounded nodes/facts/diagnostics; explicit limit reasons |
+| CI-09B | Symbol/import resolution | Resolved edges with ambiguity preserved |
 | CI-10 | Incremental extraction store | Atomic per-file replacement; last-known-good preservation |
 | CI-11 | Query API | File/symbol search, source retrieval, explain, references, optional neighbors/path/impact |
 | CI-12 | Optional export and host adapter | Versioned exports; integration remains outside engine |
