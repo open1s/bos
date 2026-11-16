@@ -24,7 +24,7 @@ impl RustProvider {
     pub const ID: &'static str = "codintelli.rust.tree-sitter";
 
     /// Parser and grammar versions used by this provider.
-    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2/facts-v2";
+    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2/facts-v3";
 }
 
 impl LanguageProvider for RustProvider {
@@ -520,22 +520,22 @@ fn private_fn() {}
                 .and_then(|fact| fact.visibility.clone())
                 .expect("declaration visibility fact")
         };
-        assert_eq!(visibility("private_mod"), super::RustVisibility::Private);
-        assert_eq!(visibility("public_mod"), super::RustVisibility::Public);
-        assert_eq!(visibility("CrateType"), super::RustVisibility::Crate);
-        assert_eq!(visibility("parent_visible"), super::RustVisibility::Super);
-        assert_eq!(visibility("SELF_VALUE"), super::RustVisibility::SelfScope);
+        assert_eq!(visibility("private_mod"), super::super::RustVisibility::Private);
+        assert_eq!(visibility("public_mod"), super::super::RustVisibility::Public);
+        assert_eq!(visibility("CrateType"), super::super::RustVisibility::Crate);
+        assert_eq!(visibility("parent_visible"), super::super::RustVisibility::Super);
+        assert_eq!(visibility("SELF_VALUE"), super::super::RustVisibility::SelfScope);
         assert_eq!(
             visibility("ScopedAlias"),
-            super::RustVisibility::InPath(vec!["crate".to_owned(), "outer".to_owned()])
+            super::super::RustVisibility::InPath(vec!["crate".to_owned(), "outer".to_owned()])
         );
-        assert_eq!(visibility("private_fn"), super::RustVisibility::Private);
+        assert_eq!(visibility("private_fn"), super::super::RustVisibility::Private);
         let import = result
             .facts
             .iter()
             .find(|fact| fact.kind == SyntaxFactKind::Import)
             .expect("pub use syntax fact");
-        assert_eq!(import.visibility, Some(super::RustVisibility::Public));
+        assert_eq!(import.visibility, Some(super::super::RustVisibility::Public));
     }
 
     #[test]
