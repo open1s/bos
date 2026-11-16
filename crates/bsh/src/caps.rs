@@ -901,6 +901,17 @@ fn build_agent_for_session_inner(
         // halves the context growth per big tool call against the engine's
         // 48 KB default, which is what kept the auto-compaction trigger hot.
         tool_output_cap: eff.tool_output_cap,
+        // A slow provider is not a failed one. This one number bounds a request
+        // at both layers the reader can see: the engine's per-call ceiling and
+        // the vendor's idle-socket guard. Inheriting the framework's 60s
+        // default put a one-minute wall in front of a turn a reasoning model
+        // or a buffering gateway can spend minutes on, while it is working
+        // perfectly.
+        timeout_secs: eff.llm_timeout_secs,
+        // The retry budget for a transient failure. It is the engine's own
+        // budget, because BSH configures no resilience layer (a rate limiter
+        // here would also throttle healthy turns).
+        max_retries: eff.llm_max_retries,
         // No ceiling: the loop ends when the model stops asking for tools, so a
         // long but healthy turn is never cut off by a number. A zero budget is
         // the engine's "unbounded" contract.
@@ -9735,6 +9746,40 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
         assert!(bash, "the shell itself stayed");
         assert!(!background, "the denied capability withdrew the flag");
         assert!(output && kill, "the job tools are independent");
+    }
+
+    /// The wait the reader sets is the wait the built agent runs with.
+    ///
+    /// This is the one number `build_vendor` hands to the wire guard and the
+    /// engine keeps as its per-call ceiling, so the pane's field is not a
+    /// control that only looks wired.
+    #[test]
+    fn the_llm_wait_reaches_the_built_agent() {
+        let root = scratch("llm-wait-build");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.llm_timeout_secs = 900;
+        settings.workspace.agent.llm_max_retries = 1;
+        settings.workspace.agent.temperature = Some(0.2);
+        let built = crate::caps::build_agent_for_session(
+            &settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "run",
+        );
+        let config = built.agent.config();
+        assert_eq!(
+            config.timeout_secs, 900,
+            "the reader's wait is the ceiling the built agent carries"
+        );
+        assert_eq!(
+            config.max_retries, 1,
+            "and the retry budget is the engine's own, with no resilience layer"
+        );
+        assert_eq!(
+            config.temperature, 0.2,
+            "and every request carries the stored sampling temperature"
+        );
     }
 
     /// A policy that denies the subagent spawn creates no child at all: the

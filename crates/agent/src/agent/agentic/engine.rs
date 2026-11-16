@@ -239,10 +239,19 @@ impl Agent {
         // request without corrupting the one already in flight.
         .with_steers(self.steers.clone());
 
+        // Zero is "the shipped guard", the same spelling the vendor layer uses:
+        // a host that never chose a wait gets the generous default rather than
+        // an instant timeout at the engine.
+        let llm_timeout = if self.config.timeout_secs == 0 {
+            react::llm::vendor::DEFAULT_READ_TIMEOUT.as_secs()
+        } else {
+            self.config.timeout_secs
+        };
         let mut builder = ReActEngineBuilder::<AgentReActApp>::new()
             .llm(react_llm)
             .resilience(self.resilience.clone())
-            .llm_timeout(self.config.timeout_secs)
+            .llm_timeout(llm_timeout)
+            .max_retries(self.config.max_retries)
             .parallel_tool_calls(self.config.parallel_tool_calls)
             .context_budget(self.context_budget)
             // ONE per-turn ceiling for the definitions a request carries: the

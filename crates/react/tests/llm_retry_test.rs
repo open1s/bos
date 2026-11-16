@@ -123,6 +123,65 @@ async fn call_llm_retries_exactly_max_retries_times() {
     );
 }
 
+/// The engine's own budget bounds a host that configured no resilience layer.
+///
+/// BSH configures no rate limiter (it would also throttle healthy turns), so
+/// the retry count it exposes reaches the engine through the builder. One
+/// retry means two calls, never the shipped three.
+#[tokio::test]
+async fn a_host_without_resilience_still_bounds_its_retries() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
+        .llm(Box::new(AlwaysRateLimited {
+            calls: Arc::clone(&calls),
+        }))
+        .max_retries(1)
+        .build()
+        .expect("engine builds");
+
+    let result = engine
+        .call_llm(
+            None,
+            LlmRequest::new("test-model"),
+            &mut LlmSession::default(),
+            &mut LlmContext::default(),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(react::ReactError::Llm(LlmError::RateLimited))
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one initial attempt plus the configured single retry"
+    );
+}
+
+/// Zero is a real budget: one attempt, and a transient failure ends the call.
+#[tokio::test]
+async fn zero_retries_means_one_attempt() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
+        .llm(Box::new(AlwaysRateLimited {
+            calls: Arc::clone(&calls),
+        }))
+        .max_retries(0)
+        .build()
+        .expect("engine builds");
+
+    let _ = engine
+        .call_llm(
+            None,
+            LlmRequest::new("test-model"),
+            &mut LlmSession::default(),
+            &mut LlmContext::default(),
+        )
+        .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry was allowed");
+}
+
 /// The streaming path carries the same retry contract.
 ///
 /// The interactive turn streams, and the retry loop used to exist only on the

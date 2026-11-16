@@ -805,6 +805,7 @@ Agent configuration.
 | `system_prompt` | `"You are a helpful assistant."` | System prompt |
 | `temperature` | `0.7` | Sampling temperature |
 | `timeout_secs` | `60` | Request timeout |
+| `max_retries` | `3` | Retries after the first attempt when the provider failure is transient; `0` disables retries |
 | `max_steps` | `10` | Optional ReAct step guard; `0` means no ceiling, so a turn ends when the model stops calling tools |
 | `circuit_breaker` | `None` | Circuit breaker config |
 | `rate_limit` | `None` | Rate limiter config |

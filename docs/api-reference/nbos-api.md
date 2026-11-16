@@ -99,6 +99,7 @@ AgentBuilder(bus, options=None)
 | `with_temperature(temp)` | Set temperature | `AgentBuilder` |
 | `with_max_tokens(tokens)` | Set max tokens | `AgentBuilder` |
 | `with_timeout(secs)` | Set timeout | `AgentBuilder` |
+| `with_max_retries(retries)` | Retries after the first attempt on a transient failure (`0` disables) | `AgentBuilder` |
 | `with_api_mode(mode)` | Set the API mode (`chat` or `responses`) | `AgentBuilder` |
 | `with_reasoning_effort(effort)` | Set reasoning effort for reasoning models | `AgentBuilder` |
 | `with_circuit_breaker(max_failures, cooldown_secs)` | Configure the circuit breaker (matches JS `circuitBreaker`) | `AgentBuilder` |
@@ -378,6 +379,7 @@ config.api_key = "sk-..."
 config.system_prompt = "You are helpful."
 config.temperature = 0.7
 config.timeout_secs = 120
+config.max_retries = 3
 ```
 
 #### Resilience Fields

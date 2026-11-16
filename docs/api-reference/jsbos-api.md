@@ -83,6 +83,7 @@ new AgentBuilder(bus, options = {})
 | `system(prompt)` / `prompt(prompt)` | Set system prompt | `AgentBuilder` |
 | `temperature(temp)` | Set temperature | `AgentBuilder` |
 | `timeout(secs)` | Set timeout | `AgentBuilder` |
+| `maxRetries(retries)` | Retries after the first attempt on a transient failure (`0` disables) | `AgentBuilder` |
 | `maxTokens(tokens)` | Set max tokens | `AgentBuilder` |
 | `withConfig(config)` | Apply config object | `AgentBuilder` |
 | `apiMode(mode)` | Set the API mode (`chat` or `responses`) | `AgentBuilder` |

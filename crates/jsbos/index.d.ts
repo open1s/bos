@@ -682,6 +682,8 @@ export interface AgentConfig {
   maxTokens?: number
   /** Per-request timeout in seconds. */
   timeoutSecs: number
+  /** Retries after the first attempt on a transient provider failure. */
+  maxRetries?: number
   /** Maximum ReAct steps. */
   maxSteps?: number
   /** API protocol. */
@@ -1040,6 +1042,7 @@ export class AgentBuilder {
         systemPrompt: any;
         temperature: any;
         timeoutSecs: any;
+        maxRetries: any;
         maxTokens: any;
         maxSteps: any;
         apiMode: any;
@@ -1062,6 +1065,7 @@ export class AgentBuilder {
     prompt(prompt: any): this;
     temperature(temp: any): this;
     timeout(secs: any): this;
+    maxRetries(retries: any): this;
     maxTokens(tokens: any): this;
     apiMode(mode: any): this;
     reasoningEffort(effort: any): this;

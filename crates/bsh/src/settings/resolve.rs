@@ -514,6 +514,10 @@ pub(crate) struct Resolution {
     pub(crate) skills: std::sync::Arc<Vec<DiscoveredSkill>>,
     /// Send-side token ceiling; 0 disables compaction.
     pub(crate) context_budget: usize,
+    /// Seconds one LLM request may wait before the loop gives up on it.
+    pub(crate) llm_timeout_secs: u64,
+    /// Retries after the first attempt when a provider failure is transient.
+    pub(crate) llm_max_retries: u32,
     /// Seconds one shell command may run before it is killed.
     pub(crate) shell_timeout_secs: u64,
     /// Bytes of one tool result kept before the rest is truncated.
@@ -726,6 +730,8 @@ pub(crate) fn resolve_with_catalogue(
         skill_sources,
         skills,
         context_budget: workspace.agent.context_budget,
+        llm_timeout_secs: workspace.agent.llm_timeout_secs,
+        llm_max_retries: workspace.agent.llm_max_retries,
         shell_timeout_secs: workspace.agent.shell_timeout_secs,
         tool_output_cap: workspace.agent.tool_output_cap,
         mcp_servers: merge_mcp(&global.mcp_servers, &workspace.agent.mcp_servers),

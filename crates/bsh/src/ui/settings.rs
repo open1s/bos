@@ -53,18 +53,25 @@ pub(crate) const SECTIONS: [&str; 18] = [
 /// card, a tab or a sidebar panel in the reference, so it is not a rail cell
 /// here either. See `docs/ui-mirror/reference/dsh-settings-rail.md`.
 ///
-/// Two BSH additions. The Vault sits after Account, the surface it is
+/// Three BSH additions. The Vault sits after Account, the surface it is
 /// administered from. Web search sits after Models, because that is where a
 /// reader looks for the thing the model calls: the reference only reaches its
 /// own Web search page through the plugins pane's built-in inventory, which is
 /// a list of what is installed rather than a place to find a tool's settings -
 /// and this pane owns a credential and a request shape, not just a switch.
-pub(crate) const NAV: [&str; 7] = [
+///
+/// The Agent loop is the third, for the same reason: its rows are the live
+/// behaviour of a turn - tool dispatch, the persona contract, and the one wait
+/// a model request gets - and the reference reaches its own page only through
+/// that same inventory. A behaviour setting buried in a list of what is
+/// installed is a setting most readers never find.
+pub(crate) const NAV: [&str; 8] = [
     "account",
     "vault",
     "general",
     "models",
     "web-search",
+    "agent-loop",
     "extensions",
     "agent-presets",
 ];
@@ -129,6 +136,9 @@ fn settings_hero_meta(section: usize) -> (IconName, u32, IconName) {
         1 => (IconName::ShieldCheck, 0x3B82F6, IconName::Lock),
         2 => (IconName::Settings, 0x64748B, IconName::SlidersHorizontal),
         3 => (IconName::Box, VIOLET, IconName::Sparkles),
+        // The same glyph and tint the built-in inventory row uses: one pane, one
+        // identity, whichever door the reader came through.
+        7 => (IconName::RefreshCw, theme::warn(), IconName::RotateCw),
         16 => (IconName::Globe, TEAL, IconName::Search),
         17 => (IconName::Puzzle, AMBER, IconName::Boxes),
         12 => (IconName::Sparkles, 0x8B5CF6, IconName::Wand),
@@ -147,6 +157,7 @@ fn nav_meta(index: usize) -> (IconName, &'static str) {
         1 => (IconName::ShieldCheck, "settings.vaultSub"),
         2 => (IconName::Settings, "settings.generalSub"),
         3 => (IconName::Box, "settings.modelsSub"),
+        7 => (IconName::RefreshCw, "settings.agentLoopSub"),
         16 => (IconName::Globe, "settings.webSearchSub"),
         17 => (IconName::Puzzle, "settings.extensionsSub"),
         12 => (IconName::Sparkles, "settings.agentPresetsSub"),
@@ -187,6 +198,13 @@ fn cap_matches(query: &str, cap: &crate::caps::CapInfo) -> bool {
 pub(crate) struct SettingsInputs {
     system_prompt: Entity<InputState>,
     budget: Entity<InputState>,
+    /// The one wait a model request gets; read back by the Agent loop pane's
+    /// test, the way the web-search fields are.
+    pub(crate) llm_timeout: Entity<InputState>,
+    /// Sampling temperature; empty means the engine's own default.
+    pub(crate) temperature: Entity<InputState>,
+    /// Retries after the first attempt on a transient provider failure.
+    pub(crate) retries: Entity<InputState>,
     shell_timeout: Entity<InputState>,
     output_cap: Entity<InputState>,
     max_tokens: Entity<InputState>,
@@ -204,6 +222,9 @@ impl SettingsInputs {
         Self {
             system_prompt: cx.new(|cx| InputState::new(window, cx)),
             budget: cx.new(|cx| InputState::new(window, cx)),
+            llm_timeout: cx.new(|cx| InputState::new(window, cx)),
+            temperature: cx.new(|cx| InputState::new(window, cx)),
+            retries: cx.new(|cx| InputState::new(window, cx)),
             shell_timeout: cx.new(|cx| InputState::new(window, cx)),
             output_cap: cx.new(|cx| InputState::new(window, cx)),
             max_tokens: cx.new(|cx| InputState::new(window, cx)),
@@ -224,6 +245,31 @@ impl SettingsInputs {
         set(
             &self.budget,
             effective.context_budget.to_string(),
+            window,
+            cx,
+        );
+        set(
+            &self.llm_timeout,
+            effective.llm_timeout_secs.to_string(),
+            window,
+            cx,
+        );
+        // The STORED value, not the resolved one: a blank field means "the
+        // engine's default", which is a different fact from 0.7 copied in.
+        set(
+            &self.temperature,
+            settings
+                .workspace
+                .agent
+                .temperature
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
+        set(
+            &self.retries,
+            effective.llm_max_retries.to_string(),
             window,
             cx,
         );
@@ -268,6 +314,22 @@ impl SettingsInputs {
         let budget = self.budget.read(cx).value().trim().to_string();
         if let Some(parsed) = parse_capacity(&budget) {
             settings.workspace.agent.context_budget = parsed;
+        }
+        let llm_timeout = self.llm_timeout.read(cx).value().trim().to_string();
+        if let Ok(parsed) = llm_timeout.parse::<u64>() {
+            settings.workspace.agent.llm_timeout_secs = parsed.max(1);
+        }
+        let temperature = self.temperature.read(cx).value().trim().to_string();
+        if temperature.is_empty() {
+            settings.workspace.agent.temperature = None;
+        } else if let Ok(parsed) = temperature.parse::<f32>() {
+            settings.workspace.agent.temperature = Some(parsed.clamp(0.0, 2.0));
+        }
+        let retries = self.retries.read(cx).value().trim().to_string();
+        if let Ok(parsed) = retries.parse::<u32>() {
+            // A ten-retry budget is already generous; more is a hang dressed
+            // up as resilience.
+            settings.workspace.agent.llm_max_retries = parsed.min(10);
         }
         let timeout = self.shell_timeout.read(cx).value().trim().to_string();
         if let Ok(parsed) = timeout.parse::<u64>() {
@@ -802,6 +864,24 @@ fn memory_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
     cx.notify();
 }
 
+/// Turn governed knowledge capture on or off.
+///
+/// Capture commits through the memory store, so with Memory off there is
+/// nowhere for a record to land. The switch is dimmed then, and the press
+/// answers with the reason instead of storing a preference that cannot take
+/// effect - a stored flag with no effect is exactly the lying control the
+/// pane refuses to draw.
+fn memory_capture_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
+    if !shell.state.draft().workspace.agent.memory_enabled {
+        let notice = tr(shell.state.lang, "settings.memoryCaptureNeedsMemory").to_string();
+        shell.state.notice(notice);
+        cx.notify();
+        return;
+    }
+    shell.state.draft_mut().workspace.agent.memory_capture = on;
+    cx.notify();
+}
+
 /// How much of a tool call the transcript shows.
 ///
 /// The reference's own modes, measured from its `TranscriptViewPolicy`
@@ -874,6 +954,13 @@ pub(crate) fn reveal_config_shared(shell: &mut Shell, cx: &mut Context<Shell>) {
 /// The editable fields whose shipped default the dialog can restore.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
+    /// The LLM request timeout, which bounds one model call at the engine and
+    /// on the wire.
+    LlmTimeout,
+    /// The sampling temperature for every request.
+    Temperature,
+    /// The retry budget for a transient provider failure.
+    Retries,
     /// The shell command timeout.
     ShellTimeout,
     /// The per-stream output cap.
@@ -893,6 +980,14 @@ impl Field {
     fn default_text(self) -> String {
         let default = Settings::default();
         match self {
+            Field::LlmTimeout => default.workspace.agent.llm_timeout_secs.to_string(),
+            Field::Temperature => default
+                .workspace
+                .agent
+                .temperature
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            Field::Retries => default.workspace.agent.llm_max_retries.to_string(),
             Field::ShellTimeout => default.workspace.agent.shell_timeout_secs.to_string(),
             Field::OutputCap => default.workspace.agent.tool_output_cap.to_string(),
             Field::Budget => default.workspace.agent.context_budget.to_string(),
@@ -1612,30 +1707,6 @@ impl Shell {
                                         })
                                         .child(icon(IconName::Info, 12.0, theme::faint())),
                                 )
-                            })
-                            // The Market tab's filter sits in the row the pane
-                            // leaves empty beside its subtitle: the hint names the
-                            // Git provider, and the field narrows the entries that
-                            // provider lists, so it costs no extra row above the
-                            // install controls. It takes the row's leftover width
-                            // (the reference's `flex: 1; min-width: 120px`) and
-                            // carries a clear control while it holds text, the
-                            // counterpart of the reference input's type="search".
-                            //
-                            // The clear control is bsh's own rather than the
-                            // kit's `cleanable` one: measured in the harness, a
-                            // click inside the field never reached the kit's
-                            // suffix button - every offset targeted the input
-                            // itself - so drawing it would be a control that only
-                            // looks wired.
-                            .when(section == 17 && self.extensions_tab == 4, |row| {
-                                row.child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(140.0))
-                                        .debug_selector(|| "extension-market-search".to_string())
-                                        .child(self.extension_market_search_field(cx)),
-                                )
                             }),
                     )
                     .children(hero)
@@ -1777,8 +1848,12 @@ impl Shell {
         .into_any_element()
     }
 
-    /// The persona row every agent-behaviour pane shares: one always-visible
-    /// switch whose help line states what "complete" does to the prompt.
+    /// The persona row the Agent loop pane owns: one always-visible switch
+    /// whose help line states what "complete" does to the prompt.
+    ///
+    /// It is drawn in ONE pane. The row used to be repeated in General, which
+    /// gave one flag two controls and two places to look; a behaviour of the
+    /// turn belongs where the rest of that behaviour is configured.
     fn persona_help_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let effective = self.state.effective();
         let on = effective.persona_complete;
@@ -1976,15 +2051,21 @@ impl Shell {
         .into_any_element()
     }
 
-    /// An editable text field.
+    /// An editable text field, with an optional hint line under its label.
+    ///
+    /// The hint is the reference field row's own `12px label-tertiary` line:
+    /// a number whose meaning is not obvious (a blank temperature, a retry
+    /// budget) explains itself where it is edited, not in a section note far
+    /// above it.
     fn input_row(
         &self,
         label: &'static str,
+        hint: Option<&'static str>,
         input: &Entity<InputState>,
         field: Field,
         cx: &mut Context<Shell>,
     ) -> AnyElement {
-        self.field_row(label, input, false, field, cx)
+        self.field_row(label, hint, input, false, field, cx)
     }
 
     /// The shared shape of the two: a label over a bordered, borderless-inner
@@ -1992,6 +2073,7 @@ impl Shell {
     fn field_row(
         &self,
         label: &'static str,
+        hint: Option<&'static str>,
         input: &Entity<InputState>,
         secret: bool,
         field: Field,
@@ -2059,6 +2141,7 @@ impl Shell {
                 .gap(px(6.0))
                 .border_color(rgb(theme::border_soft()))
                 .child(header)
+                .children(hint.map(|key| txt(tr(self.state.lang, key), 12.0, theme::faint())))
                 .child(hairline_all(
                     div()
                         .debug_selector(move || format!("field-{label}"))
@@ -3164,11 +3247,6 @@ impl Shell {
             self.current_version_row(),
             self.federation_row(),
         ];
-        // The persona rule, near the top of the rail's General pane: a reader
-        // who never opens the nested agent-loop pane still learns that the
-        // workspace prompt is a slot and that a legacy complete flag is
-        // ignored (with the control that clears it).
-        rows.splice(1..1, self.persona_help_rows(cx));
         if let Some(peers) = self.federation_peers_block() {
             rows.push(peers);
         }
@@ -7587,6 +7665,7 @@ impl Shell {
         // default they reset to.
         rows.push(self.input_row(
             "settings.webSearchBaseUrl",
+            None,
             &self.settings_inputs.web_search_base,
             Field::WebSearchBase,
             cx,
@@ -7609,6 +7688,7 @@ impl Shell {
         ));
         rows.push(self.input_row(
             "settings.webSearchResults",
+            None,
             &self.settings_inputs.web_search_results,
             Field::WebSearchResults,
             cx,
@@ -7734,6 +7814,29 @@ impl Shell {
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let mut rows = vec![
+            // The wait one model request gets is the loop's own bound: the
+            // engine's ceiling and the vendor's wire guard are this number.
+            self.input_row(
+                "settings.llmTimeout",
+                Some("settings.llmTimeoutHint"),
+                &self.settings_inputs.llm_timeout,
+                Field::LlmTimeout,
+                cx,
+            ),
+            self.input_row(
+                "settings.temperatureTitle",
+                Some("settings.temperatureHint"),
+                &self.settings_inputs.temperature,
+                Field::Temperature,
+                cx,
+            ),
+            self.input_row(
+                "settings.retriesTitle",
+                Some("settings.retriesHint"),
+                &self.settings_inputs.retries,
+                Field::Retries,
+                cx,
+            ),
             {
                 let on = self.state.draft().workspace.agent.memory_enabled;
                 // The reference's General pane has no memory row, so this one
@@ -7746,44 +7849,42 @@ impl Shell {
                 )
             },
             {
+                // Capture is the write half of memory: it commits at the
+                // completed-turn boundary, so it needs the store to exist.
+                let memory_on = self.state.draft().workspace.agent.memory_enabled;
+                let on = self.state.draft().workspace.agent.memory_capture;
+                self.preference_row(
+                    "settings.memoryCaptureTitle",
+                    Some("settings.memoryCaptureHelp"),
+                    self.switch(
+                        "settings-memory-capture",
+                        on,
+                        memory_on,
+                        memory_capture_action,
+                        cx,
+                    ),
+                )
+            },
+            {
                 let on = self.state.draft().workspace.agent.parallel_tool_calls;
-                div()
-                    .debug_selector(|| "parallel-tool-calls".to_string())
-                    .id(SharedString::from("parallel-tool-calls"))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.0))
-                            .border_1()
-                            .border_color(rgb(theme::border()))
-                            .bg(rgb(theme::page()))
-                            .when(on, |element| {
-                                element
-                                    .bg(rgb(theme::accent()))
-                                    .border_color(rgb(theme::accent()))
-                                    .child(txt("✓", 12.0, theme::page()))
-                            })
-                            .into_any_element(),
-                    )
-                    .child(txt(
-                        tr(self.state.lang, "settings.parallelToolCalls"),
-                        13.0,
-                        theme::text(),
-                    ))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.set_parallel_tool_calls(!on);
-                        cx.notify();
-                    }))
-                    .into_any_element()
+                // The row's own long-standing hint describes the switch in
+                // BSH's words. The reference's sentence is an upper BOUND on
+                // a number; this control is a switch, so quoting it would
+                // describe a different setting.
+                self.preference_row(
+                    "settings.parallelToolCalls",
+                    Some("settings.parallelToolCallsHint"),
+                    self.switch(
+                        "parallel-tool-calls",
+                        on,
+                        true,
+                        |shell, next, cx| {
+                            shell.state.set_parallel_tool_calls(next);
+                            cx.notify();
+                        },
+                        cx,
+                    ),
+                )
             },
         ];
         // The persona contract lives beside the agent-behaviour switches.
@@ -7800,12 +7901,14 @@ impl Shell {
         let rows = vec![
             self.input_row(
                 "settings.shellTimeout",
+                None,
                 &inputs.shell_timeout,
                 Field::ShellTimeout,
                 cx,
             ),
             self.input_row(
                 "settings.outputCap",
+                None,
                 &inputs.output_cap,
                 Field::OutputCap,
                 cx,
@@ -8203,6 +8306,7 @@ impl Shell {
         rows.push(
             div()
                 .mb(px(12.0))
+                .debug_selector(|| "extension-market-url".to_string())
                 .flex()
                 .flex_row()
                 .items_center()
@@ -8240,6 +8344,18 @@ impl Shell {
                     .into_any_element(),
             );
         }
+        // The Market tab's filter is a row of its own, directly above the list
+        // it narrows. In the pane header's subtitle row it read as page chrome
+        // and squeezed the subtitle, while the entries it filters sat a hero and
+        // a provider row away; a filter belongs with the list. The clear control
+        // rides in the field (see `extension_market_search_field`).
+        rows.push(
+            div()
+                .mb(px(8.0))
+                .debug_selector(|| "extension-market-search".to_string())
+                .child(self.extension_market_search_field(cx))
+                .into_any_element(),
+        );
         // The field narrows the provider's own list by the three facts a row
         // shows - id, name and description - and an empty query keeps every
         // entry.
@@ -13660,12 +13776,14 @@ impl Shell {
         let rows = vec![
             self.input_row(
                 "settings.budget",
+                None,
                 &self.settings_inputs.budget,
                 Field::Budget,
                 cx,
             ),
             self.input_row(
                 "settings.maxOutputTokens",
+                None,
                 &self.settings_inputs.max_tokens,
                 Field::MaxTokens,
                 cx,

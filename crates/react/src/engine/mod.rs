@@ -300,6 +300,11 @@ pub struct ReActEngine<A: ReActApp> {
     parallel_tool_calls: bool,
     telemetry: Telemetry,
     llm_timeout_secs: u64,
+    /// Retries after the first attempt when a provider failure is transient.
+    ///
+    /// A configured resilience layer's own budget takes precedence; this is
+    /// the budget a host gets when it set none.
+    max_retries: u32,
     model: String,
     token_counter: TokenCounter,
     react_app: A,
@@ -327,6 +332,7 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     telemetry: Telemetry,
     resilience: Option<ReActResilience>,
     llm_timeout_secs: u64,
+    max_retries: u32,
     model: String,
     token_counter: TokenCounter,
     schema_budget: SchemaBudget,

@@ -81,7 +81,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-android-arm64')
         const bindingPackageVersion = require('@open1s/jsbos-android-arm64/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -97,7 +97,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-android-arm-eabi')
         const bindingPackageVersion = require('@open1s/jsbos-android-arm-eabi/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -118,7 +118,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-win32-x64-gnu')
         const bindingPackageVersion = require('@open1s/jsbos-win32-x64-gnu/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -134,7 +134,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-win32-x64-msvc')
         const bindingPackageVersion = require('@open1s/jsbos-win32-x64-msvc/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -151,7 +151,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-win32-ia32-msvc')
         const bindingPackageVersion = require('@open1s/jsbos-win32-ia32-msvc/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -167,7 +167,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-win32-arm64-msvc')
         const bindingPackageVersion = require('@open1s/jsbos-win32-arm64-msvc/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -186,7 +186,7 @@ function requireNative() {
     try {
       const binding = require('@open1s/jsbos-darwin-universal')
       const bindingPackageVersion = require('@open1s/jsbos-darwin-universal/package.json').version
-      if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+      if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
         throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
       }
       return binding
@@ -202,7 +202,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-darwin-x64')
         const bindingPackageVersion = require('@open1s/jsbos-darwin-x64/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -218,7 +218,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-darwin-arm64')
         const bindingPackageVersion = require('@open1s/jsbos-darwin-arm64/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -238,7 +238,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-freebsd-x64')
         const bindingPackageVersion = require('@open1s/jsbos-freebsd-x64/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -254,7 +254,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-freebsd-arm64')
         const bindingPackageVersion = require('@open1s/jsbos-freebsd-arm64/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -275,7 +275,7 @@ function requireNative() {
         try {
           const binding = require('@open1s/jsbos-linux-x64-musl')
           const bindingPackageVersion = require('@open1s/jsbos-linux-x64-musl/package.json').version
-          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
@@ -291,7 +291,7 @@ function requireNative() {
         try {
           const binding = require('@open1s/jsbos-linux-x64-gnu')
           const bindingPackageVersion = require('@open1s/jsbos-linux-x64-gnu/package.json').version
-          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
@@ -309,7 +309,7 @@ function requireNative() {
         try {
           const binding = require('@open1s/jsbos-linux-arm64-musl')
           const bindingPackageVersion = require('@open1s/jsbos-linux-arm64-musl/package.json').version
-          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
@@ -325,7 +325,7 @@ function requireNative() {
         try {
           const binding = require('@open1s/jsbos-linux-arm64-gnu')
           const bindingPackageVersion = require('@open1s/jsbos-linux-arm64-gnu/package.json').version
-          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
@@ -343,7 +343,7 @@ function requireNative() {
         try {
           const binding = require('@open1s/jsbos-linux-arm-musleabihf')
           const bindingPackageVersion = require('@open1s/jsbos-linux-arm-musleabihf/package.json').version
-          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
@@ -359,7 +359,7 @@ function requireNative() {
         try {
           const binding = require('@open1s/jsbos-linux-arm-gnueabihf')
           const bindingPackageVersion = require('@open1s/jsbos-linux-arm-gnueabihf/package.json').version
-          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
@@ -377,7 +377,7 @@ function requireNative() {
         try {
           const binding = require('@open1s/jsbos-linux-loong64-musl')
           const bindingPackageVersion = require('@open1s/jsbos-linux-loong64-musl/package.json').version
-          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
@@ -393,7 +393,7 @@ function requireNative() {
         try {
           const binding = require('@open1s/jsbos-linux-loong64-gnu')
           const bindingPackageVersion = require('@open1s/jsbos-linux-loong64-gnu/package.json').version
-          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
@@ -411,7 +411,7 @@ function requireNative() {
         try {
           const binding = require('@open1s/jsbos-linux-riscv64-musl')
           const bindingPackageVersion = require('@open1s/jsbos-linux-riscv64-musl/package.json').version
-          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
@@ -427,7 +427,7 @@ function requireNative() {
         try {
           const binding = require('@open1s/jsbos-linux-riscv64-gnu')
           const bindingPackageVersion = require('@open1s/jsbos-linux-riscv64-gnu/package.json').version
-          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+          if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
@@ -444,7 +444,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-linux-ppc64-gnu')
         const bindingPackageVersion = require('@open1s/jsbos-linux-ppc64-gnu/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -460,7 +460,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-linux-s390x-gnu')
         const bindingPackageVersion = require('@open1s/jsbos-linux-s390x-gnu/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -480,7 +480,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-openharmony-arm64')
         const bindingPackageVersion = require('@open1s/jsbos-openharmony-arm64/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -496,7 +496,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-openharmony-x64')
         const bindingPackageVersion = require('@open1s/jsbos-openharmony-x64/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
@@ -512,7 +512,7 @@ function requireNative() {
       try {
         const binding = require('@open1s/jsbos-openharmony-arm')
         const bindingPackageVersion = require('@open1s/jsbos-openharmony-arm/package.json').version
-        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '4.1.10') {
+        if (bindingPackageVersion !== '4.1.10' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 4.1.10 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding

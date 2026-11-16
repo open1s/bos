@@ -137,6 +137,18 @@ pub(crate) struct AgentSection {
     /// enforced would be a lying control.
     #[serde(default, skip_serializing)]
     pub(crate) max_steps: usize,
+    /// Seconds one LLM request may wait before the loop gives up on it.
+    ///
+    /// One number bounds both layers a reader can see: the engine's per-call
+    /// ceiling and the vendor's idle-socket read guard. A reasoning model or a
+    /// gateway that buffers is WORKING, not failing, so the shipped value is
+    /// generous; the reader's Stop is what ends a slow turn, in seconds.
+    pub(crate) llm_timeout_secs: u64,
+    /// Retries after the first attempt when a provider failure is transient.
+    ///
+    /// Zero turns a rate limit or a dropped connection into a failed turn; 3
+    /// keeps the engine's shipped budget.
+    pub(crate) llm_max_retries: u32,
     /// Seconds one shell command may run before it is killed.
     pub(crate) shell_timeout_secs: u64,
     /// Bytes of one tool result kept before the rest is truncated.
@@ -178,6 +190,12 @@ impl Default for AgentSection {
             // ceiling has to pay for the reply it reserves.
             context_budget: 65536,
             max_steps: 0,
+            // An hour, not the framework's 60s: a slow provider must be
+            // waited out, and Stop is the reader's own cutoff.
+            llm_timeout_secs: 3600,
+            // The engine's shipped retry budget: three retries after the
+            // first attempt, so a transient 429 does not fail a turn.
+            llm_max_retries: 3,
             shell_timeout_secs: 300,
             tool_output_cap: 16384,
             skills_dir: None,
@@ -298,6 +316,35 @@ extensions = ["plan"]
             "the ceiling ({} tokens) must be more than twice the reply reserve ({} tokens)",
             agent.context_budget,
             reserve
+        );
+    }
+
+    /// The shipped LLM wait is generous, and a file that never named one
+    /// inherits it.
+    ///
+    /// The framework's 60s default was a dead-model guard that a slow reasoning
+    /// model or a buffering gateway exceeds while it is working, and the cut
+    /// surfaced as `LLM error: Request timed out`. The wait is a workspace
+    /// fact now, so an older file has to get the generous one rather than zero.
+    #[test]
+    fn the_shipped_llm_wait_is_generous_and_inherited() {
+        let shipped = AgentSection::default();
+        assert_eq!(
+            shipped.llm_timeout_secs, 3600,
+            "a slow provider is waited out, not cut off"
+        );
+        assert_eq!(
+            shipped.llm_max_retries, 3,
+            "a transient failure is retried, not fatal"
+        );
+        let older = WorkspaceSettings::from_toml(WORKED).expect("an older file parses");
+        assert_eq!(
+            older.agent.llm_timeout_secs, shipped.llm_timeout_secs,
+            "a file that never named the wait inherits the shipped one"
+        );
+        assert_eq!(
+            older.agent.llm_max_retries, shipped.llm_max_retries,
+            "and so does the retry budget"
         );
     }
 

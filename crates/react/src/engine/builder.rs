@@ -16,6 +16,9 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             telemetry: Telemetry::new(),
             resilience: None,
             llm_timeout_secs: 120,
+            // The shipped retry budget: three retries after the first
+            // attempt, the same number the engine used before it was a knob.
+            max_retries: 3,
             model: String::new(),
             token_counter: TokenCounter::with_default(),
             schema_budget: SchemaBudget::default(),
@@ -51,6 +54,16 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
     /// never cut off. A caller that needs a ceiling asks for one here.
     pub fn max_steps(mut self, steps: usize) -> Self {
         self.max_steps = (steps > 0).then_some(steps);
+        self
+    }
+
+    /// Set the retry budget for a transient provider failure.
+    ///
+    /// Counts retries AFTER the first attempt, so `3` allows at most four
+    /// calls. A configured resilience layer's own `max_retries` keeps
+    /// precedence; this is the budget a host that set none gets.
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.max_retries = retries;
         self
     }
 
@@ -187,6 +200,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             parallel_tool_calls: self.parallel_tool_calls,
             telemetry: self.telemetry,
             llm_timeout_secs: self.llm_timeout_secs,
+            max_retries: self.max_retries,
             model: self.model,
             token_counter: self.token_counter,
             react_app: self.react_app.unwrap_or_default(),

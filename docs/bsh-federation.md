@@ -367,6 +367,13 @@ document is validated, a listener that cannot read its material is an error, and
 the failure is logged like any other startup failure. It never falls back to an
 unencrypted session.
 
+A node that accepts remote work applies three caps to it:
+`max_task_steps = 20`, `max_task_tokens = 200000` and
+`max_task_deadline_ms = 600000` as shipped. A peer task that asks for more is
+REFUSED, not clamped - the numbers are an admission policy, read when the shell
+claims the next due task. The Federation pane's Work tab edits the same three
+fields and saves them together, so the file and the pane cannot disagree.
+
 ### Production profile
 
 Set `security = "production"` to make transport security a startup

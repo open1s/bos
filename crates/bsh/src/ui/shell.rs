@@ -355,6 +355,12 @@ pub(crate) struct Shell {
     pub(crate) federation_knowledge: Entity<InputState>,
     /// The federation pane's knowledge publication payload.
     pub(crate) federation_knowledge_payload: Entity<InputState>,
+    /// The federation pane's remote-task step cap.
+    pub(crate) federation_task_steps: Entity<InputState>,
+    /// The federation pane's remote-task token cap.
+    pub(crate) federation_task_tokens: Entity<InputState>,
+    /// The federation pane's remote-task deadline cap, in milliseconds.
+    pub(crate) federation_task_deadline: Entity<InputState>,
     /// The memory pane's search field.
     pub(crate) memory_query: Entity<InputState>,
     /// The memory pane's add-record field.
@@ -1510,6 +1516,41 @@ impl Shell {
                 "right.federation.knowledgePayloadPlaceholder",
             ))
         });
+        // The three caps the node applies to the remote work it accepts. They
+        // are loaded, not placeheld: a value the reader cannot see would make
+        // the field look empty while a task was refused by it.
+        let federation_task_steps = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(
+                state.settings.global.federation.max_task_steps.to_string(),
+                window,
+                cx,
+            );
+            input
+        });
+        let federation_task_tokens = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(
+                state.settings.global.federation.max_task_tokens.to_string(),
+                window,
+                cx,
+            );
+            input
+        });
+        let federation_task_deadline = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(
+                state
+                    .settings
+                    .global
+                    .federation
+                    .max_task_deadline_ms
+                    .to_string(),
+                window,
+                cx,
+            );
+            input
+        });
         let memory_query = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(crate::i18n::tr(lang, "memory.searchPlaceholder"))
@@ -2125,6 +2166,9 @@ impl Shell {
             federation_capability_search,
             federation_knowledge,
             federation_knowledge_payload,
+            federation_task_steps,
+            federation_task_tokens,
+            federation_task_deadline,
             memory_query,
             memory_add_input,
             memory_edit_input,

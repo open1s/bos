@@ -43,6 +43,11 @@ pub struct TomlAgentConfig {
     /// Per-request timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Optional retry budget for a transient provider failure.
+    ///
+    /// Counts retries after the first attempt; absent keeps the engine's 3.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
     /// Optional ReAct step cap.
     pub max_steps: Option<usize>,
     /// Optional API mode, `chat` or `responses`.
@@ -82,6 +87,7 @@ impl From<TomlAgentConfig> for AgentConfig {
             temperature: t.temperature,
             max_tokens: t.max_tokens,
             timeout_secs: t.timeout_secs,
+            max_retries: t.max_retries.unwrap_or(3),
             max_steps: t.max_steps.unwrap_or(10),
             // The TOML surface has no compaction budget yet; the direct builder
             // (`AgentConfig::compaction_input_tokens`) is how a host sets it.

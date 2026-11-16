@@ -37,20 +37,46 @@ use std::time::Duration;
 /// a STREAMED completion: a reasoning model can think for minutes and a
 /// gateway can buffer until the answer is ready, and a 120s window cut both
 /// short while reporting the cut as "error decoding response body". A
-/// whole-response call is still bounded at 120s by the engine's own
-/// `llm_timeout`; a stream is bounded by its Stop control.
-pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(600);
+/// whole-response call is still bounded by the engine's own `llm_timeout`; a
+/// stream is bounded by its Stop control.
+///
+/// The guard is therefore only for a WEDGED socket, and any value short enough
+/// to fire on a merely slow provider ends work that was still running with
+/// `LLM error: Request timed out`. That sentence names a failure the provider
+/// never had, and it kills a turn the reader was happy to wait for. An hour is
+/// the bound; the reader's Stop is what ends a slow turn, in seconds.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// How long a built-in vendor waits for the TCP/TLS connection to open.
-pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Ten seconds is a healthy LAN and a cruel bound for a congested uplink or a
+/// cold TLS handshake through a gateway, which fails with the same spurious
+/// "Request timed out" as the read guard above. A minute is still short enough
+/// that a dead host is reported promptly.
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Build the timeout-bounded HTTP client shared by the built-in vendors.
-pub(crate) fn build_http_client() -> reqwest::Client {
+/// Build the LLM HTTP client with `read_timeout` as the idle-socket guard.
+///
+/// A host that lets its reader say how long one LLM request may wait builds
+/// its vendors with this guard (see `OpenAiVendor::with_read_timeout`), so the
+/// number the reader chose is the number the wire obeys. The connect guard is
+/// the shared one in every case: it catches an unreachable host, not a slow
+/// model.
+#[must_use]
+pub fn http_client(read_timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-        .read_timeout(DEFAULT_READ_TIMEOUT)
+        .read_timeout(read_timeout)
         .build()
         .expect("failed to build the shared HTTP client")
+}
+
+/// Build the timeout-bounded HTTP client shared by the built-in vendors.
+///
+/// This is [`http_client`] at [`DEFAULT_READ_TIMEOUT`]: the guard a vendor
+/// uses when the host names no wait of its own.
+pub(crate) fn build_http_client() -> reqwest::Client {
+    http_client(DEFAULT_READ_TIMEOUT)
 }
 
 /// The error a stream that stopped mid-body reports, with its cause.
@@ -324,6 +350,25 @@ mod tests {
         assert!(
             matches!(stream_error(error), LlmError::Timeout),
             "and the vendor reports the stall it actually was"
+        );
+    }
+
+    /// A slow provider must not be reported as a failure.
+    ///
+    /// The read guard exists for a wedged socket, not as a turn budget: a
+    /// reasoning model or a gateway that buffers until the answer is ready can
+    /// be silent for minutes, and a window short enough to fire then ends a
+    /// healthy turn with "LLM error: Request timed out". The floor is pinned so
+    /// a later round cannot quietly shrink it back into a timeline.
+    #[test]
+    fn the_wait_guards_are_large_enough_for_a_slow_provider() {
+        assert!(
+            super::DEFAULT_READ_TIMEOUT >= std::time::Duration::from_secs(1800),
+            "a stream may be silent for minutes; the guard is for a wedged socket"
+        );
+        assert!(
+            super::DEFAULT_CONNECT_TIMEOUT >= std::time::Duration::from_secs(30),
+            "a congested uplink must not read as a dead provider"
         );
     }
 

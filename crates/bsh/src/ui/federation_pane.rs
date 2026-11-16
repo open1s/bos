@@ -3152,6 +3152,123 @@ fn work_tab(
         }
         card = card.child(row);
     }
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(CARD_GAP))
+        .child(remote_task_limits_card(shell, cx))
+        .child(card.into_any_element())
+        .into_any_element()
+}
+
+/// The caps this node applies to the remote work it accepts.
+///
+/// A peer task that asks for more steps, tokens or wall clock than the cap is
+/// REFUSED, not clamped, so the three numbers are an admission policy. They sit
+/// on the Work tab beside the delegations they govern, and they save together:
+/// a half-written budget must not become the policy. The shell reads them when
+/// it claims the next due task, so a saved change needs no restart.
+fn remote_task_limits_card(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
+    let lang = shell.state.lang;
+    let mut card = card();
+    card = card.child(card_header(
+        IconName::CircleGauge,
+        theme::warn(),
+        lang.tr("right.federation.taskLimits"),
+        lang.tr("right.federation.taskLimitsSubtitle"),
+        None,
+    ));
+    let label = |key: &'static str| txt(lang.tr(key), 11.0, theme::faint());
+    card = card.child(
+        div()
+            .flex()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .flex_1()
+                    .min_w_0()
+                    .child(label("right.federation.taskLimitsSteps"))
+                    .child(field(&shell.federation_task_steps, "federation-task-steps")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .flex_1()
+                    .min_w_0()
+                    .child(label("right.federation.taskLimitsTokens"))
+                    .child(field(
+                        &shell.federation_task_tokens,
+                        "federation-task-tokens",
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .flex_1()
+                    .min_w_0()
+                    .child(label("right.federation.taskLimitsDeadline"))
+                    .child(field(
+                        &shell.federation_task_deadline,
+                        "federation-task-deadline",
+                    )),
+            ),
+    );
+    card = card.child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                txt(
+                    lang.tr("right.federation.taskLimitsHint"),
+                    10.0,
+                    theme::faint(),
+                )
+                .flex_1()
+                .min_w_0(),
+            )
+            .child(solid_button(
+                "federation-task-limits-save",
+                lang.tr("right.federation.save"),
+                true,
+                true,
+                cx,
+                |this, cx| {
+                    let read = |input: &Entity<InputState>| -> Option<u64> {
+                        let raw = input.read(cx).value().trim().to_string();
+                        raw.parse::<u64>().ok().filter(|value| *value > 0)
+                    };
+                    let steps = read(&this.federation_task_steps);
+                    let tokens = read(&this.federation_task_tokens);
+                    let deadline = read(&this.federation_task_deadline);
+                    let (Some(steps), Some(tokens), Some(deadline)) = (steps, tokens, deadline)
+                    else {
+                        this.right.federation.error =
+                            Some(this.state.lang.tr("right.federation.taskLimitsInvalid"));
+                        cx.notify();
+                        return;
+                    };
+                    {
+                        let federation = &mut this.state.settings.global.federation;
+                        federation.max_task_steps = steps.min(u64::from(u32::MAX)) as u32;
+                        federation.max_task_tokens = tokens;
+                        federation.max_task_deadline_ms = deadline;
+                    }
+                    this.save_settings(cx);
+                    this.right.federation.error = None;
+                    this.right.federation.notice =
+                        Some(this.state.lang.tr("right.federation.taskLimitsSaved"));
+                    cx.notify();
+                },
+            )),
+    );
     card.into_any_element()
 }
 

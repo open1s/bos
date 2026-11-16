@@ -588,6 +588,9 @@ pub struct PyAgentConfig {
     /// Per-request timeout in seconds.
     #[pyo3(get, set)]
     pub timeout_secs: u64,
+    /// Retries after the first attempt on a transient provider failure.
+    #[pyo3(get, set)]
+    pub max_retries: u32,
     /// Maximum ReAct steps.
     #[pyo3(get, set)]
     pub max_steps: usize,
@@ -655,6 +658,7 @@ impl Default for PyAgentConfig {
             temperature: c.temperature,
             max_tokens: c.max_tokens,
             timeout_secs: c.timeout_secs,
+            max_retries: c.max_retries,
             max_steps: 10,
             api_mode: "chat".to_string(),
             reasoning_effort: None,
@@ -719,6 +723,7 @@ impl From<PyAgentConfig> for AgentConfig {
             temperature: value.temperature,
             max_tokens: value.max_tokens,
             timeout_secs: value.timeout_secs,
+            max_retries: value.max_retries,
             max_steps: value.max_steps,
             compaction_input_tokens: value.compaction_input_tokens,
             tool_output_cap: value.tool_output_cap,
@@ -1425,6 +1430,10 @@ impl PyAgent {
         map.insert(
             "timeout_secs".to_string(),
             serde_json::Value::Number(cfg.timeout_secs.into()),
+        );
+        map.insert(
+            "max_retries".to_string(),
+            serde_json::Value::Number(cfg.max_retries.into()),
         );
         map.insert(
             "api_mode".to_string(),

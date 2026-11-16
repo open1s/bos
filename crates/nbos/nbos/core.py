@@ -206,6 +206,7 @@ class AgentBuilder:
         self._config.system_prompt = opts.get("system_prompt", "You are a helpful assistant.")
         self._config.temperature = opts.get("temperature", 0.7)
         self._config.timeout_secs = opts.get("timeout_secs", 120)
+        self._config.max_retries = opts.get("max_retries", 3)
         if "max_tokens" in opts and opts["max_tokens"] is not None:
             self._config.max_tokens = opts["max_tokens"]
         if "api_mode" in opts and opts["api_mode"] is not None:
@@ -280,6 +281,11 @@ class AgentBuilder:
 
     def with_timeout(self, secs: int) -> "AgentBuilder":
         self._config.timeout_secs = secs
+        return self
+
+    def with_max_retries(self, retries: int) -> "AgentBuilder":
+        """Retries after the first attempt on a transient provider failure."""
+        self._config.max_retries = retries
         return self
 
     def with_api_mode(self, mode: str) -> "AgentBuilder":
@@ -425,6 +431,8 @@ class AgentBuilder:
             self._config.temperature = config["temperature"]
         if config.get("timeout_secs"):
             self._config.timeout_secs = config["timeout_secs"]
+        if config.get("max_retries") is not None:
+            self._config.max_retries = config["max_retries"]
         if config.get("max_tokens"):
             self._config.max_tokens = config["max_tokens"]
         if config.get("api_mode"):

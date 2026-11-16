@@ -632,6 +632,8 @@ class AgentBuilder {
       systemPrompt: options.systemPrompt || 'You are a helpful assistant.',
       temperature: options.temperature ?? 0.7,
       timeoutSecs: options.timeoutSecs || 120,
+      // 0 is a real budget (no retries), so this must not use `||`.
+      maxRetries: options.maxRetries ?? 3,
       maxTokens: options.maxTokens,
       maxSteps: options.maxSteps,
       apiMode: options.apiMode || 'chat',
@@ -660,6 +662,7 @@ class AgentBuilder {
     if (config.systemPrompt) this._config.systemPrompt = config.systemPrompt;
     if (config.temperature !== undefined) this._config.temperature = config.temperature;
     if (config.timeoutSecs) this._config.timeoutSecs = config.timeoutSecs;
+    if (config.maxRetries !== undefined) this._config.maxRetries = config.maxRetries;
     if (config.maxTokens) this._config.maxTokens = config.maxTokens;
     if (config.apiMode) this._config.apiMode = config.apiMode;
     if (config.reasoningEffort) this._config.reasoningEffort = config.reasoningEffort;
@@ -719,6 +722,11 @@ class AgentBuilder {
 
   timeout(secs) {
     this._config.timeoutSecs = secs;
+    return this;
+  }
+
+  maxRetries(retries) {
+    this._config.maxRetries = retries;
     return this;
   }
 
@@ -2066,6 +2074,7 @@ class BrainOS {
       systemPrompt: options.systemPrompt || 'You are a helpful assistant.',
       temperature: options.temperature ?? 0.7,
       timeoutSecs: options.timeoutSecs || 120,
+      maxRetries: options.maxRetries ?? 3,
       apiMode: options.apiMode || 'chat',
       reasoningEffort: options.reasoningEffort,
     }).tools(this._registry);

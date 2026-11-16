@@ -684,6 +684,8 @@ export interface AgentConfig {
   maxTokens?: number
   /** Per-request timeout in seconds. */
   timeoutSecs: number
+  /** Retries after the first attempt on a transient provider failure. */
+  maxRetries?: number
   /** Maximum ReAct steps. */
   maxSteps?: number
   /** API protocol. */

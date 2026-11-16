@@ -3941,24 +3941,94 @@ fn plugin_switch_writes_the_disabled_plugin(cx: &mut TestAppContext) {
     );
 }
 
-/// The agent loop pane keeps the switches that do something. The step ceiling
-/// is gone from the model, the resolution and the pane: a control for a limit
-/// that is not enforced would be a lying control, and the absence of the field
-/// is what the compiler holds.
+/// The agent loop pane keeps the switches that do something, and the one wait
+/// a turn is bounded by.
+///
+/// The step ceiling is gone from the model, the resolution and the pane: a
+/// control for a limit that is not enforced would be a lying control, and the
+/// absence of the field is what the compiler holds. The wait that IS enforced
+/// is drawn, loads the number the build would use, and writes it back.
 #[gpui::test]
 fn the_agent_loop_pane_draws_its_switches(cx: &mut TestAppContext) {
     init_test_app(cx);
-    let (_harness, cx) = cx.add_window_view(move |window, cx| {
-        let state = state_with_turns("agent-loop", 2);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("agent-loop", 2);
+        state.settings.workspace.agent.llm_timeout_secs = 900;
+        state.settings.workspace.agent.temperature = Some(0.3);
+        state.settings.workspace.agent.llm_max_retries = 5;
         let shell =
             cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
         Harness { shell }
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(
-        cx.debug_bounds("parallel-tool-calls").is_some(),
-        "parallel tool calls is still a real switch in the pane"
+    // Dispatch wears the pane's one row anatomy now: the shared 36x20 switch
+    // on the shared preference row, not a hand-built checkbox beside a label.
+    let dispatch = cx
+        .debug_bounds("parallel-tool-calls")
+        .expect("parallel tool calls is still a real switch in the pane");
+    assert_eq!(
+        (dispatch.size.width, dispatch.size.height),
+        (px(36.0), px(20.0)),
+        "the shared switch, not a bespoke checkbox"
     );
+    assert!(
+        cx.debug_bounds("field-settings.llmTimeout").is_some(),
+        "the wait one request gets is a field in this pane"
+    );
+    for field in [
+        "field-settings.temperatureTitle",
+        "field-settings.retriesTitle",
+    ] {
+        assert!(cx.debug_bounds(field).is_some(), "{field} draws");
+    }
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let inputs = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.settings_inputs.llm_timeout.clone(),
+            shell.settings_inputs.temperature.clone(),
+            shell.settings_inputs.retries.clone(),
+        )
+    });
+    assert_eq!(
+        cx.update(|_, cx| inputs.0.read(cx).value().to_string()),
+        "900",
+        "the field loads the wait the build would use"
+    );
+    assert_eq!(
+        cx.update(|_, cx| inputs.1.read(cx).value().to_string()),
+        "0.3",
+        "the temperature field loads the STORED value"
+    );
+    assert_eq!(
+        cx.update(|_, cx| inputs.2.read(cx).value().to_string()),
+        "5",
+        "the retry field loads the budget"
+    );
+    // Writing the fields back lands on the workspace draft the build reads.
+    let (wait, temperature, retries) = cx.update(|window, cx| {
+        inputs
+            .0
+            .update(cx, |state, cx| state.set_value("1800", window, cx));
+        // Cleared means "the engine's default", not a copied-in 0.7.
+        inputs
+            .1
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        inputs
+            .2
+            .update(cx, |state, cx| state.set_value("2", window, cx));
+        let shell = shell.read(cx);
+        let mut draft = shell.state.draft().clone();
+        shell.settings_inputs.read(&mut draft, cx);
+        (
+            draft.workspace.agent.llm_timeout_secs,
+            draft.workspace.agent.temperature,
+            draft.workspace.agent.llm_max_retries,
+        )
+    });
+    assert_eq!(wait, 1800, "the field writes the workspace's wait");
+    assert_eq!(temperature, None, "a cleared temperature inherits again");
+    assert_eq!(retries, 2, "and the retry budget is written");
 }
 
 /// The Web search pane draws the controls the local tool reads, and its switch
@@ -7867,16 +7937,38 @@ fn the_policy_pane_offers_and_creates_the_starter_allowlist(cx: &mut TestAppCont
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// The complete-persona switch is shown in the rail's General pane whatever
-/// its state, and flipping it changes the persona in force and the built agent.
+/// One pane owns the complete-persona switch.
+///
+/// The row used to be drawn in General as well, which gave one flag two
+/// controls and two places to look. The Agent loop pane is its single home now,
+/// and General must not grow a second copy back.
 #[gpui::test]
-fn the_general_pane_toggles_the_complete_persona(cx: &mut TestAppContext) {
+fn only_the_agent_loop_pane_carries_the_persona_switch(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = state_with_turns("persona-single-home", 1);
+        state.settings.workspace.agent.system_prompt = "You are terse.".to_string();
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("persona-complete-toggle").is_none(),
+        "General must not carry a second persona switch"
+    );
+}
+
+/// The complete-persona switch is shown in the Agent loop pane whatever its
+/// state, and flipping it changes the persona in force and the built agent.
+#[gpui::test]
+fn the_agent_loop_pane_toggles_the_complete_persona(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(|window, cx| {
         let mut state = state_with_turns("persona-toggle", 1);
         state.settings.workspace.agent.complete = false;
         state.settings.workspace.agent.system_prompt = "You are terse.".to_string();
-        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
         Harness { shell }
     });
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
@@ -7911,7 +8003,8 @@ fn the_disabled_persona_switch_answers_with_a_notice(cx: &mut TestAppContext) {
         let mut state = state_with_turns("persona-disabled", 1);
         state.settings.workspace.agent.complete = false;
         state.settings.workspace.agent.system_prompt = String::new();
-        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
         Harness { shell }
     });
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
@@ -7950,7 +8043,8 @@ fn the_persona_switch_edits_the_preset_that_owns_the_persona(cx: &mut TestAppCon
         let mut state = state_with_turns("persona-preset-toggle", 1);
         state.settings.global.default_preset = "federation".to_string();
         state.settings.workspace.agent.complete = false;
-        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
         Harness { shell }
     });
     let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
@@ -8031,6 +8125,60 @@ fn parallel_tool_calls_switch_flips_the_setting(cx: &mut TestAppContext) {
             .parallel_tool_calls
     });
     assert!(!off, "pressing the switch again must turn it back off");
+}
+
+/// Capture is the write half of memory, and the pane says so.
+///
+/// With Memory on, the switch writes the workspace opt-in. With Memory off the
+/// control is dimmed and a press answers with the reason, because there is no
+/// store for a capture to commit into - a flag stored then would be a control
+/// that only looked wired.
+#[gpui::test]
+fn the_memory_capture_switch_writes_and_needs_memory(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let mut state = state_with_turns("memory-capture", 1);
+        state.settings.workspace.agent.memory_enabled = true;
+        state.settings.workspace.agent.memory_capture = false;
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    let capture = cx
+        .debug_bounds("settings-memory-capture")
+        .expect("the capture switch draws");
+    cx.simulate_click(capture.center(), Modifiers::default());
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.draft().workspace.agent.memory_capture),
+        "the opt-in lands on the workspace draft"
+    );
+
+    // Memory off: capture has nowhere to write, so the press is refused out loud.
+    let memory = cx
+        .debug_bounds("settings-memory")
+        .expect("the memory switch draws");
+    cx.simulate_click(memory.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let capture = cx
+        .debug_bounds("settings-memory-capture")
+        .expect("the capture switch stays drawn");
+    cx.simulate_click(capture.center(), Modifiers::default());
+    let (still_on, noticed) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.state.draft().workspace.agent.memory_capture,
+            shell
+                .state
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.to_lowercase().contains("memory")),
+        )
+    });
+    assert!(still_on, "a refused press must not store an inert flag");
+    assert!(noticed, "and it says why");
 }
 
 /// The permission chip changes the mode in place, like the reference's trigger:
@@ -16637,11 +16785,12 @@ fn the_job_stop_arms_then_stops_within_its_window(cx: &mut TestAppContext) {
 }
 
 /// The rail is the reference's five cells, plus the Vault (after Account, the
-/// surface it is administered from) and Web search (after Models, where a reader
-/// looks for what the model calls). The reference's own order is otherwise
-/// untouched.
+/// surface it is administered from), Web search (after Models, where a reader
+/// looks for what the model calls) and the Agent loop (after Web search: the
+/// turn's behaviour is what those requests run inside). The reference's own
+/// order is otherwise untouched.
 #[test]
-fn the_settings_rail_is_the_measured_cells_plus_the_vault_and_web_search() {
+fn the_settings_rail_is_the_measured_cells_plus_the_bsh_additions() {
     use super::settings::NAV;
     assert_eq!(
         NAV,
@@ -16651,10 +16800,11 @@ fn the_settings_rail_is_the_measured_cells_plus_the_vault_and_web_search() {
             "general",
             "models",
             "web-search",
+            "agent-loop",
             "extensions",
             "agent-presets",
         ],
-        "the measured settings.section registrations with the two BSH additions"
+        "the measured settings.section registrations with the three BSH additions"
     );
     // The rail renders each cell through `tr`, so a section key with no locale
     // entry draws the raw key: `settings.web-search` shipped that way once.
@@ -16748,7 +16898,7 @@ fn cmd_k_filters_the_settings_rail_by_subtitle(cx: &mut TestAppContext) {
     });
 }
 
-/// The settings rail draws every `NAV` cell - seven, and no eighth - and the
+/// The settings rail draws every `NAV` cell - eight, and no ninth - and the
 /// About block is General's own last row group, not a cell.
 #[gpui::test]
 fn the_settings_rail_draws_every_nav_cell_and_about_lives_in_general(cx: &mut TestAppContext) {
@@ -16768,12 +16918,13 @@ fn the_settings_rail_draws_every_nav_cell_and_about_lives_in_general(cx: &mut Te
         "set-nav-4",
         "set-nav-5",
         "set-nav-6",
+        "set-nav-7",
     ] {
         assert!(cx.debug_bounds(cell).is_some(), "{cell} draws");
     }
     assert!(
-        cx.debug_bounds("set-nav-7").is_none(),
-        "the rail is seven cells: the reference's five plus the Vault and Web search"
+        cx.debug_bounds("set-nav-8").is_none(),
+        "the rail is eight cells: the reference's five plus the Vault, Web search and Agent loop"
     );
     cx.update(|_window, cx| {
         let shell = harness.read(cx).shell.clone();
@@ -16826,6 +16977,46 @@ fn the_web_search_rail_cell_opens_the_tool_settings(cx: &mut TestAppContext) {
         cx.debug_bounds("settings-web-search-enabled").is_some()
             && cx.debug_bounds("field-web-search-key").is_some(),
         "and the pane that opened owns the switch and the key field"
+    );
+}
+
+/// The Agent loop cell is the entry to the turn's own settings.
+///
+/// One press opens the pane that owns the dispatch switch, the persona
+/// contract and the wait one model request gets, so none of them is reachable
+/// only by knowing what the Extensions pane's inventory lists.
+#[gpui::test]
+fn the_agent_loop_rail_cell_opens_the_turn_settings(cx: &mut TestAppContext) {
+    use super::settings::{section_index, NAV};
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("rail-agent-loop"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("general"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let cell = NAV
+        .iter()
+        .position(|id| *id == "agent-loop")
+        .expect("Agent loop is a rail cell");
+    assert_eq!(cell, 5, "the rail puts Agent loop after Web search");
+    let bounds = cx
+        .debug_bounds("set-nav-5")
+        .expect("the Agent loop cell draws");
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let section = cx.update(|_, cx| harness.read(cx).shell.read(cx).state.settings_section);
+    assert_eq!(
+        section,
+        section_index("agent-loop").expect("the Agent loop pane"),
+        "the rail cell opens the turn's settings pane"
+    );
+    assert!(
+        cx.debug_bounds("field-settings.llmTimeout").is_some()
+            && cx.debug_bounds("parallel-tool-calls").is_some(),
+        "and the pane that opened owns the wait field and the dispatch switch"
     );
 }
 
@@ -24045,6 +24236,80 @@ fn the_right_panel_offers_a_federation_pane(cx: &mut TestAppContext) {
         cx.debug_bounds("federation-node-start").is_some(),
         "a stopped node offers Start"
     );
+}
+
+/// The Work tab carries the caps this node applies to the remote work it
+/// accepts: the three numbers load from the settings and save together.
+#[gpui::test]
+fn the_federation_work_tab_saves_remote_task_limits(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("federation-task-limits");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    shell.update(cx, |this, cx| {
+        this.right.open = true;
+        this.right.tab = Some(crate::ui::right_panel::RightTab::Federation);
+        this.right.federation.tab = 1;
+        this.reload_federation();
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    for selector in [
+        "federation-task-steps",
+        "federation-task-tokens",
+        "federation-task-deadline",
+        "federation-task-limits-save",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector} draws");
+    }
+    // The fields load the stored caps, not blank placeholders: a refusal the
+    // reader cannot see the number behind would be unexplainable.
+    let values = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.federation_task_steps.read(cx).value().to_string(),
+            shell.federation_task_tokens.read(cx).value().to_string(),
+            shell.federation_task_deadline.read(cx).value().to_string(),
+        )
+    });
+    assert_eq!(
+        values,
+        ("20".to_string(), "200000".to_string(), "600000".to_string()),
+        "the shipped caps load into the fields"
+    );
+
+    let (steps_input, tokens_input, deadline_input) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.federation_task_steps.clone(),
+            shell.federation_task_tokens.clone(),
+            shell.federation_task_deadline.clone(),
+        )
+    });
+    cx.update(|window, cx| {
+        steps_input.update(cx, |state, cx| state.set_value("8", window, cx));
+        tokens_input.update(cx, |state, cx| state.set_value("50000", window, cx));
+        deadline_input.update(cx, |state, cx| state.set_value("120000", window, cx));
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let save = cx
+        .debug_bounds("federation-task-limits-save")
+        .expect("the save press draws");
+    cx.simulate_click(save.center(), Modifiers::default());
+    let caps = cx.update(|_, cx| {
+        let federation = &shell.read(cx).state.settings.global.federation;
+        (
+            federation.max_task_steps,
+            federation.max_task_tokens,
+            federation.max_task_deadline_ms,
+        )
+    });
+    assert_eq!(caps, (8, 50_000, 120_000), "the three caps saved together");
 }
 
 /// Revoking a peer takes two presses: the first asks, the second acts, and
@@ -36632,6 +36897,19 @@ fn the_market_search_narrows_the_git_provider(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("extension-market-search").is_some(),
         "the Market tab draws its search field"
+    );
+    // The filter is a row of its own ABOVE THE LIST, below the provider row -
+    // not in the pane header, where it read as page chrome rather than a
+    // filter over the entries.
+    let url = cx
+        .debug_bounds("extension-market-url")
+        .expect("the provider row draws");
+    let search = cx
+        .debug_bounds("extension-market-search")
+        .expect("the filter row draws");
+    assert!(
+        search.origin.y > url.origin.y,
+        "the filter sits below the provider row, not in the header"
     );
     assert!(
         cx.debug_bounds("extension-market-com.example.hello")

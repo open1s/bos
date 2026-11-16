@@ -138,7 +138,21 @@ pub struct AgentConfig {
     /// Optional completion token cap.
     pub max_tokens: Option<u32>,
     /// Per-request timeout in seconds.
+    ///
+    /// One number bounds one LLM request at both layers: the engine's own
+    /// ceiling around the call, and the idle-socket guard the built-in vendors
+    /// put on the wire (see `build_vendor`). A value shorter than a slow
+    /// provider's think time reports "Request timed out" for work that was
+    /// still running, so a host serving a reasoning model sets this generously;
+    /// the reader's Stop is what ends a slow turn. Zero means the shipped
+    /// guard, one hour.
     pub timeout_secs: u64,
+    /// Retries after the first attempt when a provider failure is transient.
+    ///
+    /// The engine's own budget, used when the host configures no resilience
+    /// layer: 3 means at most four calls for one request. Zero disables
+    /// retries, which turns a rate limit into a failed turn.
+    pub max_retries: u32,
     /// Maximum ReAct steps before the run is stopped.
     pub max_steps: usize,
     /// Token ceiling for ONE compaction (summarizer) request's input.
@@ -203,6 +217,7 @@ impl Default for AgentConfig {
             temperature: 0.7,
             max_tokens: None,
             timeout_secs: 60,
+            max_retries: 3,
             max_steps: 10,
             compaction_input_tokens: 24_000,
             tool_output_cap: 0,

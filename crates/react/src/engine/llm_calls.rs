@@ -24,7 +24,7 @@ impl<A: ReActApp> ReActEngine<A> {
             .resilience
             .as_ref()
             .map(|r| r.rate_limit_config().max_retries)
-            .unwrap_or(3);
+            .unwrap_or(self.max_retries);
 
         let mut attempt = 0;
         let t0 = std::time::Instant::now();
@@ -133,7 +133,7 @@ impl<A: ReActApp> ReActEngine<A> {
             .resilience
             .as_ref()
             .map(|r| r.rate_limit_config().max_retries)
-            .unwrap_or(3);
+            .unwrap_or(self.max_retries);
         let backoff = self
             .resilience
             .as_ref()

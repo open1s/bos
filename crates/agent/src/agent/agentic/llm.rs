@@ -104,31 +104,40 @@ pub fn build_vendor(
         ("openai".to_string(), config.model.clone())
     };
 
+    // ONE number bounds one LLM request at both layers a reader can see: the
+    // engine's per-call ceiling (`llm_timeout`) and the vendor's idle-socket
+    // guard. A guard shorter than the ceiling fails a slow-but-working
+    // provider with "Request timed out" before the engine ever gives up, so
+    // the host's number reaches the wire here. Zero keeps the shipped guard.
+    let read_timeout = if config.timeout_secs == 0 {
+        react::llm::vendor::DEFAULT_READ_TIMEOUT
+    } else {
+        std::time::Duration::from_secs(config.timeout_secs)
+    };
+
     let vendor: Box<dyn LlmClient<AgentSession, AgentReactContext>> = match vendor_name.as_str() {
-        "deepseek" => Box::new(DeepSeekVendor::new(
-            config.base_url.clone(),
-            model_name,
-            config.api_key.clone(),
-        )),
-        "nvidia" => Box::new(NvidiaVendor::new(
-            config.base_url.clone(),
-            model_name,
-            config.api_key.clone(),
-        )),
-        "openrouter" => Box::new(OpenRouterVendor::new(
-            config.base_url.clone(),
-            model_name,
-            config.api_key.clone(),
-        )),
+        "deepseek" => Box::new(
+            DeepSeekVendor::new(config.base_url.clone(), model_name, config.api_key.clone())
+                .with_read_timeout(read_timeout),
+        ),
+        "nvidia" => Box::new(
+            NvidiaVendor::new(config.base_url.clone(), model_name, config.api_key.clone())
+                .with_read_timeout(read_timeout),
+        ),
+        "openrouter" => Box::new(
+            OpenRouterVendor::new(config.base_url.clone(), model_name, config.api_key.clone())
+                .with_read_timeout(read_timeout),
+        ),
         "anthropic" => Box::new(AnthropicVendor::new(
-            std::sync::Arc::new(reqwest::Client::new()),
+            std::sync::Arc::new(react::llm::vendor::http_client(read_timeout)),
             config.base_url.clone(),
             model_name,
             config.api_key.clone(),
         )),
         _ => Box::new(
             OpenAiClient::new(config.base_url.clone(), model_name, config.api_key.clone())
-                .with_parallel_tool_calls(config.parallel_tool_calls),
+                .with_parallel_tool_calls(config.parallel_tool_calls)
+                .with_read_timeout(read_timeout),
         ),
     };
 

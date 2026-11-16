@@ -77,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         temperature: 0.7,
         max_tokens: Some(1000),
         timeout_secs: 60,
+        max_retries: 3,
         max_steps: 10,
         compaction_input_tokens: 24_000,
         tool_output_cap: 0,

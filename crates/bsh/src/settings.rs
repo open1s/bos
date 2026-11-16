@@ -218,6 +218,10 @@ pub(crate) struct Effective {
     pub(crate) skills: std::sync::Arc<Vec<resolve::DiscoveredSkill>>,
     /// Send-side token ceiling.
     pub(crate) context_budget: usize,
+    /// Seconds one LLM request may wait before the loop gives up on it.
+    pub(crate) llm_timeout_secs: u64,
+    /// Retries after the first attempt when a provider failure is transient.
+    pub(crate) llm_max_retries: u32,
     /// Shell command timeout in seconds.
     pub(crate) shell_timeout_secs: u64,
     /// Tool result truncation ceiling in bytes.
@@ -1012,6 +1016,8 @@ impl Settings {
             skill_sources: resolution.skill_sources.clone(),
             skills: resolution.skills.clone(),
             context_budget: resolution.context_budget,
+            llm_timeout_secs: resolution.llm_timeout_secs,
+            llm_max_retries: resolution.llm_max_retries,
             shell_timeout_secs: resolution.shell_timeout_secs,
             tool_output_cap: resolution.tool_output_cap,
             memory_enabled: resolution.memory_enabled,
@@ -1229,6 +1235,39 @@ mod tests {
         assert_eq!(settings.global.general.theme_mode, "system");
         assert_eq!(settings.global.general.lang, "en");
         assert_eq!(settings.global.general.transcript_view, "standard");
+    }
+
+    /// One request's settings - wait, retries, temperature - are workspace
+    /// facts, resolved into the numbers the build hands the engine and the wire.
+    #[test]
+    fn the_llm_request_settings_resolve_into_the_effective_settings() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.effective().llm_timeout_secs,
+            3600,
+            "the shipped wait is generous: a slow provider is working, not failing"
+        );
+        assert_eq!(
+            settings.effective().llm_max_retries,
+            3,
+            "the shipped retry budget keeps a transient 429 from failing a turn"
+        );
+        assert_eq!(
+            settings.effective().temperature,
+            0.7,
+            "no stored temperature inherits the engine's own default"
+        );
+
+        settings.workspace.agent.llm_timeout_secs = 900;
+        settings.workspace.agent.llm_max_retries = 1;
+        settings.workspace.agent.temperature = Some(0.3);
+        let resolved = settings.effective();
+        assert_eq!(
+            resolved.llm_timeout_secs, 900,
+            "the reader's wait reaches the build"
+        );
+        assert_eq!(resolved.llm_max_retries, 1, "and so does the retry budget");
+        assert_eq!(resolved.temperature, 0.3, "and the sampling temperature");
     }
 
     /// A turn runs in the workspace its CHAT belongs to, not in whichever

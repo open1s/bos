@@ -238,6 +238,19 @@ impl OpenAiVendor {
         self
     }
 
+    /// Replace the idle-socket guard with `timeout`.
+    ///
+    /// The engine bounds one LLM call with the host's per-request timeout and
+    /// the wire has to obey the same number: a guard shorter than that ceiling
+    /// turns a slow-but-working provider into `LLM error: Request timed out`
+    /// before the engine ever gives up, which is the failure this seam exists
+    /// to remove.
+    #[must_use]
+    pub fn with_read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.client = Arc::new(crate::llm::vendor::http_client(timeout));
+        self
+    }
+
     /// Start building an OpenAI vendor.
     pub fn builder() -> OpenAiVendorBuilder {
         OpenAiVendorBuilder::new()
@@ -1014,6 +1027,13 @@ impl OpenAiClient {
     /// Allow (or forbid) several tool calls in one provider response.
     pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
         self.inner = self.inner.with_parallel_tool_calls(parallel);
+        self
+    }
+
+    /// Replace the idle-socket guard with `timeout`.
+    #[must_use]
+    pub fn with_read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner = self.inner.with_read_timeout(timeout);
         self
     }
 }

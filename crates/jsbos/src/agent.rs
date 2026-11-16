@@ -313,6 +313,9 @@ pub struct AgentConfig {
   /// Per-request timeout in seconds.
   #[napi(js_name = "timeoutSecs")]
   pub timeout_secs: i64,
+  /// Retries after the first attempt on a transient provider failure.
+  #[napi(js_name = "maxRetries")]
+  pub max_retries: Option<i32>,
   /// Maximum ReAct steps.
   #[napi(js_name = "maxSteps")]
   pub max_steps: Option<i64>,
@@ -380,6 +383,7 @@ impl Default for AgentConfig {
       temperature: c.temperature as f64,
       max_tokens: c.max_tokens.map(|v| v as i32),
       timeout_secs: c.timeout_secs as i64,
+      max_retries: Some(c.max_retries as i32),
       max_steps: None,
       api_mode: Some("chat".to_string()),
       reasoning_effort: None,
@@ -410,6 +414,7 @@ impl AgentConfig {
   fn validate(&self) -> Result<()> {
     let negative = [
       ("timeoutSecs", self.timeout_secs < 0),
+      ("maxRetries", self.max_retries.is_some_and(|v| v < 0)),
       ("maxTokens", self.max_tokens.is_some_and(|v| v < 0)),
       ("maxSteps", self.max_steps.is_some_and(|v| v < 0)),
       (
@@ -501,6 +506,7 @@ impl From<AgentConfig> for agent::AgentConfig {
       temperature: value.temperature as f32,
       max_tokens: max_tokens_converted,
       timeout_secs: value.timeout_secs as u64,
+      max_retries: value.max_retries.unwrap_or(3) as u32,
       max_steps: value.max_steps.unwrap_or(10) as usize,
       compaction_input_tokens: value
         .compaction_input_tokens
@@ -710,6 +716,7 @@ impl Agent {
         "temperature": cfg.temperature,
         "max_tokens": cfg.max_tokens,
         "timeout_secs": cfg.timeout_secs,
+        "max_retries": cfg.max_retries,
         "max_steps": cfg.max_steps,
         "compaction_input_tokens": cfg.compaction_input_tokens,
         "tool_output_cap": cfg.tool_output_cap,

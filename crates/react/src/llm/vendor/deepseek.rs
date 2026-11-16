@@ -34,6 +34,16 @@ impl DeepSeekVendor {
         }
     }
 
+    /// Replace the delegate's idle-socket guard with `timeout`.
+    ///
+    /// The wire wait and the engine's per-request ceiling are one number: see
+    /// [`OpenAiVendor::with_read_timeout`].
+    #[must_use]
+    pub fn with_read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner = self.inner.with_read_timeout(timeout);
+        self
+    }
+
     /// Start building a DeepSeek vendor.
     pub fn builder() -> DeepSeekVendorBuilder {
         DeepSeekVendorBuilder::new()
