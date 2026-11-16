@@ -256,7 +256,10 @@ mod tests {
                 crate_root: PathBuf::from(crate_root),
                 module_path: module_path.iter().map(|part| (*part).to_owned()).collect(),
                 source_path: PathBuf::from(source_path),
-                range: SourceRange { start_byte: start, end_byte: start + name.len() },
+                range: SourceRange {
+                    start_byte: start,
+                    end_byte: start + name.len(),
+                },
                 kind: RustScopedSymbolKind::Struct,
             },
             name: name.to_owned(),
@@ -282,7 +285,10 @@ mod tests {
             target_source_path: Some(PathBuf::from("src/model.rs")),
             candidate_source_paths: Vec::new(),
             member_path: member_path.iter().map(|part| (*part).to_owned()).collect(),
-            range: SourceRange { start_byte: 4, end_byte: 24 },
+            range: SourceRange {
+                start_byte: 4,
+                end_byte: 24,
+            },
             status: if member_path.is_empty() {
                 RustImportResolutionStatus::ModuleTarget
             } else {
@@ -297,7 +303,10 @@ mod tests {
         graph_status: RustModuleGraphStatus,
         incomplete: Vec<PathBuf>,
     ) -> RustSymbolImportResolutionReport {
-        let workspace_id = symbols.first().map(|symbol| symbol.id.workspace_id).unwrap_or_else(WorkspaceId::new);
+        let workspace_id = symbols
+            .first()
+            .map(|symbol| symbol.id.workspace_id)
+            .unwrap_or_else(WorkspaceId::new);
         resolve_rust_import_symbols(
             &RustImportResolutionReport {
                 workspace_id,
@@ -310,7 +319,8 @@ mod tests {
                 symbols,
                 incomplete_source_paths: incomplete,
             },
-        ).expect("symbol import resolution")
+        )
+        .expect("symbol import resolution")
     }
 
     #[test]
@@ -323,7 +333,10 @@ mod tests {
             RustModuleGraphStatus::Complete,
             Vec::new(),
         );
-        assert_eq!(report.imports[0].status, RustSymbolImportStatus::UniqueCandidate);
+        assert_eq!(
+            report.imports[0].status,
+            RustSymbolImportStatus::UniqueCandidate
+        );
         assert_eq!(report.imports[0].candidates[0].local_name, "LocalWidget");
     }
 
@@ -338,7 +351,10 @@ mod tests {
             RustModuleGraphStatus::Complete,
             Vec::new(),
         );
-        assert_eq!(report.imports[0].status, RustSymbolImportStatus::AmbiguousCandidates);
+        assert_eq!(
+            report.imports[0].status,
+            RustSymbolImportStatus::AmbiguousCandidates
+        );
         assert_eq!(report.imports[0].candidates.len(), 2);
     }
 
@@ -353,7 +369,10 @@ mod tests {
             RustModuleGraphStatus::Complete,
             Vec::new(),
         );
-        assert_eq!(report.imports[0].status, RustSymbolImportStatus::GlobCandidateSet);
+        assert_eq!(
+            report.imports[0].status,
+            RustSymbolImportStatus::GlobCandidateSet
+        );
         assert_eq!(report.imports[0].candidates.len(), 1);
     }
 
@@ -365,7 +384,10 @@ mod tests {
             RustModuleGraphStatus::Partial,
             vec![PathBuf::from("src/model.rs")],
         );
-        assert_eq!(report.imports[0].status, RustSymbolImportStatus::IncompleteTargetSource);
+        assert_eq!(
+            report.imports[0].status,
+            RustSymbolImportStatus::IncompleteTargetSource
+        );
     }
 
     #[test]
@@ -373,8 +395,16 @@ mod tests {
         let mut import = module_import(&["Widget"], false, None);
         import.status = RustImportResolutionStatus::UncertainModuleTarget;
         import.target_module_path = None;
-        let report = resolve(vec![import], Vec::new(), RustModuleGraphStatus::Partial, Vec::new());
+        let report = resolve(
+            vec![import],
+            Vec::new(),
+            RustModuleGraphStatus::Partial,
+            Vec::new(),
+        );
         assert_eq!(report.imports[0].status, RustSymbolImportStatus::UnresolvedModule);
-        assert_eq!(report.imports[0].module_status, RustImportResolutionStatus::UncertainModuleTarget);
+        assert_eq!(
+            report.imports[0].module_status,
+            RustImportResolutionStatus::UncertainModuleTarget
+        );
     }
 }
