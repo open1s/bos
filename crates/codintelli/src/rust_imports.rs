@@ -189,7 +189,8 @@ fn resolve_one_import(
     }
 
     let mut path = fact.path.clone();
-    let target_path = match path.first().map(String::as_str) {
+    let path_root = path.first().cloned();
+    let target_path = match path_root.as_deref() {
         Some("crate") => {
             path.remove(0);
             path
@@ -275,7 +276,7 @@ fn resolve_one_import(
 }
 
 fn is_prefix(prefix: &[String], path: &[String]) -> bool {
-    prefix.len() <= path.len() && path[..prefix.len()] == *prefix
+    path.starts_with(prefix)
 }
 
 fn make_unresolved(
@@ -365,7 +366,7 @@ mod tests {
         }
     }
 
-    fn graph(id: WorkspaceId, nodes: Vec<RustModuleNode>) -> RustModuleGraph {
+    fn make_graph(id: WorkspaceId, nodes: Vec<RustModuleNode>) -> RustModuleGraph {
         RustModuleGraph {
             workspace_id: id,
             crate_roots: vec![PathBuf::from("src/lib.rs")],
@@ -395,7 +396,7 @@ mod tests {
             import(&["crate", "model"], &[]),
             import(&["crate", "model", "Widget"], &[]),
         ], Vec::new(), id);
-        let graph = graph(id, vec![
+        let graph = make_graph(id, vec![
             node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot),
             node(&["model"], "src/model.rs", RustModuleNodeKind::External),
         ]);
@@ -454,7 +455,7 @@ mod tests {
         let report = resolve_rust_import_module_candidates(&[parsed.clone()], &graph).expect("imports");
         assert_eq!(report.imports[0].status, RustImportResolutionStatus::InvalidSuperTraversal);
 
-        let other = graph(WorkspaceId::new(), vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)]);
+        let other = make_graph(WorkspaceId::new(), vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)]);
         assert!(matches!(
             resolve_rust_import_module_candidates(&[parsed], &other),
             Err(RustImportResolutionError::WorkspaceMismatch)
