@@ -162,28 +162,34 @@ Initial query operations:
 
 Query results should return evidence references and completeness/coverage metadata, not only labels and IDs.
 
-## 4.7 First syntax provider: Rust
+## 4.7 First syntax provider: Rust (Tree-sitter)
 
-The first provider uses Syn rather than Tree-sitter. This is a deliberate initial
-trade-off: Syn is pure Rust and avoids adding a C/C++ parser compilation
-toolchain to the core crate. Its parser is strict rather than error-recovering:
-a malformed file yields a failed parse result and a diagnostic, not a
-potentially misleading partial fact set. If tolerant parsing and editor-grade
-incremental reparsing become required, Tree-sitter can be evaluated as another
-provider behind the same contract.
+The first provider uses the upstream Tree-sitter runtime and upstream Rust
+grammar directly. Tree-sitter owns tokenization, parsing, syntax-tree
+construction, and error recovery; codintelli does not implement a Rust parser.
+The initial locked versions are `tree-sitter 0.26.13` and
+`tree-sitter-rust 0.24.2`, selected because both are already represented in
+the workspace lockfile.
 
 The provider contract is host-neutral and consumes only already-bounded UTF-8
 bytes. The caller must use `WorkspaceFs` and reserve file/aggregate bytes with
 `ScanBudget` before parsing. The provider does not read files, inspect Cargo
 metadata, invoke rustc, or execute workspace-controlled code.
 
-The initial Rust facts cover modules, free functions, methods, structs, enums,
+Tree-sitter error recovery is preserved: syntax facts from recoverable regions
+remain available and the result is marked `Recovered` with source-ranged
+diagnostics. Facts cover modules, free functions, methods, structs, enums,
 unions, traits, impl blocks, type aliases, constants, statics, imports, direct
 function-call expressions, and method-call expressions. Calls are syntax
 observations only; they are not resolved to declarations. Each fact carries a
-half-open byte range into the original UTF-8 source. Provider ID, parser
-version, schema version, workspace ID, and relative path are retained so
-persisted results can be invalidated or partitioned correctly.
+half-open byte range into the original UTF-8 source. Provider ID, parser and
+grammar versions, schema version, workspace ID, and relative path are retained
+so persisted results can be invalidated or partitioned correctly.
+
+Tree-sitter's Rust runtime and generated grammar include native C build
+components. This is an explicit dependency trade-off for using the requested
+parser rather than maintaining parser logic in codintelli; CI must validate
+supported Windows, macOS, Linux, and MSRV targets.
 
 ## 5. Structural facts and optional graph view
 
