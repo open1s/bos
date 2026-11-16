@@ -1,15 +1,9 @@
-//! Rust syntax provider based on Syn.
+//! Rust syntax provider backed by the upstream Tree-sitter Rust grammar.
 //!
-//! Syn is a pure-Rust parser and avoids introducing a C/C++ parser build
-//! toolchain into the codintelli dependency graph. It parses complete Rust
-//! syntax trees; unlike an error-recovering parser, malformed files produce a
-//! failed result with a diagnostic and no partial facts.
+//! Tree-sitter owns lexical and syntactic parsing. This module only projects
+//! grammar nodes into codintelli's language-neutral syntax-fact contract.
 
-use proc_macro2::Span;
-use syn::{
-    spanned::Spanned,
-    visit::{self, Visit},
-};
+use tree_sitter::{Node, Parser};
 
 use crate::classification::LanguageId;
 
@@ -18,16 +12,16 @@ use super::{
     ProviderError, SourceRange, SyntaxFact, SyntaxFactKind,
 };
 
-/// Rust provider using the Syn parser.
+/// Rust provider using the upstream Tree-sitter Rust grammar.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RustProvider;
 
 impl RustProvider {
     /// Stable provider identifier.
-    pub const ID: &'static str = "codintelli.rust.syn";
+    pub const ID: &'static str = "codintelli.rust.tree-sitter";
 
-    /// Provider/parser version included in persisted extraction metadata.
-    pub const VERSION: &'static str = "syn-2.0.117";
+    /// Parser and grammar versions used by this provider.
+    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2";
 }
 
 impl LanguageProvider for RustProvider {
@@ -48,148 +42,126 @@ impl LanguageProvider for RustProvider {
             return Err(ProviderError::InvalidPath);
         }
         let source = std::str::from_utf8(input.source)?;
-        let mut result = ParseResult {
+        let mut parser = Parser::new();
+        let language = tree_sitter_rust::LANGUAGE.into();
+        parser
+            .set_language(&language)
+            .map_err(|error| ProviderError::ParserInitialization(error.to_string()))?;
+
+        let tree = parser.parse(source, None).ok_or(ProviderError::ParseAborted)?;
+        let root = tree.root_node();
+        let mut facts = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut pending = vec![root];
+
+        // Iterative traversal avoids adding another recursive walk over
+        // potentially adversarially nested source syntax.
+        while let Some(node) = pending.pop() {
+            if node.is_error() || node.is_missing() {
+                diagnostics.push(ParseDiagnostic {
+                    range: source_range(node, source.len()),
+                    message: if node.is_missing() {
+                        format!("missing syntax node: {}", node.kind())
+                    } else {
+                        "syntax error".to_owned()
+                    },
+                });
+            }
+
+            if let Some((kind, name)) = classify_node(node, source) {
+                if let Some(range) = source_range(node, source.len()) {
+                    facts.push(SyntaxFact { kind, name, range });
+                }
+            }
+
+            for index in (0..node.child_count()).rev() {
+                if let Some(child) = node.child(index) {
+                    pending.push(child);
+                }
+            }
+        }
+
+        facts.sort_unstable_by(|left, right| {
+            (left.range, left.kind, &left.name).cmp(&(right.range, right.kind, &right.name))
+        });
+        diagnostics.sort_unstable_by_key(|diagnostic| diagnostic.range);
+
+        let status = if diagnostics.is_empty() {
+            ParseStatus::Complete
+        } else {
+            ParseStatus::Recovered
+        };
+
+        Ok(ParseResult {
             workspace_id: input.workspace_id,
             relative_path: input.relative_path.to_path_buf(),
             language: LanguageId::Rust,
             provider_id: Self::ID.to_owned(),
             provider_version: Self::VERSION.to_owned(),
             schema_version: 1,
-            status: ParseStatus::Failed,
-            facts: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+            status,
+            facts,
+            diagnostics,
+        })
+    }
+}
 
-        match syn::parse_file(source) {
-            Ok(file) => {
-                let mut extractor = RustFactExtractor {
-                    source,
-                    facts: Vec::new(),
-                };
-                extractor.visit_file(&file);
-                extractor.facts.sort_unstable_by(|left, right| {
-                    (left.range, left.kind, &left.name).cmp(&(right.range, right.kind, &right.name))
-                });
-                result.facts = extractor.facts;
-                result.status = ParseStatus::Complete;
-            }
-            Err(error) => {
-                let range = span_range(error.span(), source.len());
-                result.diagnostics.push(ParseDiagnostic {
-                    range,
-                    message: error.to_string(),
-                });
-            }
+fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option<String>)> {
+    let kind = match node.kind() {
+        "mod_item" => SyntaxFactKind::Module,
+        "function_item" if node.parent().is_some_and(|parent| parent.kind() == "impl_item") => {
+            SyntaxFactKind::Method
         }
-        Ok(result)
-    }
+        "function_item" => SyntaxFactKind::Function,
+        "function_signature_item" => SyntaxFactKind::Method,
+        "struct_item" => SyntaxFactKind::Struct,
+        "enum_item" => SyntaxFactKind::Enum,
+        "union_item" => SyntaxFactKind::Union,
+        "trait_item" => SyntaxFactKind::Trait,
+        "impl_item" => SyntaxFactKind::Impl,
+        "type_item" => SyntaxFactKind::TypeAlias,
+        "const_item" => SyntaxFactKind::Constant,
+        "static_item" => SyntaxFactKind::Static,
+        "use_declaration" => SyntaxFactKind::Import,
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            if function.kind() == "field_expression" {
+                return Some((
+                    SyntaxFactKind::MethodCall,
+                    text_for_node(
+                        function.child_by_field_name("field").unwrap_or(function),
+                        source,
+                    ),
+                ));
+            }
+            return Some((SyntaxFactKind::Call, text_for_node(function, source)));
+        }
+        _ => return None,
+    };
+
+    let name = match kind {
+        SyntaxFactKind::Impl => node
+            .child_by_field_name("type")
+            .and_then(|value| text_for_node(value, source)),
+        SyntaxFactKind::Import => text_for_node(node, source),
+        _ => node
+            .child_by_field_name("name")
+            .and_then(|value| text_for_node(value, source)),
+    };
+    Some((kind, name))
 }
 
-struct RustFactExtractor<'a> {
-    source: &'a str,
-    facts: Vec<SyntaxFact>,
+fn text_for_node(node: Node<'_>, source: &str) -> Option<String> {
+    source
+        .get(node.byte_range())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
-impl RustFactExtractor<'_> {
-    fn push(&mut self, kind: SyntaxFactKind, name: Option<String>, span: Span) {
-        let Some(range) = span_range(span, self.source.len()) else {
-            return;
-        };
-        self.facts.push(SyntaxFact { kind, name, range });
-    }
-
-    fn source_spelling(&self, span: Span) -> Option<String> {
-        let range = span_range(span, self.source.len())?;
-        self.source.get(range.start_byte..range.end_byte)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    }
-}
-
-fn span_range(span: Span, source_len: usize) -> Option<SourceRange> {
-    let range = span.byte_range();
+fn source_range(node: Node<'_>, source_len: usize) -> Option<SourceRange> {
+    let range = node.byte_range();
     SourceRange::new(range.start, range.end, source_len)
-}
-
-impl<'ast> Visit<'ast> for RustFactExtractor<'_> {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        self.push(SyntaxFactKind::Module, Some(node.ident.to_string()), node.span());
-        visit::visit_item_mod(self, node);
-    }
-
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.push(SyntaxFactKind::Function, Some(node.sig.ident.to_string()), node.span());
-        visit::visit_item_fn(self, node);
-    }
-
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.push(SyntaxFactKind::Method, Some(node.sig.ident.to_string()), node.span());
-        visit::visit_impl_item_fn(self, node);
-    }
-
-    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        self.push(SyntaxFactKind::Method, Some(node.sig.ident.to_string()), node.span());
-        visit::visit_trait_item_fn(self, node);
-    }
-
-    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
-        self.push(SyntaxFactKind::Struct, Some(node.ident.to_string()), node.span());
-        visit::visit_item_struct(self, node);
-    }
-
-    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
-        self.push(SyntaxFactKind::Enum, Some(node.ident.to_string()), node.span());
-        visit::visit_item_enum(self, node);
-    }
-
-    fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
-        self.push(SyntaxFactKind::Union, Some(node.ident.to_string()), node.span());
-        visit::visit_item_union(self, node);
-    }
-
-    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
-        self.push(SyntaxFactKind::Trait, Some(node.ident.to_string()), node.span());
-        visit::visit_item_trait(self, node);
-    }
-
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        let name = self.source_spelling(node.self_ty.span());
-        self.push(SyntaxFactKind::Impl, name, node.span());
-        visit::visit_item_impl(self, node);
-    }
-
-    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
-        self.push(SyntaxFactKind::TypeAlias, Some(node.ident.to_string()), node.span());
-        visit::visit_item_type(self, node);
-    }
-
-    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
-        self.push(SyntaxFactKind::Constant, Some(node.ident.to_string()), node.span());
-        visit::visit_item_const(self, node);
-    }
-
-    fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
-        self.push(SyntaxFactKind::Static, Some(node.ident.to_string()), node.span());
-        visit::visit_item_static(self, node);
-    }
-
-    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
-        let name = self.source_spelling(node.span());
-        self.push(SyntaxFactKind::Import, name, node.span());
-        visit::visit_item_use(self, node);
-    }
-
-    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        let name = self.source_spelling(node.func.span());
-        self.push(SyntaxFactKind::Call, name, node.func.span());
-        visit::visit_expr_call(self, node);
-    }
-
-    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        self.push(SyntaxFactKind::MethodCall, Some(node.method.to_string()), node.span());
-        visit::visit_expr_method_call(self, node);
-    }
 }
 
 #[cfg(test)]
@@ -213,24 +185,34 @@ mod tests {
         let source = r#"
 use std::fmt::Debug;
 
+pub mod nested {}
 pub struct Widget;
 pub enum State { Ready, Busy }
+pub union Bits { value: u32 }
 pub trait Render { fn render(&self); }
 impl Widget {
     pub fn draw(&self) { self.render(); helper(); }
 }
+type ResultAlias = Result<(), ()>;
+const LIMIT: usize = 10;
+static ENABLED: bool = true;
 fn helper() {}
 "#;
         let result = parse(source);
         assert_eq!(result.status, ParseStatus::Complete);
         for kind in [
+            SyntaxFactKind::Module,
             SyntaxFactKind::Import,
             SyntaxFactKind::Struct,
             SyntaxFactKind::Enum,
+            SyntaxFactKind::Union,
             SyntaxFactKind::Trait,
             SyntaxFactKind::Impl,
             SyntaxFactKind::Method,
             SyntaxFactKind::Function,
+            SyntaxFactKind::TypeAlias,
+            SyntaxFactKind::Constant,
+            SyntaxFactKind::Static,
             SyntaxFactKind::Call,
             SyntaxFactKind::MethodCall,
         ] {
@@ -247,11 +229,10 @@ fn helper() {}
     }
 
     #[test]
-    fn malformed_source_is_failed_not_silently_complete() {
-        let result = parse("pub fn broken( {");
-        assert_eq!(result.status, ParseStatus::Failed);
-        assert!(result.facts.is_empty());
-        assert_eq!(result.diagnostics.len(), 1);
+    fn recovers_facts_and_reports_malformed_syntax() {
+        let result = parse("fn good() {}\nfn broken( {\nfn also_good() {}");
+        assert_eq!(result.status, ParseStatus::Recovered);
+        assert!(!result.diagnostics.is_empty());
     }
 
     #[test]
