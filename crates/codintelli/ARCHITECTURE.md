@@ -161,6 +161,24 @@ The graph builder starts only from crate roots supplied by the host. Each root h
 
 The import mapper consumes structured `ImportFact` records and the crate-root module graph. It supports explicit `crate::`, `self::`, and repeated `super::` roots, resolves only the longest known module prefix, and returns remaining path segments as member-path candidates. It preserves aliases and glob markers. Bare/unqualified paths are left unresolved because they may refer to the extern prelude or language-specific lexical rules. Multiple module nodes with the same logical path remain ambiguous. The mapper also propagates unresolved graph-edge states: attribute uncertainty, unparsed targets, depth limits, and ambiguous declarations are not collapsed into `NoModuleCandidate`. A module-prefix match does not resolve the imported symbol; symbol visibility, re-exports, macro expansion, dependency crates, and compiler configuration remain outside this stage.
 
+### 4.10 Crate-root-aware scoped Rust symbol catalog (CI-09H)
+
+The Rust provider now attaches lexical inline-module scope to each syntax fact and
+marks whether the fact is in module scope or inside a function/block-local
+context. The scoped symbol catalog combines those facts with crate-root-specific
+module graph nodes. Its identity includes the crate root, logical module path,
+source path, source range, and declaration kind. A source file shared by two
+crate roots therefore yields distinct symbols in the two logical namespaces.
+
+The first slice indexes module-scope functions, methods, types, traits, aliases,
+constants, and statics. Function/block-local declarations are excluded rather
+than incorrectly promoted to module scope. The catalog retains recovered or
+limited source paths as coverage metadata. It is still a structural catalog,
+not Rust name resolution: visibility, cfg selection, re-exports, macro-generated
+items, extern-prelude lookup, trait scope, and receiver/type-based method
+resolution remain unresolved. The next slice should connect structured imports
+to these scoped declarations while preserving candidate and uncertainty states.
+
 ### 4.11 Rust import-to-scoped-symbol candidates (CI-09I)
 
 The import-symbol layer joins `RustImportResolutionReport` with
@@ -183,25 +201,7 @@ compiler-resolved symbol. Visibility, cfg selection, re-exports, macro
 expansion, extern-prelude lookup, trait scope, enum-variant imports, and
 type-dependent associated-item resolution remain future work.
 
-### 4.10 Crate-root-aware scoped Rust symbol catalog (CI-09H)
-
-The Rust provider now attaches lexical inline-module scope to each syntax fact and
-marks whether the fact is in module scope or inside a function/block-local
-context. The scoped symbol catalog combines those facts with crate-root-specific
-module graph nodes. Its identity includes the crate root, logical module path,
-source path, source range, and declaration kind. A source file shared by two
-crate roots therefore yields distinct symbols in the two logical namespaces.
-
-The first slice indexes module-scope functions, methods, types, traits, aliases,
-constants, and statics. Function/block-local declarations are excluded rather
-than incorrectly promoted to module scope. The catalog retains recovered or
-limited source paths as coverage metadata. It is still a structural catalog,
-not Rust name resolution: visibility, cfg selection, re-exports, macro-generated
-items, extern-prelude lookup, trait scope, and receiver/type-based method
-resolution remain unresolved. The next slice should connect structured imports
-to these scoped declarations while preserving candidate and uncertainty states.
-
-### 4.10 Cross-file resolution
+### 4.12 Cross-file resolution
 
 Resolution is a separate stage over extracted facts and workspace metadata. It may resolve:
 
@@ -212,7 +212,7 @@ Resolution is a separate stage over extracted facts and workspace metadata. It m
 
 Resolution output must retain its own provenance and diagnostics. Ambiguous candidates remain ambiguous; they are not collapsed to an arbitrary target.
 
-### 4.11 Relationship analysis and query
+### 4.13 Relationship analysis and query
 
 Relationship analysis is a deterministic transformation over extracted facts. A graph-shaped view may be built when it helps a query, but the underlying index must not require all records to be represented as graph nodes and edges. This stage must not perform parsing or filesystem access.
 
