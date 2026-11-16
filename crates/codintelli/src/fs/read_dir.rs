@@ -230,6 +230,45 @@ mod tests {
     }
 
     #[test]
+    fn directory_report_includes_file_sizes_and_inspected_special_entries() {
+        let root = tempdir().expect("create workspace");
+        fs::write(root.path().join("source.rs"), "fn main() {}").expect("write source");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(root.path().join("source.rs"), root.path().join("link.rs"))
+                .expect("create symlink");
+        }
+
+        let workspace = workspace_fs(root.path());
+        let listing = workspace.read_dir_report("", 10).expect("list root");
+
+        assert!(!listing.truncated);
+        #[cfg(unix)]
+        assert_eq!(listing.inspected_entries, 2);
+        #[cfg(not(unix))]
+        assert_eq!(listing.inspected_entries, 1);
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].kind, WorkspaceEntryKind::File);
+        assert_eq!(listing.entries[0].size_bytes, Some(12));
+    }
+
+    #[test]
+    fn directory_report_marks_truncation_without_losing_partial_entries() {
+        let root = tempdir().expect("create workspace");
+        fs::write(root.path().join("a.rs"), "a").expect("write a");
+        fs::write(root.path().join("b.rs"), "b").expect("write b");
+
+        let workspace = workspace_fs(root.path());
+        let listing = workspace.read_dir_report("", 1).expect("bounded list");
+
+        assert!(listing.truncated);
+        assert_eq!(listing.inspected_entries, 1);
+        assert_eq!(listing.entries.len(), 1);
+    }
+
+    #[test]
     fn enforces_entry_limit() {
         let root = tempdir().expect("create workspace");
         fs::write(root.path().join("a"), "a").expect("write a");
