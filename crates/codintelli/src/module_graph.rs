@@ -466,11 +466,12 @@ pub fn build_rust_module_graph(
 }
 
 fn valid_module_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment != "."
-        && segment != ".."
-        && !segment.contains('/')
-        && !segment.contains('\\')
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_alphabetic())
+        && chars.all(|character| character == '_' || character.is_alphanumeric())
 }
 
 #[cfg(test)]
