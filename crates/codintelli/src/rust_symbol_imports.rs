@@ -348,7 +348,7 @@ mod tests {
         let direct = symbol(id, "src/lib.rs", &["model"], "src/model.rs", "Widget", 10);
         let nested = symbol(id, "src/lib.rs", &["model", "inner"], "src/model.rs", "Hidden", 40);
         let report = resolve(
-            vec![module_import(id, &[], true, None)],
+            vec![module_import(&[], true, None)],
             vec![direct, nested],
             RustModuleGraphStatus::Complete,
             Vec::new(),
@@ -359,9 +359,8 @@ mod tests {
 
     #[test]
     fn does_not_call_absence_resolved_when_target_parse_is_incomplete() {
-        let id = WorkspaceId::new();
         let report = resolve(
-            vec![module_import(id, &["Missing"], false, None)],
+            vec![module_import(&["Missing"], false, None)],
             Vec::new(),
             RustModuleGraphStatus::Partial,
             vec![PathBuf::from("src/model.rs")],
@@ -371,8 +370,7 @@ mod tests {
 
     #[test]
     fn preserves_unresolved_module_status() {
-        let id = WorkspaceId::new();
-        let mut import = module_import(id, &["Widget"], false, None);
+        let mut import = module_import(&["Widget"], false, None);
         import.status = RustImportResolutionStatus::UncertainModuleTarget;
         import.target_module_path = None;
         let report = resolve(vec![import], Vec::new(), RustModuleGraphStatus::Partial, Vec::new());
