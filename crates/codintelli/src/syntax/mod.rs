@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use crate::{classification::LanguageId, ScanBudget, ScanBudgetError, WorkspaceId};
 
+pub mod document;
 pub mod rust;
+
+pub use document::{ParsedDocument, ParsedDocumentStatus};
 
 /// Half-open byte range in the original UTF-8 source file.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
