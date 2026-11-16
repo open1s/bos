@@ -11,7 +11,7 @@ use crate::{
     fs::{WorkspaceEntryKind, WorkspaceFs},
     scanner::{scan_workspace_with_policy, ScanStatus, WorkspaceScanReport},
     syntax::{LanguageProvider, ParseInput, ParseResult},
-    IgnorePolicy, ScanBudget, ScanBudgetError, WorkspaceDescriptor,
+    IgnorePolicy, ScanBudget, ScanBudgetError,
 };
 
 /// Outcome of processing one source file.
@@ -113,7 +113,6 @@ pub struct SourceIndexReport {
 /// function. No project commands, build scripts, compilers, or package
 /// managers are executed.
 pub fn index_workspace(
-    descriptor: &WorkspaceDescriptor,
     workspace: &WorkspaceFs,
     budget: &ScanBudget,
     ignore: &IgnorePolicy,
@@ -243,7 +242,7 @@ pub fn index_workspace(
         };
 
         match provider.parse(ParseInput {
-            workspace_id: descriptor.id(),
+            workspace_id: workspace.workspace_id(),
             relative_path: &entry.relative_path,
             source: &source,
         }) {
@@ -317,13 +316,12 @@ pub fn index_workspace(
 
 /// Convenience entry point for the initial Rust-only provider set.
 pub fn index_rust_workspace(
-    descriptor: &WorkspaceDescriptor,
     workspace: &WorkspaceFs,
     budget: &ScanBudget,
     ignore: &IgnorePolicy,
 ) -> SourceIndexReport {
     let rust = crate::RustProvider;
-    index_workspace(descriptor, workspace, budget, ignore, &[&rust])
+    index_workspace(workspace, budget, ignore, &[&rust])
 }
 
 #[cfg(test)]
@@ -357,7 +355,6 @@ mod tests {
         let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(limits());
         let report = index_rust_workspace(
-            &descriptor,
             &workspace,
             &budget,
             &IgnorePolicy::default(),
@@ -370,7 +367,7 @@ mod tests {
         assert_eq!(report.failed_files, 0);
         assert_eq!(report.files.len(), 1);
         let parse = report.files[0].parse.as_ref().expect("parse result");
-        assert_eq!(parse.workspace_id, descriptor.id());
+        assert_eq!(parse.workspace_id, workspace.workspace_id());
         assert_eq!(parse.relative_path, PathBuf::from("src/lib.rs"));
         assert!(parse.facts.iter().any(|fact| {
             fact.kind == crate::SyntaxFactKind::Function
