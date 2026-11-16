@@ -3,7 +3,7 @@
 //! Tree-sitter owns lexical and syntactic parsing. This module only projects
 //! grammar nodes into codintelli's language-neutral syntax-fact contract.
 
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, sync::Arc};
 
 use tree_sitter::{Node, ParseOptions, Parser, ParseState};
 
@@ -12,7 +12,7 @@ use crate::classification::LanguageId;
 use super::{
     valid_relative_path, ImportFact, RustModuleFact, LanguageProvider, ParseDiagnostic, ParseInput, ParseResult,
     ParseStatus, ParseControl, ParseLimitKind, ParseLimits, ProviderError, SourceRange,
-    SyntaxFact, SyntaxFactKind,
+    ParsedDocument, SyntaxFact, SyntaxFactKind,
 };
 
 /// Rust provider using the upstream Tree-sitter Rust grammar.
@@ -54,6 +54,87 @@ impl LanguageProvider for RustProvider {
 }
 
 impl RustProvider {
+    /// Parse a bounded UTF-8 source snapshot and retain the native Tree-sitter tree.
+    ///
+    /// Unlike the compatibility fact-projection API, this returns no custom
+    /// syntax representation. Consumers query and traverse the native tree.
+    pub fn parse_document(
+        &self,
+        input: ParseInput<'_>,
+    ) -> Result<ParsedDocument, ProviderError> {
+        self.parse_document_bounded(input, None)
+    }
+
+    /// Parse a bounded source snapshot while observing shared cancellation.
+    pub fn parse_document_with_control(
+        &self,
+        input: ParseInput<'_>,
+        control: &ParseControl<'_>,
+    ) -> Result<ParsedDocument, ProviderError> {
+        self.parse_document_bounded(input, Some(control))
+    }
+
+    fn parse_document_bounded(
+        &self,
+        input: ParseInput<'_>,
+        control: Option<&ParseControl<'_>>,
+    ) -> Result<ParsedDocument, ProviderError> {
+        if !valid_relative_path(input.relative_path) {
+            return Err(ProviderError::InvalidPath);
+        }
+        std::str::from_utf8(input.source)?;
+        if let Some(control) = control {
+            control.check()?;
+        }
+
+        let source: Arc<[u8]> = Arc::from(input.source);
+        let mut parser = Parser::new();
+        let language = tree_sitter_rust::LANGUAGE.into();
+        parser
+            .set_language(&language)
+            .map_err(|error| ProviderError::ParserInitialization(error.to_string()))?;
+
+        let mut budget_error = None;
+        let mut progress = |_: &ParseState| match control.map(ParseControl::check) {
+            Some(Err(error)) => {
+                budget_error = Some(error);
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        };
+        let options = ParseOptions::new().progress_callback(&mut progress);
+        let tree = parser.parse_with_options(
+            &mut |offset, _| source.get(offset..).unwrap_or(&[]),
+            None,
+            Some(options),
+        );
+        drop(progress);
+
+        let Some(tree) = tree else {
+            parser.reset();
+            if let Some(error) = budget_error {
+                return Err(ProviderError::Budget(error));
+            }
+            if let Some(control) = control {
+                control.check()?;
+            }
+            return Err(ProviderError::ParseAborted);
+        };
+        if let Some(control) = control {
+            control.check()?;
+        }
+
+        Ok(ParsedDocument::new(
+            input.workspace_id,
+            input.relative_path.to_path_buf(),
+            LanguageId::Rust,
+            Self::ID.to_owned(),
+            Self::VERSION.to_owned(),
+            source,
+            tree,
+        ))
+    }
+
     fn parse_bounded(
         &self,
         input: ParseInput<'_>,
@@ -541,6 +622,64 @@ mod tests {
                 source: source.as_bytes(),
             })
             .expect("provider accepts UTF-8 source")
+    }
+
+    #[test]
+    fn parsed_document_exposes_native_tree_and_matching_source_snapshot() {
+        let source = b"pub fn greet() {}";
+        let document = RustProvider
+            .parse_document(ParseInput {
+                workspace_id: WorkspaceId::new(),
+                relative_path: Path::new("src/lib.rs"),
+                source,
+            })
+            .expect("parse native document");
+
+        assert_eq!(document.status(), super::super::ParsedDocumentStatus::Complete);
+        assert_eq!(document.source(), source);
+        assert_eq!(document.root_node().kind(), "source_file");
+
+        let function = document.root_node().named_child(0).expect("function node");
+        assert_eq!(function.kind(), "function_item");
+        let name = function.child_by_field_name("name").expect("function name");
+        assert_eq!(document.text_for_node(&name), Some("greet"));
+        assert_eq!(document.relative_path(), Path::new("src/lib.rs"));
+    }
+
+    #[test]
+    fn parsed_document_preserves_tree_sitter_recovery() {
+        let document = RustProvider
+            .parse_document(ParseInput {
+                workspace_id: WorkspaceId::new(),
+                relative_path: Path::new("src/lib.rs"),
+                source: b"fn broken( {",
+            })
+            .expect("tree-sitter should return a recovered tree");
+
+        assert_eq!(document.status(), super::super::ParsedDocumentStatus::Recovered);
+        assert!(document.root_node().has_error());
+    }
+
+    #[test]
+    fn parsed_document_observes_shared_cancellation() {
+        let budget = ScanBudget::new(ScanLimits::default());
+        budget.cancel();
+        let limits = ParseLimits::default();
+        let error = RustProvider
+            .parse_document_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"fn main() {}",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect_err("cancelled budget must stop native parsing");
+
+        assert!(matches!(
+            error,
+            ProviderError::Budget(crate::ScanBudgetError::Cancelled)
+        ));
     }
 
     #[test]
