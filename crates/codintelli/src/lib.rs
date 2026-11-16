@@ -17,11 +17,15 @@
 //! root. Callers that need identity to survive restarts must persist the ID in
 //! host-managed metadata and supply it again when opening the workspace.
 
+pub mod classification;
 pub mod fs;
 pub mod scan_budget;
 pub mod scanner;
 pub mod workspace;
 
+pub use classification::{
+    classify_entry, classify_path, ClassificationReason, FileCategory, FileClassification, LanguageId,
+};
 pub use fs::{
     DirectoryListing, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs, WorkspaceFsError,
 };
