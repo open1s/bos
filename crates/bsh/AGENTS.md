@@ -4239,3 +4239,28 @@ Traps worth keeping:
   the way AppKit keeps its lights above the content: a modal must not dim the one
   control that closes the window.
 
+## Extension grants: the pane's 授权 must mean what `ext grant` means
+
+The Installed row's 授权 button (`extension::grant_required`) is the reader's decision,
+so it must write the grant the row needs. Two seams made a Cordis package impossible to
+fix from the UI (reported against `com.open1s.vcs` 1.4.0, "授权 not work"):
+
+- **A Cordis runtime has no process executable to scope.** Its `[runtime.config] entry`
+  is the JavaScript module it loads, and the commands it runs are chosen per
+  `terminal.run` call, so `grant_required` refused with "process extension has no
+  declared executable" and wrote nothing. It now grants `process.execute` as `any` for
+  Cordis — the same scope `ext grant` derives — and the runtime's per-call check still
+  gates every command. Process and MCP keep the declared program; `status.program` now
+  covers MCP too, because its capability row is decided under the same program scope the
+  activation check carries.
+- **A grant written by `bsh ext grant` lives in another process's memory.** The running
+  host loaded `grants.toml` at open and `rebuild` never re-read it, so following the
+  error row's own CLI hint changed the file and left the pane failing. `rebuild` now
+  calls `PolicyEngine::reload_grants` first: the file is the source of truth, and
+  in-process grants are persisted before they are applied, so the reload cannot lose
+  one (a revoke written the same way now lands without a restart too).
+
+Tests: `extension::host::tests::the_grant_button_scopes_a_cordis_package_to_any_program`
+and `extension::host::tests::an_external_grant_reaches_a_running_host`, both
+discrimination-checked by reverting the two fixes (each fails with the reported denial).
+

@@ -889,6 +889,24 @@ impl PolicyEngine {
             .grant(extension, capability, scope, note)
     }
 
+    /// Re-read the grant document.
+    ///
+    /// `bsh ext grant` opens its own engine over the same file, so a host
+    /// that was already open keeps the snapshot it loaded at startup and
+    /// never sees that grant. Reloading under the same lock `grant` takes
+    /// keeps the two writers from interleaving: a grant this engine writes
+    /// is on disk before it is in memory, and a reload reads the whole
+    /// document, so neither path can resurrect a revoked capability.
+    pub fn reload_grants(&self) -> Result<(), ExtensionError> {
+        let mut store = self.grants.lock().map_err(|_| ExtensionError::Corrupt {
+            path: PathBuf::new(),
+            message: "grant store lock is poisoned".to_string(),
+        })?;
+        let path = store.path().to_path_buf();
+        *store = GrantStore::load(path)?;
+        Ok(())
+    }
+
     /// Revoke a grant. Returns whether it existed.
     pub fn revoke(&self, extension: &str, capability: Capability) -> Result<bool, ExtensionError> {
         self.grants
@@ -1519,6 +1537,37 @@ mod tests {
                 },
             )
             .is_allowed());
+    }
+
+    #[test]
+    fn a_reload_sees_a_grant_written_by_another_engine() {
+        let scratch = Scratch::new("reload");
+        let running = engine(&scratch);
+        // The CLI writes through its own engine, as `bsh ext grant` does.
+        let cli = engine(&scratch);
+        cli.grant(
+            "com.example.tool",
+            Capability::ProcessExecute,
+            GrantScope::Any,
+            None,
+        )
+        .expect("cli grant");
+        assert!(
+            running.grants_for("com.example.tool").is_empty(),
+            "the running engine still holds its startup snapshot"
+        );
+        running.reload_grants().expect("reload");
+        let grant = running
+            .grants_for("com.example.tool")
+            .get("process.execute")
+            .cloned()
+            .expect("reloaded grant");
+        assert_eq!(grant.scope, GrantScope::Any);
+        // A revoke written the same way is picked up by the next reload.
+        cli.revoke("com.example.tool", Capability::ProcessExecute)
+            .expect("cli revoke");
+        running.reload_grants().expect("second reload");
+        assert!(running.grants_for("com.example.tool").is_empty());
     }
 
     #[test]

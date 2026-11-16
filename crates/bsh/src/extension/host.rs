@@ -213,7 +213,7 @@ pub(crate) struct ExtensionStatus {
     pub(crate) versions: Vec<String>,
     /// Runtime kind.
     pub(crate) runtime: String,
-    /// Declared process executable, when the runtime is a process.
+    /// Declared process executable, when the runtime spawns one (process or MCP).
     pub(crate) program: Option<String>,
     /// Trust level.
     pub(crate) trust: String,
@@ -1952,6 +1952,12 @@ impl ExtensionHost {
     }
 
     fn rebuild(&mut self) -> Result<(), ExtensionError> {
+        // The grant document is shared with `bsh ext grant`, which opens its
+        // own engine over the same file. Without this reload a grant (or a
+        // revoke) written from another process while this host runs never
+        // reaches the activation check below, so the pane kept reporting the
+        // denial after the reader had already granted it.
+        self.policy.reload_grants()?;
         // A previous batch must not activate a runtime that this rebuild is
         // about to replace, disable or remove.
         self.stop_warm_startup();
@@ -3311,8 +3317,9 @@ impl ExtensionHost {
     /// This is the explicit UI decision behind the Installed row's Grant
     /// button. The button is only shown when a required capability is denied;
     /// each grant is written with the narrowest default scope available here
-    /// (workspace for path capabilities, declared program for process, any for
-    /// the rest) and is audited with the pane as its note.
+    /// (workspace for path capabilities, the declared program for a process or
+    /// MCP runtime, any for Cordis and the rest) and is audited with the pane
+    /// as its note.
     pub(crate) fn grant_required(&mut self, id: &str) -> Result<usize, ExtensionError> {
         let status = self
             .statuses()
@@ -3329,13 +3336,26 @@ impl ExtensionHost {
             let parsed: Capability = capability.capability.parse()?;
             let scope = match parsed {
                 Capability::WorkspaceRead | Capability::WorkspaceWrite => GrantScope::Workspace,
-                Capability::ProcessExecute => {
-                    GrantScope::Program(program.clone().ok_or_else(|| ExtensionError::Denied {
-                        extension: id.to_string(),
-                        capability: capability.capability.clone(),
-                        reason: "process extension has no declared executable".to_string(),
-                    })?)
-                }
+                Capability::ProcessExecute => match program.clone() {
+                    // A process or MCP runtime names the executable its
+                    // manifest spawns, so the grant is scoped to it.
+                    Some(program) => GrantScope::Program(program),
+                    // The Cordis runtime runs whatever command a tool asks
+                    // for through terminal.run, and its declared entry is
+                    // the JavaScript module it loads, not an executable:
+                    // there is no program to scope to, and the runtime's
+                    // per-call check still gates every command. Refusing
+                    // here left the Grant button unable to fix a Cordis
+                    // package at all.
+                    None if status.runtime == RuntimeKind::Cordis.as_str() => GrantScope::Any,
+                    None => {
+                        return Err(ExtensionError::Denied {
+                            extension: id.to_string(),
+                            capability: capability.capability.clone(),
+                            reason: "process extension has no declared executable".to_string(),
+                        })
+                    }
+                },
                 // A secret or a host cannot be named from this pane, and
                 // granting "any" would be wider than the standard's
                 // secret:NAME / domain: scope. Leave the denial; its reason
@@ -3741,7 +3761,14 @@ impl ExtensionHost {
             .clone()
             .or_else(|| record.and_then(|record| record.last_error.clone()));
         let mut scope = self.host_scope();
-        if entry.package.manifest.runtime.kind == RuntimeKind::Process {
+        // MCP spawns a child exactly like the process runtime, so the
+        // capability row must be decided under the same program scope the
+        // activation check carries; a Cordis entry is a module, not an
+        // executable, and stays scope-free.
+        if matches!(
+            entry.package.manifest.runtime.kind,
+            RuntimeKind::Process | RuntimeKind::Mcp
+        ) {
             scope.program = entry.package.manifest.runtime.entry.clone();
         }
         let mut capabilities = Vec::new();
@@ -6268,6 +6295,171 @@ tools = ["echo"]
             .find(|status| status.id == "com.example.secretive")
             .expect("status");
         assert!(!status.applied, "{status:?}");
+    }
+
+    /// The Installed row's Grant button used to refuse every Cordis package:
+    /// the runtime spawns the commands its tools ask for through
+    /// terminal.run, so the manifest has no executable to scope the grant to,
+    /// and the button answered "process extension has no declared executable"
+    /// instead of granting. The grant is `any` (as `bsh ext grant` defaults
+    /// to); the runtime still gates every command it runs.
+    #[tokio::test]
+    async fn the_grant_button_scopes_a_cordis_package_to_any_program() {
+        let root = scratch("grant-cordis");
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).expect("source");
+        write_manifest(
+            &source,
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.cordis-grant"
+name = "Cordis Grant"
+version = "1.0.0"
+description = "A Cordis package that runs commands"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "cordis"
+entry = "index.js"
+startup = "on-demand"
+
+[capabilities]
+required = ["process.execute", "agent.tools.register"]
+"#,
+        );
+        std::fs::write(
+            source.join("index.js"),
+            "module.exports = { apply() {} };\n",
+        )
+        .expect("entry");
+        let store = ExtensionStore::open(&root).expect("store");
+        store.install(&source).expect("install");
+        let mut host = ExtensionHost::open(config(&root)).expect("host");
+        let before = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.example.cordis-grant")
+            .expect("status");
+        assert_eq!(before.runtime, "cordis");
+        assert!(
+            before.program.is_none(),
+            "a Cordis entry is a module, not an executable: {before:?}"
+        );
+        assert!(before.capabilities.iter().any(|capability| {
+            capability.capability == "process.execute" && capability.required && !capability.allowed
+        }));
+        let granted = host
+            .grant_required("com.example.cordis-grant")
+            .expect("the Grant button must grant a Cordis package");
+        assert!(granted >= 1, "granted {granted} capabilities");
+        let grant = host
+            .policy()
+            .grants_for("com.example.cordis-grant")
+            .get("process.execute")
+            .cloned()
+            .expect("the process.execute grant is written");
+        assert_eq!(
+            grant.scope,
+            GrantScope::Any,
+            "there is no executable to scope to"
+        );
+        let after = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.example.cordis-grant")
+            .expect("status");
+        assert!(
+            after
+                .capabilities
+                .iter()
+                .filter(|capability| capability.required)
+                .all(|capability| capability.allowed),
+            "every required capability is now granted: {:?}",
+            after.capabilities
+        );
+        host.shutdown().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `bsh ext grant` runs in its own process with its own policy engine:
+    /// the grant is on disk, not in a running host's memory. A rebuild must
+    /// re-read the shared document, or the pane keeps reporting the denial
+    /// until the reader restarts the app.
+    #[test]
+    fn an_external_grant_reaches_a_running_host() {
+        let root = scratch("grant-external");
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("tools")).expect("tools");
+        write_manifest(
+            &source,
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.external"
+name = "External"
+version = "1.0.0"
+description = "Granted from the CLI while the host runs"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[capabilities]
+required = ["workspace.write"]
+
+[contributes]
+tools = ["echo"]
+"#,
+        );
+        std::fs::write(
+            source.join("tools/echo.json"),
+            r#"{"description":"Echo","implementation":{"kind":"echo_arguments"}}"#,
+        )
+        .expect("tool");
+        let store = ExtensionStore::open(&root).expect("store");
+        store.install(&source).expect("install");
+        let mut host = ExtensionHost::open(config(&root)).expect("host");
+        let before = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.example.external")
+            .expect("status");
+        assert!(!before.applied, "a high-risk capability starts denied");
+        // The CLI's engine writes the same document through its own handle.
+        let cli = PolicyEngine::open(
+            host.policy().grants_path(),
+            root.join("cli-audit.jsonl"),
+            PolicyMode::Enforce,
+        )
+        .expect("cli policy");
+        cli.grant(
+            "com.example.external",
+            Capability::WorkspaceWrite,
+            GrantScope::Workspace,
+            None,
+        )
+        .expect("cli grant");
+        host.ensure_fresh().expect("refresh");
+        let after = host
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == "com.example.external")
+            .expect("status");
+        assert!(
+            after.applied,
+            "the running host picks up a grant written elsewhere: {:?}",
+            after.error
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     struct BlockingActivate {
