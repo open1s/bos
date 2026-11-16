@@ -157,7 +157,7 @@ impl RustProvider {
                             scope_path: enclosing_module_path(node, source),
                             name: name.trim_start_matches("r#").to_owned(),
                             is_inline: node.child_by_field_name("body").is_some(),
-                            has_attributes: has_outer_attributes(node),
+                            has_resolution_attributes: has_resolution_attributes(node, source),
                             range,
                         });
                     }
@@ -253,11 +253,24 @@ impl RustProvider {
     }
 }
 
-fn has_outer_attributes(node: Node<'_>) -> bool {
-    // In tree-sitter-rust 0.24.x, outer attribute_item nodes are siblings
-    // immediately preceding the declaration, not children of mod_item.
-    node.prev_named_sibling()
-        .is_some_and(|sibling| sibling.kind() == "attribute_item")
+fn has_resolution_attributes(node: Node<'_>, source: &str) -> bool {
+    // Outer attribute_item nodes are siblings immediately preceding mod_item.
+    // Only attributes that can change module inclusion or file selection make
+    // conventional path mapping unsafe; doc/lint/derive-style attributes do not.
+    let mut previous = node.prev_named_sibling();
+    while let Some(sibling) = previous {
+        if sibling.kind() != "attribute_item" {
+            break;
+        }
+        let attribute = source.get(sibling.byte_range()).unwrap_or_default().trim_start();
+        if attribute.starts_with("#[cfg")
+            || attribute.starts_with("#[path")
+        {
+            return true;
+        }
+        previous = sibling.prev_named_sibling();
+    }
+    false
 }
 
 fn enclosing_module_path(node: Node<'_>, source: &str) -> Vec<String> {
@@ -507,8 +520,8 @@ mod optional;
 #[path = "custom/location.rs"]
 mod custom;
 "#);
-        assert!(result.modules.iter().any(|item| item.name == "optional" && item.has_attributes));
-        assert!(result.modules.iter().any(|item| item.name == "custom" && item.has_attributes));
+        assert!(result.modules.iter().any(|item| item.name == "optional" && item.has_resolution_attributes));
+        assert!(result.modules.iter().any(|item| item.name == "custom" && item.has_resolution_attributes));
     }
 
     #[test]
