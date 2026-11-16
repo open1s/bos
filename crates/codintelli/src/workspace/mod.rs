@@ -6,4 +6,4 @@
 
 mod identity;
 
-pub use identity::{WorkspaceDescriptor, WorkspaceError, WorkspaceId};
+pub use identity::{WorkspaceDescriptor, WorkspaceError, WorkspaceId, WorkspaceRegistry};

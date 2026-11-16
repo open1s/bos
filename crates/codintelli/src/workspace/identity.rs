@@ -54,7 +54,7 @@ impl Default for WorkspaceId {
 
 impl fmt::Display for WorkspaceId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        fmt::Display::fmt(&self.0, formatter)
     }
 }
 
@@ -133,6 +133,85 @@ impl WorkspaceDescriptor {
         &self.canonical_root
     }
 
+/// In-memory registry that enforces a one-to-one mapping between workspace
+/// IDs and canonical roots within one Engine instance.
+///
+/// The registry does not persist IDs. The embedding host must reload the same
+/// ID for a checkout after restart. Different worktrees must be registered
+/// with different IDs, even when they share a Git repository.
+#[derive(Debug, Default)]
+pub struct WorkspaceRegistry {
+    by_id: std::collections::HashMap<WorkspaceId, WorkspaceDescriptor>,
+    by_root: std::collections::HashMap<PathBuf, WorkspaceId>,
+}
+
+impl WorkspaceRegistry {
+    /// Register a workspace, allowing an identical registration to be repeated.
+    ///
+    /// # Errors
+    ///
+    /// Returns DuplicateId if an ID is already associated with another root,
+    /// or DuplicateRoot if a root is already associated with another ID.
+    pub fn register(
+        &mut self,
+        descriptor: WorkspaceDescriptor,
+    ) -> Result<(), WorkspaceError> {
+        let id = descriptor.id();
+        let root = descriptor.canonical_root().to_path_buf();
+
+        if let Some(existing) = self.by_id.get(&id) {
+            if existing.canonical_root() != root {
+                return Err(WorkspaceError::DuplicateId {
+                    id,
+                    existing_root: existing.canonical_root().to_path_buf(),
+                    new_root: root,
+                });
+            }
+            return Ok(());
+        }
+
+        if let Some(existing_id) = self.by_root.get(&root) {
+            if *existing_id != id {
+                return Err(WorkspaceError::DuplicateRoot {
+                    root,
+                    existing_id: *existing_id,
+                    new_id: id,
+                });
+            }
+            return Ok(());
+        }
+
+        self.by_root.insert(root, id);
+        self.by_id.insert(id, descriptor);
+        Ok(())
+    }
+
+    /// Find a registered workspace by its opaque identity.
+    #[must_use]
+    pub fn get(&self, id: WorkspaceId) -> Option<&WorkspaceDescriptor> {
+        self.by_id.get(&id)
+    }
+
+    /// Remove a workspace and return its descriptor, if registered.
+    pub fn remove(&mut self, id: WorkspaceId) -> Option<WorkspaceDescriptor> {
+        let descriptor = self.by_id.remove(&id)?;
+        self.by_root.remove(descriptor.canonical_root());
+        Some(descriptor)
+    }
+
+    /// Return the number of registered workspaces.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    /// Return whether the registry contains no workspaces.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+}
+
     /// Re-resolve the root and reject a missing or redirected directory.
     ///
     /// This detects a root whose path now resolves elsewhere, such as a path
@@ -194,6 +273,28 @@ pub enum WorkspaceError {
         path: PathBuf,
     },
 
+    /// A workspace ID is already associated with a different root.
+    #[error("workspace ID {id} is already registered for {existing_root}, not {new_root}")]
+    DuplicateId {
+        /// Conflicting workspace ID.
+        id: WorkspaceId,
+        /// Root already associated with the ID.
+        existing_root: PathBuf,
+        /// Root being registered.
+        new_root: PathBuf,
+    },
+
+    /// A canonical root is already associated with a different workspace ID.
+    #[error("workspace root {root} is already registered as {existing_id}, not {new_id}")]
+    DuplicateRoot {
+        /// Canonical root already registered.
+        root: PathBuf,
+        /// ID already associated with the root.
+        existing_id: WorkspaceId,
+        /// ID being registered.
+        new_id: WorkspaceId,
+    },
+
     /// The workspace root now resolves to a different canonical path.
     #[error("workspace root changed from {expected} to {actual}")]
     RootChanged {
@@ -251,6 +352,68 @@ mod tests {
         let error = WorkspaceDescriptor::new(WorkspaceId::new(), &file)
             .expect_err("file cannot be a workspace root");
         assert!(matches!(error, WorkspaceError::NotDirectory { .. }));
+    }
+
+    #[test]
+    fn registry_keeps_worktrees_with_separate_ids() {
+        let first = tempfile::tempdir().expect("first worktree");
+        let second = tempfile::tempdir().expect("second worktree");
+        let first_id = WorkspaceId::new();
+        let second_id = WorkspaceId::new();
+        let mut registry = WorkspaceRegistry::default();
+
+        registry
+            .register(WorkspaceDescriptor::new(first_id, first.path()).expect("first descriptor"))
+            .expect("register first worktree");
+        registry
+            .register(
+                WorkspaceDescriptor::new(second_id, second.path()).expect("second descriptor"),
+            )
+            .expect("register second worktree");
+
+        assert_eq!(registry.len(), 2);
+        assert_ne!(
+            registry.get(first_id).expect("first registered").canonical_root(),
+            registry.get(second_id).expect("second registered").canonical_root()
+        );
+    }
+
+    #[test]
+    fn registry_rejects_one_id_for_two_roots() {
+        let first = tempfile::tempdir().expect("first workspace");
+        let second = tempfile::tempdir().expect("second workspace");
+        let id = WorkspaceId::new();
+        let mut registry = WorkspaceRegistry::default();
+        registry
+            .register(WorkspaceDescriptor::new(id, first.path()).expect("first descriptor"))
+            .expect("register first workspace");
+
+        let error = registry
+            .register(WorkspaceDescriptor::new(id, second.path()).expect("second descriptor"))
+            .expect_err("one ID cannot identify two roots");
+
+        assert!(matches!(error, WorkspaceError::DuplicateId { .. }));
+    }
+
+    #[test]
+    fn registry_rejects_two_ids_for_one_root() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let mut registry = WorkspaceRegistry::default();
+        registry
+            .register(
+                WorkspaceDescriptor::new(WorkspaceId::new(), directory.path())
+                    .expect("first descriptor"),
+            )
+            .expect("register first identity");
+
+        let error = registry
+            .register(
+                WorkspaceDescriptor::new(WorkspaceId::new(), directory.path())
+                    .expect("second descriptor"),
+            )
+            .expect_err("one root cannot have two IDs");
+
+        assert!(matches!(error, WorkspaceError::DuplicateRoot { .. }));
     }
 
     #[test]

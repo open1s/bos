@@ -19,4 +19,4 @@
 
 pub mod workspace;
 
-pub use workspace::{WorkspaceDescriptor, WorkspaceError, WorkspaceId};
+pub use workspace::{WorkspaceDescriptor, WorkspaceError, WorkspaceId, WorkspaceRegistry};
