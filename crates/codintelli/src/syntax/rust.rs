@@ -255,7 +255,8 @@ fn source_range(node: Node<'_>, source_len: usize) -> Option<SourceRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WorkspaceId;
+    use crate::{ParseControl, ParseLimits, ScanBudget, ScanLimits, WorkspaceId};
+    use std::time::Duration;
     use std::path::{Path, PathBuf};
 
     fn parse(source: &str) -> ParseResult {
@@ -335,6 +336,76 @@ fn helper() {}
             .expect("parse source");
         assert_eq!(result.workspace_id, id);
         assert_eq!(result.relative_path, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn cooperatively_rejects_an_already_cancelled_scan() {
+        let budget = ScanBudget::new(ScanLimits::default());
+        budget.cancel();
+        let limits = ParseLimits::default();
+        let error = RustProvider
+            .parse_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"fn main() {}",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect_err("cancelled budget must stop parsing");
+
+        assert!(matches!(
+            error,
+            ProviderError::Budget(crate::ScanBudgetError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn bounds_fact_output_and_preserves_limited_status() {
+        let budget = ScanBudget::new(ScanLimits {
+            max_duration: Duration::from_secs(10),
+            ..ScanLimits::default()
+        });
+        let limits = ParseLimits {
+            max_nodes: 1000,
+            max_facts: 1,
+            max_diagnostics: 10,
+        };
+        let result = RustProvider
+            .parse_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"fn first() {} fn second() {}",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect("parse within limits");
+
+        assert_eq!(result.status, ParseStatus::Limited);
+        assert_eq!(result.facts.len(), 1);
+    }
+
+    #[test]
+    fn bounds_syntax_tree_traversal() {
+        let budget = ScanBudget::new(ScanLimits::default());
+        let limits = ParseLimits {
+            max_nodes: 1,
+            max_facts: 100,
+            max_diagnostics: 10,
+        };
+        let result = RustProvider
+            .parse_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"fn main() {}",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect("parse within node limit");
+
+        assert_eq!(result.status, ParseStatus::Limited);
     }
 
     #[test]
