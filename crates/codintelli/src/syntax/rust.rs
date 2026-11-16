@@ -3,7 +3,7 @@
 //! Tree-sitter owns lexical and syntactic parsing. This module only projects
 //! grammar nodes into codintelli's language-neutral syntax-fact contract.
 
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, sync::Arc};
 
 use tree_sitter::{Node, ParseOptions, Parser, ParseState};
 
@@ -12,7 +12,7 @@ use crate::classification::LanguageId;
 use super::{
     valid_relative_path, ImportFact, RustModuleFact, LanguageProvider, ParseDiagnostic, ParseInput, ParseResult,
     ParseStatus, ParseControl, ParseLimitKind, ParseLimits, ProviderError, SourceRange,
-    SyntaxFact, SyntaxFactKind,
+    ParsedDocument, SyntaxFact, SyntaxFactKind,
 };
 
 /// Rust provider using the upstream Tree-sitter Rust grammar.
@@ -24,7 +24,7 @@ impl RustProvider {
     pub const ID: &'static str = "codintelli.rust.tree-sitter";
 
     /// Parser and grammar versions used by this provider.
-    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2/facts-v4";
+    pub const VERSION: &'static str = "tree-sitter-0.26.13/tree-sitter-rust-0.24.2/facts-v3";
 }
 
 impl LanguageProvider for RustProvider {
@@ -54,6 +54,87 @@ impl LanguageProvider for RustProvider {
 }
 
 impl RustProvider {
+    /// Parse a bounded UTF-8 source snapshot and retain the native Tree-sitter tree.
+    ///
+    /// Unlike the compatibility fact-projection API, this returns no custom
+    /// syntax representation. Consumers query and traverse the native tree.
+    pub fn parse_document(
+        &self,
+        input: ParseInput<'_>,
+    ) -> Result<ParsedDocument, ProviderError> {
+        self.parse_document_bounded(input, None)
+    }
+
+    /// Parse a bounded source snapshot while observing shared cancellation.
+    pub fn parse_document_with_control(
+        &self,
+        input: ParseInput<'_>,
+        control: &ParseControl<'_>,
+    ) -> Result<ParsedDocument, ProviderError> {
+        self.parse_document_bounded(input, Some(control))
+    }
+
+    fn parse_document_bounded(
+        &self,
+        input: ParseInput<'_>,
+        control: Option<&ParseControl<'_>>,
+    ) -> Result<ParsedDocument, ProviderError> {
+        if !valid_relative_path(input.relative_path) {
+            return Err(ProviderError::InvalidPath);
+        }
+        std::str::from_utf8(input.source)?;
+        if let Some(control) = control {
+            control.check()?;
+        }
+
+        let source: Arc<[u8]> = Arc::from(input.source);
+        let mut parser = Parser::new();
+        let language = tree_sitter_rust::LANGUAGE.into();
+        parser
+            .set_language(&language)
+            .map_err(|error| ProviderError::ParserInitialization(error.to_string()))?;
+
+        let mut budget_error = None;
+        let mut progress = |_: &ParseState| match control.map(ParseControl::check) {
+            Some(Err(error)) => {
+                budget_error = Some(error);
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        };
+        let options = ParseOptions::new().progress_callback(&mut progress);
+        let tree = parser.parse_with_options(
+            &mut |offset, _| source.get(offset..).unwrap_or(&[]),
+            None,
+            Some(options),
+        );
+        drop(progress);
+
+        let Some(tree) = tree else {
+            parser.reset();
+            if let Some(error) = budget_error {
+                return Err(ProviderError::Budget(error));
+            }
+            if let Some(control) = control {
+                control.check()?;
+            }
+            return Err(ProviderError::ParseAborted);
+        };
+        if let Some(control) = control {
+            control.check()?;
+        }
+
+        Ok(ParsedDocument::new(
+            input.workspace_id,
+            input.relative_path.to_path_buf(),
+            LanguageId::Rust,
+            Self::ID.to_owned(),
+            Self::VERSION.to_owned(),
+            source,
+            tree,
+        ))
+    }
+
     fn parse_bounded(
         &self,
         input: ParseInput<'_>,
@@ -205,7 +286,6 @@ impl RustProvider {
                         scope_path: enclosing_module_path(node, source),
                         is_module_scope: is_module_scope(node),
                         visibility: rust_visibility(node, source),
-                        namespace: rust_namespace(node, kind),
                         range,
                     });
                 }
@@ -431,38 +511,6 @@ fn rust_visibility(node: Node<'_>, source: &str) -> Option<super::RustVisibility
     })
 }
 
-fn rust_namespace(node: Node<'_>, kind: SyntaxFactKind) -> Option<super::RustNamespace> {
-    match kind {
-        SyntaxFactKind::Module
-        | SyntaxFactKind::Struct
-        | SyntaxFactKind::Enum
-        | SyntaxFactKind::Union
-        | SyntaxFactKind::Trait
-        | SyntaxFactKind::TypeAlias => Some(super::RustNamespace::Type),
-        SyntaxFactKind::Function if !is_associated_item(node) => {
-            Some(super::RustNamespace::Value)
-        }
-        SyntaxFactKind::Function | SyntaxFactKind::Method => {
-            Some(super::RustNamespace::Associated)
-        }
-        SyntaxFactKind::Constant | SyntaxFactKind::Static if is_associated_item(node) => {
-            Some(super::RustNamespace::Associated)
-        }
-        SyntaxFactKind::Constant | SyntaxFactKind::Static => Some(super::RustNamespace::Value),
-        SyntaxFactKind::Macro => Some(super::RustNamespace::Macro),
-        SyntaxFactKind::Impl
-        | SyntaxFactKind::Import
-        | SyntaxFactKind::Call
-        | SyntaxFactKind::MethodCall => None,
-    }
-}
-
-fn is_associated_item(node: Node<'_>) -> bool {
-    node.parent()
-        .and_then(|parent| parent.parent())
-        .is_some_and(|ancestor| matches!(ancestor.kind(), "impl_item" | "trait_item"))
-}
-
 fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option<String>)> {
     let kind = match node.kind() {
         "mod_item" => SyntaxFactKind::Module,
@@ -477,7 +525,7 @@ fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option
         "impl_item" => SyntaxFactKind::Impl,
         "type_item" => SyntaxFactKind::TypeAlias,
         "const_item" => SyntaxFactKind::Constant,
-        "static_item" => SyntaxFactKind::Static,\n        "macro_definition" => SyntaxFactKind::Macro,
+        "static_item" => SyntaxFactKind::Static,
         "use_declaration" => SyntaxFactKind::Import,
         "call_expression" => {
             let function = node.child_by_field_name("function")?;
@@ -541,6 +589,65 @@ mod tests {
                 source: source.as_bytes(),
             })
             .expect("provider accepts UTF-8 source")
+    }
+
+    #[test]
+    fn parsed_document_exposes_native_tree_and_matching_source_snapshot() {
+        let source = b"pub fn greet() {}";
+        let document = RustProvider
+            .parse_document(ParseInput {
+                workspace_id: WorkspaceId::new(),
+                relative_path: Path::new("src/lib.rs"),
+                source,
+            })
+            .expect("parse native document");
+
+        assert_eq!(document.status(), super::super::ParsedDocumentStatus::Complete);
+        assert_eq!(document.source(), source);
+        assert_eq!(document.root_node().kind(), "source_file");
+
+        let function = document.root_node().named_child(0).expect("function node");
+        assert_eq!(function.kind(), "function_item");
+        let name = function.child_by_field_name("name").expect("function name");
+        assert_eq!(document.text_for_node(&name), Some("greet"));
+        assert_eq!(document.relative_path(), Path::new("src/lib.rs"));
+    }
+
+    #[test]
+    fn parsed_document_preserves_tree_sitter_recovery() {
+        let document = RustProvider
+            .parse_document(ParseInput {
+                workspace_id: WorkspaceId::new(),
+                relative_path: Path::new("src/lib.rs"),
+                source: b"fn broken( {",
+            })
+            .expect("tree-sitter should return a recovered tree");
+
+        assert_eq!(document.status(), super::super::ParsedDocumentStatus::Recovered);
+        assert!(document.root_node().has_error());
+    }
+
+    #[test]
+    fn parsed_document_observes_shared_cancellation() {
+        let budget = ScanBudget::new(ScanLimits::default());
+        budget.cancel();
+        let limits = ParseLimits::default();
+        let error = match RustProvider.parse_document_with_control(
+            ParseInput {
+                workspace_id: WorkspaceId::new(),
+                relative_path: Path::new("src/lib.rs"),
+                source: b"fn main() {}",
+            },
+            &ParseControl::new(&budget, &limits),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled budget must stop native parsing"),
+        };
+
+        assert!(matches!(
+            error,
+            ProviderError::Budget(crate::ScanBudgetError::Cancelled)
+        ));
     }
 
     #[test]

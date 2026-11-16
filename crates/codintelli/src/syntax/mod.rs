@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use crate::{classification::LanguageId, ScanBudget, ScanBudgetError, WorkspaceId};
 
+pub mod document;
 pub mod rust;
+
+pub use document::{ParsedDocument, ParsedDocumentStatus};
 
 /// Half-open byte range in the original UTF-8 source file.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -59,21 +62,6 @@ pub enum SyntaxFactKind {
     MethodCall,
 }
 
-/// Rust name namespace attached to a source-backed declaration.
-///
-/// This is a syntactic classification, not a complete Rust name-resolution model.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum RustNamespace {
-    /// Modules, structs, enums, unions, traits, and type aliases.
-    Type,
-    /// Free functions, constants, and statics.
-    Value,
-    /// Declarative macro definitions.
-    Macro,
-    /// Methods and associated type/constant items inside traits or impls.
-    Associated,
-}
-
 /// Rust visibility written on a declaration or import.
 ///
 /// This records the syntactic visibility modifier only. It does not calculate
@@ -110,8 +98,6 @@ pub struct SyntaxFact {
     pub is_module_scope: bool,
     /// Explicit or implicit Rust visibility for declarations/imports; absent for references.
     pub visibility: Option<RustVisibility>,
-    /// Rust namespace for declarations; absent where namespace is not applicable or modeled.
-    pub namespace: Option<RustNamespace>,
     /// Exact source byte range.
     pub range: SourceRange,
 }
