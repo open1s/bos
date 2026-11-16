@@ -198,7 +198,9 @@ fn classify_well_known_name(name: &str) -> Option<FileClassification> {
         "package.json" | "tsconfig.json" | "jsconfig.json" => {
             classification(Configuration, Some(LanguageId::Json), WellKnownFileName)
         }
-        "package-lock.json" => classification(Configuration, Some(LanguageId::Json), WellKnownFileName),
+        "package-lock.json" => {
+            classification(Configuration, Some(LanguageId::Json), WellKnownFileName)
+        }
         "pnpm-lock.yaml" => {
             classification(Configuration, Some(Yaml), WellKnownFileName)
         }
@@ -398,12 +400,10 @@ mod tests {
         {
             use std::os::unix::ffi::OsStrExt;
             let path = Path::new(std::ffi::OsStr::from_bytes(b"source.\xff"));
-            assert_eq!(
-                classify_path(path).category,
-                FileCategory::Unknown
-            );
+            assert_eq!(classify_path(path).category, FileCategory::Unknown);
         }
     }
+
     #[test]
     fn classifies_justfiles_and_jsonc_as_configuration() {
         assert_eq!(
