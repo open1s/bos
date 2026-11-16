@@ -2020,6 +2020,8 @@ version = "4.1.12"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "proc-macro2",
+ "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.21",
  "tree-sitter 0.26.13",
