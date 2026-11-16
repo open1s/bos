@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use crate::{
     index::{SourceIndexReport, SourceFileStatus},
-    syntax::{ParseStatus, SyntaxFactKind},
+    syntax::SyntaxFactKind,
     WorkspaceId,
 };
 
@@ -279,7 +279,7 @@ fn import_leaf(import: &str) -> Option<&str> {
         .strip_suffix(';')?
         .trim();
     if declaration.is_empty()
-        || declaration.contains(['{', '}', '*', ','])
+        || declaration.chars().any(|character| matches!(character, '{' | '}' | '*' | ','))
         || declaration.contains(" as ")
     {
         return None;
@@ -304,5 +304,85 @@ mod tests {
         assert_eq!(import_leaf("use crate::model::{A, B};"), None);
         assert_eq!(import_leaf("use crate::model::*;"), None);
         assert_eq!(import_leaf("use crate::model::A as B;"), None);
+    }
+
+    #[test]
+    fn builds_unique_and_ambiguous_candidates_from_real_rust_facts() {
+        use crate::{index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor, WorkspaceFs};
+        use std::{fs, time::Duration};
+        use tempfile::tempdir;
+
+        let root = tempdir().expect("create workspace");
+        fs::write(
+            root.path().join("lib.rs"),
+            "fn helper() {} fn caller() { helper(); }",
+        )
+        .expect("write source");
+        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
+            .expect("create descriptor");
+        let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
+        let budget = ScanBudget::new(ScanLimits {
+            max_duration: Duration::from_secs(10),
+            ..ScanLimits::default()
+        });
+        let source = index_rust_workspace(&workspace, &budget, &IgnorePolicy::default());
+        let report = build_symbol_candidates(workspace.workspace_id(), &source)
+            .expect("same workspace identity");
+
+        assert_eq!(report.symbols.len(), 2);
+        assert_eq!(report.unique_candidate_references, 1);
+        assert_eq!(report.references[0].state, CandidateState::UniqueCandidate);
+        assert_eq!(report.references[0].candidates.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_names_remain_ambiguous_instead_of_selecting_arbitrarily() {
+        use crate::{index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor, WorkspaceFs};
+        use std::{fs, time::Duration};
+        use tempfile::tempdir;
+
+        let root = tempdir().expect("create workspace");
+        fs::write(
+            root.path().join("lib.rs"),
+            "fn helper() {} mod nested { fn helper() {} } fn caller() { helper(); }",
+        )
+        .expect("write source");
+        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
+            .expect("create descriptor");
+        let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
+        let budget = ScanBudget::new(ScanLimits {
+            max_duration: Duration::from_secs(10),
+            ..ScanLimits::default()
+        });
+        let source = index_rust_workspace(&workspace, &budget, &IgnorePolicy::default());
+        let report = build_symbol_candidates(workspace.workspace_id(), &source)
+            .expect("same workspace identity");
+
+        assert_eq!(report.ambiguous_references, 1);
+        assert_eq!(report.references[0].state, CandidateState::AmbiguousCandidates);
+        assert_eq!(report.references[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn rejects_facts_from_another_workspace() {
+        use crate::{index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor, WorkspaceFs};
+        use std::{fs, time::Duration};
+        use tempfile::tempdir;
+
+        let root = tempdir().expect("create workspace");
+        fs::write(root.path().join("lib.rs"), "fn helper() {}").expect("write source");
+        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
+            .expect("create descriptor");
+        let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
+        let budget = ScanBudget::new(ScanLimits {
+            max_duration: Duration::from_secs(10),
+            ..ScanLimits::default()
+        });
+        let source = index_rust_workspace(&workspace, &budget, &IgnorePolicy::default());
+
+        assert_eq!(
+            build_symbol_candidates(WorkspaceId::new(), &source),
+            Err(SymbolCandidateError::MixedWorkspaces)
+        );
     }
 }
