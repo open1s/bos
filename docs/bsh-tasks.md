@@ -115,6 +115,13 @@ Status rules:
   verified completion, and retrying a non-idempotent execution merely because
   verification is pending is forbidden.
 
+Verification execution: a task's `verification_contract` is run by the host
+runtime after a successful settle — a command through the host shell with a
+60-second deadline, or an artifact existence/digest check. Review and human
+contracts need an external approval reference and conclude `inconclusive`;
+they are never satisfied by model self-attestation. A passed report is only
+accepted when it names a non-model verifier and carries evidence.
+
 ## Tiers and dispatch
 
 The scheduler dispatches an attempt according to tier:

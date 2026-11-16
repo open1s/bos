@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "id": "constraint_survives_compaction",
+      "description": "An explicit constraint is preserved in the checkpoint source and restored"
+    },
+    {
+      "id": "conflicting_decisions_visible",
+      "description": "Contradictory decisions remain explicit in the preserved source"
+    },
+    {
+      "id": "restart_preserves_checkpoint",
+      "description": "Checkpoint and rebuilt history survive serialization"
+    }
+  ]
+}

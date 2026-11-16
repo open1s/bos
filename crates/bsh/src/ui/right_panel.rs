@@ -4473,6 +4473,34 @@ impl Shell {
                     theme::faint(),
                 ));
             }
+            if record.verification.status.is_requested() {
+                let status_key = match record.verification.status {
+                    crate::extension::tasks::VerificationStatus::NotRequested => {
+                        "right.tasks.verification"
+                    }
+                    crate::extension::tasks::VerificationStatus::Pending => {
+                        "right.tasks.verifyPending"
+                    }
+                    crate::extension::tasks::VerificationStatus::Passed => {
+                        "right.tasks.verifyPassed"
+                    }
+                    crate::extension::tasks::VerificationStatus::Failed => {
+                        "right.tasks.verifyFailed"
+                    }
+                    crate::extension::tasks::VerificationStatus::Inconclusive => {
+                        "right.tasks.verifyInconclusive"
+                    }
+                };
+                detail = detail.child(txt(
+                    format!(
+                        "{}: {}",
+                        lang.tr("right.tasks.verification"),
+                        lang.tr(status_key)
+                    ),
+                    11.0,
+                    theme::faint(),
+                ));
+            }
             if !record.attempts.is_empty() {
                 detail = detail
                     .child(txt(lang.tr("right.tasks.attempts"), 11.0, theme::faint()).pt(px(4.0)));

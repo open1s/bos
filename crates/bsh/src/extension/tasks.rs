@@ -276,8 +276,21 @@ impl VerificationReport {
     }
 
     /// Whether the outcome is independently verified.
+    ///
+    /// A passed status is not enough: the report must name a verifier that is
+    /// not the model itself and carry at least one evidence reference. Model
+    /// self-attestation alone is never verification (issue #414).
     pub(crate) fn is_verified(&self) -> bool {
-        self.status.is_passed()
+        if !self.status.is_passed() || self.evidence.is_empty() {
+            return false;
+        }
+        match self.verifier.as_deref().map(str::trim) {
+            Some(verifier) if !verifier.is_empty() => !matches!(
+                verifier.to_ascii_lowercase().as_str(),
+                "model" | "self" | "assistant"
+            ),
+            _ => false,
+        }
     }
 
     /// The one-line state a board or a model-facing row shows.
@@ -290,6 +303,32 @@ impl VerificationReport {
             VerificationStatus::Inconclusive => "inconclusive",
         }
     }
+}
+
+/// A task-specific verification contract (issue #414).
+///
+/// The contract names what a deterministic verifier may check; a model's
+/// prose report alone never satisfies it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum VerificationContract {
+    /// Run a command and require a zero exit status.
+    Command {
+        /// The command line the verifier runs.
+        command: String,
+    },
+    /// Require an artifact to exist, optionally with a known digest.
+    Artifact {
+        /// Workspace-relative or absolute path.
+        path: String,
+        /// Expected SHA-256, when the task pins one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
+    },
+    /// Require a review approval reference.
+    Review,
+    /// Require a human confirmation reference.
+    Human,
 }
 
 /// What a finished attempt consumed.
@@ -500,6 +539,9 @@ pub(crate) struct Task {
     /// Whether the intended outcome was independently verified (issue #414).
     #[serde(default)]
     pub(crate) verification: VerificationReport,
+    /// The contract a verifier must satisfy, when verification was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verification_contract: Option<VerificationContract>,
 }
 
 impl Task {
@@ -560,6 +602,7 @@ impl Task {
             created_ms: now_ms,
             updated_ms: now_ms,
             verification: VerificationReport::not_requested(),
+            verification_contract: None,
         })
     }
 
@@ -915,6 +958,7 @@ mod tests {
             created_ms: 1_000,
             updated_ms: 1_000,
             verification: VerificationReport::not_requested(),
+            verification_contract: None,
         }
     }
 
@@ -1353,7 +1397,35 @@ mod tests {
         };
         assert!(record.verification_owed());
 
-        record.verification.status = VerificationStatus::Passed;
+        // A passed status with no verifier or evidence is self-attestation,
+        // not verification (issue #414).
+        record.verification = VerificationReport {
+            status: VerificationStatus::Passed,
+            verifier: Some("model".to_string()),
+            ..VerificationReport::default()
+        };
+        assert!(!record.verified_completion());
+        record.verification = VerificationReport {
+            status: VerificationStatus::Passed,
+            verifier: Some("cargo test".to_string()),
+            ..VerificationReport::default()
+        };
+        assert!(
+            !record.verified_completion(),
+            "a verifier with no evidence is not enough"
+        );
+
+        record.verification = VerificationReport {
+            status: VerificationStatus::Passed,
+            verifier: Some("cargo test".to_string()),
+            evidence: vec![VerificationEvidence {
+                kind: "command".to_string(),
+                reference: "cargo test".to_string(),
+                digest: None,
+                detail: Some("exit 0".to_string()),
+            }],
+            ..VerificationReport::default()
+        };
         assert!(record.verified_completion());
     }
 

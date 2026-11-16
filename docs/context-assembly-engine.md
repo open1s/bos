@@ -92,6 +92,38 @@ The concrete first slice of these types lives in
 Each slice keeps the previous behavior byte-identical until its own tests prove
 the new guarantee, so the migration never requires a big-bang rewrite.
 
+## Request identities (issue #412)
+
+Two identities are reported per assembly:
+
+- **Composition** (`ContextFingerprint::composition`, SHA-256 hex): ordered
+  block shapes (source, trust, provenance, inclusion) plus source versions: the
+  persona's keyed digest or, without a key, a coarse length/token label; the
+  workspace instruction digest and file names; each recalled memory
+  `<record-id>@<revision>`; the tool-guidance version; the provider/model
+  identity; and the turn number. It never contains block text.
+- **Content** (`ContextFingerprint::content`, HMAC-SHA256): canonicalized block
+  bytes under `BSH_CONTEXT_CONTENT_KEY`, present only when that key is set.
+  Without a key no content identity is produced, so logs cannot be dictionary-
+  attacked.
+
+Intentional exclusions: provider registration order (BSH models no provider
+list at this layer), the session id (not known to the assembly call), and the
+content of persona, workspace and memory blocks from the composition identity.
+Logs distinguish the two values; the content one is `-` unless keyed.
+
+### Adapter flattening (documented)
+
+A provider protocol here carries only roles and text, so the host uses an
+explicit encoding: runtime, time and workspace instruction blocks are injected
+as typed messages with a `source`/`trust` footer, and every block — including
+persona, retrieved memory and tool guidance — is listed in the
+`BSH-CONTEXT-MANIFEST-V1` manifest carried by the first request block. Persona,
+memory and tool guidance still have their text in the system prompt; the
+manifest is what makes their identity, trust and provenance distinguishable at
+the adapter boundary. The typed snapshot remains authoritative for diagnostics
+and fingerprints.
+
 ## 6. Non-goals
 
 - No change to permission/sandbox enforcement semantics (they are host code).

@@ -4327,8 +4327,27 @@ fn extension_prompt_section_removal_rejects_substring_matches() {
 // no stochastic model. The corpus version is bumped when a scenario's expected
 // baseline changes, so a silent relaxation of the harness is visible in review.
 
+/// The checked-in scenario corpus (issue #415).
+const RELIABILITY_CORPUS: &str = include_str!("reliability_corpus.json");
+
 /// Version of the checked-in reliability scenario corpus.
 const RELIABILITY_CORPUS_VERSION: u32 = 1;
+
+fn corpus_scenarios() -> Vec<String> {
+    let corpus: serde_json::Value =
+        serde_json::from_str(RELIABILITY_CORPUS).expect("the corpus parses");
+    assert_eq!(
+        corpus["version"].as_u64(),
+        Some(RELIABILITY_CORPUS_VERSION as u64),
+        "corpus version"
+    );
+    corpus["scenarios"]
+        .as_array()
+        .expect("scenarios")
+        .iter()
+        .map(|scenario| scenario["id"].as_str().expect("id").to_string())
+        .collect()
+}
 
 /// Counters the smoke subset reports. The full harness (on-demand) extends
 /// this with task verification and tool fixtures.
@@ -4347,6 +4366,15 @@ fn debug_messages(messages: &[react::llm::LlmMessage]) -> String {
 #[tokio::test]
 async fn reliability_horizon_smoke_subset() {
     assert_eq!(RELIABILITY_CORPUS_VERSION, 1, "corpus version is pinned");
+    assert_eq!(
+        corpus_scenarios(),
+        vec![
+            "constraint_survives_compaction".to_string(),
+            "conflicting_decisions_visible".to_string(),
+            "restart_preserves_checkpoint".to_string(),
+        ],
+        "the checked-in corpus is the scenario list this smoke run executes"
+    );
     let mut metrics = ReliabilityMetrics::default();
 
     // Scenario 1: an explicit user constraint survives compaction in the
@@ -4433,4 +4461,39 @@ async fn reliability_horizon_smoke_subset() {
     assert_eq!(metrics.constraint_retention, 1);
     assert_eq!(metrics.conflict_visibility, 1);
     assert_eq!(metrics.recovery, 2);
+}
+
+/// On-demand larger run: a long history crosses the compaction boundary and
+/// still recovers the explicit constraint from the preserved source. The CI
+/// smoke subset is `reliability_horizon_smoke_subset`; this one is opt-in.
+#[tokio::test]
+#[ignore = "on-demand long-horizon run: cargo test -p agent --lib reliability_horizon_extended -- --ignored"]
+async fn reliability_horizon_extended_long_history() {
+    let agent = agent_with_summary("long summary");
+    {
+        let mut session = agent.session();
+        for index in 0..20 {
+            session.add_user(format!("turn {index} {}", "x".repeat(240)));
+            session.add_assistant(format!("reply {index} {}", "y".repeat(240)));
+        }
+        session.add_user("CONSTRAINT: keep the public API stable".to_string());
+        session.add_assistant("Understood.".to_string());
+    }
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let outcome = agent
+        .compact_now(0, &signal)
+        .await
+        .expect("compaction runs")
+        .expect("a checkpoint");
+    let checkpoint = outcome.checkpoint.expect("checkpoint");
+    let source = format!("{:?}", checkpoint.source_span);
+    assert!(
+        source.contains("CONSTRAINT: keep the public API stable"),
+        "the constraint survives a long history"
+    );
+    let mut session = agent.session();
+    let index = session.checkpoints().len() - 1;
+    assert!(session.restore_checkpoint(index));
+    let restored = format!("{:?}", session.messages());
+    assert!(restored.contains("CONSTRAINT: keep the public API stable"));
 }

@@ -314,6 +314,13 @@ fn trust_label(trust: Trust) -> &'static str {
     }
 }
 
+/// A keyed digest of text, for a version input whose content is private
+/// (issue #412). Without a key the caller should use a coarse, non-reversible
+/// label instead of an unkeyed digest.
+pub(crate) fn keyed_digest(key: &[u8], text: &str) -> String {
+    hmac_sha256(key, text.as_bytes())
+}
+
 /// A SHA-256 digest of text, for version inputs such as an instruction file
 /// or a persona revision (issue #412).
 pub(crate) fn digest_text(text: &str) -> String {
@@ -951,6 +958,50 @@ mod tests {
             again.fingerprint().content,
             "edited bytes change the keyed content identity"
         );
+    }
+
+    /// Every block is named in the request manifest with its trust boundary,
+    /// including the sources that remain in the system prompt (issue #411).
+    #[test]
+    fn the_provider_manifest_names_every_source_and_trust() {
+        let persona = persona_block("persona text");
+        let host = ContextBlock {
+            source: ContextSource::HostRuntime,
+            trust: ContextSource::HostRuntime.trust(),
+            text: "host contract".to_string(),
+            token_estimate: 3,
+            provenance: Some("runtime-context".to_string()),
+        };
+        let memory = memory_block(
+            &MemoryRecallInfo {
+                included: true,
+                hits: 1,
+                tokens: 4,
+                records: vec!["rec-1@2".to_string()],
+                ..MemoryRecallInfo::default()
+            },
+            Some("Relevant memory:\n- a fact"),
+        )
+        .expect("memory block");
+        let snapshot = AssemblySnapshot::build(
+            vec![persona, host, memory],
+            SourceVersions {
+                persona: Some("rev-1".to_string()),
+                memory_records: vec!["rec-1@2".to_string()],
+                ..SourceVersions::default()
+            },
+            None,
+        );
+        let manifest = snapshot.provider_manifest();
+        for expected in [
+            "\"source\":\"persona\"",
+            "\"source\":\"host-runtime\"",
+            "\"source\":\"retrieved-memory\"",
+            "\"trust\":\"host-authority\"",
+            "\"trust\":\"untrusted-data\"",
+        ] {
+            assert!(manifest.contains(expected), "{expected} in {manifest}");
+        }
     }
 
     /// Issue #346: budget omissions are recorded per source, not silent.

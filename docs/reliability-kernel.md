@@ -197,6 +197,16 @@ unreadable file. `FederationNode::reset_replay_store()` is the explicit operator
 recovery: it moves the unreadable file to `<name>.corrupt-<stamp>` (bytes
 preserved), starts empty, and audits that prior history was discarded.
 
+## Reliability regression harness (issue #415)
+
+A deterministic smoke subset lives in `crates/agent/src/agent/agentic/tests.rs`
+and is driven by the checked-in corpus
+`crates/agent/src/agent/agentic/reliability_corpus.json` (version 1). It covers
+constraint retention through compaction, explicit contradictory decisions, and
+checkpoint recovery across a restart boundary; no provider credentials or
+network are used. An on-demand long-history variant is marked `#[ignore]` and
+runs with `cargo test -p agent --lib reliability_horizon_extended -- --ignored`.
+
 ## 9. Compatibility policies
 
 1. Existing histories keep reading: legacy segment names, missing columns and

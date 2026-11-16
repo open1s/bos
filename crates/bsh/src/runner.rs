@@ -396,8 +396,25 @@ impl Runner {
                     .instructions
                     .as_deref()
                     .map(|_| crate::instructions::sources(std::path::Path::new(&facts.cwd)).join(","));
+                // A content identity is opt-in: the key never lives in the
+                // repository, so logs cannot be dictionary-attacked by default.
+                let content_key = std::env::var("BSH_CONTEXT_CONTENT_KEY")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(String::into_bytes);
+                // The persona is private text, so its version input is a keyed
+                // digest when a key is configured, and a coarse length label
+                // otherwise: the log never carries an unkeyed persona hash.
+                let persona_version = match content_key.as_deref() {
+                    Some(key) => crate::context_assembly::keyed_digest(key, &assembly.base_prompt),
+                    None => format!(
+                        "chars:{}:tokens:{}",
+                        assembly.base_prompt.chars().count(),
+                        agent::agent::context::estimate_tokens(&assembly.base_prompt)
+                    ),
+                };
                 let versions = crate::context_assembly::SourceVersions {
-                    persona: Some(crate::context_assembly::digest_text(&assembly.base_prompt)),
+                    persona: Some(persona_version),
                     workspace_instructions: context.instructions.as_deref().map(|text| {
                         format!(
                             "{}:{}",
@@ -407,16 +424,10 @@ impl Runner {
                     }),
                     memory_records: recall.records.clone(),
                     tool_guidance: Some("tool-guidance@1".to_string()),
-                    provider: None,
+                    provider: Some(agent.config().model.clone()),
                     session: None,
                     turn: Some(time.turn as u64),
                 };
-                // A content identity is opt-in: the key never lives in the
-                // repository, so logs cannot be dictionary-attacked by default.
-                let content_key = std::env::var("BSH_CONTEXT_CONTENT_KEY")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .map(String::into_bytes);
                 let snapshot = crate::context_assembly::AssemblySnapshot::build(
                     blocks,
                     versions,

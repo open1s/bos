@@ -10,12 +10,13 @@ use std::sync::Arc;
 
 use agent::tools::{AsyncFunctionTool, DeclaredAsyncTool};
 use agent::{Agent, ToolError};
+use ferris_sdk::terminal::TerminalService as _;
 use serde_json::{json, Value};
 
 use crate::extension::runs::{Limits, RunSpec, RunState, RunTier, Runs};
 use crate::extension::tasks::{
     self, Attempt, AttemptStatus, FileTasksStore, Host, Origin, Task, TaskStatus, TasksStore, Tier,
-    Trigger,
+    Trigger, VerificationContract, VerificationEvidence, VerificationReport, VerificationStatus,
 };
 
 /// What the tools need to know about the turn they run in.
@@ -598,6 +599,7 @@ fn task_json(task: &Task) -> Value {
         "execution_succeeded": task.execution_succeeded(),
         "verified_completion": task.verified_completion(),
         "verification": task.verification,
+        "verification_contract": task.verification_contract,
         "next_fire_ms": task.trigger.next_fire_ms(),
         "created_ms": task.created_ms,
         "updated_ms": task.updated_ms,
@@ -1423,6 +1425,24 @@ pub(crate) async fn join_with(
                 attempt.error = row.error.clone();
             }
         }
+        // Execution success is not verification. A settled successful task
+        // with a contract is verified by the runtime here, not by the model's
+        // prose report (issue #414).
+        if state.is_settled()
+            && record.status == TaskStatus::Succeeded
+            && !matches!(
+                record.verification.status,
+                VerificationStatus::Passed | VerificationStatus::Failed
+            )
+        {
+            if let Some(contract) = record.verification_contract.clone() {
+                let report = verify_contract(&contract, &context.workspace).await;
+                record.verification = report.clone();
+                if let Some(attempt) = record.attempts.last_mut() {
+                    attempt.verification = report;
+                }
+            }
+        }
         let _ = FileTasksStore.save(&context.workspace, record);
     }
     let mut rows: Vec<tasks::JoinRow> = Vec::with_capacity(order.len());
@@ -1446,6 +1466,135 @@ pub(crate) async fn join_with(
             }))
             .collect::<Vec<_>>(),
     }))
+}
+
+/// SHA-256 of a file's bytes, lowercase hex.
+fn file_sha256(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)?;
+    let digest = Sha256::digest(&bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    Ok(out)
+}
+
+/// Run a task's verification contract deterministically (issue #414).
+///
+/// Commands run through the host shell with a bounded deadline; artifacts are
+/// checked for existence and, when pinned, SHA-256. Review and human contracts
+/// need an external reference, so they conclude inconclusive here rather than
+/// accepting a model's self-attestation.
+pub(crate) async fn verify_contract(
+    contract: &VerificationContract,
+    workspace: &std::path::Path,
+) -> VerificationReport {
+    let verifier = Some("bsh-runtime".to_string());
+    let verifier_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    match contract {
+        VerificationContract::Command { command } => {
+            let runner_command = command.clone();
+            let workspace = workspace.to_path_buf();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                tokio::task::spawn_blocking(move || {
+                    crate::extension::terminal::HostTerminal.run(&runner_command, Some(workspace))
+                }),
+            )
+            .await;
+            let (status, detail) = match outcome {
+                Ok(Ok(Ok(output))) if output.code == 0 => (
+                    VerificationStatus::Passed,
+                    Some(format!("exit {}", output.code)),
+                ),
+                Ok(Ok(Ok(output))) => (
+                    VerificationStatus::Failed,
+                    Some(format!("exit {}", output.code)),
+                ),
+                Ok(Ok(Err(error))) => (VerificationStatus::Inconclusive, Some(error)),
+                Ok(Err(error)) => (VerificationStatus::Inconclusive, Some(error.to_string())),
+                Err(_) => (
+                    VerificationStatus::Inconclusive,
+                    Some("the verifier command timed out".to_string()),
+                ),
+            };
+            VerificationReport {
+                status,
+                verifier,
+                verifier_version,
+                verified_ms: Some(crate::settings::unix_now().saturating_mul(1_000)),
+                evidence: vec![VerificationEvidence {
+                    kind: "command".to_string(),
+                    reference: command.to_string(),
+                    digest: None,
+                    detail,
+                }],
+                message: None,
+            }
+        }
+        VerificationContract::Artifact { path, digest } => {
+            let target = if std::path::Path::new(path).is_absolute() {
+                std::path::PathBuf::from(path)
+            } else {
+                workspace.join(path)
+            };
+            let metadata = std::fs::metadata(&target);
+            let (status, actual_digest, detail, message) = match metadata {
+                Ok(metadata) if !metadata.is_file() => (
+                    VerificationStatus::Failed,
+                    None,
+                    Some("not a regular file".to_string()),
+                    Some(format!("{} is not a file", target.display())),
+                ),
+                Ok(_) => {
+                    let actual = file_sha256(&target).ok();
+                    match (digest, &actual) {
+                        (Some(expected), Some(actual)) if expected != actual => (
+                            VerificationStatus::Failed,
+                            Some(actual.clone()),
+                            Some("digest mismatch".to_string()),
+                            Some(format!("expected {expected}, found {actual}")),
+                        ),
+                        _ => (
+                            VerificationStatus::Passed,
+                            actual.clone(),
+                            Some("artifact present".to_string()),
+                            None,
+                        ),
+                    }
+                }
+                Err(error) => (
+                    VerificationStatus::Failed,
+                    None,
+                    Some(error.to_string()),
+                    Some(format!("{} is missing", target.display())),
+                ),
+            };
+            VerificationReport {
+                status,
+                verifier,
+                verifier_version,
+                verified_ms: Some(crate::settings::unix_now().saturating_mul(1_000)),
+                evidence: vec![VerificationEvidence {
+                    kind: "artifact".to_string(),
+                    reference: target.display().to_string(),
+                    digest: actual_digest,
+                    detail,
+                }],
+                message,
+            }
+        }
+        VerificationContract::Review | VerificationContract::Human => VerificationReport {
+            status: VerificationStatus::Inconclusive,
+            verifier: Some("external".to_string()),
+            verifier_version,
+            verified_ms: Some(crate::settings::unix_now().saturating_mul(1_000)),
+            evidence: Vec::new(),
+            message: Some("this contract needs an external approval reference".to_string()),
+        },
+    }
 }
 
 /// The run's snapshot from the job roster, when it exists.
@@ -2660,6 +2809,66 @@ mod tests {
             .expect_err("no subagents");
         assert!(format!("{no_subagents:?}").contains("subagents are not available"));
     }
+    /// The runtime verifier checks artifacts and commands deterministically;
+    /// a missing artifact or a non-zero command fails, and an external
+    /// approval contract is inconclusive rather than self-attested.
+    #[tokio::test]
+    async fn the_runtime_verifier_checks_artifacts_and_commands() {
+        let root = std::env::temp_dir().join(format!("bsh-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let artifact = root.join("artifact.txt");
+        std::fs::write(&artifact, "done").expect("artifact");
+        let digest = file_sha256(&artifact).expect("digest");
+
+        let passed = verify_contract(
+            &VerificationContract::Artifact {
+                path: "artifact.txt".to_string(),
+                digest: Some(digest),
+            },
+            &root,
+        )
+        .await;
+        assert_eq!(passed.status, VerificationStatus::Passed);
+        assert_eq!(passed.verifier.as_deref(), Some("bsh-runtime"));
+        assert!(!passed.evidence.is_empty());
+        assert!(passed.is_verified());
+
+        let missing = verify_contract(
+            &VerificationContract::Artifact {
+                path: "missing.txt".to_string(),
+                digest: None,
+            },
+            &root,
+        )
+        .await;
+        assert_eq!(missing.status, VerificationStatus::Failed);
+        assert!(!missing.is_verified());
+
+        let zero = verify_contract(
+            &VerificationContract::Command {
+                command: "exit 0".to_string(),
+            },
+            &root,
+        )
+        .await;
+        assert_eq!(zero.status, VerificationStatus::Passed, "{zero:?}");
+        let non_zero = verify_contract(
+            &VerificationContract::Command {
+                command: "exit 3".to_string(),
+            },
+            &root,
+        )
+        .await;
+        assert_eq!(non_zero.status, VerificationStatus::Failed);
+
+        let review = verify_contract(&VerificationContract::Review, &root).await;
+        assert_eq!(review.status, VerificationStatus::Inconclusive);
+        assert!(!review.is_verified());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// An unknown id is a refusal, not an empty report.
     #[tokio::test]
     async fn join_refuses_unknown_ids() {
