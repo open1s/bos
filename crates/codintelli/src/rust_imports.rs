@@ -534,6 +534,7 @@ mod tests {
         ]);
         let report = resolve_rust_import_module_candidates(&[parsed], &graph).expect("imports");
         assert_eq!(report.imports[0].status, RustImportResolutionStatus::AmbiguousModuleTarget);
+        assert_eq!(report.imports[0].candidate_source_paths.len(), 2);
     }
 
     #[test]
@@ -557,7 +558,6 @@ mod tests {
         );
         let report = resolve_rust_import_module_candidates(&[parsed], &graph).expect("imports");
         assert_eq!(report.imports[0].status, RustImportResolutionStatus::AmbiguousModuleTarget);
-        assert_eq!(report.imports[0].candidate_source_paths.len(), 2);
         assert_eq!(report.imports[0].candidate_source_paths.len(), 2);
     }
 
