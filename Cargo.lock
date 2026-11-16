@@ -2024,6 +2024,8 @@ dependencies = [
  "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.21",
+ "tree-sitter 0.26.13",
+ "tree-sitter-rust",
  "uuid",
 ]
 
