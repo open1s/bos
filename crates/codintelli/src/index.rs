@@ -297,8 +297,8 @@ pub fn index_workspace_with_limits(
                 });
             }
             Err(error) => {
-                let budget_error = match error {
-                    ProviderError::Budget(error) => Some(error),
+                let budget_error = match &error {
+                    ProviderError::Budget(error) => Some(*error),
                     _ => None,
                 };
                 diagnostics.push(SourceIndexDiagnostic {
@@ -484,6 +484,41 @@ mod tests {
             SourceIndexDiagnosticKind::Budget(ScanBudgetError::FileTooLarge)
         ));
         assert_eq!(budget.usage().total_bytes, 0);
+    }
+
+    #[test]
+    fn applies_per_file_fact_limits_and_marks_coverage_partial() {
+        let root = tempdir().expect("create workspace");
+        fs::write(
+            root.path().join("main.rs"),
+            "fn first() {} fn second() {} fn third() {}",
+        )
+        .expect("write Rust source");
+        let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root.path())
+            .expect("create descriptor");
+        let workspace = WorkspaceFs::open(&descriptor).expect("open workspace");
+        let budget = ScanBudget::new(limits());
+        let parse_limits = ParseLimits {
+            max_nodes: 1000,
+            max_facts: 1,
+            max_diagnostics: 10,
+        };
+
+        let report = index_workspace_with_limits(
+            &workspace,
+            &budget,
+            &IgnorePolicy::default(),
+            &[&crate::RustProvider],
+            &parse_limits,
+        );
+
+        assert_eq!(report.status, SourceIndexStatus::Partial);
+        assert_eq!(report.limited_files, 1);
+        assert_eq!(report.files[0].status, SourceFileStatus::Limited);
+        assert_eq!(
+            report.files[0].parse.as_ref().expect("limited parse").facts.len(),
+            1
+        );
     }
 
     #[test]
