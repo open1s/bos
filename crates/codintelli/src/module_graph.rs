@@ -336,15 +336,21 @@ pub fn build_rust_module_graph(
                 let mut unique_target = None;
                 if candidate.status == RustModuleResolutionStatus::UniqueCandidate {
                     if let Some(target) = candidate.existing_candidates.first() {
-                        if by_path.get(target).is_some_and(|parsed| {
-                            parsed.language == LanguageId::Rust && parsed.status != ParseStatus::Failed
-                        }) {
-                            if child_path.len() > limits.max_depth {
-                                edge_status = RustModuleEdgeStatus::DepthLimit;
-                            } else {
-                                edge_status = RustModuleEdgeStatus::UniqueCandidateParsed;
-                                unique_target = Some(target.clone());
+                        if let Some(target_parse) = by_path.get(target) {
+                            if target_parse.language == LanguageId::Rust
+                                && target_parse.status != ParseStatus::Failed
+                            {
+                                if child_path.len() > limits.max_depth {
+                                    edge_status = RustModuleEdgeStatus::DepthLimit;
+                                } else {
+                                    edge_status = RustModuleEdgeStatus::UniqueCandidateParsed;
+                                    unique_target = Some(target.clone());
+                                }
+                            } else if graph.status == RustModuleGraphStatus::Complete {
+                                graph.status = RustModuleGraphStatus::Partial;
                             }
+                        } else if graph.status == RustModuleGraphStatus::Complete {
+                            graph.status = RustModuleGraphStatus::Partial;
                         }
                     }
                 }
@@ -506,6 +512,20 @@ mod tests {
         ).expect("module graph");
         assert_eq!(graph.edges[0].status, RustModuleEdgeStatus::AmbiguousCandidates);
         assert_eq!(graph.edges[0].candidate_paths.len(), 2);
+    }
+
+    #[test]
+    fn reports_partial_when_candidate_file_was_not_parsed() {
+        let id = WorkspaceId::new();
+        let results = vec![parsed("src/lib.rs", vec![module("child", &[], false)], id)];
+        let graph = build_rust_module_graph(
+            &results,
+            &[PathBuf::from("src/lib.rs"), PathBuf::from("src/child.rs")],
+            &[PathBuf::from("src/lib.rs")],
+            RustModuleGraphLimits::default(),
+        ).expect("partial module graph");
+        assert_eq!(graph.status, RustModuleGraphStatus::Partial);
+        assert_eq!(graph.edges[0].status, RustModuleEdgeStatus::UniqueCandidateUnparsed);
     }
 
     #[test]
