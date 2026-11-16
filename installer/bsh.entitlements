@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for a Developer ID build.
+
+  Wasmtime compiles extension components to native code at runtime, and a
+  hardened-runtime process may not map executable memory unless it says so.
+  Without allow-jit the extension platform's WASM runtime dies on first use
+  while the rest of the app looks healthy.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+</dict>
+</plist>

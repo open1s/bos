@@ -1,0 +1,222 @@
+use super::*;
+
+impl<A: ReActApp> ReActEngineBuilder<A> {
+    /// Create a builder with sensible defaults.
+    pub fn new() -> Self {
+        Self {
+            llm: None,
+            tools: ToolRegistry::new(),
+            // No bound by default: a turn ends when the model stops asking
+            // for tools, which is the contract the shipped shell relies on.
+            max_steps: None,
+            context_budget: 0,
+            // The engine default applies until a host passes its own cap.
+            tool_result_cap: TOOL_RESULT_CAP,
+            parallel_tool_calls: false,
+            telemetry: Telemetry::new(),
+            resilience: None,
+            llm_timeout_secs: 120,
+            // The shipped retry budget: three retries after the first
+            // attempt, the same number the engine used before it was a knob.
+            max_retries: 3,
+            model: String::new(),
+            token_counter: TokenCounter::with_default(),
+            schema_budget: SchemaBudget::default(),
+            react_app: None,
+            bus: None,
+            agent_name: String::new(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Set the LLM client.
+    pub fn llm<S: Send + Sync + Clone + 'static, C: Send + Sync + Clone + 'static>(
+        mut self,
+        llm: Box<dyn LlmClient<S, C>>,
+    ) -> Self
+    where
+        A: ReActApp<Session = S, Context = C>,
+    {
+        self.llm = Some(llm);
+        self
+    }
+
+    /// Register a tool.
+    pub fn with_tool(self, t: ToolVariant) -> Self {
+        self.tools.register(t);
+        self
+    }
+
+    /// Set a runaway guard on the number of ReAct steps.
+    ///
+    /// Optional on purpose: the loop's exit rule is the model itself - a turn
+    /// ends when a response carries no tool call - so a well-behaved run is
+    /// never cut off. A caller that needs a ceiling asks for one here.
+    pub fn max_steps(mut self, steps: usize) -> Self {
+        self.max_steps = (steps > 0).then_some(steps);
+        self
+    }
+
+    /// Set the retry budget for a transient provider failure.
+    ///
+    /// Counts retries AFTER the first attempt, so `3` allows at most four
+    /// calls. A configured resilience layer's own `max_retries` keeps
+    /// precedence; this is the budget a host that set none gets.
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.max_retries = retries;
+        self
+    }
+
+    /// Set the send-side token ceiling used for mid-turn compaction.
+    ///
+    /// Zero disables it. The budget covers the request history; the engine
+    /// leaves a fixed reserve for the persona and tool schemas. A host that
+    /// already prices a context window passes that ceiling here.
+    pub fn context_budget(mut self, tokens: usize) -> Self {
+        self.context_budget = tokens;
+        self
+    }
+
+    /// Set the most text one tool result may add to the model context.
+    ///
+    /// Zero selects the engine default. A host with a workspace-level
+    /// tool-output setting passes that limit here, so the session the model
+    /// reads obeys the same cap its UI does instead of an engine constant.
+    pub fn tool_result_cap(mut self, cap: usize) -> Self {
+        self.tool_result_cap = if cap == 0 { TOOL_RESULT_CAP } else { cap };
+        self
+    }
+
+    /// Set the cumulative tool-schema byte budget for one turn. Zero selects
+    /// the engine default; a per-tool limit is set separately.
+    pub fn schema_budget(mut self, bytes: usize) -> Self {
+        self.schema_budget = SchemaBudget::new(bytes, self.schema_budget.per_tool());
+        self
+    }
+
+    /// Set the byte ceiling for one revealed tool schema. Zero selects the
+    /// engine default.
+    pub fn schema_per_tool(mut self, bytes: usize) -> Self {
+        self.schema_budget = SchemaBudget::new(self.schema_budget.limit(), bytes);
+        self
+    }
+
+    /// Run one response's tool calls concurrently instead of one at a time.
+    ///
+    /// Off by default: a sequential batch keeps the hook and session order a
+    /// caller may depend on, and a batch of one behaves the same either way.
+    pub fn parallel_tool_calls(mut self, parallel: bool) -> Self {
+        self.parallel_tool_calls = parallel;
+        self
+    }
+
+    /// Set the telemetry sink.
+    pub fn telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    /// Set the resilience configuration.
+    pub fn resilience(mut self, resilience: ReActResilience) -> Self {
+        log::debug!(
+            "[ReActEngine] Resilience enabled: circuit_state={:?}, rate_limit_remaining={:?}",
+            resilience.circuit_state(),
+            resilience.rate_limit_remaining()
+        );
+        self.resilience = Some(resilience);
+        self
+    }
+
+    /// Set the per-call LLM timeout in seconds.
+    pub fn llm_timeout(mut self, secs: u64) -> Self {
+        self.llm_timeout_secs = secs;
+        self
+    }
+
+    /// Set the model name reported in telemetry.
+    pub fn model(mut self, model: String) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Set the app providing the ReAct hooks.
+    pub fn app(mut self, app: A) -> Self {
+        self.react_app = Some(app);
+        self
+    }
+
+    /// Set the bus used to publish tool events.
+    pub fn bus(mut self, bus: Bus) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    /// Set the agent name used as the bus topic prefix.
+    pub fn agent_name(mut self, name: String) -> Self {
+        self.agent_name = name;
+        self
+    }
+}
+
+impl<A: ReActApp + Default> ReActEngineBuilder<A> {
+    /// Build the engine, or fail if no LLM was set.
+    pub fn build(self) -> Result<ReActEngine<A>, BuilderError> {
+        let llm = self.llm.ok_or(BuilderError::MissingLlm)?;
+        let tools = Arc::new(self.tools);
+        let bus = self.bus.clone();
+        let agent_name = self.agent_name.clone();
+        let has_bus = bus.is_some() && !agent_name.is_empty();
+        let run_manager = Arc::new(if has_bus {
+            ToolRunManager::new().with_bus(bus.unwrap(), agent_name)
+        } else {
+            ToolRunManager::new()
+        });
+        let mgr = run_manager.clone();
+        let cancel_tools = tools.clone();
+        if has_bus {
+            run_manager.start_listener(tools.clone());
+        }
+        tools.register(ToolVariant::Sync(Box::new(FnTool {
+            name: "cancel_tool".to_string(),
+            description: "Cancel a running tool by its call_id. Pass the exact call_id from the tool call you want to cancel.".to_string(),
+            f: Box::new(move |input: &Value| {
+                let call_id = input.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(name) = mgr.cancel(call_id) {
+                    if let Some(tool) = cancel_tools.get(&name) {
+                        tool.cancel(call_id);
+                    }
+                    serde_json::json!({"status": "cancelled", "call_id": call_id})
+                } else {
+                    serde_json::json!({"status": "not_found", "call_id": call_id, "message": "No running tool found with this call_id"})
+                }
+            }),
+        })));
+        Ok(ReActEngine {
+            llm,
+            tools,
+            max_steps: self.max_steps,
+            context_budget: self.context_budget,
+            tool_result_cap: self.tool_result_cap,
+            parallel_tool_calls: self.parallel_tool_calls,
+            telemetry: self.telemetry,
+            llm_timeout_secs: self.llm_timeout_secs,
+            max_retries: self.max_retries,
+            model: self.model,
+            token_counter: self.token_counter,
+            react_app: self.react_app.unwrap_or_default(),
+            resilience: self.resilience,
+            schema_budget: self.schema_budget,
+            tool_call_count: AtomicU64::new(0),
+            turn: AtomicU64::new(0),
+            tool_time_nanos: AtomicU64::new(0),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            run_manager,
+        })
+    }
+}
+
+impl<A: ReActApp + Default> Default for ReActEngineBuilder<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -1,0 +1,4 @@
+{
+  "description": "List the notes stored in this workspace",
+  "input_schema": { "type": "object", "properties": {} }
+}

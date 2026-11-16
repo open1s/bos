@@ -1,0 +1,51 @@
+[package]
+name = "qserde"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Multi-backend serialization for Rust types"
+documentation = "https://github.com/open1s/bos/blob/main/docs/rust-user-guide.md"
+repository = "https://github.com/open1s/bos"
+
+[dependencies]
+rkyv = { workspace = true, optional = true }
+thiserror = { workspace = true }
+qserde_derive = { path = "../qserde_derive" }
+# Serialization backends
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+bincode = { version = "2.0", optional = true }
+ciborium = { version = "0.2", optional = true }
+postcard = { version = "1.0", optional = true }
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[features]
+default = ["std", "rkyv-backend"]
+std = []
+alloc = []
+# Backend features
+rkyv-backend = ["rkyv"]
+serde-backend = ["serde", "serde_json"]
+bincode-backend = ["bincode", "serde"]
+cbor-backend = ["serde", "ciborium"]
+postcard-backend = ["postcard/use-std"]
+# Convenience features
+all-backends = [
+    "rkyv-backend",
+    "serde-backend",
+    "bincode-backend",
+    "cbor-backend",
+    "postcard-backend"
+]
+
+[lib]
+name = "qserde"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

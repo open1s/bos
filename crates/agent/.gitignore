@@ -1,0 +1,9 @@
+.alef/
+__pycache__/
+*.so
+*.pyd
+.venv/
+*.egg-info/
+dist/
+node_modules/
+*.node

@@ -1,0 +1,279 @@
+#!/bin/bash
+# AppRun for the BSH AppImage.
+#
+# What this image carries: the bsh binary and the libraries the host is not
+# guaranteed to have. What it does NOT carry: WebKitGTK 4.1 and the stack it
+# pulls in (GTK 3, GLib, ICU, libsoup, gdk-pixbuf). That split is deliberate.
+# WebKitGTK bakes the absolute paths of its three helper processes and of its
+# injected bundle into libwebkit2gtk at build time, and no environment variable
+# overrides them (WEBKIT_EXEC_PATH does not exist; the string appears zero times
+# in the library). A bundled WebKit therefore has to be made to *exist* at
+# /usr/lib/<triplet>/webkit2gtk-4.1, which needs a mount namespace with an
+# overlay over /usr - what Flatpak's runtime does, and what this image does not
+# attempt. Requiring the host's WebKitGTK instead turns that into one apt/dnf
+# line, which this script names for the distribution it detects.
+#
+# Both ways bsh fails to start otherwise produce a message that costs an issue
+# report, so they are answered here, before the exec:
+#   * glibc older than the build floor -> "version `GLIBC_2.35' not found"
+#   * WebKitGTK 4.1 absent             -> "error while loading shared libraries"
+#
+# --integrate and --uninstall are answered here rather than by bsh: they write a
+# menu entry that has to point at *this file*, and only the AppImage knows where
+# it lives. bsh's own CLI (ext, --help, the GUI) is passed through untouched.
+
+set -euo pipefail
+
+if [[ -z "${APPDIR:-}" ]]; then
+  APPDIR="$(cd "$(dirname "$0")" && pwd)"
+fi
+export APPDIR
+
+binary="$APPDIR/usr/bin/bsh"
+glibc_floor_major=2
+glibc_floor_minor=35
+
+# The libraries bsh links are resolved against the image's own lib directory
+# first, then the host's - the reason a host library with a different soname
+# cannot shadow one the image carries.
+export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export XDG_DATA_DIRS="$APPDIR/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+say() { printf 'bsh: %s\n' "$*" >&2; }
+die() { say "$1"; exit 1; }
+
+# --- distribution detection -------------------------------------------------
+
+os_release() {
+  # BSH_OS_RELEASE points this at a fixture; scripts/ci/test-apprun.sh uses it to
+  # check every distribution mapping without a container per distribution.
+  local key="$1" value="" file="${BSH_OS_RELEASE:-/etc/os-release}"
+  if [[ -r "$file" ]]; then
+    value="$(awk -F= -v key="$key" '
+      $1 == key {
+        v = substr($0, length($1) + 2)
+        gsub(/^"|"$/, "", v)
+        print v
+        exit
+      }' "$file")"
+  fi
+  printf '%s' "$value"
+}
+
+# One of apt, dnf, pacman, zypper, or empty when the distribution is unknown.
+package_manager() {
+  local id like
+  id="$(os_release ID)"
+  like="$(os_release ID_LIKE)"
+  case "$id $like" in
+    *debian*|*ubuntu*|*linuxmint*|*pop*) echo apt ;;
+    *rhel*|*fedora*|*centos*|*rocky*|*almalinux*) echo dnf ;;
+    *suse*|*opensuse*) echo zypper ;;
+    *arch*|*manjaro*) echo pacman ;;
+    *) echo "" ;;
+  esac
+}
+
+# The package that provides a soname, per package manager. An unknown soname
+# falls back to a sentence rather than to a wrong command.
+package_for() {
+  local soname="$1" manager="$2"
+  case "$soname:$manager" in
+    libwebkit2gtk-4.1.so.0:apt) echo libwebkit2gtk-4.1-0 ;;
+    libwebkit2gtk-4.1.so.0:dnf) echo webkit2gtk4.1 ;;
+    libwebkit2gtk-4.1.so.0:pacman) echo webkit2gtk-4.1 ;;
+    libwebkit2gtk-4.1.so.0:zypper) echo libwebkit2gtk-4_1-0 ;;
+    libjavascriptcoregtk-4.1.so.0:apt) echo libjavascriptcoregtk-4.1-0 ;;
+    libjavascriptcoregtk-4.1.so.0:dnf) echo webkit2gtk4.1 ;;
+    libjavascriptcoregtk-4.1.so.0:pacman) echo webkit2gtk4.1 ;;
+    libjavascriptcoregtk-4.1.so.0:zypper) echo libjavascriptcoregtk-4_1-0 ;;
+    libgtk-3.so.0:apt) echo libgtk-3-0 ;;
+    libgtk-3.so.0:dnf) echo gtk3 ;;
+    libgtk-3.so.0:pacman) echo gtk3 ;;
+    libgtk-3.so.0:zypper) echo gtk3 ;;
+    libgdk-3.so.0:apt) echo libgtk-3-0 ;;
+    libgdk-3.so.0:dnf) echo gtk3 ;;
+    libgdk-3.so.0:pacman) echo gtk3 ;;
+    libgdk-3.so.0:zypper) echo gtk3 ;;
+    libsoup-3.0.so.0:apt) echo libsoup-3.0-0 ;;
+    libsoup-3.0.so.0:dnf) echo libsoup3 ;;
+    libsoup-3.0.so.0:pacman) echo libsoup3 ;;
+    libsoup-3.0.so.0:zypper) echo libsoup-3_0-0 ;;
+    libglib-2.0.so.0:apt) echo libglib2.0-0 ;;
+    libglib-2.0.so.0:dnf) echo glib2 ;;
+    libglib-2.0.so.0:pacman) echo glib2 ;;
+    libglib-2.0.so.0:zypper) echo glib2 ;;
+    libxkbcommon.so.0:apt) echo libxkbcommon0 ;;
+    libxkbcommon.so.0:dnf) echo libxkbcommon ;;
+    libxkbcommon.so.0:pacman) echo libxkbcommon ;;
+    libxkbcommon.so.0:zypper) echo libxkbcommon ;;
+    *) echo "" ;;
+  esac
+}
+
+install_command() {
+  local package="$1" manager="$2"
+  case "$manager" in
+    apt) echo "sudo apt install $package" ;;
+    dnf) echo "sudo dnf install $package" ;;
+    pacman) echo "sudo pacman -S $package" ;;
+    zypper) echo "sudo zypper install $package" ;;
+    *) echo "" ;;
+  esac
+}
+
+# --- preflight --------------------------------------------------------------
+
+check_glibc() {
+  local version major minor
+  # getconf ships with glibc; a musl host answers nothing, which is also a
+  # refusal: this image is built against glibc 2.35.
+  version="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '$1 == "glibc" {print $2}')" || version=""
+  if [[ -z "$version" ]]; then
+    die "this build needs glibc ${glibc_floor_major}.${glibc_floor_minor} or newer, and this system does not use glibc (musl?)"
+  fi
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  if (( major < glibc_floor_major )) ||
+     { (( major == glibc_floor_major )) && (( minor < glibc_floor_minor )); }; then
+    say "this build needs glibc ${glibc_floor_major}.${glibc_floor_minor} or newer; this system has $version"
+    say "Ubuntu 22.04, Debian 12 and Fedora 36 are the oldest releases that qualify."
+    exit 1
+  fi
+}
+
+# Reads the dynamic loader's own answer: ldd names every library bsh cannot
+# resolve, which covers WebKitGTK and anything else the host is missing. The
+# image's own libs are already on LD_LIBRARY_PATH, so a bundled library never
+# shows up here. A host without ldd, or a static bsh, skips the check rather
+# than blocking a legitimate run.
+check_libraries() {
+  local missing soname manager package command
+  command -v ldd >/dev/null 2>&1 || return 0
+  missing="$(ldd "$binary" 2>/dev/null | awk '/not found/ {print $1}')" || missing=""
+  [[ -n "$missing" ]] || return 0
+
+  manager="$(package_manager)"
+  for soname in $missing; do
+    package="$(package_for "$soname" "$manager")"
+    command="$(install_command "$package" "$manager")"
+    say "missing library: $soname"
+    if [[ -n "$command" ]]; then
+      say "install it with: $command"
+    elif [[ -n "$package" ]]; then
+      say "install the package that provides $soname ($package)"
+    else
+      say "install the package that provides $soname"
+    fi
+  done
+  case "$missing" in
+    *libwebkit2gtk*|*libjavascriptcoregtk*|*libsoup-3*|*libgtk-3*)
+      say "BSH's window and browser pane are GTK 3 + WebKitGTK 4.1 windows; the AppImage deliberately does not carry them." ;;
+  esac
+  say "see docs/bsh-release.md for the per-distribution package list"
+  exit 1
+}
+
+# --- desktop integration ----------------------------------------------------
+
+integrate() {
+  local appimage data applications icons source
+  # The menu entry has to point at a path that survives this process, and only
+  # the Runtime knows it. A run from an extracted AppDir has no such path, and
+  # writing one that points into a temporary directory would leave a dead
+  # launcher behind.
+  if [[ -z "${APPIMAGE:-}" ]]; then
+    say "--integrate needs the .AppImage file itself; it was started from an extracted directory, which has no stable path to point a menu entry at."
+    say "run the .AppImage directly instead: ./bsh-<version>-linux-<arch>.AppImage --integrate"
+    exit 2
+  fi
+  case "$APPIMAGE" in
+    /*) appimage="$APPIMAGE" ;;
+    *) appimage="$(cd "$(dirname "$APPIMAGE")" && pwd)/$(basename "$APPIMAGE")" ;;
+  esac
+  data="${XDG_DATA_HOME:-$HOME/.local/share}"
+  applications="$data/applications"
+  icons="$data/icons/hicolor/512x512/apps"
+  source="$APPDIR/bsh.png"
+  [[ -f "$source" ]] || source="$APPDIR/usr/share/icons/hicolor/512x512/apps/bsh.png"
+
+  mkdir -p "$applications" "$icons"
+  install -m 644 "$source" "$icons/bsh.png"
+  cat > "$applications/bsh.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=BSH
+GenericName=BOS Harness
+Comment=The BOS agent workspace
+Exec="$appimage" %U
+Icon=bsh
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=bsh
+Keywords=BOS;agent;AI;terminal;harness;
+DESKTOP
+  chmod 644 "$applications/bsh.desktop"
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q "$applications" >/dev/null 2>&1 || true
+  fi
+  printf 'bsh: installed %s\n' "$applications/bsh.desktop"
+  printf 'bsh: the menu entry runs %s\n' "$appimage"
+}
+
+uninstall() {
+  local data applications icons removed=0 path
+  data="${XDG_DATA_HOME:-$HOME/.local/share}"
+  applications="$data/applications"
+  icons="$data/icons/hicolor/512x512/apps"
+  for path in "$applications/bsh.desktop" "$icons/bsh.png"; do
+    if [[ -e "$path" ]]; then
+      rm -f "$path"
+      printf 'bsh: removed %s\n' "$path"
+      removed=1
+    fi
+  done
+  if command -v update-desktop-database >/dev/null 2>&1 && [[ -d "$applications" ]]; then
+    update-desktop-database -q "$applications" >/dev/null 2>&1 || true
+  fi
+  if [[ "$removed" -eq 0 ]]; then
+    printf 'bsh: nothing to remove; no menu entry was installed\n'
+  fi
+  printf 'bsh: settings, sessions and workspaces under ~/.bsh were left alone\n'
+}
+
+usage() {
+  cat >&2 <<USAGE
+bsh - BOS Harness
+
+  <file>.AppImage               run the app
+  <file>.AppImage --integrate   add a menu entry pointing at this file
+  <file>.AppImage --uninstall   remove that menu entry and its icon
+
+The app's own command line (ext, --help, ...) is passed through.
+USAGE
+}
+
+# --- entry ------------------------------------------------------------------
+
+[[ -x "$binary" ]] || die "the image is incomplete: $binary is missing"
+
+case "${1:-}" in
+  --integrate)
+    shift
+    integrate "$@"
+    ;;
+  --uninstall)
+    shift
+    uninstall "$@"
+    ;;
+  --image-help)
+    usage
+    ;;
+  *)
+    check_glibc
+    check_libraries
+    exec "$binary" "$@"
+    ;;
+esac

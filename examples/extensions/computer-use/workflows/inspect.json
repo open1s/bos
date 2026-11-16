@@ -1,0 +1,15 @@
+{
+  "description": "Inspect the display and pointer, then capture a screenshot",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "path": { "type": "string", "description": "Optional screenshot path" }
+    },
+    "additionalProperties": false
+  },
+  "steps": [
+    { "name": "display", "tool": "screen_size", "arguments": {} },
+    { "name": "pointer", "tool": "cursor_position", "arguments": {} },
+    { "name": "capture", "tool": "screenshot", "arguments": { "path": "{{input.path}}" } }
+  ]
+}

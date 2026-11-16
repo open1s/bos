@@ -1,0 +1,61 @@
+schema_version = "2.0"
+
+[extension]
+id = "com.example.language-python"
+name = "Python Language"
+version = "1.0.0"
+description = "A complete language-service and integration starter"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+host = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "process"
+
+[runtime.config]
+args = ["server.py"]
+entry = "python3"
+startup = "on-demand"
+
+[capabilities]
+required = [
+    "process.execute",
+    "agent.tools.register",
+]
+
+[[contribution]]
+kind = "tool"
+id = "diagnose"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "github-search"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "language"
+id = "python"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "integration"
+id = "github"
+
+[contribution.payload]
+
+[resources]
+max_memory_mb = 128
+max_execution_ms = 5000
+
+[dependencies]
+
+[services]
+provides = []
+requires = []

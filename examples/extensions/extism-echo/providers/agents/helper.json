@@ -1,0 +1,7 @@
+{
+  "name": "Extism Helper",
+  "description": "A read-only agent role contributed through the Extism example",
+  "plugins": ["files"],
+  "permission": "read_only",
+  "level": 1
+}

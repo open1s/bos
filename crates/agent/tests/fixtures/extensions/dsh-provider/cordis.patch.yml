@@ -1,0 +1,5 @@
+# The fixture's bundle patch: the one row a real model-provider plugin inserts.
+- insert:
+    - id: dsh-zen
+      name: '@local/dsh-zen'
+      config: {}

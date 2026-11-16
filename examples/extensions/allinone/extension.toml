@@ -1,0 +1,289 @@
+schema_version = "2.0"
+
+[extension]
+id = "com.example.allinone"
+name = "All-in-One Exam Demo"
+version = "1.0.0"
+description = "One package that exercises every BSH extension contribution: tools, commands, panels, prompts, contexts, skills, languages, integrations, themes, presets, providers, workflows, events, configuration and the process protocol"
+authors = ["BSH Example"]
+license = "MIT"
+repository = "https://github.com/open1s/bos"
+homepage = "https://github.com/open1s/bos/tree/main/examples/extensions/allinone"
+
+[compatibility]
+host = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "process"
+
+[runtime.config]
+args = [
+    "-B",
+    "server.py",
+]
+entry = "python3"
+protocol = "jsonrpc-2.0"
+startup = "on-demand"
+
+[runtime.config.env]
+DEMO_GREETING = "hello from the all-in-one demo"
+PYTHONDONTWRITEBYTECODE = "1"
+
+[capabilities]
+required = [
+    "process.execute",
+    "agent.tools.register",
+]
+
+[[contribution]]
+kind = "tool"
+id = "describe"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "echo"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "sum"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "progress"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "fail"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "events"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "tool"
+id = "config"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "command"
+id = "hello"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "command"
+id = "refresh"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "panel"
+id = "dashboard"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "prompt"
+id = "guide"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "context"
+id = "workspace"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "skill"
+id = "allinone"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "workflow"
+id = "inspect"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "language"
+id = "demo-language"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "integration"
+id = "github"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "integration"
+id = "command"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "model-provider"
+id = "demo"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "agent-provider"
+id = "helper"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "theme"
+id = "aurora"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "preset"
+id = "safe"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "app.started"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "app.shutdown"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "workspace.opened"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "workspace.changed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "session.created"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "session.updated"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "trajectory.recorded"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "agent.started"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "agent.completed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "agent.failed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "skill.loaded"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "instruction.build"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "model.requested"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "model.completed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "tool.invoked"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "tool.completed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "tool.failed"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "event.subscribe"
+id = "extension.loaded"
+
+[contribution.payload]
+
+[configuration]
+schema = "schemas/config.schema.json"
+
+[configuration.defaults]
+greeting = "hello from the all-in-one demo"
+verbose = true
+
+[resources]
+max_memory_mb = 128
+max_execution_ms = 5000
+max_output_bytes = 1048576
+
+[dependencies]
+
+[services]
+provides = []
+requires = []

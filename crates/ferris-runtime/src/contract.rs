@@ -1,0 +1,1161 @@
+//! Runtime-neutral invocation contract.
+//!
+//! The manager never knows whether a package is Rust, a declared file tree or a
+//! process. It knows a runtime can list its tools and answer a call, and it
+//! passes the extension id and a correlation id so every runtime reports the
+//! same diagnostics. Concrete runtimes live in this module's children.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use ferris_core::capability::Capability;
+use ferris_core::manifest::{validate_relative_path, Manifest};
+use ferris_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind};
+
+/// The largest tool descriptor file.
+pub const MAX_TOOL_FILE_BYTES: u64 = 256 * 1024;
+
+/// The default tool schema when a file omits one.
+pub fn empty_schema() -> Value {
+    serde_json::json!({ "type": "object", "properties": {} })
+}
+
+/// One tool a runtime offers, independent of how it is implemented.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDescriptor {
+    /// Contribution id inside the owning extension.
+    pub id: ContributionId,
+    /// One-sentence description the model sees.
+    pub description: String,
+    /// JSON Schema for the arguments.
+    pub input_schema: Value,
+    /// Capabilities a call needs. Empty means only the registration
+    /// capability, which was authorized at activation.
+    pub capabilities: Vec<Capability>,
+}
+
+/// One part of a tool result.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolContent {
+    /// Plain text.
+    Text(String),
+    /// An image, base64 encoded with its media type.
+    Image {
+        /// MIME type such as image/png.
+        media_type: String,
+        /// Base64 bytes.
+        data: String,
+        /// Alternative text.
+        alt: String,
+    },
+    /// A file, base64 encoded with its media type.
+    File {
+        /// Display name.
+        name: String,
+        /// MIME type.
+        media_type: String,
+        /// Base64 bytes.
+        data: String,
+    },
+    /// Arbitrary structured JSON.
+    Json(Value),
+}
+
+/// A rich tool result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResult {
+    /// Ordered content parts.
+    pub content: Vec<ToolContent>,
+    /// Machine-readable structured content, when the tool produced one.
+    pub structured: Option<Value>,
+    /// Whether the tool reported a failure.
+    pub is_error: bool,
+}
+
+impl ToolResult {
+    /// A single text result.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            content: vec![ToolContent::Text(text.into())],
+            structured: None,
+            is_error: false,
+        }
+    }
+
+    /// Wrap a runtime's JSON value, recognizing MCP-shaped content.
+    pub fn from_value(value: Value) -> Self {
+        if let Value::Object(object) = &value {
+            if let Some(items) = object.get("content").and_then(Value::as_array) {
+                let content = items.iter().map(content_from_value).collect();
+                return Self {
+                    content,
+                    structured: object.get("structuredContent").cloned(),
+                    is_error: object
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                };
+            }
+        }
+        if let Value::String(text) = &value {
+            return Self::text(text.clone());
+        }
+        Self {
+            content: vec![ToolContent::Json(value)],
+            structured: None,
+            is_error: false,
+        }
+    }
+
+    /// Convert back to the JSON shape the agent transcript stores.
+    pub fn to_value(&self) -> Value {
+        if !self.is_error && self.structured.is_none() && self.content.len() == 1 {
+            match &self.content[0] {
+                ToolContent::Text(text) => return Value::String(text.clone()),
+                ToolContent::Json(value) => return value.clone(),
+                _ => {}
+            }
+        }
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "content".to_string(),
+            Value::Array(self.content.iter().map(content_to_value).collect()),
+        );
+        if let Some(structured) = &self.structured {
+            object.insert("structuredContent".to_string(), structured.clone());
+        }
+        if self.is_error {
+            object.insert("isError".to_string(), Value::Bool(true));
+        }
+        Value::Object(object)
+    }
+}
+
+fn content_from_value(value: &Value) -> ToolContent {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text") => ToolContent::Text(
+            value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        Some("image") => ToolContent::Image {
+            media_type: value
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png")
+                .to_string(),
+            data: value
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            alt: value
+                .get("alt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        Some("resource") => ToolContent::File {
+            name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("resource")
+                .to_string(),
+            media_type: value
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            data: value
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        _ => ToolContent::Json(value.clone()),
+    }
+}
+
+fn content_to_value(content: &ToolContent) -> Value {
+    match content {
+        ToolContent::Text(text) => serde_json::json!({"type":"text","text":text}),
+        ToolContent::Image {
+            media_type,
+            data,
+            alt,
+        } => serde_json::json!({
+            "type":"image","mimeType":media_type,"data":data,"alt":alt
+        }),
+        ToolContent::File {
+            name,
+            media_type,
+            data,
+        } => serde_json::json!({
+            "type":"resource","name":name,"mimeType":media_type,"data":data
+        }),
+        ToolContent::Json(value) => value.clone(),
+    }
+}
+
+/// The per-call context every runtime receives.
+#[derive(Debug, Clone)]
+pub struct CallContext {
+    /// The owning extension.
+    pub extension: ExtensionId,
+    /// The correlation id shared by the request, its events and its logs.
+    pub correlation_id: String,
+    /// The workspace open for this call, used for scoped authorization.
+    pub workspace: Option<PathBuf>,
+    /// The session whose turn invoked the call, when one exists.
+    ///
+    /// A tool that acts on a turn (a task, a delegation) needs the session it
+    /// belongs to; a workspace alone cannot name it.
+    pub session: Option<String>,
+    /// The call's wall-clock ceiling.
+    pub timeout_ms: u64,
+}
+
+impl CallContext {
+    /// Build a call context.
+    pub fn new(
+        extension: ExtensionId,
+        correlation_id: impl Into<String>,
+        workspace: Option<PathBuf>,
+        timeout_ms: u64,
+    ) -> Self {
+        Self {
+            extension,
+            correlation_id: correlation_id.into(),
+            workspace,
+            session: None,
+            timeout_ms,
+        }
+    }
+
+    /// Name the session this call belongs to.
+    pub fn with_session(mut self, session: impl Into<String>) -> Self {
+        self.session = Some(session.into());
+        self
+    }
+}
+
+/// The runtime seam. Every concrete runtime implements the same five
+/// operations and normalizes its own failures into ExtensionError.
+#[async_trait]
+pub trait Runtime: Send + Sync {
+    /// The runtime kind.
+    fn kind(&self) -> RuntimeKind;
+
+    /// Fuel consumed by the most recent WASM call, when the runtime meters it.
+    fn fuel_used(&self) -> Option<u64> {
+        None
+    }
+
+    /// The memory ceiling the manifest requested, in bytes.
+    fn memory_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// A runtime-materialized skills directory, when the runtime provides one.
+    fn skills_dir(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Declarative contributions the runtime discovered itself (contexts,
+    /// prompts, commands, panels). The factory usually supplies these; a lazy
+    /// runtime that discovers them only on activation answers here.
+    fn declarative(&self) -> crate::declarative::DeclarativeContributions {
+        crate::declarative::DeclarativeContributions::default()
+    }
+
+    /// Current linear-memory usage, when the runtime tracks it.
+    fn memory_used(&self) -> Option<u64> {
+        None
+    }
+
+    /// Prepare the runtime. A process runtime may defer the first spawn; a
+    /// wasm runtime may compile here.
+    async fn activate(&self) -> Result<(), ExtensionError> {
+        Ok(())
+    }
+
+    /// Stop accepting calls and release live resources.
+    async fn deactivate(&self) -> Result<(), ExtensionError> {
+        Ok(())
+    }
+
+    /// Release everything. Called once when the package is unloaded.
+    async fn shutdown(&self) -> Result<(), ExtensionError> {
+        self.deactivate().await
+    }
+
+    /// Whether this handle has been terminally shut down.
+    ///
+    /// A shut-down runtime refuses every call and cannot be reactivated, so a
+    /// holder that kept the handle across a host rebuild (a mounted panel, a
+    /// cached tool) can tell that it is stale before paying for a call. The
+    /// default is `false`: only a wrapper that owns a shutdown flag answers.
+    fn is_shutdown(&self) -> bool {
+        false
+    }
+
+    /// Stop outstanding work, keeping the runtime loadable.
+    async fn cancel(&self) -> Result<(), ExtensionError> {
+        self.deactivate().await
+    }
+
+    /// The tools this runtime offers.
+    async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError>;
+
+    /// Invoke one tool by contribution id.
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+    ) -> Result<Value, ExtensionError>;
+
+    /// Invoke one tool and preserve rich content parts.
+    async fn call_tool_result(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+    ) -> Result<ToolResult, ExtensionError> {
+        self.call_tool(name, arguments, context)
+            .await
+            .map(ToolResult::from_value)
+    }
+
+    /// Invoke one tool and forward runtime progress notifications.
+    ///
+    /// A runtime that cannot stream ignores the sender and returns the same
+    /// result as call_tool_result.
+    async fn call_tool_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
+    ) -> Result<ToolResult, ExtensionError> {
+        let _ = progress;
+        self.call_tool_result(name, arguments, context).await
+    }
+
+    /// Execute one command contribution. A runtime without commands refuses.
+    async fn command(&self, id: &str, _arguments: Value) -> Result<Value, ExtensionError> {
+        Err(ExtensionError::UnsupportedRuntime {
+            kind: format!("{} command {id}", self.kind()),
+        })
+    }
+
+    /// Fetch one panel's current declarative document. A runtime without
+    /// panels refuses.
+    async fn panel(&self, id: &str) -> Result<Value, ExtensionError> {
+        Err(ExtensionError::UnsupportedRuntime {
+            kind: format!("{} panel {id}", self.kind()),
+        })
+    }
+
+    /// Deliver any event the host queued for a subscriber.
+    async fn pump(&self) -> Result<(), ExtensionError> {
+        Ok(())
+    }
+
+    /// Deliver one observe hook batch to this runtime.
+    ///
+    /// The payload is `{"point": "...", "batch": [...]}`; a runtime that does
+    /// not implement hooks refuses, and the host logs that refusal rather than
+    /// pretending the package was attached.
+    async fn hook(&self, point: &str, _payload: Value) -> Result<(), ExtensionError> {
+        Err(ExtensionError::UnsupportedRuntime {
+            kind: format!("{} hook {point}", self.kind()),
+        })
+    }
+
+    /// The typed services this runtime publishes (issue #302).
+    ///
+    /// Only a first-party (Rust) runtime can supply a typed service value; a
+    /// guest runtime returns none. The host publishes each through the
+    /// activation's provide_service, which enforces the manifest declaration.
+    fn provided_services(&self) -> Vec<ProvidedService> {
+        Vec::new()
+    }
+}
+
+/// A typed service a first-party runtime publishes (issue #302).
+///
+/// The publication is a closure that captures the concrete-typed value, so the
+/// registry keys it by the value's real TypeId and a consumer can acquire it
+/// back as that same type (a type-erased value here would lose the TypeId).
+/// The name/contract/version/scope must match a provides declaration in the
+/// extension's manifest; the host enforces that before publishing.
+pub struct ProvidedService {
+    /// Stable service name.
+    pub name: String,
+    /// Stable interface identifier.
+    pub contract: String,
+    /// The provider's concrete version.
+    pub version: semver::Version,
+    /// The visibility scope to publish at.
+    pub scope: ferris_core::composable::Scope,
+    /// Publishes the concrete-typed value, returning its revocation token.
+    publisher: Arc<
+        dyn Fn(&ferris_core::composable::ServiceRegistry) -> ferris_core::composable::ServiceToken
+            + Send
+            + Sync,
+    >,
+}
+
+impl ProvidedService {
+    /// Build a provided service from a concrete typed value.
+    pub fn new<T: std::any::Any + Send + Sync>(
+        name: impl Into<String>,
+        contract: impl Into<String>,
+        version: semver::Version,
+        scope: ferris_core::composable::Scope,
+        value: Arc<T>,
+    ) -> Self {
+        let name = name.into();
+        let contract = contract.into();
+        let (pub_name, pub_contract, pub_version, pub_scope) = (
+            name.clone(),
+            contract.clone(),
+            version.clone(),
+            scope.clone(),
+        );
+        let publisher = Arc::new(move |registry: &ferris_core::composable::ServiceRegistry| {
+            registry.provide_contract(
+                pub_scope.clone(),
+                pub_name.clone(),
+                &pub_contract,
+                pub_version.clone(),
+                Arc::clone(&value),
+            )
+        });
+        Self {
+            name,
+            contract,
+            version,
+            scope,
+            publisher,
+        }
+    }
+
+    /// Publish into the shared registry, returning the revocation token.
+    pub fn publish(
+        &self,
+        registry: &ferris_core::composable::ServiceRegistry,
+    ) -> ferris_core::composable::ServiceToken {
+        (self.publisher)(registry)
+    }
+}
+
+/// The on-disk tool descriptor every declarative and process package ships for
+/// each declared tool.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolFile {
+    /// Description shown to the model. Defaults to the manifest name.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// JSON Schema for the arguments.
+    #[serde(default, rename = "input_schema")]
+    pub input_schema: Option<Value>,
+    /// Capabilities a call needs.
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    /// The declarative implementation. Process tools ignore it.
+    #[serde(default)]
+    pub implementation: Option<Implementation>,
+}
+
+/// A pure declarative tool body. Nothing here can touch the host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Implementation {
+    /// Return the arguments unchanged.
+    EchoArguments,
+    /// Return a fixed value.
+    Constant {
+        /// The value.
+        value: Value,
+    },
+    /// Interpolate '{{name}}' placeholders from the arguments into text.
+    Template {
+        /// The template.
+        text: String,
+    },
+}
+
+impl Implementation {
+    /// Run the body with the arguments, bounded by the output ceiling.
+    pub fn run(
+        &self,
+        arguments: &Value,
+        max_output_bytes: u64,
+        extension: &ExtensionId,
+    ) -> Result<Value, ExtensionError> {
+        let value = match self {
+            Self::EchoArguments => arguments.clone(),
+            Self::Constant { value } => value.clone(),
+            Self::Template { text } => {
+                let rendered = render_template(text, arguments);
+                Value::String(rendered)
+            }
+        };
+        let bytes = serde_json::to_vec(&value)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        if bytes as u64 > max_output_bytes {
+            return Err(ExtensionError::Limit {
+                extension: extension.to_string(),
+                message: format!("tool result is {bytes} bytes; the ceiling is {max_output_bytes}"),
+            });
+        }
+        Ok(value)
+    }
+}
+
+/// Replace top-level '{{name}}' placeholders. A missing argument renders as an
+/// empty string, which keeps an optional placeholder from failing a tool.
+pub fn render_template(template: &str, arguments: &Value) -> String {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let key = after[..end].trim();
+        let value = arguments.get(key);
+        match value {
+            Some(Value::String(text)) => output.push_str(text),
+            Some(value) => output.push_str(&value.to_string()),
+            None => {}
+        }
+        rest = &after[end + 2..];
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Load the tool descriptors for every tool a manifest declares.
+///
+/// The file name is the full contribution id, so 'git.status' is
+/// 'tools/git.status.json'. The full id is used rather than its last segment
+/// because two contributions in one package may share a leaf name.
+pub fn load_tool_descriptors(
+    root: &Path,
+    manifest: &Manifest,
+) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+    let mut descriptors = Vec::new();
+    for id in &manifest.contributes.tools {
+        let relative = format!("tools/{}.json", id.as_str());
+        let relative =
+            validate_relative_path(&relative).map_err(|reason| ExtensionError::Manifest {
+                path: root.join("extension.toml"),
+                message: format!("tool {id}: {reason}"),
+            })?;
+        let path = root.join(&relative);
+        let metadata = std::fs::metadata(&path).map_err(|source| ExtensionError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.len() > MAX_TOOL_FILE_BYTES {
+            return Err(ExtensionError::Limit {
+                extension: manifest.id().to_string(),
+                message: format!(
+                    "tool descriptor {} is larger than {MAX_TOOL_FILE_BYTES} bytes",
+                    relative.display()
+                ),
+            });
+        }
+        let text = std::fs::read_to_string(&path).map_err(|source| ExtensionError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let file: ToolFile = serde_json::from_str(&text).map_err(|error| ExtensionError::Json {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        let description = file
+            .description
+            .filter(|description| !description.trim().is_empty())
+            .unwrap_or_else(|| format!("{} ({id})", manifest.extension.name));
+        if description.len() > 4096 {
+            return Err(ExtensionError::Manifest {
+                path,
+                message: "tool description must be at most 4096 bytes".to_string(),
+            });
+        }
+        let input_schema = file.input_schema.unwrap_or_else(empty_schema);
+        if !input_schema.is_object() {
+            return Err(ExtensionError::Manifest {
+                path,
+                message: "tool input_schema must be a JSON object".to_string(),
+            });
+        }
+        descriptors.push(ToolDescriptor {
+            id: id.clone(),
+            description,
+            input_schema,
+            capabilities: file.capabilities,
+        });
+    }
+    Ok(descriptors)
+}
+
+/// A runtime wrapper that runs activation once, on first use.
+///
+/// The host builds an agent synchronously, while activation may need async I/O
+/// (a wasm compile, a process handshake). Wrapping every runtime in this cell
+/// keeps the build path synchronous and still gives the runtime one activation
+/// per process rather than one per call.
+pub struct LazyRuntime {
+    /// The extension the wrapped runtime serves, named in its errors.
+    ///
+    /// Without it every activation or shutdown failure reported by a wrapped
+    /// runtime was attributed to `lazy`, which is the adapter and not a
+    /// package, so the message could not name the one thing a reader can act on.
+    id: String,
+    inner: Arc<dyn Runtime>,
+    /// Whether the inner runtime is currently activated. A plain bool under an
+    /// async mutex (rather than a OnceCell) lets deactivation reopen the gate.
+    activated: tokio::sync::Mutex<bool>,
+    /// Terminal shutdown; deactivate only closes the activation gate.
+    shutdown: AtomicBool,
+    /// Lifecycle/call admission: calls hold a read guard across the inner
+    /// operation, deactivate and shutdown hold the write guard.
+    lifecycle: tokio::sync::RwLock<()>,
+    failures: AtomicU32,
+}
+
+impl LazyRuntime {
+    /// Wrap one runtime, naming the extension it serves.
+    ///
+    /// The id is what a life-cycle failure reports, so a shutdown or a failed
+    /// activation reads as `extension <id> runtime error: ...` instead of
+    /// naming the adapter.
+    pub fn new(id: impl Into<String>, inner: Arc<dyn Runtime>) -> Self {
+        Self {
+            id: id.into(),
+            inner,
+            activated: tokio::sync::Mutex::new(false),
+            shutdown: AtomicBool::new(false),
+            lifecycle: tokio::sync::RwLock::new(()),
+            failures: AtomicU32::new(0),
+        }
+    }
+
+    /// Activate once, with a bounded exponential backoff between retries.
+    ///
+    /// The first attempt is immediate. After a failure the next attempt waits
+    /// 50 ms, then 100 ms, then 200 ms, capped at 400 ms, so a package whose
+    /// startup dependency is briefly unavailable recovers without a hot loop and
+    /// without unbounded delay.
+    async fn ensure(&self) -> Result<(), ExtensionError> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err(ExtensionError::Runtime {
+                extension: self.id.clone(),
+                message: "runtime is shut down".to_string(),
+            });
+        }
+        let failures = self.failures.load(Ordering::Relaxed);
+        if failures > 0 {
+            let shift = failures.saturating_sub(1).min(3);
+            let delay = Duration::from_millis(50 * (1 << shift)).min(Duration::from_millis(400));
+            tokio::time::sleep(delay).await;
+        }
+        let mut activated = self.activated.lock().await;
+        if *activated {
+            return Ok(());
+        }
+        let result = self.inner.activate().await;
+        match &result {
+            Ok(()) => {
+                *activated = true;
+                self.failures.store(0, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl Runtime for LazyRuntime {
+    fn kind(&self) -> RuntimeKind {
+        self.inner.kind()
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    fn fuel_used(&self) -> Option<u64> {
+        self.inner.fuel_used()
+    }
+
+    fn memory_limit(&self) -> Option<u64> {
+        self.inner.memory_limit()
+    }
+
+    fn memory_used(&self) -> Option<u64> {
+        self.inner.memory_used()
+    }
+
+    /// Forward the runtime's materialized skills directory.
+    ///
+    /// A runtime that materializes skills at activation (Cordis does: the
+    /// package registers them from `apply(ctx)` and the runtime writes each as a
+    /// `SKILL.md`) advertises the directory here. Dropping the forward made
+    /// `skills_dir()` answer the trait default `None` for every package the
+    /// factory wraps, so the host fell back to the file-based `skills/` form and
+    /// a runtime-registered skill never reached the agent.
+    fn skills_dir(&self) -> Option<PathBuf> {
+        self.inner.skills_dir()
+    }
+
+    fn provided_services(&self) -> Vec<ProvidedService> {
+        self.inner.provided_services()
+    }
+
+    fn declarative(&self) -> crate::declarative::DeclarativeContributions {
+        self.inner.declarative()
+    }
+
+    async fn activate(&self) -> Result<(), ExtensionError> {
+        let _lifecycle = self.lifecycle.write().await;
+        self.ensure().await
+    }
+
+    async fn deactivate(&self) -> Result<(), ExtensionError> {
+        // Serialize with activation and with calls: a call admitted before
+        // this point finishes before the inner runtime is deactivated.
+        let _lifecycle = self.lifecycle.write().await;
+        let mut activated = self.activated.lock().await;
+        let was_active = *activated;
+        *activated = false;
+        drop(activated);
+        if was_active {
+            self.inner.deactivate().await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn shutdown(&self) -> Result<(), ExtensionError> {
+        let _lifecycle = self.lifecycle.write().await;
+        self.shutdown.store(true, Ordering::SeqCst);
+        let mut activated = self.activated.lock().await;
+        *activated = false;
+        drop(activated);
+        self.inner.shutdown().await
+    }
+
+    async fn cancel(&self) -> Result<(), ExtensionError> {
+        self.inner.cancel().await
+    }
+
+    async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
+        self.ensure().await?;
+        self.inner.tools().await
+    }
+
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+    ) -> Result<Value, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
+        self.ensure().await?;
+        self.inner.call_tool(name, arguments, context).await
+    }
+
+    async fn call_tool_result(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+    ) -> Result<ToolResult, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
+        self.ensure().await?;
+        self.inner.call_tool_result(name, arguments, context).await
+    }
+
+    async fn call_tool_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &CallContext,
+        progress: Option<tokio::sync::mpsc::Sender<Value>>,
+    ) -> Result<ToolResult, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
+        self.ensure().await?;
+        self.inner
+            .call_tool_progress(name, arguments, context, progress)
+            .await
+    }
+
+    async fn command(&self, id: &str, arguments: Value) -> Result<Value, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
+        self.ensure().await?;
+        self.inner.command(id, arguments).await
+    }
+
+    async fn panel(&self, id: &str) -> Result<Value, ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
+        self.ensure().await?;
+        self.inner.panel(id).await
+    }
+
+    /// Deliver an observe-hook batch to the wrapped runtime.
+    ///
+    /// The host's only hook path is a factory-wrapped runtime, so this method
+    /// is the difference between a package that declared `http.exchange`
+    /// receiving its batches and one that silently receives nothing.
+    async fn hook(&self, point: &str, payload: Value) -> Result<(), ExtensionError> {
+        let _lifecycle = self.lifecycle.read().await;
+        self.ensure().await?;
+        self.inner.hook(point, payload).await
+    }
+
+    async fn pump(&self) -> Result<(), ExtensionError> {
+        // Pump must not activate an on-demand package: an idle host with no
+        // subscribers should pay nothing for a package nobody called yet.
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _lifecycle = self.lifecycle.read().await;
+        self.inner.pump().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let index = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "bsh-ext-runtime-{label}-{}-{index}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(path.join("tools")).expect("scratch");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn manifest() -> Manifest {
+        Manifest::parse(
+            r#"
+schema_version = "1.0"
+
+[extension]
+id = "com.example.tools"
+name = "Tools"
+version = "1.0.0"
+description = "Test tools"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "declarative"
+
+[contributes]
+tools = ["echo", "greet"]
+"#,
+            Path::new("extension.toml"),
+        )
+        .expect("manifest")
+    }
+
+    #[test]
+    fn descriptors_load_from_the_declared_files() {
+        let scratch = Scratch::new("load");
+        std::fs::write(
+            scratch.0.join("tools/echo.json"),
+            r#"{"description":"Echo arguments","input_schema":{"type":"object"}}"#,
+        )
+        .expect("echo");
+        std::fs::write(
+            scratch.0.join("tools/greet.json"),
+            r#"{"description":"Greet","capabilities":["workspace.read"]}"#,
+        )
+        .expect("greet");
+        let descriptors = load_tool_descriptors(&scratch.0, &manifest()).expect("descriptors");
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].id.as_str(), "echo");
+        assert_eq!(descriptors[1].capabilities, vec![Capability::WorkspaceRead]);
+    }
+
+    #[test]
+    fn a_missing_descriptor_file_is_an_error() {
+        let scratch = Scratch::new("missing");
+        std::fs::write(scratch.0.join("tools/echo.json"), "{}").expect("echo");
+        let error = load_tool_descriptors(&scratch.0, &manifest()).expect_err("missing greet");
+        assert!(matches!(error, ExtensionError::Io { .. }), "{error}");
+    }
+
+    #[test]
+    fn templates_interpolate_top_level_arguments() {
+        assert_eq!(
+            render_template(
+                "hello {{name}} #{{n}}",
+                &serde_json::json!({"name":"world","n":2})
+            ),
+            "hello world #2"
+        );
+        assert_eq!(render_template("{{missing}}x", &serde_json::json!({})), "x");
+        assert_eq!(
+            render_template("{{unfinished", &serde_json::json!({})),
+            "{{unfinished"
+        );
+    }
+
+    #[test]
+    fn declarative_output_is_bounded() {
+        let extension = manifest().id().clone();
+        let implementation = Implementation::Template {
+            text: "x".repeat(64),
+        };
+        assert!(implementation
+            .run(&serde_json::json!({}), 1024, &extension)
+            .is_ok());
+        assert!(implementation
+            .run(&serde_json::json!({}), 16, &extension)
+            .is_err());
+    }
+
+    struct FlakyRuntime {
+        attempts: AtomicU32,
+    }
+
+    #[async_trait]
+    impl Runtime for FlakyRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn activate(&self) -> Result<(), ExtensionError> {
+            if self.attempts.fetch_add(1, Ordering::Relaxed) < 2 {
+                return Err(ExtensionError::Denied {
+                    extension: "com.example.flaky".to_string(),
+                    capability: "startup".to_string(),
+                    reason: "not yet".to_string(),
+                });
+            }
+            Ok(())
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_activation_retries_then_succeeds() {
+        let inner = Arc::new(FlakyRuntime {
+            attempts: AtomicU32::new(0),
+        });
+        let runtime = LazyRuntime::new("com.example.flaky", inner.clone());
+        assert!(runtime.activate().await.is_err());
+        assert!(runtime.activate().await.is_err());
+        runtime.activate().await.expect("third attempt succeeds");
+        assert_eq!(inner.attempts.load(Ordering::Relaxed), 3);
+    }
+
+    struct CountingRuntime {
+        activations: AtomicU32,
+        deactivations: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for CountingRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        async fn activate(&self) -> Result<(), ExtensionError> {
+            self.activations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn deactivate(&self) -> Result<(), ExtensionError> {
+            self.deactivations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_activation_reopens_after_deactivation() {
+        let inner = Arc::new(CountingRuntime {
+            activations: AtomicU32::new(0),
+            deactivations: AtomicU32::new(0),
+        });
+        let runtime = LazyRuntime::new("com.example.counting", inner.clone());
+        runtime.activate().await.expect("first activation");
+        runtime.activate().await.expect("cached activation");
+        assert_eq!(inner.activations.load(Ordering::Relaxed), 1);
+        runtime.deactivate().await.expect("deactivate");
+        assert_eq!(inner.deactivations.load(Ordering::Relaxed), 1);
+        runtime.activate().await.expect("reactivation");
+        assert_eq!(inner.activations.load(Ordering::Relaxed), 2);
+    }
+
+    /// A runtime that records the seams the wrapper must not swallow.
+    struct Forwarding {
+        hooks: AtomicU32,
+    }
+
+    #[async_trait]
+    impl Runtime for Forwarding {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Builtin
+        }
+
+        fn declarative(&self) -> crate::declarative::DeclarativeContributions {
+            crate::declarative::DeclarativeContributions {
+                commands: vec![crate::declarative::CommandContribution {
+                    id: ContributionId::parse("greet").expect("contribution id"),
+                    description: "Greet".to_string(),
+                    template: "hello".to_string(),
+                }],
+                ..Default::default()
+            }
+        }
+
+        async fn tools(&self) -> Result<Vec<ToolDescriptor>, ExtensionError> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+            _context: &CallContext,
+        ) -> Result<Value, ExtensionError> {
+            Ok(Value::Null)
+        }
+
+        async fn hook(&self, point: &str, _payload: Value) -> Result<(), ExtensionError> {
+            assert_eq!(point, "model.request");
+            self.hooks.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// The wrapper must forward every seam the host drives.
+    ///
+    /// The host only sees factory-wrapped runtimes, so a method the wrapper
+    /// answers with the trait default is a method no package can receive: the
+    /// observe worker got "not implemented" for every batch and a package that
+    /// declared `http.exchange` captured nothing while its panel and tools
+    /// worked.
+    #[tokio::test]
+    async fn a_lazy_wrapper_forwards_hooks_and_declarative_contributions() {
+        let inner = Arc::new(Forwarding {
+            hooks: AtomicU32::new(0),
+        });
+        let runtime = LazyRuntime::new("com.example.observers", inner.clone());
+        runtime
+            .hook(
+                "model.request",
+                serde_json::json!({"point": "model.request", "batch": []}),
+            )
+            .await
+            .expect("the hook reaches the wrapped runtime");
+        assert_eq!(inner.hooks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            runtime.declarative().commands.len(),
+            1,
+            "the wrapper forwards what the runtime discovered"
+        );
+    }
+
+    /// A shut-down wrapper is terminal and names its extension.
+    ///
+    /// A mounted panel keeps this handle across a host rebuild, so the message
+    /// it shows is the whole diagnosis: `lazy` is the adapter and names
+    /// nothing a reader can act on, while the package id does.
+    #[tokio::test]
+    async fn a_shut_down_lazy_wrapper_names_its_extension_and_never_revives() {
+        let inner = Arc::new(CountingRuntime {
+            activations: AtomicU32::new(0),
+            deactivations: AtomicU32::new(0),
+        });
+        let runtime = LazyRuntime::new("com.example.panels", inner.clone());
+        assert!(!runtime.is_shutdown());
+        runtime.activate().await.expect("activation");
+        runtime.shutdown().await.expect("shutdown");
+        assert!(runtime.is_shutdown(), "shutdown is observable to a holder");
+        let error = runtime
+            .panel("overview")
+            .await
+            .expect_err("a shut-down wrapper serves nothing");
+        assert_eq!(
+            error.to_string(),
+            "extension com.example.panels runtime error: runtime is shut down"
+        );
+        assert!(
+            runtime.activate().await.is_err(),
+            "activation cannot reopen a shut-down wrapper"
+        );
+        assert_eq!(
+            inner.activations.load(Ordering::Relaxed),
+            1,
+            "the refused activation never reached the inner runtime"
+        );
+    }
+}

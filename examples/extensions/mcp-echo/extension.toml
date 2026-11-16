@@ -1,0 +1,51 @@
+schema_version = "2.0"
+
+[extension]
+id = "com.example.mcp-echo"
+name = "MCP Echo"
+version = "1.0.0"
+description = "An echo tool, resource and prompt served over MCP"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+host = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "mcp"
+
+[runtime.config]
+args = ["server.py"]
+entry = "python3"
+protocol = "mcp"
+startup = "on-demand"
+
+[capabilities]
+required = [
+    "process.execute",
+    "agent.tools.register",
+    "agent.context.provide",
+    "agent.prompts.provide",
+]
+
+[[contribution]]
+kind = "prompt"
+id = "greet"
+
+[contribution.payload]
+
+[[contribution]]
+kind = "context"
+id = "guide"
+
+[contribution.payload]
+
+[resources]
+max_execution_ms = 5000
+
+[dependencies]
+
+[services]
+provides = []
+requires = []

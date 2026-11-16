@@ -1,0 +1,350 @@
+name: jsbos pipeline
+env:
+  DEBUG: napi:*
+  APP_NAME: brainos
+  MACOSX_DEPLOYMENT_TARGET: '10.13'
+  CARGO_INCREMENTAL: '1'
+
+on:
+  # Tags only: main pushes are tested by the rust workflow, not published.
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Detect a release tag
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # A release happens only when a vX.Y.Z tag matches every manifest; when
+      # it does not, the jobs below are skipped instead of publishing a
+      # partial or mismatched set.
+      - id: check
+        name: Check the release precondition
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash scripts/ci/release-precondition.sh
+
+  build:
+    name: Build bindings for ${{ matrix.target }}
+    needs: release
+    if: needs.release.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            build: yarn build
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            build: yarn build
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            build: yarn build --target aarch64-apple-darwin
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            build: yarn build --target x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            build: yarn build --target aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: ./crates/jsbos
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Setup yarn
+        run: corepack enable && corepack prepare yarn@4.13.0 --activate
+
+      - name: Install dependencies
+        run: yarn install --no-immutable
+
+      - name: Build
+        run: ${{ matrix.build }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/jsbos/*.node
+          retention-days: 7
+
+  test-macos-windows:
+    name: Test bindings on ${{ matrix.target }} - node@${{ matrix.node }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            host: windows-latest
+            architecture: x64
+            node: '20'
+          - target: aarch64-pc-windows-msvc
+            host: windows-11-arm
+            architecture: arm64
+            node: '20'
+          - target: aarch64-apple-darwin
+            host: macos-latest
+            architecture: arm64
+            node: '20'
+    runs-on: ${{ matrix.host }}
+    defaults:
+      run:
+        working-directory: ./crates/jsbos
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.architecture }}
+
+      - name: Setup yarn
+        run: corepack enable && corepack prepare yarn@4.13.0 --activate
+
+      - name: Install dependencies
+        run: yarn install --no-immutable
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/jsbos
+
+      - name: List artifacts
+        run: ls -la *.node
+        shell: bash
+
+      - name: Run smoke test
+        run: yarn test
+        env:
+          OPENAI_API_KEY: test-key
+          LLM_MODEL: test-model
+
+  test-linux:
+    name: Test ${{ matrix.target }} - node@${{ matrix.node }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            node: '20'
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            node: '20'
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: ./crates/jsbos
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Setup yarn
+        run: corepack enable && corepack prepare yarn@4.13.0 --activate
+
+      - name: Install dependencies
+        run: yarn install --no-immutable
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/jsbos
+
+      - name: List artifacts
+        run: ls -la *.node
+        shell: bash
+
+      - name: Run smoke test
+        run: yarn test
+        env:
+          OPENAI_API_KEY: test-key
+          LLM_MODEL: test-model
+
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    # The workflow-level group is per-ref, so a version commit on main and
+    # its v* tag run concurrently. Publishes must not: the second run would
+    # race this job past the already-published guard and fail on an
+    # EPUBLISHCONFLICT. Serialize publish jobs across every ref, and never
+    # cancel one in progress — a cancelled publish leaves a half-published
+    # release behind.
+    concurrency:
+      group: ${{ github.workflow }}-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+    needs:
+      - release
+      - build
+      - test-macos-windows
+      - test-linux
+    if: needs.release.outputs.should_release == 'true'
+    defaults:
+      run:
+        working-directory: ./crates/jsbos
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      # Trusted publishing has npm exchange this workflow OIDC identity
+      # for registry access, which needs npm >= 11.5.1. Node 20 still
+      # ships npm 10, so pin a current npm 11 before anything publishes.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@11
+
+      - name: Setup yarn
+        run: corepack enable && corepack prepare yarn@4.13.0 --activate
+
+      - name: Install dependencies
+        run: yarn install --no-immutable
+
+      - name: create npm dirs
+        run: yarn napi create-npm-dirs
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: crates/jsbos/artifacts
+
+      - name: Create npm artifacts
+        run: yarn artifacts
+
+      - name: List packages
+        run: ls -R ./npm
+        shell: bash
+
+      - name: Publish
+        run: |
+          npm config set provenance true
+          pkg=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          subject=$(git log -1 --pretty=%s)
+
+          # 1. Decide the dist-tag this push would publish under: `latest`
+          #    for a full release, `next` for a pre-release, nothing at
+          #    all when the push is not a release.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if echo "$GITHUB_REF_NAME" | grep -qE "^v?[0-9]+\.[0-9]+\.[0-9]+$"; then
+              dist_tag=latest
+            else
+              dist_tag=next
+            fi
+          elif echo "$subject" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+$"; then
+            dist_tag=latest
+          elif echo "$subject" | grep -qE "^[0-9]+\.[0-9]+"; then
+            dist_tag=next
+          else
+            echo "Not a version commit. Commit: ${subject}"
+            echo "Not a release, skipping publish"
+            exit 0
+          fi
+
+          # 2. The push's version identity must equal package.json. A stray
+          #    or stale tag (or a mislabeled version commit) would publish
+          #    whatever version happens to be checked out — possibly an old
+          #    version over `latest`.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            push_version="${GITHUB_REF_NAME#v}"
+          else
+            push_version=$(echo "$subject" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' || true)
+          fi
+          if [ "$push_version" != "$version" ]; then
+            echo "Push version (${push_version:-none}) does not match package.json ${version}; skipping publish."
+            exit 0
+          fi
+
+          # 3. Publishing must be idempotent: a version commit and its v*
+          #    tag both trigger this workflow for the same commit, and a
+          #    re-run repeats it. Without this guard the second attempt
+          #    fails the release on an already-published version instead
+          #    of no-oping. The per-platform packages are equally safe:
+          #    `napi prepublish` skips any platform package the registry
+          #    reports as already published.
+          if npm view "${pkg}@${version}" version >/dev/null 2>&1; then
+            echo "${pkg}@${version} is already published."
+            # The version may have first landed under `next` (a
+            # pre-release push beat this one to the registry); a full
+            # release must still move `latest` onto it or npm users
+            # never receive this version.
+            if [ "$dist_tag" = "latest" ] && [ "$(npm view "${pkg}" version 2>/dev/null)" != "$version" ]; then
+              echo "latest does not point at ${version}; moving it."
+              npm dist-tag add "${pkg}@${version}" latest
+            fi
+            exit 0
+          fi
+
+          # 4. Publish only from this workflow. Auth comes from npm Trusted
+          #    Publishing -- npm exchanges the OIDC identity of this
+          #    workflow for registry access, so no _authToken is written
+          #    and no OTP is ever prompted. Every package published from
+          #    here (this one plus the per-platform ones emitted by
+          #    `napi prepublish`) must list this workflow as a trusted
+          #    publisher on npmjs.com.
+          # A concurrent run can finish this same version between step 3's
+          # guard and this publish: npm serves a brief read-after-write
+          # staleness, so the guard misses, `napi prepublish` hits E409
+          # re-publishing an already-published platform package, and the run
+          # fails on a race instead of no-oping. If the registry now
+          # confirms the release landed, the outcome this job wanted has
+          # happened — accept it rather than failing the release.
+          if [ "$dist_tag" = "latest" ]; then
+            publish=(npm publish --access public)
+          else
+            publish=(npm publish --tag next --access public)
+          fi
+          if ! "${publish[@]}"; then
+            if npm view "${pkg}@${version}" version >/dev/null 2>&1; then
+              echo "${pkg}@${version} is on the registry; a concurrent run published it first."
+              if [ "$dist_tag" = "latest" ] && [ "$(npm view "${pkg}" version 2>/dev/null)" != "$version" ]; then
+                echo "latest does not point at ${version}; moving it."
+                npm dist-tag add "${pkg}@${version}" latest
+              fi
+              exit 0
+            fi
+            echo "Publish failed and ${pkg}@${version} is not on the registry."
+            exit 1
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

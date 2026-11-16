@@ -1,0 +1,12 @@
+{
+  "name": "dsh_echo",
+  "description": "Echo the arguments back.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "value": { "type": "string" }
+    },
+    "required": ["value"]
+  },
+  "behavior": { "kind": "echo_arguments" }
+}

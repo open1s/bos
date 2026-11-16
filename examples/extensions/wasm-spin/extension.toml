@@ -1,0 +1,44 @@
+schema_version = "2.0"
+
+[extension]
+id = "com.example.wasm-spin"
+name = "Wasm Spin"
+version = "1.0.0"
+description = "A pure-compute fixture used to test Wasmtime cancellation"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+host = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "wasm-component"
+
+[runtime.config]
+entry = "wasm/extension.wasm"
+startup = "on-demand"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[[contribution]]
+kind = "tool"
+id = "spin"
+
+[[contribution]]
+kind = "tool"
+id = "echo"
+
+[contribution.payload]
+
+[resources]
+max_memory_mb = 64
+max_execution_ms = 60000
+max_output_bytes = 65536
+
+[dependencies]
+
+[services]
+provides = []
+requires = []

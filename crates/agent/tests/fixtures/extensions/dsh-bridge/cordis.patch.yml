@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-bridge
+      name: '@local/dsh-bridge'
+      config: { name: 'fixture' }

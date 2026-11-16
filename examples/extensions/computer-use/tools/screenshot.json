@@ -1,0 +1,16 @@
+{
+  "description": "Capture the main display to a PNG file and return its path and dimensions. Requires macOS Screen Recording permission.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Optional absolute path for the PNG. Defaults to a temp file."
+      }
+    },
+    "additionalProperties": false
+  },
+  "capabilities": [
+    "computer.use"
+  ]
+}

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=BSH
+GenericName=BOS Harness
+Comment=The BOS agent workspace
+Exec=bsh %U
+Icon=bsh
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=bsh
+Keywords=BOS;agent;AI;terminal;harness;

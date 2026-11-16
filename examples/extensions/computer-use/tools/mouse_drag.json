@@ -1,0 +1,42 @@
+{
+  "description": "Drag from one display point to another.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "from_x": {
+        "type": "number"
+      },
+      "from_y": {
+        "type": "number"
+      },
+      "to_x": {
+        "type": "number"
+      },
+      "to_y": {
+        "type": "number"
+      },
+      "button": {
+        "type": "string",
+        "enum": [
+          "left",
+          "right"
+        ]
+      },
+      "duration_ms": {
+        "type": "integer",
+        "minimum": 50,
+        "maximum": 2000
+      }
+    },
+    "required": [
+      "from_x",
+      "from_y",
+      "to_x",
+      "to_y"
+    ],
+    "additionalProperties": false
+  },
+  "capabilities": [
+    "computer.use"
+  ]
+}

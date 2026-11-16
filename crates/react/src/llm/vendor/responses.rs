@@ -1,0 +1,1510 @@
+//! OpenAI Responses API (`/v1/responses`) support.
+//!
+//! The Responses API is OpenAI's successor to Chat Completions. Its wire
+//! format differs from Chat Completions:
+//! - requests carry an `input` array of typed *items* plus `instructions`,
+//! - responses carry an `output` array of typed items (messages, function
+//!   calls, hosted-tool calls such as `web_search_call`),
+//! - streaming emits typed SSE events (`response.output_text.delta`,
+//!   `response.function_call_arguments.done`, `response.completed`, ...).
+//!
+//! This module provides the request/response types, request building from the
+//! crate's own `LlmMessage` history, hosted-tool serialization, and an SSE
+//! extractor/accumulator that normalize the stream back into [`StreamToken`]s.
+//!
+//! It is protocol-agnostic about the endpoint host, so any vendor that speaks
+//! an OpenAI-compatible Responses API (OpenAI, OpenRouter, ...) can reuse it.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use futures::StreamExt;
+use log::info;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::mpsc;
+
+use crate::llm::{
+    Content, ContentPart, LlmError, LlmMessage, LlmRequest, LlmResponse, LlmResponseResult,
+    LlmTool, LlmToolKind, ReactContext, ReactSession, StreamToken, TokenStream,
+};
+use crate::utils::{JsonExtractor, StreamExtractor};
+
+// =============================================================================
+// Request
+// =============================================================================
+
+#[derive(Debug, Serialize)]
+/// A Responses API request.
+pub struct ResponsesRequest {
+    /// Model identifier.
+    pub model: String,
+    /// System-level instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Typed input items.
+    pub input: Vec<ResponsesInputItem>,
+    /// Serialized tool definitions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Value>>,
+    /// Sampling temperature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling probability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Output token cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Reasoning configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ResponsesReasoning>,
+    /// Whether to stream the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// Let the model answer with several tool calls at once; the engine runs
+    /// such a batch concurrently. Only sent when tools are offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+/// Reasoning configuration for a Responses request.
+pub struct ResponsesReasoning {
+    /// Requested reasoning effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::llm::ReasoningEffort>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+/// One typed item in a Responses request `input` array.
+pub enum ResponsesInputItem {
+    /// A conversation message.
+    #[serde(rename = "message")]
+    Message {
+        /// Message role.
+        role: String,
+        /// Message content parts.
+        content: Vec<ResponsesContentPart>,
+    },
+    /// A function call made by the model.
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        /// Provider call id.
+        #[serde(rename = "call_id")]
+        call_id: String,
+        /// Function name.
+        name: String,
+        /// JSON-encoded arguments.
+        arguments: String,
+    },
+    /// The output of a function call.
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        /// Id of the call this answers.
+        #[serde(rename = "call_id")]
+        call_id: String,
+        /// Function output.
+        output: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+/// One typed content part in a Responses item.
+pub enum ResponsesContentPart {
+    /// Input text.
+    #[serde(rename = "input_text")]
+    InputText {
+        /// The text.
+        text: String,
+    },
+    /// Output text.
+    #[serde(rename = "output_text")]
+    OutputText {
+        /// The text.
+        text: String,
+        /// Inline annotations.
+        #[serde(default)]
+        annotations: Vec<Value>,
+    },
+    /// An input image.
+    #[serde(rename = "input_image")]
+    InputImage {
+        /// Image URL or data URL.
+        image_url: String,
+    },
+    /// Input audio.
+    #[serde(rename = "input_audio")]
+    InputAudio {
+        /// The audio payload.
+        input_audio: ResponsesInputAudio,
+    },
+    /// An output image.
+    #[serde(rename = "output_image")]
+    OutputImage {
+        /// Image URL.
+        #[serde(default)]
+        image_url: String,
+    },
+    /// Output audio.
+    #[serde(rename = "output_audio")]
+    OutputAudio {
+        /// Transcript of the audio.
+        #[serde(default)]
+        transcript: String,
+    },
+    /// A model refusal.
+    #[serde(rename = "refusal")]
+    Refusal {
+        /// The refusal text.
+        #[serde(default)]
+        refusal: String,
+    },
+    /// An unrecognized part type.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+/// An audio payload for a Responses input item.
+pub struct ResponsesInputAudio {
+    /// Base64-encoded audio data.
+    pub data: String,
+    /// Audio format, for example `wav`.
+    pub format: String,
+}
+
+// =============================================================================
+// Response
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A Responses API response.
+pub struct ResponsesResponse {
+    /// Response id.
+    pub id: String,
+    /// Object type.
+    pub object: String,
+    /// Unix creation timestamp.
+    pub created_at: u64,
+    /// Completion status.
+    pub status: String,
+    /// Model that served the request.
+    pub model: String,
+    /// Typed output items.
+    #[serde(default)]
+    pub output: Vec<ResponsesItem>,
+    /// Token usage.
+    #[serde(default)]
+    pub usage: Option<ResponsesUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+/// One typed item in a Responses response `output` array.
+pub enum ResponsesItem {
+    /// An assistant message.
+    #[serde(rename = "message")]
+    Message {
+        /// Item id.
+        #[serde(default)]
+        id: String,
+        /// Message role.
+        #[serde(default)]
+        role: String,
+        /// Message content parts.
+        #[serde(default)]
+        content: Vec<ResponsesContentPart>,
+    },
+    /// A function call.
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        /// Item id.
+        #[serde(default)]
+        id: String,
+        /// Provider call id.
+        #[serde(rename = "call_id", default)]
+        call_id: String,
+        /// Function name.
+        #[serde(default)]
+        name: String,
+        /// JSON-encoded arguments.
+        #[serde(default)]
+        arguments: String,
+    },
+    /// A function call output.
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        /// Id of the call this answers.
+        #[serde(rename = "call_id", default)]
+        call_id: String,
+        /// Function output.
+        #[serde(default)]
+        output: String,
+    },
+    /// Reasoning output.
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        /// Reasoning summary parts.
+        #[serde(default)]
+        summary: Vec<ResponsesReasoningSummary>,
+    },
+    /// A hosted web-search call.
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        /// Item id.
+        #[serde(default)]
+        id: String,
+    },
+    /// A hosted file-search call.
+    #[serde(rename = "file_search_call")]
+    FileSearchCall {
+        /// Item id.
+        #[serde(default)]
+        id: String,
+    },
+    /// A hosted computer-use call.
+    #[serde(rename = "computer_call")]
+    ComputerCall {
+        /// Item id.
+        #[serde(default)]
+        id: String,
+    },
+    /// An unrecognized item type.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A summary of a reasoning item.
+pub struct ResponsesReasoningSummary {
+    /// Summary text.
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Token usage for a Responses call.
+pub struct ResponsesUsage {
+    /// Input tokens.
+    pub input_tokens: u32,
+    /// Breakdown of input tokens.
+    #[serde(default)]
+    pub input_tokens_details: Option<Value>,
+    /// Output tokens.
+    pub output_tokens: u32,
+    /// Breakdown of output tokens.
+    #[serde(default)]
+    pub output_tokens_details: Option<Value>,
+    /// Input plus output tokens.
+    pub total_tokens: u32,
+}
+
+impl ResponsesResponse {
+    /// Concatenate all `output_text` parts of `message` items in order.
+    ///
+    /// Wire markup a gateway leaves in a text part is dropped here too, so a
+    /// special-token span never becomes the turn's answer.
+    pub fn output_text(&self) -> String {
+        let joined: String = self
+            .output
+            .iter()
+            .filter_map(|item| match item {
+                ResponsesItem::Message { content, .. } => {
+                    Some(content.iter().filter_map(|part| match part {
+                        ResponsesContentPart::OutputText { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    }))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        super::strip_special_tokens(&joined)
+    }
+
+    /// Map Responses API usage onto the Chat-Completions-shaped [`crate::llm::vendor::openaicompatible::Usage`].
+    pub fn chat_usage(&self) -> Option<super::openaicompatible::Usage> {
+        self.usage.as_ref().map(|u| super::openaicompatible::Usage {
+            prompt_tokens: u.input_tokens,
+            completion_tokens: u.output_tokens,
+            total_tokens: u.total_tokens,
+            prompt_tokens_details: None,
+        })
+    }
+}
+
+// =============================================================================
+// Request building
+// =============================================================================
+
+fn serialize_args(args: &Value) -> String {
+    if args.is_null() || !args.is_object() {
+        "{}".to_string()
+    } else {
+        args.to_string()
+    }
+}
+
+fn serialize_content_part(part: &ContentPart) -> Option<ResponsesContentPart> {
+    match part {
+        ContentPart::Text { text } => Some(ResponsesContentPart::InputText { text: text.clone() }),
+        ContentPart::Binary { binary } => {
+            if binary.is_image() {
+                Some(ResponsesContentPart::InputImage {
+                    image_url: binary.url(),
+                })
+            } else if binary.is_audio() {
+                let format = binary
+                    .content_type
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("mp3")
+                    .to_string();
+                Some(ResponsesContentPart::InputAudio {
+                    input_audio: ResponsesInputAudio {
+                        data: binary.url(),
+                        format,
+                    },
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn serialize_input_content(content: &Content) -> Vec<ResponsesContentPart> {
+    match content {
+        Content::Text(s) => match crate::llm::types::parse_content_parts(s) {
+            Some(parts) => parts.iter().filter_map(serialize_content_part).collect(),
+            None => vec![ResponsesContentPart::InputText { text: s.clone() }],
+        },
+        Content::Parts(parts) => parts.iter().filter_map(serialize_content_part).collect(),
+    }
+}
+
+fn build_input(history: Option<&[LlmMessage]>, input: &Content) -> Vec<ResponsesInputItem> {
+    let mut items = Vec::new();
+    if let Some(history) = history {
+        for message in history {
+            match message {
+                // System prompts are folded into `instructions`, not `input`.
+                LlmMessage::System { .. } => {}
+                LlmMessage::User { content } => items.push(ResponsesInputItem::Message {
+                    role: "user".to_string(),
+                    content: serialize_input_content(content),
+                }),
+                LlmMessage::Assistant { content } => {
+                    items.push(ResponsesInputItem::Message {
+                        role: "assistant".to_string(),
+                        content: vec![ResponsesContentPart::OutputText {
+                            text: content.clone(),
+                            annotations: Vec::new(),
+                        }],
+                    });
+                }
+                LlmMessage::AssistantToolCall {
+                    tool_call_id,
+                    name,
+                    args,
+                } => items.push(ResponsesInputItem::FunctionCall {
+                    call_id: tool_call_id.clone(),
+                    name: name.clone(),
+                    arguments: serialize_args(args),
+                }),
+                LlmMessage::ToolResult {
+                    tool_call_id,
+                    content,
+                } => items.push(ResponsesInputItem::FunctionCallOutput {
+                    call_id: tool_call_id.clone(),
+                    output: content.clone(),
+                }),
+            }
+        }
+    }
+
+    // A bare request (no history) still carries the user input.
+    if items.is_empty() {
+        items.push(ResponsesInputItem::Message {
+            role: "user".to_string(),
+            content: serialize_input_content(input),
+        });
+    }
+    items
+}
+
+fn serialize_tools(tools: Option<&[LlmTool]>) -> Option<Vec<Value>> {
+    let mut out = Vec::new();
+    if let Some(tools) = tools {
+        for tool in tools {
+            match tool.kind {
+                LlmToolKind::Function => {
+                    out.push(serde_json::json!({
+                        "type": "function",
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }));
+                }
+                // Hosted tools (`web_search`, `file_search`, `computer_use`) are
+                // sent as `{"type": "<kind>", ...config}`. The Responses API
+                // expects config keys (e.g. `max_results`, `vector_store_ids`,
+                // `display_width`) at the TOP level of the tool object, not
+                // nested under a sub-key.
+                LlmToolKind::WebSearch | LlmToolKind::FileSearch | LlmToolKind::ComputerUse => {
+                    let mut v = serde_json::json!({ "type": tool.kind.as_str() });
+                    if let Some(cfg) = &tool.config {
+                        if let Some(obj) = cfg.as_object() {
+                            for (key, val) in obj {
+                                v[key] = val.clone();
+                            }
+                        }
+                    }
+                    out.push(v);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn build_instructions(
+    persona: Option<String>,
+    query: &str,
+    session: &impl ReactSession,
+    context: &impl ReactContext,
+) -> Option<String> {
+    let mut instructions = String::new();
+
+    if let Some(history) = session.history() {
+        for message in history {
+            if let LlmMessage::System { content } = message {
+                instructions.push_str(content);
+                instructions.push('\n');
+            }
+        }
+    }
+
+    if let Some(p) = &persona {
+        instructions.push_str(&format!("Persona: {}\n", p));
+    }
+
+    if let Some(skills) = context.skills() {
+        // Ranked against this request and bounded; see render_skill_catalog.
+        instructions.push_str(&crate::llm::render_skill_catalog(skills, query));
+    }
+
+    if let Some(rules) = context.rules() {
+        if !rules.is_empty() {
+            let rule_texts = rules
+                .iter()
+                .map(|r| r.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            instructions.push_str(&format!("You should follow below rules:\n{}\n", rule_texts));
+        }
+    }
+
+    if let Some(inst) = context.instructions() {
+        if !inst.is_empty() {
+            let inst_texts = inst
+                .iter()
+                .map(|i| format!("- {}: {}", i.name, i.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            instructions.push_str(&format!("Instructions:\n{}\n", inst_texts));
+        }
+    }
+
+    if instructions.trim().is_empty() {
+        None
+    } else {
+        Some(instructions)
+    }
+}
+
+/// Build a [`ResponsesRequest`] from a generic request and history.
+pub fn build_request(
+    persona: Option<String>,
+    req: &LlmRequest,
+    session: &impl ReactSession,
+    context: &impl ReactContext,
+    stream: bool,
+    parallel_tool_calls: bool,
+) -> ResponsesRequest {
+    let tools = serialize_tools(context.tools());
+    let parallel = tools.as_ref().map(|_| parallel_tool_calls);
+    ResponsesRequest {
+        model: req.model.clone(),
+        instructions: build_instructions(
+            persona,
+            req.input.as_text().unwrap_or_default(),
+            session,
+            context,
+        ),
+        input: build_input(session.history(), &req.input),
+        tools,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        max_output_tokens: req.max_tokens,
+        reasoning: req.reasoning_effort.map(|effort| ResponsesReasoning {
+            effort: Some(effort),
+        }),
+        stream: Some(stream),
+        parallel_tool_calls: parallel,
+    }
+}
+
+// =============================================================================
+// Streaming events
+// =============================================================================
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+/// One typed SSE event from a streamed Responses call.
+pub enum ResponsesStreamEvent {
+    /// An output-text delta.
+    #[serde(rename = "response.output_text.delta")]
+    OutputTextDelta {
+        /// Item id.
+        item_id: String,
+        /// Index of the output item.
+        output_index: u32,
+        /// Index of the content part.
+        content_index: u32,
+        /// Text delta.
+        delta: String,
+    },
+    /// Output text completed.
+    #[serde(rename = "response.output_text.done")]
+    OutputTextDone {
+        /// Item id.
+        item_id: String,
+        /// Index of the output item.
+        output_index: u32,
+        /// The complete text.
+        text: String,
+    },
+    /// A reasoning-summary delta.
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ReasoningSummaryDelta {
+        /// Item id.
+        item_id: String,
+        /// Index of the output item.
+        output_index: u32,
+        /// Text delta.
+        delta: String,
+    },
+    /// A reasoning-text delta (DeepSeek variant).
+    #[serde(rename = "response.reasoning_text.delta")]
+    ReasoningTextDelta {
+        /// Item id.
+        item_id: String,
+        /// Index of the output item.
+        output_index: u32,
+        /// Text delta.
+        delta: String,
+    },
+    /// An output item was added.
+    #[serde(rename = "response.output_item.added")]
+    OutputItemAdded {
+        /// Index of the output item.
+        output_index: u32,
+        /// The raw item.
+        item: Value,
+    },
+    /// An output item completed.
+    #[serde(rename = "response.output_item.done")]
+    OutputItemDone {
+        /// Index of the output item.
+        output_index: u32,
+        /// The raw item.
+        item: Value,
+    },
+    /// A function-call arguments delta.
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionCallArgumentsDelta {
+        /// Item id.
+        item_id: String,
+        /// Index of the output item.
+        output_index: u32,
+        /// Arguments delta.
+        delta: String,
+    },
+    /// Function-call arguments completed.
+    #[serde(rename = "response.function_call_arguments.done")]
+    FunctionCallArgumentsDone {
+        /// Item id.
+        item_id: String,
+        /// Index of the output item.
+        output_index: u32,
+        /// The complete JSON arguments.
+        arguments: String,
+    },
+    /// The response completed.
+    #[serde(rename = "response.completed")]
+    Completed {
+        /// The full response.
+        response: ResponsesResponse,
+    },
+    /// The response was incomplete.
+    #[serde(rename = "response.incomplete")]
+    Incomplete {
+        /// The full response.
+        response: ResponsesResponse,
+    },
+    /// The response failed.
+    #[serde(rename = "response.failed")]
+    Failed {
+        /// The full response.
+        response: ResponsesResponse,
+    },
+    /// A stream error.
+    #[serde(rename = "error")]
+    Error {
+        /// Error message.
+        message: String,
+        /// Provider error code.
+        code: Option<String>,
+    },
+    /// An unrecognized event.
+    #[serde(other)]
+    Other,
+}
+
+impl ResponsesStreamEvent {
+    /// Whether this event ends the stream.
+    pub fn is_final(&self) -> bool {
+        matches!(
+            self,
+            ResponsesStreamEvent::Completed { .. }
+                | ResponsesStreamEvent::Incomplete { .. }
+                | ResponsesStreamEvent::Failed { .. }
+                | ResponsesStreamEvent::Error { .. }
+        )
+    }
+}
+
+/// Extracts typed Responses events from an SSE stream.
+pub struct ResponsesExtractor {
+    inner: JsonExtractor,
+}
+
+impl ResponsesExtractor {
+    /// Wrap a JSON extractor.
+    pub fn new(inner: JsonExtractor) -> Self {
+        Self { inner }
+    }
+}
+
+impl StreamExtractor for ResponsesExtractor {
+    type Item<'a> = ResponsesStreamEvent;
+
+    fn push<'a>(&mut self, chunk: &str) -> Option<Vec<Self::Item<'a>>> {
+        let spans = self.inner.push(chunk)?;
+        let mut events = Vec::new();
+        for span in spans.iter() {
+            if span.is_root() {
+                let json_str = self.inner.extract(span);
+                if let Ok(event) = serde_json::from_slice::<ResponsesStreamEvent>(json_str) {
+                    if !matches!(event, ResponsesStreamEvent::Other) {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        if events.is_empty() {
+            None
+        } else {
+            Some(events)
+        }
+    }
+
+    fn extract<'a>(&'a self, span: &crate::utils::StreamSpan) -> &'a [u8] {
+        self.inner.extract(span)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
+/// Accumulates streamed Responses API function calls.
+///
+/// The Responses API identifies items by `item_id` and streams the arguments
+/// in `response.function_call_arguments.delta` events; the tool name and
+/// `call_id` arrive earlier inside `response.output_item.added`/`done` events.
+/// This accumulator joins them per `item_id` so a completed call can be
+/// emitted as a [`StreamToken::ToolCall`].
+#[derive(Debug, Default)]
+pub struct ResponsesFunctionCallAccumulator {
+    pending: HashMap<String, PendingResponsesFunctionCall>,
+}
+
+#[derive(Debug, Default)]
+struct PendingResponsesFunctionCall {
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    /// True once `function_call_arguments.done` (or `drain`) has emitted this
+    /// call. A later `output_item.done` for the same item must not re-emit it.
+    finalized: bool,
+}
+
+impl ResponsesFunctionCallAccumulator {
+    /// Create an empty accumulator.
+    pub fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+        }
+    }
+
+    /// Feed a raw `response.output_item.added`/`done` item. If it is a
+    /// `function_call` item its name and call_id are captured by `item_id`.
+    pub fn add_item(&mut self, item: &Value) {
+        let item_type = item.get("type").and_then(|v| v.as_str());
+        let item_id = item.get("id").and_then(|v| v.as_str());
+        if item_type == Some("function_call") {
+            if let Some(item_id) = item_id {
+                let entry = self.pending.entry(item_id.to_string()).or_default();
+                if entry.name.is_none() {
+                    entry.name = item.get("name").and_then(|v| v.as_str()).map(String::from);
+                }
+                if entry.call_id.is_none() {
+                    entry.call_id = item
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                }
+            }
+        }
+    }
+
+    /// Append a function-call arguments delta for `item_id`.
+    pub fn push_args_delta(&mut self, item_id: &str, delta: &str) {
+        self.pending
+            .entry(item_id.to_string())
+            .or_default()
+            .arguments
+            .push_str(delta);
+    }
+
+    /// Finalize a call from `response.function_call_arguments.done`. The event
+    /// carries the complete `arguments` string; accumulated deltas are used as
+    /// a fallback for providers that only send deltas.
+    pub fn done(
+        &mut self,
+        item_id: &str,
+        final_arguments: Option<String>,
+    ) -> Option<(String, Value, Option<String>)> {
+        let entry = self.pending.get_mut(item_id)?;
+        if entry.finalized {
+            return None;
+        }
+        if let Some(args) = &final_arguments {
+            if !args.is_empty() {
+                entry.arguments = args.clone();
+            }
+        }
+        let name = entry.name.clone().unwrap_or_default();
+        let call_id = entry.call_id.clone();
+        let arguments = std::mem::take(&mut entry.arguments);
+        entry.finalized = true;
+
+        if name.is_empty() {
+            return None;
+        }
+        let args_val = serde_json::from_str(&arguments).unwrap_or_else(|_| serde_json::json!({}));
+        let id = call_id
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
+        Some((name, args_val, id))
+    }
+
+    /// Drain all pending calls (stream end / error). Incomplete arguments fall
+    /// back to `{}`. Already-finalized calls are skipped.
+    pub fn drain(&mut self) -> Vec<(String, Value, Option<String>)> {
+        let keys: Vec<String> = self.pending.keys().cloned().collect();
+        keys.into_iter()
+            .filter_map(|key| self.done(&key, None))
+            .collect()
+    }
+}
+
+// =============================================================================
+// Transport
+// =============================================================================
+
+/// Minimal HTTP client for the Responses API. Vendors construct it from their
+/// own endpoint/api-key and delegate both complete and streaming calls.
+pub struct ResponsesTransport {
+    client: Arc<Client>,
+    api_key: Arc<String>,
+    endpoint: Arc<String>,
+    parallel_tool_calls: bool,
+}
+
+impl ResponsesTransport {
+    /// Create a transport from a client, key, and endpoint.
+    pub fn new(client: Arc<Client>, api_key: Arc<String>, endpoint: Arc<String>) -> Self {
+        Self {
+            client,
+            api_key,
+            endpoint,
+            parallel_tool_calls: true,
+        }
+    }
+
+    /// Allow (or forbid) several tool calls in one provider response.
+    pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
+        self.parallel_tool_calls = parallel;
+        self
+    }
+
+    /// Run a non-streaming Responses call.
+    pub async fn complete(
+        &self,
+        persona: Option<String>,
+        mut request: LlmRequest,
+        session: &mut (impl ReactSession + Send),
+        context: &mut (impl ReactContext + Send),
+    ) -> LlmResponseResult {
+        context.notify_request(&request);
+
+        if request.model.is_empty() {
+            request.model = "gpt-4".to_string();
+        }
+
+        let responses_req = build_request(
+            persona,
+            &request,
+            session,
+            context,
+            false,
+            self.parallel_tool_calls,
+        );
+
+        let url = format!("{}/responses", self.endpoint);
+
+        let wire = serde_json::to_string(&responses_req)
+            .unwrap_or_else(|_| "Failed to serialize request".into());
+        if log::log_enabled!(log::Level::Info) {
+            // A one-line summary, not the whole body: the full payload rode
+            // this INFO line for every call, images included.
+            info!("Req: {} chars", wire.chars().count());
+        }
+        if log::log_enabled!(log::Level::Trace) {
+            if crate::llm::vendor::wire_bodies_enabled() {
+                log::trace!("Req body: {wire}");
+            } else {
+                log::trace!(
+                    "Req body head: {}",
+                    crate::llm::vendor::wire_body_head(&wire)
+                );
+            }
+        }
+
+        let builder = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&responses_req);
+        let response = super::tap::traced_send(
+            "llm",
+            "POST",
+            &url,
+            request.request_id.as_deref(),
+            self.client.as_ref(),
+            builder,
+        )
+        .await
+        .map_err(|e| {
+            let err = LlmError::Http(e.to_string());
+            context.notify_error(&err);
+            err
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let err = LlmError::Http(format!("HTTP {}: {} (endpoint: {})", status, body, url));
+            context.notify_error(&err);
+            return Err(err);
+        }
+
+        let body: ResponsesResponse = response.json().await.map_err(|e| {
+            let err = LlmError::Parse(e.to_string());
+            context.notify_error(&err);
+            err
+        })?;
+
+        let resp = LlmResponse::Responses(body);
+        context.notify_response(&resp);
+        Ok(resp)
+    }
+
+    /// Run a streaming Responses call.
+    pub async fn stream_complete(
+        &self,
+        persona: Option<String>,
+        mut request: LlmRequest,
+        session: &mut (impl ReactSession + Send),
+        context: &mut (impl ReactContext + Send),
+    ) -> Result<TokenStream, LlmError> {
+        context.notify_request(&request);
+
+        if request.model.is_empty() {
+            request.model = "gpt-4".to_string();
+        }
+
+        let responses_req = build_request(
+            persona,
+            &request,
+            session,
+            context,
+            true,
+            self.parallel_tool_calls,
+        );
+
+        let url = format!("{}/responses", self.endpoint);
+
+        let builder = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .json(&responses_req);
+        let response = super::tap::traced_send(
+            "llm",
+            "POST",
+            &url,
+            request.request_id.as_deref(),
+            self.client.as_ref(),
+            builder,
+        )
+        .await
+        .map_err(|e| {
+            let err = LlmError::Other(format!("Request failed: {}", e));
+            context.notify_error(&err);
+            err
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let err = LlmError::Other(format!("HTTP {}: {} (endpoint: {})", status, body, url));
+            context.notify_error(&err);
+            return Err(err);
+        }
+
+        let (tx, rx) = mpsc::channel(32);
+        let on_chunk = context.on_chunk_callback();
+
+        tokio::spawn(async move {
+            let mut byte_stream = response.bytes_stream();
+            let mut extractor = ResponsesExtractor::new(JsonExtractor::default());
+            let mut func_calls = ResponsesFunctionCallAccumulator::new();
+            // A transport chunk may split a multi-byte character; keep the
+            // incomplete tail and decode it with the next chunk.
+            let mut utf8_tail: Vec<u8> = Vec::new();
+
+            while let Some(chunk_result) = byte_stream.next().await {
+                let text = match chunk_result {
+                    Ok(bytes) => {
+                        utf8_tail.extend_from_slice(&bytes);
+                        let valid = crate::utils::complete_utf8_prefix(&utf8_tail);
+                        let text = String::from_utf8_lossy(&utf8_tail[..valid]).into_owned();
+                        utf8_tail.drain(..valid);
+                        text
+                    }
+                    Err(e) => {
+                        let err = crate::llm::vendor::stream_error(e);
+                        let _ = tx.send(Err(err)).await;
+                        return;
+                    }
+                };
+
+                if let Some(events) = extractor.push(&text) {
+                    for event in events {
+                        match event {
+                            ResponsesStreamEvent::OutputTextDelta { delta, .. } => {
+                                if !delta.is_empty() {
+                                    on_chunk.as_ref().inspect(|cb| cb(&delta));
+                                    let _ = tx.send(Ok(StreamToken::Text(delta))).await;
+                                }
+                            }
+                            ResponsesStreamEvent::ReasoningSummaryDelta { delta, .. }
+                            | ResponsesStreamEvent::ReasoningTextDelta { delta, .. } => {
+                                if !delta.is_empty() {
+                                    let _ = tx.send(Ok(StreamToken::ReasoningContent(delta))).await;
+                                }
+                            }
+                            ResponsesStreamEvent::OutputItemAdded { item, .. }
+                            | ResponsesStreamEvent::OutputItemDone { item, .. } => {
+                                func_calls.add_item(&item);
+                            }
+                            ResponsesStreamEvent::FunctionCallArgumentsDelta {
+                                item_id,
+                                delta,
+                                ..
+                            } => {
+                                func_calls.push_args_delta(&item_id, &delta);
+                            }
+                            ResponsesStreamEvent::FunctionCallArgumentsDone {
+                                item_id,
+                                arguments,
+                                ..
+                            } => {
+                                if let Some((name, args_val, id)) =
+                                    func_calls.done(&item_id, Some(arguments))
+                                {
+                                    on_chunk.as_ref().inspect(|cb| cb(&name));
+                                    let _ = tx
+                                        .send(Ok(StreamToken::ToolCall {
+                                            name,
+                                            args: args_val,
+                                            id,
+                                        }))
+                                        .await;
+                                }
+                            }
+                            ResponsesStreamEvent::Completed { response }
+                            | ResponsesStreamEvent::Incomplete { response } => {
+                                if let Some(usage) = response.chat_usage() {
+                                    let _ = tx.send(Ok(StreamToken::Usage(usage))).await;
+                                }
+                                for (name, args_val, id) in func_calls.drain() {
+                                    let _ = tx
+                                        .send(Ok(StreamToken::ToolCall {
+                                            name,
+                                            args: args_val,
+                                            id,
+                                        }))
+                                        .await;
+                                }
+                                let _ = tx.send(Ok(StreamToken::Done)).await;
+                                return;
+                            }
+                            ResponsesStreamEvent::Failed { response } => {
+                                for (name, args_val, id) in func_calls.drain() {
+                                    let _ = tx
+                                        .send(Ok(StreamToken::ToolCall {
+                                            name,
+                                            args: args_val,
+                                            id,
+                                        }))
+                                        .await;
+                                }
+                                let err = LlmError::Other(format!(
+                                    "Responses API failed (status={})",
+                                    response.status
+                                ));
+                                let _ = tx.send(Err(err)).await;
+                                return;
+                            }
+                            ResponsesStreamEvent::Error { message, .. } => {
+                                for (name, args_val, id) in func_calls.drain() {
+                                    let _ = tx
+                                        .send(Ok(StreamToken::ToolCall {
+                                            name,
+                                            args: args_val,
+                                            id,
+                                        }))
+                                        .await;
+                                }
+                                let err =
+                                    LlmError::Other(format!("Responses API error: {}", message));
+                                let _ = tx.send(Err(err)).await;
+                                return;
+                            }
+                            ResponsesStreamEvent::Other
+                            | ResponsesStreamEvent::OutputTextDone { .. } => {}
+                        }
+                    }
+                }
+            }
+
+            for (name, args_val, id) in func_calls.drain() {
+                let _ = tx
+                    .send(Ok(StreamToken::ToolCall {
+                        name,
+                        args: args_val,
+                        id,
+                    }))
+                    .await;
+            }
+            let _ = tx.send(Ok(StreamToken::Done)).await;
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::{Instruction, LlmContext, LlmMessage, LlmSession, Skill};
+
+    fn session_with_history() -> LlmSession {
+        let mut session = LlmSession::new();
+        session.push(LlmMessage::system("You are a helpful assistant."));
+        session.push(LlmMessage::user("What is the weather in SF?"));
+        session.push(LlmMessage::Assistant {
+            content: String::new(),
+        });
+        session.push(LlmMessage::AssistantToolCall {
+            tool_call_id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+            args: serde_json::json!({"location": "San Francisco, CA"}),
+        });
+        session.push(LlmMessage::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            content: "72 F and sunny".to_string(),
+        });
+        session
+    }
+
+    fn context_with_tools() -> LlmContext {
+        let mut context = LlmContext::default();
+        context.add_tool(LlmTool::function(
+            "get_weather",
+            "Get the current weather",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"}
+                }
+            }),
+        ));
+        context.add_tool(LlmTool::web_search(Some(serde_json::json!({
+            "max_results": 5
+        }))));
+        context.add_tool(LlmTool::file_search(Some(serde_json::json!({
+            "vector_store_ids": ["vs_abc"]
+        }))));
+        context.add_tool(LlmTool::computer_use(None));
+        context.skills = vec![Skill {
+            category: "general".to_string(),
+            name: "web_browsing".to_string(),
+            description: "Browse the web".to_string(),
+        }];
+        context.instructions = vec![Instruction {
+            instruction: "be concise".to_string(),
+            description: "Keep answers short".to_string(),
+            name: "concise".to_string(),
+            dependon: None,
+        }];
+        context
+    }
+
+    #[test]
+    fn a_responses_batch_request_asks_for_parallel_tool_calls() {
+        use crate::llm::{LlmContext, LlmRequest, LlmSession, LlmTool, LlmToolKind};
+        let context = LlmContext {
+            tools: vec![LlmTool {
+                name: "a".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                kind: LlmToolKind::Function,
+                config: None,
+            }],
+            ..Default::default()
+        };
+        let session = LlmSession::new();
+        let req = LlmRequest::new("m");
+        let built = build_request(None, &req, &session, &context, false, true);
+        assert_eq!(built.parallel_tool_calls, Some(true));
+        let built = build_request(None, &req, &session, &context, false, false);
+        assert_eq!(built.parallel_tool_calls, Some(false));
+        let bare = LlmContext::default();
+        let built = build_request(None, &req, &session, &bare, false, true);
+        assert_eq!(built.parallel_tool_calls, None);
+    }
+
+    #[test]
+    fn build_request_maps_history_and_hosted_tools() {
+        let session = session_with_history();
+        let context = context_with_tools();
+        let req = LlmRequest {
+            model: "gpt-5".to_string(),
+            input: Content::text("Summarize"),
+            temperature: Some(0.5),
+            top_p: None,
+            top_k: None,
+            max_tokens: Some(100),
+            reasoning_effort: Some(crate::llm::ReasoningEffort::High),
+            api_mode: crate::llm::ApiMode::Responses,
+            request_id: None,
+            intent: Default::default(),
+        };
+
+        let built = build_request(None, &req, &session, &context, false, true);
+
+        assert_eq!(built.model, "gpt-5");
+        assert_eq!(built.max_output_tokens, Some(100));
+        assert_eq!(built.stream, Some(false));
+        assert_eq!(
+            built.reasoning.as_ref().and_then(|r| r.effort),
+            Some(crate::llm::ReasoningEffort::High),
+            "reasoning_effort maps to reasoning.effort"
+        );
+        let wire = serde_json::to_string(&built).unwrap();
+        assert!(
+            wire.contains("\"reasoning\":{\"effort\":\"high\"}"),
+            "wire format must nest effort under reasoning: {wire}"
+        );
+        assert!(
+            built
+                .instructions
+                .as_deref()
+                .unwrap()
+                .contains("You are a helpful assistant."),
+            "system messages fold into instructions"
+        );
+        assert!(
+            built
+                .instructions
+                .as_deref()
+                .unwrap()
+                .contains("web_browsing"),
+            "skills are appended to instructions"
+        );
+
+        let item_types: Vec<&str> = built
+            .input
+            .iter()
+            .map(|i| match i {
+                ResponsesInputItem::Message { .. } => "message",
+                ResponsesInputItem::FunctionCall { .. } => "function_call",
+                ResponsesInputItem::FunctionCallOutput { .. } => "function_call_output",
+            })
+            .collect();
+        assert_eq!(
+            item_types,
+            vec!["message", "message", "function_call", "function_call_output"],
+            "system folds into instructions; history maps to user/assistant messages + tool round-trip items"
+        );
+
+        let tools = built.tools.expect("tools serialized");
+        assert_eq!(tools.len(), 4);
+        let types: Vec<&str> = tools
+            .iter()
+            .map(|t| t.get("type").and_then(|v| v.as_str()).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["function", "web_search", "file_search", "computer_use"]
+        );
+        assert_eq!(
+            tools[1].get("max_results").unwrap().as_u64(),
+            Some(5),
+            "web_search config keys sit at the top level of the tool object"
+        );
+        assert!(
+            tools[1].get("web_search").is_none(),
+            "config must not be nested under a sub-key"
+        );
+        assert_eq!(
+            tools[2].get("vector_store_ids").unwrap(),
+            &serde_json::json!(["vs_abc"]),
+            "file_search config keys sit at the top level"
+        );
+        assert!(
+            tools[3].get("display_width").is_none(),
+            "computer_use without config omits config keys"
+        );
+        assert!(
+            tools[0].get("name").is_some(),
+            "function tools keep their name"
+        );
+    }
+
+    #[test]
+    fn bare_request_produces_single_user_message() {
+        let session = LlmSession::new();
+        let context = LlmContext::default();
+        let mut req = LlmRequest::new("gpt-5");
+        req.input = Content::text("hi");
+
+        let built = build_request(None, &req, &session, &context, false, true);
+
+        assert_eq!(built.input.len(), 1);
+        match &built.input[0] {
+            ResponsesInputItem::Message { role, content } => {
+                assert_eq!(role, "user");
+                assert_eq!(content.len(), 1);
+            }
+            other => panic!("expected a user message, got {:?}", other),
+        }
+        assert!(built.tools.is_none(), "empty tool set serializes to None");
+        assert!(
+            built.instructions.is_none(),
+            "no system/persona -> no instructions"
+        );
+    }
+
+    #[test]
+    fn output_text_and_chat_usage_mapping() {
+        let response: ResponsesResponse = serde_json::from_value(serde_json::json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "gpt-5",
+            "output": [
+                {"type": "message", "id": "msg_1", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "Hello", "annotations": []},
+                    {"type": "output_text", "text": " world", "annotations": []}
+                ]},
+                {"type": "message", "id": "msg_2", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "!", "annotations": []}
+                ]}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        }))
+        .unwrap();
+
+        assert_eq!(response.output_text(), "Hello world!");
+        let usage = response.chat_usage().unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn accumulator_joins_streamed_function_call() {
+        let mut acc = ResponsesFunctionCallAccumulator::new();
+
+        acc.add_item(&serde_json::json!({
+            "id": "fc_1",
+            "type": "function_call",
+            "name": "get_weather",
+            "call_id": "call_1",
+            "arguments": ""
+        }));
+        acc.push_args_delta("fc_1", r#"{"location":"SF"}"#);
+
+        let (name, args, id) = acc.done("fc_1", None).expect("call completes");
+        assert_eq!(name, "get_weather");
+        assert_eq!(args, serde_json::json!({"location": "SF"}));
+        assert_eq!(id.as_deref(), Some("call_1"));
+        assert!(acc.drain().is_empty(), "done() removes the pending entry");
+    }
+
+    #[test]
+    fn accumulator_drain_emits_incomplete_calls() {
+        let mut acc = ResponsesFunctionCallAccumulator::new();
+        acc.add_item(&serde_json::json!({
+            "id": "fc_1",
+            "type": "function_call",
+            "name": "noop",
+            "call_id": "call_9",
+            "arguments": ""
+        }));
+
+        let drained = acc.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, "noop");
+        assert_eq!(drained[0].1, serde_json::json!({}));
+    }
+
+    #[test]
+    fn accumulator_does_not_duplicate_call_after_output_item_done() {
+        let mut acc = ResponsesFunctionCallAccumulator::new();
+
+        acc.add_item(&serde_json::json!({
+            "id": "fc_1",
+            "type": "function_call",
+            "name": "add",
+            "call_id": "call_1",
+            "arguments": ""
+        }));
+        acc.push_args_delta("fc_1", r#"{"a":3,"b":4}"#);
+
+        let (name, args, id) = acc
+            .done("fc_1", Some(r#"{"a":3,"b":4}"#.to_string()))
+            .unwrap();
+        assert_eq!(name, "add");
+        assert_eq!(args, serde_json::json!({"a": 3, "b": 4}));
+        assert_eq!(id.as_deref(), Some("call_1"));
+
+        acc.add_item(&serde_json::json!({
+            "id": "fc_1",
+            "type": "function_call",
+            "name": "add",
+            "call_id": "call_1",
+            "arguments": r#"{"a":3,"b":4}"#
+        }));
+
+        assert!(
+            acc.drain().is_empty(),
+            "a trailing output_item.done must not re-emit the same call_id"
+        );
+    }
+
+    #[test]
+    fn extractor_parses_sse_json_events() {
+        let mut extractor = ResponsesExtractor::new(JsonExtractor::default());
+        let payload = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
+            r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hel"}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"lo"}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","name":"get_weather","call_id":"call_1","arguments":""}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"gpt-5","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+        );
+
+        let events = extractor.push(&payload).unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[0],
+            ResponsesStreamEvent::OutputTextDelta { ref delta, .. } if delta == "Hel"
+        ));
+        assert!(matches!(
+            events[1],
+            ResponsesStreamEvent::OutputTextDelta { ref delta, .. } if delta == "lo"
+        ));
+        assert!(matches!(
+            events[2],
+            ResponsesStreamEvent::OutputItemAdded { ref item, .. }
+                if item.get("name").and_then(|v| v.as_str()) == Some("get_weather")
+        ));
+        assert!(events[3].is_final());
+    }
+
+    #[test]
+    fn responses_response_serde_roundtrip() {
+        let response: ResponsesResponse = serde_json::from_value(serde_json::json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "gpt-5",
+            "output": [
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "get_weather", "arguments": "{\"location\":\"SF\"}"}
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+        }))
+        .unwrap();
+
+        assert_eq!(response.id, "resp_1");
+        assert!(matches!(
+            &response.output[0],
+            ResponsesItem::FunctionCall { name, .. } if name == "get_weather"
+        ));
+
+        let serialized = serde_json::to_string(&response).unwrap();
+        let back: ResponsesResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(back.output_text(), "");
+        assert_eq!(back.chat_usage().unwrap().total_tokens, 7);
+    }
+}

@@ -1,0 +1,17 @@
+{
+  "title": "Git",
+  "location": "right",
+  "default_visibility": "visible",
+  "refresh_ms": 5000,
+  "view": {
+    "schema_version": "1.0",
+    "root": {
+      "type": "column",
+      "children": [
+        { "type": "heading", "text": "Git", "level": 2 },
+        { "type": "text", "text": "Loading the working copy\u2026", "tone": "muted" },
+        { "type": "button", "label": "Refresh", "action": "refresh", "style": "primary" }
+      ]
+    }
+  }
+}

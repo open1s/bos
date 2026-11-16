@@ -1,0 +1,188 @@
+[workspace]
+members = [
+    "crates/config",
+    "crates/hostkit",
+    "crates/bus",
+    "crates/capability",
+    "crates/federation",
+    "crates/agent",
+    "crates/logging",
+    "crates/react",
+    "crates/nbos",
+    "crates/jsbos",
+    "crates/qserde",
+    "crates/qserde_derive",
+    "crates/resource",
+    "crates/ferris-core",
+    "crates/ferris-runtime",
+    "crates/ferris-sdk",
+    "crates/ferris-bindings",
+    "crates/ferris-smoke",
+    "crates/bsh",
+    "crates/codintelli"
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1.52", features = ["full"] }
+fs2 = "0.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+semver = "1"
+# Cargo ignores semver build metadata, so `+spec-1.1.0` only produced a
+# manifest warning on every build.
+toml = "1.1.8"
+serde_yaml = "0.9"
+dashmap = "6.2.1"
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+# 0.1.92 removed the #[must_use] it used to inject into async trait
+# methods, which trips clippy 1.99 double_must_use under -D warnings.
+async-trait = "0.1.92"
+tracing = "0.1"
+uuid = { version = "1.29.0", features = ["v4"] }
+futures = "0.3"
+tokio-stream = "0.1.19"
+async-stream = "0.3"
+chrono = { version = "0.4.45", features = ["serde"] }
+reqwest = { version = "0.13.5", features = ["json", "query"] }
+zenoh = "1.10.2"
+rkyv = { version = "0.8.18", features = ["unaligned"] }
+rkyv_derive = "0.8.18"
+notify = "8.2.1"
+async-channel = "2.5"
+shellexpand = "3.1"
+bus = { path = "crates/bus" }
+regorus = "0.14.0"
+# The admin-key vault: a memory-hard KDF, an XChaCha20-Poly1305 AEAD, and the
+# zeroizing wrappers that keep a derived key and its plaintext out of ordinary
+# allocations once they are dropped.
+argon2 = "0.6.0"
+chacha20poly1305 = "0.11.0"
+zeroize = "1.9.1"
+rand = "0.10.3"
+# The ONE sandbox implementation. heel builds macOS SBPL profiles (sandbox-exec),
+# Linux Landlock + Seccomp and Windows AppContainer, and its model is the one
+# bsh now follows: the working directory is the only writable place, nothing
+# writable is executable, reads are opt-in above a baseline, and network goes
+# through a policy.
+#
+# Pinned to an exact COMMIT, not the `dev` branch. The crate published no
+# release that matches the measured API (0.5.1 is the dev tip), so a branch
+# reference would let the build change under this repo without a diff here; a
+# commit makes every dependency bump an explicit edit.
+#
+# Supply chain, stated plainly: this is a young crate (created 2026-10-23, zero
+# stars, a fork of lexoliu/heel) whose API changed the same day it was measured.
+# Pinning removes drift, not trust: review the diff before moving the commit.
+# heel is a REQUIRED dependency of `agent`: there is one sandbox
+# implementation and no feature flag or in-tree fallback that turns it off.
+heel = { git = "https://github.com/open1s/heel", rev = "6db173aa0baf48ef06c3e946b9b074e7ae81ac9c", default-features = false }
+
+[workspace.package]
+version = "4.1.12"
+edition = "2021"
+rust-version = "1.97"
+authors = ["BrickOS Team"]
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# A key-derivation function is the one dependency whose debug build a reader
+# feels: Argon2 at the vault's documented 64 MiB / 3 passes is benchmarked in
+# release, not at opt-level 0. Compiling just the KDF, its Blake2 core and the
+# AEAD optimised keeps the unlock press responsive and the security tests quick,
+# without changing a single crypto parameter.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+
+[profile.dev.package.chacha20]
+opt-level = 3
+
+[profile.dev.package.poly1305]
+opt-level = 3
+
+# The tool-boundary policy engine is an interpreter, so a debug build's lack of
+# optimisation is the whole cost of a check. Compiling regorus optimised keeps
+# the 10 us budget measurable (and the perf smoke test meaningful) in the test
+# profile, exactly as the KDF above is compiled optimised for the same reason.
+[profile.dev.package.regorus]
+opt-level = 3
+
+# The transcript's per-frame cost is TEXT LAYOUT, and layout lives in the UI
+# stack: a debug build of it is what makes a long message cost tens of
+# milliseconds a frame (measured: ~50 ms per frame for four visible 3 KiB
+# markdown bodies, against ~10 ms for the same shell with nothing to lay out).
+# Optimising the stack keeps the debug binary - the one the round recipes
+# launch - close to what ships, and costs the release profile nothing.
+[profile.dev.package.gpui-pre]
+opt-level = 3
+
+[profile.dev.package.gpui-pre-sum-tree]
+opt-level = 3
+
+[profile.dev.package.gpui-base]
+opt-level = 3
+
+[profile.dev.package.gpui-component]
+opt-level = 3
+
+[profile.dev.package.gpui-kit]
+opt-level = 3
+
+[profile.dev.package.markdown]
+opt-level = 3
+
+# The font stack: shaping and rasterising every glyph a frame draws.
+[profile.dev.package.swash]
+opt-level = 3
+
+[profile.dev.package.fontdb]
+opt-level = 3
+
+# The Browser pane's frame decode. The pump thread turns each captured frame
+# back into pixels, and that decode was the largest single cost of a frame.
+#
+# MEASURED on the pane's own 800x600 fixture capture, decoding the same real
+# PNG frame:
+#     image at opt-level 0   11.62 ms   <- what target/debug/bsh paid
+#     image at opt-level 3    0.58 ms   (20x faster)
+# and for JPEG at quality 80, 37.50 ms against 0.70 ms (53x). End to end per
+# changed frame that is ~20.5 ms before against ~9.6 ms after, which is the
+# difference between missing and meeting the pane's own 30 fps cadence
+# (`FRAME_FAST` = 33 ms). This is the same bargain the UI stack above takes:
+# the debug binary is the one the round recipes launch, and it costs the
+# release profile nothing.
+[profile.dev.package.image]
+opt-level = 3
+
+# image's own codecs, which hold the actual per-pixel loops. Naming them
+# explicitly matters: a profile override applies to the named package and does
+# NOT cascade to its dependencies.
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[workspace.lints.rust]
+linker_messages = "allow"

@@ -1,0 +1,40 @@
+use thiserror::Error;
+
+/// Tool execution error.
+///
+/// This is the canonical tool error for the workspace. `agent` re-exports it
+/// rather than defining its own, so a tool author only handles one type.
+#[derive(Debug, Error, Clone)]
+pub enum ToolError {
+    /// No tool with that name is registered.
+    #[error("Tool not found: {0}")]
+    NotFound(String),
+    /// The tool ran but failed.
+    #[error("Tool execution failed: {0}")]
+    Failed(String),
+    /// More than one registered tool matches the bare name.
+    #[error("Tool name {name} is ambiguous: {candidates:?}")]
+    Ambiguous {
+        /// The bare name the caller asked for.
+        name: String,
+        /// Sorted, fully qualified candidate names.
+        candidates: Vec<String>,
+    },
+    /// The arguments were rejected.
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+    /// The arguments did not match the tool schema.
+    #[error("Schema mismatch: {message}")]
+    SchemaMismatch {
+        /// Description of the mismatch.
+        message: String,
+    },
+    /// The tool did not finish in time.
+    ///
+    /// Carries the timeout's own account of itself: which call exceeded which
+    /// bound, and the output captured before the process was killed. A bare
+    /// "timed out" leaves the reader unable to tell a one-second cap from the
+    /// five-minute default, and throws away what the command had already said.
+    #[error("Tool execution timed out: {0}")]
+    Timeout(String),
+}

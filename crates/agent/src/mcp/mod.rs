@@ -1,0 +1,28 @@
+//! MCP (Model Context Protocol) Bridge Implementation
+//!
+//! This module provides STDIO and HTTP-based MCP server communication with JSON-RPC 2.0 protocol.
+
+/// Exposes MCP tools as local async tools.
+pub mod adapter;
+/// JSON-RPC client for an MCP server over stdio or HTTP.
+pub mod client;
+/// HTTP (streamable) transport for MCP.
+pub mod http_transport;
+/// Allow/deny governance policy over MCP servers and tools.
+pub mod policy;
+/// JSON-RPC 2.0 and MCP message types.
+pub mod protocol;
+/// Stdio transport for MCP servers launched as child processes.
+pub mod transport;
+
+pub use adapter::McpToolAdapter;
+pub use client::McpClient;
+pub use client::McpError;
+pub use http_transport::HttpTransport;
+pub use policy::{McpDecision, McpEffect, McpPolicy, McpRule};
+pub use protocol::{
+    GetPromptResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpPrompt, McpPromptArgument,
+    McpPromptMessage, McpResource, ReadResourceResult, ResourceContents, ServerCapabilities,
+    ToolDefinition,
+};
+pub use transport::StdioTransport;

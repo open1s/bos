@@ -1,0 +1,146 @@
+name: nbos pipeline
+
+on:
+  # Tags only: main pushes are tested by the rust workflow, not published.
+  push:
+    tags:
+      - "v[0-9]*"
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Detect a release tag
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # A release happens only when a vX.Y.Z tag matches every manifest. Any
+      # other run skips publishing (pull requests and dispatches still build),
+      # so a mismatched tag can never publish a partial set.
+      - id: check
+        name: Check the release precondition
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash scripts/ci/release-precondition.sh
+
+  build:
+    name: Build bindings for ${{ matrix.target }}
+    needs: release
+    # Pull requests and dispatches still build (a dry run); a tag releases
+    # only when the precondition passes.
+    if: needs.release.outputs.should_release == 'true' || github.event_name != 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build
+        shell: bash
+        run: |
+          mkdir -p dist
+          maturin build -m crates/nbos/Cargo.toml --target ${{ matrix.target }} --release --out dist
+          if ! ls dist/*.whl >/dev/null 2>&1; then
+            echo "::error::No wheel produced for ${{ matrix.target }}"
+            exit 1
+          fi
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          retention-days: 7
+
+  test:
+    name: Test Python bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin and pytest
+        run: pip install maturin pytest pytest-asyncio pyee
+
+      - name: Build and install the wheel
+        run: |
+          maturin build -m crates/nbos/Cargo.toml --release --out dist
+          pip install dist/*.whl
+
+      - name: Run Python tests
+        run: pytest crates/nbos/tests -m "not llm" -q
+
+  publish:
+    name: Publish to PyPI
+    needs: [release, build, test]
+    runs-on: ubuntu-latest
+    if: >-
+      needs.release.outputs.should_release == 'true'
+      && github.event_name == 'push' && github.ref_type == 'tag'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Re-runs and duplicate triggers must not fail the job when
+          # this version is already on PyPI.
+          skip-existing: true

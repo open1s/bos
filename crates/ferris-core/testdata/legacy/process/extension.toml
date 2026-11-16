@@ -1,0 +1,30 @@
+schema_version = "1.0"
+
+[extension]
+id = "com.example.process-echo"
+name = "Process Echo"
+version = "1.0.0"
+description = "An echo tool served by a Python JSON-RPC process"
+authors = ["BSH Example"]
+license = "MIT"
+
+[compatibility]
+bsh = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+
+[runtime]
+kind = "process"
+entry = "python3"
+args = ["server.py"]
+protocol = "jsonrpc-2.0"
+startup = "on-demand"
+
+[capabilities]
+required = ["process.execute", "agent.tools.register"]
+
+[contributes]
+tools = ["echo"]
+
+[resources]
+max_execution_ms = 5000
+max_output_bytes = 1048576

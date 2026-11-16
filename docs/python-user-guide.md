@@ -1,0 +1,1354 @@
+# BrainOS Python API User Guide
+
+This guide provides a unified, consistent API for using BrainOS in Python. The API follows a fluent/decorator style for intuitive usage.
+
+## Table of Contents
+
+1. [Installation](#installation)
+2. [Quick Start](#quick-start)
+3. [Core Concepts](#core-concepts)
+   - [Multimodal Content](#multimodal-content)
+4. [Agent API](#agent-api)
+5. [Tool Registration](#tool-registration)
+6. [Bus Communication](#bus-communication)
+7. [Query/Queryable](#queryqueryable)
+8. [Caller/Callable](#callercallable)
+9. [Configuration](#configuration)
+10. [API Reference](#api-reference)
+
+---
+
+## Installation
+
+```bash
+pip install nbos
+```
+
+Or install from source:
+
+```bash
+cd crates/nbos
+pip install -e .
+```
+
+---
+
+## Quick Start
+
+```python
+import asyncio
+from nbos import BrainOS, tool
+
+@tool("Add two numbers together")
+def add(a: int, b: int) -> int:
+    return a + b
+
+async def main():
+    async with BrainOS() as brain:
+        agent = brain.agent("assistant")
+        agent.register(add)
+        result = await agent.ask("What is 42 + 58?")
+        print(result)
+
+asyncio.run(main())
+```
+
+---
+
+## Core Concepts
+
+### BrainOS (Main Entry Point)
+
+The `BrainOS` class is the main entry point that manages the lifecycle:
+
+```python
+async with BrainOS() as brain:
+    # brain is ready to use
+    agent = brain.agent("my-agent")
+```
+
+### Agent
+
+An `Agent` represents an LLM-powered agent that can use tools:
+
+```python
+agent = brain.agent("assistant")
+agent = brain.agent("coder", system_prompt="You are a coding assistant.")
+```
+
+### Tool
+
+Tools are functions that the LLM can call. Use the `@tool()` decorator:
+
+```python
+@tool("Description of what the tool does")
+def function_name(param1: type, param2: type) -> return_type:
+    return result
+```
+
+### Multimodal Content
+
+BrainOS supports multimodal content (images, audio) through the `Content`, `ContentPart`, and `Binary` classes.
+
+#### Creating Content
+
+```python
+from nbos.content import Content, ContentPart
+
+# Simple text content
+text_content = Content.text("What is Python?")
+
+# Single image content
+image_content = Content.image("https://example.com/photo.jpg")
+
+# Audio from base64 data or bytes
+audio_content = Content.audio(base64_data, "mp3")
+audio_content = Content.audio(b"raw_bytes", "wav")
+
+# Audio from URL
+audio_url_content = Content.audio_url("https://example.com/audio.mp3", "mp3")
+
+# Multi-part content (text + image + audio)
+multi_content = Content.parts([
+    ContentPart.text("Describe this image and audio"),
+    ContentPart.image("https://example.com/photo.jpg"),
+    ContentPart.audio(base64_data, "mp3"),
+])
+```
+
+#### Using Content with Agent
+
+```python
+# Send text
+result = await agent.ask("What is Python?")
+
+# Send text with image
+image_content = Content.parts([
+    ContentPart.text("What is in this image?"),
+    ContentPart.image("https://example.com/photo.jpg"),
+])
+result = await agent.ask(image_content)
+
+# Send text with audio
+audio_content = Content.parts([
+    ContentPart.text("Transcribe this audio"),
+    ContentPart.audio(base64_data, "wav"),
+])
+result = await agent.ask(audio_content)
+```
+
+#### Streaming Response
+
+Stream responses return structured tokens:
+
+```python
+async for token in await agent.stream("Tell me a story"):
+    if token is None:
+        continue
+    # token is a dict with type field
+    if token.get("type") == "Text":
+        print(token.get("text", ""), end="", flush=True)
+    elif token.get("type") == "ReasoningContent":
+        print(f"[thinking] {token.get('text')}", end="", flush=True)
+    elif token.get("type") == "ToolCall":
+        print(f"Tool: {token.get('name')} - {token.get('args')}")
+    elif token.get("type") == "Done":
+        print("\n[Stream complete]")
+```
+
+#### ContentPart API
+
+| Method | Description |
+|--------|-------------|
+| `ContentPart.text(text)` | Create text part |
+| `ContentPart.image(url, name=None)` | Create image part (URL) |
+| `ContentPart.audio(data, format="mp3")` | Create audio part (base64 or bytes) |
+| `ContentPart.audio_url(url, format="mp3")` | Create audio part (URL) |
+| `ContentPart.binary(content_type, data, name=None)` | Create binary part |
+
+#### Content API
+
+| Method | Description |
+|--------|-------------|
+| `Content.text(text)` | Simple text content |
+| `Content.image(url)` | Single image (URL) |
+| `Content.audio(data, format="mp3")` | Single audio (base64) |
+| `Content.audio_url(url, format="mp3")` | Single audio (URL) |
+| `Content.parts([...])` | Multi-part content |
+
+---
+
+## Agent API
+
+### Creating an Agent
+
+```python
+# Basic agent
+agent = brain.agent("assistant")
+
+# Agent with custom config
+agent = brain.agent(
+    "coder",
+    system_prompt="You are a helpful coding assistant.",
+    model="gpt-4",
+    temperature=0.5,
+    timeout_secs=180,
+)
+```
+
+### Fluent Configuration
+
+Use chainable methods to configure the agent:
+
+```python
+agent = brain.agent("assistant") \
+    .with_model("gpt-4") \
+    .with_temperature(0.3) \
+    .with_prompt("You are a math tutor.") \
+    .with_timeout(300)
+```
+
+### Running the Agent
+
+```python
+# Simple Q&A (no tool use)
+result = await agent.ask("What is Python?")
+
+# Run with tool use enabled
+result = await agent.react("Calculate 2 + 2")
+
+# Simple conversation
+result = await agent.chat("Hello!")
+result = await agent.run_simple("Hello!")
+
+# Streaming response
+async for chunk in await agent.stream("Tell me a story"):
+    print(chunk, end="", flush=True)
+```
+
+### Registering Tools
+
+```python
+# Single tool
+agent.register(add)
+
+# Multiple tools
+agent.with_tools(tool1, tool2, tool3)
+
+# Or chain them
+agent.with_tools(tool1).with_tools(tool2)
+
+# Register skills from a directory
+agent.with_skills_dir("/path/to/skills_directory")
+```
+
+### Loading Skills from Directory
+
+Skills are loaded from `SKILL.md` files in skill directories. Use `with_skills_dir()` to load skills from a directory:
+
+```python
+# Directory structure:
+# /path/to/skills/
+#   ├── my-skill/
+#   │   └── SKILL.md        # YAML frontmatter + markdown instructions
+#   └── another-skill/
+#       └── SKILL.md
+
+agent.with_skills_dir("/path/to/skills")
+```
+
+When `start()` is called, all skills in the directory are automatically registered.
+
+---
+
+## Tool Registration
+
+### Using the `@tool()` Decorator
+
+```python
+from nbos import tool
+
+@tool("Calculate a math expression")
+def calc(expression: str) -> str:
+    result = eval(expression)
+    return str(result)
+
+@tool("Get weather information")
+def get_weather(city: str) -> dict:
+    return {"city": city, "temperature": 22, "unit": "celsius"}
+```
+
+### Custom Schema
+
+```python
+@tool("Calculate", schema={
+    "type": "object",
+    "properties": {
+        "expression": {
+            "type": "string",
+            "description": "Math expression to evaluate"
+        }
+    },
+    "required": ["expression"]
+})
+def calc(expression: str) -> str:
+    return str(eval(expression))
+```
+
+### Manual ToolDef
+
+```python
+from nbos.tool import ToolDef
+
+def my_handler(args: dict) -> str:
+    return f"Processed: {args}"
+
+tool_def = ToolDef(
+    name="my_tool",
+    description="A custom tool",
+    callback=my_handler,
+    parameters={"arg1": {"type": "string"}},
+    schema={"type": "object", "properties": {"arg1": {"type": "string"}}}
+)
+
+agent.register(tool_def)
+```
+
+### Async Tool
+
+Tools can be async — auto-detected and awaited automatically:
+
+```python
+from nbos import tool
+
+@tool("Fetch data from API")
+async def fetch_data(endpoint: str) -> dict:
+    import asyncio
+    await asyncio.sleep(0.1)  # Simulate API call
+    return {"endpoint": endpoint, "status": "ok", "data": [1, 2, 3]}
+
+# Usage with agent
+async with BrainOS() as brain:
+    agent = brain.agent("assistant").register(fetch_data)
+    result = await agent.ask("Fetch data from /users endpoint")
+```
+
+---
+
+## Bus Communication
+
+The Bus provides pub/sub messaging between components.
+
+### Using BusManager
+
+```python
+from nbos import BusManager
+
+async with BusManager() as bus:
+    # Publish
+    await bus.publish("my/topic", "hello")
+    await bus.publish("my/topic", {"data": 123}, is_json=True)
+
+    # Create publisher
+    pub = await bus.publisher("output/topic")
+    await pub.publish_text("message")
+
+    # Create subscriber
+    sub = await bus.subscriber("input/topic")
+    msg = await sub.recv()
+```
+
+### Subscriber Patterns
+
+```python
+sub = await bus.subscriber("my/topic")
+
+# One-shot receive
+msg = await sub.recv()
+msg = await sub.recv(5000)          # with timeout
+
+# Get JSON
+data = await sub.recv_json(5000)
+
+# Callback loop
+await sub.run(lambda msg: print(f"Received: {msg}"))
+
+# Async iteration
+async for msg in sub:
+    print(msg)
+```
+
+---
+
+## Query/Queryable
+
+Request-response pattern with timeout support.
+
+### Server Side (Queryable)
+
+```python
+def upper_handler(text: str) -> str:
+    return text.upper()
+
+async with BusManager() as bus:
+    q = await bus.queryable("svc/upper", upper_handler)
+    await q.start()
+```
+
+### Client Side (Query)
+
+```python
+async with BusManager() as bus:
+    query = await bus.query("svc/upper")
+    result = await query.ask("hello")  # "HELLO"
+    result = await query.ask("hello", 5000)  # with timeout
+```
+
+### Query API
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `topic` | `str` | Topic name |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `ask(payload, timeout_ms=None)` | Send text query |
+| `ask_json(payload, timeout_ms=None)` | Send JSON and decode the response |
+
+### Queryable API
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `handle(handler)` | Register the handler (applied on `start`) |
+| `start()` | Start server |
+| `run(handler)` | Run with handler |
+| `run_json(handler)` | Run JSON handler |
+
+---
+
+## Caller/Callable
+
+RPC-style request-response pattern.
+
+### Server Side (Callable)
+
+```python
+def echo_handler(text: str) -> str:
+    return f"echo: {text}"
+
+async with BusManager() as bus:
+    srv = await bus.callable("svc/echo", echo_handler)
+    await srv.start()
+```
+
+### Client Side (Caller)
+
+```python
+async with BusManager() as bus:
+    caller = await bus.caller("svc/echo")
+    result = await caller.call("ping")  # "echo: ping"
+```
+
+### Caller API
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `call(payload)` | Call remote service |
+| `call_json(payload)` | Send JSON and decode the response |
+
+### Callable API
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `is_started` | `bool` | Whether server is running |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `handle(handler)` | Register the handler (applied on `start`) |
+| `start()` | Start server |
+| `run(handler)` | Run with handler |
+| `run_json(handler)` | Run JSON handler |
+
+---
+
+## Configuration
+
+### Using Config Files
+
+BrainOS looks for config in:
+- `~/.bos/conf/config.toml`
+- `./conf/config.toml`
+- Environment variables
+
+Example config:
+```toml
+[global_model]
+api_key = "your-api-key"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4"
+```
+
+### Using Config Class
+
+```python
+from nbos import Config
+
+config = Config() \
+    .discover() \
+    .file("/path/to/config.toml") \
+    .inline({"key": "value"}) \
+    .load()
+
+data = config.to_json()
+```
+
+### Environment Variables
+
+- `BOS_API_KEY` - API key for LLM
+- `BOS_BASE_URL` - Base URL for LLM API
+- `BOS_MODEL` - Model name
+
+---
+
+## Hooks, Plugins, and Sessions
+
+### Hooks
+
+Hooks allow you to intercept and react to events during agent execution.
+
+#### Using Hooks
+
+```python
+from nbos import BrainOS, HookEvent, HookDecision, HookContext
+import asyncio
+
+def before_tool_hook(event: HookEvent, ctx: HookContext) -> HookDecision:
+    tool_name = ctx.data.get("tool_name", "unknown")
+    print(f"[HOOK] About to call tool: {tool_name}")
+    return HookDecision("Continue", None)
+
+def after_llm_hook(event: HookEvent, ctx: HookContext) -> HookDecision:
+    print(f"[HOOK] LLM call completed")
+    return HookDecision("Continue", None)
+
+async def main():
+    async with BrainOS() as brain:
+        agent = await (
+            brain.agent("assistant")
+            .with_hooks({
+                "BeforeToolCall": before_tool_hook,
+                "AfterLlmCall": after_llm_hook,
+            })
+            .start()
+        )
+        
+        result = await agent.ask("What is 5 + 3?")
+        print(result)
+
+asyncio.run(main())
+```
+
+#### Async Hook
+
+Hooks can also be async — auto-detected and awaited automatically:
+
+```python
+from nbos import BrainOS, HookEvent, HookDecision, HookContext
+import asyncio
+
+async def async_rate_limit_hook(event: HookEvent, ctx: HookContext) -> str:
+    await asyncio.sleep(0.01)  # Simulate async rate limit check
+    print(f"[Async Hook:{event}] Rate limit check passed")
+    return "continue"
+
+async def async_logging_hook(event: HookEvent, ctx: HookContext) -> str:
+    await asyncio.sleep(0.01)  # Simulate async logging
+    print(f"[Async Hook:{event}] Logged response")
+    return "continue"
+
+async def main():
+    async with BrainOS() as brain:
+        agent = (
+            brain.agent("assistant")
+            .with_hooks({
+                "BeforeLlmCall": async_rate_limit_hook,
+                "AfterLlmCall": async_logging_hook,
+            })
+        )
+        
+        result = await agent.ask("What is 5 + 3?")
+        print(result)
+
+asyncio.run(main())
+```
+
+#### Hook Events
+
+| Event | Description |
+|-------|-------------|
+| `BeforeToolCall` | Fired before a tool is called |
+| `AfterToolCall` | Fired after a tool completes |
+| `BeforeLlmCall` | Fired before LLM API call |
+| `AfterLlmCall` | Fired after LLM API call |
+| `OnMessage` | Fired for each message |
+| `OnComplete` | Fired when agent completes |
+| `OnError` | Fired when an error occurs |
+
+#### Hook Decisions
+
+Return a dict to control execution:
+
+| Decision | Description |
+|----------|-------------|
+| `{"decision": "continue"}` | Proceed normally (default) |
+| `{"decision": "abort"}` | Abort current operation |
+| `{"decision": "error", "message": "error message"}` | Return an error |
+
+### Plugins
+
+Plugins allow you to preprocess and postprocess LLM requests and responses.
+
+#### Using Plugins
+
+```python
+from nbos import BrainOS
+import asyncio
+
+async def main():
+    def on_llm_request(wrapped):
+        print(f"[PLUGIN] LLM Request: model={wrapped.model}")
+        return wrapped
+
+    def on_tool_call(wrapped):
+        print(f"[PLUGIN] Tool call: {wrapped.name}")
+        return wrapped
+
+    plugin = {
+        "name": "logging-plugin",
+        "on_llm_request": on_llm_request,
+        "on_tool_call": on_tool_call,
+    }
+
+    async with BrainOS() as brain:
+        agent = await (
+            brain.agent("assistant")
+            .with_plugins(plugin)
+            .start()
+        )
+        
+        result = await agent.ask("Say hello!")
+        print(result)
+
+asyncio.run(main())
+```
+
+#### Async Plugin
+
+Plugins can also be async — auto-detected via `inspect.iscoroutinefunction()`:
+
+```python
+import asyncio
+
+async def main():
+    async def async_on_llm_request(wrapped):
+        await asyncio.sleep(0.01)  # Simulate async enrichment
+        print(f"[Async Plugin] LLM Request: model={wrapped.model}")
+        return wrapped
+
+    async def async_on_llm_response(wrapped):
+        await asyncio.sleep(0.01)  # Simulate async analysis
+        print(f"[Async Plugin] LLM Response: type={wrapped.response_type}")
+        return wrapped
+
+    plugin = {
+        "name": "async-logging-plugin",
+        "on_llm_request": async_on_llm_request,
+        "on_llm_response": async_on_llm_response,
+    }
+
+    async with BrainOS() as brain:
+        agent = (
+            brain.agent("assistant")
+            .with_plugins(plugin)
+        )
+        
+        result = await agent.ask("Say hello!")
+        print(result)
+
+asyncio.run(main())
+```
+
+### Session Management
+
+BrainOS provides session management for persisting agent state across restarts.
+
+#### Session Operations
+
+```python
+from nbos import BrainOS
+import asyncio
+
+async def main():
+    async with BrainOS() as brain:
+        agent = await brain.agent("assistant").start()
+        
+        # Save session
+        agent.session.save("/tmp/session.json")
+        
+        # Get messages
+        messages = agent.session.get_messages()
+        
+        # Compact long conversations
+        agent.session.compact()
+        
+        result = await agent.ask("Say hello!")
+        print(result)
+
+asyncio.run(main())
+```
+
+#### Session Info Methods
+
+| Method | Description |
+|--------|-------------|
+| `save(path)` | Save conversation messages to file |
+| `restore(path)` | Restore conversation messages from file |
+| `save_full(path)` | Save the full session (messages + context) to file |
+| `restore_full(path)` | Restore the full session from file |
+| `add_message(role, content)` | Add message to conversation |
+| `get_messages()` | Get conversation messages |
+| `compact(keep_recent=10, max_summary_chars=2000)` | Compact long conversation logs mechanically |
+| `agent.compact_now(retain_tokens=0)` | Ask the model to write a checkpoint summary now (returns the outcome or `None`) |
+| `clear()` | Drop every non-system message and reset the context |
+| `export()` | Return the session state as a dict |
+| `export_json()` | Return the session state as a JSON string |
+| `import_session(data)` | Restore from a snapshot dict or JSON string |
+| `context` | The session context object (null until set) |
+| `set_context(context)` | Replace the opaque session context |
+| `clear_context()` | Reset the session context to null |
+
+---
+
+## Memory
+
+`Memory` is an in-process, keyword-ranked store. Attach one to an agent
+and matching items are prepended to every text run.
+
+```python
+from nbos import AgentBuilder, Memory
+
+memory = Memory()
+memory.add("The staging deploy needs VPN", {"source": "runbook"})
+
+agent = await AgentBuilder(None).with_memory(memory, limit=3).start()
+# ask/react/stream now recall up to 3 items for the prompt.
+
+# Persist across processes as JSON lines (same format as Rust FileMemory):
+memory.save("./agent-memory.jsonl")
+restored = Memory.load("./agent-memory.jsonl")
+```
+
+`search(query, limit, metadata)` returns the best matches, where `metadata`
+keeps only items whose keys match exactly. `all`/`remove`/`clear` manage
+the store, and a blank query returns the most recent items. A
+`Memory(max_items=N)` (or `with_max_items(N)`) cap evicts the oldest
+items on overflow. Multimodal `Content` is passed through without recall.
+
+## Plans, Goals, Jobs and Steering
+
+These controls cover the long-running parts of a session: the working plan, the
+durable goal, background processes, and mid-turn messages.
+
+### Plans
+
+The agent owns one plan store. Register the built-in update_plan tool so the
+model can maintain it, then render plan_items() in your UI:
+
+    from nbos import AgentBuilder
+
+    agent = await AgentBuilder(None).with_plan_tool().start()
+    agent.add_plan_tool()               # explicit alternative
+    agent.set_plan([{"text": "write tests", "status": "in_progress"}])
+    print(agent.plan_items())
+    agent.clear_plan()
+
+### Goals
+
+A goal outlives a turn. Seed a GoalStore for the current turn, register the
+get_goal/update_goal tools, and settle the store when the turn ends:
+
+    from nbos import Goal, GoalStore
+
+    goal = Goal.create("Ship the 4.1 release")
+    store = GoalStore(goal)
+    agent.add_goal_tools(store)
+
+    # ... run the turn ...
+
+    settle = store.take_settle()   # None, {"type": "complete"} or blocked
+    if settle and settle["type"] == "complete":
+        goal.complete()
+
+Goal also supports pause, resume, advance, block, arm, disarm, to_json and
+Goal.from_json.
+
+### Steering
+
+steer(content, ticket) queues a message for the RUNNING turn's next step.
+take_undelivered_steers() returns the tickets of messages no step reached, so a
+host can put them back in its own queue.
+
+    agent.steer("Also check the changelog.", 12)
+    agent.steer_depth()                 # queued messages
+    agent.take_undelivered_steers()     # [12] after a turn that ended early
+
+Messages steered while no turn is running are delivered to the next turn.
+
+### Background jobs
+
+Share one JobRegistry between the bash tool that spawns jobs and the job tools
+that read them. Passing jobs to with_bash() enables run_in_background on the
+shell tool.
+
+    from nbos import AgentBuilder, JobRegistry
+
+    jobs = JobRegistry()
+    agent = await (
+        AgentBuilder(None)
+        .with_bash("bash", os.getcwd(), jobs, "default")
+        .start()
+    )
+    agent.add_job_tools(jobs, "default")
+
+    for job in jobs.list("default"):
+        print(job["id"], job["status"])
+    tail = jobs.output(job_id)
+    jobs.wait(job_id, 5000)
+    jobs.kill(job_id)
+
+### Deferred tools, live tools, live skills and prompt sections
+
+defer_tool(name) / defer_tool_prefix(prefix) keep a tool out of the advertised
+array while keeping it discoverable through find_tool; the reported tool is
+called directly by name on the next step.
+
+register_skill and register_skills_from_dir change the build's own set. To add
+a tool or skill while a turn is running, use the live overlay; the running turn
+sees it on its next step and the change survives the run.
+
+    agent.defer_tool("mcp_search").defer_tool_prefix("mcp_")
+    agent.register_skill("reviewer", "Review code", "Read the diff first.")
+    agent.add_live_prompt_section("Stay terse.")
+
+    await agent.add_live_tool(ToolDef("lookup", "Look up a record", lookup, schema=lookup_schema))
+    agent.add_live_skill("reviewer", "Review code", "Read the diff first.")
+    await agent.add_live_skills_from_dir("./extra-skills")
+    agent.remove_live_tools(["lookup"])
+    agent.remove_live_skills_by_paths(["./extra-skills/reviewer"])
+    agent.tool_definitions()      # full descriptions/schemas, incl. MCP/live tools
+    agent.model_tool_definitions()
+    agent.list_skills()
+
+### Prompt templates
+
+    from nbos import render_template, with_memory, estimate_tokens
+
+    render_template("You are {{role}}.", {"role": "a reviewer"})
+    with_memory("You are a reviewer.\n\n{{memory}}", "Remember: tea.")
+    estimate_tokens("one two three")
+
+## Ferris Extensions
+
+Ferris is the BOS extension framework. The binding lets you implement the SDK's
+Extension interface in Python and run it in process. A manifest is still a
+schema-2.0 extension.toml; the callbacks supply the same start/invoke/shutdown
+steps a Rust extension implements.
+
+    from nbos import FerrisHarness, FerrisManifest
+
+    manifest = """
+    schema_version = "2.0"
+
+    [extension]
+    id = "com.example.echo"
+    name = "Echo"
+    version = "1.0.0"
+    description = "Echoes its input"
+
+    [compatibility]
+    host = ">=3.0.0"
+    extension_api = ">=1.0.0"
+
+    [runtime]
+    kind = "builtin"
+
+    [capabilities]
+    required = ["agent.tools.register"]
+
+    [[contribution]]
+    kind = "tool"
+    id = "echo"
+    """
+
+    async def start(ctx):
+        return [{"kind": "tool", "id": "echo", "payload": {"description": "Echo"}}]
+
+    async def invoke(call):
+        return call["input"]  # {"contribution", "input", "context"}
+
+    harness = FerrisHarness(manifest, "/tmp/echo-extension", start, invoke)
+    contributions = await harness.start()
+    result = await harness.invoke("echo", {"text": "hi"})
+    await harness.shutdown()
+
+FerrisManifest.parse(toml) validates a manifest without running anything and
+exposes id, runtime_kind, to_toml() and to_json(). Callbacks may be sync or
+async. This harness runs code in the host process; for untrusted packages use
+the Ferris process/WASM runtimes through a host that enforces capabilities.
+
+A manifest can also be built without hand-writing TOML:
+
+    from nbos import FerrisManifestBuilder
+
+    manifest = (
+        FerrisManifestBuilder("com.example.echo", "Echo", "1.0.0", "Echo")
+        .runtime("declarative")
+        .capability("agent.tools.register")
+        .contribution("tool", "echo", {"description": "Echo"})
+        .startup("on-demand")
+        .build()
+    )
+
+### Installing and running packages
+
+FerrisHost is the package host. It installs into a canonical store, plans in
+dependency order, activates the standard runtimes and exposes contributions.
+
+    from nbos import FerrisHost
+
+    host = FerrisHost("/tmp/ferris-store", "/tmp/workspace")
+    host.install("/path/to/package")
+    host.plan()                        # dependency-first ids
+    contributions = await host.apply()
+    result = await host.invoke("com.example.echo", "tool", "echo", {"x": 1})
+    await host.unload()
+
+Hosts default to policy_mode="enforce"; grant what a package needs first:
+
+    host.grant("com.example.echo", "process.execute", "program:node")
+
+Use set_enabled, uninstall, versions, activate, rollback, package_root and
+quarantine for lifecycle. Contributions are data; `register_agent_tools`
+registers tools on an agent, while prompts/skills/context remain yours to place.
+
+Host options add callbacks and event hooks:
+
+    host = FerrisHost(
+        "/tmp/ferris-store",
+        workspace="/tmp/workspace",
+        on_contributions=lambda payload: register(payload),
+        on_revoke=lambda payload: unregister(payload),
+    )
+    subscription = host.subscribe_events(["agent.*"], lambda event: print(event))
+    host.publish_event("agent.started", {"ok": True})
+    host.unsubscribe_events(subscription)
+
+A Python extension can also be registered as an in-process linked package:
+
+    await host.register_extension(manifest.to_toml(), "/tmp/linked", start, invoke)
+
+After `apply()`, register the applied tools on an agent with
+`register_agent_tools`; each tool forwards to the owning runtime:
+
+    registered = await host.register_agent_tools(agent)
+
+## API Reference
+
+For the complete API reference, see [Python API Reference](./api-reference/nbos-api.md).
+
+### `BrainOS`
+
+Main entry point for BrainOS.
+
+**Constructor:**
+```python
+BrainOS(api_key=None, base_url=None, model=None)
+```
+
+**Attributes:**
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `__version__` | `str` | BrainOS package version (e.g., "2.1.1") |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `agent(name, **options)` | Create a new agent |
+| `bus` | Get the underlying Bus |
+
+### `Agent`
+
+LLM-powered agent with tool support. Created via `AgentBuilder` (`.with_X()` chain + `.start()`).
+
+**AgentBuilder Methods (chainable until `.start()`):**
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `with_model(model)` | Set model | `AgentBuilder` |
+| `with_prompt(prompt)` | Set system prompt | `AgentBuilder` |
+| `with_system(prompt)` | Alias for with_prompt | `AgentBuilder` |
+| `with_temperature(temp)` | Set temperature | `AgentBuilder` |
+| `with_timeout(secs)` | Set timeout | `AgentBuilder` |
+| `with_resilience(**opts)` | Set resilience config | `AgentBuilder` |
+| `with_config(config)` | Apply a config mapping in one call | `AgentBuilder` |
+| `with_circuit_breaker(max_failures, cooldown_secs=30)` | Set circuit breaker | `AgentBuilder` |
+| `with_rate_limit(capacity, window_secs=60, max_retries=3)` | Set rate limiter | `AgentBuilder` |
+| `with_tools(*tools)` | Register one or more tools | `AgentBuilder` |
+| `register(*tools)` | Alias for with_tools | `AgentBuilder` |
+| `with_hooks(hooks)` | Register lifecycle hooks | `AgentBuilder` |
+| `with_plugins(*plugins)` | Register plugins | `AgentBuilder` |
+| `with_mcp(namespace, cmd, args)` | Add MCP server | `AgentBuilder` |
+| `with_mcp_http(namespace, url)` | Add MCP HTTP server | `AgentBuilder` |
+| `with_skills_dir(path)` | Load skills from directory | `AgentBuilder` |
+| `start()` | Initialize agent | `Agent` |
+| `ask(question)` | Lazy-init + run agent | `str` |
+| `chat(message)` | Lazy-init + chat | `str` |
+| `react(task)` | Lazy-init + ReAct | `str` |
+| `stream(task)` | Lazy-init + stream | `AsyncIterator` |
+
+**Agent Methods (after `.start()`):**
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `ask(question)` | Run agent | `str` |
+| `chat(message)` | Simple chat | `str` |
+| `run_simple(message)` | Simple run | `str` |
+| `react(task)` | Run with ReAct | `str` |
+| `stream(task)` | Stream response | `AsyncIterator` |
+| `stream_collect(task)` | Collect all stream tokens | `list` |
+| `stop(clear_session=False)` | Cooperatively stop the agent | `bool` |
+| `is_running` | Whether a call is in flight | `bool` |
+| `session` | Session manager | `SessionManager` |
+| `tools` | Registered tool names | `list[str]` |
+| `tool_names` | Alias for `tools` (matches JS `toolNames`) | `list[str]` |
+| `config` | Agent configuration | `dict` |
+| `metrics` | Performance metrics (timings in µs) | `dict` |
+| `reset_metrics()` | Reset performance metrics | `Agent` |
+| `list_mcp_tools()` | Tools from connected MCP servers | `list[dict]` |
+| `list_mcp_resources(namespace)` | Resources for an MCP namespace | `list[dict]` |
+| `list_mcp_prompts()` | Prompts from connected MCP servers | `list[dict]` |
+
+### Resilience Configuration
+
+The Agent supports configuring circuit breaker and rate limiter for resilience via three methods:
+
+**Method 1: Fluent API (`with_resilience()`)**
+```python
+from nbos import BrainOS, tool
+
+@tool("Add two numbers")
+def add(a: int, b: int) -> int:
+    return a + b
+
+async with BrainOS(api_key="sk-...") as brain:
+    agent = brain.agent("assistant").register(add)
+    agent.with_resilience(
+        rate_limit_capacity=40,           # max requests per window
+        rate_limit_window_secs=60,         # window duration in seconds
+        rate_limit_max_retries=3,          # retry attempts on 429 errors
+        circuit_breaker_max_failures=5,       # failures before opening circuit
+        circuit_breaker_cooldown_secs=30,     # seconds before attempting recovery
+    )
+    result = await agent.ask("What is 42 + 58?")
+```
+
+**Method 2: Constructor kwargs**
+```python
+async with BrainOS(api_key="sk-...") as brain:
+    agent = brain.agent(
+        "assistant",
+        rate_limit_capacity=40,
+        rate_limit_window_secs=60,
+        rate_limit_max_retries=3,
+        circuit_breaker_max_failures=5,
+        circuit_breaker_cooldown_secs=30,
+    )
+    result = await agent.ask("What is 42 + 58?")
+```
+
+**Method 3: `BrainOS.agent()` with resilience params**
+```python
+async with BrainOS(api_key="sk-...") as brain:
+    agent = brain.agent(
+        "assistant",
+        rate_limit_capacity=20,
+        circuit_breaker_max_failures=5,
+    )
+    result = await agent.ask("What is 42 + 58?")
+```
+
+**Method 4: Using nbos directly with AgentConfig**
+
+```python
+from nbos import PyAgent, AgentConfig, Bus, BusConfig
+
+cfg = AgentConfig(
+    name="assistant",
+    model="gpt-4",
+    api_key="sk-...",
+    base_url="https://api.openai.com/v1",
+    # Circuit Breaker - prevents cascading failures
+    circuit_breaker_max_failures=5,      # failures before opening circuit
+    circuit_breaker_cooldown_secs=30,      # seconds before attempting recovery
+    # Rate Limiter - prevents 429 errors
+    rate_limit_capacity=40,               # max requests per window
+    rate_limit_window_secs=60,             # window duration in seconds
+    rate_limit_max_retries=3,            # retry attempts on rate limit
+)
+
+async with BrainOS() as brain:
+    agent = await PyAgent.create(cfg, brain.bus)
+```
+
+**Circuit Breaker Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `circuit_breaker_max_failures` | 5 | Failures before opening circuit |
+| `circuit_breaker_cooldown_secs` | 30 | Seconds before half-open state |
+
+**Rate Limiter Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `rate_limit_capacity` | 40 | Max requests per window |
+| `rate_limit_window_secs` | 60 | Window duration in seconds |
+| `rate_limit_max_retries` | 3 | Retry attempts on 429 errors |
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `tools` | `list[str]` | Registered tool names |
+| `config` | `dict` | Agent configuration |
+
+### `@tool()`
+
+Decorator to create a tool from a function.
+
+**Signature:**
+```python
+@tool(description: str, *, name: str = None, schema: dict = None)
+```
+
+### `BusManager`
+
+Async context manager for Bus lifecycle.
+
+**Constructor:**
+```python
+BusManager(mode="peer", connect=None, listen=None, peer=None)
+```
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `create(**options)` | Construct and start (classmethod) |
+| `start()` / `stop()` | Start or close the underlying bus |
+| `publish(topic, payload, is_json=False)` | Publish text or JSON |
+| `mode(m)` / `connect(a)` / `listen(a)` / `peer(id)` | Fluent configuration |
+| `publisher(topic)` / `subscriber(topic)` | Create a publisher or subscriber |
+| `query(topic)` / `queryable(topic, handler=None)` | Create a query or queryable |
+| `caller(name)` / `callable(uri, handler=None)` | Create a caller or callable |
+
+The `publish_text`/`publish_json` and `create_*` methods remain as aliases.
+
+### `Publisher`
+
+Message publisher for a specific topic.
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `topic` | `str` | Topic name |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `publish(payload, is_json=False)` | Publish text or JSON |
+| `publish_text(payload)` | Publish text |
+| `publish_json(data)` | Publish JSON |
+
+### `Subscriber`
+
+Message subscriber with receive methods.
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `topic` | `str` | Topic name |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `recv(timeout_ms=None)` | Receive a message, with an optional timeout |
+| `recv_json(timeout_ms=None)` | Receive and decode JSON |
+| `run(callback)` | Run callback loop |
+| `run_json(callback)` | Run JSON callback loop |
+| `next()` | One async-iterator step |
+
+### `Query` / `Queryable`
+
+Request-response pattern.
+
+**Query Methods:**
+| Method | Description |
+|--------|-------------|
+| `ask(payload, timeout_ms=None)` | Send a text query |
+| `ask_json(payload, timeout_ms=None)` | Send JSON and decode the response |
+
+**Queryable Methods:**
+| Method | Description |
+|--------|-------------|
+| `handle(handler)` | Register the handler (applied on `start`) |
+| `start()` | Start server |
+| `run(handler)` | Run with handler |
+| `run_json(handler)` | Run JSON handler |
+
+### `Caller` / `Callable`
+
+RPC pattern.
+
+**Caller Methods:**
+| Method | Description |
+|--------|-------------|
+| `call(payload)` | Call remote service |
+| `call_json(payload)` | Send JSON and decode the response |
+
+**Callable Methods:**
+| Method | Description |
+|--------|-------------|
+| `handle(handler)` | Register the handler (applied on `start`) |
+| `start()` | Start server |
+| `run(handler)` | Run with handler |
+| `run_json(handler)` | Run JSON handler |
+| `is_started` | Check if running |
+
+### `Config`
+
+Configuration loader.
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `from_file(path)` / `from_directory(path)` / `from_inline(data)` | Construct and load (classmethods) |
+| `discover()` | Auto-discover config files |
+| `file(path)` / `directory(path)` / `inline(data)` | Declare a source (fluent) |
+| `reset()` | Reset config |
+| `load()` / `reload()` | Resolve and cache the configuration |
+| `get(key, default=None)` | Dotted-path lookup |
+| `to_json()` / `is_loaded()` | Cached config dict / load state |
+
+`add_file`/`add_directory`/`add_inline`/`load_sync`/`reload_sync` remain as aliases.
+
+---
+
+## Examples
+
+### Complete Example with Tools
+
+```python
+import asyncio
+from nbos import BrainOS, tool
+
+@tool("Add two numbers")
+def add(a: int, b: int) -> int:
+    return a + b
+
+@tool("Multiply two numbers")
+def multiply(a: int, b: int) -> int:
+    return a * b
+
+@tool("Get current time")
+def get_time() -> dict:
+    from datetime import datetime, timezone
+    return {"utc": datetime.now(timezone.utc).isoformat()}
+
+async def main():
+    async with BrainOS() as brain:
+        agent = await (
+            brain.agent("assistant")
+            .with_tools(add, multiply, get_time)
+            .start()
+        )
+        
+        # Ask with tool use
+        result = await agent.react("What is 5 + 3? What is 4 * 7?")
+        print(result)
+
+asyncio.run(main())
+```
+
+### Pub/Sub Example
+
+```python
+import asyncio
+from nbos import BusManager
+
+async def publisher():
+    async with BusManager() as bus:
+        await bus.publish("events/start", "Hello subscribers!")
+
+async def subscriber():
+    async with BusManager() as bus:
+        sub = await bus.subscriber("events/start")
+        msg = await sub.recv(5000)
+        print(f"Received: {msg}")
+
+# Run both in separate processes or tasks
+```
+
+### Query/Response Example
+
+```python
+import asyncio
+from nbos import BusManager
+
+def uppercase(text: str) -> str:
+    return text.upper()
+
+async def main():
+    async with BusManager() as bus:
+        # Server
+        q = await bus.queryable("svc/uppercase", uppercase)
+        await q.start()
+        
+        # Client
+        query = await bus.query("svc/uppercase")
+        result = await query.ask("hello world")
+        print(result)  # "HELLO WORLD"
+
+asyncio.run(main())
+```
+
+---
+
+## Error Handling
+
+```python
+import asyncio
+from nbos import BrainOS
+
+async def main():
+    try:
+        async with BrainOS() as brain:
+            agent = brain.agent("assistant")
+            result = await agent.ask("Hello")
+    except RuntimeError as e:
+        print(f"Runtime error: {e}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+asyncio.run(main())
+```

@@ -1,0 +1,73 @@
+name: platform conformance
+
+# The shared OS-service conformance suite (hostkit) runs on every supported
+# operating system, so a platform-specific regression in process ownership,
+# path safety, environment baselines, private files or root resolution cannot
+# land silently (issue #313). The process-lifecycle contract is the same on all
+# three hosts because every runtime spawns through hostkit.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/hostkit/**"
+      - "crates/agent/src/jobs.rs"
+      - "crates/agent/src/shell_backend.rs"
+      - "crates/agent/src/security/**"
+      - ".github/workflows/platform-conformance.yml"
+  pull_request:
+    paths:
+      - "crates/hostkit/**"
+      - "crates/agent/src/jobs.rs"
+      - "crates/agent/src/shell_backend.rs"
+      - "crates/agent/src/security/**"
+      - ".github/workflows/platform-conformance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: Conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-conformance-${{ hashFiles('Cargo.lock') }}
+
+      # The shared OS-service conformance suite: process-tree ownership and
+      # confirmed termination, path safety, environment baselines, private
+      # files, root resolution. Not cfg-gated, so it exercises the native
+      # implementation on each host.
+      - name: hostkit conformance
+        run: cargo test -p hostkit -- --nocapture
+
+      - name: hostkit lint
+        run: cargo clippy -p hostkit --all-targets -- -D warnings
+
+      # The per-tool execution conformance: shell backend resolution and the
+      # background-job kill/exit contract through the real production paths.
+      - name: tool execution conformance
+        run: cargo test -p agent --test platform_conformance -- --nocapture

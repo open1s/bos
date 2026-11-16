@@ -1,0 +1,9 @@
+{
+  "name": "All-in-One Example",
+  "base_url": "https://example.invalid/v1",
+  "api_mode": "chat",
+  "demo-model": {
+    "model": "demo-model",
+    "name": "Demo Model"
+  }
+}

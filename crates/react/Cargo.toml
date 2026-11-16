@@ -1,0 +1,35 @@
+[package]
+name = "react"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ReAct-inspired reasoning and acting engine in Rust"
+documentation = "https://github.com/open1s/bos/blob/main/docs/rust-user-guide.md"
+repository = "https://github.com/open1s/bos"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = { workspace = true }
+log = "0.4"
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+async-trait = "0.1"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+bytes = "1"
+tokio-stream = "0.1"
+async-stream = { workspace = true }
+dashmap = {workspace = true}
+uuid = {workspace = true}
+qserde = { path = "../qserde" }
+bus = { workspace = true }
+
+[dev-dependencies]
+config = { path = "../config" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,41 @@
+digraph AgentExecution {
+  graph [
+    bgcolor="#FFFFFF", pad="0.42", rankdir=TB, nodesep="0.28", ranksep="0.42",
+    splines=ortho, outputorder=edgesfirst, fontname="Arial",
+    label="BOS Agent Execution", labelloc=t, labeljust=l,
+    fontsize=28, fontcolor="#111111"
+  ];
+  node [
+    shape=box, style="rounded,filled", fontname="Arial",
+    fontsize=16, margin="0.32,0.24", color="#D9DDE2",
+    fillcolor="#FFFFFF", fontcolor="#111111", penwidth=1.2
+  ];
+  edge [color="#111111", penwidth=1.5, arrowsize=0.75];
+
+  subgraph cluster_execution {
+    label=""; color="#D9DDE2"; penwidth=1.2; style="rounded"; margin=24;
+
+    request [
+      label=<<B>Agent Request</B><BR/><FONT POINT-SIZE="14" COLOR="#666666">Intent  ·  Context  ·  Capabilities</FONT>>,
+      fillcolor="#E8F3FA", color="#DDEBF4", width=8.6, height=1.0
+    ];
+    engine [
+      label=<<B>BOS Agent Engine</B><BR/><FONT POINT-SIZE="14" COLOR="#666666">Understand  ·  Plan  ·  Reason  ·  Coordinate</FONT>>,
+      fillcolor="#F2F2F2", color="#E8E8E8", width=8.6, height=1.0
+    ];
+    runtime [
+      label=<<B>Execution Runtime</B><BR/><FONT POINT-SIZE="14" COLOR="#666666">Models  ·  Tools  ·  Extensions  ·  Services</FONT>>,
+      width=8.6, height=1.0
+    ];
+    feedback [
+      label=<<B>Observe &amp; Adapt</B><BR/><FONT POINT-SIZE="14" COLOR="#666666">Results  ·  State  ·  Next action</FONT>>,
+      fillcolor="#F2F2F2", color="#E8E8E8", width=8.6, height=1.0
+    ];
+    response [
+      label=<<B>Agent Response</B><BR/><FONT POINT-SIZE="14" COLOR="#666666">Outcome  ·  Trace</FONT>>,
+      fillcolor="#E8F3FA", color="#DDEBF4", width=8.6, height=1.0
+    ];
+
+    request -> engine -> runtime -> feedback -> response;
+  }
+}

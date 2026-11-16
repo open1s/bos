@@ -1,0 +1,25 @@
+[
+  {
+    "type": "text",
+    "text": "What is in this image?"
+  },
+  {
+    "type": "binary",
+    "binary": {
+      "content_type": "image/jpeg",
+      "source": {
+        "url": "https://example.com/photo.jpg"
+      },
+      "name": "photo.jpg"
+    }
+  },
+  {
+    "type": "binary",
+    "binary": {
+      "content_type": "audio/mp3",
+      "source": {
+        "base64": "QUJD"
+      }
+    }
+  }
+]

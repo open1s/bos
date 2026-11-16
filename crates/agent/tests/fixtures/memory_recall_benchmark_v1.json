@@ -1,0 +1,143 @@
+{
+  "version": 1,
+  "description": "Multilingual recall benchmark v1 (issue #345): Chinese, English and mixed queries over a 12-document corpus. Relevant sets are conservative: a query lists the documents a correct retriever must surface in top-3.",
+  "documents": [
+    {
+      "id": "d1",
+      "created": 100,
+      "content": "The deployment pipeline builds the workspace with cargo and runs clippy before release."
+    },
+    {
+      "id": "d2",
+      "created": 200,
+      "content": "项目的部署流程先用 cargo 构建，再运行测试，最后发布。"
+    },
+    {
+      "id": "d3",
+      "created": 300,
+      "content": "We decided to use tokio as the async runtime for all services."
+    },
+    {
+      "id": "d4",
+      "created": 400,
+      "content": "团队决定采用 tokio 作为异步运行时，统一所有服务的并发模型。"
+    },
+    {
+      "id": "d5",
+      "created": 500,
+      "content": "The memory store persists records to a JSON-lines file with atomic replacement."
+    },
+    {
+      "id": "d6",
+      "created": 600,
+      "content": "记忆存储把记录写入 JSONL 文件，并用原子替换保证崩溃安全。"
+    },
+    {
+      "id": "d7",
+      "created": 700,
+      "content": "User prefers concise answers in Chinese with code examples."
+    },
+    {
+      "id": "d8",
+      "created": 800,
+      "content": "用户偏好中文简洁回答，并附带代码示例。"
+    },
+    {
+      "id": "d9",
+      "created": 900,
+      "content": "Rotate peer keys by signing the successor statement with the old key."
+    },
+    {
+      "id": "d10",
+      "created": 1000,
+      "content": "轮换节点密钥时，用旧密钥签署继任声明，再提交持久化。"
+    },
+    {
+      "id": "d11",
+      "created": 1100,
+      "content": "BM25 ranking with CJK bigrams improves mixed-language recall."
+    },
+    {
+      "id": "d12",
+      "created": 1200,
+      "content": "混合语言检索用 BM25 加上中文二元组，提高召回率。"
+    }
+  ],
+  "queries": [
+    {
+      "query": "deployment pipeline",
+      "relevant": [
+        "d1"
+      ]
+    },
+    {
+      "query": "部署流程",
+      "relevant": [
+        "d2"
+      ]
+    },
+    {
+      "query": "async runtime decision",
+      "relevant": [
+        "d3"
+      ]
+    },
+    {
+      "query": "异步运行时 决定",
+      "relevant": [
+        "d4"
+      ]
+    },
+    {
+      "query": "memory persistence atomic",
+      "relevant": [
+        "d5"
+      ]
+    },
+    {
+      "query": "记忆 原子替换",
+      "relevant": [
+        "d6"
+      ]
+    },
+    {
+      "query": "中文 回答 偏好",
+      "relevant": [
+        "d8"
+      ]
+    },
+    {
+      "query": "混合检索 BM25",
+      "relevant": [
+        "d12",
+        "d11"
+      ]
+    },
+    {
+      "query": "tokio",
+      "relevant": [
+        "d3",
+        "d4"
+      ]
+    },
+    {
+      "query": "cargo 构建",
+      "relevant": [
+        "d2",
+        "d1"
+      ]
+    },
+    {
+      "query": "peer key rotation",
+      "relevant": [
+        "d9"
+      ]
+    },
+    {
+      "query": "密钥 轮换",
+      "relevant": [
+        "d10"
+      ]
+    }
+  ]
+}

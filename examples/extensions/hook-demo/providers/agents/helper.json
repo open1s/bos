@@ -1,0 +1,7 @@
+{
+  "name": "Hook Helper",
+  "description": "A read-only agent role contributed by the hook demo",
+  "plugins": ["files"],
+  "permission": "read_only",
+  "level": 1
+}

@@ -1,0 +1,129 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv
+.yarn
+
+node_modules/
+jsbos.node
+*.node
+
+# Virtual environment
+.env
+.venv
+.jj/
+
+# Editor files
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build artifacts
+target/
+dist/
+build/
+# Ghostty's Zig build logic lives in a directory named build/; it is source,
+# not an artifact, and the Linux harness cannot compile the terminal without it.
+!vendor/gpui-libghostty/vendor/ghostty/src/build/
+!vendor/gpui-libghostty/vendor/ghostty/src/build/**
+!vendor/gpui-libghostty/vendor/ghostty/src/apprt/gtk/build/
+!vendor/gpui-libghostty/vendor/ghostty/src/apprt/gtk/build/**
+*.egg-info/
+*.egg
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Logs
+*.log
+logs/
+
+# Testing and coverage
+.coverage
+.cache
+.pytest_cache/
+htmlcov/
+.coverage.*
+.tox/
+.nox/
+.hypothesis/
+.claude/
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Project specific
+.codebuddy/
+
+# Linter and formatter caches
+.mypy_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+
+
+
+# Temporary files
+*.tmp
+*.temp
+.tmp-gui-home/
+.tmp-ref/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment variables
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
+
+# Database files
+*.db
+*.sqlite3
+
+# Added by cargo
+
+/target
+
+# Git worktrees
+.worktrees/
+.opencode
+
+# The harness workspace: the configuration travels with the checkout (that is
+# how a second clone inherits the same agent setup, and it carries no
+# credentials by design), while this machine's sessions, plans and logs do not.
+.bsh/*
+.bsh/settings/
+
+# Generated: the shipped reference bundle corpus (regenerate with the extract-asar.py recipe)
+docs/ui-mirror/reference/pkgs/
+
+# The bsh app's runtime sidecar (sessions, annotations); its settings stay tracked.
+crates/bsh/.bsh/*
+!crates/bsh/.bsh/settings/

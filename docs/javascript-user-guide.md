@@ -1,0 +1,1723 @@
+# BrainOS JavaScript API User Guide
+
+This guide provides a unified, consistent API for using BrainOS in JavaScript/Node.js. The API mirrors the Python API for a seamless cross-language experience.
+
+## Table of Contents
+
+1. [Installation](#installation)
+2. [Quick Start](#quick-start)
+3. [Core Concepts](#core-concepts)
+   - [Multimodal Content](#multimodal-content)
+4. [Agent API](#agent-api)
+5. [Tool Registration](#tool-registration)
+6. [Hooks](#hooks)
+7. [Bus Communication](#bus-communication)
+8. [Query/Queryable](#queryqueryable)
+9. [Caller/Callable](#callercallable)
+10. [Configuration](#configuration)
+11. [MCP Client](#mcp-client-model-context-protocol)
+12. [API Reference](#api-reference)
+
+---
+
+## Installation
+
+```bash
+npm install @open1s/jsbos
+# Or use the alias:
+npm install brainos
+```
+
+Or build from source:
+
+```bash
+cd crates/jsbos
+npm install
+npm run build
+```
+
+---
+
+## Quick Start
+
+```javascript
+import { BrainOS, ToolDef } from '@open1s/jsbos';
+
+// Create a tool definition
+const addTool = new ToolDef(
+  'add',
+  'Add two numbers',
+  (args) => (args.a || 0) + (args.b || 0),
+  { type: 'object', properties: { result: { type: 'number' } }, required: ['result'] },
+  { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }
+);
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+
+  const agent = await brain.agent('assistant')
+    .register(addTool)
+    .start();
+
+  const result = await agent.runSimple('What is 2+2?');
+  console.log(result);
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+---
+
+## Core Concepts
+
+### BrainOS (Main Entry Point)
+
+The `BrainOS` class manages the lifecycle:
+
+```javascript
+const brain = new BrainOS();
+await brain.start();
+// brain is ready to use
+const agent = brain.agent('my-agent');
+await brain.stop();
+```
+
+### Agent
+
+An `Agent` represents an LLM-powered agent that can use tools:
+
+```javascript
+const agent = brain.agent('assistant');
+const agent = brain.agent('coder', { systemPrompt: 'You are a coding assistant.' });
+```
+
+### Tool
+
+Tools are functions that the LLM can call. Use the `tool()` decorator:
+
+```javascript
+// Note: Due to JavaScript's nature, tools work slightly differently
+// See Tool Registration section for details
+```
+
+### Multimodal Content
+
+BrainOS supports multimodal content (images, audio) through the `Content`, `ContentPart`, and `Binary` classes.
+
+#### Creating Content
+
+```javascript
+import { Content, ContentPart } from '@open1s/jsbos';
+
+// Simple text content
+const textContent = Content.text('What is Python?');
+
+// Single image content
+const imageContent = Content.image('https://example.com/photo.jpg');
+
+// Audio from base64 data
+const audioContent = Content.audio(base64Data, 'mp3');
+
+// Audio from URL
+const audioUrlContent = Content.audioUrl('https://example.com/audio.mp3', 'mp3');
+
+// Multi-part content (text + image + audio)
+const multiContent = Content.parts([
+    ContentPart.text('Describe this image and audio'),
+    ContentPart.image('https://example.com/photo.jpg'),
+    ContentPart.audio(base64Data, 'mp3'),
+]);
+```
+
+#### Using Content with Agent
+
+```javascript
+// Send text
+const result = await agent.ask('What is Python?');
+
+// Send text with image
+const imageContent = Content.parts([
+    ContentPart.text('What is in this image?'),
+    ContentPart.image('https://example.com/photo.jpg'),
+]);
+const result = await agent.ask(imageContent);
+
+// Send text with audio
+const audioContent = Content.parts([
+    ContentPart.text('Transcribe this audio'),
+    ContentPart.audio(base64Data, 'wav'),
+]);
+const result = await agent.ask(audioContent);
+```
+
+#### Streaming Response
+
+Stream responses with a callback that receives structured tokens:
+
+```javascript
+const result = await agent.stream('Tell me a story', (err, token) => {
+    if (err) { console.log('Error:', err.error || err); return; }
+    if (!token) return;
+    
+    // token can be a string or structured object
+    if (typeof token === 'string') {
+        process.stdout.write(token);
+    } else if (token.type === 'Text' && token.text) {
+        process.stdout.write(token.text);
+    } else if (token.type === 'ReasoningContent' && token.text) {
+        process.stderr.write('[thinking] ' + token.text);
+    } else if (token.type === 'ToolCall') {
+        console.log('Tool:', token.name, token.args);
+    } else if (token.type === 'Done') {
+        console.log('\n[Stream complete]');
+    }
+});
+```
+
+#### ContentPart API
+
+| Method | Description |
+|--------|-------------|
+| `ContentPart.text(text)` | Create text part |
+| `ContentPart.image(url)` | Create image part (URL) |
+| `ContentPart.audio(data, format)` | Create audio part (base64) |
+| `ContentPart.audioUrl(url, format)` | Create audio part (URL) |
+| `ContentPart.binary(type, data)` | Create binary part |
+
+#### Content API
+
+| Method | Description |
+|--------|-------------|
+| `Content.text(text)` | Simple text content |
+| `Content.image(url)` | Single image (URL) |
+| `Content.audio(data, format)` | Single audio (base64) |
+| `Content.audioUrl(url, format)` | Single audio (URL) |
+| `Content.parts([...])` | Multi-part content |
+
+---
+
+## Agent API
+
+### Creating an Agent
+
+```javascript
+// Basic agent
+const agent = brain.agent('assistant');
+
+// Agent with custom config
+const agent = brain.agent('coder', {
+  systemPrompt: 'You are a helpful coding assistant.',
+  model: 'nvidia/meta/llama-3.1-8b-instruct',
+  baseUrl: 'https://integrate.api.nvidia.com/v1',
+  temperature: 0.5,
+  timeoutSecs: 180,
+});
+```
+
+### Fluent Configuration
+
+Use chainable methods to configure the agent:
+
+```javascript
+const agent = brain.agent('assistant')
+  .model('nvidia/meta/llama-3.1-8b-instruct')
+  .temperature(0.3)
+  .prompt('You are a math tutor.')
+  .timeout(300);
+
+// Add a Bash tool for shell execution
+const agentWithBash = brain.agent('assistant')
+  .bash('bash', '/path/to/workspace');  // name, workspaceRoot
+```
+
+### Running the Agent
+
+```javascript
+// Simple Q&A (no tool use)
+const result = await agent.ask('What is Python?');
+
+// Run with tool use enabled
+const result = await agent.react('Calculate 2 + 2');
+
+// Streaming response
+const result = await agent.stream('Tell me a story', (token) => {
+  process.stdout.write(token);
+});
+
+// Collect all streaming tokens into a string
+const fullResponse = await agent.streamCollect('Tell me a story');
+```
+
+### Registering Tools
+
+```javascript
+// First create a ToolDef, then register
+const toolDef = new ToolDef(
+  'add',
+  'Add two numbers',
+  (args) => args.a + args.b,
+  { a: { type: 'integer' }, b: { type: 'integer' } },
+  { type: 'object', properties: { a: { type: 'integer' }, b: { type: 'integer' } }}
+);
+
+agent.register(toolDef);
+agent.register(tool1);
+agent.register(tool2);
+```
+
+---
+
+## Hooks
+
+Hooks allow you to intercept and react to events during agent execution. Use `.hook()` in the fluent chain to register callbacks.
+
+### Using Hooks with BrainOS Agent
+
+```javascript
+import { BrainOS, HookEvent } from '@open1s/jsbos';
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+
+  // Register hooks in the fluent chain, then call .start()
+  const agent = await brain.agent('assistant')
+    .hook(HookEvent.BeforeToolCall, (err, ctx) => {
+      console.log('[BeforeToolCall]', ctx?.data?.tool_name || 'unknown');
+      return 'continue';
+    })
+    .hook(HookEvent.AfterToolCall, (err, ctx) => {
+      console.log('[AfterToolCall]', ctx?.data?.tool_name || 'unknown');
+      return 'continue';
+    })
+    .hook(HookEvent.BeforeLlmCall, (err, ctx) => {
+      console.log('[BeforeLlmCall] Starting LLM call');
+      return 'continue';
+    })
+    .hook(HookEvent.AfterLlmCall, (err, ctx) => {
+      console.log('[AfterLlmCall] LLM call completed');
+      return 'continue';
+    })
+    .hook(HookEvent.OnError, (err, ctx) => {
+      console.log('[OnError]', ctx?.data?.error || 'unknown error');
+      return 'continue';
+    })
+    .start();
+
+  const result = await agent.runSimple('What is 2+2?');
+  console.log(result);
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+### Async Hook
+
+Hooks can also be async — automatically detected and awaited:
+
+```javascript
+import { BrainOS, HookEvent } from '@open1s/jsbos';
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+
+  const asyncRateLimitHook = async (event, ctx) => {
+    await new Promise(r => setTimeout(r, 10));  // Simulate async check
+    console.log(`[Async Hook:${event}] Rate limit check passed`);
+    return 'continue';
+  };
+
+  const asyncLoggingHook = async (event, ctx) => {
+    await new Promise(r => setTimeout(r, 10));  // Simulate async logging
+    console.log(`[Async Hook:${event}] Response logged`);
+    return 'continue';
+  };
+
+  const agent = await brain.agent('assistant')
+    .with_hooks({
+      [HookEvent.BeforeLlmCall]: asyncRateLimitHook,
+      [HookEvent.AfterLlmCall]: asyncLoggingHook,
+    })
+    .start();
+
+  const result = await agent.runSimple('What is 2+2?');
+  console.log(result);
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+### Using Hooks with Raw Agent (Low-level API)
+
+```javascript
+import { Agent, HookEvent } from '@open1s/jsbos';
+
+async function main() {
+  const agent = await Agent.create({
+    name: 'assistant',
+    model: 'gpt-4',
+    apiKey: 'sk-...',
+    baseUrl: 'https://api.openai.com/v1',
+    systemPrompt: 'You are helpful.',
+    temperature: 0.7,
+    timeoutSecs: 120,
+  });
+
+  await agent.registerHook(HookEvent.BeforeToolCall, (err, ctx) => {
+    console.log('[BeforeToolCall]', ctx.data.tool_name);
+    return 'continue';
+  });
+
+  await agent.registerHook(HookEvent.AfterToolCall, (err, ctx) => {
+    console.log('[AfterToolCall]', ctx.data.tool_name);
+    return 'continue';
+  });
+
+  const result = await agent.runSimple('Hello');
+  console.log(result);
+}
+
+main().catch(console.error);
+```
+
+### Hook Events
+
+| Event | Description |
+|-------|-------------|
+| `BeforeToolCall` | Fired before a tool is called |
+| `AfterToolCall` | Fired after a tool completes |
+| `BeforeLlmCall` | Fired before LLM API call |
+| `AfterLlmCall` | Fired after LLM API call |
+| `OnMessage` | Fired for each message |
+| `OnComplete` | Fired when agent completes |
+| `OnError` | Fired when an error occurs |
+
+### Hook Decisions
+
+Return a string to control execution:
+
+| Decision | Description |
+|---------|-------------|
+| `'continue'` | Proceed normally (default) |
+| `'abort'` | Abort current operation |
+| `'error:message'` | Return an error |
+
+### Hook Context
+
+The callback receives a `HookContextData` object:
+
+```javascript
+{
+  agent_id: 'assistant',     // agent name
+  data: {                   // event-specific data
+    tool_name: 'add',      // for BeforeToolCall/AfterToolCall
+    error: 'failed',        // for OnError
+    // ...
+  }
+}
+```
+
+---
+
+## Tool Registration
+
+### Using `ToolDef` Directly
+
+Create tool definitions using the `ToolDef` class:
+
+```javascript
+import { ToolDef } from '@open1s/jsbos';
+
+// Simple function tool
+function add(args) {
+  return args.a + args.b;
+}
+
+const addTool = new ToolDef(
+  'add',                           // name
+  'Add two numbers together',       // description
+  add,                             // callback function
+  { a: { type: 'integer' }, b: { type: 'integer' } },  // parameters
+  {                                 // schema
+    type: 'object',
+    properties: {
+      a: { type: 'integer', description: 'First number' },
+      b: { type: 'integer', description: 'Second number' }
+    },
+    required: ['a', 'b']
+  }
+);
+
+// Register with agent
+agent.register(addTool);
+```
+
+### Async Tool
+
+Tools can return Promises — automatically detected and awaited:
+
+```javascript
+import { ToolDef } from '@open1s/jsbos';
+
+const fetchWeatherTool = new ToolDef(
+  'fetch_weather',
+  'Fetch weather from async API',
+  async (args) => {
+    const response = await fetch(`/api/weather?city=${args.city}`);
+    const data = await response.json();
+    return JSON.stringify(data);
+  },
+  { city: { type: 'string' } },
+  { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] }
+);
+
+// Register with agent
+agent.register(fetchWeatherTool);
+```
+
+### Tool with JSON Schema
+
+```javascript
+const weatherTool = new ToolDef(
+  'get_weather',
+  'Get weather information for a city',
+  (args) => {
+    // Simulated weather data
+    return JSON.stringify({
+      city: args.city,
+      temperature: 22,
+      unit: 'celsius',
+      condition: 'sunny'
+    });
+  },
+  { city: { type: 'string' } },  // parameters
+  {                               // schema
+    type: 'object',
+    properties: {
+      city: {
+        type: 'string',
+        description: 'City name, e.g., "Beijing", "San Francisco"'
+      }
+    },
+    required: ['city']
+  }
+);
+
+agent.register(weatherTool);
+```
+
+---
+
+## Bus Communication
+
+The Bus provides pub/sub messaging between components.
+
+### Using BusManager
+
+```javascript
+import { BusManager } from '@open1s/jsbos';
+
+const bus = await BusManager.create();
+await bus.start();
+
+// Publish
+await bus.publishText('my/topic', 'hello');
+await bus.publishJson('my/topic', { data: 123 });
+
+// Create publisher
+const pub = await bus.createPublisher('output/topic');
+await pub.publishText('message');
+
+// Create subscriber
+const sub = await bus.createSubscriber('input/topic');
+const msg = await sub.recv();
+
+await bus.stop();
+```
+
+### Subscriber Patterns
+
+```javascript
+const sub = await bus.createSubscriber('my/topic');
+
+// One-shot receive
+let msg = await sub.recv();
+msg = await sub.recvWithTimeoutMs(5000);
+
+// Get JSON
+const data = await sub.recvJsonWithTimeoutMs(5000);
+
+// Callback loop
+await sub.run((err, msg) => console.log(`Received: ${msg}`));
+
+// Async iteration
+for await (const msg of sub) {
+  console.log(msg);
+}
+```
+
+---
+
+## Query/Queryable
+
+Request-response pattern with timeout support. Uses `BusManager` factory methods.
+
+### Server Side (Queryable)
+
+```javascript
+import { BusManager } from '@open1s/jsbos';
+
+const bus = await BusManager.create();
+await bus.start();
+
+// Create and start queryable server
+const q = await bus.createQueryable('svc/upper', (text) => text.toUpperCase());
+await q.start();
+```
+
+### Client Side (Query)
+
+```javascript
+const query = await bus.createQuery('svc/upper');
+const result = await query.ask('hello');  // "HELLO"
+const result = await query.ask('hello', 5000);  // with timeout
+```
+
+### QueryClient API
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `topic` | `string` | Topic name |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `queryText(payload)` | Send text query |
+| `queryTextTimeoutMs(payload, ms)` | Send with timeout |
+
+### QueryableServer API
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `handle(handler)` | Set handler function |
+| `start()` | Start server |
+| `run(handler)` | Run with handler |
+| `runJson(handler)` | Run JSON handler |
+
+---
+
+## Caller/Callable
+
+RPC-style request-response pattern. Uses `BusManager` factory methods.
+
+### Server Side (Callable)
+
+```javascript
+import { BusManager } from '@open1s/jsbos';
+
+const bus = await BusManager.create();
+await bus.start();
+
+// Create and start callable server
+const srv = await bus.createCallable('svc/echo', (text) => `echo: ${text}`);
+await srv.start();
+```
+
+### Client Side (Caller)
+
+```javascript
+const caller = await bus.createCaller('svc/echo');
+const result = await caller.call('ping');  // "echo: ping"
+```
+
+### CallerClient API
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `callText(payload)` | Call remote service |
+
+### CallableServer API
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `isStarted` | `boolean` | Whether server is running |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `handle(handler)` | Set handler function |
+| `start()` | Start server |
+| `run(handler)` | Run with handler |
+| `runJson(handler)` | Run JSON handler |
+
+---
+
+## Configuration
+
+### Using Config Files
+
+BrainOS looks for config in:
+- `~/.bos/conf/config.toml`
+- `./conf/config.toml`
+- Environment variables
+
+Example config:
+```toml
+[global_model]
+api_key = "your-api-key"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4"
+```
+
+### Using ConfigLoader Class
+
+```javascript
+import { ConfigLoader } from '@open1s/jsbos';
+
+const loader = new ConfigLoader();
+loader.discover();
+loader.addFile('/path/to/config.toml');
+loader.addDirectory('/path/to/conf');
+loader.addInline({ key: 'value' });
+
+const config = JSON.parse(loader.loadSync());
+```
+
+### Environment Variables
+
+- `OPENAI_API_KEY` - API key for OpenAI (or `BOS_API_KEY`)
+- `LLM_BASE_URL` - Base URL for LLM API (or `BOS_BASE_URL`)
+- `LLM_MODEL` - Model name (or `BOS_MODEL`)
+
+---
+
+## MCP Client (Model Context Protocol)
+
+BrainOS supports MCP (Model Context Protocol) for connecting to external tools and services.
+
+### Using MCP Client
+
+```javascript
+import { McpClient } from '@open1s/jsbos';
+
+async function main() {
+  // Spawn an MCP server process
+  const client = await McpClient.spawn('npx', ['-y', '@modelcontextprotocol/server-filesystem', '/tmp']);
+  await client.initialize();
+
+  // List available tools
+  const tools = await client.listTools();
+  console.log('Available tools:', tools);
+
+  // Call a tool
+  const result = await client.callTool('tool_name', JSON.stringify({ arg: 'value' }));
+  console.log(result);
+
+  // List prompts
+  const prompts = await client.listPrompts();
+  console.log(prompts);
+
+  // List resources
+  const resources = await client.listResources();
+  console.log(resources);
+
+  // Read a resource
+  const resource = await client.readResource('resource://path/to/resource');
+  console.log(resource);
+}
+
+main().catch(console.error);
+```
+
+### Connect via HTTP
+
+```javascript
+import { McpClient } from '@open1s/jsbos';
+
+const client = McpClient.connectHttp('http://localhost:3000');
+await client.initialize();
+const tools = await client.listTools();
+```
+
+### MCP Client API
+
+| Method | Description |
+|--------|-------------|
+| `McpClient.spawn(command, args)` | Spawn an MCP server process |
+| `McpClient.connectHttp(url)` | Connect via HTTP URL |
+| `initialize()` | Initialize MCP connection |
+| `listTools()` | List available tools |
+| `callTool(name, argsJson)` | Call a tool with JSON string args |
+| `listPrompts()` | List available prompts |
+| `getPrompt(name, arguments)` | Fetch one prompt by name |
+| `getCapabilities()` | Server capabilities from initialization |
+| `listResources()` | List available resources |
+| `restart()` | Restart and re-initialize the connection |
+| `healthStatus()` | Connection health snapshot |
+| `readResource(uri)` | Read a resource by URI |
+
+---
+
+## Performance and Tracing
+
+### Performance Metrics
+
+```javascript
+import { BrainOS } from '@open1s/jsbos';
+
+async function main() {
+  const brain = new BrainOS({ apiKey: 'sk-...' });
+  await brain.start();
+
+  const agent = brain.agent('assistant');
+
+  // Get performance metrics
+  const metrics = agent.getPerfMetrics();
+  console.log('Metrics:', metrics);
+
+  // Reset metrics
+  agent.resetPerfMetrics();
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+### Tracing
+
+```javascript
+import { initTracing } from '@open1s/jsbos';
+
+// Initialize tracing (usually called once at app start)
+initTracing();
+
+// Log a test message
+import { logTestMessage } from '@open1s/jsbos';
+logTestMessage('Test trace message');
+```
+
+---
+
+## Memory
+
+`Memory` is an in-process, keyword-ranked store. Attach one to an agent
+and matching items are prepended to every text run.
+
+```javascript
+const { AgentBuilder, Memory } = require('brainos');
+
+const memory = new Memory();
+memory.add('The staging deploy needs VPN', { source: 'runbook' });
+
+const agent = new AgentBuilder(null).withMemory(memory, 3);
+await agent.start();
+// ask/react/stream now recall up to 3 items for the prompt.
+
+// Persist across processes as JSON lines (same format as Rust FileMemory):
+memory.save('./agent-memory.jsonl');
+const restored = Memory.load('./agent-memory.jsonl');
+```
+
+`search(query, limit, metadata)` returns the best matches, where `metadata`
+keeps only items whose keys match exactly. `all`/`remove`/`clear` manage
+the store, and a blank query returns the most recent items. A
+`new Memory(maxItems)` (or `withMaxItems(n)`) cap evicts the oldest
+items on overflow.
+
+## Plans, Goals, Jobs and Steering
+
+These controls cover the long-running parts of a session: the working plan, the
+durable goal, background processes, and mid-turn messages.
+
+### Plans
+
+The agent owns one plan store. Register the built-in `update_plan` tool so the
+model can maintain it, then render `planItems()` in your UI:
+
+```javascript
+const agent = await new AgentBuilder(null, { apiKey, baseUrl, model })
+  .planTool()
+  .start();
+
+agent.addPlanTool();               // explicit alternative to .planTool()
+agent.setPlan([{ text: 'write tests', status: 'in_progress' }]);
+console.log(agent.planItems());
+agent.clearPlan();
+```
+
+### Goals
+
+A goal outlives a turn. Seed a `GoalStore` for the current turn, register the
+`get_goal`/`update_goal` tools, and settle the store when the turn ends:
+
+```javascript
+const { Goal, GoalStore } = require('@open1s/jsbos');
+
+const goal = Goal.create('Ship the 4.1 release');
+const store = new GoalStore(goal);
+agent.addGoalTools(store);
+
+// ... run the turn ...
+
+const settle = store.takeSettle(); // null, { type: 'complete' } or { type: 'blocked', code, message }
+if (settle?.type === 'complete') goal.complete();
+```
+
+`Goal` also supports `pause`, `resume`, `advance`, `block`, `arm`, `disarm`,
+`toJSON` and `Goal.fromJSON`.
+
+### Steering
+
+`steer(content, ticket)` queues a message for the RUNNING turn's next step.
+`takeUndeliveredSteers()` returns the tickets of messages no step reached, so a
+host can put them back in its own queue.
+
+```javascript
+agent.steer('Also check the changelog.', 12);
+agent.steerDepth();                 // queued messages
+agent.takeUndeliveredSteers();      // [12] after a turn that ended early
+```
+
+### Background jobs
+
+Share one `JobRegistry` between the bash tool that spawns jobs and the job
+tools that read them. Passing `jobs` to `bash()` enables
+`run_in_background` on the shell tool.
+
+```javascript
+const { JobRegistry } = require('@open1s/jsbos');
+
+const jobs = new JobRegistry();
+const agent = await new AgentBuilder(null, { apiKey, baseUrl, model })
+  .bash('bash', process.cwd(), jobs, 'default')
+  .start();
+agent.addJobTools(jobs, 'default');
+
+for (const job of jobs.list('default')) console.log(job.id, job.status);
+const tail = jobs.output(id);
+await jobs.wait(id, 5000);
+jobs.kill(id);
+```
+
+### Deferred tools, live tools, live skills and prompt sections
+
+`deferTool(name)` / `deferToolPrefix(prefix)` keep a tool out of the advertised
+array while keeping it discoverable through `find_tool`; the reported tool is
+called directly by name on the next step.
+
+`registerSkill` / `skillsDir` change the build's own set. To add a tool or skill
+while a turn is running, use the live overlay; the running turn sees it on its
+next step and the change survives the run.
+
+```javascript
+agent.deferTool('mcp_search').deferToolPrefix('mcp_');
+agent.registerSkill('reviewer', 'Review code', 'Read the diff first.');
+agent.addLivePromptSection('Stay terse.');
+agent.listSkills();
+
+await agent.addLiveTool(new ToolDef('lookup', 'Look up a record', lookup, {}, lookupSchema));
+agent.addLiveSkill('reviewer', 'Review code', 'Read the diff first.');
+await agent.addLiveSkillsFromDir('./extra-skills');
+agent.removeLiveTools(['lookup']);
+agent.removeLiveSkillsByPaths(['./extra-skills/reviewer']);
+agent.toolDefinitions();      // full descriptions/schemas, incl. MCP/live tools
+agent.modelToolDefinitions();
+```
+
+### Prompt templates
+
+```javascript
+const { renderTemplate, withMemory, estimateTokens } = require('@open1s/jsbos');
+renderTemplate('You are {{role}}.', { role: 'a reviewer' });
+withMemory('You are a reviewer.\n\n{{memory}}', 'Remember: tea.');
+estimateTokens('one two three');
+```
+
+## Ferris Extensions
+
+Ferris is the BOS extension framework. The binding lets you implement the SDK's
+`Extension` interface in JavaScript and run it in process. A manifest is still a
+schema-2.0 `extension.toml`; the callbacks supply the same start/invoke/shutdown
+steps a Rust extension implements.
+
+```javascript
+const { FerrisHarness, FerrisManifest } = require('@open1s/jsbos');
+
+const manifest = `
+schema_version = "2.0"
+
+[extension]
+id = "com.example.echo"
+name = "Echo"
+version = "1.0.0"
+description = "Echoes its input"
+
+[compatibility]
+host = ">=3.0.0"
+extension_api = ">=1.0.0"
+
+[runtime]
+kind = "builtin"
+
+[capabilities]
+required = ["agent.tools.register"]
+
+[[contribution]]
+kind = "tool"
+id = "echo"
+`;
+
+const harness = new FerrisHarness(
+  manifest,
+  '/tmp/echo-extension',
+  async (ctx) => [{ kind: 'tool', id: 'echo', payload: { description: 'Echo' } }],
+  async (call) => call.input, // { contribution, input, context }
+);
+
+const contributions = await harness.start();
+const result = await harness.invoke('echo', { text: 'hi' });
+await harness.shutdown();
+```
+
+`FerrisManifest.parse(toml)` validates a manifest without running anything and
+exposes `id`, `runtimeKind`, `toToml()` and `toJSON()`. Callbacks may be sync or
+async. This harness runs code in the host process; for untrusted packages use
+the Ferris process/WASM runtimes through a host that enforces capabilities.
+
+A manifest can also be built without hand-writing TOML:
+
+```javascript
+const { FerrisManifestBuilder } = require('@open1s/jsbos');
+const manifest = new FerrisManifestBuilder('com.example.echo', 'Echo', '1.0.0', 'Echo')
+  .runtime('declarative')
+  .capability('agent.tools.register')
+  .contribution('tool', 'echo', { description: 'Echo' })
+  .startup('on-demand')
+  .build();
+```
+
+### Installing and running packages
+
+`FerrisHost` is the package host. It installs into a canonical store, plans in
+dependency order, activates the standard runtimes and exposes contributions.
+
+```javascript
+const { FerrisHost } = require('@open1s/jsbos');
+
+const host = new FerrisHost('/tmp/ferris-store', '/tmp/workspace');
+host.install('/path/to/package');
+host.plan();                        // dependency-first ids
+const contributions = await host.apply();
+const result = await host.invoke('com.example.echo', 'tool', 'echo', { x: 1 });
+await host.unload();
+```
+
+Hosts default to `policyMode: 'enforce'`; grant what a package needs first:
+
+```javascript
+host.grant('com.example.echo', 'process.execute', 'program:node');
+```
+
+Use `setEnabled`, `uninstall`, `versions`, `activate`, `rollback`,
+`packageRoot` and `quarantine` for lifecycle. Contributions are data;
+`registerAgentTools` registers tools on an agent, while prompts/skills/context
+remain yours to place.
+
+Host options add callbacks and event hooks:
+
+```javascript
+const host = new FerrisHost('/tmp/ferris-store', {
+  workspace: '/tmp/workspace',
+  onContributions: ({ extension, contributions }) => { /* register */ },
+  onRevoke: ({ extension, contributions }) => { /* unregister */ },
+});
+
+const subscription = host.subscribeEvents(['agent.*'], (event) => {
+  console.log(event.event_type, event.payload);
+});
+host.publishEvent('agent.started', { ok: true });
+host.unsubscribeEvents(subscription);
+```
+
+A JavaScript extension can also be registered as an in-process linked package:
+
+```javascript
+await host.registerExtension(manifestToml, '/tmp/linked', start, invoke);
+```
+
+After `apply()`, register the applied tools on an agent with
+`registerAgentTools`; each tool forwards to the owning runtime:
+
+```javascript
+const tools = await host.registerAgentTools(agent);
+```
+
+## API Reference
+
+For the complete API reference, see [JavaScript API Reference](./api-reference/jsbos-api.md).
+
+### `BrainOS`
+
+Main entry point for BrainOS.
+
+**Constructor:**
+```javascript
+new BrainOS(options = {})
+// options: { apiKey, baseUrl, model }
+```
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `start()` | Initialize BrainOS |
+| `stop()` | Shutdown BrainOS |
+| `agent(name, options)` | Create a new agent |
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `bus` | `Bus` | The underlying Bus |
+
+### `Agent`
+
+LLM-powered agent with tool support.
+
+**Constructor:**
+```javascript
+new Agent(bus, options = {})
+// options: { name, model, baseUrl, apiKey, systemPrompt, temperature, timeoutSecs }
+// Defaults: model: 'nvidia/meta/llama-3.1-8b-instruct', baseUrl: 'https://integrate.api.nvidia.com/v1'
+```
+
+**Methods:**
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `model(model)` | Set model | `AgentBuilder` |
+| `prompt(prompt)` | Set system prompt | `AgentBuilder` |
+| `temperature(temp)` | Set temperature | `AgentBuilder` |
+| `timeout(secs)` | Set timeout | `AgentBuilder` |
+| `register(toolDef)` | Register a tool | `AgentBuilder` |
+| `start()` | Initialize agent | `Promise<Agent>` |
+| `ask(question)` | Run agent | `Promise<string>` |
+| `react(task)` | Run with ReAct | `Promise<string>` |
+| `stream(task, callback)` | Stream response | `Promise<void>` |
+| `streamCollect(task)` | Collect stream tokens | `Promise<any[]>` |
+| `session` | Session manager | `SessionManager` |
+| `config` | Resolved agent configuration | `object` |
+| `toolNames` | Registered tool names | `string[]` |
+| `metrics` | Performance metrics (timings in µs) | `object` |
+| `resetMetrics()` | Reset performance metrics | `AgentBuilder` |
+| `listMcpTools()` | Tools from connected MCP servers | `Promise<any[]>` |
+| `listMcpResources(namespace)` | Resources for an MCP namespace | `Promise<any[]>` |
+| `listMcpPrompts()` | Prompts from connected MCP servers | `Promise<any[]>` |
+| `stop(options?)` | Stop the agent | `Promise<void>` |
+| `isRunning()` | Whether the agent is running | `boolean` |
+
+### Resilience Configuration
+
+The Agent supports configuring circuit breaker and rate limiter for resilience:
+
+```javascript
+import { Agent } from '@open1s/jsbos';
+
+const agent = await Agent.create({
+  name: "assistant",
+  model: "gpt-4",
+  apiKey: "sk-...",
+  // Circuit Breaker - prevents cascading failures
+  circuitBreakerMaxFailures: 5,         // failures before opening circuit
+  circuitBreakerCooldownSecs: 30,       // seconds before attempting recovery
+
+  // Rate Limiter - prevents 429 errors
+  rateLimitCapacity: 40,               // max requests per window
+  rateLimitWindowSecs: 60,             // window duration in seconds
+  rateLimitMaxRetries: 3,            // retry attempts on rate limit
+  rateLimitRetryBackoffSecs: 1,         // backoff between retries
+  rateLimitAutoWait: true,             // auto-wait when rate limited
+});
+```
+
+**Circuit Breaker Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `circuitBreakerMaxFailures` | 5 | Failures before opening circuit |
+| `circuitBreakerCooldownSecs` | 30 | Seconds before half-open state |
+
+**Rate Limiter Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `rateLimitCapacity` | 40 | Max requests per window |
+| `rateLimitWindowSecs` | 60 | Window duration in seconds |
+| `rateLimitMaxRetries` | 3 | Retry attempts on 429 errors |
+| `rateLimitRetryBackoffSecs` | 1 | Initial backoff duration |
+| `rateLimitAutoWait` | true | Auto-wait when rate limited |
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `tools` | `string[]` | Registered tool names |
+| `config` | `object` | Agent configuration |
+
+### `ToolDef`
+
+Tool definition class.
+
+**Constructor:**
+```javascript
+new ToolDef(name, description, callback, parameters, schema)
+```
+
+### `BusManager`
+
+Async context manager for Bus lifecycle.
+
+**Constructor:**
+```javascript
+new BusManager(options = {})
+// options: { mode, connect, listen, peer }
+```
+
+**Static Methods:**
+| Method | Description |
+|--------|-------------|
+| `BusManager.create(options)` | Create and start BusManager |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `start()` | Initialize bus |
+| `stop()` | Shutdown bus |
+| `publishText(topic, payload)` | Publish text message |
+| `publishJson(topic, data)` | Publish JSON message |
+| `createPublisher(topic)` | Create a publisher |
+| `createSubscriber(topic)` | Create a subscriber |
+| `createQuery(topic)` | Create a query client |
+| `createQueryable(topic, handler)` | Create a queryable server |
+| `createCaller(name)` | Create a caller client |
+| `createCallable(uri, handler)` | Create a callable server |
+
+### `PublisherWrapper`
+
+Message publisher for a specific topic.
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `topic` | `string` | Topic name |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `text(payload)` | Publish text |
+| `json(data)` | Publish JSON |
+| `publish(payload, isJson?)` | Publish with format flag |
+
+### `SubscriberWrapper`
+
+Message subscriber with receive methods.
+
+**Properties:**
+| Property | Type | Description |
+|-----------|------|-------------|
+| `topic` | `string` | Topic name |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `recv(timeoutMs?)` | Receive message (with optional timeout) |
+| `recvJson(timeoutMs?)` | Receive JSON with optional timeout |
+| `run(callback)` | Run callback loop |
+| `runJson(callback)` | Run JSON callback loop |
+
+### `QueryClient` / `QueryableServer`
+
+Request-response pattern.
+
+**QueryClient Methods:**
+| Method | Description |
+|--------|-------------|
+| `ask(payload, timeoutMs?)` | Send query (optional timeout) |
+| `askJson(payload, timeoutMs?)` | Send JSON query |
+
+**QueryableServer Methods:**
+| Method | Description |
+|--------|-------------|
+| `handle(handler)` | Set handler |
+| `start()` | Start server |
+| `run(handler)` | Run with handler |
+| `runJson(handler)` | Run JSON handler |
+
+### `CallerClient` / `CallableServer`
+
+RPC pattern.
+
+**CallerClient Methods:**
+| Method | Description |
+|--------|-------------|
+| `call(payload)` | Call remote service |
+| `callJson(payload)` | Call with JSON payload |
+
+**CallableServer Methods:**
+| Method | Description |
+|--------|-------------|
+| `handle(handler)` | Set handler |
+| `start()` | Start server |
+| `run(handler)` | Run with handler |
+| `runJson(handler)` | Run JSON handler |
+| `isStarted` | Check if running |
+
+### `ConfigLoader`
+
+Configuration loader.
+
+**Constructor:**
+```javascript
+new ConfigLoader()
+```
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `discover()` | Auto-discover config files |
+| `addFile(path)` | Add config file |
+| `addDirectory(path)` | Add config directory |
+| `addInline(data)` | Add inline config |
+| `reset()` | Reset config |
+| `loadSync()` | Load configuration |
+| `reloadSync()` | Reload configuration |
+
+### `McpClient`
+
+MCP (Model Context Protocol) client for connecting to external tools and services.
+
+**Static Factory Methods:**
+| Method | Description |
+|--------|-------------|
+| `McpClient.spawn(command, args)` | Spawn an MCP server process |
+| `McpClient.connectHttp(url)` | Connect via HTTP URL |
+
+**Methods:**
+| Method | Description |
+|--------|-------------|
+| `initialize()` | Initialize MCP connection |
+| `listTools()` | List available tools |
+| `callTool(name, argsJson)` | Call a tool with JSON string args |
+| `listPrompts()` | List available prompts |
+| `getPrompt(name, arguments)` | Fetch one prompt by name |
+| `getCapabilities()` | Server capabilities from initialization |
+| `listResources()` | List available resources |
+| `restart()` | Restart and re-initialize the connection |
+| `healthStatus()` | Connection health snapshot |
+| `readResource(uri)` | Read a resource by URI |
+
+---
+
+## Examples
+
+### Complete Example with Tools
+
+```javascript
+import { BrainOS, ToolDef } from '@open1s/jsbos';
+
+function add(args) {
+  return args.a + args.b;
+}
+
+function multiply(args) {
+  return args.a * args.b;
+}
+
+function getTime(args) {
+  return JSON.stringify({ utc: new Date().toISOString() });
+}
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+
+  const agent = brain.agent('assistant')
+    .register(new ToolDef(
+      'add', 'Add two numbers', add,
+      { a: { type: 'integer' }, b: { type: 'integer' } },
+      { type: 'object', properties: { a: { type: 'integer' }, b: { type: 'integer' } }, required: ['a', 'b'] }
+    ))
+    .register(new ToolDef(
+      'multiply', 'Multiply two numbers', multiply,
+      { a: { type: 'integer' }, b: { type: 'integer' } },
+      { type: 'object', properties: { a: { type: 'integer' }, b: { type: 'integer' } }, required: ['a', 'b'] }
+    ))
+    .register(new ToolDef(
+      'get_time', 'Get current time', getTime,
+      {}, { type: 'object', properties: {} }
+    ));
+
+  // Ask with tool use
+  const result = await agent.react('What is 5 + 3? What is 4 * 7?');
+  console.log(result);
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+### Pub/Sub Example
+
+```javascript
+import { BusManager } from '@open1s/jsbos';
+
+async function publisher() {
+  const bus = await BusManager.create();
+  await bus.start();
+  
+  await bus.publishText('events/start', 'Hello subscribers!');
+  await bus.stop();
+}
+
+async function subscriber() {
+  const bus = await BusManager.create();
+  await bus.start();
+  
+  const sub = await bus.createSubscriber('events/start');
+  const msg = await sub.recvWithTimeoutMs(5000);
+  console.log(`Received: ${msg}`);
+  
+  await bus.stop();
+}
+
+// Run both in separate processes
+```
+
+### Query/Response Example
+
+```javascript
+import { BusManager } from '@open1s/jsbos';
+
+function uppercase(text) {
+  return text.toUpperCase();
+}
+
+async function main() {
+  const bus = await BusManager.create();
+  await bus.start();
+
+  // Server
+  const q = await bus.createQueryable('svc/uppercase', uppercase);
+  await q.start();
+
+  // Client
+  const query = await bus.createQuery('svc/uppercase');
+  const result = await query.queryText('hello world');
+  console.log(result);  // "HELLO WORLD"
+
+  await bus.stop();
+}
+
+main().catch(console.error);
+```
+
+---
+
+## Hooks, Plugins, and Sessions
+
+Hooks, plugins, and session management are available through the low-level `jsbos` bindings.
+
+### Hooks (jsbos)
+
+Hooks allow you to intercept and react to events during agent execution.
+
+#### Using Hooks with Low-level API
+
+```javascript
+import { Agent, HookEvent } from '@open1s/jsbos';
+
+async function main() {
+  const agent = await Agent.create({
+    name: 'assistant',
+    model: 'gpt-4',
+    apiKey: 'sk-...',
+    baseUrl: 'https://api.openai.com/v1',
+    systemPrompt: 'You are helpful.',
+    temperature: 0.7,
+    timeoutSecs: 120,
+  });
+
+  // Register hooks using registerHook()
+  await agent.registerHook(HookEvent.BeforeToolCall, (err, ctx) => {
+    console.log('[BeforeToolCall]', ctx.data?.tool_name);
+    return 'continue';
+  });
+
+  await agent.registerHook(HookEvent.AfterToolCall, (err, ctx) => {
+    console.log('[AfterToolCall]', ctx.data?.tool_name);
+    return 'continue';
+  });
+
+  await agent.registerHook(HookEvent.BeforeLlmCall, (ctx) => {
+    console.log('[BeforeLlmCall] Starting LLM call');
+    return 'continue';
+  });
+
+  await agent.registerHook(HookEvent.AfterLlmCall, (ctx) => {
+    console.log('[AfterLlmCall] LLM call completed');
+    return 'continue';
+  });
+
+  await agent.registerHook(HookEvent.OnError, (ctx) => {
+    console.log('[OnError]', ctx.data?.error);
+    return 'continue';
+  });
+
+  const result = await agent.runSimple('Hello');
+  console.log(result);
+}
+
+main().catch(console.error);
+```
+
+#### Hook Events
+
+| Event | Description |
+|-------|-------------|
+| `BeforeToolCall` | Fired before a tool is called |
+| `AfterToolCall` | Fired after a tool completes |
+| `BeforeLlmCall` | Fired before LLM API call |
+| `AfterLlmCall` | Fired after LLM API call |
+| `OnMessage` | Fired for each message |
+| `OnComplete` | Fired when agent completes |
+| `OnError` | Fired when an error occurs |
+
+#### Hook Decisions
+
+Return a string to control execution:
+
+| Decision | Description |
+|----------|-------------|
+| `'continue'` | Proceed normally (default) |
+| `'abort'` | Abort current operation |
+| `'error:message'` | Return an error |
+
+### Plugins
+
+Plugins allow you to preprocess and postprocess LLM requests and responses.
+
+#### Using Plugins with brainos.js (High-level API)
+
+```javascript
+import { BrainOS } from '@open1s/jsbos';
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+
+  // Use .plugin() in the fluent chain
+  const agent = await brain.agent('assistant')
+    .plugin('DemoPlugin', {
+      onLlmRequest: (req) => {
+        console.log('[Plugin:on_llm_request]');
+        return req;
+      },
+      onLlmResponse: (resp) => {
+        console.log('[Plugin:on_llm_response]');
+        return resp;
+      },
+      onToolCall: (call) => {
+        console.log('[Plugin:on_tool_call]', call.name);
+        return call;
+      },
+      onToolResult: (result) => {
+        console.log('[Plugin:on_tool_result]');
+        return result;
+      }
+    })
+    .start();
+
+  const result = await agent.runSimple('Hello');
+  console.log(result);
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+#### Async Plugin
+
+Plugins can also be async — automatically detected and awaited:
+
+```javascript
+import { BrainOS } from '@open1s/jsbos';
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+
+  const asyncPlugin = {
+    name: 'AsyncEnricher',
+    onLlmRequest: async (req) => {
+      await new Promise(r => setTimeout(r, 10));  // Simulate async enrichment
+      console.log('[Async Plugin] LLM Request:', req.model);
+      req.temperature = 0.7;
+      return req;
+    },
+    onLlmResponse: async (resp) => {
+      await new Promise(r => setTimeout(r, 10));  // Simulate async analysis
+      console.log('[Async Plugin] LLM Response:', resp.response_type);
+      return resp;
+    },
+  };
+
+  const agent = await brain.agent('assistant')
+    .plugin(asyncPlugin.name, asyncPlugin)
+    .start();
+
+  const result = await agent.runSimple('Hello');
+  console.log(result);
+
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+#### Using Plugins with Low-level API (jsbos)
+
+```javascript
+import { Agent } from '@open1s/jsbos';
+
+async function main() {
+  const agent = await Agent.create({
+    name: 'assistant',
+    model: 'gpt-4',
+    apiKey: 'sk-...',
+    baseUrl: 'https://api.openai.com/v1',
+  });
+
+  // Register plugin with all 4 intercept points
+  agent.registerPlugin(
+    'DemoInterceptor',
+    (err, request) => {
+      console.log('[Plugin:on_llm_request]');
+      return JSON.stringify(request);
+    },
+    (err, response) => {
+      console.log('[Plugin:on_llm_response]');
+      return JSON.stringify(response);
+    },
+    (err, toolCall) => {
+      console.log('[Plugin:on_tool_call]', toolCall.name);
+      return JSON.stringify(toolCall);
+    },
+    (err, toolResult) => {
+      console.log('[Plugin:on_tool_result]');
+      return JSON.stringify(toolResult);
+    },
+  );
+
+  const result = await agent.runSimple('Hello');
+  console.log(result);
+}
+
+main().catch(console.error);
+```
+
+### Session Management
+
+BrainOS provides session management for persisting agent state across restarts.
+
+#### Session Operations
+
+```javascript
+import { BrainOS } from '@open1s/jsbos';
+
+async function main() {
+  const brain = new BrainOS();
+  await brain.start();
+  
+  const agent = await brain.agent('assistant')
+    .start();
+  
+  // Save the conversation, then restore it in a later run.
+  await agent.session.save('/tmp/session.json');
+  
+  // await agent.session.restore('/tmp/session.json');
+  
+  const result = await agent.runSimple('Hello');
+  console.log(result);
+  
+  await brain.stop();
+}
+
+main().catch(console.error);
+```
+
+#### Session Info Methods
+
+| Method | Description |
+|--------|-------------|
+| `addMessage(role, content)` | Append a message to the conversation |
+| `getMessages()` | Get the conversation messages (JSON array) |
+| `save(path)` | Save the conversation to a file |
+| `restore(path)` | Restore the conversation from a file |
+| `saveFull(path)` | Save the full session (messages + context) to a file |
+| `restoreFull(path)` | Restore the full session from a file |
+| `compact(keepRecent?, maxSummaryChars?)` | Summarize older messages mechanically (defaults 10 / 2000) |
+| `agent.compactNow(retainTokens?)` | Ask the model to write a checkpoint summary now |
+| `clear()` | Drop every non-system message and reset the context |
+| `export()` | Return the session snapshot as an object |
+| `exportJson()` | Return the session snapshot as a JSON string |
+| `importSession(data)` | Restore from a snapshot object or JSON string |
+| `import(data)` | Alias for `importSession` (back-compat) |
+| `context` | The session context object (null until set) |
+| `setContext(context)` | Replace the opaque session context |
+| `clearContext()` | Reset the session context to null |
+
+The started agent also exposes `agent.config` (the resolved configuration) and `agent.toolNames` (registered tool names).
+
+---
+
+## Error Handling
+
+---
+
+## Differences from Python API
+
+While the JavaScript API mirrors the Python API for consistency, there are some differences:
+
+| Feature | Python | JavaScript |
+|---------|--------|------------|
+| Tool decorator | `@tool("desc")` | `ToolDef` class |
+| Type hints | Native | JSDoc/TypeScript |
+| Context manager | `async with` | `await brain.start()/stop()` |
+| Async iteration | `async for` | `for await` |
+| Class naming | `Subscriber` | `SubscriberWrapper` |
+
+---
+
+## TypeScript Support
+
+If using TypeScript, import types from the main package:
+
+```typescript
+import { BrainOS, Agent, ToolDef } from 'brainos';
+
+const brain = new BrainOS();
+await brain.start();
+
+const agent: Agent = brain.agent('assistant');
+```
+
+The type definitions are available in `index.d.ts`.

@@ -1,0 +1,9 @@
+{
+  "name": "All-in-One Helper",
+  "description": "A read-only agent role contributed by the all-in-one demo",
+  "plugins": [
+    "files"
+  ],
+  "permission": "read_only",
+  "level": 1
+}

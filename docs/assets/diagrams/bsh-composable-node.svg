@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+<title id="title">Inside a Composable BSH Node</title>
+<desc id="desc">A conceptual architecture of one BSH node showing intent, an independent composition engine, a validated workspace capability view, agents and execution, capability providers, Ferris extensions, BOS runtime and policy enforcement.</desc>
+<defs>
+ <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#F9FBFF"/><stop offset="1" stop-color="#EEF4FC"/></linearGradient>
+ <linearGradient id="blue" x2="0" y2="1"><stop stop-color="#EAF3FF"/><stop offset="1" stop-color="#DCEBFF"/></linearGradient>
+ <linearGradient id="violet" x2="0" y2="1"><stop stop-color="#F2EEFF"/><stop offset="1" stop-color="#E6DFFF"/></linearGradient>
+ <linearGradient id="green" x2="0" y2="1"><stop stop-color="#E6FAF3"/><stop offset="1" stop-color="#D7F2E8"/></linearGradient>
+ <filter id="shadow" x="-15%" y="-15%" width="130%" height="140%"><feDropShadow dx="0" dy="6" stdDeviation="9" flood-color="#17345F" flood-opacity=".09"/></filter>
+ <style>
+ .h{font:700 40px Inter,Arial,sans-serif;fill:#142B4D}.sub{font:18px Inter,Arial,sans-serif;fill:#63758E}.section{font:700 20px Inter,Arial,sans-serif;fill:#17345F}.ct{font:700 17px Inter,Arial,sans-serif;fill:#1B385D}.body{font:15px Inter,Arial,sans-serif;fill:#60738C}.tiny{font:13px Inter,Arial,sans-serif;fill:#70829A}.white{fill:#FFF}.whiteSub{font:14px Inter,Arial,sans-serif;fill:#D7E5F5}
+ </style>
+</defs>
+<rect width="1600" height="1000" fill="url(#bg)"/>
+<text x="70" y="78" class="h">Inside a Composable BSH Node</text>
+<text x="72" y="112" class="sub">A workspace is an assembled, policy-bounded view of capabilities — not the entire node registry.</text>
+
+<!-- left intent + composition -->
+<g filter="url(#shadow)">
+ <rect x="70" y="170" width="330" height="620" rx="24" fill="#FFF" stroke="#D4E1F0" stroke-width="2"/>
+</g>
+<text x="105" y="215" class="section">Composition Control</text>
+<rect x="100" y="246" width="270" height="100" rx="16" fill="url(#violet)" stroke="#D8D0F6"/>
+<text x="235" y="283" text-anchor="middle" class="ct">Task / Workspace Intent</text><text x="235" y="310" text-anchor="middle" class="body">Goal · Role · Constraints</text>
+<rect x="100" y="374" width="270" height="160" rx="16" fill="url(#blue)" stroke="#C9DDF7"/>
+<text x="235" y="414" text-anchor="middle" class="ct">Composition Engine</text>
+<text x="235" y="446" text-anchor="middle" class="body">Discover &amp; select</text><text x="235" y="472" text-anchor="middle" class="body">Resolve dependencies</text><text x="235" y="498" text-anchor="middle" class="body">Check compatibility</text>
+<rect x="100" y="562" width="270" height="86" rx="14" fill="#FFF7E8" stroke="#F0D9A9"/>
+<text x="235" y="596" text-anchor="middle" class="ct">Runtime Validation</text><text x="235" y="622" text-anchor="middle" class="body">Policy · Grants · Resource limits</text>
+<rect x="100" y="678" width="270" height="76" rx="14" fill="#EAF0F8" stroke="#D5E0EE"/>
+<text x="235" y="711" text-anchor="middle" class="ct">Composition Manifest</text><text x="235" y="735" text-anchor="middle" class="tiny">Versioned desired capability set</text>
+
+<!-- center workspace -->
+<g filter="url(#shadow)">
+ <rect x="450" y="170" width="680" height="620" rx="24" fill="#FFF" stroke="#C8D9EC" stroke-width="2"/>
+</g>
+<rect x="450" y="170" width="680" height="76" rx="24" fill="#17345F"/>
+<rect x="450" y="220" width="680" height="26" fill="#17345F"/>
+<text x="490" y="216" class="white" font-size="24" font-weight="700">Workspace Runtime</text>
+<text x="1090" y="214" text-anchor="end" class="whiteSub">Isolated composition</text>
+<rect x="485" y="274" width="610" height="94" rx="16" fill="url(#blue)" stroke="#C9DDF7"/>
+<text x="790" y="310" text-anchor="middle" class="ct">Workspace Capability View</text>
+<text x="790" y="340" text-anchor="middle" class="body">Only selected, compatible and authorized capabilities are visible</text>
+<rect x="485" y="392" width="290" height="130" rx="16" fill="#F7F9FC" stroke="#DCE5EF"/>
+<text x="630" y="430" text-anchor="middle" class="ct">Agent Runtime</text><text x="630" y="460" text-anchor="middle" class="body">Planner / ReAct</text><text x="630" y="486" text-anchor="middle" class="tiny">Sessions · Context · Delegation</text>
+<rect x="795" y="392" width="300" height="130" rx="16" fill="url(#green)" stroke="#BDE8D8"/>
+<text x="945" y="430" text-anchor="middle" class="ct">Execution Dispatcher</text><text x="945" y="460" text-anchor="middle" class="body">Provider selection</text><text x="945" y="486" text-anchor="middle" class="tiny">Local · Process · WASM · Remote</text>
+<rect x="485" y="548" width="610" height="92" rx="15" fill="#F5F2FF" stroke="#DCD4FA"/>
+<text x="790" y="584" text-anchor="middle" class="ct">Workspace Context &amp; Resources</text><text x="790" y="612" text-anchor="middle" class="body">Project context · Memory · Files · Services · Resource grants</text>
+<rect x="485" y="666" width="610" height="88" rx="15" fill="#FFF7E8" stroke="#F0D9A9"/>
+<text x="790" y="700" text-anchor="middle" class="ct">Policy Enforcement &amp; Audit</text><text x="790" y="728" text-anchor="middle" class="body">Authorization · Limits · Cancellation · Traceable decisions</text>
+
+<!-- right providers -->
+<g filter="url(#shadow)">
+ <rect x="1180" y="170" width="350" height="620" rx="24" fill="#FFF" stroke="#D4E1F0" stroke-width="2"/>
+</g>
+<text x="1215" y="215" class="section">Capability Providers</text>
+<rect x="1210" y="246" width="290" height="76" rx="14" fill="#F7F9FC" stroke="#DCE5EF"/>
+<text x="1355" y="277" text-anchor="middle" class="ct">Built-in &amp; Native</text><text x="1355" y="301" text-anchor="middle" class="tiny">Rust tools · BOS services</text>
+<rect x="1210" y="338" width="290" height="76" rx="14" fill="#F7F9FC" stroke="#DCE5EF"/>
+<text x="1355" y="369" text-anchor="middle" class="ct">Ferris Extensions</text><text x="1355" y="393" text-anchor="middle" class="tiny">Declarative · Process · WASM · Extism</text>
+<rect x="1210" y="430" width="290" height="76" rx="14" fill="#F7F9FC" stroke="#DCE5EF"/>
+<text x="1355" y="461" text-anchor="middle" class="ct">Protocol Adapters</text><text x="1355" y="485" text-anchor="middle" class="tiny">MCP · External APIs</text>
+<rect x="1210" y="522" width="290" height="76" rx="14" fill="#F7F9FC" stroke="#DCE5EF"/>
+<text x="1355" y="553" text-anchor="middle" class="ct">Remote Capabilities</text><text x="1355" y="577" text-anchor="middle" class="tiny">Federated peer nodes</text>
+<rect x="1210" y="626" width="290" height="128" rx="14" fill="url(#green)" stroke="#BDE8D8"/>
+<text x="1355" y="662" text-anchor="middle" class="ct">Provider Contract</text><text x="1355" y="691" text-anchor="middle" class="body">Describe · Validate · Invoke</text><text x="1355" y="718" text-anchor="middle" class="tiny">Uniform capability semantics</text>
+
+<!-- connectors -->
+<g fill="none" stroke="#829BB9" stroke-width="3" stroke-linecap="round">
+ <path d="M370 296 H420 V420 H450"/><path d="M370 454 H410 V320 H450"/><path d="M370 716 H430 V710 H450"/>
+ <path d="M1130 450 H1180"/><path d="M1095 320 H1150 V284 H1210"/><path d="M1095 580 H1150 V560 H1210"/>
+</g>
+<g fill="#829BB9"><path d="M441 441 L450 420 L459 441Z"/><path d="M1170 441 L1180 450 L1170 459Z"/></g>
+
+<!-- bottom principle -->
+<rect x="70" y="835" width="1460" height="100" rx="20" fill="#17345F"/>
+<text x="115" y="878" class="white" font-size="21" font-weight="700">AI proposes. The Composition Engine resolves. Runtime policy decides. Providers execute.</text>
+<text x="115" y="908" class="whiteSub">Composition is independent of agent reasoning; execution is mediated by explicit capability contracts and grants.</text>
+</svg>

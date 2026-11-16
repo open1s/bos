@@ -1,0 +1,2542 @@
+import * as jsbos from './jsbos.js';
+import { randomUUID } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
+
+const {
+  Bus,
+  Agent,
+  ConfigLoader,
+  Query,
+  Queryable,
+  Caller,
+  Callable,
+  Publisher,
+  Subscriber,
+  McpClient,
+  version,
+  initTracing,
+  logTestMessage,
+  HookEvent,
+  HookDecision,
+  HookRegistry,
+  Goal,
+  GoalStore,
+  JobRegistry,
+  NativeFerrisHarness,
+  FerrisManifest,
+  FerrisManifestBuilder,
+  NativeFerrisHost,
+  renderTemplate,
+  withMemory,
+  estimateTokens,
+} = jsbos;
+
+const DEFAULT_MODEL = 'nvidia/meta/llama-3.1-8b-instruct';
+const DEFAULT_BASE_URL = 'https://integrate.api.nvidia.com/v1';
+
+class ToolDef {
+  constructor(name, description, callback, parameters = {}, schema = {}, cancelCallback = null, metadata = null) {
+    if (typeof schema === 'function') {
+      metadata = cancelCallback;
+      cancelCallback = schema;
+      schema = {};
+    }
+    this.name = name;
+    this.description = description;
+    this.callback = callback;
+    this.parameters = parameters;
+    this.schema = schema;
+    this.cancelCallback = cancelCallback;
+    this.metadata = metadata;
+  }
+}
+
+class ToolResult {
+  constructor(success, data = null, error = null, metadata = {}) {
+    this.success = success;
+    this.data = data;
+    this.error = error;
+    this.metadata = metadata;
+  }
+
+  static success(data, metadata = {}) {
+    return new ToolResult(true, data, null, { timestamp: Date.now(), ...metadata });
+  }
+
+  static error(message, metadata = {}) {
+    return new ToolResult(false, null, message, { timestamp: Date.now(), ...metadata });
+  }
+
+  static fromResult(result) {
+    return result.success
+      ? ToolResult.success(result.data, result.metadata)
+      : ToolResult.error(result.error, result.metadata);
+  }
+}
+
+class Binary {
+  constructor(contentType, source, name = null) {
+    this.contentType = contentType;
+    this.source = source; // { type: 'url' | 'base64', data: string }
+    this.name = name;
+  }
+
+  static fromBase64(contentType, data, name = null) {
+    return new Binary(contentType, { type: 'base64', data }, name);
+  }
+
+  static fromUrl(contentType, url, name = null) {
+    return new Binary(contentType, { type: 'url', data: url }, name);
+  }
+
+  isImage() {
+    return this.contentType.startsWith('image/');
+  }
+
+  isAudio() {
+    return this.contentType.startsWith('audio/');
+  }
+
+  url() {
+    if (this.source.type === 'url') return this.source.data;
+    return `data:${this.contentType};base64,${this.source.data}`;
+  }
+
+  toJSON() {
+    const source = {};
+    if (this.source.type === 'url') {
+      source.url = this.source.data;
+    } else {
+      source.base64 = this.source.data;
+    }
+    const obj = { content_type: this.contentType, source };
+    if (this.name) obj.name = this.name;
+    return obj;
+  }
+}
+
+class ContentPart {
+  constructor(type, data = {}) {
+    this.type = type;
+    if (type === 'text') {
+      this.text = data.text || '';
+    } else if (type === 'binary') {
+      this.binary = data.binary instanceof Binary
+        ? data.binary
+        : new Binary(data.binary?.contentType || data.contentType || 'application/octet-stream',
+            data.binary?.source || { type: 'base64', data: data.binary?.source?.data || data.data || '' },
+            data.binary?.name || data.name);
+    }
+  }
+
+  static text(text) {
+    return new ContentPart('text', { text });
+  }
+
+  static binary(contentType, data, name = null) {
+    return new ContentPart('binary', { binary: Binary.fromBase64(contentType, data, name) });
+  }
+
+  static binaryUrl(contentType, url, name = null) {
+    return new ContentPart('binary', { binary: Binary.fromUrl(contentType, url, name) });
+  }
+
+  static image(url, name = null) {
+    return ContentPart.binaryUrl('image/jpeg', url, name);
+  }
+
+  static audio(data, format = 'mp3') {
+    return ContentPart.binary('audio/' + format, data);
+  }
+
+  static audioUrl(url, format = 'mp3') {
+    return ContentPart.binaryUrl('audio/' + format, url);
+  }
+
+  toJSON() {
+    const obj = { type: this.type };
+    if (this.type === 'text' && this.text !== undefined) obj.text = this.text;
+    if (this.type === 'binary' && this.binary) obj.binary = this.binary.toJSON();
+    return obj;
+  }
+}
+
+class Content {
+  constructor(parts = null, text = null) {
+    this._parts = parts;
+    this._text = text;
+  }
+
+  static text(text) {
+    return new Content(null, text);
+  }
+
+  static parts(parts) {
+    return new Content(parts);
+  }
+
+  static image(url, name = null) {
+    return Content.parts([ContentPart.binaryUrl('image/jpeg', url, name)]);
+  }
+
+  static audio(data, format = 'mp3') {
+    return Content.parts([ContentPart.binary('audio/' + format, data)]);
+  }
+
+  static audioUrl(url, format = 'mp3') {
+    return Content.parts([ContentPart.binaryUrl('audio/' + format, url)]);
+  }
+
+  toJSON() {
+    if (this._text !== null && this._text !== undefined) {
+      return { type: 'text', text: this._text };
+    }
+    if (this._parts !== null) {
+      return this._parts.map(p => p.toJSON ? p.toJSON() : p);
+    }
+    return '';
+  }
+
+  toString() {
+    return JSON.stringify(this.toJSON());
+  }
+
+  isMultimodal() {
+    return this._parts !== null && this._parts.length > 0;
+  }
+}
+
+const ToolCategory = Object.freeze({
+  FILE: 'file',
+  SHELL: 'shell',
+  SEARCH: 'search',
+  NETWORK: 'network',
+  CUSTOM: 'custom',
+});
+
+class BaseTool {
+  constructor(metadata) {
+    this.metadata = {
+      name: '',
+      description: '',
+      category: ToolCategory.CUSTOM,
+      dangerous: false,
+      parameters: {},
+      schema: {},
+      ...metadata,
+    };
+  }
+
+  async execute(args) {
+    throw new Error('execute() must be implemented by subclass');
+  }
+
+  validate(args) {
+    return args != null;
+  }
+
+  success(data, metadata = {}) {
+    return ToolResult.success(data, { toolName: this.metadata.name, ...metadata });
+  }
+
+  failure(error, metadata = {}) {
+    return ToolResult.error(error, { toolName: this.metadata.name, ...metadata });
+  }
+
+  toToolDef() {
+    return new ToolDef(
+      this.metadata.name,
+      this.metadata.description,
+      (args) => this.execute(args),
+      this.metadata.parameters,
+      this.metadata.schema
+    );
+  }
+
+  static fromFunction(fn, name, description, schema = {}) {
+    return new FunctionTool(fn, name, description, schema);
+  }
+}
+
+class FunctionTool extends BaseTool {
+  constructor(fn, name, description, schema = {}) {
+    super({ name, description, schema });
+    this._fn = fn;
+  }
+
+  async execute(args) {
+    try {
+      const result = await this._fn(args);
+      return this.success(result);
+    } catch (error) {
+      return this.failure(error.message || String(error));
+    }
+  }
+}
+
+class ToolRegistry {
+  constructor(tools = []) {
+    this._tools = new Map();
+    for (const tool of tools) {
+      this.add(tool);
+    }
+  }
+
+  add(tool) {
+    if (tool instanceof BaseTool) {
+      this._tools.set(tool.metadata.name, tool);
+    } else if (tool instanceof ToolDef) {
+      this._tools.set(tool.name, tool);
+    } else if (typeof tool === 'function') {
+      const t = BaseTool.fromFunction(tool, tool.name || 'anonymous', tool.description || '');
+      this._tools.set(t.metadata.name, t);
+    } else if (typeof tool === 'object' && tool !== null) {
+      if (tool.name && tool.description && typeof tool.callback === 'function') {
+        this._tools.set(tool.name, new ToolDef(tool.name, tool.description, tool.callback, tool.parameters || {}, tool.schema || {}));
+      } else {
+        const extracted = extractTools(tool);
+        if (extracted.length === 0) {
+          console.warn('ToolRegistry.add: Object has no valid tool definitions or decorated methods.', tool);
+        }
+        for (const t of extracted) {
+          this._tools.set(t.name, t);
+        }
+      }
+    } else {
+      throw new Error('Tool must be BaseTool, ToolDef, function, plain object, or decorated class instance');
+    }
+    return this;
+  }
+
+  register(tool) {
+    return this.add(tool);
+  }
+
+  remove(name) {
+    this._tools.delete(name);
+    return this;
+  }
+
+  unregister(name) {
+    return this.remove(name);
+  }
+
+  get(name) {
+    return this._tools.get(name);
+  }
+
+  has(name) {
+    return this._tools.has(name);
+  }
+
+  list() {
+    return Array.from(this._tools.keys());
+  }
+
+  listTools() {
+    return Array.from(this._tools.values());
+  }
+
+  listToolDefs() {
+    const results = [];
+    for (const tool of this._tools.values()) {
+      if (tool instanceof BaseTool) {
+        results.push(tool.toToolDef());
+      } else {
+        results.push(tool);
+      }
+    }
+    return results;
+  }
+
+  listByCategory(category) {
+    return this.listTools().filter(t => t instanceof BaseTool && t.metadata.category === category);
+  }
+
+  filter(predicate) {
+    const filtered = this.listTools().filter(predicate);
+    return new ToolRegistry(filtered);
+  }
+
+  merge(other) {
+    for (const tool of other.listTools()) {
+      this.add(tool);
+    }
+    return this;
+  }
+
+  size() {
+    return this._tools.size;
+  }
+
+  clear() {
+    this._tools.clear();
+    return this;
+  }
+
+  toJSON() {
+    return this.list().map(name => {
+      const tool = this._tools.get(name);
+      return tool instanceof BaseTool ? tool.metadata : tool;
+    });
+  }
+}
+
+function tool(descriptionOrOptions, maybeOptions = {}) {
+  const options = typeof descriptionOrOptions === 'string'
+    ? { description: descriptionOrOptions, ...maybeOptions }
+    : descriptionOrOptions || {};
+  const { description = '', schema = {}, name: customName } = options;
+
+  return function (target, propertyKey, descriptor) {
+    const originalMethod = descriptor.value;
+    const toolName = customName || propertyKey;
+    const paramSchema = schema.properties || {};
+    const required = schema.required || Object.keys(paramSchema);
+
+    const wrapper = function (args) {
+      const params = {};
+      for (const [key, spec] of Object.entries(paramSchema)) {
+        params[key] = args[key] !== undefined ? args[key] : (spec.default ?? undefined);
+      }
+      return originalMethod.call(this, params);
+    };
+
+    const fullSchema = {
+      type: 'object',
+      properties: paramSchema,
+      required
+    };
+
+    const toolDef = new ToolDef(toolName, description, wrapper, fullSchema, fullSchema);
+    descriptor.value.toolDef = toolDef;
+    descriptor.value.toolName = toolName;
+    return descriptor;
+  };
+}
+
+function createToolClass(classDefinition) {
+  for (const name of Object.getOwnPropertyNames(classDefinition.prototype)) {
+    const method = classDefinition.prototype[name];
+    if (name === 'constructor' || typeof method !== 'function') continue;
+    if (method.toolDef) {
+      const td = method.toolDef;
+      classDefinition.prototype[name] = function(...args) {
+        return method.call(this, ...args);
+      };
+      classDefinition.prototype[name].toolDef = td;
+      classDefinition.prototype[name].toolName = td.name;
+    }
+  }
+  return classDefinition;
+}
+
+function extractTools(instance) {
+  const tools = [];
+  const proto = Object.getPrototypeOf(instance);
+  const props = new Set([...Object.getOwnPropertyNames(proto || {}), ...Object.getOwnPropertyNames(instance)]);
+
+  for (const name of props) {
+    const method = instance[name];
+    if (name === 'constructor' || typeof method !== 'function') continue;
+    if (method.toolDef) {
+      const td = method.toolDef;
+      const boundWrapper = (args) => td.callback.call(instance, args);
+      tools.push(new ToolDef(td.name, td.description, boundWrapper, td.parameters, td.schema));
+    }
+  }
+  return tools;
+}
+
+function defineTool(name, description) {
+  const paramSchemaBuilder = (paramSchema) => {
+    const callbackBuilder = (callback) => {
+      const properties = {};
+      const required = [];
+
+      for (const [key, spec] of Object.entries(paramSchema)) {
+        if (typeof spec === 'object' && spec !== null) {
+          properties[key] = { ...spec };
+          if (spec.required) required.push(key);
+        } else {
+          properties[key] = { type: 'number', default: spec };
+        }
+      }
+
+      const schema = {
+        type: 'object',
+        properties,
+        required: required.length > 0 ? required : Object.keys(properties)
+      };
+
+      return new ToolDef(name, description, callback, schema, schema);
+    };
+
+    callbackBuilder.returns = (returnSchema) => {
+      const callbackBuilderWithReturns = (callback) => {
+        const properties = {};
+        const required = [];
+
+        for (const [key, spec] of Object.entries(paramSchema)) {
+          if (typeof spec === 'object' && spec !== null) {
+            properties[key] = { ...spec };
+            if (spec.required) required.push(key);
+          } else {
+            properties[key] = { type: 'number', default: spec };
+          }
+        }
+
+        const paramSchemaDef = {
+          type: 'object',
+          properties,
+          required: required.length > 0 ? required : Object.keys(properties)
+        };
+
+        const returnProperties = {};
+        for (const [key, spec] of Object.entries(returnSchema)) {
+          if (typeof spec === 'object' && spec !== null) {
+            returnProperties[key] = { ...spec };
+          } else {
+            returnProperties[key] = { type: 'number', default: spec };
+          }
+        }
+        const returnSchemaDef = {
+          type: 'object',
+          properties: returnProperties
+        };
+
+        return new ToolDef(name, description, callback, paramSchemaDef, returnSchemaDef);
+      };
+      return callbackBuilderWithReturns;
+    };
+
+    return callbackBuilder;
+  };
+
+  return paramSchemaBuilder;
+}
+
+function defineTools(toolDefs) {
+  const result = {};
+  for (const [name, def] of Object.entries(toolDefs)) {
+    const { description, params, returns, fn } = def;
+    const toolDef = defineTool(name, description)(params)(fn || (() => {}));
+    result[name] = toolDef;
+  }
+  return result;
+}
+
+const createTool = defineTool;
+
+class SessionManager {
+  constructor(inner) {
+    this._inner = inner;
+  }
+
+  async save(path) {
+    await this._inner.saveMessageLog(path);
+    return this;
+  }
+
+  async restore(path) {
+    await this._inner.restoreMessageLog(path);
+    return this;
+  }
+
+  async saveFull(path) {
+    await this._inner.saveSession(path);
+    return this;
+  }
+
+  async restoreFull(path) {
+    await this._inner.restoreSessionFromFile(path);
+    return this;
+  }
+
+  compact(keepRecent = 10, maxSummaryChars = 2000) {
+    this._inner.compactSession(keepRecent, maxSummaryChars);
+    return this;
+  }
+
+  clear() {
+    // Drops every non-system message and resets the context.
+    this._inner.clearSession();
+    return this;
+  }
+
+  getMessages() {
+    return this._inner.getMessages();
+  }
+
+  addMessage(role, content) {
+    this._inner.addMessage({ role, content });
+    return this;
+  }
+
+  export() {
+    return JSON.parse(this._inner.getSessionJson());
+  }
+
+  exportJson() {
+    return this._inner.getSessionJson();
+  }
+
+  importSession(data) {
+    const json = typeof data === 'string' ? data : JSON.stringify(data);
+    this._inner.restoreSessionJson(json);
+    return this;
+  }
+
+  // Retained for backwards compatibility; accepts an object or a JSON string.
+  import(data) {
+    return this.importSession(data);
+  }
+
+  get context() {
+    return this._inner.sessionContext()
+  }
+
+  setContext(context) {
+    this._inner.setSessionContext(context)
+    return this
+  }
+
+  clearContext() {
+    this._inner.clearSessionContext()
+    return this
+  }
+}
+
+class AgentBuilder {
+  constructor(bus, options = {}) {
+    this._bus = bus;
+    this._inner = null;
+    this._tools = new ToolRegistry();
+    this._hooks = [];
+    this._plugins = [];
+    this._skills = [];
+    this._mcpServers = [];
+    this._memory = options.memory || null;
+    this._recallLimit = options.memoryRecallLimit || 5;
+    this._memoryMetadata = options.memoryMetadata || null;
+    this._autoRemember = options.autoRemember || false;
+    this._deferredTools = [];
+    this._deferredPrefixes = [];
+    this._planTool = false;
+    this._promptSections = [];
+    this._config = {
+      name: options.name || 'assistant',
+      model: options.model || DEFAULT_MODEL,
+      baseUrl: options.baseUrl || DEFAULT_BASE_URL,
+      apiKey: options.apiKey || '',
+      systemPrompt: options.systemPrompt || 'You are a helpful assistant.',
+      temperature: options.temperature ?? 0.7,
+      timeoutSecs: options.timeoutSecs || 120,
+      // 0 is a real budget (no retries), so this must not use `||`.
+      maxRetries: options.maxRetries ?? 3,
+      maxTokens: options.maxTokens,
+      maxSteps: options.maxSteps,
+      apiMode: options.apiMode || 'chat',
+      reasoningEffort: options.reasoningEffort,
+      personaComplete: options.personaComplete,
+      compactionInputTokens: options.compactionInputTokens,
+      toolOutputCap: options.toolOutputCap,
+      parallelToolCalls: options.parallelToolCalls,
+      webSearch: options.webSearch,
+      contextBudget: options.contextBudget,
+      skillCatalogue: options.skillCatalogue,
+      fallbacks: options.fallbacks ? [...options.fallbacks] : [],
+    };
+  }
+
+  name(name) {
+    this._config.name = name;
+    return this;
+  }
+
+  withConfig(config) {
+    if (config.name) this._config.name = config.name;
+    if (config.model) this._config.model = config.model;
+    if (config.baseUrl) this._config.baseUrl = config.baseUrl;
+    if (config.apiKey) this._config.apiKey = config.apiKey;
+    if (config.systemPrompt) this._config.systemPrompt = config.systemPrompt;
+    if (config.temperature !== undefined) this._config.temperature = config.temperature;
+    if (config.timeoutSecs) this._config.timeoutSecs = config.timeoutSecs;
+    if (config.maxRetries !== undefined) this._config.maxRetries = config.maxRetries;
+    if (config.maxTokens) this._config.maxTokens = config.maxTokens;
+    if (config.apiMode) this._config.apiMode = config.apiMode;
+    if (config.reasoningEffort) this._config.reasoningEffort = config.reasoningEffort;
+    if (config.maxSteps !== undefined) this._config.maxSteps = config.maxSteps;
+    if (config.personaComplete !== undefined) this._config.personaComplete = config.personaComplete;
+    if (config.compactionInputTokens !== undefined) {
+      this._config.compactionInputTokens = config.compactionInputTokens;
+    }
+    if (config.toolOutputCap !== undefined) this._config.toolOutputCap = config.toolOutputCap;
+    if (config.parallelToolCalls !== undefined) {
+      this._config.parallelToolCalls = config.parallelToolCalls;
+    }
+    if (config.webSearch !== undefined) this._config.webSearch = config.webSearch;
+    if (config.contextBudget !== undefined) this._config.contextBudget = config.contextBudget;
+    if (config.skillCatalogue !== undefined) this._config.skillCatalogue = config.skillCatalogue;
+    if (Array.isArray(config.fallbacks)) this._config.fallbacks = [...config.fallbacks];
+    if (config.circuitBreaker) {
+      this._config.circuitBreakerMaxFailures = config.circuitBreaker.maxFailures;
+      this._config.circuitBreakerCooldownSecs = config.circuitBreaker.cooldownSecs;
+    }
+    if (config.rateLimit) {
+      this._config.rateLimitCapacity = config.rateLimit.capacity;
+      this._config.rateLimitWindowSecs = config.rateLimit.windowSecs;
+      this._config.rateLimitMaxRetries = config.rateLimit.maxRetries;
+    }
+    return this;
+  }
+
+  model(model) {
+    this._config.model = model;
+    return this;
+  }
+
+  baseUrl(url) {
+    this._config.baseUrl = url;
+    return this;
+  }
+
+  apiKey(key) {
+    this._config.apiKey = key;
+    return this;
+  }
+
+  system(prompt) {
+    this._config.systemPrompt = prompt;
+    return this;
+  }
+
+  prompt(prompt) {
+    return this.system(prompt);
+  }
+
+  temperature(temp) {
+    this._config.temperature = temp;
+    return this;
+  }
+
+  timeout(secs) {
+    this._config.timeoutSecs = secs;
+    return this;
+  }
+
+  maxRetries(retries) {
+    this._config.maxRetries = retries;
+    return this;
+  }
+
+  maxTokens(tokens) {
+    this._config.maxTokens = tokens;
+    return this;
+  }
+
+  apiMode(mode) {
+    this._config.apiMode = mode;
+    return this;
+  }
+
+  reasoningEffort(effort) {
+    this._config.reasoningEffort = effort;
+    return this;
+  }
+
+  maxSteps(steps) {
+    this._config.maxSteps = steps;
+    return this;
+  }
+
+  personaComplete(complete = true) {
+    this._config.personaComplete = complete;
+    return this;
+  }
+
+  compactionInputTokens(tokens) {
+    this._config.compactionInputTokens = tokens;
+    return this;
+  }
+
+  toolOutputCap(bytes) {
+    this._config.toolOutputCap = bytes;
+    return this;
+  }
+
+  parallelToolCalls(enabled = true) {
+    this._config.parallelToolCalls = enabled;
+    return this;
+  }
+
+  webSearch(enabled = true) {
+    this._config.webSearch = enabled;
+    return this;
+  }
+
+  contextBudget(tokens) {
+    if (tokens === undefined) {
+      return this._inner ? this._inner.contextBudget() : this._config.contextBudget ?? 0;
+    }
+    this._config.contextBudget = tokens;
+    if (this._inner) this._inner.setContextBudget(tokens);
+    return this;
+  }
+
+  setContextBudget(tokens) {
+    return this.contextBudget(tokens);
+  }
+
+  skillCatalogue(enabled) {
+    if (enabled === undefined) {
+      return this._inner ? this._inner.skillCatalogue() : !!this._config.skillCatalogue;
+    }
+    this._config.skillCatalogue = enabled;
+    if (this._inner) this._inner.setSkillCatalogue(enabled);
+    return this;
+  }
+
+  setSkillCatalogue(enabled = true) {
+    return this.skillCatalogue(enabled);
+  }
+
+  fallback(baseUrl, model, apiKey = '') {
+    this._config.fallbacks = [...(this._config.fallbacks || []), { baseUrl, model, apiKey }];
+    return this;
+  }
+
+  deferTool(name) {
+    if (this._inner) {
+      this._inner.deferTool(name);
+    } else {
+      this._deferredTools.push(name);
+    }
+    return this;
+  }
+
+  deferToolPrefix(prefix) {
+    if (this._inner) {
+      this._inner.deferToolPrefix(prefix);
+    } else {
+      this._deferredPrefixes.push(prefix);
+    }
+    return this;
+  }
+
+  isDeferredTool(name) {
+    if (this._inner) return this._inner.isDeferredTool(name);
+    return this._deferredTools.includes(name)
+      || this._deferredPrefixes.some((prefix) => name.startsWith(prefix));
+  }
+
+  hasDeferredTools() {
+    if (this._inner) return this._inner.hasDeferredTools();
+    return this._deferredTools.length > 0 || this._deferredPrefixes.length > 0;
+  }
+
+  planTool(enabled = true) {
+    this._planTool = enabled;
+    return this;
+  }
+
+  withMemory(memory, limit = 5, metadata = null, autoRemember = false) {
+    this._memory = memory;
+    this._recallLimit = limit;
+    this._memoryMetadata = metadata;
+    this._autoRemember = autoRemember;
+    return this;
+  }
+
+  remember(content, metadata = null) {
+    if (!this._memory) throw new Error('no memory store is attached');
+    return this._memory.add(content, metadata);
+  }
+
+  forget(id) {
+    return this._memory ? this._memory.remove(id) : false;
+  }
+
+  forgetAll() {
+    if (!this._memory) return false;
+    const hadItems = !this._memory.isEmpty();
+    this._memory.clear();
+    return hadItems;
+  }
+
+  recall(query, limit = 5) {
+    if (!this._memory) return [];
+    return this._memory.search(query, limit, this._memoryMetadata);
+  }
+
+  recalledContext(query, limit = 5) {
+    if (!this._memory) return null;
+    const block = this._memory.recallBlock(query, limit, this._memoryMetadata);
+    return block || null;
+  }
+
+  tools(...tools) {
+    for (const t of tools) {
+      if (t instanceof ToolRegistry) {
+        this._tools.merge(t);
+      } else {
+        this._tools.add(t);
+      }
+    }
+    return this;
+  }
+
+  register(...tools) {
+    return this.tools(...tools);
+  }
+
+  withTools(...tools) {
+    return this.tools(...tools);
+  }
+
+  bash(name = 'bash', workspaceRoot = null, jobs = null, session = null) {
+    this._config._bashTool = { name, workspaceRoot, jobs, session };
+    return this;
+  }
+
+  circuitBreaker(maxFailures, cooldownSecs = 30) {
+    this._config.circuitBreakerMaxFailures = maxFailures;
+    this._config.circuitBreakerCooldownSecs = cooldownSecs;
+    return this;
+  }
+
+  rateLimit(capacity, windowSecs = 60, maxRetries = 3) {
+    this._config.rateLimitCapacity = capacity;
+    this._config.rateLimitWindowSecs = windowSecs;
+    this._config.rateLimitMaxRetries = maxRetries;
+    return this;
+  }
+
+  resilience(config) {
+    if (config.circuitBreaker) {
+      this.circuitBreaker(config.circuitBreaker.maxFailures, config.circuitBreaker.cooldownSecs);
+    }
+    if (config.rateLimit) {
+      this.rateLimit(config.rateLimit.capacity, config.rateLimit.windowSecs, config.rateLimit.maxRetries);
+    }
+    return this;
+  }
+
+  hook(event, callback) {
+    this._hooks.push({ event, callback });
+    return this;
+  }
+
+  hooks(hooks) {
+    for (const [event, callback] of Object.entries(hooks)) {
+      this._hooks.push({ event, callback });
+    }
+    return this;
+  }
+
+  plugin(nameOrObj, handlers = {}) {
+    if (typeof nameOrObj === 'object') {
+      this._plugins.push(nameOrObj);
+    } else {
+      this._plugins.push({ name: nameOrObj, ...handlers });
+    }
+    return this;
+  }
+
+  plugins(...plugins) {
+    for (const plugin of plugins) this.plugin(plugin);
+    return this;
+  }
+
+  skill(name, content, description = name, path = null) {
+    this._skills.push({ name, content, description, path });
+    return this;
+  }
+
+  skillsDir(dirPath) {
+    this._skills.push({ dirPath });
+    return this;
+  }
+
+  mcp(namespace, command, args) {
+    this._mcpServers.push({ namespace, command, args, type: 'process' });
+    return this;
+  }
+
+  mcpHttp(namespace, url) {
+    this._mcpServers.push({ namespace, url, type: 'http' });
+    return this;
+  }
+
+  async start() {
+    this._inner = await jsbos.Agent.create(this._config);
+
+    for (const td of this._tools.listToolDefs()) {
+      const callbackWrapper = async (err, args) => {
+        const result = await td.callback(args);
+        return result;
+      };
+      const cancelWrapper = td.cancelCallback
+        ? (err, callId) => {
+            td.cancelCallback(callId);
+          }
+        : null;
+      await this._inner.addTool(
+        td.name,
+        td.description,
+        JSON.stringify(td.parameters),
+        JSON.stringify(td.schema),
+        callbackWrapper,
+        !!td.cancelCallback,
+        cancelWrapper,
+        td.metadata ? JSON.stringify(td.metadata) : null,
+      );
+    }
+
+    if (this._config._bashTool) {
+      await this._inner.addBashTool(
+        this._config._bashTool.name,
+        this._config._bashTool.workspaceRoot ?? null,
+        this._config._bashTool.jobs ?? null,
+        this._config._bashTool.session ?? null,
+      );
+    }
+
+    for (const h of this._hooks) {
+      this._inner.registerHook(h.event, h.callback);
+    }
+
+    for (const p of this._plugins) {
+      this._inner.registerPlugin(
+        p.name,
+        p.on_llm_request || p.onLlmRequest || p.onRequest,
+        p.on_llm_response || p.onLlmResponse || p.onResponse,
+        p.on_tool_call || p.onToolCall,
+        p.on_tool_result || p.onToolResult,
+        p.on_stream_token || p.onStreamToken,
+        p.on_turn_start || p.onTurnStart,
+        p.on_turn_end || p.onTurnEnd,
+      );
+    }
+
+    for (const s of this._skills) {
+      if (s.dirPath) {
+        await this._inner.registerSkillsFromDir(s.dirPath);
+      } else {
+        this._inner.registerSkill(
+          s.name,
+          s.description || s.name,
+          s.content,
+          s.path ?? null,
+        );
+      }
+    }
+
+    for (const name of this._deferredTools) {
+      this._inner.deferTool(name);
+    }
+    for (const prefix of this._deferredPrefixes) {
+      this._inner.deferToolPrefix(prefix);
+    }
+    if (this._planTool) {
+      this._inner.addPlanTool();
+    }
+    for (const section of this._promptSections) {
+      this._inner.addLivePromptSection(section);
+    }
+
+    for (const m of this._mcpServers) {
+      if (m.type === 'process') {
+        await this._inner.addMcpServer(m.namespace, m.command, m.args);
+      } else {
+        await this._inner.addMcpServerHttp(m.namespace, m.url);
+      }
+    }
+
+    return this;
+  }
+
+  _contentPartsToJsContentArray(input) {
+    if (input instanceof Content) {
+      if (input._text !== null && input._text !== undefined) {
+        return [{ type: 'text', text: input._text }];
+      }
+      const parts = input.toJSON();
+      if (!Array.isArray(parts)) return [{ type: 'text', text: typeof parts === 'string' ? parts : JSON.stringify(parts) }];
+      return parts.map(p => {
+        if (p.type === 'text') {
+          return { type: 'text', text: p.text || '' };
+        }
+        const b = p.binary || {};
+        const source = b.source || {};
+        const result = { type: 'binary', contentType: b.content_type || 'image/jpeg', name: b.name };
+        if (source.url !== undefined) result.url = source.url;
+        else if (source.base64 !== undefined) result.base64 = source.base64;
+        else if (source.type === 'url') result.url = source.data;
+        else if (source.type === 'base64') result.base64 = source.data;
+        return result;
+      });
+    }
+    if (typeof input === 'string') {
+      return [{ type: 'text', text: input }];
+    }
+    return input;
+  }
+
+  _resolveContent(input) {
+    return this._contentPartsToJsContentArray(input);
+  }
+
+  _withMemory(prompt, content) {
+    if (!this._memory || typeof prompt !== 'string') return content;
+    const block = this._memory.recallBlock(
+      prompt,
+      this._recallLimit,
+      this._memoryMetadata,
+    );
+    if (!block) return content;
+    if (Array.isArray(content) && content.length > 0 && content[0].type === 'text') {
+      return [{ ...content[0], text: block + '\n\n' + content[0].text }, ...content.slice(1)];
+    }
+    return content;
+  }
+
+  _rememberExchange(prompt, reply) {
+    if (!this._autoRemember || !this._memory) return;
+    if (typeof prompt !== 'string' || !prompt.trim()) return;
+    if (typeof reply !== 'string' || !reply.trim()) return;
+    this._memory.add(
+      'User: ' + prompt.trim() + '\nAssistant: ' + reply.trim().slice(0, 4000),
+    );
+  }
+
+  async ask(prompt) {
+    if (!this._inner) await this.start();
+    const content = this._resolveContent(prompt);
+    const reply = await this._inner.runSimple(this._withMemory(prompt, content));
+    this._rememberExchange(prompt, reply);
+    return reply;
+  }
+
+  async chat(message) {
+    return this.ask(message);
+  }
+
+  async runSimple(prompt) {
+    return this.ask(prompt);
+  }
+
+  async react(task) {
+    if (!this._inner) await this.start();
+    const content = this._resolveContent(task);
+    const reply = await this._inner.react(this._withMemory(task, content));
+    this._rememberExchange(task, reply);
+    return reply;
+  }
+
+  async stream(task, onToken) {
+    if (!this._inner) await this.start();
+    const content = this._resolveContent(task);
+    return this._inner.stream(this._withMemory(task, content), (err, token) => {
+      onToken(err, token);
+    });
+  }
+
+  async streamCollect(task) {
+    const tokens = [];
+    try {
+      await new Promise((resolve, reject) => {
+        this.stream(task, (err, token) => {
+          if (err) { reject(typeof err === 'string' ? new Error(err) : err); return; }
+          if (!token) return;
+          tokens.push(token);
+          if (token.type === 'Done' || token.type === 'Error' || token.type === 'Stopped') {
+            if (token.type === 'Error') reject(new Error(token.error));
+            else resolve();
+          }
+        });
+      });
+    } catch {
+      // Return whatever was collected before the error
+    }
+    return tokens;
+  }
+
+  stop(options = {}) {
+    if (!this._inner) throw new Error('Agent not started');
+    const result = this._inner.stop(options);
+    return typeof result === 'string' ? JSON.parse(result) : result;
+  }
+
+  isRunning() {
+    if (!this._inner) return false;
+    return this._inner.isRunning();
+  }
+
+  close() {
+    if (!this._inner) throw new Error('Agent not started');
+    this._inner.close();
+    return this;
+  }
+
+  async compactNow(retainTokens = 0) {
+    if (!this._inner) throw new Error('Agent not started');
+    return this._inner.compactNow(retainTokens);
+  }
+
+  get session() {
+    if (!this._inner) throw new Error('Agent not started');
+    return new SessionManager(this._inner);
+  }
+
+  get config() {
+    return this._inner ? this._inner.config() : { ...this._config };
+  }
+
+  get toolNames() {
+    return this._inner ? this._inner.listTools() : this._tools.list();
+  }
+
+  get metrics() {
+    return this._inner ? this._inner.getPerfMetrics() : null;
+  }
+
+  resetMetrics() {
+    if (this._inner) this._inner.resetPerfMetrics();
+    return this;
+  }
+
+  async listMcpTools() {
+    return this._inner.listMcpTools();
+  }
+
+  async listMcpResources(namespace) {
+    return this._inner.listMcpResources(namespace);
+  }
+
+  async listMcpPrompts() {
+    return this._inner.listMcpPrompts();
+  }
+
+  _requireAgent(action) {
+    if (!this._inner) throw new Error(`Agent not started; call start() before ${action}`);
+    return this._inner;
+  }
+
+  planItems() {
+    return this._requireAgent('planItems()').planItems();
+  }
+
+  setPlan(items) {
+    this._requireAgent('setPlan()').setPlan(items);
+    return this;
+  }
+
+  clearPlan() {
+    this._requireAgent('clearPlan()').clearPlan();
+    return this;
+  }
+
+  addPlanTool() {
+    if (!this._inner) {
+      this._planTool = true;
+      return true;
+    }
+    return this._inner.addPlanTool();
+  }
+
+  steer(content, ticket) {
+    return this._requireAgent('steer()').steer(content, ticket);
+  }
+
+  steerDepth() {
+    return this._requireAgent('steerDepth()').steerDepth();
+  }
+
+  takeUndeliveredSteers() {
+    return this._requireAgent('takeUndeliveredSteers()').takeUndeliveredSteers();
+  }
+
+  removeTools(names) {
+    return this._requireAgent('removeTools()').removeTools(names);
+  }
+
+  async addLiveTool(toolDef) {
+    const inner = this._requireAgent('addLiveTool()');
+    const td = toolDef instanceof ToolDef ? toolDef : new ToolDef(
+      toolDef.name,
+      toolDef.description,
+      toolDef.callback,
+      toolDef.parameters || {},
+      toolDef.schema || {},
+      toolDef.cancelCallback || null,
+      toolDef.metadata || null,
+    );
+    const callbackWrapper = async (err, args) => {
+      if (err) throw err;
+      return td.callback(args);
+    };
+    const cancelWrapper = td.cancelCallback
+      ? (err, callId) => {
+          td.cancelCallback(callId);
+        }
+      : null;
+    await inner.addLiveTool(
+      td.name,
+      td.description,
+      JSON.stringify(td.parameters),
+      JSON.stringify(td.schema),
+      callbackWrapper,
+      !!td.cancelCallback,
+      cancelWrapper,
+      td.metadata ? JSON.stringify(td.metadata) : null,
+    );
+    this._tools.add(td);
+    return this;
+  }
+
+  removeLiveTools(names) {
+    return this._requireAgent('removeLiveTools()').removeLiveTools(names);
+  }
+
+  toolDefinitions() {
+    return this._requireAgent('toolDefinitions()').toolDefinitions();
+  }
+
+  modelToolDefinitions() {
+    return this._requireAgent('modelToolDefinitions()').modelToolDefinitions();
+  }
+
+  addLivePromptSection(section) {
+    if (this._inner) {
+      this._inner.addLivePromptSection(section);
+    } else {
+      this._promptSections.push(section);
+    }
+    return this;
+  }
+
+  removeLivePromptSection(section) {
+    if (this._inner) return this._inner.removeLivePromptSection(section);
+    const before = this._promptSections.length;
+    this._promptSections = this._promptSections.filter((entry) => entry !== section);
+    return this._promptSections.length !== before;
+  }
+
+  registerSkill(name, description, content, path = null) {
+    if (this._inner) {
+      this._inner.registerSkill(name, description, content, path);
+    } else {
+      this._skills.push({ name, description, content, path });
+    }
+    return this;
+  }
+
+  addLiveSkill(name, description, content, path = null) {
+    this._requireAgent('addLiveSkill()').addLiveSkill(name, description, content, path);
+    return this;
+  }
+
+  addLiveSkillsFromDir(dirPath) {
+    return this._requireAgent('addLiveSkillsFromDir()').addLiveSkillsFromDir(dirPath);
+  }
+
+  removeLiveSkillsByPaths(paths) {
+    return this._requireAgent('removeLiveSkillsByPaths()').removeLiveSkillsByPaths(paths);
+  }
+
+  liveSkills() {
+    return this._requireAgent('liveSkills()').liveSkills();
+  }
+
+  removeSkillsByNames(names) {
+    if (this._inner) return this._inner.removeSkillsByNames(names);
+    const before = this._skills.length;
+    this._skills = this._skills.filter((skill) => !names.includes(skill.name));
+    return before - this._skills.length;
+  }
+
+  listSkills() {
+    if (this._inner) return this._inner.listSkills();
+    return this._skills
+      .filter((skill) => !skill.dirPath)
+      .map((skill) => ({
+        name: skill.name,
+        description: skill.description || skill.name,
+        category: 'other',
+        path: skill.path || `.bos/skills/${skill.name}/SKILL.md`,
+        directory: skill.path || `.bos/skills/${skill.name}`,
+        user_only: false,
+        instructions: skill.content,
+      }));
+  }
+
+  addGoalTools(store) {
+    return this._requireAgent('addGoalTools()').addGoalTools(store);
+  }
+
+  addJobTools(jobs, session = 'default') {
+    return this._requireAgent('addJobTools()').addJobTools(jobs, session);
+  }
+
+  async addBashTool(name = 'bash', workspaceRoot = null, jobs = null, session = null) {
+    await this._requireAgent('addBashTool()').addBashTool(name, workspaceRoot, jobs, session);
+    return this;
+  }
+
+}
+
+class AgentWrapperClass {
+  constructor(inner, tools) {
+    this._inner = inner;
+    this._tools = tools;
+  }
+
+  _resolveContent(input) {
+    if (input instanceof Content) {
+      if (input._text !== null && input._text !== undefined) {
+        return [{ type: 'text', text: input._text }];
+      }
+      const parts = input.toJSON();
+      if (!Array.isArray(parts)) return [{ type: 'text', text: typeof parts === 'string' ? parts : JSON.stringify(parts) }];
+      return parts.map(p => {
+        if (p.type === 'text') {
+          return { type: 'text', text: p.text || '' };
+        }
+        const b = p.binary || {};
+        const source = b.source || {};
+        const result = { type: 'binary', contentType: b.content_type || 'image/jpeg', name: b.name };
+        if (source.url !== undefined) result.url = source.url;
+        else if (source.base64 !== undefined) result.base64 = source.base64;
+        else if (source.type === 'url') result.url = source.data;
+        else if (source.type === 'base64') result.base64 = source.data;
+        return result;
+      });
+    }
+    if (typeof input === 'string') {
+      return [{ type: 'text', text: input }];
+    }
+    return input;
+  }
+
+  async ask(prompt) {
+    const content = this._resolveContent(prompt);
+    return this._inner.runSimple(content);
+  }
+
+  async react(task) {
+    const content = this._resolveContent(task);
+    return this._inner.react(content);
+  }
+
+  stop(options = {}) {
+    const result = this._inner.stop(options);
+    return typeof result === 'string' ? JSON.parse(result) : result;
+  }
+
+  isRunning() {
+    return this._inner.isRunning();
+  }
+
+  stream(task, onToken) {
+    const content = this._resolveContent(task);
+    return this._inner.stream(content, (err, token) => {
+      if (err) {
+        onToken({ type: 'Error', error: err.message || String(err) });
+      } else {
+        onToken(token);
+      }
+    });
+  }
+
+  async streamCollect(task) {
+    const tokens = [];
+    try {
+      await new Promise((resolve, reject) => {
+        this.stream(task, (err, token) => {
+          if (err) { reject(typeof err === 'string' ? new Error(err) : err); return; }
+          if (!token) return;
+          tokens.push(token);
+          if (token.type === 'Done' || token.type === 'Error' || token.type === 'Stopped') {
+            if (token.type === 'Error') reject(new Error(token.error));
+            else resolve();
+          }
+        });
+      });
+    } catch {
+      // Return whatever was collected before the error
+    }
+    return tokens;
+  }
+
+  get session() {
+    return new SessionManager(this._inner);
+  }
+
+  get tools() {
+    return this._inner.listTools();
+  }
+
+  get config() {
+    return this._inner.config();
+  }
+
+  get inner() {
+    return this._inner;
+  }
+
+  async listMcpTools() {
+    return this._inner.listMcpTools();
+  }
+
+  async listMcpResources(namespace) {
+    return this._inner.listMcpResources(namespace);
+  }
+
+  async listMcpPrompts() {
+    return this._inner.listMcpPrompts();
+  }
+
+  get metrics() {
+    return this._inner.getPerfMetrics();
+  }
+
+  resetMetrics() {
+    this._inner.resetPerfMetrics();
+  }
+
+  planItems() {
+    return this._inner.planItems();
+  }
+
+  setPlan(items) {
+    this._inner.setPlan(items);
+    return this;
+  }
+
+  clearPlan() {
+    this._inner.clearPlan();
+    return this;
+  }
+
+  addPlanTool() {
+    return this._inner.addPlanTool();
+  }
+
+  steer(content, ticket) {
+    return this._inner.steer(content, ticket);
+  }
+
+  steerDepth() {
+    return this._inner.steerDepth();
+  }
+
+  takeUndeliveredSteers() {
+    return this._inner.takeUndeliveredSteers();
+  }
+
+  deferTool(name) {
+    this._inner.deferTool(name);
+    return this;
+  }
+
+  deferToolPrefix(prefix) {
+    this._inner.deferToolPrefix(prefix);
+    return this;
+  }
+
+  isDeferredTool(name) {
+    return this._inner.isDeferredTool(name);
+  }
+
+  hasDeferredTools() {
+    return this._inner.hasDeferredTools();
+  }
+
+  removeTools(names) {
+    return this._inner.removeTools(names);
+  }
+
+  addLivePromptSection(section) {
+    this._inner.addLivePromptSection(section);
+    return this;
+  }
+
+  removeLivePromptSection(section) {
+    return this._inner.removeLivePromptSection(section);
+  }
+
+  registerSkill(name, description, content, path = null) {
+    this._inner.registerSkill(name, description, content, path);
+    return this;
+  }
+
+  removeSkillsByNames(names) {
+    return this._inner.removeSkillsByNames(names);
+  }
+
+  listSkills() {
+    return this._inner.listSkills();
+  }
+
+  contextBudget() {
+    return this._inner.contextBudget();
+  }
+
+  setContextBudget(tokens) {
+    this._inner.setContextBudget(tokens);
+    return this;
+  }
+
+  skillCatalogue() {
+    return this._inner.skillCatalogue();
+  }
+
+  setSkillCatalogue(enabled) {
+    this._inner.setSkillCatalogue(enabled);
+    return this;
+  }
+
+  addGoalTools(store) {
+    return this._inner.addGoalTools(store);
+  }
+
+  addJobTools(jobs, session = 'default') {
+    return this._inner.addJobTools(jobs, session);
+  }
+
+  async addBashTool(name = 'bash', workspaceRoot = null, jobs = null, session = null) {
+    await this._inner.addBashTool(name, workspaceRoot, jobs, session);
+    return this;
+  }
+
+}
+
+class BusManager {
+  constructor(options = {}) {
+    this._mode = options.mode || 'peer';
+    this._connect = options.connect;
+    this._listen = options.listen;
+    this._peer = options.peer;
+    this._bus = null;
+  }
+
+  static async create(options = {}) {
+    const manager = new BusManager(options);
+    return manager.start();
+  }
+
+  async start() {
+    this._bus = await Bus.create({
+      mode: this._mode,
+      connect: this._connect,
+      listen: this._listen,
+      peer: this._peer,
+    });
+    return this;
+  }
+
+  async stop() {
+    if (this._bus) {
+      await this._bus.close();
+      this._bus = null;
+    }
+  }
+
+  mode(mode) {
+    this._mode = mode;
+    return this;
+  }
+
+  connect(addresses) {
+    this._connect = addresses;
+    return this;
+  }
+
+  listen(addresses) {
+    this._listen = addresses;
+    return this;
+  }
+
+  peer(id) {
+    this._peer = id;
+    return this;
+  }
+
+  async publish(topic, payload, isJson = false) {
+    if (!this._bus) throw new Error('Bus not started');
+    return isJson
+      ? this._bus.publishJson(topic, payload)
+      : this._bus.publishText(topic, payload);
+  }
+
+  async publisher(topic) {
+    if (!this._bus) throw new Error('Bus not started');
+    return new PublisherWrapper(await this._bus.createPublisher(topic));
+  }
+
+  async subscriber(topic) {
+    if (!this._bus) throw new Error('Bus not started');
+    return new SubscriberWrapper(await this._bus.createSubscriber(topic));
+  }
+
+  async query(topic) {
+    if (!this._bus) throw new Error('Bus not started');
+    return new QueryClient(await this._bus.createQuery(topic));
+  }
+
+  async queryable(topic, handler) {
+    if (!this._bus) throw new Error('Bus not started');
+    const q = await this._bus.createQueryable(topic);
+    if (handler) q.setHandler(handler);
+    return new QueryableServer(q);
+  }
+
+  async caller(name) {
+    if (!this._bus) throw new Error('Bus not started');
+    return new CallerClient(await this._bus.createCaller(name));
+  }
+
+  async callable(uri, handler) {
+    if (!this._bus) throw new Error('Bus not started');
+    const c = await this._bus.createCallable(uri);
+    if (handler) c.setHandler(handler);
+    return new CallableServer(c);
+  }
+
+  get bus() {
+    if (!this._bus) throw new Error('Bus not started');
+    return this._bus;
+  }
+
+  get sessionId() {
+    if (!this._bus) throw new Error('Bus not started');
+    return this._bus.sessionId();
+  }
+}
+
+class PublisherWrapper {
+  constructor(inner) {
+    this._inner = inner;
+  }
+
+  get topic() {
+    return this._inner.topic;
+  }
+
+  async publish(payload, isJson = false) {
+    return isJson
+      ? this._inner.publishJson(payload)
+      : this._inner.publishText(payload);
+  }
+
+  /** @deprecated Use publishText. */
+  async text(payload) {
+    return this._inner.publishText(payload);
+  }
+
+  /** @deprecated Use publishJson. */
+  async json(data) {
+    return this._inner.publishJson(data);
+  }
+
+  async publishText(payload) {
+    return this._inner.publishText(payload);
+  }
+
+  async publishJson(data) {
+    return this._inner.publishJson(data);
+  }
+}
+
+class SubscriberWrapper {
+  constructor(inner) {
+    this._inner = inner;
+  }
+
+  get topic() {
+    return this._inner.topic;
+  }
+
+  async recv(timeoutMs) {
+    return timeoutMs
+      ? this._inner.recvWithTimeoutMs(timeoutMs)
+      : this._inner.recv();
+  }
+
+  async recvJson(timeoutMs) {
+    if (timeoutMs) {
+      return this._inner.recvJsonWithTimeoutMs(timeoutMs);
+    }
+    // The native subscriber exposes recvJsonWithTimeoutMs but no plain
+    // recvJson, so decode a normal receive here instead of calling undefined.
+    const raw = await this._inner.recv();
+    if (typeof raw !== "string") return raw;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }
+
+  async run(callback) {
+    return this._inner.run(callback);
+  }
+
+  async runJson(callback) {
+    return this._inner.runJson(callback);
+  }
+
+  [Symbol.asyncIterator]() {
+    return this;
+  }
+
+  async next() {
+    const msg = await this.recv();
+    return msg === null ? { done: true } : { done: false, value: msg };
+  }
+}
+
+class QueryClient {
+  constructor(inner) {
+    this._inner = inner;
+  }
+
+  get topic() {
+    return this._inner.topic;
+  }
+
+  async ask(payload, timeoutMs) {
+    return timeoutMs
+      ? this._inner.queryTextTimeoutMs(payload, timeoutMs)
+      : this._inner.queryText(payload);
+  }
+
+  async askJson(payload, timeoutMs) {
+    const response = await this.ask(JSON.stringify(payload), timeoutMs);
+    try {
+      return JSON.parse(response);
+    } catch {
+      return response;
+    }
+  }
+}
+
+class QueryableServer {
+  constructor(inner) {
+    this._inner = inner;
+  }
+
+  handle(handler) {
+    this._inner.setHandler(handler);
+    return this;
+  }
+
+  async start() {
+    await this._inner.start();
+    return this;
+  }
+
+  async run(handler) {
+    await this._inner.run(handler);
+  }
+
+  async runJson(handler) {
+    await this._inner.runJson(handler);
+  }
+}
+
+class CallerClient {
+  constructor(inner) {
+    this._inner = inner;
+  }
+
+  async call(payload) {
+    return this._inner.callText(payload);
+  }
+
+  async callJson(payload) {
+    const response = await this._inner.callText(JSON.stringify(payload));
+    try {
+      return JSON.parse(response);
+    } catch {
+      return response;
+    }
+  }
+}
+
+class CallableServer {
+  constructor(inner) {
+    this._inner = inner;
+  }
+
+  handle(handler) {
+    this._inner.setHandler(handler);
+    return this;
+  }
+
+  get isStarted() {
+    return this._inner.isStarted();
+  }
+
+  async start() {
+    await this._inner.start();
+    return this;
+  }
+
+  async run(handler) {
+    await this._inner.run(handler);
+  }
+
+  async runJson(handler) {
+    await this._inner.runJson(handler);
+  }
+}
+
+class Config {
+  constructor(options = {}) {
+    this._loader = new ConfigLoader();
+    this._loaded = false;
+    this._config = null;
+    this._options = options;
+  }
+
+  static load(options = {}) {
+    return new Config(options).discover().load();
+  }
+
+  static fromFile(path) {
+    const config = new Config();
+    config._loader.addFile(path);
+    return config.load();
+  }
+
+  static fromDirectory(path) {
+    const config = new Config();
+    config._loader.addDirectory(path);
+    return config.load();
+  }
+
+  static fromInline(data) {
+    const config = new Config();
+    config._loader.addInline(data);
+    return config.load();
+  }
+
+  file(path) {
+    this._loader.addFile(path);
+    return this;
+  }
+
+  directory(path) {
+    this._loader.addDirectory(path);
+    return this;
+  }
+
+  inline(data) {
+    this._loader.addInline(data);
+    return this;
+  }
+
+  discover() {
+    this._loader.discover();
+    return this;
+  }
+
+  reset() {
+    this._loader.reset();
+    this._loaded = false;
+    this._config = null;
+    return this;
+  }
+
+  load() {
+    try {
+      this._config = JSON.parse(this._loader.loadSync());
+      this._loaded = true;
+    } catch (e) {
+      this._config = {};
+      this._loaded = true;
+    }
+    return this;
+  }
+
+  reload() {
+    this._loader.reloadSync();
+    return this.load();
+  }
+
+  get(key, defaultValue = null) {
+    if (!this._loaded) this.load();
+    const keys = key.split('.');
+    let value = this._config;
+    for (const k of keys) {
+      if (value && typeof value === 'object' && k in value) {
+        value = value[k];
+      } else {
+        return defaultValue;
+      }
+    }
+    return value;
+  }
+
+  get globalModel() {
+    return this.get('global_model', {});
+  }
+
+  get model() {
+    return this.get('global_model.model', 'nvidia/meta/llama-3.1-8b-instruct');
+  }
+
+  get baseUrl() {
+    return this.get('global_model.base_url', 'https://integrate.api.nvidia.com/v1');
+  }
+
+  get apiKey() {
+    return this.get('global_model.api_key', '');
+  }
+
+  get bus() {
+    return this.get('bus', {});
+  }
+
+  toJSON() {
+    return this._config || {};
+  }
+
+  isLoaded() {
+    return this._loaded;
+  }
+}
+
+function normalizeEndpoints(endpoints) {
+  if (!endpoints) return endpoints;
+  if (!Array.isArray(endpoints)) return endpoints;
+  return endpoints.map(ep => {
+    if (typeof ep !== 'string') return ep;
+    return ep.replace(/^(\w+):\/\//, '$1/');
+  });
+}
+
+class BrainOS {
+  constructor(options = {}) {
+    this._options = options;
+    this._bus = null;
+    this._registry = new ToolRegistry();
+    this._started = false;
+    this._config = null;
+  }
+
+  async start() {
+    const config = Config.load();
+    const gm = config.globalModel;
+
+    // Explicit option beats the standard environment variable, which beats the
+    // discovered config file. The empty-string default keeps agent construction
+    // working on machines with no BOS config at all.
+    this._apiKey = this._options.apiKey || process.env.OPENAI_API_KEY || gm.api_key || '';
+    this._baseUrl = this._options.baseUrl || gm.base_url || DEFAULT_BASE_URL;
+    this._model = this._options.model || gm.model || DEFAULT_MODEL;
+    this._config = config;
+
+    const busOptions = {
+      mode: this._options.busMode || this._options.mode || 'peer',
+      connect: normalizeEndpoints(this._options.busConnect || this._options.connect),
+      listen: normalizeEndpoints(this._options.busListen || this._options.listen),
+      peer: this._options.busPeer || this._options.peer,
+    };
+    this._bus = await BusManager.create(busOptions);
+    this._started = true;
+    return this;
+  }
+
+  async stop() {
+    if (this._bus) {
+      await this._bus.stop();
+      this._bus = null;
+    }
+    this._started = false;
+  }
+
+  get isStarted() {
+    return this._started;
+  }
+
+  agent(name = 'assistant', options = {}) {
+    if (!this._started) {
+      throw new Error('BrainOS not started. Call start() first.');
+    }
+    return new AgentBuilder(this._bus.bus, {
+      name,
+      model: options.model || this._model,
+      baseUrl: options.baseUrl || this._baseUrl,
+      apiKey: options.apiKey || this._apiKey,
+      systemPrompt: options.systemPrompt || 'You are a helpful assistant.',
+      temperature: options.temperature ?? 0.7,
+      timeoutSecs: options.timeoutSecs || 120,
+      maxRetries: options.maxRetries ?? 3,
+      apiMode: options.apiMode || 'chat',
+      reasoningEffort: options.reasoningEffort,
+    }).tools(this._registry);
+  }
+
+  get bus() {
+    if (!this._started) throw new Error('BrainOS not started');
+    return this._bus;
+  }
+
+  get config() {
+    return this._config;
+  }
+
+  get registry() {
+    return this._registry;
+  }
+
+  registerGlobal(...tools) {
+    for (const t of tools) {
+      this._registry.add(t);
+    }
+    return this;
+  }
+
+  tools(...tools) {
+    return this.registerGlobal(...tools);
+  }
+
+  async createBus(options = {}) {
+    return BusManager.create(options);
+  }
+
+  static async create(options = {}) {
+    const instance = new BrainOS(options);
+    await instance.start();
+    return instance;
+  }
+}
+
+// Lexical long-term memory. Mirrors agent::memory::InMemoryMemory: text is
+// tokenized into lowercase alphanumeric runs, an item scores one point per
+// query token it contains, and ties break toward the more recently added item.
+function memoryTokens(text) {
+  return String(text)
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+}
+
+function memoryEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (a && b && typeof a === 'object') {
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    if (Array.isArray(a)) {
+      return a.length === b.length && a.every((v, i) => memoryEqual(v, b[i]));
+    }
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length
+      && keys.every((key) => key in b && memoryEqual(a[key], b[key]));
+  }
+  return false;
+}
+
+function memoryMatches(item, metadata) {
+  if (!metadata) return true;
+  if (item.metadata === null || typeof item.metadata !== 'object') return false;
+  return Object.entries(metadata).every(
+    ([key, value]) => key in item.metadata && memoryEqual(item.metadata[key], value),
+  );
+}
+
+class Memory {
+  constructor(maxItems = null) {
+    this._items = [];
+    this._maxItems = maxItems;
+  }
+
+  withMaxItems(maxItems) {
+    this._maxItems = maxItems;
+    return this;
+  }
+
+  get maxItems() {
+    return this._maxItems;
+  }
+
+  add(content, metadata = null) {
+    const item = {
+      id: randomUUID(),
+      content: String(content),
+      metadata: metadata ?? null,
+      created_at_ms: Date.now(),
+    };
+    this._items.push(item);
+    if (this._maxItems !== null && this._items.length > this._maxItems) {
+      this._items.splice(0, this._items.length - this._maxItems);
+    }
+    return { ...item };
+  }
+
+  all() {
+    return this._items.map((item) => ({ ...item }));
+  }
+
+  search(query, limit = 5, metadata = null) {
+    const candidates = this._items.filter((item) => memoryMatches(item, metadata));
+    if (limit <= 0) return [];
+    const tokens = memoryTokens(query);
+    if (tokens.length === 0) {
+      return [...candidates].reverse().slice(0, limit).map((item) => ({ ...item }));
+    }
+    const scored = [];
+    for (const item of candidates) {
+      const contentTokens = new Set(memoryTokens(item.content));
+      let score = 0;
+      for (const token of tokens) if (contentTokens.has(token)) score += 1;
+      if (score > 0) scored.push({ score, item });
+    }
+    scored.sort(
+      (a, b) => b.score - a.score || b.item.created_at_ms - a.item.created_at_ms,
+    );
+    return scored.slice(0, limit).map(({ item }) => ({ ...item }));
+  }
+
+  remove(id) {
+    const before = this._items.length;
+    this._items = this._items.filter((item) => item.id !== id);
+    return this._items.length !== before;
+  }
+
+  clear() {
+    this._items = [];
+  }
+
+  save(path) {
+    const body = this._items.map((item) => JSON.stringify(item)).join('\n')
+      + (this._items.length > 0 ? '\n' : '');
+    writeFileSync(path, body, 'utf8');
+    return this._items.length;
+  }
+
+  static load(path) {
+    const memory = new Memory();
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed) memory._items.push(JSON.parse(trimmed));
+    }
+    return memory;
+  }
+
+  len() {
+    return this._items.length;
+  }
+
+  isEmpty() {
+    return this._items.length === 0;
+  }
+
+  recallBlock(query, limit = 5, metadata = null) {
+    const hits = this.search(query, limit, metadata);
+    if (hits.length === 0) return '';
+    return 'Relevant memory:' + hits.map((hit) => '\n- ' + hit.content).join('');
+  }
+
+  toJSON() {
+    return this.all();
+  }
+}
+
+// FerrisHarness adapts the native callback convention. NAPI's threadsafe
+// functions deliver (error, payload); the wrapper presents the SDK-shaped
+// single-argument callbacks documented for JavaScript.
+class FerrisHarness {
+  constructor(manifest, root, start, invoke, shutdown = null) {
+    this._inner = new NativeFerrisHarness(
+      manifest,
+      root,
+      (err, ctx) => {
+        if (err) throw err;
+        return start(ctx);
+      },
+      (err, call) => {
+        if (err) throw err;
+        return invoke(call);
+      },
+      shutdown
+        ? (err) => {
+            if (err) throw err;
+            return shutdown();
+          }
+        : null,
+    );
+  }
+
+  start() {
+    return this._inner.start();
+  }
+
+  invoke(id, input) {
+    return this._inner.invoke(id, input);
+  }
+
+  invokeContribution(kind, id, input) {
+    return this._inner.invokeContribution(kind, id, input);
+  }
+
+  shutdown() {
+    return this._inner.shutdown();
+  }
+
+  manifest() {
+    return this._inner.manifest();
+  }
+
+  get runtimeKind() {
+    return this._inner.runtimeKind;
+  }
+
+  get root() {
+    return this._inner.root;
+  }
+}
+
+// FerrisHost adapts NAPI's (error, payload) callback convention and presents
+// the SDK-shaped single-argument/host-options API documented for JavaScript.
+class FerrisHost {
+  constructor(root, options = {}) {
+    if (typeof NativeFerrisHost !== 'function') {
+      throw new Error(
+        'FerrisHost is not built; rebuild @open1s/jsbos with the ferris-host feature',
+      );
+    }
+    this._inner = new NativeFerrisHost(
+      root,
+      options.workspace ?? null,
+      options.trust ?? null,
+      options.policyMode ?? null,
+      options.onContributions
+        ? (err, payload) => {
+            if (err) throw err;
+            return options.onContributions(payload);
+          }
+        : null,
+      options.onRevoke
+        ? (err, payload) => {
+            if (err) throw err;
+            return options.onRevoke(payload);
+          }
+        : null,
+      options.processSandbox ?? null,
+    );
+  }
+
+  get root() {
+    return this._inner.root;
+  }
+
+  registerExtension(manifest, root, start, invoke, shutdown = null) {
+    return this._inner.registerExtension(
+      manifest,
+      root,
+      (err, ctx) => {
+        if (err) throw err;
+        return start(ctx);
+      },
+      (err, call) => {
+        if (err) throw err;
+        return invoke(call);
+      },
+      shutdown
+        ? (err) => {
+            if (err) throw err;
+            return shutdown();
+          }
+        : null,
+    );
+  }
+
+  installed() {
+    return this._inner.installed();
+  }
+
+  install(source) {
+    return this._inner.install(source);
+  }
+
+  installPackage(source, origin = null) {
+    return this._inner.installPackage(source, origin);
+  }
+
+  uninstall(id, purgeData = false) {
+    return this._inner.uninstall(id, purgeData);
+  }
+
+  setEnabled(id, enabled) {
+    return this._inner.setEnabled(id, enabled);
+  }
+
+  versions(id) {
+    return this._inner.versions(id);
+  }
+
+  activeVersion(id) {
+    return this._inner.activeVersion(id);
+  }
+
+  activate(id, version) {
+    return this._inner.activate(id, version);
+  }
+
+  rollback(id) {
+    return this._inner.rollback(id);
+  }
+
+  clearFailure(id) {
+    return this._inner.clearFailure(id);
+  }
+
+  quarantine(id, reason) {
+    return this._inner.quarantine(id, reason);
+  }
+
+  packageRoot(id, version) {
+    return this._inner.packageRoot(id, version);
+  }
+
+  plan() {
+    return this._inner.plan();
+  }
+
+  apply() {
+    return this._inner.apply();
+  }
+
+  reload() {
+    return this._inner.reload();
+  }
+
+  unload() {
+    return this._inner.unload();
+  }
+
+  invoke(extension, kind, id, input) {
+    return this._inner.invoke(extension, kind, id, input);
+  }
+
+  contributions() {
+    return this._inner.contributions();
+  }
+
+  grant(extension, capability, scope = null, note = null) {
+    return this._inner.grant(extension, capability, scope, note);
+  }
+
+  revokeGrant(extension, capability) {
+    return this._inner.revokeGrant(extension, capability);
+  }
+
+  grants(extension) {
+    return this._inner.grants(extension);
+  }
+
+  auditDegraded() {
+    return this._inner.auditDegraded();
+  }
+
+  subscribeEvents(topics, callback) {
+    return this._inner.subscribeEvents(topics, (err, event) => {
+      if (err) throw err;
+      return callback(event);
+    });
+  }
+
+  unsubscribeEvents(id) {
+    return this._inner.unsubscribeEvents(id);
+  }
+
+  publishEvent(topic, payload) {
+    return this._inner.publishEvent(topic, payload);
+  }
+
+  /**
+   * Register every applied tool contribution on an AgentBuilder or started
+   * Agent. The tool callback forwards to the owning extension runtime.
+   */
+  async registerAgentTools(agent) {
+    const registered = [];
+    for (const [extension, entries] of Object.entries(this.contributions())) {
+      for (const contribution of entries) {
+        if (contribution.kind !== 'tool') continue;
+        const payload = contribution.payload || {};
+        const schema = payload.input_schema || {};
+        const name = contribution.id;
+        const td = new ToolDef(
+          name,
+          payload.description || name,
+          (args) => this.invoke(extension, 'tool', name, args),
+          schema.properties || {},
+          schema,
+        );
+        if (agent?._tools?.add) agent._tools.add(td);
+        if (agent?._inner?.addTool) {
+          await agent._inner.addTool(
+            td.name,
+            td.description,
+            JSON.stringify(td.parameters),
+            JSON.stringify(td.schema),
+            async (err, args) => {
+              if (err) throw err;
+              return td.callback(args);
+            },
+            false,
+            null,
+          );
+        }
+        registered.push({ extension, name });
+      }
+    }
+    return registered;
+  }
+}
+
+export * from './jsbos.js';
+
+export {
+  jsbos,
+  BrainOS,
+  AgentBuilder,
+  tool,
+  ToolDef,
+  ToolResult,
+  ToolCategory,
+  BaseTool,
+  FunctionTool,
+  ToolRegistry,
+  BusManager,
+  PublisherWrapper,
+  SubscriberWrapper,
+  QueryClient,
+  QueryableServer,
+  CallerClient,
+  CallableServer,
+  SessionManager,
+  Config,
+  extractTools,
+  defineTool,
+  defineTools,
+  createTool,
+  Binary,
+  Content,
+  ContentPart,
+  Memory,
+  Goal,
+  GoalStore,
+  JobRegistry,
+  FerrisHarness,
+  FerrisManifest,
+  FerrisManifestBuilder,
+  FerrisHost,
+  renderTemplate,
+  withMemory,
+  estimateTokens,
+};

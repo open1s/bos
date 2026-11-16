@@ -1,0 +1,1250 @@
+//! The declarative UI contract.
+//!
+//! A package returns a bounded tree of components; the host renders it with its
+//! own widgets and owns focus, layout and accessibility. No GPUI type crosses
+//! this boundary, no HTML or script is accepted, and every tree is validated
+//! against depth, node-count, text and payload ceilings before it reaches a
+//! renderer. The revision number is what lets a host reject a patch produced by
+//! a stale view.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::manifest::validate_relative_path;
+use super::types::{ContributionId, ExtensionError, ExtensionId, ValidationReport};
+
+/// The declarative UI schema generation.
+pub const UI_SCHEMA_VERSION: &str = "1.0";
+
+/// The largest serialized UI document this host accepts.
+pub const MAX_UI_BYTES: usize = 1024 * 1024;
+
+/// The structural ceilings applied to every document.
+#[derive(Debug, Clone, Copy)]
+pub struct UiLimits {
+    /// Maximum nesting depth.
+    pub max_depth: usize,
+    /// Maximum node count.
+    pub max_nodes: usize,
+    /// Maximum characters in one text leaf.
+    pub max_text: usize,
+    /// Maximum characters across all text leaves.
+    pub max_total_text: usize,
+    /// Maximum list items.
+    pub max_list_items: usize,
+    /// Maximum table rows.
+    pub max_table_rows: usize,
+    /// Maximum table columns.
+    pub max_columns: usize,
+    /// Maximum characters in one table cell.
+    pub max_cell: usize,
+    /// Maximum tabs.
+    pub max_tabs: usize,
+}
+
+impl Default for UiLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 32,
+            max_nodes: 1000,
+            max_text: 16 * 1024,
+            max_total_text: 256 * 1024,
+            max_list_items: 500,
+            max_table_rows: 500,
+            max_columns: 32,
+            max_cell: 2048,
+            max_tabs: 16,
+        }
+    }
+}
+
+/// A theme contribution's colour tokens.
+///
+/// Values are CSS-style hex strings. The host validates the file and the GPUI
+/// renderer parses the tokens it knows, falling back to the host palette for
+/// anything absent, so a partial theme is a refinement rather than a broken
+/// frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThemePalette {
+    /// Optional display name.
+    #[serde(default)]
+    pub name: String,
+    /// token name -> #rrggbb / #rrggbbaa.
+    #[serde(default)]
+    pub colors: std::collections::BTreeMap<String, String>,
+}
+
+impl ThemePalette {
+    /// Parse one token as RGB, ignoring alpha.
+    pub fn color(&self, token: &str) -> Option<u32> {
+        let raw = self.colors.get(token)?.trim();
+        let hex = raw.strip_prefix('#').unwrap_or(raw);
+        if hex.len() != 6 && hex.len() != 8 {
+            return None;
+        }
+        u32::from_str_radix(&hex[..6], 16).ok()
+    }
+}
+
+/// A semantic colour role the host resolves against the panel's theme.
+///
+/// A component names the role, not a colour: the same document then follows the
+/// reader's light/dark choice and a package's own theme tokens, instead of
+/// freezing one palette into the document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tone {
+    /// The panel's normal text.
+    #[default]
+    Neutral,
+    /// Secondary text.
+    Muted,
+    /// The quietest text.
+    Faint,
+    /// The theme accent.
+    Accent,
+    /// A success colour.
+    Success,
+    /// A warning colour.
+    Warning,
+    /// An error colour.
+    Error,
+}
+
+/// Where the host mounts a panel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PanelLocation {
+    /// The right-hand panel rail.
+    #[default]
+    Right,
+    /// The left-hand sidebar.
+    Left,
+    /// A bottom dock.
+    Bottom,
+    /// The main content column.
+    Center,
+}
+
+/// Whether a panel is shown by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PanelVisibility {
+    /// Shown when the host surface opens.
+    #[default]
+    Visible,
+    /// Registered but collapsed.
+    Hidden,
+}
+
+/// A button's visual weight.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ButtonStyle {
+    /// The primary action.
+    Primary,
+    /// A secondary action.
+    #[default]
+    Secondary,
+    /// A destructive action.
+    Danger,
+    /// A quiet inline action.
+    Ghost,
+}
+
+/// A notification's severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotificationLevel {
+    /// Informational.
+    Info,
+    /// A warning.
+    Warning,
+    /// An error.
+    Error,
+    /// A success message.
+    Success,
+}
+
+/// One option in a select.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiOption {
+    /// Value submitted with the action.
+    pub value: String,
+    /// Visible label.
+    pub label: String,
+}
+
+/// How a badge draws: coloured text, an outlined chip, or a filled chip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BadgeStyle {
+    /// Coloured text with no box, like a diff stat.
+    #[default]
+    Plain,
+    /// An outlined chip, like a branch label.
+    Chip,
+    /// A filled chip, like a count.
+    Filled,
+}
+
+/// A short labelled mark: a status letter, a line stat, a branch chip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiBadge {
+    /// The badge text.
+    pub text: String,
+    /// Semantic colour role.
+    #[serde(default)]
+    pub tone: Tone,
+    /// Optional leading icon name from the host catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// How the badge draws.
+    #[serde(default)]
+    pub style: BadgeStyle,
+}
+
+/// One row in a list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiListItem {
+    /// Primary text.
+    pub title: String,
+    /// Secondary text.
+    #[serde(default)]
+    pub detail: String,
+    /// Action dispatched when the row is activated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Whether the row shows a checked mark.
+    #[serde(default)]
+    pub checked: bool,
+    /// Optional leading icon name from the host catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Right-aligned marks: status, stats, labels.
+    #[serde(default)]
+    pub badges: Vec<UiBadge>,
+}
+
+/// One row of a timeline: a rail dot, chips and a title.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiTimelineItem {
+    /// Primary text.
+    pub title: String,
+    /// Secondary text.
+    #[serde(default)]
+    pub detail: String,
+    /// Chips drawn before the title, like branch and HEAD labels.
+    #[serde(default)]
+    pub badges: Vec<UiBadge>,
+}
+
+/// One node in a tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiTreeNode {
+    /// Stable node id.
+    pub id: String,
+    /// Visible label.
+    pub label: String,
+    /// Children.
+    #[serde(default)]
+    pub children: Vec<UiTreeNode>,
+    /// Optional leading icon name from the host catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Secondary text drawn after the label, like a parent path.
+    #[serde(default)]
+    pub detail: String,
+    /// Right-aligned marks: status, stats, labels.
+    #[serde(default)]
+    pub badges: Vec<UiBadge>,
+    /// Action dispatched when the node is activated; the payload carries the
+    /// node id as `{"id": ...}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Whether a node with children starts open; the reader's toggle wins.
+    #[serde(default = "section_starts_open")]
+    pub open: bool,
+}
+
+/// One tab.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiTab {
+    /// Stable tab id.
+    pub id: String,
+    /// Visible label.
+    pub label: String,
+    /// Tab body.
+    pub content: Box<UiNode>,
+}
+
+/// One component in a declarative view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum UiNode {
+    /// A plain container.
+    Container {
+        /// Children.
+        #[serde(default)]
+        children: Vec<UiNode>,
+    },
+    /// A horizontal stack.
+    Row {
+        /// Children.
+        #[serde(default)]
+        children: Vec<UiNode>,
+        /// Horizontal inset in device-independent pixels, so a panel-level
+        /// row aligns with section content instead of sitting flush at the
+        /// card edge.
+        #[serde(default)]
+        pad_x: u16,
+    },
+    /// A vertical stack.
+    Column {
+        /// Children.
+        #[serde(default)]
+        children: Vec<UiNode>,
+    },
+    /// Body text.
+    Text {
+        /// The text.
+        text: String,
+        /// Semantic colour role.
+        #[serde(default)]
+        tone: Tone,
+    },
+    /// A section heading.
+    Heading {
+        /// The heading text.
+        text: String,
+        /// Level, 1 through 6.
+        #[serde(default = "default_heading_level")]
+        level: u8,
+        /// Semantic colour role.
+        #[serde(default)]
+        tone: Tone,
+    },
+    /// Markdown text.
+    Markdown {
+        /// The document.
+        text: String,
+    },
+    /// A button that dispatches an action.
+    Button {
+        /// Visible label.
+        label: String,
+        /// Action id.
+        action: String,
+        /// Visual weight.
+        #[serde(default)]
+        style: ButtonStyle,
+        /// Optional leading icon name from the host catalog.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
+    },
+    /// A single-line text field.
+    Input {
+        /// Field label.
+        label: String,
+        /// Current value.
+        #[serde(default)]
+        value: String,
+        /// Placeholder.
+        #[serde(default)]
+        placeholder: String,
+        /// Action dispatched on submit.
+        action: String,
+        /// Optional trailing icon name from the host catalog.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
+        /// The submit button's label; empty hides the text and, without a
+        /// submit icon, the button itself, submitting on Enter / Cmd+Enter
+        /// instead.
+        #[serde(default = "default_submit_label")]
+        submit_label: String,
+        /// Optional submit-button icon name from the host catalog. With an
+        /// empty submit label the button is icon-only - the commit check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submit_icon: Option<String>,
+    },
+    /// A select field.
+    Select {
+        /// Field label.
+        label: String,
+        /// Current value.
+        #[serde(default)]
+        value: String,
+        /// Options.
+        options: Vec<UiOption>,
+        /// Action dispatched on change.
+        action: String,
+    },
+    /// A checkbox.
+    Checkbox {
+        /// Field label.
+        label: String,
+        /// Current state.
+        #[serde(default)]
+        checked: bool,
+        /// Action dispatched on toggle.
+        action: String,
+    },
+    /// A list.
+    List {
+        /// Rows.
+        #[serde(default)]
+        items: Vec<UiListItem>,
+    },
+    /// A table.
+    Table {
+        /// Column headers.
+        columns: Vec<String>,
+        /// Rows of cells.
+        #[serde(default)]
+        rows: Vec<Vec<String>>,
+        /// Relative column widths, one per column.
+        ///
+        /// A missing or short list means equal columns. Layout is a view
+        /// concern, but only the package knows that a message table needs a
+        /// wide preview column and a narrow index.
+        #[serde(default)]
+        widths: Vec<f32>,
+    },
+
+    /// A collapsible section.
+    ///
+    /// The title is a disclosure header and the host remembers the reader's
+    /// choice, so a package can ship a long card without inventing its own
+    /// paging.
+    Section {
+        /// The disclosure header.
+        title: String,
+        /// Whether it starts open.
+        #[serde(default = "section_starts_open")]
+        open: bool,
+        /// The body, drawn while open. Always validated, so a hidden mistake
+        /// is still a load error rather than a surprise on the first open.
+        #[serde(default)]
+        children: Vec<UiNode>,
+    },
+    /// A tree.
+    Tree {
+        /// Roots.
+        #[serde(default)]
+        nodes: Vec<UiTreeNode>,
+    },
+    /// A tab strip.
+    Tabs {
+        /// Tabs.
+        tabs: Vec<UiTab>,
+    },
+    /// A progress bar.
+    Progress {
+        /// Fraction from 0.0 to 1.0.
+        #[serde(default)]
+        value: f32,
+        /// Optional label.
+        #[serde(default)]
+        label: String,
+    },
+    /// A code block.
+    Code {
+        /// Language name.
+        #[serde(default)]
+        language: String,
+        /// Source text.
+        value: String,
+        /// Semantic colour role for the text.
+        #[serde(default)]
+        tone: Tone,
+    },
+    /// An image.
+    ///
+    /// Only `asset/` package-relative paths are drawn in this build: the host
+    /// has no remote image loader, so accepting an https URL would render
+    /// nothing.
+    Image {
+        /// An `asset/` package-relative path.
+        src: String,
+        /// Alternative text.
+        #[serde(default)]
+        alt: String,
+    },
+    /// An inline notification.
+    Notification {
+        /// Severity.
+        level: NotificationLevel,
+        /// Message.
+        text: String,
+    },
+    /// A short labelled mark drawn inline: a count, a status, a chip.
+    Badge {
+        /// The badge text.
+        text: String,
+        /// Semantic colour role.
+        #[serde(default)]
+        tone: Tone,
+        /// Optional leading icon name from the host catalog.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
+        /// How the badge draws.
+        #[serde(default)]
+        style: BadgeStyle,
+    },
+    /// Horizontal flex fill: pushes later row children to the far edge.
+    Fill,
+    /// A commit-style rail: one dot and line per item, chips and a title.
+    Timeline {
+        /// Rows, newest first.
+        #[serde(default)]
+        items: Vec<UiTimelineItem>,
+    },
+    /// A horizontal rule.
+    Divider,
+    /// Vertical space.
+    Spacer {
+        /// Height in device-independent pixels.
+        #[serde(default = "default_spacer")]
+        size: u16,
+    },
+}
+
+/// The submit button a declared input shows unless it opts out.
+fn default_submit_label() -> String {
+    "Apply".to_string()
+}
+
+fn default_heading_level() -> u8 {
+    2
+}
+
+/// A section starts open unless the document says otherwise.
+fn section_starts_open() -> bool {
+    true
+}
+
+fn default_spacer() -> u16 {
+    8
+}
+
+/// A complete declarative view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiDocument {
+    /// Schema generation.
+    pub schema_version: String,
+    /// Root component.
+    pub root: UiNode,
+}
+
+impl UiDocument {
+    /// Validate the tree against the host limits and the owning extension.
+    pub fn validate(&self, extension: &ExtensionId) -> ValidationReport {
+        self.validate_with(extension, UiLimits::default())
+    }
+
+    /// Validate with explicit limits.
+    pub fn validate_with(&self, _extension: &ExtensionId, limits: UiLimits) -> ValidationReport {
+        let mut report = ValidationReport::default();
+        if self.schema_version != UI_SCHEMA_VERSION {
+            report.error(
+                "ui.schema_version",
+                format!(
+                    "unsupported UI schema {:?}; this host reads {:?}",
+                    self.schema_version, UI_SCHEMA_VERSION
+                ),
+            );
+        }
+        let mut state = WalkState {
+            nodes: 0,
+            text: 0,
+            limits,
+            report: &mut report,
+        };
+        walk(&self.root, 1, &mut state);
+        match serde_json::to_vec(self) {
+            Ok(bytes) if bytes.len() > MAX_UI_BYTES => report.error(
+                "ui",
+                format!(
+                    "document is {} bytes; the ceiling is {MAX_UI_BYTES}",
+                    bytes.len()
+                ),
+            ),
+            Err(error) => report.error("ui", format!("document cannot be serialized: {error}")),
+            Ok(_) => {}
+        }
+        report
+    }
+}
+
+struct WalkState<'a> {
+    nodes: usize,
+    text: usize,
+    limits: UiLimits,
+    report: &'a mut ValidationReport,
+}
+
+fn walk(node: &UiNode, depth: usize, state: &mut WalkState<'_>) {
+    state.nodes += 1;
+    if state.nodes > state.limits.max_nodes {
+        if state.nodes == state.limits.max_nodes + 1 {
+            state.report.error(
+                "ui",
+                format!("document has more than {} nodes", state.limits.max_nodes),
+            );
+        }
+        return;
+    }
+    if depth > state.limits.max_depth {
+        state.report.error(
+            "ui",
+            format!(
+                "document nests deeper than {} levels",
+                state.limits.max_depth
+            ),
+        );
+        return;
+    }
+    match node {
+        UiNode::Container { children, .. }
+        | UiNode::Row { children, .. }
+        | UiNode::Column { children, .. } => {
+            for child in children {
+                walk(child, depth + 1, state);
+            }
+        }
+        UiNode::Text { text, .. }
+        | UiNode::Markdown { text }
+        | UiNode::Notification { text, .. } => {
+            text_leaf("ui.text", text, state);
+        }
+        UiNode::Heading { text, level, .. } => {
+            if !(1..=6).contains(level) {
+                state
+                    .report
+                    .error("ui.heading.level", "must be 1 through 6");
+            }
+            text_leaf("ui.heading.text", text, state);
+        }
+        UiNode::Button { label, action, .. } => {
+            text_leaf("ui.button.label", label, state);
+            action_id("ui.button.action", action, state);
+        }
+        UiNode::Input {
+            label,
+            value,
+            placeholder,
+            action,
+            submit_label,
+            ..
+        } => {
+            text_leaf("ui.input.label", label, state);
+            text_leaf("ui.input.value", value, state);
+            text_leaf("ui.input.placeholder", placeholder, state);
+            text_leaf("ui.input.submit_label", submit_label, state);
+            action_id("ui.input.action", action, state);
+        }
+        UiNode::Select {
+            label,
+            value,
+            options,
+            action,
+        } => {
+            text_leaf("ui.select.label", label, state);
+            text_leaf("ui.select.value", value, state);
+            if options.len() > 200 {
+                state
+                    .report
+                    .error("ui.select.options", "must contain at most 200 options");
+            }
+            for option in options {
+                text_leaf("ui.select.option.label", &option.label, state);
+                text_leaf("ui.select.option.value", &option.value, state);
+            }
+            action_id("ui.select.action", action, state);
+        }
+        UiNode::Checkbox {
+            label,
+            checked: _,
+            action,
+        } => {
+            text_leaf("ui.checkbox.label", label, state);
+            action_id("ui.checkbox.action", action, state);
+        }
+        UiNode::List { items } => {
+            if items.len() > state.limits.max_list_items {
+                state.report.error(
+                    "ui.list.items",
+                    format!("must contain at most {} items", state.limits.max_list_items),
+                );
+            }
+            for item in items {
+                text_leaf("ui.list.item.title", &item.title, state);
+                text_leaf("ui.list.item.detail", &item.detail, state);
+                if let Some(action) = &item.action {
+                    action_id("ui.list.item.action", action, state);
+                }
+                walk_badges("ui.list.item.badges", &item.badges, state);
+            }
+        }
+        UiNode::Table {
+            columns,
+            rows,
+            widths,
+        } => {
+            if !widths.is_empty() {
+                if widths.len() != columns.len() {
+                    state.report.error(
+                        "ui.table.widths",
+                        "must be empty or carry one weight per column",
+                    );
+                }
+                if widths.iter().any(|width| !(*width > 0.0 && *width <= 20.0)) {
+                    state.report.error(
+                        "ui.table.widths",
+                        "every weight must be greater than 0 and at most 20",
+                    );
+                }
+            }
+            if columns.len() > state.limits.max_columns {
+                state.report.error(
+                    "ui.table.columns",
+                    format!("must have at most {} columns", state.limits.max_columns),
+                );
+            }
+            if rows.len() > state.limits.max_table_rows {
+                state.report.error(
+                    "ui.table.rows",
+                    format!("must have at most {} rows", state.limits.max_table_rows),
+                );
+            }
+            for column in columns {
+                text_leaf("ui.table.column", column, state);
+            }
+            for row in rows {
+                if row.len() != columns.len() {
+                    state.report.error(
+                        "ui.table.row",
+                        "every row must have exactly one cell per column",
+                    );
+                }
+                for cell in row {
+                    if cell.chars().count() > state.limits.max_cell {
+                        state.report.error(
+                            "ui.table.cell",
+                            format!("must be at most {} characters", state.limits.max_cell),
+                        );
+                    }
+                    text_leaf("ui.table.cell", cell, state);
+                }
+            }
+        }
+        UiNode::Tree { nodes } => {
+            for node in nodes {
+                walk_tree(node, depth + 1, state);
+            }
+        }
+        UiNode::Section {
+            title, children, ..
+        } => {
+            text_leaf("ui.section.title", title, state);
+            for child in children {
+                walk(child, depth + 1, state);
+            }
+        }
+        UiNode::Tabs { tabs } => {
+            if tabs.len() > state.limits.max_tabs {
+                state.report.error(
+                    "ui.tabs",
+                    format!("must contain at most {} tabs", state.limits.max_tabs),
+                );
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for tab in tabs {
+                if tab.id.is_empty() || !seen.insert(tab.id.clone()) {
+                    state
+                        .report
+                        .error("ui.tabs.id", "tab ids must be non-empty and unique");
+                }
+                text_leaf("ui.tabs.label", &tab.label, state);
+                walk(&tab.content, depth + 1, state);
+            }
+        }
+        UiNode::Progress { value, label } => {
+            if !(0.0..=1.0).contains(value) {
+                state
+                    .report
+                    .error("ui.progress.value", "must be between 0.0 and 1.0");
+            }
+            text_leaf("ui.progress.label", label, state);
+        }
+        UiNode::Code {
+            language, value, ..
+        } => {
+            text_leaf("ui.code.language", language, state);
+            text_leaf("ui.code.value", value, state);
+        }
+        UiNode::Image { src, alt } => {
+            if !valid_image_source(src) {
+                state.report.error(
+                    "ui.image.src",
+                    "must be an asset/ package-relative path; this host does not fetch remote images",
+                );
+            }
+            text_leaf("ui.image.alt", alt, state);
+        }
+        UiNode::Badge { text, .. } => {
+            text_leaf("ui.badge.text", text, state);
+        }
+        UiNode::Fill => {}
+        UiNode::Timeline { items } => {
+            if items.len() > state.limits.max_list_items {
+                state.report.error(
+                    "ui.timeline.items",
+                    format!("must contain at most {} items", state.limits.max_list_items),
+                );
+            }
+            for item in items {
+                text_leaf("ui.timeline.item.title", &item.title, state);
+                text_leaf("ui.timeline.item.detail", &item.detail, state);
+                walk_badges("ui.timeline.item.badges", &item.badges, state);
+            }
+        }
+        UiNode::Divider => {}
+        UiNode::Spacer { size } => {
+            if *size > 512 {
+                state.report.error("ui.spacer.size", "must be at most 512");
+            }
+        }
+    }
+}
+
+/// Badges are inline marks, but each still spends the node and text budgets.
+fn walk_badges(field: &str, badges: &[UiBadge], state: &mut WalkState<'_>) {
+    if badges.len() > 8 {
+        state.report.error(field, "must contain at most 8 badges");
+    }
+    for badge in badges {
+        state.nodes += 1;
+        text_leaf("ui.badge.text", &badge.text, state);
+    }
+}
+
+fn walk_tree(node: &UiTreeNode, depth: usize, state: &mut WalkState<'_>) {
+    state.nodes += 1;
+    if state.nodes > state.limits.max_nodes {
+        if state.nodes == state.limits.max_nodes + 1 {
+            state.report.error(
+                "ui",
+                format!("document has more than {} nodes", state.limits.max_nodes),
+            );
+        }
+        return;
+    }
+    if depth > state.limits.max_depth {
+        state.report.error(
+            "ui.tree",
+            format!("tree nests deeper than {} levels", state.limits.max_depth),
+        );
+        return;
+    }
+    if node.id.is_empty() {
+        state
+            .report
+            .error("ui.tree.id", "node ids must not be empty");
+    }
+    text_leaf("ui.tree.label", &node.label, state);
+    text_leaf("ui.tree.detail", &node.detail, state);
+    if let Some(action) = &node.action {
+        action_id("ui.tree.action", action, state);
+    }
+    walk_badges("ui.tree.badges", &node.badges, state);
+    for child in &node.children {
+        walk_tree(child, depth + 1, state);
+    }
+}
+
+fn text_leaf(field: &str, text: &str, state: &mut WalkState<'_>) {
+    let characters = text.chars().count();
+    if characters > state.limits.max_text {
+        state.report.error(
+            field,
+            format!("must be at most {} characters", state.limits.max_text),
+        );
+    }
+    state.text += characters;
+    if state.text > state.limits.max_total_text {
+        state.report.error(
+            "ui",
+            format!(
+                "document carries more than {} characters of text",
+                state.limits.max_total_text
+            ),
+        );
+    }
+}
+
+fn action_id(field: &str, action: &str, state: &mut WalkState<'_>) {
+    if ContributionId::parse(action).is_err() {
+        state.report.error(
+            field,
+            "must be a dotted contribution id owned by the extension",
+        );
+    }
+}
+
+fn valid_image_source(src: &str) -> bool {
+    if let Some(rest) = src.strip_prefix("asset/") {
+        return validate_relative_path(rest).is_ok();
+    }
+    // Remote images are refused rather than accepted and drawn as text: a
+    // component the renderer cannot honour is worse than a validation error.
+    false
+}
+
+/// One UI action request from the host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiActionRequest {
+    /// The action id the control carried.
+    pub action: String,
+    /// The revision the control was rendered from.
+    pub revision: u64,
+    /// Action payload.
+    #[serde(default)]
+    pub payload: Value,
+}
+
+/// One extension's live declarative view.
+#[derive(Debug, Clone)]
+pub struct UiSession {
+    extension: ExtensionId,
+    revision: u64,
+    document: UiDocument,
+}
+
+impl UiSession {
+    /// Start a session from a validated document.
+    pub fn open(extension: ExtensionId, document: UiDocument) -> Result<Self, ExtensionError> {
+        let report = document.validate(&extension);
+        if !report.is_valid() {
+            return Err(ExtensionError::Manifest {
+                path: std::path::PathBuf::from("<ui>"),
+                message: report
+                    .errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            });
+        }
+        Ok(Self {
+            extension,
+            revision: 1,
+            document,
+        })
+    }
+
+    /// The current revision.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The current document.
+    pub fn document(&self) -> &UiDocument {
+        &self.document
+    }
+
+    /// Apply a new document at `revision`. A revision at or below the current
+    /// one is stale and refused.
+    pub fn apply(&mut self, document: UiDocument, revision: u64) -> Result<(), ExtensionError> {
+        if revision <= self.revision {
+            return Err(ExtensionError::Protocol {
+                extension: self.extension.to_string(),
+                message: format!(
+                    "stale UI patch at revision {revision}; current revision is {}",
+                    self.revision
+                ),
+            });
+        }
+        let report = document.validate(&self.extension);
+        if !report.is_valid() {
+            return Err(ExtensionError::Manifest {
+                path: std::path::PathBuf::from("<ui>"),
+                message: report
+                    .errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            });
+        }
+        self.document = document;
+        self.revision = revision;
+        Ok(())
+    }
+
+    /// Validate an action against the current revision and the action grammar.
+    pub fn accept_action(
+        &self,
+        request: &UiActionRequest,
+    ) -> Result<ContributionId, ExtensionError> {
+        if request.revision != self.revision {
+            return Err(ExtensionError::Protocol {
+                extension: self.extension.to_string(),
+                message: format!(
+                    "action at revision {} but the view is at {}; the control was stale",
+                    request.revision, self.revision
+                ),
+            });
+        }
+        ContributionId::parse(request.action.clone()).map_err(|_| ExtensionError::Protocol {
+            extension: self.extension.to_string(),
+            message: format!("action {:?} is not a contribution id", request.action),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id() -> ExtensionId {
+        ExtensionId::parse("com.example.ui").expect("id")
+    }
+
+    fn document() -> UiDocument {
+        UiDocument {
+            schema_version: UI_SCHEMA_VERSION.to_string(),
+            root: UiNode::Column {
+                children: vec![
+                    UiNode::Heading {
+                        text: "Git Status".to_string(),
+                        level: 2,
+                        tone: Tone::Neutral,
+                    },
+                    UiNode::Text {
+                        text: "Working tree clean".to_string(),
+                        tone: Tone::Neutral,
+                    },
+                    UiNode::Button {
+                        label: "Refresh".to_string(),
+                        action: "git.refresh".to_string(),
+                        style: ButtonStyle::Primary,
+                        icon: None,
+                    },
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn a_valid_document_passes() {
+        let report = document().validate(&id());
+        assert!(report.is_valid(), "{report:?}");
+    }
+
+    #[test]
+    fn a_bad_action_is_refused() {
+        let mut document = document();
+        if let UiNode::Column { children } = &mut document.root {
+            if let UiNode::Button { action, .. } = &mut children[2] {
+                *action = "Refresh!".to_string();
+            }
+        }
+        let report = document.validate(&id());
+        assert!(!report.is_valid());
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "ui.button.action"));
+    }
+
+    /// Badges spend the node budget and cap at eight per row: a row cannot
+    /// smuggle a hundred chips past the limits.
+    #[test]
+    fn a_row_cannot_carry_more_than_eight_badges() {
+        let badges: Vec<Value> = (0..9)
+            .map(|index| serde_json::json!({"text": format!("b{index}")}))
+            .collect();
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": {
+                "type": "list",
+                "items": [{"title": "row", "badges": badges}]
+            }
+        }))
+        .expect("document");
+        let report = document.validate(&id());
+        assert!(!report.is_valid());
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "ui.list.item.badges"));
+    }
+
+    /// A timeline row's chips and a tree node's action validate like any
+    /// other control: the rail is a real surface, not a text escape hatch.
+    #[test]
+    fn the_timeline_and_tree_actions_validate() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": {
+                "type": "column",
+                "children": [
+                    {"type": "timeline", "items": [
+                        {"title": "feat: something",
+                         "badges": [{"text": "HEAD", "tone": "accent", "icon": "check", "style": "chip"}]}
+                    ]},
+                    {"type": "tree", "nodes": [
+                        {"id": "a.txt", "label": "a.txt", "action": "file",
+                         "badges": [{"text": "A", "tone": "success"}]}
+                    ]},
+                    {"type": "badge", "text": "8", "style": "filled"},
+                    {"type": "fill"}
+                ]
+            }
+        }))
+        .expect("document");
+        assert!(document.validate(&id()).is_valid());
+
+        let bad: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": {"type": "tree", "nodes": [
+                {"id": "a.txt", "label": "a.txt", "action": "not an id!"}
+            ]}
+        }))
+        .expect("document");
+        let report = bad.validate(&id());
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "ui.tree.action"));
+    }
+
+    /// A collapsed section still validates its body: a hidden mistake must be
+    /// a load error, not a surprise on the first open.
+    #[test]
+    fn a_collapsed_section_still_validates_its_body() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": {
+                "type": "section",
+                "title": "Details",
+                "open": false,
+                "children": [{"type": "text", "text": "hidden body"}]
+            }
+        }))
+        .expect("document");
+        assert!(document.validate(&id()).is_valid());
+    }
+
+    /// Column weights are layout, but a wrong count is a document bug: it is
+    /// refused rather than silently ignored.
+    #[test]
+    fn a_table_weight_list_must_match_its_columns() {
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "1.0",
+            "root": {
+                "type": "table",
+                "columns": ["A", "B"],
+                "rows": [["1", "2"]],
+                "widths": [1.0]
+            }
+        }))
+        .expect("document");
+        let report = document.validate(&id());
+        assert!(!report.is_valid(), "a short weight list is a load error");
+        assert!(report
+            .errors
+            .iter()
+            .any(|issue| issue.field == "ui.table.widths"));
+    }
+
+    /// A tone is a named role; an unknown one is a parse error, so a document
+    /// cannot smuggle a raw colour past the theme.
+    #[test]
+    fn a_tone_is_a_named_role_not_a_colour() {
+        assert!(serde_json::from_value::<UiNode>(serde_json::json!({
+            "type": "text", "text": "hi", "tone": "chartreuse"
+        }))
+        .is_err());
+        let parsed = serde_json::from_value::<UiNode>(serde_json::json!({
+            "type": "text", "text": "hi", "tone": "error"
+        }))
+        .expect("a known tone parses");
+        assert!(matches!(
+            parsed,
+            UiNode::Text {
+                tone: Tone::Error,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn depth_is_capped() {
+        let mut root = UiNode::Text {
+            text: "leaf".to_string(),
+            tone: Tone::Neutral,
+        };
+        for _ in 0..40 {
+            root = UiNode::Column {
+                children: vec![root],
+            };
+        }
+        let report = UiDocument {
+            schema_version: UI_SCHEMA_VERSION.to_string(),
+            root,
+        }
+        .validate(&id());
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn node_count_is_capped() {
+        let children: Vec<UiNode> = (0..1001).map(|_| UiNode::Divider).collect();
+        let report = UiDocument {
+            schema_version: UI_SCHEMA_VERSION.to_string(),
+            root: UiNode::Column { children },
+        }
+        .validate(&id());
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn images_only_accept_package_assets() {
+        for src in ["asset/icons/a.png", "asset/a.svg"] {
+            assert!(valid_image_source(src), "{src}");
+        }
+        for src in [
+            "https://example.com/a.png",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:image/png;base64,xxx",
+            "asset/../escape.png",
+            "http://example.com/a.png",
+        ] {
+            assert!(!valid_image_source(src), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_stale_patch_or_action_is_refused() {
+        let mut session = UiSession::open(id(), document()).expect("session");
+        assert_eq!(session.revision(), 1);
+        session.apply(document(), 2).expect("apply");
+        assert!(session.apply(document(), 2).is_err());
+        assert!(session.apply(document(), 1).is_err());
+        let stale = UiActionRequest {
+            action: "git.refresh".to_string(),
+            revision: 1,
+            payload: Value::Null,
+        };
+        assert!(session.accept_action(&stale).is_err());
+        let current = UiActionRequest {
+            action: "git.refresh".to_string(),
+            revision: 2,
+            payload: Value::Null,
+        };
+        assert!(session.accept_action(&current).is_ok());
+    }
+}

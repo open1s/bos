@@ -1,0 +1,1 @@
+Prefer short answers when the Extism example is active.

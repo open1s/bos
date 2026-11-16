@@ -1,0 +1,12 @@
+{
+  "name": "@local/dsh-script-only",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A package whose whole payload is an imperative host entry, the shape every real DSH package ships.",
+  "exports": {
+    ".": "./index.js"
+  },
+  "dsh": {
+    "manifestVersion": 1
+  }
+}

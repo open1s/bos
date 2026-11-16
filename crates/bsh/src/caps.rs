@@ -1,0 +1,15456 @@
+//! Building the chat agent from settings.
+//!
+//! The agent is rebuilt on every turn from the persisted settings, so a
+//! settings change reaches the very next send without an app restart. How much
+//! the agent may do is the permission mode, and every arm of it lands on a real
+//! seam: Read Only withholds the side-effecting tools from the request, Workspace
+//! Write confines the shell and the file tools to the active workspace, and Full
+//! access releases both.
+
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use agent::capabilities::{CapabilityTool, NativeToolProvider, ProxySource, ToolFacts};
+use agent::capability::{CapabilityProvider, WorkspaceRuntime};
+use agent::goal::Goal;
+use agent::memory::{FileMemory, MemoryStore};
+use agent::policy::{
+    Action, EgressGate, EgressRuleSet, PolicyData, PolicyInput, PolicySet, PolicySource,
+    SystemResolver, Target,
+};
+use agent::tools::{
+    BashTool, DeclaredAsyncTool, DeclaredTool, FunctionTool, GetGoalTool, GoalStore, PlanTool,
+    Tool as _, ToolMetadata, ToolRegistry, UpdateGoalTool,
+};
+use agent::{Agent, AgentConfig, ToolError};
+use futures::StreamExt;
+use log::warn;
+
+/// Declare this host's capability metadata on a built-in tool.
+///
+/// The wrapper changes nothing about execution; it attaches the risk, side
+/// effects, and permission scopes a capability catalogue reads. A name with no
+/// declaration is a wiring mistake and fails the build of the turn.
+fn declare(name: &str) -> agent::tools::ToolMetadata {
+    crate::tool_metadata::builtin_metadata(name)
+        .unwrap_or_else(|| panic!("built-in tool {name} has no declared metadata"))
+}
+
+use crate::plugins::{self, PluginInfo};
+use crate::review::domain::{ChangeOperation, SnapshotState};
+use crate::settings::{Effective, Settings};
+use crate::vault::{self, Vault, VaultError};
+use crate::workspace_ignore::Rules;
+
+/// The capabilities this shell can actually put in front of the reader.
+///
+/// A package that loads is not the same as a package that is usable here. The
+/// registry accepts every contribution kind, but bsh draws four of them: a
+/// package's tools become model-facing tools, its hooks become agent plugins,
+/// its skills become skill manifests, and its providers become entries in the
+/// model picker.
+///
+/// The other three land in the host registry and stop there. A command is
+/// registered but bsh's composer palette is a fixed list, so a reader never
+/// sees it; a panel is registered but nothing renders a registry panel; a
+/// prompt has no consumer at all. Listing them beside the four that work
+/// would put a capability chip on a control the reader cannot reach, which is
+/// the same lie as declaring a capability that never loaded.
+///
+/// The filter is a pure function of the loaded set, so it cannot drift from
+/// what the registry holds.
+pub(crate) fn surfaced_capabilities(
+    loaded: &[agent::extensions::Capability],
+) -> Vec<agent::extensions::Capability> {
+    use agent::extensions::Capability;
+    loaded
+        .iter()
+        .copied()
+        .filter(|capability| {
+            matches!(
+                capability,
+                Capability::Tools | Capability::Hooks | Capability::Skills | Capability::Models
+            )
+        })
+        .collect()
+}
+
+/// Lower one extension package's declared model providers onto this shell's
+/// provider node.
+///
+/// A `ProviderContribution` is the declarative form of what a DSH package
+/// registers imperatively with `ctx.llm.registerAdapter([id], adapter)`: an id,
+/// a base URL, a protocol, and the models it serves. This is the whole of the
+/// translation, and it is deliberately a pure function of the declaration - no
+/// package file is executed and no network call is made, so a package cannot
+/// make the shell do work merely by being installed.
+///
+/// A model nickname and a model id are the same string here. The reference
+/// picker shows the upstream id, and the wire form the engine dispatches on is
+/// `<provider>/<model>`, which reads back the same way, so introducing a
+/// separate display nickname would be a second name for one fact.
+pub(crate) fn plugin_provider_node(
+    provider: &agent::extensions::ProviderContribution,
+) -> crate::settings::global::Provider {
+    use crate::settings::global::{ModelEntry, Provider};
+    let mut models = std::collections::BTreeMap::new();
+    for model in &provider.models {
+        let id = model.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        models.insert(
+            id.to_string(),
+            ModelEntry {
+                model: id.to_string(),
+                name: model.name.clone(),
+                max_tokens: model.max_tokens,
+                api_mode: provider.api_mode.clone(),
+                reasoning_effort: model.reasoning_effort.clone(),
+                input_types: model.input_types.clone(),
+            },
+        );
+    }
+    Provider {
+        name: provider.name.clone().or_else(|| Some(provider.id.clone())),
+        base_url: provider.base_url.trim().to_string(),
+        // A contributed provider NEVER carries a credential: the secret is the
+        // reader's, and it reaches the endpoint through the conventional
+        // `provider:<id>:api_key` vault entry at build time.
+        api_key_vault: None,
+        legacy_api_key: None,
+        // Not the reader's declaration, so the pane must not offer to delete it
+        // as one; the package is the owner.
+        declared: false,
+        api_mode: provider.api_mode.clone(),
+        // The package declared whether its lane is anonymous; the build reads
+        // this to choose between a credential lookup and an empty key.
+        requires_key: Some(provider.requires_key),
+        models,
+    }
+}
+
+/// Rebuild the contributed model providers from the enabled extension
+/// inventory.
+///
+/// This is the one place the three contributed maps are written, and it runs
+/// per build rather than per frame: a package directory is read only when its
+/// `(path, mtime)` stamp moved, so a steady state costs a stat per package.
+///
+/// The gates are the same ones the extension loader applies to tools, so a
+/// package switched off in a workspace contributes no provider there, and a
+/// preset that allows only some extensions cannot leak an endpoint through the
+/// model layer.
+pub(crate) fn refresh_plugin_providers(settings: &mut Settings) {
+    use std::collections::BTreeMap;
+
+    let mut providers: BTreeMap<String, crate::settings::global::Provider> = BTreeMap::new();
+    let mut keys: BTreeMap<String, bool> = BTreeMap::new();
+    let mut owners: BTreeMap<String, String> = BTreeMap::new();
+
+    // Open (or refresh) the extension host and read the contributed surfaces
+    // in ONE host lock hold. At launch nothing has opened it yet - the shell's
+    // own theme and status queries run after this refresh - and the caches
+    // answer from the open host, so refreshing first cached an empty set for
+    // the whole session (which kept every provider an installed BSH package
+    // declares out of the picker). Reading them separately also let a
+    // concurrent host open (a workspace switch, or another test sharing the
+    // process) swap the host between the open and the read.
+    let (_statuses, host_providers, host_presets) = {
+        let root = settings.active_workspace_root();
+        let workspace = (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+        crate::extension::launch_surfaces(settings, workspace.as_deref())
+    };
+
+    // The inventory is read from the persisted global document, not from a
+    // draft: a build describes what is installed, and the pane's unsaved edits
+    // are not yet facts.
+    let inventory = settings.global.extensions.clone();
+    for entry in &inventory {
+        let Some(raw) = entry
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        let root = expand_path(raw);
+        let Ok(package) = agent::extensions::ExtensionRegistry::load(&root) else {
+            continue;
+        };
+        let extension = package.extension;
+        for contribution in &extension.contributions {
+            let agent::extensions::Contribution::Provider(provider) = contribution else {
+                continue;
+            };
+            // The reader's own declaration wins an id collision, and so does an
+            // earlier package: the tree is keyed by id, and replacing a node
+            // another owner already placed would make the inventory order
+            // silently decide which endpoint a session runs against.
+            if settings.global.providers.contains_key(&provider.id)
+                || providers.contains_key(&provider.id)
+            {
+                continue;
+            }
+            providers.insert(provider.id.clone(), plugin_provider_node(provider));
+            keys.insert(provider.id.clone(), provider.requires_key);
+            owners.insert(provider.id.clone(), extension.id.clone());
+        }
+    }
+
+    for (id, provider) in host_providers {
+        if settings.global.providers.contains_key(&id) || providers.contains_key(&id) {
+            continue;
+        }
+        // A descriptor that declares an open or anonymous lane is honoured;
+        // absent stays key-bearing, the safe default for a provider nobody
+        // classified.
+        let requires_key = provider.requires_key.unwrap_or(true);
+        providers.insert(id.clone(), provider);
+        keys.insert(id.clone(), requires_key);
+        owners.insert(id, "extension".to_string());
+    }
+    settings.global.set_plugin_presets(host_presets);
+    settings
+        .global
+        .set_plugin_providers(providers, keys, owners);
+}
+
+/// The permission mode that confines a turn to the active workspace.
+pub(crate) const WORKSPACE_WRITE: &str = "workspace-write";
+
+/// The permission mode that withholds every side-effecting tool.
+pub(crate) const READ_ONLY: &str = "read-only";
+
+/// The permission mode that releases the workspace confinement.
+pub(crate) const FULL_ACCESS: &str = "danger-full-access";
+
+/// The token budget one turn's memory recall may spend (issue #345): top-K is
+/// constrained by tokens, not only item count, so a few long records cannot
+/// crowd out the request window.
+pub(crate) const MEMORY_RECALL_TOKEN_BUDGET: usize = 1024;
+
+/// Whether a permission mode confines a turn to the active workspace.
+///
+/// Confined is what installs the shell's `WorkspaceValidator` and gives the file
+/// tools their root; the released mode passes `None` to both, and
+/// `BashTool::with_config` then leaves its validator unset, which is the switch
+/// that drops the destructive and elevated-privilege guards.
+pub(crate) fn is_confined(permission: &str) -> bool {
+    permission != FULL_ACCESS
+}
+
+/// Whether a permission mode lets a turn write anything at all.
+///
+/// Read Only withholds the shell and the file writer, so an uncooperative model
+/// cannot reach them: they are absent from the request rather than refused at
+/// call time.
+pub(crate) fn allows_writes(permission: &str) -> bool {
+    permission != READ_ONLY
+}
+
+/// The one sandbox spec for a turn's shell and its terminal pane.
+///
+/// Resolution decides heel vs off once (`Effective::sandbox`); this maps that
+/// decision onto the spec both spawn paths share:
+///
+/// - heel resolves to a policy-derived spec. A FULL-ACCESS session whose
+///   PRESET asked for heel is built as Workspace Write: the permission released
+///   confinement, and the preset narrowed it back, so the grants and the egress
+///   proxy come from the policy exactly as they do for a confined session.
+/// - off - because a preset asked, or because the settings master switch is
+///   off - is `bare(FullAccess)`: it spawns a bare shell and the tool result
+///   reports `sandbox: "none"` with the reason that released it.
+/// - an absent field at full access keeps the permission's own full-access
+///   spec, which is byte-for-byte today's behaviour.
+///
+/// The master switch is already folded into `eff.sandbox` by the resolution, so
+/// this function has no second copy of it: `off_by_policy` is the one predicate
+/// for "a policy released the shell", and the bare spec is its channel.
+pub(crate) fn sandbox_spec_for(
+    policy: &Arc<PolicySet>,
+    eff: &Effective,
+    tool: &str,
+    session: &str,
+) -> Arc<agent::sandbox::SandboxSpec> {
+    let principal = agent::sandbox::Principal::new(tool, session, eff.preset_id.clone());
+    if eff.sandbox.heel {
+        // A forced heel under full access must NOT derive a FullAccess spec:
+        // that spec is exactly the release the preset narrowed back.
+        let tier = if eff.permission.effective == FULL_ACCESS {
+            WORKSPACE_WRITE
+        } else {
+            eff.permission.effective.as_str()
+        };
+        Arc::new(agent::sandbox::SandboxSpec::for_policy(
+            policy, tier, principal,
+        ))
+    } else if eff.sandbox.off_by_policy() {
+        Arc::new(agent::sandbox::SandboxSpec::bare(
+            agent::sandbox::SandboxMode::FullAccess,
+            policy.data().workspace_root.clone(),
+        ))
+    } else {
+        // Inherit at full access: the permission's own release, unchanged.
+        Arc::new(agent::sandbox::SandboxSpec::for_policy(
+            policy,
+            &eff.permission.effective,
+            principal,
+        ))
+    }
+}
+
+/// Which tools a turn may offer, after permission, preset and policy agree.
+///
+/// One predicate owns this decision: registration reads these fields and
+/// nothing else decides whether a gated tool exists. `bash` and the two job
+/// tools are the shell family; `subagent` is the delegation tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolGates {
+    /// Whether the `bash` tool may be registered at all.
+    pub(crate) bash: bool,
+    /// Whether that shell may expose `run_in_background`.
+    pub(crate) background_spawn: bool,
+    /// Whether `job_output` may read a job's captured output.
+    pub(crate) output: bool,
+    /// Whether `job_list` may enumerate the session's jobs.
+    pub(crate) list: bool,
+    /// Whether `job_kill` may terminate a job.
+    pub(crate) kill: bool,
+    /// Whether the `subagent` tool may be attached.
+    pub(crate) subagent: bool,
+}
+
+/// The single tool-capability predicate. A tool is offered only when **all**
+/// three gates allow it:
+///
+/// 1. the permission matrix grants side effects (`read-only` grants none of
+///    `bash`, `run_in_background`, `job_output`, `job_list`, `job_kill`
+///    or `subagent`; the two writable modes grant all six);
+/// 2. the preset's `tools` allowlist either is absent (inherit) or names the
+///    tool - an absent list inherits, an explicit list intersects; and
+/// 3. the Rego policy answers the capability question for the tool name with
+///    `allow`. `run_in_background` is the shell's own capability, so its
+///    preset entry is `bash`.
+///
+/// The permission gate is applied first and short-circuits: a read-only turn
+/// asks the policy nothing, so the audit ring is not filled with questions its
+/// own matrix already refused. The Rego baseline carries the same rule for a
+/// caller that asks it directly.
+pub(crate) fn tool_gates_for(
+    permission: &str,
+    preset_tools: Option<&[String]>,
+    policy: &PolicySet,
+    session: &str,
+) -> ToolGates {
+    let allowed = allows_writes(permission);
+    let in_preset =
+        |name: &str| preset_tools.is_none_or(|tools| tools.iter().any(|tool| tool == name));
+    // The capability question: tool name plus the turn's principal. The target
+    // is the workspace root (capability asks about a tool, not a path).
+    let capability = |tool: &str| {
+        let input = PolicyInput::new(
+            tool,
+            Action::Capability,
+            Target::path(policy.data().workspace_root.clone()),
+        )
+        .with_session(session)
+        .with_preset(policy.data().preset.clone());
+        policy.check(&input).is_allowed()
+    };
+    let bash = in_preset("bash");
+    ToolGates {
+        bash: allowed && bash,
+        background_spawn: allowed && bash && capability("run_in_background"),
+        output: allowed && in_preset("job_output") && capability("job_output"),
+        list: allowed && in_preset("job_list") && capability("job_list"),
+        kill: allowed && in_preset("job_kill") && capability("job_kill"),
+        subagent: allowed && in_preset("subagent") && capability("subagent"),
+    }
+}
+
+/// Ask the policy whether `tool` may spawn a process or child in `root`.
+///
+/// This is the call-time half of the capability decision: registration narrows
+/// what a turn carries, and this check refuses a call that a policy narrows
+/// later (the workspace policy is read on every build, so both halves see the
+/// same source). The error is the policy's own refusal, which names the rule.
+pub(crate) fn check_spawn(
+    policy: &PolicySet,
+    tool: &str,
+    session: &str,
+    preset: &str,
+    root: &str,
+) -> Result<(), String> {
+    let input = PolicyInput::new(tool, Action::Spawn, Target::path(root))
+        .with_session(session.to_string())
+        .with_preset(preset.to_string());
+    let decision = policy.check(&input);
+    if decision.is_allowed() {
+        Ok(())
+    } else {
+        Err(policy.refusal(&decision))
+    }
+}
+
+/// A capability the built agent exposes, for the settings inventory.
+#[derive(Debug, Clone)]
+pub(crate) struct CapInfo {
+    /// Tool or skill name.
+    pub(crate) name: String,
+    /// One-line description.
+    pub(crate) description: String,
+    /// "tool" or "skill".
+    pub(crate) category: String,
+}
+
+/// The process-wide plugin bridge pool.
+///
+/// A bridged tool is only callable while its plugin's process is alive, and a
+/// build re-reads the package on every turn, so the session cannot live in the
+/// build. It lives here instead: one child per (package, root), reused across
+/// turns, and torn down by the reconcile below when a package stops being asked
+/// for.
+///
+/// This mirrors the MCP pool's shape for the same reason - a connection is the
+/// expensive part and a turn must not pay it again - with one difference that
+/// matters: an MCP connection is a socket, and this is a process running code the
+/// reader approved, so every spawn is behind the trust gate.
+static BRIDGE_POOL: std::sync::OnceLock<std::sync::Mutex<agent::extensions::bridge::BridgePool>> =
+    std::sync::OnceLock::new();
+
+/// Run `f` against the process-wide bridge pool.
+fn with_bridge_pool<T>(f: impl FnOnce(&mut agent::extensions::bridge::BridgePool) -> T) -> T {
+    let pool = BRIDGE_POOL
+        .get_or_init(|| std::sync::Mutex::new(agent::extensions::bridge::BridgePool::new()));
+    match pool.lock() {
+        Ok(mut guard) => f(&mut guard),
+        Err(poisoned) => f(&mut poisoned.into_inner()),
+    }
+}
+
+/// Stop every bridged plugin process.
+///
+/// Called when the shell tears down, so no child outlives the app that started
+/// it. Nothing else depends on the timing: the sessions are also reconciled on
+/// every build and reaped by `Drop` if the process exits first.
+pub(crate) fn stop_bridge_pool() {
+    with_bridge_pool(|pool| pool.stop_all());
+}
+
+/// A built agent together with the plugins its tools came from.
+/// Forwards the agent's own LLM/tool plugin stages to the extension
+/// EventDispatcher. Observers and policy-authorized interceptors see the same
+/// model and tool events the extension runtime sees.
+struct DispatcherPlugin;
+
+#[async_trait::async_trait]
+impl agent::agent::AgentPlugin for DispatcherPlugin {
+    fn name(&self) -> &str {
+        "bsh-extension-dispatcher"
+    }
+
+    async fn on_llm_request(
+        &self,
+        mut request: agent::agent::LlmRequestWrapper,
+    ) -> Option<agent::agent::LlmRequestWrapper> {
+        let payload = serde_json::json!({
+            "model": request.model,
+            "input": request.input.as_text().unwrap_or_default(),
+            "temperature": request.temperature,
+        });
+        if let Some(value) = crate::extension::dispatcher().waterfall("model.before", payload) {
+            if let Some(model) = value.get("model").and_then(serde_json::Value::as_str) {
+                request.model = model.to_string();
+            }
+        }
+        Some(request)
+    }
+
+    async fn on_turn_start(
+        &self,
+        turn: agent::agent::TurnStartWrapper,
+    ) -> Option<agent::agent::TurnStartWrapper> {
+        crate::extension::dispatcher().waterfall(
+            "agent.turn.start",
+            serde_json::json!({
+                "agent": turn.agent,
+                "input": turn.input,
+            }),
+        );
+        Some(turn)
+    }
+
+    async fn on_turn_end(
+        &self,
+        turn: agent::agent::TurnEndWrapper,
+    ) -> Option<agent::agent::TurnEndWrapper> {
+        crate::extension::dispatcher().emit(
+            "agent.turn.end",
+            serde_json::json!({
+                "agent": turn.agent,
+                "ok": turn.error.is_none(),
+            }),
+        );
+        Some(turn)
+    }
+
+    async fn on_llm_response(
+        &self,
+        response: agent::agent::LlmResponseWrapper,
+    ) -> Option<agent::agent::LlmResponseWrapper> {
+        crate::extension::dispatcher().emit("model.after", serde_json::json!({ "ok": true }));
+        Some(response)
+    }
+
+    async fn on_tool_call(
+        &self,
+        mut call: agent::agent::ToolCallWrapper,
+    ) -> Option<agent::agent::ToolCallWrapper> {
+        let payload = serde_json::json!({ "tool": call.name, "arguments": call.args });
+        if let Some(value) = crate::extension::dispatcher().waterfall("tool.call.before", payload) {
+            if let Some(name) = value.get("tool").and_then(serde_json::Value::as_str) {
+                call.name = name.to_string();
+            }
+            if let Some(arguments) = value.get("arguments") {
+                call.args = arguments.clone();
+            }
+        }
+        Some(call)
+    }
+
+    async fn on_tool_result(
+        &self,
+        mut result: agent::agent::ToolResultWrapper,
+    ) -> Option<agent::agent::ToolResultWrapper> {
+        if let Some(value) =
+            crate::extension::dispatcher().waterfall("tool.call.after", result.result.clone())
+        {
+            result.result = value;
+        }
+        Some(result)
+    }
+}
+
+/// Aborts the live service watcher when the build that owns it is dropped.
+struct LiveDriverGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for LiveDriverGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+pub(crate) struct BuiltAgent {
+    /// The agent the shell runs turns against.
+    pub(crate) agent: Arc<Agent>,
+    /// Serialized length of the tool definitions the agent carries.
+    ///
+    /// The composer's context meter prices the request's tool schemas from this
+    /// array, the way the reference's `contextBreakdown` follows the latest
+    /// request header.
+    pub(crate) tools_schema_chars: usize,
+    /// Whether the configuration REQUESTED a complete persona.
+    ///
+    /// The request is no longer obeyed - the harness layers are always
+    /// composed - so this drives one thing: the diagnostics badge that names
+    /// the legacy flag and clears it in one click.
+    pub(crate) persona_complete: bool,
+    /// The installed plugins, for the settings inventory.
+    pub(crate) plugins: Vec<PluginInfo>,
+    /// Fiber activations held for exactly as long as this build is live.
+    pub(crate) extension_activations: crate::extension::host::ActivationList,
+    /// The service-change watcher for this build; aborted on drop.
+    live_driver: LiveDriverGuard,
+    /// What this build actually composed: every capability, its exact version,
+    /// and whether it runs here or on a peer. Taken once, after every provider,
+    /// extension, and MCP tool is in place, so it records the build rather than
+    /// a plan that was hoped for.
+    pub(crate) snapshot: Option<Arc<agent::capability::CompositionSnapshot>>,
+    /// Why the provider credential could not be resolved, if it could not.
+    ///
+    /// A locked vault is named here rather than silently handing the engine an
+    /// empty key. The field is absent for every build that needs no vault - a
+    /// plaintext key, an empty key awaiting environment auth, or no vault file.
+    pub(crate) credential_error: Option<VaultError>,
+    /// The tool-boundary policy this turn's tools ask before they act.
+    ///
+    /// It is compiled once here, not per tool call, and every file/shell tool
+    /// holds a clone. The denial ring and allow counters are readable through
+    /// it for the UI a later slice adds; until that pane exists, the tests are
+    /// the reader, so the field is deliberately kept without a production
+    /// caller.
+    #[allow(dead_code)]
+    pub(crate) policy: Arc<PolicySet>,
+    /// The one resolution this build used.
+    ///
+    /// The turn's runtime-context snapshot is rendered from THIS value rather
+    /// than from a second `effective_for` call, so the facts the model reads
+    /// and the facts the tools enforce cannot diverge.
+    pub(crate) effective: Effective,
+    /// The goal handle this turn's model tools write through, when the session
+    /// has a goal.
+    ///
+    /// The shell keeps it for the turn and settles the transition the model
+    /// recorded when the turn ends; a build without a goal (a pricing build, or
+    /// a session that never set one) carries none.
+    pub(crate) goal: Option<GoalStore>,
+    /// The memory lifecycle state this build resolved (issue #334): disabled,
+    /// ready, empty, or an initialization failure that is surfaced rather than
+    /// silently dropping the feature.
+    pub(crate) memory_state: crate::context_assembly::MemoryState,
+    /// The governed capture coordinator for this build's completed turns
+    /// (issue #343), when memory opened.
+    pub(crate) memory_capture: Option<Arc<crate::memory_capture::CaptureHandle>>,
+}
+
+impl BuiltAgent {
+    /// Start the service-change watcher for this build.
+    pub(crate) fn start_live_driver(&mut self) {
+        let Some(services) = self
+            .extension_activations
+            .first()
+            .map(|activation| activation.services())
+        else {
+            return;
+        };
+        let entries = self
+            .extension_activations
+            .iter()
+            .map(|activation| {
+                let requirements = activation
+                    .service_requirements()
+                    .iter()
+                    .map(|requirement| (requirement.name.clone(), requirement.optional))
+                    .collect();
+                crate::extension::live::LiveEntry::new(
+                    activation.extension_id().to_string(),
+                    activation.lease_snapshot(),
+                    requirements,
+                    &services,
+                )
+            })
+            .collect();
+        self.live_driver = LiveDriverGuard(crate::extension::live::start(
+            Arc::clone(&self.agent),
+            services,
+            entries,
+        ));
+    }
+
+    /// Suspend one extension's live tools/prompts/skills without dropping the
+    /// build. Commands and panels remain for the running turn.
+    #[allow(dead_code)] // driver lands with the service-change supervisor
+    pub(crate) fn suspend_extension(&self, id: &str) -> usize {
+        self.extension_activations
+            .iter()
+            .find(|activation| activation.extension_id() == id)
+            .map(|activation| activation.suspend_live(&self.agent))
+            .unwrap_or(0)
+    }
+
+    /// Resume a previously suspended extension's live overlay.
+    #[allow(dead_code)] // driver lands with the service-change supervisor
+    pub(crate) fn resume_extension(&self, id: &str) -> usize {
+        self.extension_activations
+            .iter()
+            .find(|activation| activation.extension_id() == id)
+            .map(|activation| activation.resume_live(&self.agent))
+            .unwrap_or(0)
+    }
+}
+
+/// Build the agent for one session.
+///
+/// 'choice' is the session's own model pair, and the only source of a model:
+/// a session that names none is built with nothing rather than a fallback. It
+/// is the same resolution the composer chip, the menu and the send gate read.
+///
+/// 'vault' is the in-app credential store and the only credential source: the
+/// settings tree stores no API key. The build reads the entry the SELECTED
+/// provider names, falling back to provider:ID:api_key when no entry is
+/// named. A vault that exists but is locked - and a named entry that does not
+/// exist - is reported through 'BuiltAgent::credential_error' instead of
+/// silently leaving the key empty.
+///
+/// `mcp` is the live server pool: its tools are registered under their
+/// server namespace, so a configured MCP server reaches the model on the very
+/// next turn without the settings pane being the only place that knows it.
+pub(crate) fn build_agent(
+    settings: &Settings,
+    vault: &Vault,
+    choice: &crate::settings::resolve::SessionChoice,
+    mcp: &crate::mcp::McpPool,
+) -> BuiltAgent {
+    build_agent_for_session(settings, vault, choice, mcp, "")
+}
+
+/// Build the agent for one turn, naming the session the turn belongs to.
+///
+/// The session id is half of a policy principal (session + preset + tool) and
+/// is what a denial row records. A build that only prices the tool schemas may
+/// pass an empty id.
+pub(crate) fn build_agent_for_session(
+    settings: &Settings,
+    vault: &Vault,
+    choice: &crate::settings::resolve::SessionChoice,
+    mcp: &crate::mcp::McpPool,
+    session: &str,
+) -> BuiltAgent {
+    build_agent_for_session_inner(
+        settings,
+        vault,
+        choice,
+        mcp,
+        session,
+        None,
+        Arc::new(agent::jobs::JobRegistry::new()),
+        // A build that only prices the request's tools carries its own browser:
+        // the tool schema must be the one a real turn sends, and nothing a
+        // pricing build does may reach the reader's pane.
+        Arc::new(crate::browser::BrowserHandle::new()),
+        // A pricing build carries no goal: it is pricing what a turn would
+        // send, and the goal tools are added only to a real turn's build.
+        None,
+        None,
+        ScannedSkills::Register,
+    )
+}
+
+/// Build a turn that can delegate to child agents. The parent id and the shared
+/// registry are attached before the tool schema is priced and before the agent
+/// is frozen into an Arc.
+#[allow(dead_code)]
+pub(crate) fn build_agent_for_session_with_subagents(
+    settings: &Settings,
+    vault: &Vault,
+    choice: &crate::settings::resolve::SessionChoice,
+    mcp: &crate::mcp::McpPool,
+    session: &str,
+    parent: &str,
+    subagents: Arc<crate::subagent::SubagentRegistry>,
+) -> BuiltAgent {
+    build_agent_for_session_with_subagents_and_jobs(
+        settings,
+        vault,
+        choice,
+        mcp,
+        session,
+        parent,
+        subagents,
+        Arc::new(agent::jobs::JobRegistry::new()),
+        Arc::new(crate::browser::BrowserHandle::new()),
+        // The delegation wrapper is a pricing/tool probe path: no goal rides
+        // here. A real turn comes through the _and_jobs entry with its goal.
+        None,
+    )
+}
+
+/// Build a turn that both delegates and shares the shell's live job roster.
+///
+/// The roster is created once per app and handed to every build, so a job a
+/// previous turn started stays readable and killable by the next one. The
+/// tools and the header draw the same registry. The session goal, when there
+/// is one, rides in the same way: the model tools write through its store and
+/// the shell settles it at the turn's end.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_agent_for_session_with_subagents_and_jobs(
+    settings: &Settings,
+    vault: &Vault,
+    choice: &crate::settings::resolve::SessionChoice,
+    mcp: &crate::mcp::McpPool,
+    session: &str,
+    parent: &str,
+    subagents: Arc<crate::subagent::SubagentRegistry>,
+    jobs: Arc<agent::jobs::JobRegistry>,
+    browser: Arc<crate::browser::BrowserHandle>,
+    goal: Option<Goal>,
+) -> BuiltAgent {
+    build_agent_for_session_with_subagents_jobs_and_review(
+        settings, vault, choice, mcp, session, parent, subagents, jobs, browser, goal, None,
+    )
+}
+
+/// Build a turn that also records exact file changes for review.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_agent_for_session_with_subagents_jobs_and_review(
+    settings: &Settings,
+    vault: &Vault,
+    choice: &crate::settings::resolve::SessionChoice,
+    mcp: &crate::mcp::McpPool,
+    session: &str,
+    parent: &str,
+    subagents: Arc<crate::subagent::SubagentRegistry>,
+    jobs: Arc<agent::jobs::JobRegistry>,
+    browser: Arc<crate::browser::BrowserHandle>,
+    goal: Option<Goal>,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
+) -> BuiltAgent {
+    build_agent_for_session_inner(
+        settings,
+        vault,
+        choice,
+        mcp,
+        session,
+        Some((parent, subagents)),
+        jobs,
+        browser,
+        goal,
+        review,
+        ScannedSkills::Register,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_agent_for_session_inner(
+    settings: &Settings,
+    vault: &Vault,
+    choice: &crate::settings::resolve::SessionChoice,
+    mcp: &crate::mcp::McpPool,
+    session: &str,
+    subagents: Option<(&str, Arc<crate::subagent::SubagentRegistry>)>,
+    jobs: Arc<agent::jobs::JobRegistry>,
+    browser: Arc<crate::browser::BrowserHandle>,
+    goal: Option<Goal>,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
+    scanned_skills: ScannedSkills,
+) -> BuiltAgent {
+    let eff = settings.effective_for(choice);
+    // A contributed provider may declare that it needs no credential - an open
+    // or anonymous lane. Its package said so, so the build does not invent a
+    // missing-key refusal for an endpoint that was never going to be sent one.
+    let (api_key, credential_error) =
+        if eff.provider.trim().is_empty() || settings.global.provider_requires_key(&eff.provider) {
+            provider_api_key(&eff, vault)
+        } else {
+            (String::new(), None)
+        };
+    // The wire form is `<provider>/<model>`: the engine registers one vendor
+    // per provider id and resolves the prefix out of this string, so the id the
+    // Models pane shows is the id the engine dispatches on.
+    let model = if eff.provider.is_empty() {
+        eff.model.clone()
+    } else {
+        format!("{}/{}", eff.provider, eff.model)
+    };
+    // The persona is a SLOT by default (identity < persona < workflow). A
+    // persona that sets `complete` is the reference's sole-section arm: its
+    // text is the whole prompt, so tool guidance is suppressed below too. An
+    // empty persona under `complete` falls back to the default composition,
+    // because an empty system prompt is never what a persona meant.
+    // A complete persona is the reader's explicit choice: it replaces the
+    // identity, the workflow and the per-tool sections, while the compact
+    // harness execution footer stays. The toggle lives in the Agent loop pane
+    // and in the composer's permission menu; it edits the document that OWNS
+    // the persona in force (the preset that ships it, else the workspace), and
+    // the build reports the state so an off-contract turn is attributable to
+    // the setting.
+    let persona_complete = eff.persona_complete && !eff.llm_system_prompt().trim().is_empty();
+    if persona_complete {
+        log::warn!(
+            "persona complete: session {session} sends the persona plus the harness execution footer; the identity, workflow and tool guidance are omitted"
+        );
+    }
+    let mut system_prompt =
+        agent::prompts::compose_system_prompt_with(eff.llm_system_prompt(), persona_complete);
+    if persona_complete {
+        // A complete persona replaces the identity, workflow and per-tool
+        // guidance, but NOT the host-owned runtime contract (issue #332): the
+        // session/workspace semantics and stop/queue behavior stay, ahead of
+        // the execution footer so the footer remains the closing section.
+        system_prompt.push_str(
+            "
+
+",
+        );
+        system_prompt.push_str(crate::prompts::HARNESS_CONTEXT);
+        system_prompt.push_str(crate::prompts::COMPLETE_PERSONA_CONTRACT);
+    }
+    let mut config = AgentConfig {
+        name: "bsh".to_string(),
+        model,
+        base_url: eff.base_url.clone(),
+        api_key,
+        system_prompt,
+        persona_complete,
+        temperature: eff.temperature,
+        // The composer's "Off" level is stored as the literal `off` so it can
+        // beat the model's declared effort; on the wire it means NO effort field
+        // rather than a string a provider would reject.
+        reasoning_effort: eff
+            .reasoning_effort
+            .clone()
+            .filter(|level| !level.eq_ignore_ascii_case("off")),
+        max_tokens: eff.max_tokens,
+        // The summarizer's request is bounded against the same window the
+        // session is configured to send into, less the checkpoint's own output
+        // reservation. Without this, a history larger than the window reached
+        // the provider whole and came back as an error the UI called a useless
+        // summary.
+        compaction_input_tokens: compaction_input_tokens(&eff),
+        // The workspace's tool-output cap governs what one result may add to
+        // the MODEL's session too, not only what the UI displays: a 16 KB cap
+        // halves the context growth per big tool call against the engine's
+        // 48 KB default, which is what kept the auto-compaction trigger hot.
+        tool_output_cap: eff.tool_output_cap,
+        // A slow provider is not a failed one. This one number bounds a request
+        // at both layers the reader can see: the engine's per-call ceiling and
+        // the vendor's idle-socket guard. Inheriting the framework's 60s
+        // default put a one-minute wall in front of a turn a reasoning model
+        // or a buffering gateway can spend minutes on, while it is working
+        // perfectly.
+        timeout_secs: eff.llm_timeout_secs,
+        // The retry budget for a transient failure. It is the engine's own
+        // budget, because BSH configures no resilience layer (a rate limiter
+        // here would also throttle healthy turns).
+        max_retries: eff.llm_max_retries,
+        // No ceiling: the loop ends when the model stops asking for tools, so a
+        // long but healthy turn is never cut off by a number. A zero budget is
+        // the engine's "unbounded" contract.
+        max_steps: 0,
+        parallel_tool_calls: eff
+            .preset_parallel_tool_calls
+            .unwrap_or(eff.parallel_tool_calls),
+        ..AgentConfig::default()
+    };
+    // BSH does not read the ambient BOS config: the settings files are the
+    // whole truth for this shell. The model's declared protocol arrives through
+    // the settings instead, so the pane and the wire agree by construction.
+    config.api_mode = eff.api_mode.clone();
+    // Search is a LOCAL tool here (see `crate::web`), so the framework's hosted
+    // `web_search` object stays withdrawn: it is a Responses-only capability and
+    // two tools named `web_search` on one request would collide. What decides
+    // whether the reader gets search at all is the workspace switch, narrowed by
+    // the preset - see `offers_local_web_search` for why that is an
+    // intersection and not an override.
+    config.web_search = false;
+    let web_search_on = offers_local_web_search(eff.web_tools_enabled, eff.preset_web_search);
+    // A zero context budget disables pressure compaction; it must disable the
+    // mid-turn check too. Otherwise the manual-/compact fallback ceiling would
+    // turn it back on behind the setting's back.
+    let mid_turn_budget = if eff.context_budget == 0 {
+        0
+    } else {
+        config.compaction_input_tokens
+    };
+
+    let mut agent = Agent::from_config(config).with_context_budget(mid_turn_budget);
+    agent.add_plugin(Arc::new(DispatcherPlugin));
+    // Canonicalise once: `resolve_path` canonicalises every target, so the
+    // policy data and the shell cwd must carry the same spelling of the root or
+    // a symlinked workspace would look outside itself.
+    let root = workspace_root(&eff).map(|path| path.canonicalize().unwrap_or(path));
+    // A turn with file or shell tools and NO root can only refuse every path,
+    // which the model reads as "the workspace is unreadable". A fresh install
+    // or a settings tree that names no workspace is exactly this state, so say
+    // it here, once, with the ids that explain where it came from.
+    if root.is_none() && (eff.file_tools_enabled || eff.bash_enabled) {
+        log::warn!(
+            "turn for session {session} has file/shell tools but no workspace root (session workspace {:?}, active workspace {:?}); every path will be refused",
+            choice.workspace,
+            settings.global.general.active_workspace
+        );
+    }
+    // The tool-boundary policy is compiled ONCE for this turn. Every file and
+    // shell tool below holds a clone of this Arc, so a check costs an engine
+    // eval and nothing else; there is no parse, no disk read and no data
+    // install per call. It is rebaked whenever the turn is rebuilt, which is
+    // the preset or workspace change the design calls for.
+    let policy = policy_for_effective(settings, &eff);
+    let preset = eff.preset_id.clone();
+    // A preset names the BUNDLES it wants, not their tools: the shipped
+    // presets say `shell`, `files` and `plan`, while the bundle that carries the
+    // shell is named `shell` and its own tool `bash`. Comparing a tool name
+    // against a bundle name would switch every tool off, which is exactly the
+    // wrong-model symptom of an agent that answers with no tools at all. So the
+    // preset answers by bundle, and the tool-level switch answers by tool.
+    // A selected preset's plugin list is authoritative even when it is EMPTY:
+    // Minimal mounts nothing, and an empty list must not read as "no preset".
+    let preset_bundles = (!eff.preset_id.is_empty()).then(|| eff.preset_plugins.clone());
+    let off_bundle = |name: &str| {
+        if let Some(allowed) = &preset_bundles {
+            if !allowed.iter().any(|bundle| bundle == name) {
+                return true;
+            }
+        }
+        false
+    };
+    let preset_tools = eff.preset_tools.as_deref();
+    let off_tool = |name: &str| {
+        eff.disabled_tools.iter().any(|d| d == name)
+            || preset_tools.is_some_and(|tools| !tools.iter().any(|tool| tool == name))
+    };
+    // The goal tools are session-durable state, not a preset capability: a
+    // preset's tool allowlist must NOT withdraw the only path that can complete
+    // or block a goal, or a goal created under that preset can only run to its
+    // round cap. The reader's own per-tool switch still applies.
+    let off_goal_tool = |name: &str| eff.disabled_tools.iter().any(|d| d == name);
+    let mut bundles: Vec<plugins::Bundle> = Vec::new();
+
+    // The permission mode is the reference's own trinary, and each arm lands on
+    // a real seam rather than a label:
+    //
+    // - Read Only withholds the two side-effecting tool families, so the shell
+    //   and every write are absent from the request, not merely refused.
+    // - Workspace Write is the confined build: the shell validator and the file
+    //   tools' root are both installed.
+    // - Full access hands the shell `workspace_root: None`, which is the one
+    //   switch that drops BashTool's destructive and elevated-privilege guards.
+    //   The shell still STARTS in the workspace (its own cwd), and the file
+    //   tools keep their root at every tier: the release widens the SANDBOX, it
+    //   does not make the project forgettable. The policy still confines every
+    //   file path to the workspace, so the root costs nothing to keep.
+    // The preset's permission is a ceiling, never a grant: a read-only preset
+    // keeps a Full-access session read-only, while a full-access preset cannot
+    // lift a read-only session.
+    // The ONE resolved tier: the session's request capped by the preset's
+    // ceiling. The Rust registration matrix below is the first tier and stays
+    // in place; the policy engine gets the same effective value as data, so a
+    // tool that is reached another way is still refused (defence in depth).
+    let permission = eff.permission.effective.clone();
+    // The SHELL's confinement is its own resolved fact: a preset may force heel
+    // under full access, or (only at full access) turn it off. The file tools
+    // keep following the permission tier, which the preset already caps.
+    let shell_confined = eff.sandbox.heel;
+    let writes = allows_writes(&permission);
+    // ONE capability decision for the shell family and the delegation tool.
+    // Permission, the preset's tool allowlist and the Rego capability answer
+    // are intersected here; registration below only consumes the result.
+    let gates = tool_gates_for(&permission, preset_tools, &policy, session);
+
+    if eff.bash_enabled && !off_bundle("shell") {
+        let mut shell_tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        if gates.bash && !off_tool("bash") {
+            let config = agent::tools::bash::BashToolConfig {
+                // The cwd is the workspace root whenever the shell is CONFINED
+                // or a preset explicitly unconfined it: for those two arms the
+                // spawn question is asked about this path, and the baseline's
+                // path rule answers it.
+                //
+                // An INHERITED full-access release is the third arm, and it is
+                // deliberately handed None: None is the one switch that leaves
+                // BashTool's validator unset and so drops its destructive and
+                // elevated-privilege guards. None also means the shell's cwd is
+                // the app's launch directory rather than the workspace, so the
+                // policy MUST permit the spawn by TIER - that is what the
+                // baseline's `spawn-shell-full-access` arm is for. A path-only
+                // policy would refuse every command here before a process
+                // existed, which is exactly the bug this arm fixes.
+                workspace_root: if shell_confined || eff.sandbox.off_by_policy() {
+                    root.as_ref().map(|r| r.to_string_lossy().to_string())
+                } else {
+                    None
+                },
+                // The directory the command STARTS in is the project the reader
+                // is working on, whatever the confinement says: a released
+                // shell that inherited the app's launch directory ran `pwd` in
+                // the wrong project entirely (measured: a chat in `hello`
+                // reported the BOS checkout).
+                cwd: root.as_ref().map(|r| r.to_string_lossy().to_string()),
+                timeout_secs: eff.shell_timeout_secs,
+                ..Default::default()
+            };
+            // ONE sandbox spec for the shell and the terminal pane: the grants
+            // are the policy's own answers, asked once per candidate, so the
+            // confinement is not a profile this file wrote down. At full access
+            // the DEFAULT is still an unconfined spec (today's release); a
+            // preset's explicit heel is the narrowing arm, and an explicit none
+            // is the widening arm the resolver already guard-checked.
+            let spec = sandbox_spec_for(&policy, &eff, "bash", session);
+            let mut bash = BashTool::new("bash")
+                .with_config(config)
+                .with_policy(policy.clone(), session, preset.clone())
+                .with_jobs(jobs.clone(), session)
+                .with_background(gates.background_spawn)
+                .with_sandbox_spec(spec);
+            // ONE attribution for both spawn paths: the settings switch wins
+            // over a preset's arm, and a permission release sets nothing here so
+            // the tool's own fallback names it.
+            if let Some(reason) = crate::settings::resolve::sandbox_off_reason(&eff.sandbox) {
+                bash = bash.with_sandbox_reason(reason);
+            }
+            // Publish the SAME tool to the scheduled-job seam: a job fired from
+            // the task store must run under this session's policy and sandbox,
+            // and rebuilding it elsewhere would duplicate (and drift from) the
+            // permission decision made here.
+            let bash: Arc<dyn agent::tools::Tool> = Arc::new(bash);
+            crate::extension::commands::install_command_tool(session, Arc::clone(&bash));
+            shell_tools.push(Arc::new(DeclaredTool::new(bash, declare("bash"))));
+        }
+        // The job tools share the shell bundle but each has its own gate: a
+        // preset that names only `job_output` gets exactly that tool, and a
+        // policy that denies `job_kill` leaves the reader intact.
+        if gates.output && !off_tool("job_output") {
+            shell_tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(
+                    agent::tools::JobTool::reader("job_output")
+                        .with_policy(policy.clone(), session, preset.clone())
+                        .with_jobs(jobs.clone(), session),
+                ),
+                declare("job_output"),
+            )));
+        }
+        if gates.list && !off_tool("job_list") {
+            shell_tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(
+                    agent::tools::JobTool::lister("job_list").with_jobs(jobs.clone(), session),
+                ),
+                declare("job_list"),
+            )));
+        }
+        if gates.kill && !off_tool("job_kill") {
+            shell_tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(
+                    agent::tools::JobTool::stopper("job_kill")
+                        .with_policy(policy.clone(), session, preset.clone())
+                        .with_jobs(jobs.clone(), session),
+                ),
+                declare("job_kill"),
+            )));
+        }
+        if !shell_tools.is_empty() {
+            bundles.push(plugins::Bundle::new("shell", shell_tools));
+        }
+    }
+    if eff.file_tools_enabled && !off_bundle("files") {
+        // The workspace root is what a RELATIVE path resolves against, so every
+        // file tool keeps it at EVERY tier. The release arm used to pass None
+        // here, which did not widen anything - the policy still denies reads
+        // and writes outside the workspace at full access, and only the SHELL
+        // may spawn anywhere - but it broke relative paths outright ("no
+        // workspace root is open for this turn") and left grep/glob walking the
+        // app's launch directory instead of the project.
+        let files_root = root.clone();
+        // The escape pre-check belongs to the confined tier; a released turn
+        // leaves the decision to the policy, whose rule name is what the
+        // reader and the audit see.
+        let enforce_escape = is_confined(&permission);
+        let mut files: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        if !off_tool("glob") {
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(glob_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("glob"),
+            )));
+        }
+        if !off_tool("grep") {
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(grep_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("grep"),
+            )));
+        }
+        if !off_tool("read_file") {
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(read_file_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("read_file"),
+            )));
+        }
+        if !off_tool("read_files") {
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(read_files_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("read_files"),
+            )));
+        }
+        if writes && !off_tool("write_file") {
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(write_file_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                    review.clone(),
+                )),
+                declare("write_file"),
+            )));
+        }
+        if writes && !off_tool("edit_file") {
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(edit_file_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                    review.clone(),
+                )),
+                declare("edit_file"),
+            )));
+        }
+        if writes && !off_tool("sed") {
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(sed_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                    review.clone(),
+                )),
+                declare("sed"),
+            )));
+        }
+        if writes && !off_tool("apply_patch") {
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(apply_patch_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                    review.clone(),
+                )),
+                declare("apply_patch"),
+            )));
+        }
+        if !off_tool("list_dir") {
+            files.push(Arc::new(DeclaredTool::new(
+                Arc::new(list_dir_tool(
+                    files_root.clone(),
+                    enforce_escape,
+                    policy.clone(),
+                    session.to_string(),
+                    preset.clone(),
+                )),
+                declare("list_dir"),
+            )));
+        }
+        if !files.is_empty() {
+            bundles.push(plugins::Bundle::new("files", files));
+        }
+    }
+    if !off_bundle("plan") {
+        let mut plan_tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        if !off_tool("update_plan") {
+            plan_tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(PlanTool::new(agent.plan())),
+                declare("update_plan"),
+            )));
+        }
+        // The model's way to ask the reader: the chat draws the options as
+        // buttons and the choice arrives as the next user message (OpenCode's
+        // question-tool shape). Rides the plan bundle so every preset that can
+        // plan can also ask.
+        if !off_tool("ask_user") {
+            plan_tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(FunctionTool::new(
+                    "ask_user",
+                    "Ask the reader up to six questions with 2-6 options each, drawn as buttons. multi_select allows several picks; single-select advances on one click. Answers arrive as the next user message; end your turn after calling.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "questions": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "question": { "type": "string" },
+                                        "options": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 6 },
+                                        "multi_select": { "type": "boolean" }
+                                    },
+                                    "required": ["question", "options"]
+                                }
+                            }
+                        },
+                        "required": ["questions"]
+                    }),
+                    |args| {
+                        let questions = args
+                            .get("questions")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        if questions.is_empty() || questions.len() > 6 {
+                            return Err(ToolError::InvalidInput(
+                                "questions must list one to six questions".to_string(),
+                            ));
+                        }
+                        for item in &questions {
+                            let question = item
+                                .get("question")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim();
+                            let options = item
+                                .get("options")
+                                .and_then(|v| v.as_array())
+                                .map(|list| {
+                                    list.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .filter(|s| !s.trim().is_empty())
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            if question.is_empty() {
+                                return Err(ToolError::InvalidInput(
+                                    "every question needs text".to_string(),
+                                ));
+                            }
+                            if !(2..=6).contains(&options) {
+                                return Err(ToolError::InvalidInput(
+                                    "every question needs two to six options".to_string(),
+                                ));
+                            }
+                        }
+                        Ok(serde_json::json!({
+                            "status": "presented",
+                            "questions": questions.len(),
+                            "note": "The reader sees the questions as steps with the options as buttons. End your turn now; their answers arrive as the next user message."
+                        }))
+                    },
+                )),
+                declare("ask_user"),
+            )));
+        }
+        if !plan_tools.is_empty() {
+            bundles.push(plugins::Bundle::new("plan", plan_tools));
+        }
+    }
+
+    // The model's way to settle a goal. This is session-durable state rather
+    // than a preset capability, so it answers to the reader's per-tool switches
+    // and NOT to the preset's bundle list or tool allowlist: a preset that
+    // names `shell`, `files` and `plan` (or one that narrows the tools to a
+    // list) must not silently withdraw the one path that can complete a goal -
+    // a goal created under such a preset could otherwise only run to its round
+    // cap. Each goal tool answers to its OWN switch: gating the pair with one
+    // condition withdrew both when either was unchecked, and since the Tools
+    // pane lists the tools the built agent carries, the surviving row vanished
+    // too. The store is attached whenever EITHER tool is present, because
+    // settling a recorded transition needs it.
+    let mut goal_store = None;
+    if let Some(goal) = goal {
+        let store = GoalStore::new(goal);
+        let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        if !off_goal_tool("get_goal") {
+            tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(GetGoalTool::new(store.clone())),
+                declare("get_goal"),
+            )));
+        }
+        if !off_goal_tool("update_goal") {
+            tools.push(Arc::new(DeclaredTool::new(
+                Arc::new(UpdateGoalTool::new(store.clone())),
+                declare("update_goal"),
+            )));
+        }
+        if !tools.is_empty() {
+            goal_store = Some(store);
+            bundles.push(plugins::Bundle::new("goal", tools));
+        }
+    }
+
+    // The model's own automation tasks, mounted by the `schedule` bundle the
+    // shipped presets list. Read Only never reaches here at all because it
+    // grants no writes, the reader's per-tool switches close one tool at a
+    // time, and the Extensions list closes the bundle.
+    //
+    // The tools never touch settings: a turn is built from a snapshot, so they
+    // queue a request and the shell applies it (see crate::schedule).
+    if writes && !off_bundle("schedule") {
+        let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        for tool in schedule_tools(settings.global.schedules.clone(), session) {
+            if off_tool(tool.name()) {
+                continue;
+            }
+            let metadata = declare(tool.name());
+            tools.push(Arc::new(DeclaredTool::new(tool, metadata)));
+        }
+        if !tools.is_empty() {
+            bundles.push(plugins::Bundle::new("schedule", tools));
+        }
+    }
+
+    // Agent-authored interfaces. Available whenever the turn may write, and
+    // still answerable to the reader's per-tool switches and to the preset's
+    // bundle list: a presented surface is a proposal the reader can close,
+    // not authority, and a shell-only preset keeps no surface tool.
+    if writes && !off_bundle("surface") {
+        let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        for tool in surface_tools() {
+            if off_tool(tool.name()) {
+                continue;
+            }
+            let metadata = declare(tool.name());
+            tools.push(Arc::new(DeclaredTool::new(tool, metadata)));
+        }
+        if !tools.is_empty() {
+            bundles.push(plugins::Bundle::new("surface", tools));
+        }
+    }
+
+    // Federation is a first-class tool family, not a hidden pane action: the
+    // model lists peers and delegates through the same signed node the UI uses.
+    if (crate::federation_node::running().is_some() || settings.global.federation.enabled)
+        && !off_bundle("federation")
+    {
+        let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+        // Read Only keeps the QUERIES (status, peers, knowledge) and loses the
+        // actions: delegating work to a peer and deleting a peer's artifacts
+        // are writes this turn may not perform.
+        let writes = allows_writes(&permission);
+        for tool in crate::federation_tools::FederationTool::bundle() {
+            let name = tool.name().to_string();
+            if !writes
+                && matches!(
+                    name.as_str(),
+                    "federation_delegate" | "federation_cancel" | "federation_cleanup"
+                )
+            {
+                continue;
+            }
+            // Standard keeps the federation queries but not distributed
+            // delegation; the Federation preset grants it.
+            if !eff.distributed_delegate && name == "federation_delegate" {
+                continue;
+            }
+            if off_tool(&name) {
+                continue;
+            }
+            let metadata = declare(&name);
+            tools.push(Arc::new(DeclaredTool::new(Arc::new(tool), metadata)));
+        }
+        if !tools.is_empty() {
+            bundles.push(plugins::Bundle::new("federation", tools));
+        }
+    }
+
+    // The registry is the source of the agent's tools: install the bundles,
+    // then hand every tool they contributed to the agent.
+    let (mut registry, mut plugins) =
+        plugins::install(bundles, &settings.workspace.disabled.extensions);
+    for name in registry.tool_names() {
+        if let Some(tool) = registry.tool(&name) {
+            agent.add_tool(tool);
+        }
+    }
+
+    // The BSH extension platform. Its enabled packages contribute tools,
+    // commands, panels, prompts and contexts through the same agent and plugin
+    // seams the built-in bundles use, and they are gated by the preset's own
+    // extension allowlist and the workspace's disabled list. A failure here is
+    // logged and reflected in the status/doctor surfaces; it never stops the
+    // turn from being built.
+    let extension_activations = crate::extension::install_with_fibers(
+        &mut agent,
+        &mut registry,
+        settings,
+        root.as_deref(),
+        eff.preset_extensions.as_deref(),
+        session,
+    );
+    plugins.extend(
+        extension_activations
+            .iter()
+            .map(|activation| activation.info.clone()),
+    );
+    // Hooks are installed after the extension platform has applied its
+    // packages: the decision is "is a hook-attached package live for THIS
+    // build", and a package installed in this build is live now.
+    crate::extension::hooks::install_agent_hooks(&mut agent);
+
+    // The MCP HTTP path is the tool boundary's network egress. The pool shares
+    // one slot with every live transport, so installing this turn's gate here
+    // updates connections that were opened before the turn without respawning
+    // them. ureq resolves through the gate, so a denied host opens no socket.
+    mcp.set_egress_gate(Arc::new(EgressGate::new(
+        policy.clone(),
+        Arc::new(SystemResolver),
+        session,
+        preset.clone(),
+        "mcp",
+    )));
+
+    // MCP tools come from the live pool rather than from the document: the
+    // connection is the expensive part and it is shared across turns. A name
+    // the registry already holds is skipped by the registration itself.
+    //
+    // A large roster collapses behind one gateway: forty MCP tools would put
+    // forty schemas in every request, and the model can discover the one it
+    // needs through action=list. Small rosters keep real tools, which cost less
+    // than the indirection.
+    let mcp_tools: Vec<crate::mcp::McpTool> = mcp
+        .tools()
+        .filter(|tool| {
+            // A preset names the MCP server namespaces it wants. None means
+            // every connected server; an empty list means none.
+            if eff
+                .preset_mcps
+                .as_ref()
+                .is_some_and(|servers| !servers.iter().any(|server| server == &tool.namespace))
+            {
+                return false;
+            }
+            if eff.preset_mcp_tools.as_ref().is_some_and(|tools| {
+                let full = format!("{}_{}", tool.namespace, tool.name);
+                !tools.iter().any(|allowed| allowed == &full)
+            }) {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect();
+    if mcp_tools.len() > crate::mcp::MCP_GATEWAY_THRESHOLD {
+        let gateway = Arc::new(DeclaredAsyncTool::new(
+            Arc::new(crate::mcp::McpGateway::new(mcp_tools.clone())),
+            declare("mcp_gateway"),
+        ));
+        match agent.try_add_async_tool(gateway) {
+            Ok(()) => log::info!(
+                "mcp: {} tools behind one gateway (threshold {})",
+                mcp_tools.len(),
+                crate::mcp::MCP_GATEWAY_THRESHOLD
+            ),
+            Err(error) => {
+                log::warn!(
+                    "MCP gateway was not registered: {error}; registering tools individually"
+                );
+                for tool in &mcp_tools {
+                    if let Err(error) =
+                        agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone())
+                    {
+                        log::warn!("MCP tool '{}' was not registered: {error}", tool.name);
+                    }
+                }
+            }
+        }
+    } else {
+        for tool in &mcp_tools {
+            if let Err(error) =
+                agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone())
+            {
+                log::warn!("MCP tool '{}' was not registered: {error}", tool.name);
+            }
+        }
+    }
+
+    // Skills come from the ENABLED sources the resolution already scanned, and
+    // only from the skills it kept: turning a source off removes its skills from
+    // this list, and turning a skill off removes that one. Registering from the
+    // resolved catalogue rather than re-walking the directories is what makes
+    // the pane's toggle and the agent's build one fact instead of two scans that
+    // agree by luck.
+    //
+    // A preview build skips this: registering every manifest is the expensive
+    // part of a build (2.2 s on the 121 skills measured here), and the pane
+    // lists skills from that same cached catalogue instead.
+    if scanned_skills == ScannedSkills::Register {
+        for skill in eff.enabled_skills() {
+            let _ = agent.register_skill_manifest(skill.manifest.clone());
+        }
+    }
+
+    // Installed extension packages named by a path in the global inventory.
+    // Both standards lower onto one registry: their tools and hooks go onto the
+    // same agent this turn runs, while their commands and panels land in the
+    // host plugin registry. A refusal (a DSH JavaScript entry, a Codex app
+    // connector) is reported with the package id rather than silently dropped;
+    // declared MCP servers are handled by the MCP pool below.
+    let mut extensions = agent::extensions::ExtensionRegistry::new();
+    let mut installed_extensions: Vec<(String, String)> = Vec::new();
+    // The packages this build actually asked for, as (id, root). The bridge
+    // reconcile below uses it to stop the process of a package that was disabled,
+    // uninstalled, distrusted, or repointed: a plugin whose tools are no longer
+    // offered must not keep running.
+    let mut wanted: Vec<(String, PathBuf)> = Vec::new();
+    for entry in &settings.global.extensions {
+        if eff
+            .preset_extensions
+            .as_ref()
+            .is_some_and(|allowed| !allowed.iter().any(|id| id == &entry.id))
+        {
+            continue;
+        }
+        if settings
+            .workspace
+            .disabled
+            .extensions
+            .iter()
+            .any(|disabled| disabled == &entry.id)
+        {
+            continue;
+        }
+        let Some(raw) = entry
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        // TRUST IS THE GATE. Only a package the reader approved at THIS path may
+        // have its host entry executed; an untrusted one is parsed declaratively
+        // and its entry refused by name, which is what `load_with_trust` does
+        // without starting a process.
+        let trust = if entry.is_trusted() {
+            agent::extensions::Trust::Trusted
+        } else {
+            agent::extensions::Trust::Untrusted
+        };
+        let root = expand_path(raw);
+        match agent::extensions::ExtensionRegistry::load_with_trust(&root, trust) {
+            Ok(package) => {
+                for refusal in &package.refusals {
+                    // The shim declines to own MCP processes; the MCP pool
+                    // starts them from the package's config instead.
+                    if refusal.feature == agent::extensions::RefusedFeature::McpServer {
+                        continue;
+                    }
+                    warn!("extension refused a part: {refusal}");
+                }
+                let package_id = package.extension.id.clone();
+                // A trusted entry that RAN left a live session behind. Adopt it
+                // into the process-wide pool so its tools stay callable after
+                // this build returns: the pool is the only owner that outlives
+                // the parse.
+                if let Some(session) = package.session.clone() {
+                    with_bridge_pool(|pool| {
+                        pool.adopt(&package_id, root.clone(), Arc::clone(&session));
+                    });
+                    wanted.push((package_id.clone(), root.clone()));
+                }
+                if let Err(error) = extensions.install(package) {
+                    warn!("extension '{}' was not installed: {error}", entry.id);
+                } else {
+                    // The inventory row keeps the settings id the disable list
+                    // and the pane toggle use; the package id is the registry
+                    // key and the source of the contributed tool names.
+                    installed_extensions.push((entry.id.clone(), package_id));
+                }
+            }
+            Err(error) => warn!("extension '{}' could not be loaded: {error}", entry.id),
+        }
+    }
+    // A plugin process outlives the build that started it, so the reconcile has
+    // to be here: every package the pool holds but this build did not ask for is
+    // stopped now. Without it, disabling or untrusting a package would leave its
+    // process running with its tools still on the agent.
+    with_bridge_pool(|pool| {
+        pool.retain(|id, root| {
+            wanted
+                .iter()
+                .any(|(wanted_id, wanted_root)| wanted_id == id && wanted_root == root)
+        });
+    });
+    if !extensions.is_empty() {
+        if let Err(error) = extensions.apply_to_agent(&mut agent) {
+            warn!("extensions could not be applied to the agent: {error}");
+        }
+        for (settings_id, package_id) in &installed_extensions {
+            plugins.push(PluginInfo {
+                name: settings_id.clone(),
+                tools: extensions.tool_names_of(package_id),
+                enabled: true,
+                error: None,
+            });
+        }
+        if let Err(error) = extensions.install_host_items(&mut registry) {
+            warn!("extension commands and panels could not be installed: {error}");
+        }
+    }
+
+    let mut memory_capture = None;
+    let memory_state = if eff.memory_enabled {
+        let opened = open_memory(settings, choice, session);
+        if let Some(memory) = opened.store {
+            agent = agent.with_memory(memory);
+            // Recall is bounded by tokens, not only item count (issue #345).
+            agent.set_memory_token_budget(Some(MEMORY_RECALL_TOKEN_BUDGET));
+        }
+        memory_capture = opened.capture;
+        opened.state
+    } else {
+        crate::context_assembly::MemoryState::Disabled
+    };
+
+    let mut task_subagents: Option<Arc<SubagentContext>> = None;
+    if let Some((parent, registry)) = subagents {
+        // Delegation is a capability, not a free attachment: the same single
+        // predicate that gates the shell family decides whether the tool and
+        // its standing guidance exist at all, and the reader's own switch for
+        // `subagent` closes it like every other tool's.
+        if gates.subagent && !off_tool("subagent") {
+            let context = Arc::new(SubagentContext::new(
+                &agent,
+                parent,
+                parent,
+                0,
+                registry,
+                policy.clone(),
+                preset.clone(),
+                root.as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                crate::context::RuntimeFacts::from_effective(&eff),
+                SubagentTools {
+                    message: !off_tool("send_message"),
+                    interrupt: !off_tool("interrupt_agent"),
+                },
+            ));
+            task_subagents = Some(context.clone());
+            attach_subagent_tool(&mut agent, context);
+        }
+    }
+
+    // Durable tasks: create a record and run it as a turn, then join it.
+    // The store lives beside the workspace's sessions, so a turn's task is
+    // scoped to the workspace that turn actually runs in.
+    let task_root = choice
+        .workspace
+        .as_ref()
+        .and_then(|id| {
+            settings
+                .global
+                .workspaces
+                .iter()
+                .find(|workspace| &workspace.id == id)
+        })
+        .map(|workspace| std::path::PathBuf::from(&workspace.root))
+        .or_else(|| {
+            let root = settings.active_workspace_root();
+            (!root.is_empty()).then(|| std::path::PathBuf::from(root))
+        });
+    if let Some(workspace) = task_root {
+        if !off_tool("task_create") {
+            let task_bash = agent.registry().and_then(|registry| registry.get("bash"));
+            crate::task_tools::attach(
+                &mut agent,
+                crate::task_tools::TaskToolsContext {
+                    session: session.to_string(),
+                    workspace,
+                    subagents: task_subagents,
+                    bash: task_bash,
+                    jobs: Some(jobs.clone()),
+                },
+            );
+        }
+    }
+
+    // The built-in browser: its tools act on ONE shared pane. The handle is the
+    // shell's, so a call and the reader's pane show the same document; a pricing
+    // build passes its own.
+    //
+    // The browser asks the SAME turn egress policy the shell and the MCP
+    // transport ask (issue #329): a refused host is unreachable through the
+    // pane too, and Read Only refuses local browser egress.
+    browser.set_egress_gate(Arc::new(EgressGate::new(
+        policy.clone(),
+        Arc::new(SystemResolver),
+        session,
+        preset.clone(),
+        "browser",
+    )));
+    crate::browser::attach(&mut agent, crate::browser::Tools { browser });
+
+    // The local web-search tool. It asks the SAME policy the browser and the
+    // shell ask, and it is offered only when the reader (or the preset) wants
+    // search: a tool the pane says is off must not be in the request.
+    if web_search_on && !off_tool("web_search") {
+        crate::web::attach(
+            &mut agent,
+            crate::web::Tools {
+                config: web_search_config(settings, vault),
+                policy: policy.clone(),
+                session: session.to_string(),
+                preset: preset.clone(),
+            },
+        );
+    }
+
+    // The workspace's skill switches are name-keyed, and the settings scan
+    // already honors them for its own skills. A package's skills arrive after
+    // that scan - the extension platform in the live overlay, the legacy shim
+    // straight into the build's own list - so the switch is applied to the
+    // finished set here: without it a switched-off package skill stayed in the
+    // request while a switched-off scanned skill left, and the menu could not
+    // state what the model actually carried.
+    //
+    // A preview build keeps them instead: its rows ARE the switch, so the one
+    // the reader turned off has to stay on screen to be turned back on.
+    if scanned_skills == ScannedSkills::Register && !settings.workspace.disabled.skills.is_empty() {
+        agent.remove_skills_by_names(&settings.workspace.disabled.skills);
+    }
+    // A trusted peer's capabilities reach the model only when the reader asked
+    // for them. The node is a process singleton; a build with no running node
+    // (federation disabled, or the node failed to start) has no remote tools.
+    if settings.global.federation.enabled && settings.global.federation.include_remote_tools {
+        if let Some(federation) = crate::federation_node::running() {
+            let workspace = agent::capability::WorkspaceId::new(format!("ws:session:{session}"))
+                .unwrap_or_else(|_| {
+                    agent::capability::WorkspaceId::new("ws:session")
+                        .expect("a valid fallback workspace id")
+                });
+            match crate::federation_node::attach_remote_tools(
+                &agent,
+                &federation,
+                workspace,
+                agent::capability::Principal::Local {
+                    session: session.to_string(),
+                    preset: preset.clone(),
+                },
+            ) {
+                Ok(0) => {}
+                Ok(count) => {
+                    log::info!("federation: {count} remote capabilities offered to the model")
+                }
+                Err(error) => log::warn!("federation remote tools were not attached: {error}"),
+            }
+        }
+    }
+    // The capability registry is opt-in: it rebuilds this turn's tools through
+    // the model (validation, descriptors, provider dispatch) instead of the
+    // raw registry. A failure keeps the raw registry, so the turn still runs.
+    if settings.global.general.capability_registry {
+        match compose_registry(&mut agent, session, &preset) {
+            Ok(count) => log::info!("capability registry composed {count} tools"),
+            Err(error) => log::warn!("capability registry kept the raw tools: {error}"),
+        }
+    }
+    // The prompt names a tool only when the request actually carries it. This
+    // runs after every attachment (bundles, MCP, extensions, browser, search,
+    // subagent) and before the meter prices the request, so the two cannot
+    // disagree.
+    crate::prompts::append_tool_guidance(&mut agent);
+
+    // The meter's tools bucket follows the request's own tool array, so it is
+    // priced from exactly that array - the build registry AND the live overlay
+    // the extension platform installs into - and from the one admission
+    // decision the request itself uses.
+    let admission = agent.tool_admission();
+    let schema_chars = tools_schema_chars(&admission.tools);
+    // What the request no longer carries, so a build's withholding can be
+    // judged from the log instead of from a bill: every char here is one that
+    // left each step's cached prefix, whether a tool withheld itself, an MCP
+    // gateway deferred it, or the byte budget could not admit it.
+    let withheld_chars = tools_schema_chars(&agent.all_tools()).saturating_sub(schema_chars);
+    let budget_withheld = admission.withheld.len();
+    let tool_count = admission.tools.len();
+    // The counters diagnose a build; the session id does not belong in a
+    // cleartext log line.
+    log::info!(
+        "build tools={tool_count} schema_chars={schema_chars} withheld_chars={withheld_chars} withheld_by_budget={budget_withheld} schema_budget={}/{} mcp_tools={}",
+        admission.bytes,
+        admission.limit,
+        mcp.tools().count()
+    );
+    // A withholding is a decision, not an accident: name what left and why, so
+    // a reader can tell "the model does not need it" from "the budget was too
+    // small for the prompt's own tools".
+    if budget_withheld > 0 {
+        log::warn!(
+            "tool schema budget withheld {budget_withheld} definition(s) ({} bytes) from the initial request: {}; find_tool reaches them",
+            admission.withheld_bytes(),
+            admission.withheld_names().join(", ")
+        );
+    }
+    if admission.over_budget {
+        log::warn!(
+            "required tool definitions alone are {} bytes, over the {}-byte initial schema budget; every required tool is still sent",
+            admission.required_bytes,
+            admission.limit
+        );
+    }
+    // A schema this large is re-sent on every step; name it at build time so a
+    // connected MCP server or a wide preset can be seen in the log instead of
+    // felt as latency.
+    if schema_chars > 20_000 {
+        log::warn!(
+            "tool schema is {schema_chars} chars; a preset allowlist or a lazy MCP gateway would cut every request"
+        );
+    }
+
+    for skill in agent.all_skills() {
+        crate::extension::publish(
+            crate::extension::topics::SKILL_LOADED,
+            serde_json::json!({
+                "session": session,
+                "skill": skill.metadata.name,
+            }),
+        );
+    }
+    // One record of what this build composed, taken here because every
+    // provider, extension, and MCP tool is now installed. The cache returns the
+    // same record for an unchanged surface, so the log is written once per
+    // distinct composition rather than once per send.
+    let (snapshot, composition_is_new) = match composition_for(&agent) {
+        Some((entry, fresh)) => (Some(Arc::clone(&entry.snapshot)), fresh),
+        None => (None, false),
+    };
+    crate::extension::publish(
+        crate::extension::topics::INSTRUCTION_BUILD,
+        serde_json::json!({
+            "session": session,
+            "preset": preset,
+            "tools": tool_count,
+            "skills": agent.all_skills().len(),
+            "schema_chars": schema_chars,
+            "withheld_chars": withheld_chars,
+            // Which contract this build actually carries: a diagnostics pane
+            // can tell a talk-only turn caused by a complete persona from one
+            // caused by the model, the tools or the provider.
+            "persona_complete": persona_complete,
+            "workflow_contract": !persona_complete,
+            "execution_footer": persona_complete,
+            "capabilities": snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.capabilities.len()),
+        }),
+    );
+    if let (true, Some(snapshot), Some(path)) =
+        (composition_is_new, &snapshot, settings.compositions_path())
+    {
+        crate::compositions::record(&path, snapshot);
+    }
+    let mut built = BuiltAgent {
+        agent: Arc::new(agent),
+        snapshot,
+        plugins,
+        extension_activations: extension_activations.into(),
+        live_driver: LiveDriverGuard(None),
+        tools_schema_chars: schema_chars,
+        persona_complete,
+        credential_error,
+        policy,
+        effective: eff,
+        goal: goal_store,
+        memory_state,
+        memory_capture,
+    };
+    built.start_live_driver();
+    if let Some(snapshot) = &built.snapshot {
+        log::debug!(
+            "composition {} capabilities={} local={}",
+            snapshot.composition,
+            snapshot.capabilities.len(),
+            snapshot.is_local_only()
+        );
+    }
+    built
+}
+
+/// Resolve one provider's credential from the vault, and the refusal when a
+/// vault that should supply it cannot.
+///
+/// The settings tree no longer carries an API key, so the order is:
+///
+/// 1. when the provider named a vault entry in `api_key_vault`, that exact
+///    entry is read. A name the unlocked vault does not hold is an explicit
+///    refusal carrying the id - never a silent empty key;
+/// 2. otherwise the conventional `provider:<id>:api_key` entry is read, which
+///    is where an older migration filed a moved key.
+///
+/// A vault that exists but is locked is an explicit 'Locked' refusal on every
+/// vault path, because an empty key would send the turn unauthenticated. With
+/// no vault file at all, a named entry is reported missing (naming the id),
+/// while an unnamed provider keeps the empty key, preserving environment
+/// authentication for installs that never created a vault.
+pub(crate) fn provider_credential(
+    provider: &str,
+    api_key_vault: Option<&str>,
+    vault: &Vault,
+) -> (String, Option<VaultError>) {
+    let named = api_key_vault
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty());
+    if let Some(entry) = named {
+        if !vault.is_app_available() {
+            // No app access key means the encrypted entries cannot be read. A
+            // locked file is a different refusal from a name no file could
+            // hold: the first says grant app access, the second names the id
+            // that is missing.
+            if vault.exists() {
+                return (String::new(), Some(VaultError::Locked));
+            }
+            return (
+                String::new(),
+                Some(VaultError::MissingEntry(entry.to_string())),
+            );
+        }
+        return match vault.resolve(entry) {
+            Some(secret) => (secret.as_str().to_string(), None),
+            None => (
+                String::new(),
+                Some(VaultError::MissingEntry(entry.to_string())),
+            ),
+        };
+    }
+    if provider.is_empty() || !vault.exists() {
+        return (String::new(), None);
+    }
+    if !vault.is_app_available() {
+        return (String::new(), Some(VaultError::Locked));
+    }
+    let name = vault::provider_key(provider);
+    match vault.resolve(&name) {
+        Some(secret) => (secret.as_str().to_string(), None),
+        None => (String::new(), None),
+    }
+}
+
+/// The effective provider's credential, derived from the same resolution the
+/// build uses.
+fn provider_api_key(eff: &Effective, vault: &Vault) -> (String, Option<VaultError>) {
+    provider_credential(&eff.provider, eff.api_key_vault.as_deref(), vault)
+}
+
+/// Why the next build would have no credential, if it would have none.
+///
+/// The send path asks this before it opens a turn, so a locked vault is refused
+/// where the reader can see it rather than producing an unauthenticated request.
+/// The input-token budget one summarizer request may use.
+///
+/// The configured context budget is the request ceiling bsh already prices
+/// against, so the summarizer must fit inside it: the checkpoint's own output
+/// is reserved first (it is capped by the agent at
+/// `COMPACTION_MAX_OUTPUT_TOKENS`), then a small margin for the instruction and
+/// framing. A zero context budget means the setting disables pressure-based
+/// compaction, but a manual `/compact` still needs a sane ceiling, so the
+/// agent's default budget is kept rather than unbounded.
+fn compaction_input_tokens(eff: &Effective) -> usize {
+    compaction_input_tokens_for(eff.context_budget)
+}
+
+/// The pure budget rule, split out so a test can pin the arithmetic.
+fn compaction_input_tokens_for(context_budget: usize) -> usize {
+    if context_budget == 0 {
+        return agent::agent::AgentConfig::default().compaction_input_tokens;
+    }
+    let reserved_output = agent::agent::context::COMPACTION_MAX_OUTPUT_TOKENS as usize;
+    context_budget
+        .saturating_sub(reserved_output + 1_024)
+        .max(4_096)
+}
+
+/// The older span a compaction would fold out of one session, if any.
+///
+/// This is the gate the Compact row reads before it builds an agent, so a
+/// session with nothing safely compactable costs no request. It asks the SAME
+/// selection the summarizer will: the agent-side rule protects a leading system
+/// prompt and never cuts between an assistant tool call and its result, and the
+/// bridge below feeds it the transcript the request would carry.
+///
+/// `retain_tokens` is the recent tail kept verbatim; zero means "everything
+/// safe", which is what the manual command asks for.
+pub(crate) fn compactable_span(
+    transcript: &[crate::model::ChatMessage],
+    retain_tokens: usize,
+) -> Option<usize> {
+    let messages = agent_messages(transcript);
+    let mut probe = agent::agent::AgentSession::new();
+    probe.restore_messages(messages);
+    probe
+        .split_for_compaction_at(retain_tokens)
+        .map(|(removed, _)| removed.len())
+}
+
+/// The agent-side message log for one transcript window.
+///
+/// The bridge is the same shape `Runner::seed_session` builds, minus the empty
+/// rows: a blank assistant placeholder is a streaming artifact, not history, and
+/// an empty user row carries nothing to summarize.
+///
+/// Two limits are deliberate, not oversights. Tool calls and their results live
+/// on the row for DISPLAY (`ChatMessage::tools`) and are not bridged, so the
+/// compaction contract's tool-pairing boundary has no tool units to protect in
+/// bsh; a fold can only land between user/assistant text rows. Images live on
+/// the row too and are not bridged here either, so the summarizer sees the text
+/// of a span but not its pictures, and an image-only row has no text to count.
+/// Both need a richer agent-history bridge (and an image-offload seam) before
+/// the reference's behaviour can exist here.
+pub(crate) fn agent_messages(
+    transcript: &[crate::model::ChatMessage],
+) -> Vec<agent::agent::Message> {
+    let mut messages = Vec::with_capacity(transcript.len());
+    for message in transcript {
+        match message.role {
+            crate::model::Role::User if !message.text.is_empty() => {
+                messages.push(agent::agent::Message::user(message.text.clone()));
+            }
+            crate::model::Role::Assistant if !message.text.is_empty() => {
+                messages.push(agent::agent::Message::assistant(message.text.clone()));
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
+pub(crate) fn credential_error(
+    settings: &Settings,
+    vault: &Vault,
+    choice: &crate::settings::resolve::SessionChoice,
+) -> Option<VaultError> {
+    let eff = settings.effective_for(choice);
+    provider_api_key(&eff, vault).1
+}
+
+/// The turn's tool set as a resolved capability plan.
+///
+/// The registry stays the authority for what this turn may call: this projects
+/// it through the capability model without changing what runs. It is the
+/// evidence that the model expresses the turn exactly - a tool the capability
+/// model cannot describe is a tool composition cannot govern.
+pub(crate) fn plan_for_registry(
+    agent: &Agent,
+) -> Result<agent::capability::composition::ResolvedComposition, String> {
+    use agent::capability::composition::{
+        resolve_host, CapabilityRequirement, CompositionSpec, LocalScope,
+    };
+    use agent::capability::id::WorkspaceId;
+    use semver::{Version, VersionReq};
+
+    let registry = merged_registry(agent).ok_or("the agent has no tool registry")?;
+    let catalogue = agent::capabilities::catalogue_from_registry(&registry)
+        .map_err(|error| error.to_string())?;
+    let workspace = WorkspaceId::new("ws:turn").map_err(|error| error.to_string())?;
+    let mut scope = LocalScope::new(workspace);
+    let mut spec = CompositionSpec::new(
+        "compose:turn",
+        Version::new(1, 0, 0),
+        "the tools this turn may call",
+    );
+    for id in catalogue.ids() {
+        scope.admit(id.clone());
+        spec = spec.with_requirement(CapabilityRequirement::new(id.clone(), VersionReq::STAR));
+    }
+    resolve_host(&spec, &catalogue, &[], &scope).map_err(|error| error.to_string())
+}
+
+/// One cached composition, keyed by the tool surface it was built from.
+struct CachedComposition {
+    key: u64,
+    plan: Arc<agent::capability::composition::ResolvedComposition>,
+    snapshot: Arc<agent::capability::CompositionSnapshot>,
+    /// The shim registry built for this surface and principal, when a build
+    /// asked for it. Reusing it keeps the capability-registry mode cheap on a
+    /// warm cache.
+    composed: Option<Arc<ToolRegistry>>,
+    /// The surface fingerprint mixed with the principal the shims were built
+    /// for: a shim carries the session and preset it reports, so a different
+    /// turn principal must not reuse it.
+    composed_key: u64,
+}
+
+thread_local! {
+    /// The last composition this thread built. A build normally runs on the
+    /// same thread as the previous one, so an unchanged tool surface reuses
+    /// the plan, the snapshot, and the log record instead of rebuilding them.
+    static COMPOSITION_CACHE: RefCell<Option<Arc<CachedComposition>>> = const { RefCell::new(None) };
+}
+
+/// A fingerprint of the exact tool surface: names, schemas, and declarations.
+///
+/// A schema or a declaration that changes without a name change invalidates the
+/// cache too, because the descriptor the engine would advertise changed.
+fn registry_fingerprint(registry: &ToolRegistry) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut names = registry.list();
+    names.sort();
+    for name in names {
+        name.hash(&mut hasher);
+        if let Some(tool) = registry.get(&name) {
+            tool.json_schema().to_string().hash(&mut hasher);
+            hash_metadata(tool.metadata(), &mut hasher);
+        } else if let Some(tool) = registry.get_async(&name) {
+            tool.json_schema().to_string().hash(&mut hasher);
+            hash_metadata(tool.metadata(), &mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn hash_metadata(metadata: Option<&ToolMetadata>, hasher: &mut impl Hasher) {
+    if let Some(metadata) = metadata {
+        metadata.version.hash(hasher);
+        metadata.risk.hash(hasher);
+        metadata.side_effects.hash(hasher);
+        metadata.permissions.hash(hasher);
+        metadata.timeout_ms.hash(hasher);
+        metadata.max_output_bytes.hash(hasher);
+    }
+}
+
+/// Remember the shim registry a build made for this surface.
+fn cache_composed(key: u64, composed_key: u64, composed: Arc<ToolRegistry>) {
+    COMPOSITION_CACHE.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        let Some(entry) = slot.as_ref() else {
+            return;
+        };
+        if entry.key != key {
+            return;
+        }
+        let plan = Arc::clone(&entry.plan);
+        let snapshot = Arc::clone(&entry.snapshot);
+        *slot = Some(Arc::new(CachedComposition {
+            key,
+            plan,
+            snapshot,
+            composed: Some(composed),
+            composed_key,
+        }));
+    });
+}
+
+fn principal_salt(session: &str, preset: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    session.hash(&mut hasher);
+    preset.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The turn's whole tool surface: the base registry plus the live overlay.
+///
+/// Extension packages register their tools live, so a plan built from the base
+/// registry alone would omit exactly the capabilities a package contributes.
+/// The base registry wins a name collision; live tools are additive.
+fn merged_registry(agent: &Agent) -> Option<ToolRegistry> {
+    let mut merged = (**agent.registry()?).clone();
+    let live = agent.live_tools().read().ok()?;
+    for name in live.list() {
+        if merged.get(&name).is_some() || merged.get_async(&name).is_some() {
+            continue;
+        }
+        if let Some(tool) = live.get(&name) {
+            let _ = merged.register(tool);
+        } else if let Some(tool) = live.get_async(&name) {
+            let _ = merged.register_async(tool);
+        }
+    }
+    Some(merged)
+}
+/// The composition for this tool surface, and whether it was just built.
+fn composition_for(agent: &Agent) -> Option<(Arc<CachedComposition>, bool)> {
+    let registry = merged_registry(agent)?;
+    let key = registry_fingerprint(&registry);
+    let cached = COMPOSITION_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|entry| entry.key == key)
+            .map(Arc::clone)
+    });
+    if let Some(entry) = cached {
+        return Some((entry, false));
+    }
+    let plan = plan_for_registry(agent).ok()?;
+    let snapshot = agent::capability::CompositionSnapshot::from_resolved(
+        &plan,
+        None,
+        agent::capability::unix_ms(),
+    );
+    let entry = Arc::new(CachedComposition {
+        key,
+        plan: Arc::new(plan),
+        snapshot: Arc::new(snapshot),
+        composed: None,
+        composed_key: 0,
+    });
+    COMPOSITION_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(Arc::clone(&entry));
+    });
+    Some((entry, true))
+}
+/// Rebuild this turn's registry through the capability model.
+///
+/// The raw tools are kept by the provider; the registry the engine sees holds
+/// one shim per capability, so every call is validated against the descriptor
+/// and dispatched through the same path a remote capability would take.
+fn compose_registry(agent: &mut Agent, session: &str, preset: &str) -> Result<usize, String> {
+    let registry = merged_registry(agent).ok_or("the agent has no tool registry")?;
+    let live_names: HashSet<String> = agent
+        .live_tools()
+        .read()
+        .map(|live| live.list().into_iter().collect())
+        .unwrap_or_default();
+    let entry = composition_for(agent)
+        .ok_or("the composition could not be resolved")?
+        .0;
+    let wanted = entry.key ^ principal_salt(session, preset);
+    if let Some(composed) = entry
+        .composed
+        .as_ref()
+        .filter(|_| entry.composed_key == wanted)
+    {
+        let count = composed.list().len();
+        agent.set_registry((**composed).clone());
+        return Ok(count);
+    }
+    let plan = (*entry.plan).clone();
+    let provider: Arc<dyn CapabilityProvider> =
+        Arc::new(NativeToolProvider::new(Arc::new(registry.clone())));
+    let runtime = Arc::new(
+        WorkspaceRuntime::instantiate(plan, &[provider]).map_err(|error| error.to_string())?,
+    );
+    let principal = agent::capability::Principal::Local {
+        session: session.to_string(),
+        preset: preset.to_string(),
+    };
+    let mut composed = ToolRegistry::new();
+    for descriptor in runtime.describe() {
+        let id = descriptor.id.clone();
+        let name = descriptor.surface.to_string();
+        // A live tool keeps its own advertisement and cancellation path; the
+        // shim registry covers the base tools only.
+        if live_names.contains(&name) {
+            continue;
+        }
+        let Some(mut tool) = CapabilityTool::new(Arc::clone(&runtime), &id, principal.clone())
+        else {
+            continue;
+        };
+        // Presentation facts belong to the replaced tool, not to the runtime:
+        // a deferred tool stays deferred, a skill stays a skill, and a
+        // dispatcher still names the tool it forwards to.
+        if let Some(raw) = registry.get(&name) {
+            tool = tool
+                .with_facts(ToolFacts {
+                    deferred: raw.deferred(),
+                    is_skill: raw.is_skill(),
+                    cancelable: raw.is_cancelable(),
+                })
+                .with_proxy(ProxySource::Sync(raw));
+        } else if let Some(raw) = registry.get_async(&name) {
+            tool = tool
+                .with_facts(ToolFacts {
+                    deferred: raw.deferred(),
+                    is_skill: raw.is_skill(),
+                    cancelable: raw.is_cancelable(),
+                })
+                .with_proxy(ProxySource::Async(raw));
+        }
+        composed
+            .register_async(Arc::new(tool))
+            .map_err(|error| error.to_string())?;
+    }
+    let count = composed.list().len();
+    cache_composed(entry.key, wanted, Arc::new(composed.clone()));
+    agent.set_registry(composed);
+    Ok(count)
+}
+/// The serialized length of the tool definitions an agent sends.
+///
+/// `contextBreakdown`'s tools bucket follows the latest request header, so this
+/// measures exactly what that request carries: the agent's model-facing tool
+/// array, registry and live extension overlay alike, serialized as one array.
+/// The argument is that array rather than a registry because the registry is no
+/// longer the whole answer - a package applies after the build - and a meter
+/// that priced only the registry under-reported every extension's schema.
+pub(crate) fn tools_schema_chars(tools: &[react::llm::LlmTool]) -> usize {
+    serde_json::to_string(tools)
+        .map(|json| json.chars().count())
+        .unwrap_or(0)
+}
+
+/// Whether this build offers the local `web_search` tool.
+///
+/// The reader's workspace switch is the MASTER and a preset may only decline:
+/// read-only does, because the tool opens a socket. The two therefore
+/// INTERSECT, which is the rule egress already follows - a preset that declares
+/// `web_search = true` states what it is for, it cannot re-offer a tool the
+/// reader switched off. Letting the preset override the switch made both the
+/// Tools pane and the Web search pane carry a control that only looked wired:
+/// pressing it wrote the draft and changed nothing in the build.
+pub(crate) fn offers_local_web_search(enabled: bool, preset: Option<bool>) -> bool {
+    enabled && preset.unwrap_or(true)
+}
+
+/// The capabilities the agent exposes, for the tools-and-skills pane.
+/// The web-search configuration a build would carry.
+///
+/// One derivation for the build and the tests: the pane's fields and the
+/// requests the tool sends cannot disagree, because both read this.
+pub(crate) fn web_search_config(settings: &Settings, vault: &Vault) -> crate::web::Config {
+    let section = &settings.global.web_search;
+    let shape = crate::web::Shape {
+        method: crate::web::Method::parse(&section.method),
+        path: section.path.trim().to_string(),
+        query_key: section.query_key.trim().to_string(),
+        count_key: section.count_key.trim().to_string(),
+        body: section.body.clone(),
+        results_key: if section.results_key.trim().is_empty() {
+            "results".to_string()
+        } else {
+            section.results_key.trim().to_string()
+        },
+        url_key: if section.url_key.trim().is_empty() {
+            "url".to_string()
+        } else {
+            section.url_key.trim().to_string()
+        },
+        title_key: section.title_key.trim().to_string(),
+        snippet_key: section.snippet_key.trim().to_string(),
+        date_key: section.date_key.trim().to_string(),
+    };
+    crate::web::Config::with_shape(
+        shape,
+        section.base_url.clone(),
+        vault
+            .resolve(crate::vault::WEB_SEARCH_KEY)
+            .map(|secret| secret.as_str().to_string())
+            .unwrap_or_default(),
+        section.results_per_search,
+    )
+}
+
+pub(crate) fn capabilities(agent: &Agent) -> Vec<CapInfo> {
+    // The pane lists what the model can CALL, which is the whole registry: a
+    // row read from the build registry alone left every extension package's
+    // tool out of the pane it was installed for, and reading the advertised
+    // array instead hid every deferred tool - still callable once found, so
+    // still a capability the reader may switch. The meter
+    // prices the advertised array separately (see `build_agent_for_session`).
+    let mut caps: Vec<CapInfo> = agent
+        .all_tools()
+        .into_iter()
+        .map(|tool| CapInfo {
+            name: tool.name,
+            description: tool.description,
+            category: "tool".to_string(),
+        })
+        .collect();
+    for (name, instructions) in agent.all_skills_content() {
+        let summary = instructions
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("")
+            .to_string();
+        caps.push(CapInfo {
+            name: name.to_string(),
+            description: summary,
+            category: "skill".to_string(),
+        });
+    }
+    caps.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+    caps
+}
+
+/// The capabilities the Tools pane lists.
+///
+/// The pane draws exactly this list, and each row's switch writes the disabled
+/// lists - so a preview that HONORED those lists would omit the very row the
+/// reader unchecked, and the pane would carry no control to restore it. A goal
+/// made that fatal: withdrawing `update_goal` withdrew the only way a running
+/// goal could be closed.
+///
+/// The preview therefore clears the tool switches, and only those: a disabled
+/// extension still contributes nothing, a preset still narrows the tools, and
+/// the skill switches are the catalogue's business, because none of those is a
+/// switch THIS pane owns. The meter and the plugin inventory are priced from
+/// the real build, not this preview.
+#[cfg(test)]
+pub(crate) fn preview_capabilities(
+    settings: &Settings,
+    vault: &Vault,
+    mcp: &crate::mcp::McpPool,
+) -> Vec<CapInfo> {
+    capabilities(&preview_build(settings, vault, mcp).agent)
+}
+
+/// Build the preview agent once when a pane needs both the full capability list
+/// and the tool-schema size, instead of building twice.
+///
+/// The preview skips the reader's scanned skills. Registering every manifest in
+/// the enabled sources is the expensive half of a build - measured on this
+/// machine's 121 skills: 2.2 s of a 3.1 s build, against 10 ms warm with the
+/// loop skipped - and the pane lists skills from the resolution it already
+/// holds (the scan is cached there), so registering them again would buy
+/// nothing and cost the whole click.
+pub(crate) fn preview_build(
+    settings: &Settings,
+    vault: &Vault,
+    mcp: &crate::mcp::McpPool,
+) -> BuiltAgent {
+    let mut preview = settings.clone();
+    preview.workspace.disabled.tools.clear();
+    // The skill switches stay as the reader set them: clearing them changes the
+    // catalogue's fingerprint, and re-scanning every manifest to learn nothing
+    // the pane does not already hold was measured at ~470 ms of the click.
+    // Package skills are kept by skipping the removal in the build instead.
+    build_agent_for_session_inner(
+        &preview,
+        vault,
+        &crate::settings::resolve::SessionChoice::default(),
+        mcp,
+        "",
+        None,
+        Arc::new(agent::jobs::JobRegistry::new()),
+        Arc::new(crate::browser::BrowserHandle::new()),
+        None,
+        None,
+        ScannedSkills::Skip,
+    )
+}
+
+/// Which of the reader's scanned skills a build registers.
+///
+/// The settings pane lists skills from the cached catalogue, so a build it
+/// triggers only needs the tool roster and the package skills; a turn's build
+/// needs both halves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScannedSkills {
+    /// Register every enabled scanned skill - a turn's build.
+    Register,
+    /// Leave the scanned skills out - the settings pane's preview build.
+    Skip,
+}
+
+/// The workspace root, expanded, when one is configured.
+fn workspace_root(eff: &Effective) -> Option<PathBuf> {
+    let raw = eff.root.trim();
+    (!raw.is_empty()).then(|| expand_path(raw))
+}
+
+/// Expand a leading tilde.
+pub(crate) fn expand_path(raw: &str) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(raw).into_owned())
+}
+
+/// Resolve a tool path against the workspace root, refusing escapes.
+///
+/// `root` is the turn's canonical workspace root (the build canonicalizes it
+/// once), so a call does not pay for re-canonicalizing it. The path is
+/// normalized lexically first, so `..` cannot climb out, and then its real path
+/// is checked: an existing leaf resolves through its symlinks, and a leaf that
+/// does not exist yet is appended to the real path of its deepest existing
+/// ancestor. That ancestor walk is what stops a symlinked directory from
+/// becoming a bridge to the outside as soon as the intermediate directory is
+/// itself missing, a case a check on the immediate parent lets through.
+///
+/// An existing target resolves to its real path, so a read or an edit through a
+/// symlink reaches the file the link points at and the policy sees that same
+/// file rather than the link's name.
+fn resolve_path(root: Option<&Path>, raw: &str, enforce: bool) -> Result<PathBuf, String> {
+    if raw.trim().is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    let raw_path = Path::new(raw);
+    let Some(root) = root else {
+        // A turn with no workspace root has nothing to resolve a RELATIVE path
+        // against. Handing the bare relative string to the policy produced the
+        // misleading "reads are confined to the workspace" refusal; name the
+        // real cause so the model (and the reader) can act on it. An absolute
+        // path still goes to the policy, which decides on its own terms.
+        if raw_path.is_absolute() {
+            return Ok(raw_path.to_path_buf());
+        }
+        return Err(format!(
+            "no workspace root is open for this turn, so `{raw}` cannot be resolved; open a folder and retry"
+        ));
+    };
+    let joined = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        root.join(raw_path)
+    };
+    let candidate = normalize_path(&joined);
+    // A relative path may only walk within the root. An absolute one may name
+    // the root through another spelling (a symlinked /var on macOS), which the
+    // real-path check below resolves without a lexical exemption.
+    //
+    // `enforce` is the permission tier's rule: a CONFINED turn refuses an
+    // escape here, while a released one leaves the decision to the policy
+    // (which still denies reads and writes outside the workspace, and whose
+    // rule name is what the reader and the audit see). The root is passed at
+    // every tier either way, because a relative path has to resolve somewhere.
+    if enforce && !raw_path.is_absolute() && !candidate.starts_with(root) {
+        return Err(escape(raw));
+    }
+    let real = real_path(&candidate);
+    if enforce && !real.starts_with(root) {
+        return Err(escape(raw));
+    }
+    Ok(real)
+}
+
+/// The refusal every escaping path shares.
+fn escape(raw: &str) -> String {
+    format!("path escapes the workspace: {raw}")
+}
+
+/// Collapse `.` and `..` without touching the filesystem.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::RootDir => out = PathBuf::from(std::path::MAIN_SEPARATOR.to_string()),
+            Component::Prefix(prefix) => out = PathBuf::from(prefix.as_os_str()),
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+/// The real path of `path`, resolving every component that exists.
+///
+/// The common case is one `canonicalize`. A path the call is about to create
+/// has no real path yet, so its deepest existing ancestor is canonicalized and
+/// the missing tail is re-appended. The tail is already normalized (no `.` or
+/// `..`) and by definition contains no symlink, so appending it lexically
+/// cannot escape the ancestor that was just checked.
+fn real_path(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    while let Some(parent) = cursor.parent() {
+        if let Some(name) = cursor.file_name() {
+            missing.push(name.to_os_string());
+        }
+        if let Ok(real) = parent.canonicalize() {
+            let mut out = real;
+            for part in missing.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
+}
+
+/// Compile a policy for a resolution that already exists.
+///
+/// The turn build and the MCP pool both need the same policy; going through one
+/// function is what keeps the turn's principal and the network gate's data
+/// document from drifting apart.
+pub(crate) fn policy_for_effective(settings: &Settings, eff: &Effective) -> Arc<PolicySet> {
+    // The same spelling the tools and `resolve_path` use, so a symlinked
+    // workspace is not mistaken for a path outside itself.
+    let root = workspace_root(eff).map(|path| path.canonicalize().unwrap_or(path));
+    Arc::new(build_policy(settings, eff, root.as_deref()))
+}
+/// The factory one parent turn hands to its subagent tool.
+///
+/// It snapshots the parent's LLM config and tool registry at build time, so a
+/// child runs with the same model and the same tools but a fresh context. A
+/// child at depth 0 or 1 may attach the same tool again, producing the bounded
+/// DSH child tree; the depth check stops the recursion.
+pub(crate) struct SubagentContext {
+    session: String,
+    parent: String,
+    depth: usize,
+    registry: Arc<crate::subagent::SubagentRegistry>,
+    config: AgentConfig,
+    sync_tools: Vec<Arc<dyn agent::tools::Tool>>,
+    async_tools: Vec<Arc<dyn react::tool::registry::AsyncTool>>,
+    /// The policy a call re-asks before a child exists.
+    policy: Arc<PolicySet>,
+    /// The preset half of the principal.
+    preset: String,
+    /// The workspace root the child runs in.
+    root: String,
+    /// The resolved facts the child turn's runtime snapshot states.
+    ///
+    /// Captured from the parent build's one `Effective`, so a child reports the
+    /// same sandbox, permission and preset the tools it inherits enforce.
+    runtime: crate::context::RuntimeFacts,
+    /// The parent's mid-turn history ceiling, inherited by the child.
+    context_budget: usize,
+    /// The parent's parsed skills, inherited by the child.
+    ///
+    /// A child is a build of the same turn, so it reads the same catalogue the
+    /// parent does - including a skill the manifest reserves for the reader,
+    /// which a delegated prompt may name. Carrying the parsed content means a
+    /// child costs pushes, not a second walk of the sources.
+    skills: Vec<agent::skills::SkillContent>,
+    /// The delegation companions this turn carries besides the spawn tool.
+    ///
+    /// The reader's own per-tool switches decide them once for the turn; a
+    /// nested child inherits the answers rather than re-deciding them, so a
+    /// switched-off tool does not reappear one level down.
+    tools: SubagentTools,
+}
+
+/// Which delegation companions a turn carries beside `subagent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SubagentTools {
+    /// Whether `send_message` may continue a child's conversation.
+    pub(crate) message: bool,
+    /// Whether `interrupt_agent` may stop a running child.
+    pub(crate) interrupt: bool,
+}
+
+impl SubagentContext {
+    /// Capture the parent agent's config and tools.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        agent: &Agent,
+        session: impl Into<String>,
+        parent: impl Into<String>,
+        depth: usize,
+        registry: Arc<crate::subagent::SubagentRegistry>,
+        policy: Arc<PolicySet>,
+        preset: impl Into<String>,
+        root: impl Into<String>,
+        runtime: crate::context::RuntimeFacts,
+        tools: SubagentTools,
+    ) -> Self {
+        let (sync_tools, async_tools) = match agent.registry() {
+            Some(registry) => {
+                let sync_tools: Vec<Arc<dyn agent::tools::Tool>> =
+                    registry.iter().map(|(_, tool)| tool.clone()).collect();
+                let async_tools: Vec<Arc<dyn react::tool::registry::AsyncTool>> = registry
+                    .async_tool_names()
+                    .into_iter()
+                    .filter_map(|name| registry.get_async(&name))
+                    .collect();
+                (sync_tools, async_tools)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        Self {
+            session: session.into(),
+            parent: parent.into(),
+            depth,
+            registry,
+            config: agent.config().clone(),
+            sync_tools,
+            async_tools,
+            policy,
+            preset: preset.into(),
+            root: root.into(),
+            runtime,
+            context_budget: agent.context_budget(),
+            // The model-facing set, not the pre-extension set: a child must
+            // inherit the package skills the parent turn actually carries.
+            skills: agent.all_skills(),
+            tools,
+        }
+    }
+
+    /// Re-ask the policy before a child is spawned.
+    ///
+    /// A denial returns the policy's own refusal and leaves the registry
+    /// untouched: no run row exists, so no child session is ever persisted.
+    fn authorize_spawn(&self) -> Result<(), ToolError> {
+        match check_spawn(
+            &self.policy,
+            "subagent",
+            &self.session,
+            &self.preset,
+            &self.root,
+        ) {
+            Ok(()) => Ok(()),
+            Err(refusal) => Err(ToolError::Failed(refusal)),
+        }
+    }
+
+    /// Start one detached child and return its run id and the title it was
+    /// given. Policy is asked before the child exists, so a denial creates no
+    /// run row and no child session; the slot is reserved atomically.
+    pub(crate) fn spawn_child(
+        &self,
+        title: &str,
+        prompt: &str,
+    ) -> Result<(String, String), ToolError> {
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            return Err(ToolError::InvalidInput(
+                "prompt is required and must not be empty".to_string(),
+            ));
+        }
+        self.authorize_spawn()?;
+        let title = if title.trim().is_empty() {
+            prompt
+                .lines()
+                .next()
+                .unwrap_or("Subagent")
+                .chars()
+                .take(60)
+                .collect::<String>()
+        } else {
+            title.trim().to_string()
+        };
+        // A live estimate for the header before the child reports usage:
+        // prompt bytes plus a small allowance for tools/config.
+        let estimated_tokens = (prompt.chars().count() / 4) as u64 + 2_000;
+        let Some(id) = self.registry.try_begin(
+            &self.session,
+            &self.parent,
+            self.depth + 1,
+            estimated_tokens,
+            &title,
+            &prompt,
+            crate::subagent::SUBAGENT_SLOTS,
+        ) else {
+            return Err(ToolError::Failed(
+                "all subagent slots are running; wait for one to finish".to_string(),
+            ));
+        };
+        let child = self.child(&id);
+        let turn_context = crate::context::TurnContext::from_facts(&self.runtime, true);
+        let registry = self.registry.clone();
+        let task_id = id.clone();
+        let task_title = title.clone();
+        // The child is detached on the runner's runtime: the parent continues
+        // with work it delegated. The registry is the live handle the header,
+        // subagent_result and the task join read.
+        let registry_for_handle = registry.clone();
+        let handle_id = task_id.clone();
+        let handle = tokio::spawn(async move {
+            log::info!("subagent {task_id} started: {task_title}");
+            let result = stream_child(
+                &child,
+                prompt.to_string(),
+                registry.clone(),
+                &task_id,
+                &turn_context,
+            )
+            .await;
+            let usage = child.last_token_usage().unwrap_or((0, 0));
+            let transcript = child_transcript(&child);
+            registry.set_agent(&task_id, Arc::new(tokio::sync::Mutex::new(child)));
+            match result {
+                Ok((text, usage)) => {
+                    registry.finish(&task_id, text, usage, transcript);
+                    log::info!("subagent {task_id} done");
+                }
+                Err(message) => {
+                    log::warn!("subagent {task_id} failed: {message}");
+                    registry.fail(&task_id, message, Some(usage), transcript);
+                }
+            }
+        });
+        // Detached means interruptible: the handle is what interrupt_agent
+        // aborts. A turn that settles first drops it in finish/fail.
+        registry_for_handle.set_handle(&handle_id, handle.abort_handle());
+        Ok((id, title))
+    }
+
+    /// The run's observed snapshot for the task seam, when it exists.
+    pub(crate) fn snapshot(&self, id: &str) -> Option<crate::extension::runs::RunSnapshot> {
+        self.registry.run(id).map(|run| run.snapshot())
+    }
+
+    /// Stop one child run. Returns whether the registry knew the id.
+    pub(crate) fn interrupt_run(&self, id: &str) -> bool {
+        self.registry.interrupt(id)
+    }
+
+    /// Build a child and, below the depth cap, give it the subagent tool too.
+    fn child(&self, child_id: &str) -> Agent {
+        self.child_with_delegation(child_id, true)
+    }
+
+    /// Build a child, optionally without the delegation tool.
+    ///
+    /// The spawn path always wants it (the parent turn only owns the tool when
+    /// the capability gate allowed it), while a rebuilt child asks the gate
+    /// itself: the same predicate that gated the parent turn decides whether
+    /// the restored child may delegate again.
+    fn child_with_delegation(&self, child_id: &str, delegate: bool) -> Agent {
+        let mut config = self.config.clone();
+        config.name = "subagent".to_string();
+        // The child runs on the parent's own budget. It used to be capped at 12
+        // while the parent ran to its own ceiling, so a delegated task stopped
+        // mid-investigation and handed back a partial result that read like an
+        // answer. Only the child's model may end its turn.
+        // A leaf child has no subagent tool, so it must not inherit the parent's
+        // standing instruction to delegate. A child that gets the tool has it
+        // appended by attach_subagent_tool below.
+        if let Some(pos) = config.system_prompt.find("## Delegating with subagents") {
+            config.system_prompt.truncate(pos);
+            config.system_prompt = config.system_prompt.trim_end().to_string();
+        }
+        config.system_prompt = format!(
+            "You are a focused subagent. Your parent cannot see this transcript: complete the task you were given and return a concise result that carries the evidence it needs.\n\n{}",
+            config.system_prompt
+        );
+        let mut child = Agent::from_config(config).with_context_budget(self.context_budget);
+        crate::extension::hooks::install_agent_hooks(&mut child);
+        // The same skills the parent turn carries: a delegated prompt can name
+        // one (the `/name` gesture), and the child's own catalogue and
+        // `load_skill` tool then answer from it.
+        for skill in &self.skills {
+            child.register_skill_content(skill.clone());
+        }
+        for tool in &self.sync_tools {
+            child.add_tool(tool.clone());
+        }
+        for tool in &self.async_tools {
+            if let Err(error) = child.try_add_async_tool(tool.clone()) {
+                warn!(
+                    "subagent tool '{}' was not registered: {error}",
+                    tool.name()
+                );
+            }
+        }
+        if delegate && self.depth < 1 {
+            let nested = SubagentContext::new(
+                &child,
+                self.session.clone(),
+                child_id.to_string(),
+                self.depth + 1,
+                self.registry.clone(),
+                self.policy.clone(),
+                self.preset.clone(),
+                self.root.clone(),
+                self.runtime.clone(),
+                self.tools,
+            );
+            attach_subagent_tool(&mut child, Arc::new(nested));
+            crate::prompts::append_subagent_guidance(&mut child);
+        }
+        child
+    }
+}
+
+/// Rebuild the live child behind a settled run.
+///
+/// A child runs on the parent turn's Tokio runtime and its process does not
+/// survive the app, so a prompt sent to a settled run used to have nowhere to
+/// go. This rebuilds the child from the same resolution the run was spawned
+/// under - the session's model and tools, the focused-child persona, and (at
+/// the delegation depths) the subagent tool, gated by the same capability
+/// predicate - so the reader can continue it exactly like any other session.
+///
+/// The caller replays the stored transcript into the returned agent before the
+/// next turn; this function builds and gates, it does not run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rebuild_child_agent(
+    settings: &Settings,
+    vault: &Vault,
+    choice: &crate::settings::resolve::SessionChoice,
+    mcp: &crate::mcp::McpPool,
+    run_session: &str,
+    child_id: &str,
+    parent: &str,
+    depth: usize,
+    registry: Arc<crate::subagent::SubagentRegistry>,
+) -> Result<Agent, VaultError> {
+    // The parent turn's build is the inheritance: the child runs on the same
+    // model, the same tools and the same policy, which is why a rebuild goes
+    // through the ordinary builder instead of inventing a config.
+    let built = build_agent_for_session(settings, vault, choice, mcp, run_session);
+    if let Some(error) = built.credential_error {
+        return Err(error);
+    }
+    // The delegation tool is a capability, not a free attachment: ask the same
+    // predicate the parent turn asked, with the run's own session principal.
+    let gates = tool_gates_for(
+        &built.effective.permission.effective,
+        built.effective.preset_tools.as_deref(),
+        &built.policy,
+        run_session,
+    );
+    let root = workspace_root(&built.effective)
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let context = SubagentContext::new(
+        &built.agent,
+        run_session,
+        parent,
+        // The run's depth is the child's; the context sits one level above it.
+        depth.saturating_sub(1),
+        registry,
+        built.policy.clone(),
+        built.effective.preset_id.clone(),
+        root,
+        crate::context::RuntimeFacts::from_effective(&built.effective),
+        // A rebuilt child answers the same reader switches as the turn that
+        // spawned it: the switches were stored in the settings, not in the run.
+        {
+            let eff = &built.effective;
+            let carries = |name: &str| {
+                !eff.disabled_tools.iter().any(|tool| tool == name)
+                    && eff
+                        .preset_tools
+                        .as_ref()
+                        .is_none_or(|tools| tools.iter().any(|tool| tool == name))
+            };
+            SubagentTools {
+                message: carries("send_message"),
+                interrupt: carries("interrupt_agent"),
+            }
+        },
+    );
+    Ok(context.child_with_delegation(child_id, gates.subagent))
+}
+
+/// Flatten a child's session into the rows the read-only view draws.
+pub(crate) fn child_transcript(child: &Agent) -> Vec<crate::subagent::SubagentMessage> {
+    let session = child.session();
+    let mut rows: Vec<crate::subagent::SubagentMessage> = Vec::new();
+    for message in session.messages() {
+        let row = match message {
+            react::llm::LlmMessage::System { .. } => None,
+            react::llm::LlmMessage::User { content } => {
+                let raw = content.as_text().unwrap_or("");
+                // The child's row is the model-facing request, so an extension
+                // command's template block reads back as the `/name` annotation
+                // the reader typed - the same line the parent's row keeps. The
+                // skill projection runs first: a send appends skill blocks in
+                // FRONT of the command, and both are harness injections.
+                let skill_visible = crate::skill_invocation::visible_text(raw);
+                let text = crate::command_invocation::visible_text(skill_visible)
+                    .unwrap_or_else(|| skill_visible.to_string());
+                // The per-turn runtime snapshot and workspace instructions are
+                // harness injections, not something the child or its caller
+                // said; the read-only view shows the child's work.
+                (!crate::context::is_injected_user_text(&text)).then_some(("user", text, None))
+            }
+            react::llm::LlmMessage::Assistant { content } => {
+                Some(("assistant", content.clone(), None))
+            }
+            react::llm::LlmMessage::AssistantToolCall { name, args, .. } => {
+                Some(("tool", format!("{name} {args}"), Some(name.clone())))
+            }
+            react::llm::LlmMessage::ToolResult { content, .. } => {
+                Some(("tool", content.clone(), None))
+            }
+        };
+        if let Some((role, content, tool)) = row {
+            rows.push(crate::subagent::SubagentMessage {
+                role: role.to_string(),
+                content,
+                tool,
+            });
+        }
+    }
+    let mut rows: Vec<crate::subagent::SubagentMessage> = rows;
+    // Some vendor branches historically recorded the same final assistant row
+    // twice; adjacent identical assistant rows are never meaningful.
+    rows.dedup_by(|a, b| a.role == "assistant" && b.role == "assistant" && a.content == b.content);
+    rows
+}
+
+/// Stream one child turn, updating the live registry as tokens and tools land.
+///
+/// The final child Session is still the authority; the live rows make the
+/// transcript and token counter move while the child is incomplete.
+pub(crate) async fn stream_child(
+    child: &Agent,
+    prompt: String,
+    registry: Arc<crate::subagent::SubagentRegistry>,
+    id: &str,
+    context: &crate::context::TurnContext,
+) -> Result<(String, (u64, u64)), String> {
+    // The child turn carries the same two per-turn messages a parent turn
+    // does, rendered with the delegation context added.
+    context.inject(child);
+    // A child prompt can carry the same `/name` gesture a parent request can,
+    // and the child was built with the same skills, so it resolves through the
+    // same reader and appends the same block.
+    let (prompt, _invoked) =
+        crate::skill_invocation::expand(child, react::llm::Content::Text(prompt));
+    let mut stream = child.stream(prompt);
+    let mut text = String::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(react::llm::StreamToken::Text(chunk)) => {
+                text.push_str(&chunk);
+                registry.append_text(id, &chunk);
+            }
+            Ok(react::llm::StreamToken::ReasoningContent(_)) => {}
+            Ok(react::llm::StreamToken::ToolCall { name, args, .. }) => {
+                registry.append_tool_call(id, &name, &args.to_string());
+            }
+            Ok(react::llm::StreamToken::ToolResult { output, .. }) => {
+                registry.append_tool_result(id, &output);
+            }
+            Ok(react::llm::StreamToken::Usage(usage)) => {
+                registry.set_usage(
+                    id,
+                    u64::from(usage.prompt_tokens),
+                    u64::from(usage.completion_tokens),
+                );
+            }
+            Ok(react::llm::StreamToken::Done | react::llm::StreamToken::Stopped) => break,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let usage = child.last_token_usage().unwrap_or((0, 0));
+    Ok((text, usage))
+}
+
+/// Install the subagent tool on a parent turn.
+pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: Arc<SubagentContext>) {
+    // The collector needs the same registry and session the starter uses. Take
+    // them before the starter closure moves the Arc, and keep one handle for the
+    // follow-up tool the same build may also install.
+    let result_registry = context.registry.clone();
+    let result_session = context.session.clone();
+    let message_context = Arc::clone(&context);
+    let tool = agent::tools::AsyncFunctionTool::from_fn(
+        "subagent",
+        "Delegate ONE self-contained part of a large job to a focused child agent with its own context; write a complete prompt and run up to three children at once. Returns immediately with a subagent_id; the child keeps running in the background and you collect it with subagent_result. Do not use it for a trivial single step or tightly coupled sequential work.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "description": { "type": "string", "description": "Short 3-8 word title for the child run; shown in the subagent menu." },
+                "prompt": { "type": "string", "description": "Complete self-contained task: goal, relevant paths and context, constraints, expected output format, and what to report. The child cannot see this conversation." }
+            },
+            "required": ["description", "prompt"]
+        }),
+        move |args| {
+            let context = context.clone();
+            async move {
+                let title = args
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let prompt = args
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let (id, title) = context.spawn_child(&title, &prompt)?;
+                Ok(serde_json::json!({
+                    "subagent_id": id,
+                    "status": "running",
+                    "title": title,
+                    "note": "The child runs in the background. Continue useful work; call subagent_result with this id when you need the answer, and before you finish the turn."
+                }))
+            }
+        },
+    );
+    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
+        Arc::new(tool),
+        declare("subagent"),
+    ))) {
+        warn!("subagent tool was not registered: {error}");
+        return;
+    }
+    attach_subagent_result_tool(agent, result_registry, result_session);
+    let tools = message_context.tools;
+    if tools.message {
+        attach_subagent_message_tool(agent, Arc::clone(&message_context));
+    }
+    if tools.interrupt {
+        attach_subagent_interrupt_tool(agent, message_context);
+    }
+}
+
+/// Install the collector a background subagent returns through.
+///
+/// Without it the parent has no way to read a detached child's answer: the
+/// child's only durable handle is the registry, and the turn should not have to
+/// end just to learn what a delegated run found.
+/// The longest one `subagent_result` call blocks for a running child.
+///
+/// A shell child routinely runs one to three minutes, so a one-minute ceiling
+/// turned every collection into a poll: the model called the tool again and
+/// again, and each round trip re-prefilled the request while the child ran.
+/// A five-minute ceiling lets one call wait out a normal child; a longer child
+/// still reports `still running` and the model decides.
+const SUBAGENT_RESULT_WAIT_CAP_SECS: u64 = 300;
+
+fn attach_subagent_result_tool(
+    agent: &mut Agent,
+    registry: Arc<crate::subagent::SubagentRegistry>,
+    session: String,
+) {
+    let tool = agent::tools::AsyncFunctionTool::from_fn(
+        "subagent_result",
+        "Collect a background subagent's result, or list this session's runs. Omit subagent_id to list; pass wait_seconds to block until the child finishes (up to 300 seconds), which is cheaper than polling. Call this before finishing a turn that started subagents.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subagent_id": { "type": "string", "description": "The id subagent returned; omit to list runs." },
+                "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "description": "Block up to this long for a running child; 0 polls once and returns immediately." }
+            }
+        }),
+        move |args| {
+            let registry = registry.clone();
+            let session = session.clone();
+            async move {
+                let id = args
+                    .get("subagent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let wait = args
+                    .get("wait_seconds")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    .min(SUBAGENT_RESULT_WAIT_CAP_SECS);
+                if id.is_empty() {
+                    let runs: Vec<serde_json::Value> = registry
+                        .snapshot()
+                        .iter()
+                        .filter(|run| run.session == session)
+                        .map(|run| {
+                            let status = run.status.as_str();
+                            let elapsed = run.elapsed_ms();
+                            let tokens = run.total_tokens();
+                            serde_json::json!({
+                                "subagent_id": run.id,
+                                "title": run.title,
+                                "status": status,
+                                "elapsed_ms": elapsed,
+                                "tokens": tokens,
+                            })
+                        })
+                        .collect();
+                    return Ok(serde_json::json!({ "runs": runs }));
+                }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+                loop {
+                    let Some(status) = registry.status(&id) else {
+                        return Err(ToolError::InvalidInput(format!(
+                            "no subagent run '{id}'; omit subagent_id to list runs"
+                        )));
+                    };
+                    let timed_out = std::time::Instant::now() >= deadline;
+                    if !status.is_running() || wait == 0 || timed_out {
+                        let Some(run) = registry.run(&id) else {
+                            return Err(ToolError::InvalidInput(format!(
+                                "subagent run '{id}' disappeared"
+                            )));
+                        };
+                        let status = run.status.as_str();
+                        let elapsed = run.elapsed_ms();
+                        let mut payload = serde_json::json!({
+                            "subagent_id": run.id,
+                            "title": run.title,
+                            "status": status,
+                            "elapsed_ms": elapsed,
+                            "prompt_tokens": run.prompt_tokens,
+                            "completion_tokens": run.completion_tokens,
+                        });
+                        if let Some(result) = run.result {
+                            let clipped: String = result.chars().take(16_000).collect();
+                            payload["result"] = serde_json::Value::String(clipped);
+                        }
+                        if let Some(error) = run.error {
+                            payload["error"] = serde_json::Value::String(error);
+                        }
+                        if run.status.is_running() {
+                            payload["note"] = serde_json::Value::String(
+                                "still running; pass a larger wait_seconds (up to 300) instead of polling".to_string(),
+                            );
+                        }
+                        return Ok(payload);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        },
+    );
+    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
+        Arc::new(tool),
+        declare("subagent_result"),
+    ))) {
+        warn!("subagent_result tool was not registered: {error}");
+    }
+}
+
+/// Install the tool that answers a child's next turn from the model side.
+///
+/// The reader can already type into a child from its menu; this is the same
+/// path for the model, and it reuses the same registry calls rather than a
+/// second opinion about what "the child is busy" means:
+///
+/// - a RUNNING child queues the message behind its current turn, and the child
+///   clock starts it when that turn settles, exactly as a reader's queued
+///   prompt starts;
+/// - a SETTLED child reopens immediately and runs on the live agent that
+///   answered its last turn, so the follow-up keeps the conversation.
+///
+/// A run restored from disk has no live process on this side (the child agent
+/// is not persisted); that case is refused with the one action that works
+/// instead of silently starting a stranger.
+fn attach_subagent_message_tool(agent: &mut Agent, context: Arc<SubagentContext>) {
+    let tool = agent::tools::AsyncFunctionTool::from_fn(
+        "send_message",
+        "Send a message to a subagent run you started: a running child queues it behind its current turn, and a finished child starts a new turn with the message. Returns queued or started; read the answer with subagent_result. The child cannot see this conversation, so a follow-up must carry its own context. Start a new delegation instead when the run's process is gone (a restart).",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subagent_id": { "type": "string", "description": "The id the subagent tool returned; list the runs with subagent_result and no id." },
+                "message": { "type": "string", "description": "The follow-up: what to do next, with the context the child needs. It is a user row in the child's own conversation." }
+            },
+            "required": ["subagent_id", "message"]
+        }),
+        move |args| {
+            let context = context.clone();
+            async move {
+                let id = args
+                    .get("subagent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let message = args
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if id.is_empty() {
+                    return Err(ToolError::InvalidInput(
+                        "subagent_id is required; list the runs with subagent_result and no id"
+                            .to_string(),
+                    ));
+                }
+                if message.is_empty() {
+                    return Err(ToolError::InvalidInput(
+                        "message is required and must not be empty".to_string(),
+                    ));
+                }
+                // The same non-disclosure the collector keeps: a run from
+                // another conversation is indistinguishable from an unknown id.
+                let Some(run) = context.registry.run(&id) else {
+                    return Err(ToolError::InvalidInput(format!(
+                        "no subagent run '{id}'; list them with subagent_result and no id"
+                    )));
+                };
+                if run.session != context.session {
+                    return Err(ToolError::InvalidInput(format!(
+                        "no subagent run '{id}'; list them with subagent_result and no id"
+                    )));
+                }
+                // A follow-up is another child turn, so it asks the same spawn
+                // question the first delegation asked, before anything moves.
+                context.authorize_spawn()?;
+                if run.status.is_running() && context.registry.queue_followup(&id, &message) {
+                    return Ok(serde_json::json!({
+                        "subagent_id": id,
+                        "status": "queued",
+                        "note": "The child is mid-turn; the message starts the next child turn when this one settles. Collect it with subagent_result."
+                    }));
+                }
+                let Some(child) = context.registry.agent(&id) else {
+                    return Err(ToolError::Failed(format!(
+                        "subagent run '{id}' has no live process (it was restored after a restart), so a follow-up cannot continue it. Start a new subagent with the context it needs."
+                    )));
+                };
+                if !context.registry.begin_followup(&id, &message) {
+                    // It settled between the snapshot and the reopen: queue
+                    // behind the turn that just started rather than opening a
+                    // second stream over the same transcript.
+                    if context.registry.queue_followup(&id, &message) {
+                        return Ok(serde_json::json!({
+                            "subagent_id": id,
+                            "status": "queued",
+                            "note": "The child started a turn while this call was made; the message starts the next one. Collect it with subagent_result."
+                        }));
+                    }
+                    return Err(ToolError::Failed(format!(
+                        "subagent run '{id}' is already running a turn and refused the queue; read it with subagent_result"
+                    )));
+                }
+                let handle = tokio::spawn(continue_child(
+                    context.clone(),
+                    id.clone(),
+                    child,
+                    message,
+                ));
+                context.registry.set_handle(&id, handle.abort_handle());
+                Ok(serde_json::json!({
+                    "subagent_id": id,
+                    "status": "started",
+                    "note": "The child is answering in the background; collect it with subagent_result before you finish the turn."
+                }))
+            }
+        },
+    );
+    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
+        Arc::new(tool),
+        declare("send_message"),
+    ))) {
+        warn!("send_message tool was not registered: {error}");
+    }
+}
+
+/// Run one more turn into a child that already lives in the registry.
+///
+/// The turn itself is [stream_child], the same call the first delegation makes,
+/// so a follow-up reports the same transcript, token usage and finish/fail
+/// transitions. The child is locked for the turn so two queued prompts cannot
+/// write over one transcript.
+async fn continue_child(
+    context: Arc<SubagentContext>,
+    id: String,
+    child: Arc<tokio::sync::Mutex<Agent>>,
+    prompt: String,
+) {
+    let turn_context = crate::context::TurnContext::from_facts(&context.runtime, true);
+    let registry = context.registry.clone();
+    let guard = child.lock().await;
+    let result = stream_child(&guard, prompt, registry.clone(), &id, &turn_context).await;
+    let usage = guard.last_token_usage().unwrap_or((0, 0));
+    let transcript = child_transcript(&guard);
+    drop(guard);
+    match result {
+        Ok((text, usage)) => registry.finish(&id, text, usage, transcript),
+        Err(message) => registry.fail(&id, message, Some(usage), transcript),
+    }
+}
+
+/// Install the tool that stops a running child.
+///
+/// The reader's subagent menu can stop a run; this is the same registry call
+/// from the model side. A settled run is not an error - it reports the state it
+/// already has - and a run with no live task (restored after a restart) says so
+/// instead of pretending to have stopped it.
+fn attach_subagent_interrupt_tool(agent: &mut Agent, context: Arc<SubagentContext>) {
+    let tool = agent::tools::AsyncFunctionTool::from_fn(
+        "interrupt_agent",
+        "Stop a running subagent. The child's turn is aborted and its slot is released; the run is marked failed with 'interrupted by the parent turn', and any prompts queued behind it are dropped. A run that already settled is reported unchanged, not stopped. Use it when a child is clearly going the wrong way, then delegate again with a corrected prompt.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subagent_id": { "type": "string", "description": "The id the subagent tool returned; list the runs with subagent_result and no id." }
+            },
+            "required": ["subagent_id"]
+        }),
+        move |args| {
+            let context = context.clone();
+            async move {
+                let id = args
+                    .get("subagent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if id.is_empty() {
+                    return Err(ToolError::InvalidInput(
+                        "subagent_id is required; list the runs with subagent_result and no id"
+                            .to_string(),
+                    ));
+                }
+                let Some(run) = context.registry.run(&id) else {
+                    return Err(ToolError::InvalidInput(format!(
+                        "no subagent run '{id}'; list them with subagent_result and no id"
+                    )));
+                };
+                if run.session != context.session {
+                    return Err(ToolError::InvalidInput(format!(
+                        "no subagent run '{id}'; list them with subagent_result and no id"
+                    )));
+                }
+                if !run.status.is_running() {
+                    return Ok(serde_json::json!({
+                        "subagent_id": id,
+                        "interrupted": false,
+                        "status": run.status.as_str(),
+                        "note": "The run already settled; read it with subagent_result."
+                    }));
+                }
+                if !context.registry.interrupt(&id) {
+                    // It may have settled between the status check and the
+                    // abort: report the state it reached rather than claiming a
+                    // failure to stop something that already finished.
+                    if let Some(now) = context.registry.run(&id) {
+                        if !now.status.is_running() {
+                            return Ok(serde_json::json!({
+                                "subagent_id": id,
+                                "interrupted": false,
+                                "status": now.status.as_str(),
+                                "note": "The run settled before it could be stopped; read it with subagent_result."
+                            }));
+                        }
+                    }
+                    return Err(ToolError::Failed(format!(
+                        "subagent run '{id}' has no live process to stop (it was restored after a restart); its status is unchanged. Start a new subagent instead."
+                    )));
+                }
+                Ok(serde_json::json!({
+                    "subagent_id": id,
+                    "interrupted": true,
+                    "status": "failed",
+                    "note": "The child's turn was stopped and its slot released. Start a new subagent if the work still matters."
+                }))
+            }
+        },
+    );
+    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
+        Arc::new(tool),
+        declare("interrupt_agent"),
+    ))) {
+        warn!("interrupt_agent tool was not registered: {error}");
+    }
+}
+
+/// Compile this turn's policy: the workspace file when present, else the
+/// shipped baseline, with one data document built from the turn's facts.
+///
+/// A policy file that exists and does not parse does not make the build fail:
+/// [`PolicySet::compile`] records the failure and every check then applies the
+/// documented asymmetry (deny writes and egress, allow in-workspace reads).
+fn build_policy(settings: &Settings, eff: &Effective, root: Option<&Path>) -> PolicySet {
+    let mut data = PolicyData::new(root.map(Path::to_path_buf).unwrap_or_default())
+        .with_preset(eff.preset_id.clone())
+        // WHY no preset applied, recorded beside the id: empty means either
+        // "none chosen" or "the master switch is off", and the audit has to be
+        // able to tell a later reader which one it was.
+        .with_presets_disabled(eff.presets_disabled)
+        // The master switch is DATA, and so is the RESOLVED answer beside it:
+        // a policy that requires confinement reads `data.sandbox_confined`,
+        // which is false for a full-access release even when the switch is on
+        // and true for a preset's heel at full access.
+        .with_sandbox_enabled(settings.global.general.sandbox_active())
+        .with_sandbox_confined(eff.sandbox.heel)
+        .with_preset_permission(eff.preset_permission.clone().unwrap_or_default())
+        // The capability query and every action rule read the EFFECTIVE
+        // permission (session mode capped by the preset ceiling), not the
+        // preset's ceiling alone and never the requested mode.
+        .with_permission(eff.permission.effective.clone());
+    if let Some(root) = root {
+        // The file is TRI-STATE, and the state is a fact the empty rule lists
+        // cannot carry: ABSENT means nothing constrains egress (a fresh
+        // workspace reaches the network), PRESENT with no rule is a deliberate
+        // deny-all, PRESENT with rules is the allowlist. Only the last one is
+        // described by the three rule shapes (addresses = the strong door,
+        // hostnames = the weak door, ports = a constraint on both).
+        match read_egress_rules(root) {
+            WorkspaceEgress::Absent => {
+                data = data.with_egress_unrestricted(true);
+            }
+            WorkspaceEgress::Empty => {
+                // The baseline's deny-all floor is the right answer for a file
+                // the reader created and left empty.
+            }
+            WorkspaceEgress::Rules(rules) => {
+                data = data
+                    .with_egress_allowlist(rules.addresses)
+                    .with_egress_hosts(rules.hosts)
+                    .with_egress_ports(rules.ports);
+            }
+        }
+        // One parse of each scope list into its LITERAL roots (prefix
+        // matching, what every shipped preset relies on) and its GLOBS (the
+        // entries that carry * ? [ or {). Both shapes reach the same decision,
+        // and deny is decided first so it wins even inside a granted root.
+        let (read_roots, read_globs) = eff
+            .preset_read
+            .as_ref()
+            .map(|items| preset_scope_patterns(root, items, false))
+            .unwrap_or_default();
+        let (write_roots, write_globs) = eff
+            .preset_write
+            .as_ref()
+            .map(|items| preset_scope_patterns(root, items, false))
+            .unwrap_or_default();
+        let (deny_roots, deny_globs) = preset_scope_patterns(root, &eff.preset_deny, true);
+        data = data
+            .with_preset_scope(
+                eff.preset_read.is_some(),
+                read_roots,
+                eff.preset_write.is_some(),
+                write_roots,
+                deny_roots,
+            )
+            .with_preset_globs(read_globs, write_globs, deny_globs);
+        if let Some(egress) = &eff.preset_egress {
+            // The preset's own entries are classified through the SAME parser
+            // the workspace file uses, so a preset can name an address, a
+            // hostname (with a `*.` wildcard) or a bare port and mean the same
+            // thing the file means. A declared empty list still restricts: it
+            // is the preset saying "no network", not an absent field, and the
+            // policy then refuses every address while the derived proxy set
+            // stays empty.
+            data = data.with_preset_egress(true, EgressRuleSet::parse(egress));
+        }
+    }
+    // The session tier as a policy fact, generated for the effective level.
+    // A read-only session denies writes, egress and spawns here as well as in
+    // the Rust registration matrix; that matrix is the floor (the tools are not
+    // even offered), and this module is the second tier (defence in depth).
+    // ADVISORY applies to the modules the PRESET contributes, and only to
+    // them. The baseline, the session tier and the workspace policy are never
+    // marked: in advisory mode the preset's own scope, egress, guard and custom
+    // Rego warn instead of blocking, while the floor still refuses. That is
+    // what keeps advisory from widening the session or leaving the workspace.
+    let advisory = eff.policy_mode() == crate::settings::global::PolicyMode::Advisory;
+    let mut sources = vec![
+        agent::policy::baseline_source(),
+        agent::policy::session_permission_source(&eff.permission.effective),
+    ];
+    let scope_active =
+        eff.preset_read.is_some() || eff.preset_write.is_some() || !eff.preset_deny.is_empty();
+    if scope_active {
+        sources.push(agent::policy::preset_scope_source().advisory(advisory));
+    }
+    if eff.preset_egress.is_some() {
+        sources.push(agent::policy::preset_egress_source().advisory(advisory));
+    }
+    // A read-only CEILING is also a policy fact of its own: the preset's module
+    // narrows independently of the session tier. The built-in read-only module
+    // already carries this rule; add the generated one only when the preset does
+    // not name it, so every read-only preset is enforced by Rego.
+    let generated_read_only = eff.preset_permission.as_deref() == Some("read-only")
+        && !eff
+            .preset_builtin_policy
+            .iter()
+            .any(|id| canonical_builtin_policy_id(id) == "builtin:read-only");
+    if generated_read_only {
+        sources.push(agent::policy::preset_permission_source().advisory(advisory));
+    }
+    for id in &eff.preset_builtin_policy {
+        match builtin_policy_source(id) {
+            Some(source) => sources.push(source.advisory(advisory)),
+            None => {
+                // An unknown built-in id must not silently disappear from the
+                // set: an unparseable placeholder latches the failure mode.
+                warn!("unknown preset builtin policy '{id}'");
+                sources.push(PolicySource::extension(
+                    "preset-builtin",
+                    "# unknown preset builtin policy",
+                    false,
+                ));
+            }
+        }
+    }
+    // A required policy that the reader has not trusted makes the preset
+    // unusable; refuse it in the set as well as in the send gate.
+    if eff.preset_policy_required_untrusted() {
+        sources.push(PolicySource::extension(
+            "preset-policy",
+            "# required preset policy is untrusted",
+            false,
+        ));
+    } else if eff.preset_trusted {
+        // A preset is an authority only after the reader trusts it. An
+        // untrusted policy is ignored; the send gate refuses the required case
+        // before a turn starts.
+        if let Some(policy) = eff.preset_policy.as_deref() {
+            sources.push(PolicySource::extension("preset", policy, true).advisory(advisory));
+        }
+    }
+    if let Some(root) = root {
+        let path = root.join(".bsh").join("policy.rego");
+        match std::fs::read_to_string(&path) {
+            Ok(rego) => sources.push(PolicySource::workspace("workspace", rego)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                // A policy file that exists but cannot be read must not
+                // silently leave only the baseline: that would widen a gate
+                // the workspace meant to narrow. An unparseable placeholder
+                // latches the set into its failure mode instead.
+                warn!("policy file {} could not be read: {error}", path.display());
+                sources.push(PolicySource::workspace(
+                    "workspace",
+                    "# the workspace policy exists but could not be read",
+                ));
+            }
+        }
+    }
+    PolicySet::compile(sources, data).with_lang(settings.global.general.lang.clone())
+}
+
+/// Binary-shipped Rego modules a preset can name by id.
+const BUILTIN_DENY_SECRETS: &str = r#"package policy.builtin.deny_secrets
+
+# rule: deny-secrets
+verdict := {"allow": false, "rule": "deny-secrets", "reason": "the path is a secret or credential store"} if {
+    input.target.kind == "path"
+    secret_path(input.target.path)
+} else := {"allow": true}
+
+secret_path(path) if {
+    contains(concat("", [path, "/"]), "/.env/")
+}
+
+secret_path(path) if {
+    contains(concat("", [path, "/"]), "/.ssh/")
+}
+
+secret_path(path) if {
+    contains(concat("", [path, "/"]), "/.aws/")
+}
+
+secret_path(path) if {
+    contains(concat("", [path, "/"]), "/secrets/")
+}
+
+secret_path(path) if {
+    endswith(path, ".pem")
+}
+
+secret_path(path) if {
+    endswith(path, "/id_rsa")
+}
+"#;
+
+const BUILTIN_READ_ONLY: &str = r#"package policy.builtin.read_only
+
+# rule: read-only
+verdict := {"allow": false, "rule": "read-only", "reason": "this preset is read-only"} if {
+    input.action == "write"
+} else := {"allow": true}
+"#;
+
+const BUILTIN_NO_SHELL: &str = r#"package policy.builtin.no_shell
+
+# rule: no-shell
+verdict := {"allow": false, "rule": "no-shell", "reason": "this preset does not allow a shell"} if {
+    input.action == "spawn"
+    input.tool == "bash"
+} else := {"allow": true}
+"#;
+
+const BUILTIN_NO_EGRESS: &str = r#"package policy.builtin.no_egress
+
+# rule: no-egress
+verdict := {"allow": false, "rule": "no-egress", "reason": "this preset does not allow network egress"} if {
+    input.action == "egress"
+} else := {"allow": true}
+"#;
+
+const BUILTIN_DOCS_ONLY: &str = r#"package policy.builtin.docs_only
+
+# rule: docs-only
+verdict := {"allow": false, "rule": "docs-only", "reason": "this preset writes documentation only"} if {
+    input.action == "write"
+    not docs_path(input.target.path)
+} else := {"allow": true}
+
+docs_path(path) if {
+    contains(concat("", [path, "/"]), "/docs/")
+}
+
+docs_path(path) if {
+    endswith(path, "/README.md")
+}
+"#;
+
+const BUILTIN_DENY_GIT_WRITES: &str = r#"package policy.builtin.deny_git_writes
+
+# rule: deny-git-writes
+verdict := {"allow": false, "rule": "deny-git-writes", "reason": "writes into Git internals are forbidden"} if {
+    input.action == "write"
+    contains(concat("", [input.target.path, "/"]), "/.git/")
+} else := {"allow": true}
+"#;
+
+/// The stable id a preset's `builtin_policy` entry names.
+///
+/// The bare names (`deny-secrets`) are the vocabulary every existing preset
+/// file uses, so they are accepted as aliases and canonicalised to the
+/// `builtin:` id; an unknown entry is returned unchanged so the loader can
+/// report it rather than silently substituting one.
+pub(crate) fn canonical_builtin_policy_id(id: &str) -> &str {
+    let trimmed = id.trim();
+    let bare = trimmed.strip_prefix("builtin:").unwrap_or(trimmed);
+    match bare {
+        "deny-secrets" => "builtin:deny-secrets",
+        "read-only" => "builtin:read-only",
+        "no-shell" => "builtin:no-shell",
+        "no-egress" => "builtin:no-egress",
+        "docs-only" => "builtin:docs-only",
+        "deny-git-writes" => "builtin:deny-git-writes",
+        _ => trimmed,
+    }
+}
+
+fn builtin_policy_source(id: &str) -> Option<PolicySource> {
+    let canonical = canonical_builtin_policy_id(id);
+    let rego = match canonical {
+        "builtin:deny-secrets" => BUILTIN_DENY_SECRETS,
+        "builtin:read-only" => BUILTIN_READ_ONLY,
+        "builtin:no-shell" => BUILTIN_NO_SHELL,
+        "builtin:no-egress" => BUILTIN_NO_EGRESS,
+        "builtin:docs-only" => BUILTIN_DOCS_ONLY,
+        "builtin:deny-git-writes" => BUILTIN_DENY_GIT_WRITES,
+        _ => return None,
+    };
+    Some(PolicySource::builtin(canonical, rego))
+}
+
+/// Resolve a preset scope list into its LITERAL roots and GLOB patterns.
+///
+/// The two shapes are not alternatives: a list may mix `docs` (a literal
+/// prefix, which is what a directory entry has always meant) with
+/// `src/**/*.rs` (a glob). A literal entry is canonicalized when the path
+/// exists so a symlinked workspace compares like the tools' resolved paths; a
+/// pattern cannot be canonicalized, so it is joined to the same canonical root
+/// the tools use.
+///
+/// Validation happens at LOAD (`Preset::scope_problem`), so an entry here has
+/// already been accepted. The fallback still fails CLOSED: an entry that slips
+/// through is logged and, for a deny list, becomes a match-everything pattern
+/// rather than disappearing - a dropped deny entry would be a widening.
+fn preset_scope_patterns(
+    root: &std::path::Path,
+    items: &[String],
+    deny: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut roots: Vec<String> = Vec::new();
+    let mut globs: Vec<String> = Vec::new();
+    for item in items {
+        let entry = item.trim();
+        if let Err(why) = agent::policy::validate_scope_entry(entry) {
+            warn!("preset scope entry '{entry}' is invalid ({why}); refusing to drop it silently");
+            // A deny entry that cannot be parsed denies everything in the
+            // workspace instead of vanishing. A read/write entry is skipped,
+            // which NARROWS (the scope no longer grants it) rather than widens.
+            if deny {
+                globs.push("**".to_string());
+            }
+            continue;
+        }
+        let path = std::path::Path::new(entry);
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        if agent::policy::is_glob(entry) {
+            globs.push(joined.to_string_lossy().to_string());
+        } else {
+            let canonical = joined.canonicalize().unwrap_or(joined);
+            roots.push(canonical.to_string_lossy().to_string());
+        }
+    }
+    (roots, globs)
+}
+
+/// The egress rules this workspace declares.
+///
+/// One file, `<workspace>/.bsh/egress-allowlist`, with `#` comments and blank
+/// lines ignored. Each line is one of three shapes, decided by what it can be:
+///
+/// - a bare integer is a destination PORT (`443`). No port lines means any
+///   port; one or more means only those.
+/// - something that parses as an address or as a CIDR range is an ADDRESS rule
+///   (`203.0.113.7`, `10.0.0.0/8`). This is the strong door: the policy decides
+///   on the resolved address, so a DNS rebind cannot ride it.
+/// - anything else is a HOSTNAME rule (`api.example.com`, `*.crates.io`). This
+///   is the weaker door - it survives a rebind - and it exists for a policy that
+///   names a service rather than an address.
+///
+/// The file is TRI-STATE, and the three states are different decisions:
+///
+/// - [`WorkspaceEgress::Absent`] - no file at all. The workspace declared
+///   nothing, so egress is UNRESTRICTED; this is the state of a fresh workspace,
+///   which is why the network works out of the box.
+/// - [`WorkspaceEgress::Empty`] - the file exists and parses to no rule (only
+///   comments and blanks). The reader created the file and left it empty, which
+///   is a deliberate deny-all.
+/// - [`WorkspaceEgress::Rules`] - the file declares rules, which constrain the
+///   reach exactly as before.
+///
+/// The classification itself is [`EgressRuleSet`], the one parser both this
+/// file and a preset's own `egress` field read through, so a line cannot mean
+/// one thing here and another in a preset.
+///
+/// An unreadable file is reported as PRESENT (a deny-all), never as absent: a
+/// permission error or a directory at the path must not widen a workspace that
+/// meant to constrain itself. Only `NotFound` is the absent state.
+fn read_egress_rules(root: &Path) -> WorkspaceEgress {
+    let path = egress_allowlist_path(root);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WorkspaceEgress::Absent;
+        }
+        Err(error) => {
+            warn!("the workspace egress allowlist could not be read: {error}");
+            return WorkspaceEgress::Empty;
+        }
+    };
+    let rules = EgressRuleSet::parse([text]);
+    if rules.is_empty() {
+        WorkspaceEgress::Empty
+    } else {
+        WorkspaceEgress::Rules(rules)
+    }
+}
+
+/// What the workspace egress file declares, in the three states the policy
+/// answers differently.
+///
+/// The rule lists cannot carry the distinction: an absent file and a
+/// present-but-empty file both have no rule, and the first is UNRESTRICTED
+/// while the second is a deliberate DENY ALL. The reader owns the file's state
+/// so the policy can be told which it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspaceEgress {
+    /// No `.bsh/egress-allowlist` file at all: nothing is constrained.
+    Absent,
+    /// The file exists and parses to no rule: a deliberate deny-all.
+    Empty,
+    /// The file exists and declares at least one rule.
+    Rules(EgressRuleSet),
+}
+
+/// The one path the workspace's egress allowlist lives at.
+///
+/// The reader, the pane's create action and the settings reveal all derive the
+/// path here, so the file the shell shows and the file the policy parses cannot
+/// drift apart.
+pub(crate) fn egress_allowlist_path(root: &Path) -> PathBuf {
+    root.join(".bsh").join("egress-allowlist")
+}
+
+/// The starter body the Policy pane's "Create starter allowlist" offers.
+///
+/// This is the SINGLE source of truth for that text: the pane action writes
+/// exactly these bytes, so the copy a reader sees and the file they get cannot
+/// drift apart.
+///
+/// CREATING THE FILE IS AN OPT-IN TO CONTROL. With no file at all the workspace
+/// is UNRESTRICTED - the network works out of the box - while a file that
+/// exists and declares no rule DENIES ALL EGRESS. The starter therefore states
+/// both facts in its own words and parses to ZERO rules: the reader who writes
+/// it has deliberately chosen the deny-all floor, and uncommenting a rule is
+/// how they open one destination.
+///
+/// The starter carries a commented DENY ALL example, a commented ALLOW ALL
+/// (nearest-equivalent) example and one WORKED allow example, every rule still
+/// commented so the file itself cannot change the floor when it is written.
+///
+/// Allow-all is NOT expressible as a single hostname rule: the parser reads a
+/// hostname rule as an exact name or a leading "*." suffix, so a bare "*"
+/// matches no host, and there is no "any hostname" spelling. The real, closest
+/// equivalent is an address rule covering every address - `0.0.0.0/0` for IPv4
+/// and `::/0` for IPv6 - which the parser classifies as an ADDRESS rule and
+/// `net.cidr_contains` then matches against any resolved address. That is what
+/// the commented example below documents, honestly, rather than inventing a
+/// syntax the parser does not accept.
+pub(crate) const EGRESS_ALLOWLIST_TEMPLATE: &str = "\
+# Egress allowlist for this workspace.
+#
+# CREATING THIS FILE OPTS INTO CONTROL.
+#
+# With NO file at all the workspace is UNRESTRICTED: the network works out of
+# the box. A file that EXISTS and declares no rule - only comments and blank
+# lines, like this starter - DENIES ALL EGRESS. That is deliberate: the file is
+# the workspace's network floor, and an empty one is a lockdown, not an
+# absence. Delete the file to restore the unrestricted default, or uncomment a
+# rule to allow a destination.
+#
+# This file can only NARROW what the baseline and the preset allow; a preset
+# may narrow it further and can never add a destination this file does not
+# name.
+#
+# One rule per line; blank lines and '#' comments are ignored. A line is one of
+# three shapes, decided by what it can be:
+#
+#   port     443              a bare integer: a destination PORT. No port lines
+#                             means any port; one or more means only those.
+#   address  203.0.113.7      an address or a CIDR range: the STRONG door,
+#            10.0.0.0/8       decided on the resolved IP, so a DNS rebind
+#                             cannot ride it.
+#   hostname api.example.com  anything else: a HOSTNAME, the WEAKER door -
+#            *.crates.io      the name is what the policy saw, so a rebind
+#                             survives it. A leading '*.' matches any subdomain.
+#
+# Every line below is a COMMENTED example, so this file declares no rule and
+# egress is denied until you deliberately uncomment one.
+#
+# WORKED EXAMPLE - allow one IPv4 address on the HTTPS port. Uncomment both
+# lines to make the HTTPS URL of 203.0.113.7 reachable and nothing else:
+# 203.0.113.7
+# 443
+#
+# Example: allow a service by name (the weaker door).
+# api.example.com
+# *.crates.io
+#
+# DENY ALL: what this file already does. Leave no uncommented rule. There is no
+# deny-all keyword - a present file with no rule IS the deny.
+#
+# ALLOW ALL: there is no wildcard-hostname spelling for any host: a hostname
+# rule matches an exact name or a leading '*.' suffix, so '*' matches no host.
+# The nearest real equivalent is an address rule covering every address; the
+# parser accepts it and it is the honest allow-all:
+# 0.0.0.0/0
+# ::/0
+";
+
+/// Write the starter allowlist whether or not one is already there.
+///
+/// This is the Policy pane's explicit "Create starter allowlist" action: the
+/// reader asked for the template, so an existing file is replaced with exactly
+/// the template bytes. Nothing seeds this file automatically: an auto-seeded
+/// file would flip a fresh, unrestricted workspace into a deny-all one.
+///
+/// The written file declares no rule, so creating it DENIES all egress; the
+/// pane's notice and the template's own prose both say so before the reader
+/// clicks. The workspace-registration path never calls this.
+pub(crate) fn write_egress_allowlist_template(root: &Path) -> std::io::Result<()> {
+    let path = egress_allowlist_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, EGRESS_ALLOWLIST_TEMPLATE)
+}
+
+/// The workspace's .bsh/.ignore rules, when a turn has a workspace root.
+///
+/// Loading them creates the file on first use, which is why it happens here and
+/// not when the agent is built: opening a settings pane must not write into a
+/// workspace, but the first file tool call must leave the reader a rule file to
+/// edit.
+fn ignore_rules(root: Option<&Path>) -> Option<Rules> {
+    root.map(Rules::load)
+}
+
+/// Refuse a path the workspace ignore file excludes.
+///
+/// The policy is still asked separately; this refusal is the reader's own
+/// preference, not a security boundary, so it runs before the policy and names
+/// the file to edit.
+fn refuse_ignored(rules: Option<&Rules>, target: &Path) -> Result<(), ToolError> {
+    if let Some(rules) = rules {
+        if rules.is_ignored(target, target.is_dir()) {
+            return Err(ToolError::Failed(rules.refusal(target)));
+        }
+    }
+    Ok(())
+}
+
+/// Ask the policy about one concrete path before a tool touches it.
+fn check_path(
+    policy: &PolicySet,
+    session: &str,
+    preset: &str,
+    tool: &str,
+    action: Action,
+    path: &Path,
+) -> Result<(), ToolError> {
+    let input = PolicyInput::new(tool, action, Target::path(path))
+        .with_session(session)
+        .with_preset(preset);
+    let decision = policy.check(&input);
+    if decision.is_allowed() {
+        Ok(())
+    } else {
+        Err(ToolError::Failed(policy.refusal(&decision)))
+    }
+}
+
+fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| ToolError::InvalidInput(format!("{key} is required")))
+}
+
+/// A positive integer argument, or none when it is absent.
+fn arg_positive(args: &serde_json::Value, key: &str) -> Result<Option<usize>, ToolError> {
+    let Some(value) = args.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(number) = value.as_u64() else {
+        return Err(ToolError::InvalidInput(format!(
+            "{key} must be a positive integer"
+        )));
+    };
+    let number = usize::try_from(number)
+        .map_err(|_| ToolError::InvalidInput(format!("{key} is too large")))?;
+    if number == 0 {
+        return Err(ToolError::InvalidInput(format!("{key} must be at least 1")));
+    }
+    Ok(Some(number))
+}
+
+/// The largest file one `read_file` call returns, in bytes.
+///
+/// A tool result travels through the request and into the transcript, so an
+/// unbounded read is not a slow call, it is a broken turn. A larger file is
+/// refused with the way to read a window instead of being loaded whole.
+const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum number of files accepted by one batch read.
+const MAX_BATCH_READ_FILES: usize = 10;
+
+/// Maximum number of files changed by one patch call.
+const MAX_PATCH_FILES: usize = 10;
+
+/// Maximum exact-text edits applied to one file by one patch call.
+const MAX_PATCH_EDITS: usize = 20;
+
+/// Maximum combined old/new text accepted by one patch request.
+const MAX_PATCH_INPUT_BYTES: usize = 1024 * 1024;
+
+/// Maximum combined content returned by one batch read.
+const MAX_BATCH_READ_BYTES: usize = 1024 * 1024;
+
+/// The largest file `edit_file` rewrites, in bytes.
+///
+/// An edit needs the whole file in memory to prove the match is unique, and sed
+/// reads it to prove a result is a no-op; past this ceiling the call is refused
+/// rather than stalling the turn.
+pub(crate) const MAX_EDIT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The most bytes one windowed read returns.
+const MAX_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+
+/// The entries one `list_dir` call collects before it stops reading.
+const MAX_LIST_ENTRIES: usize = 10_000;
+
+/// The entries one `list_dir` result returns.
+const MAX_LIST_ROWS: usize = 2_000;
+
+/// One read, as `read_file` reports it.
+struct ReadOutcome {
+    content: String,
+    truncated: bool,
+    /// The window started past the last line of the file.
+    ///
+    /// An empty window is a real answer - there is nothing between `offset`
+    /// and the end - but on its own it is indistinguishable from an empty
+    /// file, and a model that mis-computed the offset takes it as "the file
+    /// is empty". The flag says which one happened.
+    past_end: bool,
+}
+
+/// One directory listing, as `list_dir` reports it.
+struct Listing {
+    entries: Vec<serde_json::Value>,
+    truncated: bool,
+}
+
+/// One write, as `write_file` reports it.
+struct WriteOutcome {
+    bytes: usize,
+    unchanged: bool,
+}
+
+/// Why one edit could not be applied.
+enum ReplaceError {
+    NotFound,
+    Ambiguous(usize),
+}
+
+/// One edit's result: the new text, or none when the call changed nothing.
+struct EditOutcome {
+    updated: Option<String>,
+    replacements: usize,
+}
+
+/// The tool error one failed filesystem call shares.
+fn failed(target: &Path, error: &std::io::Error) -> ToolError {
+    ToolError::Failed(format!("{}: {error}", target.display()))
+}
+
+/// Open a path that must be a regular file, and its metadata.
+///
+/// The metadata check happens BEFORE the open: opening a FIFO or a device
+/// blocks or has side effects, so a path the model named can never hang the
+/// turn. A refusal that says what the path is beats a call that never returns.
+fn open_regular(target: &Path) -> Result<(fs::File, fs::Metadata), ToolError> {
+    let meta = fs::metadata(target).map_err(|error| failed(target, &error))?;
+    if meta.is_dir() {
+        return Err(ToolError::InvalidInput(format!(
+            "{} is a directory; use list_dir",
+            target.display()
+        )));
+    }
+    if !meta.is_file() {
+        return Err(ToolError::InvalidInput(format!(
+            "{} is not a regular file",
+            target.display()
+        )));
+    }
+    let file = fs::File::open(target).map_err(|error| failed(target, &error))?;
+    Ok((file, meta))
+}
+
+/// Refuse a file past the read ceiling, naming the way to read it anyway.
+fn read_ceiling(target: &Path, size: u64) -> ToolError {
+    ToolError::Failed(format!(
+        "{} is {size} bytes, past the {MAX_READ_BYTES} byte read ceiling; pass offset (1-based line) and limit to read a window",
+        target.display()
+    ))
+}
+
+/// Decode bytes as the file's text, refusing binary content up front.
+///
+/// The classification scans the head first, because a PNG or an object file is
+/// also invalid UTF-8 and "binary file" is the answer a caller can act on. The
+/// tail check uses a char search, which is a memchr: a byte-at-a-time scan of a
+/// multi-megabyte file cost 10ms a read for nothing.
+fn utf8_text(target: &Path, bytes: Vec<u8>, base: usize) -> Result<String, ToolError> {
+    let head = &bytes[..bytes.len().min(8 * 1024)];
+    if let Some(at) = head.iter().position(|byte| *byte == 0) {
+        return Err(binary(target, base + at));
+    }
+    let content = String::from_utf8(bytes).map_err(|error| {
+        ToolError::Failed(format!(
+            "{} is not valid UTF-8 (the first invalid byte is at offset {})",
+            target.display(),
+            base + error.utf8_error().valid_up_to()
+        ))
+    })?;
+    if let Some(at) = content.find('\0') {
+        return Err(binary(target, base + at));
+    }
+    Ok(content)
+}
+
+/// The refusal binary content shares.
+fn binary(target: &Path, at: usize) -> ToolError {
+    ToolError::Failed(format!(
+        "{} is a binary file (NUL byte at offset {at}); there is no text to read",
+        target.display()
+    ))
+}
+
+/// Read the whole file, bounded by the read ceiling.
+fn read_whole(target: &Path) -> Result<ReadOutcome, ToolError> {
+    let (file, meta) = open_regular(target)?;
+    if meta.len() > MAX_READ_BYTES as u64 {
+        return Err(read_ceiling(target, meta.len()));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_READ_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| failed(target, &error))?;
+    if bytes.len() > MAX_READ_BYTES {
+        return Err(read_ceiling(target, bytes.len() as u64));
+    }
+    let content = utf8_text(target, bytes, 0)?;
+    Ok(ReadOutcome {
+        content,
+        truncated: false,
+        past_end: false,
+    })
+}
+
+/// Read one line window without loading the rest of the file.
+fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome, ToolError> {
+    let (file, _) = open_regular(target)?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut line: Vec<u8> = Vec::new();
+    let mut out: Vec<u8> = Vec::new();
+    let mut index = 1_usize;
+    let mut kept = 0_usize;
+    let mut truncated = false;
+    // The byte offset of `out`'s first byte, so a refusal inside the window
+    // reports a position a reader can seek to in the FILE, not one relative to
+    // the window it happens to be looking at.
+    let mut base = 0_usize;
+    let mut consumed = 0_usize;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| failed(target, &error))?;
+        if read == 0 {
+            break;
+        }
+        if index >= offset {
+            if kept == limit || out.len() + line.len() > MAX_WINDOW_BYTES {
+                truncated = true;
+                break;
+            }
+            if kept == 0 {
+                base = consumed;
+            }
+            out.extend_from_slice(&line);
+            kept += 1;
+        }
+        consumed += read;
+        index += 1;
+    }
+    let content = utf8_text(target, out, base)?;
+    Ok(ReadOutcome {
+        content,
+        truncated,
+        past_end: kept == 0 && offset > 1,
+    })
+}
+
+/// Read a file for an edit, bounded by the edit ceiling.
+fn read_editable(target: &Path) -> Result<String, ToolError> {
+    let (file, meta) = open_regular(target)?;
+    if meta.len() > MAX_EDIT_BYTES {
+        return Err(ToolError::Failed(format!(
+            "{} is {} bytes, too large to edit (the ceiling is {MAX_EDIT_BYTES} bytes)",
+            target.display(),
+            meta.len()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_EDIT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| failed(target, &error))?;
+    if bytes.len() as u64 > MAX_EDIT_BYTES {
+        return Err(ToolError::Failed(format!(
+            "{} grew past the {MAX_EDIT_BYTES} byte edit ceiling while it was read",
+            target.display()
+        )));
+    }
+    utf8_text(target, bytes, 0)
+}
+
+/// The one temp path a write uses beside its target.
+fn temp_beside(target: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let stamp = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    target.with_file_name(format!(".{name}.bsh-{}-{stamp}.tmp", std::process::id()))
+}
+
+/// Write bytes atomically, skipping a byte-identical rewrite.
+///
+/// A temp file beside the target plus a rename means a failed write leaves the
+/// old file exactly as it was instead of truncating it and dying halfway. The
+/// identical check keeps an unchanged write from moving the mtime, so a build
+/// watcher or a formatter is not woken by a call that changed nothing.
+fn write_bytes(target: &Path, bytes: &[u8]) -> Result<WriteOutcome, ToolError> {
+    let existing = match fs::metadata(target) {
+        Ok(meta) => {
+            if meta.is_dir() {
+                return Err(ToolError::InvalidInput(format!(
+                    "{} is a directory",
+                    target.display()
+                )));
+            }
+            if meta.is_file() && meta.len() == bytes.len() as u64 {
+                if let Ok(old) = fs::read(target) {
+                    if old == bytes {
+                        return Ok(WriteOutcome {
+                            bytes: bytes.len(),
+                            unchanged: true,
+                        });
+                    }
+                }
+            }
+            Some(meta)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(failed(target, &error)),
+    };
+    if let Some(parent) = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty() && !parent.is_dir())
+    {
+        fs::create_dir_all(parent).map_err(|error| failed(parent, &error))?;
+    }
+    #[cfg(unix)]
+    let mode = existing.as_ref().map(|meta| {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode()
+    });
+    #[cfg(not(unix))]
+    let _ = &existing;
+    let temp = temp_beside(target);
+    let write = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.flush()
+    })();
+    if let Err(error) = write {
+        let _ = fs::remove_file(&temp);
+        return Err(failed(target, &error));
+    }
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(mode));
+    }
+    if let Err(error) = fs::rename(&temp, target) {
+        let _ = fs::remove_file(&temp);
+        return Err(failed(target, &error));
+    }
+    Ok(WriteOutcome {
+        bytes: bytes.len(),
+        unchanged: false,
+    })
+}
+
+/// Replace `old` in `text`, in one pass, refusing an ambiguous single replace.
+///
+/// The search is memchr's vectorised substring finder, not the standard
+/// library's `str::matches`: the latter costs about 1us a match, so a
+/// replace_all over a file with tens of thousands of matches spent more time
+/// searching than reading and writing the whole file put together.
+fn replace_text(text: &str, old: &str, new: &str, all: bool) -> Result<EditOutcome, ReplaceError> {
+    if all {
+        let mut matches = memchr::memmem::find_iter(text.as_bytes(), old.as_bytes()).peekable();
+        if matches.peek().is_none() {
+            return Err(ReplaceError::NotFound);
+        }
+        let mut updated = String::with_capacity(text.len());
+        let mut last = 0_usize;
+        let mut replacements = 0_usize;
+        for index in matches {
+            updated.push_str(&text[last..index]);
+            updated.push_str(new);
+            last = index + old.len();
+            replacements += 1;
+        }
+        updated.push_str(&text[last..]);
+        return Ok(EditOutcome {
+            updated: Some(updated),
+            replacements,
+        });
+    }
+    let Some(first) = memchr::memmem::find(text.as_bytes(), old.as_bytes()) else {
+        return Err(ReplaceError::NotFound);
+    };
+    // A second occurrence turns the edit into a question, so it is refused
+    // before anything is rewritten. Counting for the message only happens on
+    // this failure path; the success path never scans the file twice.
+    if memchr::memmem::find(&text.as_bytes()[first + old.len()..], old.as_bytes()).is_some() {
+        let count = memchr::memmem::find_iter(text.as_bytes(), old.as_bytes()).count();
+        return Err(ReplaceError::Ambiguous(count));
+    }
+    let mut updated = String::with_capacity(text.len() + new.len());
+    updated.push_str(&text[..first]);
+    updated.push_str(new);
+    updated.push_str(&text[first + old.len()..]);
+    Ok(EditOutcome {
+        updated: Some(updated),
+        replacements: 1,
+    })
+}
+
+/// A sentence that points at where a missing `old_string` almost matched.
+fn not_found_message(target: &Path, content: &str, old: &str) -> String {
+    let mut message = format!("old_string not found in {}", target.display());
+    if content.contains("\r\n") && !old.contains('\r') {
+        message.push_str("; the file uses CRLF line endings, so old_string must carry them");
+    }
+    if let Some(line) = first_line_match(content, old) {
+        message.push_str(&format!(
+            "; its first line matches line {line}, so check the rest of the block exactly"
+        ));
+    }
+    message
+}
+
+/// The 1-based line whose text contains `old`'s first non-empty line.
+fn first_line_match(content: &str, old: &str) -> Option<usize> {
+    let needle = old.lines().find(|line| !line.trim().is_empty())?.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    content
+        .lines()
+        .position(|line| line.contains(needle))
+        .map(|index| index + 1)
+}
+
+/// One directory's entries, names and kinds, in a stable order.
+///
+/// The workspace ignore rules are the caller's, so a listing does not read the
+/// rule file once per row. The two harness directories are skipped by name even
+/// when there are no rules at all.
+fn list_entries(dir: &Path, rules: Option<&Rules>) -> Result<Listing, ToolError> {
+    let reader = fs::read_dir(dir).map_err(|error| failed(dir, &error))?;
+    let mut rows: Vec<(String, &'static str)> = Vec::new();
+    let mut truncated = false;
+    for entry in reader {
+        let Ok(entry) = entry else { continue };
+        if rows.len() >= MAX_LIST_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == crate::workspace_ignore::BSH_DIR || name == crate::workspace_ignore::BOS_DIR {
+            continue;
+        }
+        // The d_type from readdir answers the common case with no stat at all;
+        // only a symlink pays for one, to answer the question the agent is
+        // really asking (does this entry behave like a directory?).
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let kind = if file_type.is_dir() {
+            "dir"
+        } else if file_type.is_symlink() {
+            // `DirEntry::metadata` is an lstat and reports the LINK, so the
+            // follow has to go through the path.
+            match fs::metadata(entry.path()) {
+                Ok(meta) if meta.is_dir() => "dir",
+                _ => "file",
+            }
+        } else {
+            "file"
+        };
+        if rules.is_some_and(|rules| rules.is_ignored_child(&entry.path(), kind == "dir")) {
+            continue;
+        }
+        rows.push((name, kind));
+    }
+    // Plain byte ordering: a name sort is the cheap, total order the agent
+    // needs, and a case-folding comparison measured 15ms slower on 5k entries.
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    if rows.len() > MAX_LIST_ROWS {
+        rows.truncate(MAX_LIST_ROWS);
+        truncated = true;
+    }
+    let entries = rows
+        .into_iter()
+        .map(|(name, kind)| serde_json::json!({ "name": name, "kind": kind }))
+        .collect();
+    Ok(Listing { entries, truncated })
+}
+
+/// One mutex per path, so two tool calls that read-modify-write one file cannot
+/// both read the original and lose one update.
+fn file_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
+/// The sentence an empty glob result carries.
+///
+/// A model that reads a path miss as "this text is absent from the workspace"
+/// then stops looking, so the hint names the two facts that mistake needs:
+/// glob matches paths rather than contents, and ignored files were skipped.
+fn glob_empty_hint(pattern: &str, root: &Path, include_ignored: bool) -> String {
+    let literal = !pattern.contains('*')
+        && !pattern.contains('?')
+        && !pattern.contains('[')
+        && !pattern.contains('{');
+    let mut hint = if literal {
+        format!(
+            "no file is named exactly {pattern:?} under {}; glob matches file paths, not file contents. Try \"*{pattern}*\" for part of a name, or search contents with grep or inspect a known file with read_file.",
+            root.display()
+        )
+    } else {
+        format!(
+            "no file path matches {pattern:?} under {}; glob matches file paths, not file contents. Search contents with grep, or use read_file when the file is already known.",
+            root.display()
+        )
+    };
+    if !include_ignored {
+        hint.push_str(
+            " Ignored and hidden files were skipped; include_ignored=true searches them too.",
+        );
+    }
+    hint
+}
+
+/// glob - list the files under a root whose paths match a pattern.
+pub(crate) fn glob_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+) -> FunctionTool {
+    FunctionTool::new(
+        "glob",
+        "Find files whose paths match a glob pattern. It matches paths, not file contents. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set. A pattern with no separator matches the file name at any depth; a separator anchors it. Up to limit paths are returned, sorted.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "minLength": 1, "description": "Glob pattern matched against workspace-relative file paths, not file contents. A pattern without '/' matches basenames at any depth." },
+                "path": { "type": "string", "description": "Directory to search, relative to the workspace or absolute inside the allowed workspace. Defaults to the workspace root." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum number of paths to return. The result reports whether more matches were omitted." },
+                "include_ignored": { "type": "boolean", "description": "Include hidden, ignored, dependency and build paths normally skipped. Use only when the default search is insufficient." }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let pattern = arg_str(args, "pattern")?;
+            let raw = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(".")
+                .to_string();
+            let limit = arg_positive(args, "limit")?.unwrap_or(crate::glob::DEFAULT_RESULTS);
+            if limit > crate::glob::MAX_RESULTS {
+                return Err(ToolError::InvalidInput(format!(
+                    "limit must be at most {}",
+                    crate::glob::MAX_RESULTS
+                )));
+            }
+            let include_ignored = args
+                .get("include_ignored")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let search_root =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            check_path(
+                &policy,
+                &session,
+                &preset,
+                "glob",
+                Action::Read,
+                &search_root,
+            )?;
+            // An anchored pattern is relative to the workspace root when one is
+            // installed, so a narrower path narrows the walk without silently
+            // changing what "src/*.rs" means.
+            let base = root
+                .as_deref()
+                .filter(|workspace| search_root.starts_with(workspace))
+                .unwrap_or(&search_root);
+            // Loaded for every glob call, not only one rooted inside the
+            // workspace: the first file-tool call is what leaves the reader a
+            // rule file, and a search outside the workspace is still a call.
+            let ignore = root.as_deref().map(Rules::load);
+            let found = crate::glob::search(
+                &search_root,
+                base,
+                &crate::glob::Query {
+                    pattern: &pattern,
+                    include_ignored,
+                    limit,
+                    workspace_ignore: ignore.as_ref(),
+                },
+            )
+            .map_err(ToolError::InvalidInput)?;
+            let matches: Vec<String> = found
+                .paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            let empty = matches.is_empty();
+            let mut result = serde_json::json!({
+                "path": search_root.display().to_string(),
+                "pattern": pattern,
+                "matches": matches,
+                "truncated": found.truncated,
+            });
+            if empty {
+                result["hint"] =
+                    serde_json::json!(glob_empty_hint(&pattern, &search_root, include_ignored));
+            }
+            Ok(result)
+        },
+    )
+}
+
+/// grep - search file contents with a ripgrep regular expression.
+pub(crate) fn grep_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+) -> FunctionTool {
+    FunctionTool::new(
+        "grep",
+        "Search file contents with a ripgrep regular expression; returns each matching line with its file and 1-based line number. A named file is always searched; directories skip ignored, hidden and dependency/build trees unless include_ignored. Case-sensitive unless case_insensitive.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "minLength": 1, "description": "Ripgrep regular expression; escape metacharacters to search them literally." },
+                "path": { "type": "string", "description": "File or directory to search; directories recurse. Defaults to the workspace root." },
+                "case_insensitive": { "type": "boolean", "description": "Match without case sensitivity. Defaults to false." },
+                "include_ignored": { "type": "boolean", "description": "Also search hidden, ignored and dependency/build paths." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max matching rows; check truncated before assuming completeness." },
+                "invert": { "type": "boolean", "description": "Return non-matching lines instead of matching ones." },
+                "context": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Surrounding lines per match (0-20)." },
+                "files_without_match": { "type": "boolean", "description": "Return paths of files with no match instead of rows." },
+                "include": { "type": "string", "description": "One glob filter, e.g. '*.rs'; negation unsupported." },
+                "text": { "type": "boolean", "description": "Search binary files as text." }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let pattern = arg_str(args, "pattern")?;
+            let raw = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(".")
+                .to_string();
+            let case_insensitive = args
+                .get("case_insensitive")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let include_ignored = args
+                .get("include_ignored")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let limit = arg_positive(args, "limit")?.unwrap_or(crate::grep::DEFAULT_RESULTS);
+            if limit > crate::grep::MAX_RESULTS {
+                return Err(ToolError::InvalidInput(format!(
+                    "limit must be at most {}",
+                    crate::grep::MAX_RESULTS
+                )));
+            }
+            let flag = |key: &str| {
+                args.get(key)
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            };
+            let invert = flag("invert");
+            let files_without_match = flag("files_without_match");
+            let text = flag("text");
+            let context = match args.get("context").filter(|value| !value.is_null()) {
+                Some(value) => {
+                    let Some(number) = value.as_u64() else {
+                        return Err(ToolError::InvalidInput(
+                            "context must be a non-negative integer".to_string(),
+                        ));
+                    };
+                    if number > crate::grep::MAX_CONTEXT as u64 {
+                        return Err(ToolError::InvalidInput(format!(
+                            "context must be at most {}",
+                            crate::grep::MAX_CONTEXT
+                        )));
+                    }
+                    number as usize
+                }
+                None => 0,
+            };
+            let include = args
+                .get("include")
+                .and_then(serde_json::Value::as_str)
+                .filter(|pattern| !pattern.trim().is_empty())
+                .map(str::to_string);
+            let search_root =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            check_path(
+                &policy,
+                &session,
+                &preset,
+                "grep",
+                Action::Read,
+                &search_root,
+            )?;
+            let base = root
+                .as_deref()
+                .filter(|workspace| search_root.starts_with(workspace))
+                .unwrap_or(&search_root);
+            // Same as glob: the call itself ensures the file, even when the
+            // searched path happens to be outside the workspace.
+            let ignore = root.as_deref().map(Rules::load);
+            let query = crate::grep::Query {
+                pattern: &pattern,
+                include_ignored,
+                case_insensitive,
+                limit,
+                invert,
+                context,
+                files_without_match,
+                include: include.as_deref(),
+                text,
+                workspace_ignore: ignore.as_ref(),
+            };
+            let found =
+                crate::grep::search(&search_root, base, &query).map_err(ToolError::InvalidInput)?;
+            let matches: Vec<serde_json::Value> = found
+                .hits
+                .iter()
+                .map(|hit| {
+                    let mut row = serde_json::json!({
+                        "path": hit.path.to_string_lossy(),
+                        "line": hit.line,
+                        "text": hit.text,
+                    });
+                    if hit.kind == crate::grep::Kind::Context {
+                        row["kind"] = serde_json::json!("context");
+                    }
+                    row
+                })
+                .collect();
+            let empty = matches.is_empty() && found.binary.is_empty();
+            let mut result = serde_json::json!({
+                "path": search_root.display().to_string(),
+                "pattern": pattern,
+                "matches": matches,
+                "truncated": found.truncated,
+            });
+            if !found.binary.is_empty() {
+                result["binary"] = serde_json::json!(
+                    found
+                        .binary
+                        .iter()
+                        .map(|binary| serde_json::json!({
+                            "path": binary.path.to_string_lossy(),
+                            "offset": binary.offset,
+                            "message": binary.message(),
+                        }))
+                        .collect::<Vec<_>>()
+                );
+            }
+            if files_without_match {
+                result["files_without_match"] = serde_json::json!(
+                    found
+                        .unmatched
+                        .iter()
+                        .map(|path| path.to_string_lossy())
+                        .collect::<Vec<_>>()
+                );
+            }
+            if empty && found.unmatched.is_empty() {
+                result["hint"] = serde_json::json!(crate::grep::hint(&query, &search_root));
+            }
+            Ok(result)
+        },
+    )
+}
+
+/// read_file - read a UTF-8 file inside the workspace.
+pub(crate) fn read_file_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+) -> FunctionTool {
+    FunctionTool::new(
+        "read_file",
+        "Read a UTF-8 text file. Paths may be absolute or relative to the workspace. A path excluded by the workspace's .bsh/.ignore is refused. A file past the read ceiling is refused; pass offset (1-based line) and limit to read a window of a large file instead.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path of the UTF-8 text file to read, relative to the workspace or absolute inside the allowed workspace." },
+                "offset": { "type": "integer", "minimum": 1, "description": "1-based starting line. Omit to start at the beginning." },
+                "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to return from offset. Use this to page through large files." }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let raw = arg_str(args, "path")?;
+            let offset = arg_positive(args, "offset")?;
+            let limit = arg_positive(args, "limit")?;
+            let target =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &target)?;
+            check_path(
+                &policy,
+                &session,
+                &preset,
+                "read_file",
+                Action::Read,
+                &target,
+            )?;
+            let read = match (offset, limit) {
+                (None, None) => read_whole(&target)?,
+                (offset, limit) => {
+                    read_window(&target, offset.unwrap_or(1), limit.unwrap_or(usize::MAX))?
+                }
+            };
+            let ReadOutcome {
+                content,
+                truncated,
+                past_end,
+            } = read;
+            let bytes = content.len();
+            Ok(serde_json::json!({
+                "path": target.display().to_string(),
+                "content": content,
+                "bytes": bytes,
+                "truncated": truncated,
+                "past_end": past_end,
+            }))
+        },
+    )
+}
+
+/// read_files - read a bounded set of files with one model/tool round-trip.
+pub(crate) fn read_files_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+) -> FunctionTool {
+    FunctionTool::new(
+        "read_files",
+        "Read up to 10 UTF-8 text files in one call. Each file is independently checked against workspace and read permissions. The combined returned content is capped at 1 MiB; inspect each entry's truncated or error field before relying on the result.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_BATCH_READ_FILES,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4096,
+                        "description": "A file path relative to the workspace or an absolute path inside the allowed workspace."
+                    },
+                    "description": "One to ten distinct UTF-8 text file paths. Results preserve this order."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional 1-based starting line applied to every file."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional maximum number of lines per file, applied to every file."
+                }
+            },
+            "required": ["paths"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let paths = args
+                .get("paths")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| ToolError::InvalidInput("paths must be an array".to_string()))?;
+            if paths.is_empty() || paths.len() > MAX_BATCH_READ_FILES {
+                return Err(ToolError::InvalidInput(format!(
+                    "paths must contain between 1 and {MAX_BATCH_READ_FILES} entries"
+                )));
+            }
+            let offset = arg_positive(args, "offset")?;
+            let limit = arg_positive(args, "limit")?;
+            // Resolve every path first, then refuse a duplicate target as a
+            // REQUEST error. Reported per file it read as a failed read, but a
+            // duplicate is not a file outcome: the caller named one target
+            // twice, so no per-file result can answer it.
+            let mut targets: Vec<(String, Result<PathBuf, ToolError>)> =
+                Vec::with_capacity(paths.len());
+            for value in paths {
+                let raw = value.as_str().ok_or_else(|| {
+                    ToolError::InvalidInput("every paths entry must be a string".to_string())
+                })?;
+                if raw.trim().is_empty() {
+                    return Err(ToolError::InvalidInput(
+                        "paths entries must not be empty".to_string(),
+                    ));
+                }
+                targets.push((
+                    raw.to_string(),
+                    resolve_path(root.as_deref(), raw, enforce).map_err(ToolError::InvalidInput),
+                ));
+            }
+            {
+                let mut seen = HashSet::with_capacity(targets.len());
+                for target in targets.iter().filter_map(|(_, target)| target.as_ref().ok()) {
+                    if !seen.insert(target.clone()) {
+                        return Err(ToolError::InvalidInput(format!(
+                            "duplicate target path in read_files: {}",
+                            target.display()
+                        )));
+                    }
+                }
+            }
+            let rules = ignore_rules(root.as_deref());
+            let mut results = Vec::with_capacity(targets.len());
+            let mut remaining = MAX_BATCH_READ_BYTES;
+            let mut total_bytes = 0usize;
+            let mut truncated = false;
+
+            for (raw, target) in targets {
+                let target = match target {
+                    Ok(target) => target,
+                    Err(error) => {
+                        results.push(serde_json::json!({
+                            "path": raw,
+                            "error": error.to_string()
+                        }));
+                        continue;
+                    }
+                };
+                let result = (|| -> Result<serde_json::Value, ToolError> {
+                    refuse_ignored(rules.as_ref(), &target)?;
+                    check_path(
+                        &policy,
+                        &session,
+                        &preset,
+                        "read_files",
+                        Action::Read,
+                        &target,
+                    )?;
+
+                    if remaining == 0 {
+                        truncated = true;
+                        return Ok(serde_json::json!({
+                            "path": target.display().to_string(),
+                            "content": "",
+                            "bytes": 0,
+                            "truncated": true,
+                            "reason": "combined batch output budget reached"
+                        }));
+                    }
+
+                    let read = match (offset, limit) {
+                        (None, None) => read_whole(&target)?,
+                        (offset, limit) => read_window(
+                            &target,
+                            offset.unwrap_or(1),
+                            limit.unwrap_or(usize::MAX),
+                        )?,
+                    };
+                    let ReadOutcome {
+                        content,
+                        truncated: file_truncated,
+                        ..
+                    } = read;
+                    let content_bytes = content.as_bytes();
+                    let keep = content_bytes.len().min(remaining);
+                    let mut boundary = keep;
+                    while !content.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    let returned = &content[..boundary];
+                    let was_truncated = file_truncated || boundary < content.len();
+                    if was_truncated {
+                        truncated = true;
+                    }
+                    let bytes = returned.len();
+                    remaining -= bytes;
+                    total_bytes += bytes;
+                    Ok(serde_json::json!({
+                        "path": target.display().to_string(),
+                        "content": returned,
+                        "bytes": bytes,
+                        "truncated": was_truncated
+                    }))
+                })();
+
+                match result {
+                    Ok(value) => results.push(value),
+                    Err(error) => results.push(serde_json::json!({
+                        "path": raw,
+                        "error": error.to_string()
+                    })),
+                }
+            }
+
+            Ok(serde_json::json!({
+                "files": results,
+                "count": paths.len(),
+                "bytes": total_bytes,
+                "truncated": truncated,
+                "max_bytes": MAX_BATCH_READ_BYTES
+            }))
+        },
+    )
+}
+
+/// apply_patch - apply exact-text edits to several files in one call.
+fn apply_patch_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
+) -> FunctionTool {
+    FunctionTool::new(
+        "apply_patch",
+        "Apply up to 10 per-file groups of exact-text edits. Each file is checked for write permission before reading, all edits for that file are validated before its atomic write, and a failed edit leaves that file unchanged. This is not a cross-file transaction; inspect each result's error field.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "changes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_PATCH_FILES,
+                    "description": "One to ten distinct file paths, each with an ordered list of exact-text edits.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 4096,
+                                "description": "Existing UTF-8 file path relative to the workspace or absolute inside the allowed workspace."
+                            },
+                            "edits": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": MAX_PATCH_EDITS,
+                                "description": "Ordered exact-text edits applied in memory before one atomic write.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "old_string": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 262144,
+                                            "description": "Exact non-empty text to find. It must occur exactly once unless replace_all is true."
+                                        },
+                                        "new_string": {
+                                            "type": "string",
+                                            "maxLength": 262144,
+                                            "description": "Replacement text; an empty string deletes the matched text."
+                                        },
+                                        "replace_all": {
+                                            "type": "boolean",
+                                            "description": "Set true only when every occurrence of old_string should be replaced."
+                                        }
+                                    },
+                                    "required": ["old_string", "new_string"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["path", "edits"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["changes"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let changes = args
+                .get("changes")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| ToolError::InvalidInput("changes must be an array".to_string()))?;
+            if changes.is_empty() || changes.len() > MAX_PATCH_FILES {
+                return Err(ToolError::InvalidInput(format!(
+                    "changes must contain between 1 and {MAX_PATCH_FILES} files"
+                )));
+            }
+
+            // Preflight every path and the aggregate patch payload before any
+            // file is read or written. Duplicate aliases must not partially
+            // apply the first occurrence before the second is discovered.
+            let rules = ignore_rules(root.as_deref());
+            let mut input_bytes = 0usize;
+            let mut seen_targets = HashSet::with_capacity(changes.len());
+            let mut targets = Vec::with_capacity(changes.len());
+            for change in changes {
+                let raw = change
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ToolError::InvalidInput(
+                            "every change requires a string path".to_string(),
+                        )
+                    })?;
+                input_bytes = input_bytes.saturating_add(raw.len());
+                let target = resolve_path(root.as_deref(), raw, enforce)
+                    .map_err(ToolError::InvalidInput)?;
+                if !seen_targets.insert(target.clone()) {
+                    return Err(ToolError::InvalidInput(format!(
+                        "duplicate target path in apply_patch: {}",
+                        target.display()
+                    )));
+                }
+                refuse_ignored(rules.as_ref(), &target)?;
+                check_path(
+                    &policy,
+                    &session,
+                    &preset,
+                    "apply_patch",
+                    Action::Write,
+                    &target,
+                )?;
+
+                let edits = change
+                    .get("edits")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| {
+                        ToolError::InvalidInput("edits must be an array".to_string())
+                    })?;
+                if edits.is_empty() || edits.len() > MAX_PATCH_EDITS {
+                    return Err(ToolError::InvalidInput(format!(
+                        "edits must contain between 1 and {MAX_PATCH_EDITS} operations per file"
+                    )));
+                }
+                for edit in edits {
+                    let old = edit
+                        .get("old_string")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            ToolError::InvalidInput(
+                                "each edit requires old_string".to_string(),
+                            )
+                        })?;
+                    let new = edit
+                        .get("new_string")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            ToolError::InvalidInput(
+                                "each edit requires new_string".to_string(),
+                            )
+                        })?;
+                    if old.is_empty() || old == new {
+                        return Err(ToolError::InvalidInput(
+                            "old_string must be non-empty and different from new_string"
+                                .to_string(),
+                        ));
+                    }
+                    input_bytes = input_bytes
+                        .saturating_add(old.len())
+                        .saturating_add(new.len());
+                    if input_bytes > MAX_PATCH_INPUT_BYTES {
+                        return Err(ToolError::InvalidInput(format!(
+                            "combined patch text must not exceed {MAX_PATCH_INPUT_BYTES} bytes"
+                        )));
+                    }
+                }
+                targets.push(target);
+            }
+
+            let mut results = Vec::with_capacity(changes.len());
+            let mut changed_files = 0usize;
+
+            for (change, target) in changes.iter().zip(targets) {
+                let raw = change
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("path was validated during preflight");
+                let result = (|| -> Result<serde_json::Value, ToolError> {
+                    let edits = change
+                        .get("edits")
+                        .and_then(serde_json::Value::as_array)
+                        .expect("edits were validated during preflight");
+
+                    let lock = file_lock(&target);
+                    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let before = review
+                        .as_ref()
+                        .map(|runtime| runtime.before(&target))
+                        .unwrap_or(SnapshotState::Absent);
+                    let original = read_editable(&target)?;
+                    let mut content = original.clone();
+                    let mut replacements = 0usize;
+
+                    for edit in edits {
+                        let old = edit["old_string"]
+                            .as_str()
+                            .expect("old_string was validated during preflight");
+                        let new = edit["new_string"]
+                            .as_str()
+                            .expect("new_string was validated during preflight");
+                        let replace_all = edit
+                            .get("replace_all")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let outcome = replace_text(&content, old, new, replace_all)
+                            .map_err(|error| match error {
+                                ReplaceError::NotFound => {
+                                    ToolError::Failed(not_found_message(&target, &content, old))
+                                }
+                                ReplaceError::Ambiguous(count) => ToolError::InvalidInput(
+                                    format!(
+                                        "old_string occurs {count} times in {}; set replace_all=true only if every occurrence is intended",
+                                        target.display()
+                                    ),
+                                ),
+                            })?;
+                        replacements += outcome.replacements;
+                        if let Some(updated) = outcome.updated {
+                            content = updated;
+                        }
+                    }
+
+                    if content.len() as u64 > MAX_EDIT_BYTES {
+                        return Err(ToolError::InvalidInput(format!(
+                            "patched file would exceed the {MAX_EDIT_BYTES} byte edit ceiling"
+                        )));
+                    }
+                    let unchanged = original == content;
+                    if !unchanged {
+                        write_bytes(&target, content.as_bytes())?;
+                        if let Some(runtime) = &review {
+                            runtime.record(
+                                &target,
+                                ChangeOperation::Patch,
+                                before,
+                                "apply_patch",
+                            );
+                        }
+                        changed_files += 1;
+                    }
+                    Ok(serde_json::json!({
+                        "path": target.display().to_string(),
+                        "replacements": replacements,
+                        "bytes": content.len(),
+                        "unchanged": unchanged
+                    }))
+                })();
+
+                match result {
+                    Ok(value) => results.push(value),
+                    Err(error) => results.push(serde_json::json!({
+                        "path": raw,
+                        "error": error.to_string()
+                    })),
+                }
+            }
+
+            Ok(serde_json::json!({
+                "files": results,
+                "count": changes.len(),
+                "changed_files": changed_files
+            }))
+        },
+    )
+}
+
+/// write_file - write a UTF-8 file inside the workspace.
+fn write_file_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
+) -> FunctionTool {
+    FunctionTool::new(
+        "write_file",
+        "Write a UTF-8 text file, creating parent directories as needed. A path excluded by the workspace's .bsh/.ignore is refused. The write is atomic, and a byte-identical write is a no-op, so it cannot wake a build watcher for nothing.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Destination path, relative to the workspace or absolute inside the allowed workspace." },
+                "content": { "type": "string", "description": "Complete UTF-8 file contents to write. This replaces the existing file; prefer edit_file for a targeted change." }
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let raw = arg_str(args, "path")?;
+            let content = arg_str(args, "content")?;
+            let target =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &target)?;
+            // The check is BEFORE the parent directory is created: a denied
+            // write must not leave the parent's mtime moved as a side effect.
+            check_path(
+                &policy,
+                &session,
+                &preset,
+                "write_file",
+                Action::Write,
+                &target,
+            )?;
+            // The same path's edit and write calls are serialized, so a pair of
+            // parallel calls cannot interleave a read-modify-write with a
+            // rename and lose one of the two results.
+            let lock = file_lock(&target);
+            let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = review
+                .as_ref()
+                .map(|runtime| runtime.before(&target))
+                .unwrap_or(SnapshotState::Absent);
+            let existed = before.is_present();
+            let outcome = write_bytes(&target, content.as_bytes())?;
+            if !outcome.unchanged {
+                if let Some(runtime) = &review {
+                    let operation = if existed {
+                        ChangeOperation::Write
+                    } else {
+                        ChangeOperation::Create
+                    };
+                    runtime.record(&target, operation, before, "write_file");
+                }
+            }
+            Ok(serde_json::json!({
+                "path": target.display().to_string(),
+                "bytes": outcome.bytes,
+                "unchanged": outcome.unchanged,
+            }))
+        },
+    )
+}
+
+/// edit_file - replace an exact string in a UTF-8 file inside the workspace.
+///
+/// The policy is asked for a Write on the resolved path before the file is even
+/// read, so a denied edit cannot observe or modify its content. An empty
+/// `old_string` is refused (it would insert at every position), a missing
+/// `old_string` is an error rather than a no-op, and an ambiguous match is
+/// refused unless `replace_all` says every occurrence is intended.
+fn edit_file_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
+) -> FunctionTool {
+    FunctionTool::new(
+        "edit_file",
+        "Replace an exact string in a UTF-8 text file inside the workspace. By default old_string must occur exactly once; pass replace_all to replace every occurrence.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path of the existing UTF-8 file to edit, relative to the workspace or absolute inside the allowed workspace." },
+                "old_string": { "type": "string", "minLength": 1, "description": "Exact non-empty text to find. By default it must occur exactly once; include enough surrounding context to make it unique." },
+                "new_string": { "type": "string", "description": "Replacement text. Use an empty string to delete the matched text." },
+                "replace_all": { "type": "boolean", "description": "Set true only when every occurrence of old_string should be replaced." }
+            },
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let raw = arg_str(args, "path")?;
+            let old = arg_str(args, "old_string")?;
+            let new = arg_str(args, "new_string")?;
+            if old.is_empty() {
+                return Err(ToolError::InvalidInput(
+                    "old_string must not be empty".to_string(),
+                ));
+            }
+            if old == new {
+                return Err(ToolError::InvalidInput(
+                    "old_string and new_string are identical; there is nothing to replace"
+                        .to_string(),
+                ));
+            }
+            let replace_all = args
+                .get("replace_all")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let target =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &target)?;
+            // Before the read: a denied edit is refused before its content is
+            // even observed.
+            check_path(
+                &policy,
+                &session,
+                &preset,
+                "edit_file",
+                Action::Write,
+                &target,
+            )?;
+            // Held across the read, the splice and the rewrite: an edit is a
+            // read-modify-write, and two of them on one file must not both
+            // start from the original bytes.
+            let lock = file_lock(&target);
+            let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = review
+                .as_ref()
+                .map(|runtime| runtime.before(&target))
+                .unwrap_or(SnapshotState::Absent);
+            let content = read_editable(&target)?;
+            let outcome = replace_text(&content, &old, &new, replace_all).map_err(|error| {
+                match error {
+                    ReplaceError::NotFound => {
+                        ToolError::Failed(not_found_message(&target, &content, &old))
+                    }
+                    ReplaceError::Ambiguous(count) => ToolError::InvalidInput(format!(
+                        "old_string occurs {count} times in {}; pass replace_all=true to replace every occurrence",
+                        target.display()
+                    )),
+                }
+            })?;
+            let unchanged = outcome.updated.is_none();
+            if let Some(updated) = &outcome.updated {
+                write_bytes(&target, updated.as_bytes())?;
+                if let Some(runtime) = &review {
+                    runtime.record(&target, ChangeOperation::Edit, before, "edit_file");
+                }
+            }
+            Ok(serde_json::json!({
+                "path": target.display().to_string(),
+                "replacements": outcome.replacements,
+                "unchanged": unchanged,
+            }))
+        },
+    )
+}
+
+/// sed - apply one stream-edit program to a workspace file.
+///
+/// The engine is the crate's own uutils sed (crate::sed); this builder is
+/// the policy half: the path is resolved and checked, the workspace ignore file
+/// is honored, and the same per-path lock the other write tools take is held
+/// across the read-modify-write. A dry run asks the policy for a READ, because
+/// it writes nothing.
+fn sed_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+    review: Option<Arc<crate::review::ReviewRuntime>>,
+) -> FunctionTool {
+    FunctionTool::new(
+        "sed",
+        "Apply one sed program to a workspace file over a private copy, replacing by rename so a failed script leaves the original untouched. GNU in-place output: the automatic print and p, P, =, l, F and s///p write to the file. e, r, R, w and W are refused. Prefer edit_file when the exact text is known.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Existing text file to edit, inside the workspace." },
+                "script": { "type": "string", "minLength": 1, "maxLength": 8192, "description": "One sed program, e.g. 's/old/new/g'; newlines/semicolons separate commands." },
+                "dry_run": { "type": "boolean", "description": "Return the resulting text without writing. Defaults to false." },
+                "extended": { "type": "boolean", "description": "POSIX extended regexes (sed -E). Defaults to false." },
+                "posix": { "type": "boolean", "description": "Disable GNU extensions (sed --posix). Defaults to false." },
+                "quiet": { "type": "boolean", "description": "Suppress automatic print (sed -n); p, P, =, l, F still write, so quiet + '/pat/p' filters to matching lines." },
+                "line_length": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Wrap column for l (sed -l). Defaults to 70." },
+                "backup_suffix": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Keep the original at path + suffix (sed -iSUFFIX); no path separator." }
+            },
+            "required": ["path", "script"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let raw = arg_str(args, "path")?;
+            let script = arg_str(args, "script")?;
+            let flag = |key: &str| {
+                args.get(key)
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            };
+            let dry_run = flag("dry_run");
+            let line_length = match args.get("line_length").filter(|value| !value.is_null()) {
+                Some(value) => {
+                    let Some(number) = value.as_u64() else {
+                        return Err(ToolError::InvalidInput(
+                            "line_length must be a positive integer".to_string(),
+                        ));
+                    };
+                    if !(1..=10_000).contains(&number) {
+                        return Err(ToolError::InvalidInput(
+                            "line_length must be between 1 and 10000".to_string(),
+                        ));
+                    }
+                    Some(number as usize)
+                }
+                None => None,
+            };
+            let target =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &target)?;
+            check_path(
+                &policy,
+                &session,
+                &preset,
+                "sed",
+                if dry_run { Action::Read } else { Action::Write },
+                &target,
+            )?;
+            // The backup is a second write, and the policy must see it as one:
+            // a suffix that escapes the directory is refused before anything is
+            // copied, and the resolved sibling obeys the same ignore/policy
+            // rules as the target.
+            let mut backup: Option<PathBuf> = None;
+            if let Some(suffix) = args
+                .get("backup_suffix")
+                .and_then(serde_json::Value::as_str)
+                .filter(|suffix| !suffix.trim().is_empty())
+            {
+                if dry_run {
+                    return Err(ToolError::InvalidInput(
+                        "dry_run writes nothing, so it cannot keep a backup_suffix".to_string(),
+                    ));
+                }
+                if suffix.contains(['/', '\\']) {
+                    return Err(ToolError::InvalidInput(
+                        "backup_suffix must not contain a path separator".to_string(),
+                    ));
+                }
+                if suffix.len() > 64 {
+                    return Err(ToolError::InvalidInput(
+                        "backup_suffix must be at most 64 bytes".to_string(),
+                    ));
+                }
+                let mut path = target.as_os_str().to_os_string();
+                path.push(suffix);
+                let backup_path = PathBuf::from(path);
+                refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &backup_path)?;
+                check_path(
+                    &policy,
+                    &session,
+                    &preset,
+                    "sed",
+                    Action::Write,
+                    &backup_path,
+                )?;
+                backup = Some(backup_path);
+            }
+            // A sed run is a read-modify-write, so it holds the same per-path
+            // lock edit_file does: two calls must not both start from the
+            // original bytes.
+            let lock = file_lock(&target);
+            let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = review
+                .as_ref()
+                .map(|runtime| runtime.before(&target))
+                .unwrap_or(SnapshotState::Absent);
+            let request = crate::sed::Request {
+                script: &script,
+                extended: flag("extended"),
+                posix: flag("posix"),
+                quiet: flag("quiet"),
+                line_length,
+                backup: backup.as_deref(),
+            };
+            let outcome = crate::sed::apply(&target, &request, dry_run).map_err(|error| {
+                match error {
+                    crate::sed::Error::Refused(message) => ToolError::InvalidInput(message),
+                    crate::sed::Error::Failed(message) => ToolError::Failed(message),
+                }
+            })?;
+            if !dry_run && outcome.changed {
+                if let Some(runtime) = &review {
+                    runtime.record(&target, ChangeOperation::Edit, before, "sed");
+                }
+            }
+            let mut result = serde_json::json!({
+                "path": target.display().to_string(),
+                "changed": outcome.changed,
+                "dry_run": dry_run,
+                "before_bytes": outcome.before_bytes,
+                "bytes": outcome.after_bytes,
+                "exit_code": outcome.exit_code,
+            });
+            if dry_run {
+                result["content"] = match outcome.content {
+                    Some(content) => serde_json::Value::String(content),
+                    None => serde_json::Value::Null,
+                };
+                result["truncated"] = serde_json::json!(outcome.truncated);
+                result["binary"] = serde_json::json!(outcome.binary);
+            }
+            if !dry_run {
+                result["diff"] = serde_json::json!(
+                    outcome
+                        .diff
+                        .iter()
+                        .map(|(sign, line)| serde_json::json!({
+                            "sign": sign.to_string(),
+                            "line": line,
+                        }))
+                        .collect::<Vec<_>>()
+                );
+                result["added"] = serde_json::json!(outcome.added);
+                result["deleted"] = serde_json::json!(outcome.deleted);
+                result["diff_truncated"] = serde_json::json!(outcome.diff_truncated);
+            }
+            if let Some(backup) = &backup {
+                result["backup"] = serde_json::json!(backup.display().to_string());
+            }
+            Ok(result)
+        },
+    )
+}
+
+/// list_dir - list a directory's entries.
+fn list_dir_tool(
+    root: Option<PathBuf>,
+    enforce: bool,
+    policy: Arc<PolicySet>,
+    session: String,
+    preset: String,
+) -> FunctionTool {
+    FunctionTool::new(
+        "list_dir",
+        "List a directory's entries (name and kind), sorted by name. Entries excluded by the workspace's .bsh/.ignore are omitted. Up to 2000 entries are returned; truncated reports a larger directory.",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string", "description": "Directory to list, relative to the workspace or absolute inside the allowed workspace." } },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let raw = arg_str(args, "path")?;
+            let target =
+                resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
+            let rules = ignore_rules(root.as_deref());
+            refuse_ignored(rules.as_ref(), &target)?;
+            check_path(
+                &policy,
+                &session,
+                &preset,
+                "list_dir",
+                Action::Read,
+                &target,
+            )?;
+            let listing = list_entries(&target, rules.as_ref())?;
+            Ok(serde_json::json!({
+                "path": target.display().to_string(),
+                "entries": listing.entries,
+                "truncated": listing.truncated,
+            }))
+        },
+    )
+}
+
+/// The model's automation-task tools.
+///
+/// Each tool validates its own fields and queues a [crate::schedule::ScheduleRequest];
+/// the shell applies the batch at the turn's end and saves once. The list tool
+/// shows the saved tasks plus what is still pending, so a create and a list in
+/// the same turn do not contradict each other.
+///
+/// Scheduling is capped by the same name and prompt rules the pane enforces,
+/// and a task is always owned by the session that created it: a model cannot
+/// park work in a conversation the reader is not looking at.
+/// The model's tools for presenting an interface to the reader.
+///
+/// A presented surface is a proposal, not authority: it is validated against
+/// the agent limits, drawn read-only, and can be closed by the reader at any
+/// time. Actions inside it are not wired to the capability pipeline yet, so a
+/// control reports that it is unavailable instead of running half-authorised.
+fn surface_tools() -> Vec<Arc<dyn agent::tools::Tool>> {
+    use ferris_sdk::surface::{PatchOp, Revision, SurfaceDocument};
+    use ferris_sdk::ui::PanelLocation;
+    use serde_json::Value;
+    let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+
+    tools.push(Arc::new(FunctionTool::new(
+        "present_surface",
+        "Present a read-only interactive surface to the reader. The document is a schema 1.1 surface tree with stable ids on controls; it is validated against the agent limits before it is shown.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "Short title shown in the panel picker." },
+                "slot": {
+                    "type": "string",
+                    "enum": ["workspace.main", "workspace.right", "workspace.left", "workspace.bottom", "transcript.inline", "empty.hero"],
+                    "description": "Where the host may draw it."
+                },
+                "document": { "type": "object", "description": "The schema 1.1 surface document." }
+            },
+            "required": ["title", "document"],
+            "additionalProperties": false
+        }),
+        |args| {
+            let title = args.get("title").and_then(Value::as_str).unwrap_or("").trim();
+            if title.is_empty() {
+                return Err(ToolError::InvalidInput("title is required".to_string()));
+            }
+            let slot = args.get("slot").and_then(Value::as_str).unwrap_or("workspace.right");
+            let location = match slot {
+                "workspace.main" | "empty.hero" => PanelLocation::Center,
+                "workspace.left" => PanelLocation::Left,
+                "workspace.bottom" | "transcript.inline" => PanelLocation::Bottom,
+                _ => PanelLocation::Right,
+            };
+            let document: SurfaceDocument = serde_json::from_value(
+                args.get("document")
+                    .cloned()
+                    .ok_or_else(|| ToolError::InvalidInput("document is required".to_string()))?,
+            )
+            .map_err(|error| ToolError::InvalidInput(format!("document is not a surface: {error}")))?;
+            let id = crate::extension::agent_surface::present(title, location, document)
+                .map_err(ToolError::InvalidInput)?;
+            Ok(serde_json::json!({
+                "id": id,
+                "slot": slot,
+                "note": "the surface is drawn read-only; close_surface removes it",
+            }))
+        },
+    )));
+
+    tools.push(Arc::new(FunctionTool::new(
+        "patch_surface",
+        "Apply a base-relative patch to a surface you presented. The base revision must be current; a stale patch is refused with the current revision.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "base": { "type": "integer", "minimum": 1 },
+                "ops": { "type": "array", "items": { "type": "object" } }
+            },
+            "required": ["id", "base", "ops"],
+            "additionalProperties": false
+        }),
+        |args| {
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            let base = args.get("base").and_then(Value::as_u64).unwrap_or(0);
+            let ops: Vec<PatchOp> = serde_json::from_value(
+                args.get("ops")
+                    .cloned()
+                    .ok_or_else(|| ToolError::InvalidInput("ops is required".to_string()))?,
+            )
+            .map_err(|error| ToolError::InvalidInput(format!("ops are not valid: {error}")))?;
+            let revision = crate::extension::agent_surface::patch(id, Revision::new(base), ops)
+                .map_err(ToolError::InvalidInput)?;
+            Ok(serde_json::json!({ "id": id, "revision": revision.value() }))
+        },
+    )));
+
+    tools.push(Arc::new(
+        FunctionTool::new(
+            "close_surface",
+            "Close a surface you presented.",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            |args| {
+                let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+                let closed = crate::extension::agent_surface::close(id);
+                Ok(serde_json::json!({ "id": id, "closed": closed }))
+            },
+        )
+        .with_deferred(true),
+    ));
+
+    tools.push(Arc::new(FunctionTool::new(
+        "surface_catalogue",
+        "Return the surface component vocabulary, limits and slots this host accepts.",
+        serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        |_args| Ok(crate::extension::agent_surface::catalogue()),
+    )));
+
+    tools
+}
+
+fn schedule_tools(
+    saved: Vec<crate::settings::global::Schedule>,
+    session: &str,
+) -> Vec<Arc<dyn agent::tools::Tool>> {
+    use crate::schedule::{ScheduleQueue, ScheduleRequest};
+    use crate::settings::global::GlobalSettings;
+
+    let queue = Arc::clone(ScheduleQueue::global());
+    let session = session.to_string();
+    let mut tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
+
+    let create_queue = queue.clone();
+    let create_session = session.clone();
+    tools.push(Arc::new(FunctionTool::new(
+        "schedule_create",
+        "Create a scheduled task: a prompt the scheduler sends to this session. every_seconds = 0 runs it once; N repeats every N seconds while the app is open.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": { "type": "string", "description": "The instruction sent when the task fires; write it as a complete request." },
+                "name": { "type": "string", "description": "Short title; defaults to the prompt's first line." },
+                "every_seconds": { "type": "integer", "minimum": 0, "description": "Seconds between runs; 0 (default) runs once." },
+                "session_id": { "type": "string", "description": "Session to run in; omit for this one." }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let prompt = args
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if prompt.is_empty() {
+                return Err(ToolError::InvalidInput(
+                    "prompt is required and must not be empty".to_string(),
+                ));
+            }
+            let name = match args.get("name").and_then(serde_json::Value::as_str) {
+                Some(name) if !name.trim().is_empty() => name.trim().to_string(),
+                Some(_) => {
+                    return Err(ToolError::InvalidInput(
+                        "name must not be empty when it is given".to_string(),
+                    ))
+                }
+                None => default_task_name(prompt),
+            };
+            if name.chars().count() > GlobalSettings::NAME_LIMIT {
+                return Err(ToolError::InvalidInput(format!(
+                    "name is longer than {} characters",
+                    GlobalSettings::NAME_LIMIT
+                )));
+            }
+            if let Some(wanted) = args.get("session_id").and_then(serde_json::Value::as_str) {
+                if !wanted.trim().is_empty() && wanted.trim() != create_session {
+                    return Err(ToolError::InvalidInput(
+                        "a task runs in the session that created it; omit session_id to use this one"
+                            .to_string(),
+                    ));
+                }
+            }
+            let every_seconds = args
+                .get("every_seconds")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let id = create_queue.next_id();
+            create_queue.push(ScheduleRequest::Create {
+                id: id.clone(),
+                name: name.clone(),
+                prompt: prompt.to_string(),
+                session_id: create_session.clone(),
+                every_seconds,
+            });
+            Ok(serde_json::json!({
+                "id": id,
+                "name": name,
+                "session_id": create_session,
+                "every_seconds": every_seconds,
+                "status": "pending",
+                "applies": "when this turn ends; call schedule_list to confirm"
+            }))
+        },
+    )));
+
+    let list_saved = saved.clone();
+    let list_queue = queue.clone();
+    tools.push(Arc::new(FunctionTool::new(
+        "schedule_list",
+        "List automation tasks with cadence, enabled state, last run and next run, plus changes still pending from this turn.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        move |_args| {
+            let now = crate::settings::global::unix_now();
+            let schedules: Vec<serde_json::Value> = list_saved
+                .iter()
+                .map(|task| {
+                    let next = if !task.enabled {
+                        serde_json::Value::Null
+                    } else if task.last_run == 0 {
+                        serde_json::json!(now)
+                    } else if task.every_seconds == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(task.last_run.saturating_add(task.every_seconds))
+                    };
+                    serde_json::json!({
+                        "id": task.id,
+                        "name": task.name,
+                        "prompt": task.prompt,
+                        "session_id": task.session_id,
+                        "every_seconds": task.every_seconds,
+                        "enabled": task.enabled,
+                        "last_run": task.last_run,
+                        "next_run": next,
+                    })
+                })
+                .collect();
+            let pending: Vec<serde_json::Value> = list_queue
+                .snapshot()
+                .iter()
+                .map(describe_schedule_request)
+                .collect();
+            Ok(serde_json::json!({
+                "schedules": schedules,
+                "pending": pending,
+            }))
+        },
+    )));
+
+    let edit_saved = saved.clone();
+    let edit_queue = queue.clone();
+    tools.push(Arc::new(FunctionTool::new(
+        "schedule_edit",
+        "Change a task's name, prompt, cadence or enabled state (false pauses, true resumes, including a one-shot task that already ran).",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Task id from schedule_list." },
+                "name": { "type": "string", "description": "New title." },
+                "prompt": { "type": "string", "description": "New instruction." },
+                "every_seconds": { "type": "integer", "minimum": 0, "description": "New cadence; 0 means one shot." },
+                "enabled": { "type": "boolean", "description": "false pauses, true resumes." }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let id = required_id(args)?;
+            if !edit_saved.iter().any(|task| task.id == id) {
+                return Err(ToolError::InvalidInput(format!(
+                    "no automation task '{id}'; call schedule_list"
+                )));
+            }
+            let name = optional_text(args, "name")?;
+            if let Some(name) = &name {
+                if name.chars().count() > GlobalSettings::NAME_LIMIT {
+                    return Err(ToolError::InvalidInput(format!(
+                        "name is longer than {} characters",
+                        GlobalSettings::NAME_LIMIT
+                    )));
+                }
+            }
+            let prompt = optional_text(args, "prompt")?;
+            let every_seconds = args
+                .get("every_seconds")
+                .and_then(serde_json::Value::as_u64);
+            let enabled = args.get("enabled").and_then(serde_json::Value::as_bool);
+            if name.is_none() && prompt.is_none() && every_seconds.is_none() && enabled.is_none() {
+                return Err(ToolError::InvalidInput(
+                    "nothing to change; pass name, prompt, every_seconds or enabled".to_string(),
+                ));
+            }
+            edit_queue.push(ScheduleRequest::Edit {
+                id: id.clone(),
+                name,
+                prompt,
+                every_seconds,
+                enabled,
+            });
+            Ok(serde_json::json!({
+                "id": id,
+                "status": "pending",
+                "applies": "when this turn ends; call schedule_list to confirm"
+            }))
+        },
+    )));
+
+    let delete_saved = saved;
+    let delete_queue = queue;
+    tools.push(Arc::new(FunctionTool::new(
+        "schedule_delete",
+        "Delete an automation task. Deleting stops the next firing, not a turn it already started.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Task id from schedule_list." }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let id = required_id(args)?;
+            if !delete_saved.iter().any(|task| task.id == id) {
+                return Err(ToolError::InvalidInput(format!(
+                    "no automation task '{id}'; call schedule_list"
+                )));
+            }
+            delete_queue.push(ScheduleRequest::Remove { id: id.clone() });
+            Ok(serde_json::json!({
+                "id": id,
+                "status": "pending",
+                "applies": "when this turn ends; call schedule_list to confirm"
+            }))
+        },
+    )));
+
+    tools
+}
+
+/// The task id every edit/delete call must carry.
+fn required_id(args: &serde_json::Value) -> Result<String, ToolError> {
+    match args.get("id").and_then(serde_json::Value::as_str) {
+        Some(id) if !id.trim().is_empty() => Ok(id.trim().to_string()),
+        _ => Err(ToolError::InvalidInput(
+            "id is required; call schedule_list for the ids".to_string(),
+        )),
+    }
+}
+
+/// An optional non-empty text field, refusing an explicit empty string.
+fn optional_text(args: &serde_json::Value, key: &str) -> Result<Option<String>, ToolError> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if !text.trim().is_empty() => {
+            Ok(Some(text.trim().to_string()))
+        }
+        Some(_) => Err(ToolError::InvalidInput(format!(
+            "{key} must be a non-empty string when it is given"
+        ))),
+    }
+}
+
+/// The default task title: the prompt's first line, bounded.
+fn default_task_name(prompt: &str) -> String {
+    let line = prompt.lines().next().unwrap_or("").trim();
+    let name: String = line.chars().take(60).collect();
+    if name.is_empty() {
+        "Scheduled task".to_string()
+    } else {
+        name
+    }
+}
+
+/// One pending request as the list tool reports it.
+fn describe_schedule_request(request: &crate::schedule::ScheduleRequest) -> serde_json::Value {
+    use crate::schedule::ScheduleRequest;
+    match request {
+        ScheduleRequest::Create {
+            id,
+            name,
+            prompt,
+            session_id,
+            every_seconds,
+        } => serde_json::json!({
+            "action": "create", "id": id, "name": name, "prompt": prompt,
+            "session_id": session_id, "every_seconds": every_seconds,
+        }),
+        ScheduleRequest::Edit {
+            id,
+            name,
+            prompt,
+            every_seconds,
+            enabled,
+        } => serde_json::json!({
+            "action": "edit", "id": id, "name": name, "prompt": prompt,
+            "every_seconds": every_seconds, "enabled": enabled,
+        }),
+        ScheduleRequest::Remove { id } => serde_json::json!({ "action": "delete", "id": id }),
+    }
+}
+
+/// What one memory open resolved (issues #334, #340, #343).
+pub(crate) struct OpenMemory {
+    /// The scoped store the agent recalls from, when memory opened.
+    pub(crate) store: Option<Arc<dyn MemoryStore>>,
+    /// The lifecycle state, surfaced rather than silently disabled.
+    pub(crate) state: crate::context_assembly::MemoryState,
+    /// The capture coordinator over the workspace store, when memory opened.
+    pub(crate) capture: Option<Arc<crate::memory_capture::CaptureHandle>>,
+}
+
+/// Open the scoped, coordinated memory stores on a short-lived runtime.
+///
+/// FileMemory::open is async while the build is sync and may run inside an
+/// async context, so the open happens on its own current-thread runtime.
+/// The scope resolver (issue #340) decides the storage identity and the access
+/// scope: a workspace store isolated by the stable workspace id, plus the
+/// legacy user store, composed into one recall surface. Both stores enforce
+/// scope on reads AND writes; the legacy file is upgraded in place, never
+/// destroyed.
+fn open_memory(
+    settings: &Settings,
+    choice: &crate::settings::resolve::SessionChoice,
+    session: &str,
+) -> OpenMemory {
+    use crate::context_assembly::MemoryState;
+    // A test that builds a bare Settings has no redirect. Attaching nothing is
+    // the only safe answer: the resolver would otherwise fall back to the
+    // reader's own ~/.bos/bsh memory files, which no test owns and several
+    // tests inside one process would share. A settings document opened from a
+    // scratch root (the normal test path) still gets its own scratch files.
+    if cfg!(test) && settings.save_root.is_none() {
+        return OpenMemory {
+            store: None,
+            state: MemoryState::Disabled,
+            capture: None,
+        };
+    }
+    let resolved = crate::memory_scope::MemoryScopeResolver::resolve(settings, choice, session);
+    log::debug!(target: "bsh::memory", "memory scope: {}", resolved.diagnostic());
+    let capture_enabled = settings.workspace.agent.memory_capture;
+    let capture_scope = resolved.viewer.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The failure reason is retained, not dropped to an Option (issue
+        // #334): an enabled memory that cannot open is surfaced, not silently
+        // disabled. The reason names the path and the error, never the content.
+        type Opened = Result<(Arc<dyn MemoryStore>, MemoryState, Arc<FileMemory>), String>;
+        let result = (|| -> Opened {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("could not start the memory runtime: {e}"))?;
+            let workspace = rt
+                .block_on(FileMemory::open_scoped(
+                    &resolved.workspace_store,
+                    resolved.storage_scope.clone(),
+                    Some(resolved.viewer.clone()),
+                ))
+                .map_err(|e| {
+                    format!("could not open {}: {e}", resolved.workspace_store.display())
+                })?;
+            let workspace = Arc::new(workspace.with_max_items(500));
+            let user_id = crate::memory_scope::user_identity();
+            let user = rt
+                .block_on(FileMemory::open_scoped(
+                    &resolved.user_store,
+                    agent::memory::MemoryScope::user(user_id.clone()),
+                    Some(agent::memory::MemoryScope::user(user_id)),
+                ))
+                .map_err(|e| format!("could not open {}: {e}", resolved.user_store.display()))?;
+            let user = Arc::new(user.with_max_items(500));
+            let composed = agent::memory::ScopedMemory::new(vec![Arc::clone(&workspace), user])
+                .map_err(|e| format!("could not compose the memory scopes: {e}"))?;
+            let state = if rt.block_on(composed.is_empty()) {
+                MemoryState::Empty
+            } else {
+                MemoryState::Ready
+            };
+            Ok((Arc::new(composed) as Arc<dyn MemoryStore>, state, workspace))
+        })();
+        let _ = tx.send(result);
+    });
+    match rx.recv() {
+        Ok(Ok((store, state, workspace))) => {
+            let policy = agent::memory::capture::CapturePolicy {
+                enabled: capture_enabled,
+                scope: capture_scope,
+                explicit_enabled: true,
+                ..Default::default()
+            };
+            OpenMemory {
+                store: Some(store),
+                state,
+                capture: Some(crate::memory_capture::CaptureHandle::new(workspace, policy)),
+            }
+        }
+        Ok(Err(reason)) => {
+            log::warn!("memory is enabled but unavailable: {reason}");
+            OpenMemory {
+                store: None,
+                state: MemoryState::InitFailed { reason },
+                capture: None,
+            }
+        }
+        Err(_) => {
+            let reason = "the memory open thread did not return".to_string();
+            log::warn!("memory is enabled but unavailable: {reason}");
+            OpenMemory {
+                store: None,
+                state: MemoryState::InitFailed { reason },
+                capture: None,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        agent_messages, allows_writes, build_agent, check_spawn, compactable_span,
+        egress_allowlist_path, is_confined, offers_local_web_search, plugin_provider_node,
+        read_egress_rules, refresh_plugin_providers, sandbox_spec_for, surfaced_capabilities,
+        tool_gates_for, web_search_config, with_bridge_pool, write_file_tool, BuiltAgent,
+        WorkspaceEgress, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, MAX_BATCH_READ_BYTES, READ_ONLY,
+        WORKSPACE_WRITE,
+    };
+    use crate::settings::global::{ModelEntry, Preset};
+    use crate::settings::resolve::SessionChoice;
+    use crate::settings::Settings;
+    use crate::vault::Vault;
+    use agent::policy::{Action, EgressRuleSet, PolicyData, PolicyInput, PolicySet, Target};
+    use agent::tools::Tool as _;
+
+    /// Serialises the tests that share the process-wide schedule queue.
+    static SCHEDULE_QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The browser's tools are reachable without being advertised. A pane the
+    /// model cannot drive is a picture, so the nine names must be on the agent
+    /// a turn runs - as the registry behind `find_tool`, not as nine schemas in
+    /// every request.
+    #[test]
+    fn a_build_offers_the_browser_tools() {
+        let built = build_agent(
+            &Settings::default(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+        );
+        let registry = built.agent.registry().expect("a tool registry");
+        let names = registry.async_tool_names();
+        let advertised: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            advertised.iter().any(|name| name == "find_tool"),
+            "the search replaces the family: {advertised:?}"
+        );
+        for tool in [
+            "browser_open",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_back",
+            "browser_forward",
+            "browser_reload",
+            "browser_close",
+        ] {
+            assert!(
+                names.iter().any(|name| name == tool),
+                "{tool} is registered and callable: {names:?}"
+            );
+            assert!(
+                !advertised.iter().any(|name| name == tool),
+                "{tool} is withheld from the request: {advertised:?}"
+            );
+        }
+    }
+
+    /// The prompt rule for a missing tool is carried by every BSH build.
+    ///
+    /// "When the tool you need is not among them, call find_tool" is written
+    /// by `Agent::system_prompt_for` only when the build really withholds a
+    /// tool (the paragraph itself is pinned by the agent crate's discovery
+    /// tests). BSH stays on that side of the gate on every build: the browser
+    /// family is registered and withheld, so `find_tool` replaces it even on
+    /// a fresh install with no MCP server, extension or federation peer. Losing
+    /// that would silently drop the way back to a withheld tool, because the
+    /// prompt would have nothing true to say.
+    #[test]
+    fn every_build_carries_the_tool_search() {
+        let built = build_agent(
+            &Settings::default(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert!(
+            built.agent.has_deferred_tools(),
+            "a build withholds at least the browser family"
+        );
+        let advertised: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            advertised.iter().any(|name| name == "find_tool"),
+            "the discovery block's precondition: {advertised:?}"
+        );
+    }
+
+    /// The egress file carries three rule shapes, and a line is classified by
+    /// what it can be: a port number, an address, or a hostname. The reader also
+    /// reports the file's own STATE, which the rule lists cannot carry: absent
+    /// (unrestricted), present-but-empty (deny-all), or present with rules.
+    #[test]
+    fn egress_rules_are_classified_by_what_they_can_be() {
+        let root = std::env::temp_dir().join(format!("bsh-egress-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            root.join(".bsh").join("egress-allowlist"),
+            "# the workspace's egress rules\n\
+             203.0.113.7\n\
+             10.0.0.0/8   # a range\n\
+             API.Example.test\n\
+             *.crates.io\n\
+             443\n",
+        )
+        .expect("the allowlist");
+        let rules = match read_egress_rules(&root) {
+            WorkspaceEgress::Rules(rules) => rules,
+            other => panic!("a file with rules must read as Rules, got {other:?}"),
+        };
+        assert_eq!(rules.addresses, vec!["203.0.113.7", "10.0.0.0/8"]);
+        assert_eq!(
+            rules.hosts,
+            vec!["api.example.test", "*.crates.io"],
+            "hostnames are lower-cased, ranges stay addresses"
+        );
+        assert_eq!(rules.ports, vec![443]);
+
+        // A missing file is ABSENT, not an empty rule list: the policy answers
+        // it with UNRESTRICTED egress, so the two must not be conflated.
+        assert_eq!(
+            read_egress_rules(&root.join("nowhere")),
+            WorkspaceEgress::Absent,
+            "no file is its own state"
+        );
+
+        // A file that exists with only comments is PRESENT and EMPTY: the
+        // deliberate deny-all, which is a different decision from absence.
+        let present = root.join("present-empty");
+        std::fs::create_dir_all(present.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            present.join(".bsh").join("egress-allowlist"),
+            "# nothing is allowed\n\n",
+        )
+        .expect("the empty allowlist");
+        assert_eq!(
+            read_egress_rules(&present),
+            WorkspaceEgress::Empty,
+            "an existing file with no rule is a deny-all"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The starter template parses to ZERO rules, so WRITING IT is the
+    /// deny-all floor rather than a way to get network access; it states the
+    /// tri-state in its own copy (creating the file opts into control, leaving
+    /// it empty denies all, deleting it restores the unrestricted default) and
+    /// documents a commented deny-all example, a commented allow-all
+    /// (nearest-equivalent) example and one worked allow example.
+    #[test]
+    fn the_starter_allowlist_parses_to_no_rules() {
+        let rules = EgressRuleSet::parse([EGRESS_ALLOWLIST_TEMPLATE]);
+        assert!(
+            rules.is_empty(),
+            "the template must declare no rule: {rules:?}"
+        );
+        assert!(rules.addresses.is_empty() && rules.hosts.is_empty() && rules.ports.is_empty());
+        // A commented DENY-ALL marker and a commented ALLOW-ALL / nearest
+        // equivalent line are both present and both still commented.
+        assert!(
+            EGRESS_ALLOWLIST_TEMPLATE.contains("# DENY ALL"),
+            "the template names the deny-all marker"
+        );
+        assert!(
+            EGRESS_ALLOWLIST_TEMPLATE.contains("# ALLOW ALL"),
+            "the template names the allow-all marker"
+        );
+        // Allow-all is not expressible as a hostname wildcard; the honest form is
+        // the address rule covering every address, and it is COMMENTED.
+        for line in EGRESS_ALLOWLIST_TEMPLATE.lines() {
+            let bare = line.split('#').next().unwrap_or("").trim();
+            assert!(
+                bare.is_empty(),
+                "every line of the template is blank or commented; found: {line:?}"
+            );
+        }
+        assert!(
+            EGRESS_ALLOWLIST_TEMPLATE.contains("# 0.0.0.0/0")
+                && EGRESS_ALLOWLIST_TEMPLATE.contains("# ::/0"),
+            "the allow-all nearest equivalent is documented and commented"
+        );
+        // The copy is the contract: the reader must learn that the file's
+        // EXISTENCE is what opts into control, that an empty one denies, that
+        // absence is unrestricted, and that a worked allow example is present.
+        for phrase in [
+            "CREATING THIS FILE OPTS INTO CONTROL",
+            "UNRESTRICTED",
+            "DENIES ALL EGRESS",
+            "Delete the file to restore",
+            "WORKED EXAMPLE",
+        ] {
+            assert!(
+                EGRESS_ALLOWLIST_TEMPLATE.contains(phrase),
+                "the starter states the tri-state; missing {phrase:?}"
+            );
+        }
+    }
+
+    /// The documented allow-all nearest equivalent really is one: the parser
+    /// reads `0.0.0.0/0` and `::/0` as ADDRESS rules, which is what the template
+    /// claims. A bare `*` does NOT match any host, which is why the template does
+    /// not offer it.
+    #[test]
+    fn allow_all_is_the_address_rule_and_not_a_hostname_wildcard() {
+        let rules = EgressRuleSet::parse(["0.0.0.0/0", "::/0", "*"]);
+        assert_eq!(
+            rules.addresses,
+            vec!["0.0.0.0/0", "::/0"],
+            "the covering ranges are address rules"
+        );
+        assert_eq!(
+            rules.hosts,
+            vec!["*"],
+            "a bare star is a hostname rule, not any host"
+        );
+    }
+
+    /// A workspace whose allowlist file EXISTS but is empty denies all egress:
+    /// the very command a fresh (absent-file) workspace allows is refused, the
+    /// listener sees no hit, and the tool reports `network: "deny-all"`. This is
+    /// the deliberate lockdown the pane's starter action opts into.
+    #[test]
+    fn a_present_but_empty_allowlist_denies_all_network() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("egress-present-empty");
+        // The reader created the file and left it empty. The pane's starter is
+        // exactly that file, so use the same writer.
+        crate::caps::write_egress_allowlist_template(&root).expect("the starter file");
+        assert!(
+            egress_allowlist_path(&root).exists(),
+            "the premise: a PRESENT file"
+        );
+        let mut settings = rooted(&root);
+        settings.global.default_preset = "standard".to_string();
+        let built = build(&settings);
+        assert!(
+            !built.policy.data().egress_unrestricted,
+            "a present file is not the absent state"
+        );
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            WORKSPACE_WRITE,
+            agent::sandbox::Principal::new("bash", "session", "standard"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &agent::sandbox::Egress::DenyAll,
+            "an empty file derives the kernel deny, not an open reach"
+        );
+
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+        // The endpoint is hidden in variables, so the command tier cannot name
+        // it: the command RUNS and only the sandbox can refuse the connection.
+        let hidden = bash
+            .run(&serde_json::json!({
+                "command": format!(
+                    "H={host}; P={port}; curl -sS --max-time 3 -o /dev/null \"http://$H:$P/\""
+                )
+            }))
+            .expect("the command runs");
+        assert_eq!(
+            hidden["network"],
+            serde_json::json!("deny-all"),
+            "the honest state for an empty file: {hidden}"
+        );
+        assert!(
+            !hidden["success"].as_bool().unwrap_or(true),
+            "the empty file let the request out: {hidden}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "a listener was reached");
+
+        // A literal endpoint is refused before a process exists and names the
+        // baseline rule it violated.
+        match bash.run(&serde_json::json!({
+            "command": format!("curl -sS --max-time 3 -o /dev/null http://{host}:{port}/")
+        })) {
+            Err(agent::ToolError::Failed(message)) => assert!(
+                message.contains("egress-not-allowlisted"),
+                "the empty file refuses with the baseline rule: {message}"
+            ),
+            other => panic!("an empty allowlist must refuse the literal endpoint, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a refused command connected"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A workspace with a PRESENT allowlist reaches only the address it names,
+    /// reports `network: "allowlist"`, and still refuses an address the file
+    /// does not carry.
+    #[test]
+    fn a_present_allowlist_reaches_only_its_endpoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("egress-present-rules");
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            egress_allowlist_path(&root),
+            format!("# the one reachable address\n{host}\n"),
+        )
+        .expect("the allowlist");
+        let mut settings = rooted(&root);
+        settings.global.default_preset = "standard".to_string();
+        let built = build(&settings);
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            WORKSPACE_WRITE,
+            agent::sandbox::Principal::new("bash", "session", "standard"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &agent::sandbox::Egress::Allow(vec![host.clone()]),
+            "the file's address is the derived allowlist"
+        );
+
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+        let allowed = bash
+            .run(&serde_json::json!({
+                "command": format!("curl -sS --max-time 3 http://{host}:{port}/")
+            }))
+            .expect("the command runs");
+        assert_eq!(
+            allowed["network"],
+            serde_json::json!("allowlist"),
+            "a real rule reports the allowlist: {allowed}"
+        );
+        assert!(allowed["success"].as_bool().unwrap_or(false), "{allowed}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the allowed endpoint was reached"
+        );
+
+        // An address the file does not name is refused at the command tier.
+        match bash.run(&serde_json::json!({
+            "command": "curl -sS --max-time 3 -o /dev/null http://203.0.113.9/"
+        })) {
+            Err(agent::ToolError::Failed(message)) => assert!(
+                message.contains("egress-not-allowlisted"),
+                "the unlisted address is refused: {message}"
+            ),
+            other => panic!("an unlisted address must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the refused command did not connect"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A transcript with `turns` exchanges, so the gate has history to fold.
+    fn turns(count: usize) -> Vec<crate::model::ChatMessage> {
+        let mut messages = Vec::new();
+        for i in 0..count {
+            messages.push(crate::model::ChatMessage::user(format!("u{i}")));
+            let mut reply = crate::model::ChatMessage::assistant();
+            reply.text = format!("a{i}");
+            messages.push(reply);
+        }
+        messages
+    }
+
+    /// The summarizer's input budget leaves the checkpoint's own output and the
+    /// instruction inside the configured window: the field log's successful
+    /// request already carried a 16710-token prompt while reserving 12800 for
+    /// the summary, leaving only ~3.2k of a 32k window for the next chunk.
+    #[test]
+    fn the_summarizer_budget_leaves_room_for_its_output() {
+        use super::compaction_input_tokens_for;
+        let max_output = agent::agent::context::COMPACTION_MAX_OUTPUT_TOKENS as usize;
+        assert_eq!(compaction_input_tokens_for(32_768), 27_648);
+        assert!(
+            compaction_input_tokens_for(32_768) + max_output <= 32_768,
+            "input + the capped summary output fits the window"
+        );
+        // A zero context budget still gives a manual /compact a sane ceiling,
+        // never the unbounded whole-span request.
+        assert_eq!(compaction_input_tokens_for(0), 24_000);
+        // A tiny window keeps a floor rather than a zero request.
+        assert_eq!(compaction_input_tokens_for(1_000), 4_096);
+    }
+
+    /// The Compact gate answers with the same selection the summarizer uses: a
+    /// trailing pair of messages is not enough to fold, more history is.
+    #[test]
+    fn the_compact_gate_agrees_with_the_selection() {
+        let mut session = crate::model::Session::new("ws", "t");
+        // A zero budget folds everything a balanced cut can, so even one
+        // exchange gives up its first message - the contract holds nothing
+        // back beyond the cut itself.
+        session.messages = turns(1);
+        assert_eq!(
+            compactable_span(&session.messages, 0),
+            Some(1),
+            "one exchange folds its first message, keeping the last"
+        );
+        session.messages = turns(6);
+        let span = compactable_span(&session.messages, 0).expect("six exchanges are foldable");
+        assert_eq!(span, session.messages.len() - 1, "all but the last message");
+        // A retain budget above the whole history leaves nothing to fold.
+        assert!(compactable_span(&session.messages, 1_000_000).is_none());
+    }
+
+    /// A Pairing rule holds across the bridge: the span ends on a balanced cut,
+    /// and a transcript whose tail is one exchange still folds its older half.
+    #[test]
+    fn the_bridge_spans_a_whole_number_of_messages() {
+        let messages = turns(5);
+        let bridged = agent_messages(&messages);
+        assert_eq!(bridged.len(), messages.len(), "every non-empty row crosses");
+        // Blank rows are streaming artifacts and must not cross.
+        let mut with_blank = messages.clone();
+        with_blank.push(crate::model::ChatMessage::assistant());
+        assert_eq!(agent_messages(&with_blank).len(), messages.len());
+    }
+
+    /// A bare tree, which is what a fresh install carries.
+    fn bare() -> Settings {
+        Settings::default()
+    }
+
+    /// A build that consults no vault, which is what every non-credential test
+    /// wants.
+    fn build(settings: &Settings) -> BuiltAgent {
+        build_agent(
+            settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+        )
+    }
+
+    /// A build for one explicit session choice.
+    fn build_for(settings: &Settings, choice: &SessionChoice) -> BuiltAgent {
+        build_agent(
+            settings,
+            &Vault::disabled(),
+            choice,
+            &crate::mcp::McpPool::default(),
+        )
+    }
+
+    /// An installed extension named by a path reaches the very agent the turn
+    /// runs: its tool is in the tool registry, its skill is in the prompt set,
+    /// and the settings inventory lists the package. The platform's activation
+    /// is proven too: its own tool runs while the build is live, and is refused
+    /// once the build - and the Fiber that gates it - is dropped.
+    #[tokio::test]
+    async fn an_installed_extension_reaches_the_turn() {
+        let mut settings = bare();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent/tests/fixtures/extensions/dsh-echo");
+        settings
+            .global
+            .extensions
+            .push(crate::settings::global::InstalledExtension {
+                id: "dsh-echo".to_string(),
+                path: Some(fixture.to_string_lossy().to_string()),
+                ..Default::default()
+            });
+
+        let built = build(&settings);
+        let tool = built
+            .agent
+            .registry()
+            .expect("tool registry")
+            .get("dsh_echo")
+            .expect("the extension tool");
+        let output = tool
+            .run(&serde_json::json!({ "value": "hi" }))
+            .expect("the tool runs");
+        assert_eq!(output["value"], "hi");
+        assert!(
+            built
+                .agent
+                .all_skills_content()
+                .iter()
+                .any(|(name, _)| name == "greet"),
+            "the extension skill is registered on the agent"
+        );
+        assert!(
+            built.plugins.iter().any(|plugin| plugin.name == "dsh-echo"),
+            "the settings inventory lists the extension under the id its toggle writes"
+        );
+        let suspended_id = built
+            .extension_activations
+            .first()
+            .expect("extension activation")
+            .extension_id()
+            .to_string();
+        assert!(built.suspend_extension(&suspended_id) > 0);
+        assert!(built.resume_extension(&suspended_id) > 0);
+
+        assert!(
+            !built.extension_activations.is_empty(),
+            "the production build retains the package Fiber handle"
+        );
+        assert!(built
+            .extension_activations
+            .iter()
+            .all(|activation| activation.state() == ferris_sdk::composable::FiberState::Active));
+
+        // The path-installed package above is served by the legacy DSH shim,
+        // whose synchronous tool carries no gate. The Fiber-owned gate belongs
+        // to the package the extension platform activated, so it is proven on
+        // that package's own async tool: a handle kept past the build must
+        // still be refused after the build is dropped.
+        let platform_tool = {
+            let live = built.agent.live_tools().read().expect("live registry");
+            let tool = built
+                .extension_activations
+                .iter()
+                .flat_map(|activation| activation.tool_names())
+                .find_map(|name| live.get_async(name))
+                .expect("the platform tool is registered asynchronously");
+            drop(live);
+            tool
+        };
+        // A package's tools are WITHHELD from the request's array now: they are
+        // a family installed at once, and a step paid for every schema. The
+        // contract is the search instead - the array carries `find_tool`, the
+        // tools it reports join the next request, and each one still runs.
+        let platform_names: Vec<String> = built
+            .extension_activations
+            .iter()
+            .flat_map(|activation| activation.tool_names())
+            .cloned()
+            .collect();
+        assert!(
+            !platform_names.is_empty(),
+            "the platform activation installs at least one tool"
+        );
+        let model_names: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for name in &platform_names {
+            assert!(
+                !model_names.contains(name),
+                "{name} is withheld from the advertised array: {model_names:?}"
+            );
+        }
+        assert!(
+            model_names.iter().any(|name| name == "find_tool"),
+            "the search replaces the withheld tools: {model_names:?}"
+        );
+        let registered: Vec<String> = built
+            .agent
+            .all_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let pane = crate::caps::capabilities(&built.agent);
+        for name in &platform_names {
+            assert!(
+                registered.contains(name),
+                "{name} is still registered, only not advertised"
+            );
+            assert!(
+                pane.iter()
+                    .any(|cap| &cap.name == name && cap.category == "tool"),
+                "the Tools pane lists {name}"
+            );
+        }
+        assert!(
+            react::tool::registry::AsyncTool::run(&*platform_tool, &serde_json::json!({}))
+                .await
+                .is_ok(),
+            "the live activation's tool runs"
+        );
+        drop(built);
+        assert!(
+            react::tool::registry::AsyncTool::run(&*platform_tool, &serde_json::json!({}))
+                .await
+                .is_err(),
+            "dropping the build must close the extension tool's liveness gate"
+        );
+    }
+
+    /// The choice the credential fixtures name: the `work` provider's leaf.
+    fn work_choice() -> SessionChoice {
+        SessionChoice {
+            model: Some(crate::settings::global::ModelRef {
+                provider: "work".to_string(),
+                model: "work-model".to_string(),
+            }),
+            preset: None,
+            ..Default::default()
+        }
+    }
+
+    /// The meter tools figure is the serialized request array: nonzero for a
+    /// built-in tool set, and strictly smaller once a tool is switched off.
+    #[test]
+    fn the_tool_schema_length_follows_the_registered_tools() {
+        let all = build(&bare()).tools_schema_chars;
+        let mut settings = bare();
+        settings.workspace.agent.bash_enabled = false;
+        let fewer = build(&settings).tools_schema_chars;
+        assert!(all > 0, "a built agent carries tool definitions");
+        assert!(
+            fewer > 0 && fewer < all,
+            "switching off a tool must shrink the array ({fewer} vs {all})"
+        );
+    }
+
+    /// The web-tools switch reaches the agent config, and the hosted tool only
+    /// appears when the protocol can carry it.
+    ///
+    /// A TRUSTED DSH package's host entry runs during a real build, and the tool
+    /// it registers is CALLABLE from the agent the shell would actually run.
+    ///
+    /// This is the end-to-end claim. `an_installed_extension_reaches_the_turn`
+    /// covers the DECLARATIVE path; this covers the IMPERATIVE one, which is how
+    /// every shipped DSH package delivers its payload. The assertion is the CALL,
+    /// and the expected value is what the fixture's own `execute` returns, so a
+    /// build that registered a name without a live process behind it cannot pass.
+    ///
+    /// The fixture is copied to a scratch root first: the trusted half runs its
+    /// JavaScript, and a test must not have a child writing into the repository.
+    #[test]
+    fn a_trusted_dsh_entry_reaches_the_turn_through_the_bridge() {
+        if agent::extensions::bridge::find_interpreter().is_none() {
+            eprintln!("skipped: no Node interpreter");
+            return;
+        }
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent/tests/fixtures/extensions/dsh-bridge");
+        let root = std::env::temp_dir().join(format!("bsh-bridge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch root");
+        for entry in std::fs::read_dir(&source).expect("fixture") {
+            let entry = entry.expect("entry");
+            std::fs::copy(entry.path(), root.join(entry.file_name())).expect("copy");
+        }
+
+        let mut settings = bare();
+        let record = crate::settings::global::InstalledExtension {
+            id: "dsh-bridge".to_string(),
+            path: Some(root.to_string_lossy().to_string()),
+            trusted: true,
+            trusted_path: Some(root.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        assert!(record.is_trusted(), "the premise: the record is trusted");
+        settings.global.extensions.push(record);
+
+        let built = build(&settings);
+        let tool = built
+            .agent
+            .registry()
+            .expect("tool registry")
+            .get("dsh_bridge_echo")
+            .expect("the bridged tool reached the turn");
+        let output = tool
+            .run(&serde_json::json!({ "value": "turn" }))
+            .expect("the bridged tool runs inside the build");
+        assert_eq!(output["echoed"], "turn", "{output}");
+        // The config came from the package's own bundle patch, so the manifest's
+        // config reached the plugin and this is not a hardcoded default.
+        assert_eq!(output["plugin"], "fixture", "{output}");
+
+        // The process is alive AFTER the build returned, which is what makes the
+        // tool usable across turns rather than for exactly one call.
+        let again = tool
+            .run(&serde_json::json!({ "value": "second" }))
+            .expect("the session outlives the build that created it");
+        assert_eq!(again["echoed"], "second", "{again}");
+
+        // A build that no longer asks for the package offers no tool from it.
+        let without = build(&bare());
+        assert!(
+            without
+                .agent
+                .registry()
+                .expect("tool registry")
+                .get("dsh_bridge_echo")
+                .is_none(),
+            "a package nobody lists contributes no tool"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An UNTRUSTED DSH package contributes no tool in a real build, and its
+    /// entry never runs: the trust gate at the build boundary.
+    ///
+    /// The fixture records execution by writing a marker on its module's first
+    /// line, so the assertion is about EXECUTION and not merely about a missing
+    /// registration. It is copied to a scratch root first: a test must never let a
+    /// child write into the repository, and a marker left in the fixture by an
+    /// earlier run would silently invert what this test proves.
+    #[test]
+    fn an_untrusted_dsh_entry_contributes_no_tool_to_the_turn() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent/tests/fixtures/extensions/dsh-untrusted");
+        let root = std::env::temp_dir().join(format!("bsh-untrusted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch root");
+        for entry in std::fs::read_dir(&source).expect("fixture") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name();
+            assert!(
+                !name.to_string_lossy().ends_with(".marker"),
+                "the fixture carries {name:?}: a previous run left execution evidence behind"
+            );
+            std::fs::copy(entry.path(), root.join(name)).expect("copy");
+        }
+
+        let mut settings = bare();
+        settings
+            .global
+            .extensions
+            .push(crate::settings::global::InstalledExtension {
+                id: "dsh-untrusted".to_string(),
+                path: Some(root.to_string_lossy().to_string()),
+                ..Default::default()
+            });
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("tool registry")
+                .get("dsh_untrusted_echo")
+                .is_none(),
+            "an untrusted package's entry never registers anything"
+        );
+        assert!(
+            !root.join("executed.marker").exists(),
+            "and it never ran: no marker, so no process"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pool reconciles: a package that stops being asked for loses its child.
+    ///
+    /// This is the lifecycle half of the trust story. A plugin process outlives
+    /// the build that spawned it, so without `retain` a reader who unticks a
+    /// package - or withdraws trust - would leave its code running invisibly.
+    /// The witness is the pid: `kill(pid, 0)` succeeds while pooled and fails
+    /// once the pool has reconciled it away.
+    #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "process-pool timing is not stable on CI"
+    )]
+    fn the_bridge_pool_stops_a_package_the_build_no_longer_asks_for() {
+        if agent::extensions::bridge::find_interpreter().is_none() {
+            eprintln!("skipped: no Node interpreter");
+            return;
+        }
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent/tests/fixtures/extensions/dsh-bridge");
+        let root = std::env::temp_dir().join(format!("bsh-pool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch root");
+        for entry in std::fs::read_dir(&source).expect("fixture") {
+            let entry = entry.expect("entry");
+            std::fs::copy(entry.path(), root.join(entry.file_name())).expect("copy");
+        }
+        let mut settings = bare();
+        settings
+            .global
+            .extensions
+            .push(crate::settings::global::InstalledExtension {
+                id: "dsh-bridge".to_string(),
+                path: Some(root.to_string_lossy().to_string()),
+                trusted: true,
+                trusted_path: Some(root.to_string_lossy().to_string()),
+                ..Default::default()
+            });
+
+        // A build that names the package starts a child and pools it.
+        let built = build(&settings);
+        let tool = built
+            .agent
+            .registry()
+            .expect("tool registry")
+            .get("dsh_bridge_echo")
+            .expect("the bridged tool");
+        let pid = with_bridge_pool(|pool| {
+            pool.session("@local/dsh-bridge", &root)
+                .expect("the pool holds the session")
+                .lock()
+                .expect("lock")
+                .pid()
+        });
+        assert!(process_alive(pid), "the child runs while pooled");
+        // Dropping the agent must not stop it: another turn may still hold it.
+        drop(tool);
+        drop(built);
+        assert!(
+            process_alive(pid),
+            "the pool owns the process, not the build that adopted it"
+        );
+
+        // A build that no longer asks for the package stops it.
+        let _ = build(&bare());
+        assert!(
+            with_bridge_pool(|pool| pool.loaded()).is_empty(),
+            "the pool keeps no package this build did not ask for"
+        );
+        // Reaping is the OS's to finish, and a loaded suite can schedule the
+        // child's exit well after the pool asked for it. Poll for the death
+        // instead of pinning one scheduler-latency number; the assertion is
+        // still "the child is gone", not "it will be gone eventually".
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !process_alive(pid),
+            "reconciling the pool reaps the child rather than leaking it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whether a process with this pid exists, without executing a new one.
+    ///
+    /// `kill(pid, 0)` is the POSIX existence probe: it sends no signal and
+    /// reports through `errno`, so it cannot itself be mistaken for the child
+    /// under test.
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // SAFETY: `kill` with signal 0 performs the permission and existence
+        // check and delivers nothing; the pid is one the OS issued us.
+        unsafe { kill(pid as i32, 0) == 0 }
+    }
+
+    #[cfg(not(unix))]
+    fn process_alive(pid: u32) -> bool {
+        let _ = pid;
+        false
+    }
+
+    /// The switch is the reader's half of the decision and the REGISTRY is the
+    /// other half, so this pins that the local `web_search` tool is offered
+    /// exactly when the switch is on - and that the hosted flag stays off on
+    /// every build, because two tools named `web_search` would collide.
+    ///
+    /// The shipped preset is left IN PLACE: it declares `web_search = true`, and
+    /// that declaration must not re-offer a tool the reader switched off. It
+    /// did once, because the build read
+    /// `preset_web_search.unwrap_or(web_tools_enabled)`, which made both the
+    /// Tools pane's row and the Web search pane's switch no-ops under every
+    /// shipped preset.
+    #[test]
+    fn the_web_tools_switch_reaches_the_agent() {
+        let mut settings = bare();
+        assert_eq!(
+            settings.global.default_preset, "standard",
+            "the premise: the shipped preset declares web_search = true"
+        );
+        assert!(
+            settings.workspace.agent.web_tools_enabled,
+            "the shipped default offers web search"
+        );
+        let names = build_tool_names(&settings);
+        assert!(
+            names.iter().any(|name| name == "web_search"),
+            "the switch offers the local search tool: {names:?}"
+        );
+        assert!(
+            !build(&settings).agent.config().web_search,
+            "the hosted object is never sent beside the local tool"
+        );
+
+        settings.workspace.agent.web_tools_enabled = false;
+        let names = build_tool_names(&settings);
+        assert!(
+            !names.iter().any(|name| name == "web_search"),
+            "switching it off withdraws the tool even though the preset declares \
+             it: {names:?}"
+        );
+    }
+
+    /// Every built-in this host composes declares the metadata a capability
+    /// catalogue needs. A tool without a declaration is invisible to
+    /// composition, so the wiring is checked against a real build rather than
+    /// against the declaration table alone.
+    #[test]
+    fn the_builtin_tools_declare_their_capability_metadata() {
+        let settings = with_tools("workspace-write", None);
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("a tool registry");
+
+        let declared = [
+            "bash",
+            "glob",
+            "grep",
+            "read_file",
+            "read_files",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "sed",
+            "list_dir",
+            "update_plan",
+            "web_search",
+            "job_list",
+            "subagent",
+            "subagent_result",
+        ];
+        let mut saw = 0;
+        for name in declared {
+            let Some(tool) = registry.get(name) else {
+                continue;
+            };
+            let metadata = tool
+                .metadata()
+                .unwrap_or_else(|| panic!("{name} declares capability metadata"));
+            assert_eq!(metadata.version.as_deref(), Some("1.0.0"), "{name}");
+            assert!(metadata.risk.is_some(), "{name} declares a risk class");
+            saw += 1;
+        }
+        assert!(
+            saw >= 8,
+            "the default build offers the file and shell tools, saw {saw}"
+        );
+    }
+
+    /// The turn's registry is exactly a resolved capability plan: the model can
+    /// name and govern every tool the build offers, with nothing left over on
+    /// either side.
+    #[test]
+    fn the_turns_tools_are_exactly_a_resolved_capability_plan() {
+        use crate::caps::plan_for_registry;
+        let settings = with_tools("workspace-write", None);
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("a tool registry");
+        let plan = plan_for_registry(&built.agent).expect("the plan resolves");
+
+        assert!(
+            plan.is_local_only(),
+            "the turn composes only local bindings"
+        );
+        // The turn's surface is the base registry plus the live overlay:
+        // extension packages register their tools live, and the plan must
+        // account for exactly that union.
+        let mut surface: std::collections::BTreeSet<String> = registry.list().into_iter().collect();
+        surface.extend(built.agent.live_tools().read().expect("live tools").list());
+        assert_eq!(
+            plan.capabilities.len(),
+            surface.len(),
+            "every tool on the turn's surface is in the plan"
+        );
+        let planned: std::collections::BTreeSet<String> = plan
+            .capabilities
+            .iter()
+            .map(|capability| capability.descriptor.surface.to_string())
+            .collect();
+        let registered: std::collections::BTreeSet<String> = surface;
+        assert_eq!(
+            planned, registered,
+            "the plan and the registry name one set"
+        );
+    }
+
+    /// A real turn build records what it got: every capability, at its exact
+    /// version, with no secret material in the record.
+    #[test]
+    fn a_turn_build_snapshots_its_composition() {
+        let settings = with_tools("workspace-write", None);
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("a tool registry");
+
+        let snapshot = built
+            .snapshot
+            .as_ref()
+            .expect("the build records its composition");
+
+        let mut surface = registry.list();
+        surface.extend(built.agent.live_tools().read().expect("live tools").list());
+        assert_eq!(snapshot.capabilities.len(), surface.len());
+        assert!(snapshot.is_local_only());
+        let json = serde_json::to_string(&snapshot).expect("the snapshot serializes");
+        assert!(!json.contains("secret"), "{json}");
+        assert!(!json.contains("api_key"), "{json}");
+    }
+
+    /// A real build writes exactly one record, and the record matches the
+    /// snapshot the build carries.
+    #[test]
+    fn a_turn_build_records_its_composition() {
+        let mut settings = with_tools("workspace-write", None);
+        let root = std::env::temp_dir().join(format!("bsh-composition-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        settings.save_root = Some(root.clone());
+
+        let built = build(&settings);
+
+        let snapshot = built.snapshot.as_ref().expect("the build records one");
+        let path = root.join("compositions.jsonl");
+        let records = crate::compositions::load(&path, 8);
+        assert_eq!(records.len(), 1, "one build writes one record");
+        assert_eq!(records[0], **snapshot);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A trusted peer's capability is offered to the model only when the build
+    /// asks for it, and the offered tool reaches the peer's runtime.
+    #[tokio::test]
+    async fn a_trusted_peer_capability_is_offered_as_a_tool() {
+        use crate::federation_node::{assemble, attach_remote_tools};
+        use agent::capability::composition::{Binding, ResolvedCapability, ResolvedComposition};
+        use agent::capability::{
+            CapabilityCall, CapabilityDescriptor, CapabilityKind, CapabilityOutput,
+            CapabilityProvider, Principal, ProviderHealth, ProviderId, ProviderKind, VersionSource,
+            Visibility, WorkspaceId, WorkspaceRuntime,
+        };
+        use async_trait::async_trait;
+        use federation::{FederationNode, InMemoryNetwork, NodeIdentity, PeerStore};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Echo {
+            descriptor: CapabilityDescriptor,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl CapabilityProvider for Echo {
+            fn id(&self) -> &ProviderId {
+                static BUILTIN: std::sync::OnceLock<ProviderId> = std::sync::OnceLock::new();
+                BUILTIN.get_or_init(ProviderId::builtin)
+            }
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Builtin
+            }
+            async fn describe(
+                &self,
+            ) -> Result<Vec<CapabilityDescriptor>, agent::capability::CapabilityError> {
+                Ok(vec![self.descriptor.clone()])
+            }
+            async fn invoke(
+                &self,
+                call: CapabilityCall<'_>,
+            ) -> Result<CapabilityOutput, agent::capability::CapabilityError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CapabilityOutput::json(
+                    serde_json::json!({ "remote": call.input }),
+                ))
+            }
+            async fn health(&self) -> ProviderHealth {
+                ProviderHealth::Available
+            }
+        }
+
+        let network = Arc::new(InMemoryNetwork::new());
+        let provider_identity = NodeIdentity::from_seed([31u8; 32]);
+        let provider_id = provider_identity.node_id();
+        let descriptor = CapabilityDescriptor::new(
+            "builtin/remote_echo".parse().expect("an id"),
+            CapabilityKind::Tool,
+            semver::Version::new(1, 0, 0),
+            VersionSource::Declared,
+        )
+        .with_visibility(Visibility::Public);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let echo: Arc<dyn CapabilityProvider> = Arc::new(Echo {
+            descriptor: descriptor.clone(),
+            calls: Arc::clone(&calls),
+        });
+        let peer_plan = ResolvedComposition {
+            id: "compose:peer".into(),
+            version: semver::Version::new(1, 0, 0),
+            workspace: WorkspaceId::new("ws:peer").expect("a workspace"),
+            capabilities: vec![ResolvedCapability {
+                descriptor: descriptor.clone(),
+                binding: Binding::Local {
+                    provider: ProviderId::builtin(),
+                },
+                decision: None,
+            }],
+            skipped: Vec::new(),
+            budgets: agent::capability::composition::Budgets::default(),
+        };
+        let peer_runtime =
+            Arc::new(WorkspaceRuntime::instantiate(peer_plan, &[echo]).expect("a peer runtime"));
+        let (peer_transport, peer_inbox) = network.join(provider_id.clone());
+        let peer_node = FederationNode::new(provider_identity, Arc::new(peer_transport))
+            .with_public_capabilities(vec![descriptor])
+            .with_runtime(peer_runtime);
+        let _peer_task = peer_node.start(peer_inbox);
+
+        let identity = NodeIdentity::from_seed([32u8; 32]);
+        let local_id = identity.node_id();
+        let (transport, inbox) = network.join(local_id.clone());
+        let federation = assemble(
+            identity,
+            PeerStore::new(),
+            Arc::new(transport),
+            inbox,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some("test node".to_string()),
+        );
+        let now = agent::capability::unix_ms();
+        {
+            let peers = federation.node().peers();
+            let mut peers = peers.write().expect("peers");
+            peers.enroll(provider_id.clone(), now, None);
+            peers
+                .grant(
+                    &provider_id,
+                    "builtin/remote_echo".parse().expect("an id"),
+                    now,
+                    None,
+                )
+                .expect("granted");
+        }
+        {
+            let peers = peer_node.peers();
+            let mut peers = peers.write().expect("peers");
+            peers.enroll(local_id.clone(), now, None);
+            peers
+                .grant(
+                    &local_id,
+                    "builtin/remote_echo".parse().expect("an id"),
+                    now,
+                    None,
+                )
+                .expect("granted");
+        }
+        federation.refresh_peers().await;
+
+        let settings = with_tools("workspace-write", None);
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .live_tools()
+                .read()
+                .expect("live tools")
+                .get_async("remote_echo")
+                .is_none(),
+            "nothing remote is offered before the attach"
+        );
+
+        let added = attach_remote_tools(
+            &built.agent,
+            &federation,
+            WorkspaceId::new("ws:test").expect("a workspace"),
+            Principal::Local {
+                session: "session".to_string(),
+                preset: "preset".to_string(),
+            },
+        )
+        .expect("the capability attaches");
+        assert_eq!(added, 1);
+
+        let tool = built
+            .agent
+            .live_tools()
+            .read()
+            .expect("live tools")
+            .get_async("remote_echo")
+            .expect("the remote tool is registered");
+        let output = tool
+            .run(&serde_json::json!({ "v": 5 }))
+            .await
+            .expect("the peer runs it");
+        assert_eq!(output["remote"]["v"], 5);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The peer leaves: the attached tool fails instead of falling back to
+        // anything local, and no local tool of that name exists to fall back to.
+        network.leave(&provider_id);
+        let error = tool
+            .run(&serde_json::json!({ "v": 6 }))
+            .await
+            .expect_err("the peer is gone");
+        assert!(
+            matches!(error, agent::tools::ToolError::Failed(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the failed call never reached the peer"
+        );
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("remote_echo")
+                .is_none(),
+            "the remote tool has no local substitute"
+        );
+    }
+
+    /// The switch rebuilds the turn's registry through the capability model:
+    /// every tool becomes an async shim that dispatches through a provider,
+    /// and a shim still runs the real tool.
+    #[test]
+    fn the_capability_registry_switch_rebuilds_the_turn_registry() {
+        let plain = build(&with_tools("workspace-write", None));
+        let raw = plain.agent.registry().expect("a registry");
+        assert!(raw.get("update_plan").is_some(), "the raw tool is sync");
+        assert!(raw.get_async("update_plan").is_none());
+
+        let mut settings = with_tools("workspace-write", None);
+        settings.global.general.capability_registry = true;
+        let composed = build(&settings);
+        let registry = composed.agent.registry().expect("a registry");
+        assert!(
+            registry.get("update_plan").is_none(),
+            "the shim replaces the raw tool"
+        );
+        assert!(
+            registry.get_async("update_plan").is_some(),
+            "shims are async"
+        );
+
+        let result = registry
+            .execute("update_plan", &serde_json::json!({ "items": [] }))
+            .expect("the shim runs the real tool");
+        assert!(result.is_object(), "{result}");
+    }
+
+    /// The same call table through the raw registry and the capability
+    /// registry: success, schema rejection, body failure, and an unknown tool
+    /// land in the same class.
+    #[test]
+    fn the_two_registries_answer_the_same_call_table() {
+        use agent::ToolError;
+        let plain = build(&with_tools("workspace-write", None));
+        let mut settings = with_tools("workspace-write", None);
+        settings.global.general.capability_registry = true;
+        let composed = build(&settings);
+        let raw = plain.agent.registry().expect("the raw registry");
+        let shims = composed.agent.registry().expect("the composed registry");
+
+        // Success: an empty plan is valid and its projection is deterministic.
+        let call = serde_json::json!({ "items": [] });
+        assert_eq!(
+            raw.execute("update_plan", &call).expect("raw"),
+            shims.execute("update_plan", &call).expect("shim"),
+            "both paths return the same value"
+        );
+
+        // Schema rejection happens before the body on both paths.
+        let left = raw
+            .execute("update_plan", &serde_json::json!({}))
+            .unwrap_err();
+        let right = shims
+            .execute("update_plan", &serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(left, ToolError::SchemaMismatch { .. }), "{left:?}");
+        assert!(
+            matches!(right, ToolError::SchemaMismatch { .. }),
+            "{right:?}"
+        );
+
+        // A body failure stays a tool failure on both paths. The message text
+        // differs (the shim reports the provider's classification), which is
+        // why the equivalence is a class.
+        if raw.get("read_file").is_some() {
+            let missing = serde_json::json!({ "path": "/definitely/not/here" });
+            let left = raw.execute("read_file", &missing).unwrap_err();
+            let right = shims.execute("read_file", &missing).unwrap_err();
+            assert!(matches!(left, ToolError::Failed(_)), "{left:?}");
+            assert!(matches!(right, ToolError::Failed(_)), "{right:?}");
+        }
+
+        // An unknown name never reaches either dispatcher.
+        let left = raw
+            .execute("no_such_tool", &serde_json::json!({}))
+            .unwrap_err();
+        let right = shims
+            .execute("no_such_tool", &serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(left, ToolError::NotFound(_)), "{left:?}");
+        assert!(matches!(right, ToolError::NotFound(_)), "{right:?}");
+    }
+
+    /// An unchanged tool surface reuses the composition record: the cache is
+    /// keyed by names, schemas, and declarations, not by the clock.
+    #[test]
+    fn an_unchanged_build_reuses_the_composition() {
+        let settings = with_tools("workspace-write", None);
+        let first = build(&settings);
+        let second = build(&settings);
+
+        let left = first
+            .snapshot
+            .as_ref()
+            .expect("the first build records one");
+        let right = second.snapshot.as_ref().expect("the second does too");
+        assert!(
+            std::sync::Arc::ptr_eq(left, right),
+            "an unchanged surface reuses the cached composition"
+        );
+    }
+
+    /// A narrower surface is a different composition, not a cached one.
+    #[test]
+    fn a_changed_tool_surface_invalidates_the_composition() {
+        let wide = build(&with_tools("workspace-write", None));
+        let narrow = build(&with_tools("read-only", None));
+
+        let left = wide.snapshot.as_ref().expect("the wide build records one");
+        let right = narrow.snapshot.as_ref().expect("the narrow build does too");
+        assert!(
+            !std::sync::Arc::ptr_eq(left, right),
+            "a different tool surface is a new composition"
+        );
+        assert!(
+            right.capabilities.len() < left.capabilities.len(),
+            "the read-only surface is narrower: {} vs {}",
+            right.capabilities.len(),
+            left.capabilities.len()
+        );
+    }
+
+    /// Extension packages register their tools live; the composition must see
+    /// them, or the one surface a package contributes is missing from the
+    /// snapshot and the plan.
+    #[test]
+    fn a_live_tool_reaches_the_composition() {
+        use agent::tools::AsyncFunctionTool;
+        use std::sync::Arc;
+
+        let built = build(&with_tools("workspace-write", None));
+        let live = AsyncFunctionTool::new(
+            "live_probe",
+            "A live tool",
+            serde_json::json!({ "type": "object" }),
+            |_args| Box::pin(async { Ok(serde_json::json!({ "ok": true })) }),
+        );
+        built
+            .agent
+            .add_live_async_tool(Arc::new(live))
+            .expect("a live tool");
+
+        let plan = crate::caps::plan_for_registry(&built.agent).expect("the plan");
+
+        assert!(
+            plan.capabilities
+                .iter()
+                .any(|capability| capability.descriptor.surface.as_str() == "live_probe"),
+            "the live overlay is part of the composition: {:?}",
+            plan.capabilities
+                .iter()
+                .map(|capability| capability.descriptor.surface.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The intersection itself, as a truth table: the workspace switch is the
+    /// master, an absent preset inherits it, and a declared `false` narrows
+    /// only. Each arm is a state the two panes and the shipped presets put the
+    /// build in.
+    #[test]
+    fn web_search_is_the_switch_intersected_with_the_preset() {
+        // switch, preset declaration, offered
+        let table = [
+            (true, None, true),
+            (true, Some(true), true),
+            (true, Some(false), false),
+            (false, None, false),
+            (false, Some(true), false),
+            (false, Some(false), false),
+        ];
+        for (enabled, preset, expected) in table {
+            assert_eq!(
+                offers_local_web_search(enabled, preset),
+                expected,
+                "switch={enabled} preset={preset:?}"
+            );
+        }
+    }
+
+    /// Every tool name one build registered, sorted.
+    fn build_tool_names(settings: &Settings) -> Vec<String> {
+        tool_names(&build(settings))
+    }
+
+    /// Every tool name a finished build registered, sorted.
+    /// ask_user presents a validated question: two to six options, a non-empty
+    /// question, and a presented note that tells the model to end its turn.
+    #[test]
+    fn ask_user_presents_options_and_validates_them() {
+        let built = build(&bare());
+        let registry = built.agent.registry().expect("the registry");
+        let ok = registry
+            .execute(
+                "ask_user",
+                &serde_json::json!({"questions": [
+                    {"question": "Which approach?", "options": ["A", "B"]},
+                    {"question": "Which extras?", "options": ["x", "y", "z"], "multi_select": true}
+                ]}),
+            )
+            .expect("valid questions present");
+        assert_eq!(ok["status"], "presented");
+        assert_eq!(ok["questions"], 2);
+        assert!(
+            registry
+                .execute(
+                    "ask_user",
+                    &serde_json::json!({"questions": [{"question": "x", "options": ["only one"]}]})
+                )
+                .is_err(),
+            "one option is not a choice"
+        );
+        assert!(
+            registry
+                .execute(
+                    "ask_user",
+                    &serde_json::json!({"questions": [{"question": "  ", "options": ["a", "b"]}]})
+                )
+                .is_err(),
+            "a blank question is refused"
+        );
+        assert!(
+            registry
+                .execute("ask_user", &serde_json::json!({"questions": []}))
+                .is_err(),
+            "no questions is refused"
+        );
+    }
+
+    /// The legacy `ptc` id still loads, as the Federation preset.
+    #[test]
+    fn the_legacy_ptc_id_loads_as_federation() {
+        let mut settings = bare();
+        settings.global.default_preset = "ptc".to_string();
+        assert!(crate::settings::global::ships_preset("ptc"));
+        let built = build(&settings);
+        assert!(built.agent.config().parallel_tool_calls);
+        assert!(built
+            .agent
+            .config()
+            .system_prompt
+            .contains(crate::prompts::FEDERATION_PERSONA));
+    }
+
+    /// Standard keeps the federation queries but not distributed delegation;
+    /// the Federation preset grants the delegate.
+    #[test]
+    fn standard_withholds_distributed_delegate_and_federation_grants_it() {
+        let mut settings = bare();
+        settings.global.federation.enabled = true;
+        let standard = build(&settings);
+        let names = tool_names(&standard);
+        assert!(
+            names.iter().any(|n| n == "federation_status"),
+            "the queries stay: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "federation_delegate"),
+            "Standard must not delegate to peers: {names:?}"
+        );
+        settings.global.default_preset = "federation".to_string();
+        let federated = build(&settings);
+        let names = tool_names(&federated);
+        assert!(
+            names.iter().any(|n| n == "federation_delegate"),
+            "Federation grants the delegate: {names:?}"
+        );
+    }
+
+    fn tool_names(built: &BuiltAgent) -> Vec<String> {
+        let mut names = built
+            .agent
+            .registry()
+            .map(|registry| registry.list())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// The intent contract is not merely a constant: a real build carries the
+    /// three layers in order, with the product context and tool rules appended.
+    #[test]
+    fn the_built_prompt_carries_the_intent_contract() {
+        let built = build(&bare());
+        let prompt = &built.agent.config().system_prompt;
+        assert!(prompt.contains(agent::HARNESS_IDENTITY));
+        assert!(prompt.contains(agent::WORKFLOW_GUIDANCE));
+        assert!(prompt.contains(crate::prompts::HARNESS_CONTEXT));
+        assert!(
+            prompt.contains("A question ends without an edit"),
+            "the question/change decision reaches the request"
+        );
+        assert!(
+            prompt.contains("too vague to act on"),
+            "the concreteness gate reaches the request"
+        );
+        assert!(
+            prompt.contains("A later message corrects the current task"),
+            "the steering rule reaches the request"
+        );
+        assert!(
+            prompt.contains(
+                "The conversation carries the intent; the workspace carries the evidence"
+            ),
+            "the product's intent/evidence split reaches the request"
+        );
+        assert!(
+            prompt.find(agent::WORKFLOW_GUIDANCE) < prompt.find(crate::prompts::HARNESS_CONTEXT),
+            "the contract precedes the product context"
+        );
+    }
+
+    /// The system prompt rides on EVERY step of EVERY turn, so its size is a
+    /// per-request cost, not a wording preference. A change that doubles it is a
+    /// performance bug: measured at 9,191 bytes with the full tool roster, and
+    /// the skill catalogue is deliberately NOT part of it (the vendor ranks that
+    /// against the request instead). The headroom below the cap is kept for
+    /// capability-gated rules, not for prose.
+    #[test]
+    fn the_system_prompt_stays_within_its_budget() {
+        let built = build(&bare());
+        let prompt = &built.agent.config().system_prompt;
+        assert!(
+            prompt.len() < 12_000,
+            "the system prompt rides on every step: {} bytes",
+            prompt.len()
+        );
+    }
+
+    /// The bare build's tool array is admitted under the framework ceiling, and
+    /// no definition its prompt names is withheld: the paragraph and the
+    /// definition are one decision.
+    #[test]
+    fn the_tool_array_is_bounded_and_prompt_tools_survive() {
+        let built = build(&bare());
+        let admission = built.agent.tool_admission();
+        assert_eq!(
+            admission.limit,
+            react::engine::DEFAULT_SCHEMA_BUDGET
+                - react::tool::admission::DEFAULT_DISCOVERY_RESERVE,
+            "the default build admits under the framework ceiling less the reserve"
+        );
+        assert!(
+            admission.bytes <= admission.limit,
+            "admitted {} bytes over a {} byte limit",
+            admission.bytes,
+            admission.limit
+        );
+        assert!(
+            !admission.over_budget,
+            "the required tools fit the default ceiling"
+        );
+
+        let withheld: std::collections::BTreeSet<&str> = admission
+            .withheld
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        let all_tools = built.agent.all_tools();
+        let registered: std::collections::BTreeSet<&str> =
+            all_tools.iter().map(|tool| tool.name.as_str()).collect();
+        for (tool, _) in agent::prompts::TOOL_GUIDANCE
+            .iter()
+            .chain(crate::prompts::TOOL_GUIDANCE.iter())
+        {
+            if registered.contains(tool) {
+                assert!(
+                    !withheld.contains(tool),
+                    "the prompt names {tool}, so the request must carry it"
+                );
+            }
+        }
+    }
+
+    /// An EMPTY persona is "the framework's default", not "no persona": a
+    /// workspace that never typed a prompt (and a preset that publishes none)
+    /// still sends the agentic default, while a typed prompt and a preset
+    /// persona both win over it.
+    #[test]
+    fn an_empty_persona_inherits_the_framework_default() {
+        let mut settings = bare();
+        settings.global.default_preset = String::new();
+        assert!(
+            settings.workspace.agent.system_prompt.trim().is_empty(),
+            "the premise: the workspace ships no prompt"
+        );
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .starts_with(agent::DEFAULT_SYSTEM_PROMPT),
+            "the shipped default persona reaches the request"
+        );
+
+        // A typed workspace prompt fills the persona slot.
+        settings.workspace.agent.system_prompt = "workspace persona".to_string();
+        let built = build(&settings);
+        let prompt = &built.agent.config().system_prompt;
+        assert!(
+            prompt.starts_with(agent::HARNESS_IDENTITY),
+            "the harness identity still opens the prompt"
+        );
+        let identity = prompt.find(agent::HARNESS_IDENTITY).expect("identity");
+        let persona = prompt.find("workspace persona").expect("the typed persona");
+        let workflow = prompt
+            .find(agent::WORKFLOW_GUIDANCE)
+            .expect("the workflow guidance");
+        assert!(
+            identity < persona && persona < workflow,
+            "identity, then the persona slot, then the workflow guidance"
+        );
+
+        // A preset's own persona wins over BOTH.
+        settings.workspace.agent.system_prompt = String::new();
+        settings.global.default_preset = "federation".to_string();
+        let built = build(&settings);
+        assert_ne!(
+            built.agent.config().system_prompt,
+            agent::DEFAULT_SYSTEM_PROMPT,
+            "the preset persona is not the default"
+        );
+        let prompt = &built.agent.config().system_prompt;
+        assert!(
+            prompt.contains(crate::prompts::FEDERATION_PERSONA),
+            "and it is the preset's own persona, in the persona slot"
+        );
+        assert!(
+            prompt.find(agent::HARNESS_IDENTITY) < prompt.find(crate::prompts::FEDERATION_PERSONA),
+            "the persona slot follows the identity"
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(agent::WORKFLOW_GUIDANCE),
+            "the preset does not replace the standing workflow guidance"
+        );
+    }
+
+    /// The reference's `complete: true` arm over a real build: the persona is
+    /// the whole persona text and the identity/workflow/tool sections are gone,
+    /// while the compact harness execution footer remains and the tool registry
+    /// is untouched. Off stays the slot composition.
+    #[test]
+    fn a_complete_persona_replaces_the_layers_and_keeps_the_footer() {
+        let mut settings = bare();
+        settings.global.default_preset = String::new();
+        settings.workspace.agent.system_prompt =
+            "You are a helpful software engineer assistant.".to_string();
+        settings.workspace.agent.complete = true;
+        let built = build(&settings);
+        let prompt = &built.agent.config().system_prompt;
+        assert!(
+            prompt.starts_with("You are a helpful software engineer assistant."),
+            "the persona is the text: {prompt}"
+        );
+        assert!(
+            prompt.ends_with(crate::prompts::COMPLETE_PERSONA_CONTRACT),
+            "the harness execution footer remains"
+        );
+        assert!(
+            prompt.contains(crate::prompts::HARNESS_CONTEXT),
+            "the host-owned runtime contract survives complete mode (issue #332)"
+        );
+        assert!(
+            !prompt.contains(agent::HARNESS_IDENTITY),
+            "the identity layer is omitted"
+        );
+        assert!(
+            !prompt.contains(agent::WORKFLOW_GUIDANCE),
+            "the standing workflow is omitted"
+        );
+        assert!(
+            !prompt.contains(crate::prompts::READ_FILE),
+            "the per-tool guidance is omitted"
+        );
+        assert!(
+            built.agent.config().persona_complete && built.persona_complete,
+            "the mode is applied and reported"
+        );
+        // complete is a PROMPT fact, not a tool gate.
+        let names = tool_names(&built);
+        assert!(names.iter().any(|name| name == "bash"), "{names:?}");
+        assert!(names.iter().any(|name| name == "read_file"), "{names:?}");
+        // The stale-tool guard still runs over the complete prompt.
+        assert_eq!(
+            crate::prompts::stale_tool_reference(&built.agent.config().system_prompt),
+            None
+        );
+
+        // A complete PRESET persona wins over the workspace prompt, and it
+        // suppresses the guidance of every tool the build carries.
+        settings.global.presets.insert(
+            "minimal".to_string(),
+            Preset {
+                system_prompt: Some("You are terse.".to_string()),
+                complete: true,
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "minimal".to_string();
+        let built = build(&settings);
+        let prompt = &built.agent.config().system_prompt;
+        assert!(
+            prompt.starts_with("You are terse."),
+            "the preset persona is the text: {prompt}"
+        );
+        assert!(
+            prompt.ends_with(crate::prompts::COMPLETE_PERSONA_CONTRACT),
+            "the footer applies to a preset's complete persona too"
+        );
+        assert!(!prompt.contains(agent::HARNESS_IDENTITY));
+        assert!(!prompt.contains(agent::WORKFLOW_GUIDANCE));
+        assert!(
+            built.agent.config().persona_complete && built.persona_complete,
+            "a preset can request the mode too"
+        );
+
+        // The default stays the slot: identity < persona < workflow, and tool
+        // guidance still follows registration.
+        settings.workspace.agent.complete = false;
+        settings.global.default_preset = String::new();
+        settings.workspace.agent.system_prompt = "workspace persona".to_string();
+        let built = build(&settings);
+        let prompt = &built.agent.config().system_prompt;
+        assert!(prompt.starts_with(agent::HARNESS_IDENTITY));
+        assert!(prompt.contains("workspace persona"));
+        assert!(prompt.contains(agent::WORKFLOW_GUIDANCE));
+        assert!(
+            prompt.find("workspace persona") < prompt.find(agent::WORKFLOW_GUIDANCE),
+            "identity < persona < workflow"
+        );
+        assert!(prompt.contains(crate::prompts::READ_FILE));
+        assert!(!built.agent.config().persona_complete);
+
+        // A complete persona that names a tool BSH does not register is still
+        // caught by the guard; complete changes what is sent, not what may be
+        // said.
+        settings.workspace.agent.complete = true;
+        settings.workspace.agent.system_prompt = "Use the read tool.".to_string();
+        let built = build(&settings);
+        assert_eq!(
+            crate::prompts::stale_tool_reference(&built.agent.config().system_prompt),
+            Some("the read tool")
+        );
+
+        // An EMPTY persona under complete falls back to the framework default
+        // composition, never an empty system prompt, and it is an ordinary
+        // build again: tool guidance follows registration.
+        settings.workspace.agent.system_prompt = "   ".to_string();
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .starts_with(agent::DEFAULT_SYSTEM_PROMPT),
+            "{}",
+            built.agent.config().system_prompt
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(crate::prompts::READ_FILE),
+            "the fallback build keeps its guidance"
+        );
+        assert!(!built.agent.config().persona_complete);
+    }
+
+    /// The complete flag the build carries follows the persona's OWNER.
+    ///
+    /// A preset that ships a persona owns the flag: a preset saying
+    /// `complete = false` keeps the slot composition even when the workspace
+    /// flag is on, because that flag describes a different prompt. A preset
+    /// that ships no persona - or a blank one - leaves the workspace persona
+    /// and its own flag in force.
+    #[test]
+    fn the_complete_flag_follows_the_persona_owner() {
+        use crate::settings::global::Preset;
+
+        let mut settings = bare();
+        settings.workspace.agent.system_prompt = "workspace persona".to_string();
+        settings.workspace.agent.complete = true;
+        settings.global.default_preset = String::new();
+        let built = build(&settings);
+        assert!(
+            built.agent.config().persona_complete,
+            "the workspace owns the persona here"
+        );
+        assert!(built
+            .agent
+            .config()
+            .system_prompt
+            .starts_with("workspace persona"));
+
+        settings.global.presets.insert(
+            "slot".to_string(),
+            Preset {
+                system_prompt: Some("preset persona.".to_string()),
+                complete: false,
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "slot".to_string();
+        let built = build(&settings);
+        assert!(
+            !built.agent.config().persona_complete,
+            "the preset owns the flag, and it says off"
+        );
+        assert!(built
+            .agent
+            .config()
+            .system_prompt
+            .contains(agent::HARNESS_IDENTITY));
+
+        // The same preset with no persona: the workspace arm is back.
+        settings
+            .global
+            .presets
+            .get_mut("slot")
+            .expect("the preset")
+            .system_prompt = None;
+        let built = build(&settings);
+        assert!(built.agent.config().persona_complete);
+        assert!(built
+            .agent
+            .config()
+            .system_prompt
+            .starts_with("workspace persona"));
+
+        // A BLANK preset persona is no persona: it must not blank the
+        // workspace prompt or steal the flag.
+        settings
+            .global
+            .presets
+            .get_mut("slot")
+            .expect("the preset")
+            .system_prompt = Some("   ".to_string());
+        let built = build(&settings);
+        assert!(built.agent.config().persona_complete);
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .starts_with("workspace persona"),
+            "a blank preset persona leaves the workspace prompt alone: {}",
+            built.agent.config().system_prompt
+        );
+    }
+
+    /// The prompt and the request carry the same tool set: every guidance
+    /// section is present exactly when its tool is registered. A preset that
+    /// removes the shell takes the bash rule with it, and the reverse cannot
+    /// happen either.
+    #[test]
+    fn the_prompt_names_a_tool_only_when_the_build_carries_it() {
+        let cases: Vec<(&str, BuiltAgent)> = vec![
+            ("default", build(&bare())),
+            ("no-shell", {
+                let mut settings = bare();
+                settings.workspace.agent.bash_enabled = false;
+                build(&settings)
+            }),
+            ("read-only", {
+                let mut settings = bare();
+                settings.workspace.agent.permission = READ_ONLY.to_string();
+                build(&settings)
+            }),
+        ];
+        for (label, built) in cases {
+            let names = built
+                .agent
+                .registry()
+                .map(|registry| registry.list())
+                .unwrap_or_default();
+            let prompt = &built.agent.config().system_prompt;
+            assert!(
+                prompt.starts_with(agent::HARNESS_IDENTITY),
+                "{label}: the prompt opens with the harness identity"
+            );
+            assert!(
+                prompt.contains(agent::WORKFLOW_GUIDANCE),
+                "{label}: the workflow guidance is always present"
+            );
+            for (tool, text) in agent::prompts::TOOL_GUIDANCE
+                .iter()
+                .chain(crate::prompts::TOOL_GUIDANCE.iter())
+            {
+                assert_eq!(
+                    prompt.contains(text),
+                    names.iter().any(|name| name == tool),
+                    "{label}: guidance for {tool} follows registration"
+                );
+            }
+        }
+
+        // The negative half is explicit, so a prompt that always carries the
+        // shell rule cannot pass by accident.
+        let mut no_shell = bare();
+        no_shell.workspace.agent.bash_enabled = false;
+        let built = build(&no_shell);
+        assert!(
+            !built
+                .agent
+                .config()
+                .system_prompt
+                .contains(agent::prompts::TOOL_BASH),
+            "no bash tool, no bash rule"
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(crate::prompts::READ_FILE),
+            "the file rule stays"
+        );
+    }
+
+    /// The shipped personas are the pinned constants, and their bullets survive
+    /// an edit: a deleted line is a changed persona, not a cosmetic diff.
+    #[test]
+    fn the_shipped_personas_are_pinned_and_keep_their_bullets() {
+        let roster: [(&str, &str, &[&str]); 3] = [
+            (
+                "federation",
+                crate::prompts::FEDERATION_PERSONA,
+                &[
+                    "Plan the batches first",
+                    "Never serialize what can be batched",
+                    "Let the tools do the work",
+                    "Hold the same engineering discipline",
+                ],
+            ),
+            (
+                "creator",
+                crate::prompts::CREATOR_PERSONA,
+                &[
+                    "Read before writing",
+                    "Ship the smallest package",
+                    "Follow the shipped formats exactly",
+                    "Keep every change reversible",
+                    "Prove it loads",
+                ],
+            ),
+            (
+                "read-only",
+                crate::prompts::READ_ONLY_PERSONA,
+                &[
+                    "Ground every claim in something you read",
+                    "Search the web when the workspace cannot answer",
+                    "Verify by reading more",
+                    "End concrete",
+                ],
+            ),
+        ];
+        for (id, persona, bullets) in roster {
+            let preset = crate::settings::global::built_in_preset(id).expect("a shipped preset");
+            let composed = crate::prompts::preset_persona(persona);
+            assert_eq!(
+                preset.system_prompt.as_deref(),
+                Some(composed.as_str()),
+                "{id} uses the pinned persona with the action-first stance"
+            );
+            assert!(
+                composed.ends_with(crate::prompts::ACTION_FIRST_PERSONA),
+                "{id} ends with the work-first clause"
+            );
+            for bullet in bullets {
+                assert!(persona.contains(bullet), "{id} keeps: {bullet}");
+            }
+        }
+    }
+
+    /// Standard and Federation ALLOW NETWORK AND WEB SEARCH BY DEFAULT. Proved through
+    /// the build and a REAL shell, on a fresh workspace with NO `.bsh/egress-allowlist`:
+    /// the command reaches a local endpoint, the result reports
+    /// `network: "unrestricted"`, and the derived spec is the unrestricted state
+    /// rather than an empty-list deny.
+    #[test]
+    fn standard_and_federation_allow_network_and_search_by_default() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let root = scratch("preset-default-network");
+        // NO allowlist file: this is the fresh-workspace state, which the
+        // tri-state reads as UNRESTRICTED.
+        assert!(
+            !egress_allowlist_path(&root).exists(),
+            "the premise: a fresh workspace has no allowlist file"
+        );
+        for id in ["standard", "federation"] {
+            let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+            let port = listener.local_addr().expect("its port").port();
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            serve_http(listener, std::sync::Arc::clone(&hits));
+
+            let mut settings = rooted(&root);
+            settings.global.default_preset = id.to_string();
+            // The workspace switch ON, which is its shipped default: the preset
+            // must not be the thing that withdraws search.
+            settings.workspace.agent.web_tools_enabled = true;
+            let built = build(&settings);
+            assert!(
+                tool_names(&built).iter().any(|name| name == "web_search"),
+                "{id} offers web search by default"
+            );
+            // Network reach: no `egress` field, so the preset inherits the
+            // workspace, and the absent file leaves that reach unrestricted.
+            assert!(
+                !built.policy.data().preset_egress_restricted,
+                "{id} narrows nothing"
+            );
+            assert!(
+                built.policy.data().egress_unrestricted,
+                "{id} builds against the absent-file state"
+            );
+            let spec = agent::sandbox::SandboxSpec::for_policy(
+                &built.policy,
+                WORKSPACE_WRITE,
+                agent::sandbox::Principal::new("bash", "session", id),
+            );
+            assert_eq!(
+                spec.egress(),
+                &agent::sandbox::Egress::Unrestricted,
+                "{id} must not derive an empty-list deny"
+            );
+            assert!(spec.egress().is_allowed() && !spec.egress().is_deny_all());
+            assert!(
+                spec.egress().entries().is_empty(),
+                "{id} needs no allowlist entry to reach the network"
+            );
+
+            let bash = built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .expect("bash");
+            let result = bash
+                .run(&serde_json::json!({
+                    "command": format!("curl -sS --max-time 3 http://{host}:{port}/")
+                }))
+                .expect("the command runs");
+            assert_eq!(
+                result["network"],
+                serde_json::json!("unrestricted"),
+                "{id} reports the absent-file state: {result}"
+            );
+            assert!(
+                result["success"].as_bool().unwrap_or(false),
+                "{id} could not reach the network out of the box: {result}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "{id}: the allowed endpoint was reached exactly once"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A Standard/Federation turn on a fresh workspace (NO allowlist file) reaches an
+    /// HTTP endpoint THROUGH heel's proxy: the listener counts the request, the
+    /// response comes back, and the result reports the absent-file state,
+    /// `unrestricted`.
+    ///
+    /// The command first proves the proxy environment exists, so a success
+    /// cannot be a direct connection that happened to be allowed: only
+    /// localhost:<proxy port> is granted, and `curl` uses the proxy it is
+    /// handed.
+    #[test]
+    fn standard_and_federation_reach_http_through_the_heel_proxy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the proxy probe needs one");
+            return;
+        };
+        for id in ["standard", "federation"] {
+            let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+            let port = listener.local_addr().expect("its port").port();
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            serve_http(listener, std::sync::Arc::clone(&hits));
+
+            let root = scratch(&format!("proxy-http-{id}"));
+            assert!(
+                !egress_allowlist_path(&root).exists(),
+                "{id}: the premise is the ABSENT allowlist file"
+            );
+            let mut settings = rooted(&root);
+            settings.global.default_preset = id.to_string();
+            let built = build(&settings);
+            assert!(
+                built.policy.data().egress_unrestricted,
+                "{id}: the absent file must derive UNRESTRICTED egress"
+            );
+            let bash = built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .expect("bash");
+            // NO_PROXY is cleared so the inherited environment cannot make curl
+            // bypass the proxy: the only path out is heel's.
+            let command = format!(
+                "[ -n \"$HTTP_PROXY\" ] || {{ printf 'no proxy'; exit 97; }}\n\
+                 NO_PROXY=; no_proxy=; curl -sS --max-time 5 http://{host}:{port}/"
+            );
+            let result = bash
+                .run(&serde_json::json!({ "command": command }))
+                .expect("the command runs");
+            assert_eq!(
+                result["network"],
+                serde_json::json!("unrestricted"),
+                "{id} reports the absent-file state: {result}"
+            );
+            assert!(
+                result["success"].as_bool().unwrap_or(false),
+                "{id} could not reach the endpoint through the proxy: {result}"
+            );
+            assert_eq!(
+                result["stdout"].as_str().unwrap_or_default().trim(),
+                "ok",
+                "{id}: the proxy did not return the listener's body: {result}"
+            );
+            assert!(
+                hits.load(Ordering::SeqCst) >= 1,
+                "{id}: the listener was never reached: {result}"
+            );
+            eprintln!("{id}: HTTP listener hits = {}", hits.load(Ordering::SeqCst));
+            assert!(
+                !egress_allowlist_path(&root).exists(),
+                "{id}: the probe created an allowlist file, changing the state it proves"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A TCP connection to a NON-LISTED, non-host-local endpoint succeeds
+    /// through the proxy's CONNECT tunnel: the destination is not on any
+    /// allowlist (there is no file at all) and is not host-local (heel's proxy
+    /// refuses those), yet bytes round-trip and the result still reports
+    /// `unrestricted`.
+    ///
+    /// This is the TCP path that DOES work. It is a tunnel established by the
+    /// sandbox proxy, not a direct socket: the ICMP test beside it pins that a
+    /// direct socket has no path.
+    #[test]
+    fn standard_and_federation_reach_a_non_listed_tcp_endpoint_through_the_connect_tunnel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the tunnel probe needs one");
+            return;
+        };
+        for id in ["standard", "federation"] {
+            let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+            let port = listener.local_addr().expect("its port").port();
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            serve_http(listener, std::sync::Arc::clone(&hits));
+
+            let root = scratch(&format!("proxy-tcp-{id}"));
+            assert!(
+                !egress_allowlist_path(&root).exists(),
+                "{id}: the premise is the ABSENT allowlist file"
+            );
+            let mut settings = rooted(&root);
+            settings.global.default_preset = id.to_string();
+            let built = build(&settings);
+            let bash = built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .expect("bash");
+            // `-X connect` is the proxy CONNECT method: nc opens a TCP tunnel to
+            // the destination the proxy has never been asked about at the
+            // command tier, and the raw request travels inside it.
+            let command = format!(
+                "P=$(printf '%s' \"$HTTP_PROXY\" | cut -d/ -f3); [ -n \"$P\" ] || {{ printf 'no proxy'; exit 97; }}\n\
+                 printf 'GET / HTTP/1.0\\r\\n\\r\\n' | nc -X connect -x \"$P\" -w 5 {host} {port}"
+            );
+            let result = bash
+                .run(&serde_json::json!({ "command": command }))
+                .expect("the command runs");
+            assert_eq!(
+                result["network"],
+                serde_json::json!("unrestricted"),
+                "{id} reports the absent-file state: {result}"
+            );
+            assert!(
+                hits.load(Ordering::SeqCst) >= 1,
+                "{id}: no TCP connection reached the non-listed endpoint: {result}"
+            );
+            eprintln!(
+                "{id}: TCP tunnel listener hits = {}",
+                hits.load(Ordering::SeqCst)
+            );
+            assert!(
+                result["stdout"].as_str().unwrap_or_default().contains("ok"),
+                "{id}: the tunnel did not carry the response back: {result}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// ICMP has NO proxied path in this sandbox even when the policy allows the
+    /// network: the profile denies every direct socket and grants only the
+    /// localhost proxy, so the send is refused while `network` honestly says
+    /// `unrestricted`. A released full-access shell does not change that: the
+    /// proxy is the one way out, and it speaks TCP, not ICMP.
+    ///
+    /// The probe bounds ITSELF with an overall deadline (`-t` on macOS, `-w`
+    /// elsewhere) on top of the per-packet wait, and a watchdog turns any
+    /// residual hang into a named failure in seconds. A packet COUNT is not a
+    /// deadline: on this host (macOS 26, 2026-10-24) a `ping -c 1` probe was
+    /// observed still alive minutes into a full-suite run, while the `-t 2`
+    /// form returns in about two seconds. The bash tool's own default bound is
+    /// 300 s, far too long for this test to wait on.
+    ///
+    /// MEASURED OUTCOME ON THIS HOST: the kernel EPERM branch. The probe exits
+    /// 2 after about 2 s with "ping: sendto: Operation not permitted" on
+    /// stderr, so the result carries
+    /// network_diagnostic = unproxied-direct-socket. The other branch - a send
+    /// that is allowed out but gets no reply - is accepted too, but then the
+    /// result must NOT claim a kernel refusal.
+    ///
+    /// This is the KNOWN LIMITATION, pinned on purpose. If this test starts
+    /// receiving replies (success), heel grew a pass-through network mode:
+    /// delete this limitation, update `docs/bsh-tool-policy.md`, and stop
+    /// showing the unproxied-socket diagnostic.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn standard_and_federation_deny_icmp_even_when_egress_is_unrestricted() {
+        for id in ["standard", "federation"] {
+            let root = scratch(&format!("icmp-{id}"));
+            assert!(
+                !egress_allowlist_path(&root).exists(),
+                "{id}: the premise is the ABSENT allowlist file"
+            );
+            let mut settings = rooted(&root);
+            settings.global.default_preset = id.to_string();
+            let built = build(&settings);
+            let bash = built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .expect("bash");
+            // macOS: -W is the per-packet reply wait in MILLISECONDS and -t is
+            // the overall deadline in seconds. Elsewhere: -W and -w are both
+            // seconds. The command returns in about two seconds either way,
+            // instead of parking the turn on the tool's 300 s default.
+            let ping = if cfg!(target_os = "macos") {
+                "ping -c 1 -W 1000 -t 2 1.1.1.1"
+            } else {
+                "ping -c 1 -W 1 -w 2 1.1.1.1"
+            };
+            // The configured bound is 300 s, so this test must never wait on
+            // it: the call runs on its own thread and a watchdog fails it by
+            // name. That makes "the probe is bounded" an assertion rather than
+            // a hope about this host's ping.
+            let probe = std::sync::Arc::clone(&bash);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let started = std::time::Instant::now();
+            std::thread::spawn(move || {
+                let _ = sender.send(probe.run(&serde_json::json!({ "command": ping })));
+            });
+            let result = match receiver.recv_timeout(std::time::Duration::from_secs(20)) {
+                Ok(result) => result.expect("the command runs and reports its own failure"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "{id}: the bounded ICMP probe HUNG past 20 s - the command needs its own deadline"
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("{id}: the probe thread died without a result")
+                }
+            };
+            let elapsed = started.elapsed();
+            eprintln!("{id}: ICMP probe returned in {elapsed:?}: {result}");
+            assert_eq!(
+                result["sandbox"],
+                serde_json::json!("heel"),
+                "{id}: the probe must run under the sandbox"
+            );
+            assert_eq!(
+                result["network"],
+                serde_json::json!("unrestricted"),
+                "{id}: the policy did allow the network: {result}"
+            );
+            if result["success"].as_bool().unwrap_or(false) {
+                panic!(
+                    "{id}: ping SUCCEEDED - heel now has a pass-through network path. \
+                     This known limitation is over: update docs/bsh-tool-policy.md and \
+                     the unproxied-socket diagnostic, then delete this test. {result}"
+                );
+            }
+            let text = format!(
+                "{}{}",
+                result["stdout"].as_str().unwrap_or_default(),
+                result["stderr"].as_str().unwrap_or_default()
+            )
+            .to_ascii_lowercase();
+            // Two honest outcomes, ONE invariant: ICMP never travels through
+            // the proxy. A refused send says so with the kernel's own errno and
+            // must carry the diagnostic; a send that was merely allowed out
+            // gets no reply, and must not claim a kernel refusal it never saw.
+            let kernel_refusal = text.contains("operation not permitted")
+                || text.contains("permission denied")
+                || text.contains("eperm")
+                || text.contains("eacces");
+            if kernel_refusal {
+                assert_eq!(
+                    result["network_diagnostic"],
+                    serde_json::json!(agent::tools::bash::UNPROXIED_DIRECT_SOCKET),
+                    "{id}: the kernel refusal is not explained in the result: {result}"
+                );
+            } else {
+                assert!(
+                    text.contains("packet loss") || text.contains("timeout"),
+                    "{id}: neither a kernel refusal nor a no-reply exit: {result}"
+                );
+                assert_eq!(
+                    result["network_diagnostic"],
+                    serde_json::Value::Null,
+                    "{id}: a no-reply exit must not claim a kernel refusal: {result}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Standard STATES its own grant, but a declaration cannot overrule the
+    /// reader: with the workspace switch off, the tool is gone even though
+    /// Standard declares `web_search = true`; with the switch on, it is offered.
+    #[test]
+    fn the_standard_preset_states_its_own_search_grant() {
+        let root = scratch("preset-standard-search");
+        let mut settings = rooted(&root);
+        settings.global.default_preset = "standard".to_string();
+        settings.workspace.agent.web_tools_enabled = false;
+        let built = build(&settings);
+        assert!(
+            !tool_names(&built).iter().any(|name| name == "web_search"),
+            "Standard's grant cannot re-offer the tool the reader switched off"
+        );
+
+        settings.workspace.agent.web_tools_enabled = true;
+        let built = build(&settings);
+        assert!(
+            tool_names(&built).iter().any(|name| name == "web_search"),
+            "and with the switch on, Standard's stated grant is what offers it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A session's chosen provider is the endpoint the agent is built against,
+    /// so what the model menu lists really reaches the agent.
+    #[test]
+    fn a_sessions_provider_is_the_endpoint() {
+        let mut settings = bare();
+        settings.global.add_provider(
+            "work",
+            "Work",
+            "https://work.example",
+            &[ModelEntry::named("work-model")],
+        );
+        let built = build_for(&settings, &work_choice());
+        let config = built.agent.config();
+        // The wire form is the prefix the engine registers a vendor on.
+        assert_eq!(config.model, "work/work-model");
+        assert_eq!(config.base_url, "https://work.example");
+    }
+
+    /// The session's pair is the only source of a model at the caps seam.
+    ///
+    /// This is the same resolution the composer chip, the menu's checked row and
+    /// the send gate read, so the model a reader picks in a chat is the model
+    /// that chat's next turn is built against - and a chat with no choice is
+    /// built with no model rather than someone else's.
+    #[test]
+    fn a_sessions_choice_is_the_only_model_source() {
+        let mut settings = bare();
+        settings.global.add_provider(
+            "p",
+            "P",
+            "https://p.example",
+            &[ModelEntry::named("session-model")],
+        );
+        assert_eq!(
+            build(&settings).agent.config().model,
+            "",
+            "a session that names no model is built with no model"
+        );
+
+        let choice = SessionChoice {
+            model: Some(crate::settings::global::ModelRef {
+                provider: "p".to_string(),
+                model: "session-model".to_string(),
+            }),
+            preset: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_for(&settings, &choice).agent.config().model,
+            "p/session-model",
+            "the session's own pair is the endpoint the next turn runs on"
+        );
+    }
+
+    /// A connected MCP server's tools reach the agent, namespaced by server.
+    ///
+    /// This is the seam that makes the settings pane real: the same build a turn
+    /// runs registers what the pool connected.
+    #[test]
+    fn a_connected_mcp_server_reaches_the_agent() {
+        use react::tool::registry::AsyncTool;
+        use std::sync::Arc;
+        let echo: Arc<dyn AsyncTool> = Arc::new(agent::tools::AsyncFunctionTool::from_fn(
+            "github_search",
+            "Search GitHub",
+            serde_json::json!({ "type": "object", "properties": {} }),
+            |_args| async move { Ok(serde_json::json!({"ok": true})) },
+        ));
+        let pool = crate::mcp::McpPool::with_tools(vec![crate::mcp::McpTool {
+            namespace: "github".to_string(),
+            name: "search".to_string(),
+            adapter: echo,
+        }]);
+        let built = build_agent(
+            &bare(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &pool,
+        );
+        let names = built
+            .agent
+            .registry()
+            .map(|registry| registry.async_tool_names())
+            .unwrap_or_default();
+        assert!(
+            names.contains(&"github_search".to_string()),
+            "the server's tool is registered: {names:?}"
+        );
+        // And it is callable through the same registry the engine dispatches
+        // on, not merely listed.
+        let value = built
+            .agent
+            .registry()
+            .expect("the build has a registry")
+            .execute("github_search", &serde_json::json!({}))
+            .expect("the MCP-backed tool runs");
+        assert_eq!(value["ok"], serde_json::json!(true));
+        // And the Tools pane can describe it, which only works when the
+        // capability projection reads the async map too.
+        let caps = crate::caps::capabilities(&built.agent);
+        assert!(
+            caps.iter()
+                .any(|cap| cap.name == "github_search" && !cap.description.is_empty()),
+            "the MCP tool is listed with its description: {caps:?}"
+        );
+    }
+
+    /// The agent-loop switch reaches the agent config, not just the file.
+    #[test]
+    fn the_parallel_switch_reaches_the_agent_config() {
+        // The shipped default is ON (a batch the prompt asks for should run
+        // concurrently), so "off" has to be stated to test the off arm.
+        let mut off = bare();
+        off.workspace.agent.parallel_tool_calls = false;
+        assert!(!build(&off).agent.config().parallel_tool_calls);
+        let mut on = bare();
+        on.workspace.agent.parallel_tool_calls = true;
+        assert!(build(&on).agent.config().parallel_tool_calls);
+    }
+
+    /// The API protocol the user picks reaches the agent config, not just the
+    /// file - which is what makes the models pane row a control rather than a
+    /// label.
+    #[test]
+    fn the_api_protocol_reaches_the_agent_config() {
+        let mut settings = bare();
+        settings
+            .global
+            .add_provider("p", "", "https://p.example", &[ModelEntry::named("m")]);
+        let choice = SessionChoice {
+            model: Some(crate::settings::global::ModelRef {
+                provider: "p".to_string(),
+                model: "m".to_string(),
+            }),
+            preset: None,
+            ..Default::default()
+        };
+        settings.global.set_family_protocol("p", "responses");
+        assert_eq!(
+            build_for(&settings, &choice).agent.config().api_mode,
+            "responses"
+        );
+        settings.global.set_family_protocol("p", "chat");
+        assert_eq!(
+            build_for(&settings, &choice).agent.config().api_mode,
+            "chat"
+        );
+    }
+
+    /// The Max output tokens row reaches the agent config. Two explicit values
+    /// are paired so the assertion cannot be satisfied by a default the BOS
+    /// config happens to carry for this model; an empty field clears the cap,
+    /// which leaves the provider own default in charge.
+    #[test]
+    fn the_output_cap_reaches_the_agent_config() {
+        let mut capped = bare();
+        capped.workspace.agent.max_tokens = Some(4096);
+        assert_eq!(build(&capped).agent.config().max_tokens, Some(4096));
+        let mut smaller = bare();
+        smaller.workspace.agent.max_tokens = Some(2048);
+        assert_eq!(build(&smaller).agent.config().max_tokens, Some(2048));
+    }
+
+    /// A selected preset narrows the tools the agent is built with, so the
+    /// agent-presets pane changes the agent rather than a label.
+    #[test]
+    fn a_preset_narrows_the_tools() {
+        let mut narrow = bare();
+        narrow.global.presets.insert(
+            "shell-only".to_string(),
+            Preset {
+                name: Some("shell-only".to_string()),
+                plugins: vec!["shell".to_string()],
+                description: None,
+                order: None,
+                policy: None,
+                trusted: false,
+                ..Default::default()
+            },
+        );
+        narrow.global.default_preset = "shell-only".to_string();
+        let built = build(&narrow);
+        assert_eq!(
+            built.agent.config().max_steps,
+            0,
+            "the loop has no step ceiling: the model decides when the turn ends"
+        );
+        let mut carrying: Vec<String> = built
+            .plugins
+            .iter()
+            .filter(|plugin| !plugin.tools.is_empty())
+            .map(|plugin| plugin.name.clone())
+            .collect();
+        carrying.sort();
+        assert_eq!(
+            carrying,
+            vec![
+                "com.bos.bsh.diagnostics".to_string(),
+                "com.bos.bsh.extensions".to_string(),
+                "com.bos.bsh.memory-tools".to_string(),
+                "shell".to_string()
+            ],
+            "the preset allows bash and the enabled built-in extensions, so every other bundle keeps no tool"
+        );
+        let shell = built
+            .plugins
+            .iter()
+            .find(|plugin| plugin.name == "shell")
+            .expect("the shell bundle");
+        assert!(shell.tools.iter().any(|tool| tool == "bash"));
+    }
+
+    /// The registry is the source of the agent tools, and a disabled tool is
+    /// filtered out before its bundle is installed.
+    #[test]
+    fn plugins_carry_the_filtered_tools() {
+        let mut settings = bare();
+        settings.workspace.disabled.tools = vec!["read_file".to_string()];
+        let built = build(&settings);
+        let names = |plugin: &str| {
+            let mut tools = built
+                .plugins
+                .iter()
+                .find(|p| p.name == plugin)
+                .map(|p| p.tools.clone())
+                .unwrap_or_default();
+            tools.sort();
+            tools
+        };
+        assert_eq!(
+            names("shell"),
+            vec![
+                "bash".to_string(),
+                "job_kill".to_string(),
+                "job_list".to_string(),
+                "job_output".to_string(),
+            ]
+        );
+        assert_eq!(
+            names("files"),
+            vec![
+                "apply_patch".to_string(),
+                "edit_file".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
+                "list_dir".to_string(),
+                "read_files".to_string(),
+                "sed".to_string(),
+                "write_file".to_string(),
+            ]
+        );
+        assert_eq!(
+            names("plan"),
+            vec!["ask_user".to_string(), "update_plan".to_string()]
+        );
+        // The reader's own switch removes the question tool like any other.
+        settings
+            .workspace
+            .disabled
+            .tools
+            .push("ask_user".to_string());
+        let built = build(&settings);
+        let plan: Vec<String> = built
+            .plugins
+            .iter()
+            .find(|p| p.name == "plan")
+            .map(|p| p.tools.clone())
+            .unwrap_or_default();
+        assert_eq!(plan, vec!["update_plan".to_string()]);
+        assert_eq!(
+            built.agent.config().max_steps,
+            0,
+            "a turn is bounded by the model, not by a number"
+        );
+    }
+
+    /// A disabled plugin contributes nothing, and the inventory still lists it
+    /// so the pane can switch it back on. Paired with the enabled case, so the
+    /// filter cannot pass by dropping every tool.
+    #[test]
+    fn a_disabled_plugin_contributes_no_tools() {
+        let on = build(&bare());
+        assert!(on
+            .plugins
+            .iter()
+            .any(|plugin| plugin.enabled && plugin.tools.iter().any(|tool| tool == "bash")));
+
+        let mut off_tree = bare();
+        off_tree.workspace.disabled.extensions = vec!["shell".to_string()];
+        let off = build(&off_tree);
+        let shell = off
+            .plugins
+            .iter()
+            .find(|plugin| plugin.name == "shell")
+            .expect("shell is still listed");
+        assert!(!shell.enabled, "a disabled plugin reads as off");
+        assert!(
+            shell.tools.is_empty(),
+            "the registry must hold none of its tools, and caps adds exactly those"
+        );
+    }
+
+    /// A write through the real tool records an exact before/after changeset.
+    #[test]
+    fn write_file_records_an_exact_review_changeset() {
+        let root = scratch("review-write");
+        let policy =
+            std::sync::Arc::new(PolicySet::compile_baseline(PolicyData::new(root.clone())));
+        let runtime = crate::review::ReviewRuntime::new(&root, "session").expect("runtime");
+        let tool = write_file_tool(
+            Some(root.clone()),
+            true,
+            policy,
+            "session".to_string(),
+            "preset".to_string(),
+            Some(runtime.clone()),
+        );
+        tool.run(&serde_json::json!({
+            "path": "src/new.rs",
+            "content": "fn added() {}\n"
+        }))
+        .expect("the write succeeds");
+        let snapshot = runtime.seal().expect("a review snapshot");
+        assert_eq!(snapshot.changeset.changes.len(), 1);
+        assert_eq!(
+            snapshot.changeset.changes[0].kind,
+            crate::review::domain::ChangeKind::Created
+        );
+        assert!(snapshot.changeset.changes[0]
+            .revisions
+            .last()
+            .is_some_and(
+                |revision| revision.before == crate::review::domain::SnapshotState::Absent
+            ));
+    }
+
+    /// A scratch directory no other test shares.
+    /// Memory lifecycle states are distinguishable (issue #334): a missing file
+    /// opens empty, a malformed file is a surfaced init failure, and a valid
+    /// file is ready. A failure never silently disables the feature.
+    #[test]
+    fn memory_open_states_are_distinguishable() {
+        use crate::context_assembly::MemoryState;
+        let dir = scratch("memory-states");
+        let mut settings = bare();
+        settings.save_root = Some(dir.clone());
+
+        let choice = crate::settings::resolve::SessionChoice::default();
+        // Missing file -> ready but empty (NotFound is not a failure).
+        settings.workspace.agent.memory_path =
+            Some(dir.join("missing.jsonl").to_string_lossy().into_owned());
+        let opened = super::open_memory(&settings, &choice, "s1");
+        assert!(
+            opened.store.is_some(),
+            "a missing file opens an empty store"
+        );
+        assert_eq!(opened.state, MemoryState::Empty);
+
+        // Malformed file -> init failure, surfaced rather than silent.
+        let bad = dir.join("bad.jsonl");
+        std::fs::write(&bad, "this is not json").expect("write");
+        settings.workspace.agent.memory_path = Some(bad.to_string_lossy().into_owned());
+        let opened = super::open_memory(&settings, &choice, "s1");
+        assert!(opened.store.is_none(), "a malformed store is not attached");
+        assert!(
+            matches!(opened.state, MemoryState::InitFailed { .. }),
+            "the failure is surfaced: {:?}",
+            opened.state
+        );
+
+        // Valid file with an item -> ready.
+        let good = dir.join("good.jsonl");
+        std::fs::write(&good, r#"{"id":"1","content":"a note","created_at_ms":0}"#).expect("write");
+        settings.workspace.agent.memory_path = Some(good.to_string_lossy().into_owned());
+        let opened = super::open_memory(&settings, &choice, "s1");
+        assert!(opened.store.is_some());
+        assert_eq!(opened.state, MemoryState::Ready);
+        assert!(
+            opened.capture.is_some(),
+            "memory open attaches the capture coordinator"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bsh-caps-skill-tests")
+            .join(format!("{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        // `resolve_path` canonicalises the workspace root, so a test that hands
+        // it a path containing `../..` would compare two spellings of the same
+        // directory. Return the canonical spelling.
+        dir.canonicalize().unwrap_or(dir)
+    }
+
+    /// Write one skill directory the way the agent crate reads it.
+    fn write_skill(root: &std::path::Path, name: &str, description: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("the skill directory");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\nBody of {name}.\n"),
+        )
+        .expect("the skill manifest");
+    }
+
+    /// A settings tree whose only skill source is `root`, named `First`.
+    fn with_one_source(root: &std::path::Path) -> Settings {
+        let mut settings = bare();
+        settings
+            .global
+            .set_skill_sources(vec![crate::settings::global::SkillSource {
+                name: "First".to_string(),
+                path: root.to_string_lossy().to_string(),
+                enabled: true,
+            }]);
+        settings
+    }
+
+    /// The skill names the built agent carries, sorted.
+    fn skill_names(built: &BuiltAgent) -> Vec<String> {
+        let mut names: Vec<String> = built
+            .agent
+            .get_skills_content()
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A source the reader switched off takes its skills out of the AGENT, not
+    /// just out of the pane. Paired with the enabled case, so the filter cannot
+    /// pass by registering nothing at all.
+    #[test]
+    fn a_disabled_source_is_absent_from_the_built_agent() {
+        let root = scratch("source-off");
+        write_skill(&root, "alpha", "one");
+        write_skill(&root, "beta", "two");
+
+        let on = with_one_source(&root);
+        assert_eq!(
+            skill_names(&build(&on)),
+            vec!["alpha".to_string(), "beta".to_string()],
+            "the premise: an enabled source registers its skills"
+        );
+
+        let mut off = with_one_source(&root);
+        off.global.skill_sources[0].enabled = false;
+        assert!(
+            skill_names(&build(&off)).is_empty(),
+            "turning the source off must remove its skills from the agent itself"
+        );
+    }
+
+    /// A skill switched off on its own is absent from the agent while its
+    /// siblings stay, and it is still discoverable so the pane can list it.
+    ///
+    /// The assertion is on the agent's skill CONTENT, not only on its name
+    /// list: content is what reaches the model's prompt, so a gate that kept a
+    /// disabled name out of the map while leaking its instructions would pass a
+    /// name-only test. The sibling's body is asserted too, so a build that
+    /// registered nothing at all cannot read as a pass.
+    #[test]
+    fn a_disabled_skill_is_absent_from_the_built_agent() {
+        let root = scratch("skill-off");
+        write_skill(&root, "alpha", "one");
+        write_skill(&root, "beta", "two");
+
+        let mut settings = with_one_source(&root);
+        settings.workspace.disabled.skills = vec!["alpha".to_string()];
+
+        let built = build(&settings);
+        assert_eq!(
+            skill_names(&built),
+            vec!["beta".to_string()],
+            "the switched-off skill is gone and its sibling is not"
+        );
+        let content = built.agent.get_skills_content();
+        assert!(
+            content.iter().all(|(name, _)| *name != "alpha"),
+            "the disabled skill's content is absent from the agent: {content:?}"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|(name, body)| *name == "beta" && body.contains("Body of beta.")),
+            "the enabled sibling's instructions are present: {content:?}"
+        );
+        let eff = settings.effective();
+        assert!(
+            eff.skills
+                .iter()
+                .any(|skill| skill.name == "alpha" && !skill.enabled),
+            "the catalogue still carries it, so the pane can switch it back on"
+        );
+        assert_eq!(
+            eff.enabled_skills().count(),
+            1,
+            "and exactly one skill is buildable"
+        );
+    }
+
+    /// The preview build the settings pane triggers skips the scanned skills.
+    ///
+    /// The pane lists skills from the resolution it already holds, so a preview
+    /// that registered every manifest would buy nothing and cost the whole
+    /// click: measured on this machine's 121 skills, 2.2 s of the 2.3 s a
+    /// first Tools visit paid. The tools - the reason the preview exists at
+    /// all - are still built, so the row set cannot silently empty out.
+    #[test]
+    fn a_preview_build_skips_the_scanned_skills_and_keeps_the_tools() {
+        let root = scratch("preview-skills");
+        write_skill(&root, "alpha", "one");
+        let settings = with_one_source(&root);
+
+        assert_eq!(
+            skill_names(&build(&settings)),
+            vec!["alpha".to_string()],
+            "the premise: a turn's build registers the scanned skill"
+        );
+
+        let preview = super::preview_build(
+            &settings,
+            &Vault::disabled(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert!(
+            skill_names(&preview).is_empty(),
+            "the preview must not pay for the skill manifests"
+        );
+        let tools: Vec<String> = super::capabilities(&preview.agent)
+            .into_iter()
+            .filter(|cap| cap.category == "tool")
+            .map(|cap| cap.name)
+            .collect();
+        assert!(
+            tools.iter().any(|name| name == "read_file"),
+            "the preview still carries the tool roster: {tools:?}"
+        );
+    }
+
+    /// A source whose directory does not exist registers nothing rather than
+    /// failing the build: the pane must not be able to break a turn by existing.
+    #[test]
+    fn a_source_that_is_not_there_registers_nothing() {
+        let missing = scratch("source-missing").join("absent");
+        let settings = with_one_source(&missing);
+        assert!(
+            skill_names(&build(&settings)).is_empty(),
+            "a directory that is not there contributes no skills and no error"
+        );
+    }
+
+    /// Read Only is not a label: the side-effecting tools never reach the
+    /// request, so the registry is smaller than the confined build and holds
+    /// neither the shell nor the file writer.
+    #[test]
+    fn read_only_withholds_the_side_effecting_tools() {
+        let confined = bare();
+        let mut read_only = bare();
+        read_only.workspace.agent.permission = READ_ONLY.to_string();
+
+        let names = |settings: &Settings| {
+            let built = build(settings);
+            let mut names: Vec<String> = built
+                .plugins
+                .iter()
+                .flat_map(|plugin| plugin.tools.clone())
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            names(&confined),
+            vec![
+                "apply_patch".to_string(),
+                "ask_user".to_string(),
+                "bash".to_string(),
+                "close_surface".to_string(),
+                "diagnostics__graph".to_string(),
+                "diagnostics__why".to_string(),
+                "edit_file".to_string(),
+                "extensions__list".to_string(),
+                "federation_cancel".to_string(),
+                "federation_capabilities".to_string(),
+                "federation_cleanup".to_string(),
+                "federation_peers".to_string(),
+                "federation_query".to_string(),
+                "federation_status".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
+                "job_kill".to_string(),
+                "job_list".to_string(),
+                "job_output".to_string(),
+                "list_dir".to_string(),
+                "memory-tools__memory_forget".to_string(),
+                "memory-tools__memory_recall".to_string(),
+                "memory-tools__memory_remember".to_string(),
+                "patch_surface".to_string(),
+                "present_surface".to_string(),
+                "read_file".to_string(),
+                "read_files".to_string(),
+                "schedule_create".to_string(),
+                "schedule_delete".to_string(),
+                "schedule_edit".to_string(),
+                "schedule_list".to_string(),
+                "sed".to_string(),
+                "surface_catalogue".to_string(),
+                "update_plan".to_string(),
+                "write_file".to_string(),
+            ],
+            "Workspace Write carries the whole shell family, including the \
+             job tools its own read-write turn may start, the federation \
+             queries (Standard withholds distributed delegation), the \
+             automation-task tools and the surface family"
+        );
+        assert_eq!(
+            names(&read_only),
+            vec![
+                "ask_user".to_string(),
+                "diagnostics__graph".to_string(),
+                "diagnostics__why".to_string(),
+                "extensions__list".to_string(),
+                "federation_capabilities".to_string(),
+                "federation_peers".to_string(),
+                "federation_query".to_string(),
+                "federation_status".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
+                "list_dir".to_string(),
+                "memory-tools__memory_forget".to_string(),
+                "memory-tools__memory_recall".to_string(),
+                "memory-tools__memory_remember".to_string(),
+                "read_file".to_string(),
+                "read_files".to_string(),
+                "update_plan".to_string(),
+            ],
+            "Read Only must drop the shell, the writer and the peer ACTIONS, \
+             and keep the readers - including the federation queries"
+        );
+    }
+
+    /// A session with a goal mounts the model's completion tools; a session
+    /// without one carries neither, so the surface is present or absent rather
+    /// than present and dormant. The settle handle rides the same build.
+    #[test]
+    fn a_goal_mounts_the_completion_tools() {
+        use std::sync::Arc;
+        let settings = bare();
+        let goal = agent::goal::Goal::new("ship it", Some(8)).expect("a goal");
+        let built = crate::caps::build_agent_for_session_with_subagents_and_jobs(
+            &settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "session",
+            "session",
+            Arc::new(crate::subagent::SubagentRegistry::default()),
+            Arc::new(agent::jobs::JobRegistry::new()),
+            Arc::new(crate::browser::BrowserHandle::new()),
+            Some(goal),
+        );
+        let names = tool_names(&built);
+        assert!(
+            names.iter().any(|name| name == "get_goal")
+                && names.iter().any(|name| name == "update_goal"),
+            "the goal's two tools ride the turn: {names:?}"
+        );
+        let store = built.goal.expect("the settle handle rides the build");
+        assert_eq!(
+            store.snapshot().map(|goal| goal.objective),
+            Some("ship it".to_string())
+        );
+
+        // No goal, no tools: a goal-less session cannot see a dormant surface.
+        let built = build(&settings);
+        let names = tool_names(&built);
+        assert!(!names.iter().any(|name| name == "get_goal"), "{names:?}");
+        assert!(!names.iter().any(|name| name == "update_goal"), "{names:?}");
+        assert!(built.goal.is_none());
+    }
+
+    /// The two goal tools answer to their own switch. Unchecking one used to
+    /// unmount BOTH, and the Tools pane lists the tools the build carries, so
+    /// the remaining row disappeared with it and could not be switched back.
+    #[test]
+    fn the_goal_tools_switch_independently() {
+        use std::sync::Arc;
+        let build_with = |disabled: &[&str]| {
+            let mut settings = bare();
+            settings.workspace.disabled.tools =
+                disabled.iter().map(|name| name.to_string()).collect();
+            let goal = agent::goal::Goal::new("ship it", Some(8)).expect("a goal");
+            crate::caps::build_agent_for_session_with_subagents_and_jobs(
+                &settings,
+                &Vault::disabled(),
+                &SessionChoice::default(),
+                &crate::mcp::McpPool::default(),
+                "session",
+                "session",
+                Arc::new(crate::subagent::SubagentRegistry::default()),
+                Arc::new(agent::jobs::JobRegistry::new()),
+                Arc::new(crate::browser::BrowserHandle::new()),
+                Some(goal),
+            )
+        };
+
+        let reader_off = build_with(&["get_goal"]);
+        let names = tool_names(&reader_off);
+        assert!(
+            names.iter().any(|name| name == "update_goal"),
+            "the settle path stays mounted: {names:?}"
+        );
+        assert!(!names.iter().any(|name| name == "get_goal"), "{names:?}");
+        assert!(
+            reader_off.goal.is_some(),
+            "the settle handle rides a build that mounts either goal tool"
+        );
+
+        let settle_off = build_with(&["update_goal"]);
+        let names = tool_names(&settle_off);
+        assert!(
+            names.iter().any(|name| name == "get_goal"),
+            "the reader stays mounted: {names:?}"
+        );
+        assert!(!names.iter().any(|name| name == "update_goal"), "{names:?}");
+        assert!(settle_off.goal.is_some());
+
+        let both_off = build_with(&["get_goal", "update_goal"]);
+        let names = tool_names(&both_off);
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "get_goal" || name == "update_goal"),
+            "{names:?}"
+        );
+        assert!(both_off.goal.is_none(), "no tool, no settle handle");
+    }
+
+    /// The Tools pane must list a tool the reader has switched off: that row is
+    /// the only control that can switch it back on. The preview build clears
+    /// the disabled lists for exactly that reason, while the real build still
+    /// honors them.
+    #[test]
+    fn the_tools_preview_keeps_a_disabled_tool_listed() {
+        let mut settings = bare();
+        settings.workspace.disabled.tools = vec!["read_file".to_string()];
+        let preview = crate::caps::preview_capabilities(
+            &settings,
+            &Vault::disabled(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert!(
+            preview
+                .iter()
+                .any(|cap| cap.name == "read_file" && cap.category == "tool"),
+            "a disabled tool keeps its row so it can be switched back on"
+        );
+
+        let real = build(&settings);
+        assert!(
+            !crate::caps::capabilities(&real.agent)
+                .iter()
+                .any(|cap| cap.name == "read_file"),
+            "the turn's build still honors the disabled list"
+        );
+    }
+
+    /// A goal is session state, not a preset capability: a preset whose tool
+    /// allowlist omits the goal tools must still mount them, or a goal created
+    /// under that preset could only run to its round cap with no way to close
+    /// it. The reader's own per-tool switch is the one that still applies.
+    #[test]
+    fn a_preset_cannot_withdraw_the_goal_tools() {
+        use std::sync::Arc;
+        let build_with = |disabled: &[&str]| {
+            let mut settings = bare();
+            settings.global.presets.insert(
+                "files-only".to_string(),
+                Preset {
+                    name: Some("files-only".to_string()),
+                    plugins: vec!["files".to_string()],
+                    tools: Some(vec!["read_file".to_string()]),
+                    ..Default::default()
+                },
+            );
+            settings.global.default_preset = "files-only".to_string();
+            settings.workspace.disabled.tools =
+                disabled.iter().map(|name| name.to_string()).collect();
+            let goal = agent::goal::Goal::new("ship it", Some(8)).expect("a goal");
+            crate::caps::build_agent_for_session_with_subagents_and_jobs(
+                &settings,
+                &Vault::disabled(),
+                &SessionChoice::default(),
+                &crate::mcp::McpPool::default(),
+                "session",
+                "session",
+                Arc::new(crate::subagent::SubagentRegistry::default()),
+                Arc::new(agent::jobs::JobRegistry::new()),
+                Arc::new(crate::browser::BrowserHandle::new()),
+                Some(goal),
+            )
+        };
+
+        let built = build_with(&[]);
+        let names = tool_names(&built);
+        assert!(
+            names.iter().any(|name| name == "get_goal"),
+            "the reader stays mounted under a narrow preset: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "update_goal"),
+            "the settle path stays mounted under a narrow preset: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "read_file"),
+            "the preset still narrows the rest: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "write_file"),
+            "a tool the preset omits stays omitted: {names:?}"
+        );
+        assert!(built.goal.is_some(), "the settle handle rides the build");
+
+        // The reader's own switch still closes the completion path.
+        let off = build_with(&["update_goal"]);
+        let names = tool_names(&off);
+        assert!(names.iter().any(|name| name == "get_goal"), "{names:?}");
+        assert!(!names.iter().any(|name| name == "update_goal"), "{names:?}");
+    }
+
+    /// The six gated capabilities, in display order.
+    type Gates = (bool, bool, bool, bool, bool, bool);
+    /// One row of the registration table.
+    type GateRow<'a> = (&'a str, Option<&'a [&'a str]>, Gates);
+
+    /// The gated tools a built parent turn actually carries.
+    ///
+    /// The tuple is `(bash, run_in_background, job_output, job_list, job_kill,
+    /// subagent)`. `run_in_background` is a shell capability rather than a
+    /// tool, so it is read from the schema the agent advertises.
+    fn gated_tools(settings: &Settings) -> Gates {
+        use std::sync::Arc;
+        let built = crate::caps::build_agent_for_session_with_subagents(
+            settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "session",
+            "session",
+            Arc::new(crate::subagent::SubagentRegistry::default()),
+        );
+        let registry = built.agent.registry().expect("registry");
+        let bash = registry.get("bash");
+        let background = bash.as_ref().is_some_and(|bash| {
+            bash.json_schema()["properties"]
+                .get("run_in_background")
+                .is_some()
+        });
+        (
+            bash.is_some(),
+            background,
+            registry.get("job_output").is_some(),
+            registry.get("job_list").is_some(),
+            registry.get("job_kill").is_some(),
+            registry.get_async("subagent").is_some(),
+        )
+    }
+
+    /// One settings tree with an optional preset `tools` allowlist.
+    fn with_tools(permission: &str, tools: Option<&[&str]>) -> Settings {
+        let mut settings = bare();
+        settings.workspace.agent.permission = permission.to_string();
+        if let Some(tools) = tools {
+            settings.global.presets.insert(
+                "gated".to_string(),
+                Preset {
+                    name: Some("gated".to_string()),
+                    plugins: vec!["shell".to_string(), "files".to_string(), "plan".to_string()],
+                    tools: Some(tools.iter().map(|tool| tool.to_string()).collect()),
+                    ..Preset::default()
+                },
+            );
+            settings.global.default_preset = "gated".to_string();
+        }
+        settings
+    }
+
+    /// The registration table: permission x preset allowlist, row by row.
+    ///
+    /// This is the consequence the change is for. Read Only removes every
+    /// gated tool; an allowlist that omits `subagent` removes it while the
+    /// shell family stays; and a read-only preset naming `subagent` still does
+    /// not get it, because permission and allowlist intersect rather than
+    /// union. A preset without `tools` inherits, which the writable rows pin.
+    #[test]
+    fn the_tool_gate_matrix_follows_permission_and_preset() {
+        let table: &[GateRow] = &[
+            (READ_ONLY, None, (false, false, false, false, false, false)),
+            (
+                READ_ONLY,
+                Some(&[
+                    "bash",
+                    "run_in_background",
+                    "job_output",
+                    "job_list",
+                    "job_kill",
+                    "subagent",
+                ]),
+                (false, false, false, false, false, false),
+            ),
+            (
+                READ_ONLY,
+                Some(&["subagent"]),
+                (false, false, false, false, false, false),
+            ),
+            (WORKSPACE_WRITE, None, (true, true, true, true, true, true)),
+            (
+                WORKSPACE_WRITE,
+                Some(&["bash", "job_output", "job_kill"]),
+                (true, true, true, false, true, false),
+            ),
+            (
+                WORKSPACE_WRITE,
+                Some(&["subagent"]),
+                (false, false, false, false, false, true),
+            ),
+            (FULL_ACCESS, None, (true, true, true, true, true, true)),
+        ];
+        for (permission, tools, expected) in table {
+            let settings = with_tools(permission, *tools);
+            assert_eq!(
+                gated_tools(&settings),
+                *expected,
+                "registered (bash, run_in_background, job_output, job_kill, subagent) \
+                 for permission={permission} tools={tools:?}"
+            );
+        }
+    }
+
+    /// The session tier is a Rego fact, and the data it reads is the EFFECTIVE
+    /// permission: a Full-access request under a read-only preset hands the
+    /// engine `read-only`, and the generated module denies write, egress and
+    /// spawn while the Rust registration floor withholds the tools too.
+    #[test]
+    fn the_session_tier_reaches_rego_as_the_effective_permission() {
+        let root = scratch("policy-effective-permission");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        settings.global.presets.insert(
+            "ro".to_string(),
+            Preset {
+                permission: Some(READ_ONLY.to_string()),
+                plugins: vec!["files".to_string()],
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "ro".to_string();
+        // Allowlist the address so the BASELINE permits the egress and the
+        // generated session tier is the module that refuses it.
+        std::fs::create_dir_all(root.join(".bsh")).expect("bsh dir");
+        std::fs::write(root.join(".bsh/egress-allowlist"), "1.2.3.4\n").expect("egress allowlist");
+        let built = build(&settings);
+        assert_eq!(
+            settings.effective().permission.requested,
+            FULL_ACCESS,
+            "the session still asks for Full access"
+        );
+        assert_eq!(
+            built.policy.data().permission,
+            READ_ONLY,
+            "the policy data hands Rego the EFFECTIVE mode (effective != requested)"
+        );
+        assert!(
+            built
+                .policy
+                .rule_ids()
+                .iter()
+                .any(|rule| rule == "session-read-only-write"),
+            "the generated session module is compiled into the set: {:?}",
+            built.policy.rule_ids()
+        );
+        let ask = |tool: &str, action: Action, target: Target| {
+            PolicyInput::new(tool, action, target)
+                .with_session("session")
+                .with_preset("ro")
+        };
+        for (tool, action, target) in [
+            (
+                "write_file",
+                Action::Write,
+                Target::path(root.join("notes.txt")),
+            ),
+            (
+                "mcp",
+                Action::Egress,
+                Target::host("example.test", "1.2.3.4"),
+            ),
+            ("bash", Action::Spawn, Target::path(root.clone())),
+        ] {
+            let decision = built.policy.check(&ask(tool, action, target));
+            assert!(
+                !decision.is_allowed(),
+                "{tool} must be denied by the read-only effective permission: {decision:?}"
+            );
+            assert!(
+                decision
+                    .rule
+                    .as_deref()
+                    .is_some_and(|rule| rule.starts_with("session-read-only")),
+                "{tool}'s denial must name the session tier, got {decision:?}"
+            );
+            assert_eq!(
+                built
+                    .policy
+                    .denials()
+                    .last()
+                    .map(|entry| entry.permission.as_str()),
+                Some(READ_ONLY),
+                "the audit row records the effective permission"
+            );
+        }
+        // Paired: with no ceiling the same write inside the workspace is
+        // allowed, so the assertions above cannot pass by denying everything.
+        settings.global.default_preset.clear();
+        let built = build(&settings);
+        assert_eq!(built.policy.data().permission, FULL_ACCESS);
+        assert!(
+            built
+                .policy
+                .check(&ask(
+                    "write_file",
+                    Action::Write,
+                    Target::path(root.join("notes.txt"))
+                ))
+                .is_allowed(),
+            "Full access without a ceiling keeps the in-workspace write"
+        );
+    }
+
+    /// The single predicate and the registry agree, and the predicate is the
+    /// only reader of the three gates.
+    #[test]
+    fn the_tool_gate_predicate_matches_registration() {
+        for (permission, tools) in [
+            (READ_ONLY, None),
+            (WORKSPACE_WRITE, None),
+            (WORKSPACE_WRITE, Some(&["bash", "job_kill"][..])),
+            (FULL_ACCESS, None),
+        ] {
+            let settings = with_tools(permission, tools);
+            let built = build(&settings);
+            let preset_tools = settings.effective().preset_tools.clone();
+            let gates = tool_gates_for(
+                permission,
+                preset_tools.as_deref(),
+                &built.policy,
+                "session",
+            );
+            let registered = gated_tools(&settings);
+            assert_eq!(
+                (
+                    gates.bash,
+                    gates.background_spawn,
+                    gates.output,
+                    gates.list,
+                    gates.kill,
+                    gates.subagent,
+                ),
+                registered,
+                "predicate and registry disagree for {permission} {tools:?}"
+            );
+        }
+    }
+
+    /// Write one workspace policy file under `root`.
+    fn write_policy(root: &std::path::Path, rego: &str) {
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(root.join(".bsh").join("policy.rego"), rego).expect("the policy file");
+    }
+
+    /// A workspace policy that denies `action` for one `tool`, and allows
+    /// everything else. The rule id is the one a refusal must name.
+    fn deny_rule(rule: &str, action: &str, tool: &str) -> String {
+        format!(
+            r#"package policy.workspace
+
+# rule: {rule}
+verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspace policy"}} if {{
+    input.action == "{action}"
+    input.tool == "{tool}"
+}} else := {{"allow": true, "rule": "workspace-allow"}}
+"#
+        )
+    }
+
+    /// A Rego capability denial removes the named tool and nothing else: bash
+    /// and its siblings stay registered.
+    #[test]
+    fn a_rego_capability_denial_removes_only_the_named_tool() {
+        let root = scratch("policy-capability-job-output");
+        write_policy(
+            &root,
+            &deny_rule("no-job-output", "capability", "job_output"),
+        );
+        let settings = rooted(&root);
+        let (bash, background, output, list, kill, subagent) = gated_tools(&settings);
+        assert!(bash, "bash is not part of the job_output decision");
+        assert!(background, "the background flag is not job_output either");
+        assert!(!output, "the denied capability removed job_output");
+        assert!(list, "the roster is not part of the job_output decision");
+        assert!(kill, "an unrelated tool stayed");
+        assert!(subagent, "an unrelated tool stayed");
+    }
+
+    /// A child runs unbounded, exactly like its parent: the step ceiling is
+    /// gone, so a delegated task cannot be cut off mid-investigation.
+    #[test]
+    fn a_child_carries_no_step_ceiling() {
+        let root = scratch("subagent-budget");
+        let settings = rooted(&root);
+        let built = build(&settings);
+        let context = crate::caps::SubagentContext::new(
+            &built.agent,
+            "parent",
+            "parent",
+            0,
+            std::sync::Arc::new(crate::subagent::SubagentRegistry::default()),
+            built.policy.clone(),
+            "",
+            root.to_string_lossy().to_string(),
+            crate::context::RuntimeFacts::from_effective(&built.effective),
+            crate::caps::SubagentTools {
+                message: true,
+                interrupt: true,
+            },
+        );
+        let child = context.child("child-1");
+        assert_eq!(
+            child.config().max_steps,
+            0,
+            "the child sees the parent's budget, not a lower cap"
+        );
+    }
+
+    /// A child inherits the parent's parsed skills: a delegated prompt can name
+    /// one (the slash-name gesture), and the child's own catalogue and loader
+    /// answer from the same set.
+    #[test]
+    fn a_child_inherits_the_parents_skills() {
+        let root = scratch("subagent-skills");
+        write_skill(&root, "alpha", "one");
+        let settings = with_one_source(&root);
+        let built = build(&settings);
+        assert!(
+            built.agent.skill("alpha").is_some(),
+            "the premise: the parent turn carries the skill"
+        );
+        let context = crate::caps::SubagentContext::new(
+            &built.agent,
+            "parent",
+            "parent",
+            0,
+            std::sync::Arc::new(crate::subagent::SubagentRegistry::default()),
+            built.policy.clone(),
+            "",
+            root.to_string_lossy().to_string(),
+            crate::context::RuntimeFacts::from_effective(&built.effective),
+            crate::caps::SubagentTools {
+                message: true,
+                interrupt: true,
+            },
+        );
+        let child = context.child("child-1");
+        let skill = child
+            .skill("alpha")
+            .expect("the child carries the parent's skill");
+        assert!(
+            skill.instructions.contains("Body of alpha."),
+            "with the parsed body, not a re-read: {}",
+            skill.instructions
+        );
+    }
+
+    /// Denying `run_in_background` keeps the shell tool but withdraws the
+    /// flag: the schema no longer advertises it, so the capability is not
+    /// merely refused after the fact.
+    #[test]
+    fn a_rego_capability_denial_withdraws_the_background_flag() {
+        let root = scratch("policy-capability-background");
+        write_policy(
+            &root,
+            &deny_rule("no-background", "capability", "run_in_background"),
+        );
+        let settings = rooted(&root);
+        let (bash, background, output, _list, kill, _subagent) = gated_tools(&settings);
+        assert!(bash, "the shell itself stayed");
+        assert!(!background, "the denied capability withdrew the flag");
+        assert!(output && kill, "the job tools are independent");
+    }
+
+    /// The wait the reader sets is the wait the built agent runs with.
+    ///
+    /// This is the one number `build_vendor` hands to the wire guard and the
+    /// engine keeps as its per-call ceiling, so the pane's field is not a
+    /// control that only looks wired.
+    #[test]
+    fn the_llm_wait_reaches_the_built_agent() {
+        let root = scratch("llm-wait-build");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.llm_timeout_secs = 900;
+        settings.workspace.agent.llm_max_retries = 1;
+        settings.workspace.agent.temperature = Some(0.2);
+        let built = crate::caps::build_agent_for_session(
+            &settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "run",
+        );
+        let config = built.agent.config();
+        assert_eq!(
+            config.timeout_secs, 900,
+            "the reader's wait is the ceiling the built agent carries"
+        );
+        assert_eq!(
+            config.max_retries, 1,
+            "and the retry budget is the engine's own, with no resilience layer"
+        );
+        assert_eq!(
+            config.temperature, 0.2,
+            "and every request carries the stored sampling temperature"
+        );
+    }
+
+    /// A policy that denies the subagent spawn creates no child at all: the
+    /// registry has no row and the store has no child session to persist.
+    #[test]
+    fn a_rego_subagent_spawn_denial_creates_no_child() {
+        use std::sync::Arc;
+        let root = scratch("policy-subagent-denied");
+        write_policy(&root, &deny_rule("no-subagent-spawn", "spawn", "subagent"));
+        let settings = rooted(&root);
+        let runs = Arc::new(crate::subagent::SubagentRegistry::default());
+        let built = crate::caps::build_agent_for_session_with_subagents(
+            &settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "parent",
+            "parent",
+            runs.clone(),
+        );
+        let registry = built.agent.registry().expect("registry");
+        assert!(
+            registry.get_async("subagent").is_some(),
+            "the capability query allows the tool; the spawn check is the one that refuses"
+        );
+        let error = registry
+            .execute(
+                "subagent",
+                &serde_json::json!({
+                    "description": "probe",
+                    "prompt": "This must never run."
+                }),
+            )
+            .expect_err("the spawn is denied by the workspace policy");
+        assert!(error.to_string().contains("no-subagent-spawn"), "{error}");
+        assert!(
+            runs.snapshot().is_empty(),
+            "a denied spawn must not create a run row"
+        );
+        // Child sessions are persisted from registry rows only; proving the
+        // store holds none is the end-to-end consequence of the empty row set.
+        let store = crate::store::Store::open_at(root.join("store"));
+        assert!(
+            store.subagent_sessions().is_empty(),
+            "a denied spawn must not leave a child session file"
+        );
+    }
+
+    /// A policy that denies the job_kill spawn leaves the process running: the
+    /// refusal names the rule, the roster still reads Running, and the pid is
+    /// still alive. The command's marker is never written.
+    #[test]
+    fn a_rego_job_kill_spawn_denial_leaves_the_process_running() {
+        use std::sync::Arc;
+        let root = scratch("policy-job-kill-denied");
+        write_policy(&root, &deny_rule("no-job-kill", "spawn", "job_kill"));
+        let settings = rooted(&root);
+        let jobs = Arc::new(agent::jobs::JobRegistry::new());
+        let built = crate::caps::build_agent_for_session_with_subagents_and_jobs(
+            &settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "session",
+            "session",
+            Arc::new(crate::subagent::SubagentRegistry::default()),
+            jobs.clone(),
+            Arc::new(crate::browser::BrowserHandle::new()),
+            None,
+        );
+        let registry = built.agent.registry().expect("registry");
+        let marker = root.join("marker.txt");
+        let started = registry
+            .execute(
+                "bash",
+                &serde_json::json!({
+                    "command": format!("sleep 30; printf made > {}", marker.display()),
+                    "run_in_background": true
+                }),
+            )
+            .expect("the spawn itself is allowed");
+        let id = started["job_id"].as_str().expect("a job id").to_string();
+        let pid = jobs
+            .job(&id)
+            .and_then(|job| job.pid)
+            .expect("the roster recorded a pid");
+        assert!(agent::jobs::pid_exists(pid), "the premise: it is running");
+
+        let error = registry
+            .execute("job_kill", &serde_json::json!({ "id": id }))
+            .expect_err("the workspace policy denies the kill");
+        assert!(error.to_string().contains("no-job-kill"), "{error}");
+        assert_eq!(
+            jobs.job(&id).expect("the job").status,
+            agent::jobs::JobStatus::Running,
+            "the denied kill changed no status"
+        );
+        assert!(
+            agent::jobs::pid_exists(pid),
+            "a denied kill must leave the process alive (pid {pid})"
+        );
+        assert!(
+            !marker.exists(),
+            "the command never reached its marker, so it did not finish on its own"
+        );
+
+        // Reap the child the test started, outside the tool boundary.
+        assert!(jobs.kill(&id), "the test reaps its own child");
+        jobs.wait_for(&id, std::time::Duration::from_secs(3));
+        for _ in 0..40 {
+            if !agent::jobs::pid_exists(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Full access is the mode that releases the confinement, and the shell
+    /// own config is where it lands: an unset workspace root is what leaves
+    /// the shell tool validator unset and drops its two guards.
+    #[test]
+    fn full_access_releases_the_workspace_confinement() {
+        assert!(is_confined(WORKSPACE_WRITE));
+        assert!(is_confined("something-unknown"));
+        assert!(!is_confined(FULL_ACCESS));
+        assert!(allows_writes(WORKSPACE_WRITE));
+        assert!(allows_writes(FULL_ACCESS));
+        assert!(!allows_writes(READ_ONLY));
+        assert!(
+            allows_writes("something-unknown"),
+            "only Read Only withholds the writers"
+        );
+    }
+
+    /// A zero step ceiling is the engine's "no ceiling": the loop ends when the
+    /// model stops asking for tools, so a long healthy turn is never cut off.
+    #[test]
+    fn a_zero_step_ceiling_means_no_ceiling() {
+        let settings = bare();
+        assert_eq!(build(&settings).agent.config().max_steps, 0);
+    }
+
+    /// The ADVERTISED tool array's wire size stays inside a budget.
+    ///
+    /// These schemas ride EVERY request as part of the provider's cached prompt
+    /// prefix, so each essay-length description is re-prefilled on every cache
+    /// miss and burns window the conversation needs. Built-in Tools 2.0 added
+    /// `read_files` and `apply_patch` and the measured set is 17,191 chars
+    /// across 22 tools, so the ceiling sits just above it: a new essay-length
+    /// description trips the test, while the shipped surface fits. Raising this
+    /// number again is the wrong fix - trim the copy instead.
+    ///
+    /// A DEFERRED tool is not in the array: the browser family and the
+    /// federation family are registered and callable after `find_tool`
+    /// reports them, which is how a rare family stays off every request. The
+    /// measure is therefore the advertised set, not the registry - counting a
+    /// schema that is never sent would charge the budget for a tool the model
+    /// cannot see until it asks.
+    #[test]
+    fn the_tool_array_stays_inside_its_wire_budget() {
+        const WIRE_BUDGET_CHARS: usize = 18_000;
+        let built = build(&bare());
+        let registry = built
+            .agent
+            .registry()
+            .expect("the default build registers tools");
+        let mut schemas: Vec<String> = Vec::new();
+        for (name, tool) in registry.iter() {
+            if tool.deferred() {
+                continue;
+            }
+            schemas.push(
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": tool.description(),
+                        "parameters": tool.json_schema(),
+                    }
+                })
+                .to_string(),
+            );
+        }
+        for name in registry.async_tool_names() {
+            if let Some(tool) = registry.get_async(&name) {
+                if tool.deferred() {
+                    continue;
+                }
+                schemas.push(
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name(),
+                            "description": tool.description(),
+                            "parameters": tool.json_schema(),
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        let chars: usize = schemas.iter().map(|s| s.len()).sum();
+        println!(
+            "tool array wire size: {chars} chars across {} tools (budget {WIRE_BUDGET_CHARS})",
+            schemas.len()
+        );
+        assert!(
+            chars <= WIRE_BUDGET_CHARS,
+            "the tool array is {chars} chars across {} tools (budget \
+             {WIRE_BUDGET_CHARS}); a new essay-length description went in. \
+             Trim it - the schema rides every request.",
+            schemas.len()
+        );
+    }
+
+    /// A vault in a scratch directory, unlocked, holding one entry.
+    fn vault_holding(label: &str, name: &str, secret: &str) -> Vault {
+        let directory =
+            std::env::temp_dir().join(format!("bsh-caps-vault-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the scratch directory");
+        let mut vault = Vault::new(directory.join(".vault.bin"));
+        vault.create("a test passphrase").expect("the vault");
+        vault.put(name, secret).expect("the entry");
+        vault
+    }
+
+    /// A settings tree whose endpoint carries no credential source yet.
+    fn provider_without_a_credential() -> Settings {
+        let mut settings = bare();
+        settings.global.add_provider(
+            "work",
+            "Work",
+            "https://work.example",
+            &[ModelEntry::named("work-model")],
+        );
+        settings
+    }
+
+    /// The agent resolves provider:ID:api_key from the vault at build time,
+    /// and the settings tree never receives the secret.
+    #[test]
+    fn a_vault_key_reaches_the_agent_when_no_entry_is_named() {
+        let settings = provider_without_a_credential();
+        assert!(
+            settings
+                .global
+                .providers
+                .get("work")
+                .is_some_and(|provider| provider.api_key_vault.is_none()),
+            "the premise: no named entry, so the convention supplies the key"
+        );
+        let secret = "sk-vault-only-value";
+        let vault = vault_holding("agent", &crate::vault::provider_key("work"), secret);
+
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert_eq!(
+            built.agent.config().api_key,
+            secret,
+            "the vault supplied it"
+        );
+        assert!(
+            built.credential_error.is_none(),
+            "a resolved key is not a refusal"
+        );
+
+        // The settings file, serialized, carries neither the secret nor a copy
+        // of it: the tree was never written to.
+        let text = toml::to_string(&settings.global).expect("the settings document");
+        assert!(!text.contains(secret), "the secret is in the settings tree");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_key =")),
+            "the settings tree has no plaintext key field: {text}"
+        );
+    }
+
+    /// A vault with no app-access key is an explicit refusal, not an empty key
+    /// handed to the provider.
+    #[test]
+    fn a_vault_without_app_access_refuses_instead_of_an_empty_key() {
+        let settings = provider_without_a_credential();
+        let directory =
+            std::env::temp_dir().join(format!("bsh-caps-no-app-access-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the scratch directory");
+        let path = directory.join(".vault.bin");
+        let mut created = Vault::new(path.clone());
+        created.create("a test passphrase").expect("the vault");
+        created
+            .put(&crate::vault::provider_key("work"), "sk-locked")
+            .expect("the entry");
+        std::fs::remove_file(path.with_file_name(".vault.access")).expect("the app access file");
+        drop(created);
+        let vault = Vault::new(path);
+
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert!(
+            matches!(
+                &built.credential_error,
+                Some(crate::vault::VaultError::Locked)
+            ),
+            "a locked vault names itself, got {:?}",
+            built.credential_error
+        );
+        assert!(
+            built.agent.config().api_key.is_empty(),
+            "the engine is not handed a secret the vault could not open"
+        );
+        assert!(
+            matches!(
+                crate::caps::credential_error(&settings, &vault, &work_choice()),
+                Some(crate::vault::VaultError::Locked)
+            ),
+            "the send path reads the same refusal before opening a turn"
+        );
+        let text = toml::to_string(&settings.global).expect("the settings document");
+        assert!(!text.contains("sk-locked"));
+    }
+
+    /// Locking the Vault pane does not take provider keys away: the app-access
+    /// key keeps the table available for resolution.
+    #[test]
+    fn a_locked_admin_view_still_supplies_provider_keys() {
+        let settings = provider_without_a_credential();
+        let mut vault = vault_holding(
+            "admin-locked-app-access",
+            &crate::vault::provider_key("work"),
+            "sk-app-still-works",
+        );
+        vault.lock();
+        assert!(!vault.is_unlocked(), "the Vault pane reads locked");
+        assert!(vault.is_app_available(), "the app still has its table");
+
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert_eq!(built.agent.config().api_key, "sk-app-still-works");
+        assert!(
+            built.credential_error.is_none(),
+            "a locked admin view is not a credential refusal"
+        );
+        assert!(crate::caps::credential_error(&settings, &vault, &work_choice()).is_none());
+    }
+
+    /// A plaintext key left in an old document is not a credential: the build
+    /// reads only the vault, and the old value is never written back.
+    #[test]
+    fn a_legacy_plaintext_key_is_not_a_credential() {
+        let mut settings = provider_without_a_credential();
+        if let Some(provider) = settings.global.providers.get_mut("work") {
+            provider.legacy_api_key = Some("sk-plaintext-legacy".to_string());
+        }
+        let vault = vault_holding("plaintext", "keys/other", "sk-vault-other");
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert!(
+            built.agent.config().api_key.is_empty(),
+            "the legacy value never authenticates a request"
+        );
+        assert!(built.credential_error.is_none());
+        let text = toml::to_string(&settings.global).expect("the settings document");
+        assert!(!text.contains("sk-plaintext-legacy"));
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_key =")),
+            "the legacy field is not written back: {text}"
+        );
+    }
+
+    /// A named vault entry is read and beats the conventional
+    /// `provider:<id>:api_key` entry.
+    #[test]
+    fn a_named_vault_entry_supplies_the_secret() {
+        let mut settings = provider_without_a_credential();
+        if let Some(provider) = settings.global.providers.get_mut("work") {
+            provider.api_key_vault = Some("keys/chosen".to_string());
+        }
+        let secret = "sk-named-entry-value";
+        let mut vault = vault_holding("named", "keys/chosen", secret);
+        vault
+            .put(&crate::vault::provider_key("work"), "sk-conventional-stale")
+            .expect("the conventional entry");
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert_eq!(built.agent.config().api_key, secret);
+        assert!(
+            built.credential_error.is_none(),
+            "a resolved named entry is not a refusal"
+        );
+        assert!(
+            crate::caps::credential_error(&settings, &vault, &work_choice()).is_none(),
+            "the send path reads the same answer"
+        );
+    }
+
+    /// A named entry the vault does not hold is an explicit refusal carrying
+    /// the id, never a silent empty key.
+    #[test]
+    fn a_missing_named_vault_entry_names_the_id() {
+        let mut settings = provider_without_a_credential();
+        if let Some(provider) = settings.global.providers.get_mut("work") {
+            provider.api_key_vault = Some("keys/absent".to_string());
+        }
+        let vault = vault_holding("named-missing", "keys/other", "sk-unrelated");
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert!(
+            built.agent.config().api_key.is_empty(),
+            "an unresolved named entry cannot become an empty-key request"
+        );
+        match &built.credential_error {
+            Some(crate::vault::VaultError::MissingEntry(name)) => {
+                assert_eq!(name, "keys/absent");
+            }
+            other => panic!("expected a named miss, got {other:?}"),
+        }
+        let described = built
+            .credential_error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            described.contains("keys/absent"),
+            "the refusal names the id: {described}"
+        );
+        assert!(
+            matches!(
+                crate::caps::credential_error(&settings, &vault, &work_choice()),
+                Some(crate::vault::VaultError::MissingEntry(ref name)) if name == "keys/absent"
+            ),
+            "the send path names the same id before opening a turn"
+        );
+        // Locking the admin view leaves the app access table in place, so the
+        // named miss is still the answer rather than a generic lock refusal.
+        let mut locked = vault;
+        locked.lock();
+        assert!(
+            matches!(
+                crate::caps::credential_error(&settings, &locked, &work_choice()),
+                Some(crate::vault::VaultError::MissingEntry(ref name)) if name == "keys/absent"
+            ),
+            "the admin lock does not hide the named miss"
+        );
+        // A file that does not exist cannot hold the named entry, so the id is
+        // still the answer rather than a generic absence.
+        let absent = Vault::new(
+            std::env::temp_dir().join(format!("bsh-caps-absent-{}", std::process::id())),
+        );
+        assert!(
+            matches!(
+                crate::caps::credential_error(&settings, &absent, &work_choice()),
+                Some(crate::vault::VaultError::MissingEntry(ref name)) if name == "keys/absent"
+            ),
+            "no vault file names the missing id for a provider that chose one"
+        );
+    }
+
+    /// A settings tree whose active workspace is `root`.
+    fn rooted(root: &std::path::Path) -> Settings {
+        let mut settings = bare();
+        let id = settings.note_workspace("scratch", &root.to_string_lossy());
+        settings.global.general.active_workspace = id;
+        settings
+    }
+
+    /// A full-access build, so the old root confinement is gone and the policy
+    /// is the only thing that can refuse the call.
+    fn full_access(root: &std::path::Path) -> Settings {
+        let mut settings = rooted(root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        settings
+    }
+
+    /// A denied write is proved by the filesystem, not by the error string: the
+    /// file does not exist and the parent directory's mtime never moved.
+    #[test]
+    fn a_denied_write_never_reaches_the_filesystem() {
+        let root = scratch("policy-denied-write");
+        std::fs::create_dir_all(root.join("src")).expect("inside directory");
+        let outside_dir = scratch("policy-denied-write-outside");
+        let outside = outside_dir.join("escaped-policy-write.txt");
+        let parent = outside_dir.as_path();
+        let before = std::fs::metadata(parent)
+            .expect("parent metadata")
+            .modified()
+            .expect("mtime");
+
+        let built = build(&full_access(&root));
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": outside.to_string_lossy(),
+                    "content": "escaped",
+                }),
+            )
+            .expect_err("the policy refuses a write outside the workspace");
+        let message = error.to_string();
+        assert!(message.contains("write-outside-workspace"), "{message}");
+        assert!(!outside.exists(), "the denied write created the file");
+        let after = std::fs::metadata(parent)
+            .expect("parent metadata")
+            .modified()
+            .expect("mtime");
+        assert_eq!(
+            before, after,
+            "the denied write touched the parent directory"
+        );
+    }
+
+    /// A write inside the workspace is allowed (so the test above is not a
+    /// policy that refuses everything), and .git/.bsh internals are refused
+    /// with the file never created.
+    #[test]
+    fn a_write_inside_is_allowed_and_git_internals_are_not() {
+        let root = scratch("policy-git-write");
+        std::fs::create_dir_all(root.join(".git").join("hooks")).expect("git hooks");
+        let built = build(&rooted(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        registry
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": root.join("src").join("main.rs").to_string_lossy(),
+                    "content": "fn main() {}",
+                }),
+            )
+            .expect("an in-workspace write is allowed");
+        assert!(root.join("src").join("main.rs").exists());
+
+        let hook = root.join(".git").join("hooks").join("pre-commit");
+        let before = std::fs::metadata(root.join(".git").join("hooks"))
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let error = registry
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": hook.to_string_lossy(),
+                    "content": "#!/bin/sh\n",
+                }),
+            )
+            .expect_err("git internals are refused");
+        assert!(
+            error.to_string().contains("write-forbidden-directory"),
+            "{error}"
+        );
+        assert!(!hook.exists(), "the denied write created the hook");
+        let after = std::fs::metadata(root.join(".git").join("hooks"))
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        assert_eq!(before, after);
+    }
+
+    /// A read outside the workspace is refused and its content never reaches
+    /// the result; a read inside is allowed. Both are proved by the probe file
+    /// the test owns.
+    #[test]
+    fn a_read_outside_is_refused_while_a_read_inside_is_allowed() {
+        let root = scratch("policy-read");
+        std::fs::write(root.join("inside.txt"), "inside-content").expect("inside");
+        let outside_dir = scratch("policy-read-outside");
+        let outside = outside_dir.join("outside-policy-read.txt");
+        std::fs::write(&outside, "outside-secret").expect("outside");
+
+        let built = build(&full_access(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let inside = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("inside.txt").to_string_lossy() }),
+            )
+            .expect("an in-workspace read is allowed");
+        assert_eq!(inside["content"], "inside-content");
+
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": outside.to_string_lossy() }),
+            )
+            .expect_err("a read outside the workspace is refused");
+        let message = error.to_string();
+        assert!(message.contains("read-outside-workspace"), "{message}");
+        assert!(
+            !message.contains("outside-secret"),
+            "the file was read: {message}"
+        );
+    }
+
+    /// The workspace policy file is the workspace half of the intersection: it
+    /// can deny a path the baseline allows.
+    #[test]
+    fn a_workspace_policy_file_narrows_the_baseline() {
+        let root = scratch("policy-workspace-file");
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            root.join(".bsh").join("policy.rego"),
+            r#"package policy.workspace
+
+# rule: no-secret-reads
+verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are not readable"} if {
+    contains(input.target.path, "secret")
+} else := {"allow": true, "rule": "workspace-allow"}
+"#,
+        )
+        .expect("policy file");
+        std::fs::write(root.join("secret.txt"), "shh").expect("secret");
+        std::fs::write(root.join("notes.txt"), "notes").expect("notes");
+
+        let built = build(&full_access(&root));
+        assert!(built.policy.error().is_none(), "{:?}", built.policy.error());
+        let registry = built.agent.registry().expect("registry");
+
+        registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("notes.txt").to_string_lossy() }),
+            )
+            .expect("an ordinary read passes both policies");
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("secret.txt").to_string_lossy() }),
+            )
+            .expect_err("the workspace rule narrows the baseline");
+        assert!(error.to_string().contains("no-secret-reads"), "{error}");
+    }
+
+    /// edit_file asks for a Write before it reads or writes: an edit inside
+    /// succeeds, an edit outside is refused with the file untouched, and an
+    /// ambiguous match is refused unless replace_all says otherwise.
+    #[test]
+    fn an_edit_is_gated_before_the_file_is_touched() {
+        let root = scratch("policy-edit");
+        std::fs::write(root.join("inside.txt"), "alpha beta alpha").expect("inside");
+        std::fs::write(root.join("ambiguous.txt"), "x x").expect("ambiguous");
+        let outside_dir = scratch("policy-edit-outside");
+        let outside = outside_dir.join("outside.txt");
+        std::fs::write(&outside, "outside-original").expect("outside");
+
+        let built = build(&full_access(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let result = registry
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": root.join("inside.txt").to_string_lossy(),
+                    "old_string": "beta",
+                    "new_string": "gamma",
+                }),
+            )
+            .expect("an in-workspace edit is allowed");
+        assert_eq!(result["replacements"], 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("inside.txt")).expect("read"),
+            "alpha gamma alpha"
+        );
+
+        let error = registry
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": outside.to_string_lossy(),
+                    "old_string": "outside",
+                    "new_string": "hacked",
+                }),
+            )
+            .expect_err("an edit outside the workspace is refused");
+        assert!(
+            error.to_string().contains("write-outside-workspace"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read"),
+            "outside-original",
+            "the denied edit changed the file"
+        );
+
+        let ambiguous = registry.execute(
+            "edit_file",
+            &serde_json::json!({
+                "path": root.join("ambiguous.txt").to_string_lossy(),
+                "old_string": "x",
+                "new_string": "y",
+            }),
+        );
+        assert!(
+            matches!(&ambiguous, Err(agent::ToolError::InvalidInput(message)) if message.contains("occurs 2 times")),
+            "{ambiguous:?}"
+        );
+
+        registry
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": root.join("ambiguous.txt").to_string_lossy(),
+                    "old_string": "x",
+                    "new_string": "y",
+                    "replace_all": true,
+                }),
+            )
+            .expect("replace_all covers every occurrence");
+        assert_eq!(
+            std::fs::read_to_string(root.join("ambiguous.txt")).expect("read"),
+            "y y"
+        );
+    }
+
+    /// .git internals are refused for edits as they are for writes, and the
+    /// file is left exactly as it was.
+    #[test]
+    fn an_edit_into_git_internals_is_denied() {
+        let root = scratch("policy-edit-git");
+        std::fs::create_dir_all(root.join(".git")).expect(".git");
+        std::fs::write(root.join(".git").join("config"), "original").expect("config");
+        let built = build(&rooted(&root));
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": root.join(".git").join("config").to_string_lossy(),
+                    "old_string": "original",
+                    "new_string": "hacked",
+                }),
+            )
+            .expect_err("git internals are refused");
+        assert!(
+            error.to_string().contains("write-forbidden-directory"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git").join("config")).expect("read"),
+            "original"
+        );
+    }
+
+    /// The confined build for a test that needs the file tools' root installed.
+    fn confined(root: &std::path::Path) -> Settings {
+        let mut settings = rooted(root);
+        settings.workspace.agent.permission = WORKSPACE_WRITE.to_string();
+        settings
+    }
+
+    /// A write whose leaf does not exist yet under a symlinked directory is
+    /// refused, and nothing is created on the other side.
+    ///
+    /// The bug this pins: canonicalizing only the IMMEDIATE parent checks
+    /// nothing when that parent is missing too, so the fallback kept the
+    /// lexical path, `create_dir_all` followed the link, and the write landed
+    /// outside the workspace.
+    #[test]
+    #[cfg(unix)]
+    fn a_write_through_a_symlinked_directory_cannot_escape() {
+        let root = scratch("policy-symlink-bridge");
+        let outside = scratch("policy-symlink-bridge-outside");
+        std::os::unix::fs::symlink(&outside, root.join("bridge")).expect("symlink");
+        let target = root.join("bridge").join("deeper").join("escaped.txt");
+        let error = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "escaped",
+                }),
+            )
+            .expect_err("the symlinked directory is not a way out");
+        assert!(
+            error.to_string().contains("escapes the workspace"),
+            "{error}"
+        );
+        assert!(
+            !outside.join("deeper").exists(),
+            "the refused write created a directory outside the workspace"
+        );
+    }
+
+    /// A `..` that climbs out of the workspace is refused even when the
+    /// directory it names does not exist, which is the case a check that
+    /// canonicalizes only an existing parent cannot see.
+    #[test]
+    fn a_parent_escape_with_a_missing_tail_is_refused() {
+        let root = scratch("policy-missing-tail");
+        let target = root
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("escaped-missing-tail.txt");
+        let error = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "escaped",
+                }),
+            )
+            .expect_err("a lexical escape is still an escape");
+        assert!(
+            error.to_string().contains("escapes the workspace"),
+            "{error}"
+        );
+        assert!(!root.join("..").join("escaped-missing-tail.txt").exists());
+    }
+
+    /// A symlink inside the workspace may not become a read of a file outside
+    /// it, and a symlink that stays inside resolves to the file it points at.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_cannot_read_out_and_resolves_in() {
+        let root = scratch("policy-symlink-read");
+        let outside = scratch("policy-symlink-read-outside");
+        std::fs::write(root.join("real.txt"), "inside-content").expect("real");
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("alias.txt")).expect("alias");
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "outside-secret").expect("secret");
+        std::os::unix::fs::symlink(&secret, root.join("notes.txt")).expect("notes link");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let inside = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("alias.txt").to_string_lossy() }),
+            )
+            .expect("an in-workspace link is readable");
+        assert_eq!(inside["content"], "inside-content");
+        assert!(
+            inside["path"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("real.txt"),
+            "a link resolves to its target: {inside}"
+        );
+
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("notes.txt").to_string_lossy() }),
+            )
+            .expect_err("a link out of the workspace is refused");
+        let message = error.to_string();
+        assert!(message.contains("escapes the workspace"), "{message}");
+        assert!(!message.contains("outside-secret"), "the file was read");
+    }
+
+    /// A RELATIVE path is resolved against the workspace root, not refused.
+    ///
+    /// The model names files the way a person does (`Cargo.toml`, `src/main.rs`).
+    /// A build that handed the policy the bare relative string compared it
+    /// against the root and called it outside the workspace, so every read in a
+    /// fresh chat came back "reads are confined to the workspace".
+    #[test]
+    fn a_relative_path_reads_inside_the_workspace() {
+        let root = scratch("relative-read");
+        std::fs::write(root.join("Cargo.toml"), "[package]").expect("file");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let out = registry
+            .execute("read_file", &serde_json::json!({ "path": "Cargo.toml" }))
+            .expect("a relative in-workspace path reads");
+        assert_eq!(out["content"], "[package]");
+    }
+
+    /// Full access keeps the root for RESOLUTION too.
+    ///
+    /// The release widens the sandbox and drops the shell's guards; it never
+    /// meant "forget the project". Before this, a Full-access chat resolved no
+    /// relative path at all ("no workspace root is open for this turn"), and
+    /// grep/glob walked the app's launch directory instead of the workspace.
+    /// Outside paths are still refused, by the policy, exactly as before.
+    #[test]
+    fn full_access_still_resolves_relative_paths_inside_the_workspace() {
+        let root = scratch("full-access-relative");
+        std::fs::write(root.join("Cargo.toml"), "[package]").expect("file");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let out = registry
+            .execute("read_file", &serde_json::json!({ "path": "Cargo.toml" }))
+            .expect("a relative in-workspace path reads at full access");
+        assert_eq!(out["content"], "[package]");
+
+        let outside = scratch("full-access-outside");
+        std::fs::write(outside.join("secret.txt"), "secret").expect("file");
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({
+                    "path": outside.join("secret.txt").to_string_lossy()
+                }),
+            )
+            .expect_err("outside reads stay confined at full access");
+        assert!(
+            error.to_string().contains("read-outside-workspace"),
+            "the policy still decides outside paths at full access: {error}"
+        );
+    }
+
+    /// A file past the ceiling is refused with the arguments that read a
+    /// window; a window returns exactly its lines and says more remain.
+    #[test]
+    fn a_large_read_is_refused_and_a_window_is_exact() {
+        let root = scratch("read-window");
+        let huge = root.join("huge.txt");
+        // Sparse, so the test does not write 9MiB: the ceiling is decided from
+        // the metadata before a byte is read.
+        let file = std::fs::File::create(&huge).expect("huge");
+        file.set_len(9 * 1024 * 1024).expect("len");
+        let lines = root.join("lines.txt");
+        let body: String = (1..=100).map(|number| format!("line {number}\n")).collect();
+        std::fs::write(&lines, &body).expect("lines");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": huge.to_string_lossy() }),
+            )
+            .expect_err("a 9MiB file is past the ceiling");
+        let message = error.to_string();
+        assert!(message.contains("read ceiling"), "{message}");
+        assert!(message.contains("offset"), "{message}");
+
+        let whole = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": lines.to_string_lossy() }),
+            )
+            .expect("a small file reads whole");
+        assert_eq!(whole["content"], body);
+        assert_eq!(whole["truncated"], false);
+
+        let window = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({
+                    "path": lines.to_string_lossy(),
+                    "offset": 10,
+                    "limit": 3,
+                }),
+            )
+            .expect("a window reads");
+        assert_eq!(window["content"], "line 10\nline 11\nline 12\n");
+        assert_eq!(window["truncated"], true);
+        assert_eq!(window["past_end"], false);
+
+        let past = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({
+                    "path": lines.to_string_lossy(),
+                    "offset": 500,
+                }),
+            )
+            .expect("an offset past the end is empty, not an error");
+        assert_eq!(past["content"], "");
+        assert_eq!(past["truncated"], false);
+        assert_eq!(
+            past["past_end"], true,
+            "an empty window past the last line says so, so it cannot be read as an empty file"
+        );
+    }
+
+    #[test]
+    fn read_files_batches_reads_and_reports_per_file_failures() {
+        let root = scratch("read-files-batch");
+        std::fs::write(root.join("a.rs"), "fn a() {}").expect("a");
+        std::fs::write(root.join("b.rs"), "fn b() {}").expect("b");
+        let outside = scratch("read-files-outside");
+        std::fs::write(outside.join("secret.txt"), "outside-secret").expect("secret");
+
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let result = registry
+            .execute(
+                "read_files",
+                &serde_json::json!({
+                    "paths": ["a.rs", "b.rs", outside.join("secret.txt").to_string_lossy()]
+                }),
+            )
+            .expect("batch call returns per-file outcomes");
+
+        assert_eq!(result["count"], 3);
+        assert_eq!(result["files"][0]["content"], "fn a() {}");
+        assert_eq!(result["files"][1]["content"], "fn b() {}");
+        assert!(result["files"][2]["error"].as_str().is_some());
+        assert!(!result.to_string().contains("outside-secret"));
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[test]
+    fn read_files_rejects_empty_oversized_and_duplicate_path_lists() {
+        let root = scratch("read-files-invalid");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        for paths in [
+            serde_json::json!([]),
+            serde_json::json!((0..11).map(|_| "a").collect::<Vec<_>>()),
+            serde_json::json!(["a", "a"]),
+        ] {
+            assert!(registry
+                .execute("read_files", &serde_json::json!({"paths": paths}))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn read_files_obeys_the_combined_output_budget() {
+        let root = scratch("read-files-budget");
+        let body = "x".repeat(MAX_BATCH_READ_BYTES / 2 + 128);
+        std::fs::write(root.join("a.txt"), &body).expect("a");
+        std::fs::write(root.join("b.txt"), &body).expect("b");
+        let built = build(&confined(&root));
+        let result = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "read_files",
+                &serde_json::json!({"paths": ["a.txt", "b.txt"]}),
+            )
+            .expect("bounded batch read");
+        assert_eq!(result["bytes"], MAX_BATCH_READ_BYTES);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(
+            result["files"][0]["bytes"].as_u64().unwrap()
+                + result["files"][1]["bytes"].as_u64().unwrap(),
+            MAX_BATCH_READ_BYTES as u64
+        );
+        assert!(result["files"][1]["truncated"].as_bool().unwrap());
+    }
+
+    /// A binary file and a directory are refused by name instead of being
+    /// pasted into the transcript as mojibake or an IO error.
+    #[test]
+    fn a_binary_read_and_a_directory_read_are_named() {
+        let root = scratch("read-binary");
+        std::fs::write(root.join("blob.bin"), [0x89_u8, b'P', b'N', b'G', 0, 1, 2]).expect("blob");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let binary = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("blob.bin").to_string_lossy() }),
+            )
+            .expect_err("a binary file is refused");
+        let message = binary.to_string();
+        assert!(message.contains("binary file"), "{message}");
+        assert!(message.contains("NUL byte at offset 4"), "{message}");
+
+        // A windowed read reports the NUL's offset in the FILE, not in the
+        // window: the caller has to be able to seek to it. The NUL sits on the
+        // second line, so a window that starts there sees it at window offset 3
+        // while the file offset is 7.
+        let split = root.join("split.bin");
+        std::fs::write(&split, [b'a', b'a', b'a', b'\n', b'b', b'b', b'b', 0, b'c'])
+            .expect("split");
+        let windowed = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({
+                    "path": split.to_string_lossy(),
+                    "offset": 2,
+                }),
+            )
+            .expect_err("a window that reaches the NUL is refused");
+        assert!(
+            windowed.to_string().contains("NUL byte at offset 7"),
+            "the offset is file-relative: {windowed}"
+        );
+
+        let directory = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.to_string_lossy() }),
+            )
+            .expect_err("a directory is refused");
+        assert!(
+            directory.to_string().contains("is a directory"),
+            "{directory}"
+        );
+    }
+
+    #[test]
+    fn apply_patch_updates_multiple_files_with_one_atomic_write_each() {
+        let root = scratch("apply-patch-multi");
+        std::fs::write(root.join("a.rs"), "fn old_a() {}\n").expect("a");
+        std::fs::write(root.join("b.rs"), "fn old_b() {}\n").expect("b");
+        let built = build(&confined(&root));
+        let result = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "apply_patch",
+                &serde_json::json!({
+                    "changes": [
+                        {
+                            "path": "a.rs",
+                            "edits": [
+                                {"old_string": "old_a", "new_string": "new_a"},
+                                {"old_string": "fn new_a()", "new_string": "pub fn new_a()"}
+                            ]
+                        },
+                        {
+                            "path": "b.rs",
+                            "edits": [
+                                {"old_string": "old_b", "new_string": "new_b"}
+                            ]
+                        }
+                    ]
+                }),
+            )
+            .expect("patch call");
+        assert_eq!(result["changed_files"], 2);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).expect("a"),
+            "pub fn new_a() {}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.rs")).expect("b"),
+            "fn new_b() {}\n"
+        );
+        assert_eq!(result["files"][0]["replacements"], 2);
+    }
+
+    #[test]
+    fn apply_patch_preflights_every_target_before_mutating_any_file() {
+        let root = scratch("apply-patch-preflight");
+        let outside = scratch("apply-patch-preflight-outside");
+        std::fs::write(root.join("src.rs"), "value").expect("seed");
+        std::fs::write(outside.join("secret.rs"), "secret").expect("outside");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let error = registry
+            .execute(
+                "apply_patch",
+                &serde_json::json!({"changes": [
+                    {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "changed"}]},
+                    {"path": outside.join("secret.rs").to_string_lossy(), "edits": [
+                        {"old_string": "secret", "new_string": "exposed"}
+                    ]}
+                ]}),
+            )
+            .expect_err("an outside target rejects the whole request during preflight");
+        assert!(error.to_string().contains("workspace"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).expect("unchanged"),
+            "value"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret.rs")).expect("outside unchanged"),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn apply_patch_leaves_a_file_unchanged_when_any_edit_fails() {
+        let root = scratch("apply-patch-failure");
+        let file = root.join("src.rs");
+        std::fs::write(&file, "let value = 1;\n").expect("seed");
+        let built = build(&confined(&root));
+        let result = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "apply_patch",
+                &serde_json::json!({
+                    "changes": [{
+                        "path": "src.rs",
+                        "edits": [
+                            {"old_string": "value = 1", "new_string": "value = 2"},
+                            {"old_string": "missing", "new_string": "present"}
+                        ]
+                    }]
+                }),
+            )
+            .expect("per-file error is reported in the result");
+        assert!(result["files"][0]["error"].as_str().is_some());
+        assert_eq!(
+            std::fs::read_to_string(file).expect("unchanged"),
+            "let value = 1;\n"
+        );
+        assert_eq!(result["changed_files"], 0);
+    }
+
+    #[test]
+    fn apply_patch_rejects_duplicate_paths_and_empty_search_text() {
+        let root = scratch("apply-patch-invalid");
+        std::fs::write(root.join("src.rs"), "value").expect("seed");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let duplicate = registry
+            .execute(
+                "apply_patch",
+                &serde_json::json!({"changes": [
+                    {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "one"}]},
+                    {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "two"}]}
+                ]}),
+            )
+            .expect_err("duplicate targets reject the complete patch request");
+        assert!(duplicate.to_string().contains("duplicate target"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).expect("unchanged"),
+            "value"
+        );
+
+        let empty = registry
+            .execute(
+                "apply_patch",
+                &serde_json::json!({"changes": [
+                    {"path": "src.rs", "edits": [{"old_string": "", "new_string": "x"}]}
+                ]}),
+            )
+            .expect_err("the schema rejects an empty old_string");
+        assert!(empty.to_string().contains("old_string"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).expect("unchanged"),
+            "value"
+        );
+    }
+
+    /// The sed tool is a write tool with a read-only dry run: the dry run
+    /// returns the resulting text and leaves the file alone, the edit lands
+    /// atomically, and a script whose output would be redirected into the file
+    /// is refused before anything is written.
+    #[test]
+    fn the_sed_tool_edits_and_dry_runs_under_the_policy() {
+        let root = scratch("sed-tool");
+        std::fs::write(root.join("a.txt"), "one two one\n").expect("seed");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let dry = registry
+            .execute(
+                "sed",
+                &serde_json::json!({
+                    "path": "a.txt",
+                    "script": "s/one/1/g",
+                    "dry_run": true
+                }),
+            )
+            .expect("the dry run runs");
+        assert_eq!(dry["changed"], true);
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["content"], "1 two 1\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("the original"),
+            "one two one\n",
+            "a dry run must not write"
+        );
+
+        let edited = registry
+            .execute(
+                "sed",
+                &serde_json::json!({ "path": "a.txt", "script": "s/one/1/g" }),
+            )
+            .expect("the edit runs");
+        assert_eq!(edited["changed"], true);
+        assert_eq!(edited["dry_run"], false);
+        assert_eq!(edited["added"], 1, "{edited}");
+        assert_eq!(edited["deleted"], 1, "{edited}");
+        assert_eq!(edited["diff"][0]["sign"], "-", "{edited}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("the edit"),
+            "1 two 1\n"
+        );
+
+        let again = registry
+            .execute(
+                "sed",
+                &serde_json::json!({ "path": "a.txt", "script": "s/one/1/g" }),
+            )
+            .expect("a second run is a no-op");
+        assert_eq!(again["changed"], false);
+
+        // GNU sed -i -n '/two/p' is the filter idiom: the explicit print goes
+        // to the edited file, and quiet suppresses the automatic one. The file
+        // is reset to three lines so the filter actually removes two of them.
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").expect("the filter input");
+        let filtered = registry
+            .execute(
+                "sed",
+                &serde_json::json!({ "path": "a.txt", "script": "/two/p", "quiet": true }),
+            )
+            .expect("the filter runs");
+        assert_eq!(filtered["changed"], true, "{filtered}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("the filter"),
+            "two\n"
+        );
+
+        // -iSUFFIX keeps the original beside the target, and the result names
+        // the backup.
+        let edited = registry
+            .execute(
+                "sed",
+                &serde_json::json!({
+                    "path": "a.txt",
+                    "script": "s/two/2/",
+                    "backup_suffix": ".bak"
+                }),
+            )
+            .expect("the backup edit runs");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("the edit"),
+            "2\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt.bak")).expect("the backup"),
+            "two\n"
+        );
+        assert!(
+            edited["backup"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("a.txt.bak")),
+            "{edited}"
+        );
+
+        // A suffix that could leave the directory is refused before a byte is
+        // copied.
+        let separator = registry
+            .execute(
+                "sed",
+                &serde_json::json!({
+                    "path": "a.txt",
+                    "script": "s/2/three/",
+                    "backup_suffix": "/tmp/backup"
+                }),
+            )
+            .expect_err("a separator in the suffix is refused");
+        assert!(
+            separator.to_string().contains("path separator"),
+            "{separator}"
+        );
+
+        let escaped = registry
+            .execute(
+                "sed",
+                &serde_json::json!({ "path": "../outside.txt", "script": "s/a/b/" }),
+            )
+            .expect_err("a path outside the workspace is refused");
+        assert!(escaped.to_string().contains("escapes the workspace"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A byte-identical write does not touch the file: its mtime stays put, so
+    /// a build watcher is not woken, and the result says the call was a no-op.
+    #[test]
+    fn an_identical_write_does_not_touch_the_file() {
+        let root = scratch("write-identical");
+        let file = root.join("same.txt");
+        std::fs::write(&file, "same").expect("seed");
+        let before = std::fs::metadata(&file)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let repeated = registry
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "content": "same",
+                }),
+            )
+            .expect("an identical write succeeds");
+        assert_eq!(repeated["unchanged"], true);
+        let after = std::fs::metadata(&file)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        assert_eq!(before, after, "the no-op write moved the mtime");
+
+        let changed = registry
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "content": "different",
+                }),
+            )
+            .expect("a real write succeeds");
+        assert_eq!(changed["unchanged"], false);
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "different");
+    }
+
+    /// An overwrite keeps the file's mode, which a temp-and-rename write would
+    /// otherwise replace with the umask default.
+    #[test]
+    #[cfg(unix)]
+    fn an_overwrite_keeps_the_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("write-mode");
+        let file = root.join("script.sh");
+        std::fs::write(&file, "#!/bin/sh\n").expect("seed");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).expect("mode");
+        build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "content": "#!/bin/sh\necho changed\n",
+                }),
+            )
+            .expect("overwrite");
+        let mode = std::fs::metadata(&file)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "the write changed the file's mode");
+    }
+
+    /// An edit that misses names the line its first line matched, so the model
+    /// fixes the block instead of rereading the file blindly.
+    #[test]
+    fn a_missing_edit_names_the_line_that_almost_matched() {
+        let root = scratch("edit-hint");
+        let file = root.join("notes.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").expect("notes");
+        let error = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "old_string": "alpha\nBETA",
+                    "new_string": "x",
+                }),
+            )
+            .expect_err("the block does not match");
+        let message = error.to_string();
+        assert!(message.contains("old_string not found"), "{message}");
+        assert!(message.contains("line 1"), "{message}");
+
+        let identical = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "old_string": "alpha",
+                    "new_string": "alpha",
+                }),
+            )
+            .expect_err("an identical edit is refused");
+        assert!(identical.to_string().contains("identical"), "{identical}");
+    }
+
+    /// Two edits to one path cannot both start from the original bytes: the
+    /// per-path lock makes the second wait, so neither change is lost.
+    #[test]
+    fn an_edit_waits_for_the_same_paths_lock() {
+        let root = scratch("edit-lock");
+        let file = root.join("shared.txt");
+        std::fs::write(&file, "alpha\nbeta\n").expect("seed");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let tool = registry.get("edit_file").expect("edit_file");
+        let target = file.canonicalize().expect("canonical target");
+
+        let held = super::file_lock(&target);
+        let guard = held.lock().expect("lock");
+        let worker = std::thread::spawn(move || {
+            tool.run(&serde_json::json!({
+                "path": target.to_string_lossy(),
+                "old_string": "alpha",
+                "new_string": "ALPHA",
+            }))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !worker.is_finished(),
+            "the edit did not wait for the path's lock"
+        );
+        drop(guard);
+        worker.join().expect("thread").expect("edit runs");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "ALPHA\nbeta\n"
+        );
+    }
+
+    /// The listing is a stable, total order and names a directory-shaped
+    /// symlink by what it behaves like.
+    #[test]
+    #[cfg(unix)]
+    fn the_listing_is_sorted_and_names_kinds() {
+        let root = scratch("list-sorted");
+        std::fs::create_dir_all(root.join("b")).expect("b");
+        std::fs::create_dir_all(root.join("a")).expect("a");
+        std::fs::write(root.join("c.txt"), b"").expect("c");
+        std::fs::write(root.join(".hidden"), b"").expect("hidden");
+        std::os::unix::fs::symlink(root.join("a"), root.join("link")).expect("link");
+        let result = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "list_dir",
+                &serde_json::json!({ "path": root.to_string_lossy() }),
+            )
+            .expect("list");
+        let entries = result["entries"].as_array().expect("entries");
+        let rows: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry["name"].as_str().expect("name"),
+                    entry["kind"].as_str().expect("kind"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (".hidden", "file"),
+                ("a", "dir"),
+                ("b", "dir"),
+                ("c.txt", "file"),
+                ("link", "dir"),
+            ]
+        );
+        assert_eq!(result["truncated"], false);
+    }
+
+    /// The ignore file is created on the first file-tool call, with the common
+    /// trees commented out: creating it must not change what a fresh workspace
+    /// shows.
+    #[test]
+    fn the_default_ignore_file_is_created_commented_out() {
+        let root = scratch("ignore-default");
+        std::fs::write(root.join("keep.txt"), "needle").expect("keep");
+        std::fs::create_dir_all(root.join("node_modules").join("pkg")).expect("node_modules");
+        std::fs::write(root.join("node_modules").join("pkg").join("x.js"), "needle").expect("dep");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        registry
+            .execute("read_file", &serde_json::json!({ "path": "keep.txt" }))
+            .expect("the first call succeeds");
+        let file = root.join(".bsh").join(".ignore");
+        let text = std::fs::read_to_string(&file).expect("the ignore file was created");
+        for needle in ["# node_modules", "# __pycache__", "# .venv"] {
+            assert!(
+                text.contains(needle),
+                "{needle} is missing from the template"
+            );
+        }
+        let listing = registry
+            .execute("list_dir", &serde_json::json!({ "path": "." }))
+            .expect("list");
+        let names: Vec<&str> = listing["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"node_modules"),
+            "a commented pattern must not hide anything: {names:?}"
+        );
+        assert!(
+            !names.contains(&".bsh"),
+            "the harness directory is always hidden: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every file tool, not only the first one tried, ensures the rule file
+    /// exists before it answers. Each case gets its own workspace, so a file
+    /// created by an earlier tool cannot make a later one pass.
+    #[test]
+    fn every_file_tool_creates_the_ignore_file_when_missing() {
+        let cases: [(&str, serde_json::Value); 9] = [
+            ("read_file", serde_json::json!({ "path": "a.txt" })),
+            ("read_files", serde_json::json!({ "paths": ["a.txt"] })),
+            (
+                "write_file",
+                serde_json::json!({ "path": "new.txt", "content": "new" }),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({
+                    "path": "a.txt",
+                    "old_string": "needle",
+                    "new_string": "changed"
+                }),
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({
+                    "changes": [{
+                        "path": "a.txt",
+                        "edits": [{ "old_string": "needle", "new_string": "changed" }]
+                    }]
+                }),
+            ),
+            (
+                "sed",
+                serde_json::json!({ "path": "a.txt", "script": "s/needle/changed/" }),
+            ),
+            ("list_dir", serde_json::json!({ "path": "." })),
+            ("glob", serde_json::json!({ "pattern": "*" })),
+            ("grep", serde_json::json!({ "pattern": "needle" })),
+        ];
+        for (tool, args) in cases {
+            let root = scratch(&format!("auto-ignore-{tool}"));
+            std::fs::write(root.join("a.txt"), "needle").expect("a file to act on");
+            let built = build(&confined(&root));
+            let registry = built.agent.registry().expect("registry");
+            registry
+                .execute(tool, &args)
+                .unwrap_or_else(|error| panic!("{tool} failed: {error}"));
+            let file = root.join(".bsh").join(".ignore");
+            assert!(file.is_file(), "{tool} did not create {}", file.display());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// One uncommented rule hides a listing entry, refuses a read and a write,
+    /// and keeps glob and grep from returning the excluded tree.
+    #[test]
+    fn the_workspace_ignore_filters_the_file_tools() {
+        let root = scratch("ignore-filter");
+        std::fs::create_dir_all(root.join("secret")).expect("secret");
+        std::fs::write(root.join("secret").join("key.txt"), "needle secret").expect("key");
+        std::fs::write(root.join("keep.txt"), "needle keep").expect("keep");
+        std::fs::write(root.join("debug.skip"), "needle debug").expect("debug");
+        std::fs::write(root.join("keep.skip"), "needle keep log").expect("keep log");
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            root.join(".bsh").join(".ignore"),
+            "secret/\n*.skip\n!keep.skip\n",
+        )
+        .expect("rules");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let read = registry
+            .execute("read_file", &serde_json::json!({ "path": "keep.txt" }))
+            .expect("an allowed file still reads");
+        assert_eq!(read["content"], "needle keep");
+
+        let refused = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": "secret/key.txt" }),
+            )
+            .expect_err("an excluded file is refused");
+        let message = refused.to_string();
+        assert!(
+            message.contains("excluded by the workspace ignore file"),
+            "{message}"
+        );
+        assert!(!message.contains("needle secret"), "the file was read");
+
+        let dir_refused = registry
+            .execute("list_dir", &serde_json::json!({ "path": "secret" }))
+            .expect_err("an excluded directory is refused");
+        assert!(
+            dir_refused
+                .to_string()
+                .contains("excluded by the workspace ignore file"),
+            "{dir_refused}"
+        );
+
+        let glob_refused = registry
+            .execute(
+                "glob",
+                &serde_json::json!({ "pattern": "*", "path": "secret" }),
+            )
+            .expect_err("a glob rooted in an excluded tree is refused");
+        assert!(
+            glob_refused
+                .to_string()
+                .contains("excluded by the workspace ignore file"),
+            "{glob_refused}"
+        );
+        let grep_refused = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "path": "secret" }),
+            )
+            .expect_err("a grep rooted in an excluded tree is refused");
+        assert!(
+            grep_refused
+                .to_string()
+                .contains("excluded by the workspace ignore file"),
+            "{grep_refused}"
+        );
+
+        let reserved = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": ".bsh/settings/settings.toml" }),
+            )
+            .expect_err("the harness directory is always excluded");
+        assert!(
+            reserved.to_string().contains("always exclude"),
+            "{reserved}"
+        );
+
+        let written = registry.execute(
+            "write_file",
+            &serde_json::json!({ "path": "secret/new.txt", "content": "x" }),
+        );
+        assert!(written.is_err(), "a write into an excluded tree is refused");
+        assert!(!root.join("secret").join("new.txt").exists());
+
+        let listing = registry
+            .execute("list_dir", &serde_json::json!({ "path": "." }))
+            .expect("list");
+        let names: Vec<&str> = listing["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"secret"), "{names:?}");
+        assert!(!names.contains(&"debug.skip"), "{names:?}");
+        assert!(
+            names.contains(&"keep.skip"),
+            "a negation re-includes: {names:?}"
+        );
+        assert!(names.contains(&"keep.txt"), "{names:?}");
+
+        let globbed = registry
+            .execute("glob", &serde_json::json!({ "pattern": "*" }))
+            .expect("glob");
+        let matches: Vec<&str> = globbed["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|path| path.as_str())
+            .collect();
+        assert!(!matches.contains(&"debug.skip"), "{matches:?}");
+        assert!(
+            !matches.iter().any(|path| path.starts_with("secret/")),
+            "{matches:?}"
+        );
+        assert!(matches.contains(&"keep.skip"), "{matches:?}");
+        assert!(matches.contains(&"keep.txt"), "{matches:?}");
+
+        let wide = registry
+            .execute(
+                "glob",
+                &serde_json::json!({ "pattern": "*", "include_ignored": true }),
+            )
+            .expect("glob");
+        let wide_matches: Vec<&str> = wide["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|path| path.as_str())
+            .collect();
+        assert!(
+            !wide_matches.iter().any(|path| path.starts_with("secret/")),
+            "include_ignored widens gitignore, never .bsh/.ignore: {wide_matches:?}"
+        );
+
+        let grepped = registry
+            .execute("grep", &serde_json::json!({ "pattern": "needle" }))
+            .expect("grep");
+        let found: Vec<&str> = grepped["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|hit| hit["path"].as_str())
+            .collect();
+        assert!(!found.contains(&"debug.skip"), "{found:?}");
+        assert!(
+            !found.iter().any(|path| path.starts_with("secret/")),
+            "{found:?}"
+        );
+        assert!(found.contains(&"keep.txt"), "{found:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn built_in_file_tool_schemas_are_strict_and_descriptive() {
+        let root = scratch("file-tool-schemas");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        for name in [
+            "glob",
+            "grep",
+            "read_file",
+            "read_files",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "sed",
+            "list_dir",
+        ] {
+            let tool = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            let schema = tool.json_schema();
+            assert_eq!(schema["additionalProperties"], false, "{name}");
+            let properties = schema["properties"].as_object().expect("properties");
+            assert!(!properties.is_empty(), "{name} has parameters");
+            for (field, definition) in properties {
+                assert!(
+                    definition["description"]
+                        .as_str()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{name}.{field} needs a model-facing description"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The glob tool matches by path, reports workspace-relative paths, and
+    /// keeps the walk's ignore/hidden policy unless asked otherwise.
+    #[test]
+    fn a_glob_lists_matching_files_inside_the_workspace() {
+        let root = scratch("glob-tool");
+        std::fs::create_dir_all(root.join("src").join("deep")).expect("dirs");
+        std::fs::write(root.join("root.rs"), "").expect("root");
+        std::fs::write(root.join("src").join("one.rs"), "").expect("one");
+        std::fs::write(root.join("src").join("deep").join("two.rs"), "").expect("two");
+        std::fs::write(root.join("ignored.rs"), "").expect("ignored");
+        std::fs::write(root.join(".hidden.rs"), "").expect("hidden");
+        std::fs::write(root.join(".gitignore"), "ignored.rs\n").expect("gitignore");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let matches = |result: &serde_json::Value| -> Vec<String> {
+            result["matches"]
+                .as_array()
+                .expect("matches")
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        };
+
+        let all = registry
+            .execute("glob", &serde_json::json!({ "pattern": "*.rs" }))
+            .expect("glob runs");
+        assert_eq!(
+            matches(&all),
+            vec!["root.rs", "src/deep/two.rs", "src/one.rs"],
+            "a pattern without a separator matches the basename at any depth"
+        );
+        assert_eq!(all["truncated"], false);
+
+        let narrowed = registry
+            .execute(
+                "glob",
+                &serde_json::json!({ "pattern": "*.rs", "path": "src" }),
+            )
+            .expect("a narrowed walk runs");
+        assert_eq!(
+            matches(&narrowed),
+            vec!["src/deep/two.rs", "src/one.rs"],
+            "paths stay workspace-relative even when the walk starts in a subdirectory"
+        );
+
+        let anchored = registry
+            .execute("glob", &serde_json::json!({ "pattern": "src/*.rs" }))
+            .expect("an anchored pattern runs");
+        assert_eq!(
+            matches(&anchored),
+            vec!["src/one.rs"],
+            "a separator anchors the star to one level"
+        );
+
+        let ignored = registry
+            .execute(
+                "glob",
+                &serde_json::json!({ "pattern": "*.rs", "include_ignored": true }),
+            )
+            .expect("ignored entries are opt-in");
+        let ignored = matches(&ignored);
+        assert!(ignored.contains(&".hidden.rs".to_string()), "{ignored:?}");
+        assert!(ignored.contains(&"ignored.rs".to_string()), "{ignored:?}");
+
+        let limited = registry
+            .execute(
+                "glob",
+                &serde_json::json!({ "pattern": "*.rs", "limit": 1 }),
+            )
+            .expect("a limited glob runs");
+        assert_eq!(matches(&limited).len(), 1);
+        assert_eq!(limited["truncated"], true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The search root is a read: a path outside the workspace is refused
+    /// before the walk starts, and no name from it leaks.
+    #[test]
+    fn a_glob_outside_the_workspace_is_refused() {
+        let root = scratch("glob-outside");
+        let outside = scratch("glob-outside-elsewhere");
+        std::fs::write(outside.join("secret.rs"), "secret").expect("secret");
+        let built = build(&full_access(&root));
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "glob",
+                &serde_json::json!({
+                    "pattern": "*.rs",
+                    "path": outside.to_string_lossy(),
+                }),
+            )
+            .expect_err("a walk outside the workspace is a read outside it");
+        let message = error.to_string();
+        assert!(message.contains("read-outside-workspace"), "{message}");
+        assert!(!message.contains("secret.rs"), "the walk leaked a name");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// An empty glob explains itself: a path miss is not "this text is absent
+    /// from the workspace", and a model that reads it that way stops looking.
+    #[test]
+    fn an_empty_glob_points_at_paths_and_contents() {
+        let root = scratch("glob-empty-hint");
+        std::fs::write(root.join("notes.md"), "hello").expect("notes");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let literal = registry
+            .execute("glob", &serde_json::json!({ "pattern": "hello" }))
+            .expect("glob runs");
+        assert!(literal["matches"].as_array().expect("matches").is_empty());
+        let hint = literal["hint"]
+            .as_str()
+            .expect("an empty result carries a hint");
+        assert!(hint.contains("not file contents"), "{hint}");
+        assert!(hint.contains("*hello*"), "{hint}");
+        assert!(hint.contains("include_ignored"), "{hint}");
+
+        let wildcard = registry
+            .execute("glob", &serde_json::json!({ "pattern": "*.nope" }))
+            .expect("glob runs");
+        let hint = wildcard["hint"].as_str().expect("hint");
+        assert!(hint.contains("no file path matches"), "{hint}");
+
+        let found = registry
+            .execute("glob", &serde_json::json!({ "pattern": "*.md" }))
+            .expect("glob runs");
+        assert!(
+            found.get("hint").is_none(),
+            "a non-empty result needs no lecture: {found}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Grep reports its hits as path, 1-based line and text, and an empty
+    /// result explains itself instead of reading as an absent workspace.
+    #[test]
+    fn a_grep_finds_a_line_and_explains_an_empty_result() {
+        let root = scratch("grep-tool");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(
+            root.join("src").join("main.rs"),
+            "fn main() {\n    let bubble = 1;\n}\n",
+        )
+        .expect("main");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let found = registry
+            .execute("grep", &serde_json::json!({ "pattern": "bubble" }))
+            .expect("grep runs");
+        assert_eq!(found["matches"][0]["path"], "src/main.rs");
+        assert_eq!(found["matches"][0]["line"], 2);
+        assert_eq!(found["matches"][0]["text"], "    let bubble = 1;");
+        assert!(found.get("hint").is_none(), "{found}");
+
+        let empty = registry
+            .execute("grep", &serde_json::json!({ "pattern": "zzz" }))
+            .expect("grep runs");
+        let hint = empty["hint"]
+            .as_str()
+            .expect("an empty result carries a hint");
+        assert!(hint.contains("case-sensitive"), "{hint}");
+        assert!(hint.contains("include_ignored"), "{hint}");
+
+        let invalid = registry
+            .execute("grep", &serde_json::json!({ "pattern": "(" }))
+            .expect_err("an unbalanced group is refused");
+        assert!(invalid.to_string().contains("invalid regex"), "{invalid}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The grep tool accepts a file where it accepts a directory: the path may
+    /// name one file, and its hits stay workspace-relative.
+    #[test]
+    fn a_grep_searches_a_file_path() {
+        let root = scratch("grep-file-path");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        let file = root.join("src").join("main.rs");
+        std::fs::write(&file, "fn main() {\n    let bubble = 1;\n}\n").expect("main");
+        std::fs::write(root.join("src").join("other.rs"), "let bubble = 2;\n").expect("other");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let found = registry
+            .execute(
+                "grep",
+                &serde_json::json!({
+                    "pattern": "bubble",
+                    "path": file.to_string_lossy(),
+                }),
+            )
+            .expect("a file path is searched");
+        assert_eq!(found["path"], file.to_string_lossy().as_ref());
+        assert_eq!(found["matches"][0]["path"], "src/main.rs");
+        assert_eq!(found["matches"][0]["line"], 2);
+        assert_eq!(found["matches"][0]["text"], "    let bubble = 1;");
+        assert_eq!(
+            found["matches"].as_array().map(Vec::len),
+            Some(1),
+            "only the named file is read: {found}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The five ripgrep switches reach the search and its answer: invert,
+    /// context, include, files_without_match and text, plus the binary row a
+    /// file with a match before its NUL byte carries.
+    #[test]
+    fn a_grep_takes_ripgreps_switches() {
+        let root = scratch("grep-switches");
+        std::fs::write(root.join("one.rs"), "a\nneedle\nb\nc\n").expect("rs");
+        std::fs::write(root.join("notes.md"), "needle\n").expect("md");
+        std::fs::write(root.join("plain.txt"), "nothing\n").expect("plain");
+        std::fs::write(root.join("blob.bin"), b"needle\n\x00rest\n".as_slice()).expect("blob");
+        std::fs::write(root.join("late.bin"), {
+            let mut bytes = b"needle\n".to_vec();
+            bytes.resize(70 * 1024, b'a');
+            bytes.push(0);
+            bytes
+        })
+        .expect("late");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let inverted = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "invert": true }),
+            )
+            .expect("grep runs");
+        assert!(
+            inverted["matches"]
+                .as_array()
+                .expect("matches")
+                .iter()
+                .all(|row| row["text"] != "needle"),
+            "invert reports the lines that do not match: {inverted}"
+        );
+        assert!(
+            inverted["matches"]
+                .as_array()
+                .expect("matches")
+                .iter()
+                .any(|row| row["path"] == "one.rs" && row["text"] == "a"),
+            "{inverted}"
+        );
+
+        let with_context = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "context": 1, "path": "one.rs" }),
+            )
+            .expect("grep runs");
+        assert_eq!(
+            with_context["matches"][0]["kind"], "context",
+            "{with_context}"
+        );
+        assert_eq!(with_context["matches"][0]["line"], 1);
+        assert_eq!(with_context["matches"][1]["line"], 2);
+        assert!(
+            with_context["matches"][1].get("kind").is_none(),
+            "a match row keeps its old shape: {with_context}"
+        );
+
+        let included = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "include": "*.rs" }),
+            )
+            .expect("grep runs");
+        assert_eq!(
+            included["matches"].as_array().map(Vec::len),
+            Some(1),
+            "{included}"
+        );
+        assert_eq!(included["matches"][0]["path"], "one.rs");
+
+        let without = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "files_without_match": true }),
+            )
+            .expect("grep runs");
+        assert_eq!(without["matches"].as_array().map(Vec::len), Some(0));
+        assert_eq!(without["files_without_match"][0], "plain.txt");
+
+        let text = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "text": true, "path": "blob.bin" }),
+            )
+            .expect("grep runs");
+        assert_eq!(text["matches"][0]["path"], "blob.bin");
+        assert!(text.get("binary").is_none(), "{text}");
+
+        // The same file reached through the WALK answers the same way: its
+        // pre-NUL row and its binary row are both reported, which is what rg
+        // prints for a directory search too.
+        let walked = registry
+            .execute("grep", &serde_json::json!({ "pattern": "needle" }))
+            .expect("grep runs");
+        assert!(
+            walked["matches"]
+                .as_array()
+                .expect("matches")
+                .iter()
+                .any(|row| row["path"] == "late.bin"),
+            "{walked}"
+        );
+        assert_eq!(walked["binary"][0]["path"], "late.bin");
+
+        let binary = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "path": "late.bin" }),
+            )
+            .expect("a named binary file is searched");
+        assert_eq!(binary["matches"][0]["path"], "late.bin");
+        assert_eq!(binary["binary"][0]["path"], "late.bin");
+        assert_eq!(binary["binary"][0]["offset"], 70 * 1024);
+        assert_eq!(
+            binary["binary"][0]["message"],
+            "binary file matches (found \"\\0\" byte around offset 71680)"
+        );
+
+        let too_much = registry
+            .execute(
+                "grep",
+                &serde_json::json!({ "pattern": "needle", "context": 21 }),
+            )
+            .expect_err("context is bounded");
+        assert!(too_much.to_string().contains("context"), "{too_much}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The grep search root is the same Read the glob tool asks: outside the
+    /// workspace is refused before any file is opened.
+    #[test]
+    fn a_grep_outside_the_workspace_is_refused() {
+        let root = scratch("grep-outside");
+        let outside = scratch("grep-outside-elsewhere");
+        std::fs::write(outside.join("secret.txt"), "needle").expect("secret");
+        let error = build(&full_access(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "grep",
+                &serde_json::json!({
+                    "pattern": "needle",
+                    "path": outside.to_string_lossy(),
+                }),
+            )
+            .expect_err("a content search outside the workspace is a read outside it");
+        let message = error.to_string();
+        assert!(message.contains("read-outside-workspace"), "{message}");
+        assert!(!message.contains("needle"), "the search leaked a match");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A workspace policy file that does not parse reaches the tools as the
+    /// documented failure asymmetry: writes are refused, an in-workspace read
+    /// is still allowed, and the refusal names the failure.
+    #[test]
+    fn a_broken_workspace_policy_denies_writes_and_allows_reads() {
+        let root = scratch("policy-broken");
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(root.join(".bsh").join("policy.rego"), "this is not rego")
+            .expect("broken policy");
+        std::fs::write(root.join("notes.txt"), "notes").expect("notes");
+
+        let built = build(&full_access(&root));
+        assert!(
+            built.policy.error().is_some(),
+            "the set is in its failure mode"
+        );
+        let registry = built.agent.registry().expect("registry");
+
+        registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("notes.txt").to_string_lossy() }),
+            )
+            .expect("an in-workspace read survives a broken policy");
+        let error = registry
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": root.join("blocked.txt").to_string_lossy(),
+                    "content": "blocked",
+                }),
+            )
+            .expect_err("a broken policy denies writes");
+        assert!(
+            error.to_string().contains("policy-evaluator-failure"),
+            "{error}"
+        );
+        assert!(!root.join("blocked.txt").exists());
+    }
+
+    /// A preset can name the tools, skills, MCP servers, extensions and LLM
+    /// persona it applies; selecting it for a session applies all of them.
+    #[test]
+    fn a_preset_applies_tools_skills_mcps_extensions_and_persona() {
+        use std::sync::Arc;
+
+        let root = scratch("preset-config");
+        write_skill(&root, "alpha", "one");
+        write_skill(&root, "beta", "two");
+        let mut settings = with_one_source(&root);
+        settings.workspace.agent.file_tools_enabled = true;
+        settings.global.presets.insert(
+            "scoped".to_string(),
+            Preset {
+                name: Some("scoped".to_string()),
+                plugins: vec!["files".to_string()],
+                tools: Some(vec!["read_file".to_string()]),
+                skills: Some(vec!["alpha".to_string()]),
+                mcps: Some(vec!["other".to_string()]),
+                extensions: Some(Vec::new()),
+                system_prompt: Some("You are terse.".to_string()),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "scoped".to_string();
+
+        let fake: Arc<dyn react::tool::registry::AsyncTool> =
+            Arc::new(agent::tools::AsyncFunctionTool::from_fn(
+                "test_echo",
+                "Echo",
+                serde_json::json!({ "type": "object", "properties": {} }),
+                |_args| async move { Ok(serde_json::json!({ "ok": true })) },
+            ));
+        let mcp = crate::mcp::McpPool::with_tools(vec![crate::mcp::McpTool {
+            namespace: "test".to_string(),
+            name: "echo".to_string(),
+            adapter: fake,
+        }]);
+        let built = build_agent(
+            &settings,
+            &Vault::disabled(),
+            &crate::settings::resolve::SessionChoice::default(),
+            &mcp,
+        );
+
+        let mut tools: Vec<String> = built
+            .plugins
+            .iter()
+            .flat_map(|plugin| plugin.tools.clone())
+            .collect();
+        tools.sort();
+        assert_eq!(
+            tools,
+            vec!["read_file".to_string()],
+            "the tool allowlist wins"
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains("You are terse."),
+            "the preset persona reaches the model"
+        );
+        assert_eq!(
+            skill_names(&built),
+            vec!["alpha".to_string()],
+            "the skill allowlist narrows the catalogue"
+        );
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("test_echo")
+                .is_none(),
+            "the MCP namespace allowlist excludes other servers"
+        );
+
+        // The same preset with the right MCP namespace and extension id sees
+        // both again, so this is a filter and not a permanently empty build.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent/tests/fixtures/extensions/dsh-echo");
+        settings
+            .global
+            .extensions
+            .push(crate::settings::global::InstalledExtension {
+                id: "dsh-echo".to_string(),
+                path: Some(fixture.to_string_lossy().to_string()),
+                ..Default::default()
+            });
+        settings.global.presets.get_mut("scoped").unwrap().mcps = Some(vec!["test".to_string()]);
+        settings
+            .global
+            .presets
+            .get_mut("scoped")
+            .unwrap()
+            .extensions = Some(vec!["dsh-echo".to_string()]);
+        // The same preset selected by the SESSION applies the whole config:
+        // the global default is empty here, so only Session.agent_preset names it.
+        settings.global.default_preset = String::new();
+        let session_choice = crate::settings::resolve::SessionChoice {
+            model: None,
+            preset: Some("scoped".to_string()),
+            ..Default::default()
+        };
+        let built = build_agent(&settings, &Vault::disabled(), &session_choice, &mcp);
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains("You are terse."),
+            "a session's preset also carries the persona"
+        );
+        let mut session_tools: Vec<String> = built
+            .plugins
+            .iter()
+            .flat_map(|plugin| plugin.tools.clone())
+            .collect();
+        session_tools.sort();
+        assert!(
+            session_tools.contains(&"read_file".to_string())
+                && !session_tools.contains(&"write_file".to_string()),
+            "the preset's tool allowlist still narrows the built-in tools: {session_tools:?}"
+        );
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("registry")
+                .get_async("test_echo")
+                .is_some(),
+            "the selected MCP namespace is registered"
+        );
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("dsh_echo")
+                .is_some(),
+            "the selected extension is loaded"
+        );
+    }
+
+    /// The shipped authorization presets enforce their permission, path and
+    /// built-in policy together, and a Full-access session cannot lift a
+    /// read-only preset.
+    #[test]
+    fn built_in_authorization_presets_enforce_their_scopes() {
+        use agent::policy::{Action, PolicyInput, Target};
+
+        let root = scratch("preset-authorization");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::create_dir_all(root.join("docs")).expect("docs");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("main");
+        std::fs::write(root.join(".env"), "SECRET=1\n").expect("env");
+
+        let decide = |built: &BuiltAgent, action: Action, path: &std::path::Path| {
+            built
+                .policy
+                .check(&PolicyInput::new("probe", action, Target::path(path)))
+                .is_allowed()
+        };
+
+        let mut settings = rooted(&root);
+        settings.global.presets.insert(
+            "scoped-docs".to_string(),
+            Preset {
+                permission: Some("workspace-write".to_string()),
+                read: Some(vec![".".to_string()]),
+                write: Some(vec!["docs".to_string(), "README.md".to_string()]),
+                deny: vec![
+                    ".git".to_string(),
+                    ".bsh".to_string(),
+                    ".env".to_string(),
+                    "secrets".to_string(),
+                ],
+                plugins: vec!["files".to_string()],
+                tools: Some(vec![
+                    "read_file".to_string(),
+                    "write_file".to_string(),
+                    "edit_file".to_string(),
+                    "list_dir".to_string(),
+                ]),
+                builtin_policy: vec![
+                    "deny-secrets".to_string(),
+                    "docs-only".to_string(),
+                    "no-shell".to_string(),
+                ],
+                system_prompt: Some(
+                    "You edit documentation only. Preserve frontmatter and code fences, and do not change code or configuration.".to_string(),
+                ),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "scoped-docs".to_string();
+        let built = build(&settings);
+        assert!(
+            decide(&built, Action::Read, &root.join("src/main.rs")),
+            "docs may read the workspace"
+        );
+        assert!(
+            !decide(&built, Action::Read, &root.join(".env")),
+            "docs must not read secrets"
+        );
+        assert!(
+            decide(&built, Action::Write, &root.join("docs/guide.md")),
+            "docs may write its docs scope"
+        );
+        assert!(
+            !decide(&built, Action::Write, &root.join("src/main.rs")),
+            "docs must not write source"
+        );
+        assert!(
+            !decide(&built, Action::Write, &root.join(".git/config")),
+            "docs must not write Git internals"
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains("You edit documentation only. Preserve frontmatter and code fences, and do not change code or configuration."),
+            "the workspace persona leads the composed prompt"
+        );
+
+        // The session may be Full access; read-only still caps it at read-only
+        // and registers no writer.
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        settings.global.default_preset = "read-only".to_string();
+        let built = build(&settings);
+        let mut tools: Vec<String> = built
+            .plugins
+            .iter()
+            .flat_map(|plugin| plugin.tools.clone())
+            .collect();
+        tools.sort();
+        assert_eq!(
+            tools,
+            vec![
+                "glob".to_string(),
+                "grep".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+                "read_files".to_string(),
+                "update_plan".to_string()
+            ],
+            "read-only mounts only the read-side tools"
+        );
+        assert!(
+            !decide(&built, Action::Write, &root.join("docs/guide.md")),
+            "a Full-access session cannot write through read-only"
+        );
+        // Search is LOCAL access now: read-only denies egress and keeps no
+        // search tool, which is the honest reading of its own deny-all.
+        assert!(
+            !tool_names(&built).iter().any(|name| name == "web_search"),
+            "read-only offers no local search tool"
+        );
+        assert!(
+            !built.agent.config().web_search,
+            "and the hosted object stays withdrawn"
+        );
+
+        // A read-only ceiling is a Rego source even when the preset declares no
+        // write scope or built-in read-only module.
+        let mut generated = rooted(&root);
+        generated.global.presets.insert(
+            "generated-ro".to_string(),
+            Preset {
+                permission: Some("read-only".to_string()),
+                plugins: vec!["files".to_string()],
+                ..Preset::default()
+            },
+        );
+        generated.global.default_preset = "generated-ro".to_string();
+        let built = build(&generated);
+        assert!(
+            !decide(&built, Action::Write, &root.join("docs/guide.md")),
+            "the generated preset permission policy denies writes"
+        );
+
+        // Federation is the batch-tool mode: parallel calls plus its instruction.
+        settings.global.default_preset = "federation".to_string();
+        let built = build(&settings);
+        assert!(
+            built.agent.config().parallel_tool_calls,
+            "Federation enables parallel calls"
+        );
+        assert!(
+            tool_names(&built).iter().any(|name| name == "web_search"),
+            "Federation keeps web search"
+        );
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(crate::prompts::FEDERATION_PERSONA),
+            "Federation carries its batch-call persona"
+        );
+
+        // Creator is the extension-authoring mode.
+        settings.global.default_preset = "creator".to_string();
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(crate::prompts::CREATOR_PERSONA),
+            "Creator carries its extension-authoring persona"
+        );
+
+        // A preset egress list is intersected with the workspace allowlist;
+        // it can only remove addresses, never add one.
+        //
+        // NEW SEMANTICS: a read-only effective permission now denies egress in
+        // the generated session tier, so the intersection is proved under a
+        // writable ceiling. The read-only egress denial has its own test below.
+        std::fs::create_dir_all(root.join(".bsh")).expect("bsh dir");
+        std::fs::write(
+            root.join(".bsh").join("egress-allowlist"),
+            "1.2.3.4
+5.6.7.8
+",
+        )
+        .expect("egress list");
+        let mut egress = rooted(&root);
+        egress.global.presets.insert(
+            "scoped-egress".to_string(),
+            Preset {
+                permission: Some("workspace-write".to_string()),
+                egress: Some(vec!["1.2.3.4".to_string()]),
+                ..Preset::default()
+            },
+        );
+        egress.global.default_preset = "scoped-egress".to_string();
+        let built = build(&egress);
+        let egress_ok = |ip: &str| {
+            built
+                .policy
+                .check(&PolicyInput::new(
+                    "mcp",
+                    Action::Egress,
+                    Target::host("example.test", ip),
+                ))
+                .is_allowed()
+        };
+        assert!(egress_ok("1.2.3.4"), "the preset allows its address");
+        assert!(
+            !egress_ok("5.6.7.8"),
+            "the preset cannot widen the workspace list and removes an address"
+        );
+
+        // A required policy that is not trusted is refused at the send gate,
+        // before a turn can build without it.
+        egress.global.presets.insert(
+            "strict".to_string(),
+            Preset {
+                policy: Some("package policy.strict\nverdict := {\"allow\": true}".to_string()),
+                policy_mode: Some(crate::settings::global::PolicyMode::Required),
+                ..Preset::default()
+            },
+        );
+        egress.global.default_preset = "strict".to_string();
+        let choice = crate::settings::resolve::SessionChoice {
+            model: None,
+            preset: Some("strict".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            egress.refusal_for(&choice),
+            Some("composer.presetPolicyUntrusted")
+        );
+    }
+
+    /// The master switch removes EVERY preset contribution from the built turn:
+    /// no preset module is compiled, the effective permission is the session's
+    /// own mode, the deny the preset added stops denying, and a bundle only the
+    /// preset withheld comes back. The policy DATA says why, and turning the
+    /// switch back on restores the same preset with the same modules and facts.
+    #[test]
+    fn presets_off_builds_no_preset_contribution_and_the_switch_back_restores_it() {
+        use agent::policy::{Action, PolicyInput, PolicyOrigin, Target};
+
+        let root = scratch("presets-off");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("main");
+        std::fs::write(root.join(".env"), "SECRET=1\n").expect("env");
+
+        let mut settings = rooted(&root);
+        settings.workspace.agent.permission = WORKSPACE_WRITE.to_string();
+        // A preset that narrows on every axis the build reads.
+        settings.global.presets.insert(
+            "guarded".to_string(),
+            Preset {
+                name: Some("guarded".to_string()),
+                permission: Some(READ_ONLY.to_string()),
+                read: Some(vec![".".to_string()]),
+                write: Some(Vec::new()),
+                deny: vec![".env".to_string()],
+                egress: Some(Vec::new()),
+                web_search: Some(false),
+                plugins: vec!["files".to_string()],
+                tools: Some(vec!["read_file".to_string(), "list_dir".to_string()]),
+                // The generated preset-permission module is the one this probe
+                // wants, so the declaration does NOT name builtin:read-only
+                // (naming it would replace the generated module).
+                builtin_policy: vec![
+                    "deny-secrets".to_string(),
+                    "no-shell".to_string(),
+                    "no-egress".to_string(),
+                ],
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "guarded".to_string();
+        let choice = SessionChoice::default();
+        let read_env = |built: &BuiltAgent| {
+            built
+                .policy
+                .check(&PolicyInput::new(
+                    "probe",
+                    Action::Read,
+                    Target::path(root.join(".env")),
+                ))
+                .is_allowed()
+        };
+
+        let on = build_for(&settings, &choice);
+        assert_eq!(on.policy.data().preset, "guarded");
+        assert!(!on.policy.data().presets_disabled);
+        let on_modules: Vec<String> = on.policy.modules().into_iter().map(|m| m.id).collect();
+        for id in [
+            "builtin:preset-scope",
+            "builtin:preset-egress",
+            "builtin:preset-permission",
+            "builtin:deny-secrets",
+            "builtin:no-shell",
+            "builtin:no-egress",
+        ] {
+            assert!(
+                on_modules.iter().any(|module| module == id),
+                "the premise: {id} is compiled while presets apply: {on_modules:?}"
+            );
+        }
+        assert_eq!(on.policy.data().permission, READ_ONLY);
+        assert!(
+            !tool_names(&on).iter().any(|name| name == "bash"),
+            "the premise: the preset withholds the shell bundle"
+        );
+        assert!(!read_env(&on), "the premise: the preset denies .env");
+
+        // OFF: the floor only. Every id and every origin is asserted, so a
+        // preset module cannot hide behind a name this test did not list.
+        settings.global.general.presets_enabled = Some(false);
+        let off = build_for(&settings, &choice);
+        assert_eq!(off.policy.data().preset, "");
+        assert!(
+            off.policy.data().presets_disabled,
+            "the audit records WHY no preset applied"
+        );
+        let modules = off.policy.modules();
+        assert_eq!(
+            modules.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["builtin:baseline", "builtin:session-permission"],
+            "no preset-contributed module is compiled"
+        );
+        assert!(
+            modules
+                .iter()
+                .all(|module| module.origin == PolicyOrigin::Builtin),
+            "and no non-builtin source was added: {modules:?}"
+        );
+        assert_eq!(
+            off.policy.data().permission,
+            WORKSPACE_WRITE,
+            "the effective permission is the session's own mode"
+        );
+        assert!(
+            !off.policy.data().preset_read_restricted
+                && !off.policy.data().preset_write_restricted
+                && off.policy.data().preset_deny_roots.is_empty()
+                && off.policy.data().preset_deny_globs.is_empty(),
+            "no read/write/deny scope applies"
+        );
+        assert!(
+            !off.policy.data().preset_egress_restricted,
+            "no preset egress intersection applies"
+        );
+        assert!(
+            tool_names(&off).iter().any(|name| name == "bash"),
+            "a bundle only the preset switched away comes back"
+        );
+        assert!(
+            tool_names(&off).iter().any(|name| name == "write_file"),
+            "a tool only the preset's allowlist removed comes back"
+        );
+        assert!(read_env(&off), "the deny the preset added no longer denies");
+
+        // ON again: the same preset, the same modules, the same facts.
+        settings.global.general.presets_enabled = None;
+        let back = build_for(&settings, &choice);
+        assert_eq!(back.policy.data().preset, "guarded");
+        assert!(!back.policy.data().presets_disabled);
+        assert_eq!(
+            back.policy
+                .modules()
+                .into_iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>(),
+            on_modules,
+            "the previous preset's modules are back"
+        );
+        assert_eq!(back.policy.data().permission, READ_ONLY);
+        assert!(
+            !tool_names(&back).iter().any(|name| name == "bash"),
+            "and its bundle selection is back"
+        );
+        assert!(!read_env(&back), "and its deny list is back");
+    }
+
+    /// The parent turn gets the subagent tool; an ordinary build (the one the
+    /// child uses) does not, so children cannot recurse.
+    #[test]
+    fn a_parent_turn_carries_the_subagent_tool() {
+        use std::sync::Arc;
+        let settings = bare();
+        let registry = Arc::new(crate::subagent::SubagentRegistry::default());
+        let built = crate::caps::build_agent_for_session_with_subagents(
+            &settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "parent",
+            "parent",
+            registry,
+        );
+        let tool = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get_async("subagent")
+            .expect("the parent turn carries the subagent tool");
+        assert!(
+            tool.description().contains("a focused child agent"),
+            "the tool description tells the model to split a large job"
+        );
+        let prompt = &built.agent.config().system_prompt;
+        assert!(
+            prompt.contains("## Delegating with subagents"),
+            "the standing guidance reaches the model"
+        );
+        assert!(
+            prompt.contains("at most three children"),
+            "the guidance names the concurrency wave"
+        );
+        let plain = build(&settings);
+        assert!(
+            plain
+                .agent
+                .registry()
+                .expect("registry")
+                .get_async("subagent")
+                .is_none(),
+            "a plain build does not carry the tool"
+        );
+        assert!(
+            !plain
+                .agent
+                .config()
+                .system_prompt
+                .contains("## Delegating with subagents"),
+            "guidance only travels with the tool"
+        );
+
+        // The same consequence when a parent build is gated OFF: read-only
+        // removes the tool, so the standing delegation guidance must not
+        // reach the model either.
+        let mut read_only = bare();
+        read_only.workspace.agent.permission = READ_ONLY.to_string();
+        let denied = crate::caps::build_agent_for_session_with_subagents(
+            &read_only,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "parent",
+            "parent",
+            Arc::new(crate::subagent::SubagentRegistry::default()),
+        );
+        assert!(
+            denied
+                .agent
+                .registry()
+                .expect("registry")
+                .get_async("subagent")
+                .is_none(),
+            "read-only withholds the subagent tool"
+        );
+        assert!(
+            !denied
+                .agent
+                .config()
+                .system_prompt
+                .contains("## Delegating with subagents"),
+            "guidance is absent when the tool is not registered"
+        );
+
+        // An allowlist that omits the name is the other way the tool goes
+        // away, and it must take the guidance with it.
+        let narrowed = with_tools(WORKSPACE_WRITE, Some(&["bash"]));
+        let narrowed = crate::caps::build_agent_for_session_with_subagents(
+            &narrowed,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "parent",
+            "parent",
+            Arc::new(crate::subagent::SubagentRegistry::default()),
+        );
+        assert!(
+            narrowed
+                .agent
+                .registry()
+                .expect("registry")
+                .get_async("subagent")
+                .is_none(),
+            "a preset allowlist excluding subagent removes it"
+        );
+        assert!(
+            !narrowed
+                .agent
+                .config()
+                .system_prompt
+                .contains("## Delegating with subagents"),
+            "guidance is absent when an allowlist removes the tool"
+        );
+    }
+
+    /// The collector reads a detached run's answer and lists the session's runs.
+    #[test]
+    fn a_background_subagent_result_is_collectable() {
+        use std::sync::Arc;
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let registry = Arc::new(crate::subagent::SubagentRegistry::default());
+            let mut agent = agent::Agent::from_config(agent::AgentConfig::default());
+            super::attach_subagent_result_tool(&mut agent, registry.clone(), "parent".to_string());
+            let id = registry
+                .try_begin(
+                    "parent",
+                    "parent",
+                    1,
+                    0,
+                    "Inspect",
+                    "look",
+                    crate::subagent::SUBAGENT_SLOTS,
+                )
+                .expect("a free slot");
+            registry.finish(&id, "the answer".to_string(), (3, 4), Vec::new());
+            let tool = agent
+                .registry()
+                .expect("registry")
+                .get_async("subagent_result")
+                .expect("the collector");
+            let out = tool
+                .run(&serde_json::json!({ "subagent_id": id }))
+                .await
+                .expect("the result");
+            assert_eq!(out["status"], "done");
+            assert_eq!(out["result"], "the answer");
+            assert_eq!(out["prompt_tokens"], 3);
+            let listed = tool.run(&serde_json::json!({})).await.expect("the list");
+            assert_eq!(listed["runs"][0]["subagent_id"], id);
+        });
+    }
+
+    /// `send_message` queues behind a running child through the same registry
+    /// call the reader's own composer uses, refuses a run it does not own, and
+    /// refuses a settled run with no live process instead of rebuilding a
+    /// stranger from nothing.
+    #[test]
+    fn send_message_queues_behind_a_running_child_and_refuses_a_stale_run() {
+        use std::sync::Arc;
+        let registry = Arc::new(crate::subagent::SubagentRegistry::default());
+        let built = crate::caps::build_agent_for_session_with_subagents(
+            &bare(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "session",
+            "session",
+            registry.clone(),
+        );
+        let tool = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get_async("send_message")
+            .expect("send_message is attached to a writable turn");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let id = registry
+                .try_begin(
+                    "session",
+                    "session",
+                    1,
+                    0,
+                    "Inspect",
+                    "look",
+                    crate::subagent::SUBAGENT_SLOTS,
+                )
+                .expect("a free slot");
+            let queued = tool
+                .run(&serde_json::json!({
+                    "subagent_id": id,
+                    "message": "also check the tests"
+                }))
+                .await
+                .expect("a running child queues");
+            assert_eq!(queued["status"], "queued");
+            assert_eq!(
+                registry.run(&id).expect("run").pending,
+                vec!["also check the tests".to_string()],
+                "the prompt waits behind the current child turn"
+            );
+
+            let unknown = tool
+                .run(&serde_json::json!({ "subagent_id": "nope", "message": "x" }))
+                .await;
+            assert!(unknown.is_err(), "an unknown run is refused");
+
+            let foreign = registry
+                .try_begin(
+                    "other",
+                    "other",
+                    1,
+                    0,
+                    "Elsewhere",
+                    "elsewhere",
+                    crate::subagent::SUBAGENT_SLOTS,
+                )
+                .expect("a free slot");
+            let refused = tool
+                .run(&serde_json::json!({ "subagent_id": foreign, "message": "x" }))
+                .await;
+            assert!(refused.is_err(), "another conversation's run is invisible");
+
+            registry.finish(&id, "done".to_string(), (1, 1), Vec::new());
+            match tool
+                .run(&serde_json::json!({ "subagent_id": id, "message": "again" }))
+                .await
+            {
+                Err(agent::ToolError::Failed(message)) => {
+                    assert!(message.contains("no live process"), "{message}")
+                }
+                other => panic!("expected the stale-run refusal, got {other:?}"),
+            }
+        });
+    }
+
+    /// The model's automation-task tools ride a writable turn and are absent
+    /// from a read-only one: scheduling spends future turns, so Read Only must
+    /// not reach it.
+    #[test]
+    fn the_build_carries_the_schedule_tools() {
+        let names = tool_names(&build(&bare()));
+        for name in [
+            "schedule_create",
+            "schedule_edit",
+            "schedule_list",
+            "schedule_delete",
+        ] {
+            assert!(names.iter().any(|tool| tool == name), "{name}: {names:?}");
+        }
+
+        let read_only = build(&with_tools(READ_ONLY, None));
+        let names = tool_names(&read_only);
+        assert!(
+            !names.iter().any(|tool| tool.starts_with("schedule_")),
+            "a read-only turn schedules nothing: {names:?}"
+        );
+    }
+
+    /// A create call queues a request the host applies to the real settings
+    /// document; the tool itself never writes it.
+    #[test]
+    fn a_schedule_tool_queues_a_task_the_host_applies() {
+        use crate::schedule::ScheduleQueue;
+        // This test owns the queue for its duration; the sibling queue test
+        // takes the same lock.
+        let _queue = SCHEDULE_QUEUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = ScheduleQueue::global().drain();
+        let built = build(&bare());
+        let created = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "schedule_create",
+                &serde_json::json!({
+                    "prompt": "Check the federation peers and report any that are down.",
+                    "every_seconds": 3600
+                }),
+            )
+            .expect("the task is accepted");
+        let id = created["id"].as_str().expect("an id").to_string();
+        assert_eq!(created["status"], "pending");
+
+        let requests = ScheduleQueue::global().drain();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let crate::schedule::ScheduleRequest::Create {
+            id: queued_id,
+            name,
+            every_seconds,
+            ..
+        } = &requests[0]
+        else {
+            panic!("expected a create request, got {:?}", requests[0]);
+        };
+        assert_eq!(queued_id, &id);
+        assert_eq!(*every_seconds, 3600);
+        assert!(name.starts_with("Check the federation peers"), "{name}");
+
+        let mut global = crate::settings::Settings::default().global;
+        global
+            .apply_schedule_request(&requests[0])
+            .expect("the host applies it");
+        assert_eq!(global.schedules.len(), 1);
+        assert_eq!(global.schedules[0].id, id);
+    }
+
+    /// The list tool reports the saved tasks and any request still waiting for
+    /// the shell, so a create and a list in one turn do not disagree.
+    #[test]
+    fn schedule_list_reports_saved_and_pending_tasks() {
+        use crate::schedule::{ScheduleQueue, ScheduleRequest};
+        let _queue = SCHEDULE_QUEUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = ScheduleQueue::global().drain();
+        let mut settings = bare();
+        settings
+            .global
+            .add_schedule("Nightly", "summarize the day", "session", 86_400)
+            .expect("a saved task");
+        let built = build(&settings);
+        let listed = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute("schedule_list", &serde_json::json!({}))
+            .expect("the list");
+        assert_eq!(listed["schedules"][0]["name"], "Nightly");
+        assert_eq!(listed["schedules"][0]["every_seconds"], 86_400);
+
+        ScheduleQueue::global().push(ScheduleRequest::Remove {
+            id: "task-pending".to_string(),
+        });
+        let listed = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute("schedule_list", &serde_json::json!({}))
+            .expect("the list");
+        assert_eq!(listed["pending"][0]["action"], "delete");
+        let _ = ScheduleQueue::global().drain();
+    }
+
+    /// The shipped everyday presets carry the federation QUERIES. They are
+    /// CALLABLE through `find_tool` without riding every request, and the
+    /// Extensions switch still closes them. Standard withholds distributed
+    /// delegation; the Federation preset grants it (proved separately).
+    #[test]
+    fn the_standard_preset_offers_the_federation_tools() {
+        let built = build(&bare());
+        let names = tool_names(&built);
+        for name in ["federation_status", "federation_peers"] {
+            assert!(names.iter().any(|tool| tool == name), "{name}: {names:?}");
+        }
+        assert!(
+            !names.iter().any(|tool| tool == "federation_delegate"),
+            "Standard keeps delegation on this node: {names:?}"
+        );
+        let advertised: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            advertised.iter().any(|tool| tool == "federation_status"),
+            "the status probe is the signpost in the array: {advertised:?}"
+        );
+        assert!(
+            !advertised.iter().any(|tool| tool == "federation_delegate"),
+            "the rest of the family is withheld: {advertised:?}"
+        );
+        assert!(
+            advertised.iter().any(|tool| tool == "find_tool"),
+            "and the discovery pair is what reaches it: {advertised:?}"
+        );
+
+        let mut off = bare();
+        off.workspace.disabled.extensions = vec!["federation".to_string()];
+        let names = tool_names(&build(&off));
+        assert!(
+            !names.iter().any(|tool| tool.starts_with("federation_")),
+            "the Extensions switch closes the family: {names:?}"
+        );
+    }
+
+    /// `interrupt_agent` aborts the child's task, releases its slot and marks
+    /// the run failed with the reason; a run that already settled reports
+    /// itself instead of being rewritten.
+    #[test]
+    fn interrupt_agent_stops_a_running_child() {
+        use std::sync::Arc;
+        let registry = Arc::new(crate::subagent::SubagentRegistry::default());
+        let built = crate::caps::build_agent_for_session_with_subagents(
+            &bare(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "session",
+            "session",
+            registry.clone(),
+        );
+        let tool = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get_async("interrupt_agent")
+            .expect("interrupt_agent is attached to a writable turn");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let id = registry
+                .try_begin(
+                    "session",
+                    "session",
+                    1,
+                    0,
+                    "Slow",
+                    "wait",
+                    crate::subagent::SUBAGENT_SLOTS,
+                )
+                .expect("a free slot");
+            let task = tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            });
+            registry.set_handle(&id, task.abort_handle());
+
+            let stopped = tool
+                .run(&serde_json::json!({ "subagent_id": id }))
+                .await
+                .expect("a running child is interruptible");
+            assert_eq!(stopped["interrupted"], true);
+            assert_eq!(stopped["status"], "failed");
+            let run = registry.run(&id).expect("run");
+            assert_eq!(run.status.as_str(), "failed");
+            assert!(
+                run.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("interrupted")),
+                "{:?}",
+                run.error
+            );
+            assert_eq!(registry.running_count(), 0, "the slot was released");
+            assert!(task.await.is_err(), "the child task was aborted");
+
+            // A settled run keeps its own answer: interrupt changes nothing.
+            let settled = registry
+                .try_begin(
+                    "session",
+                    "session",
+                    1,
+                    0,
+                    "Done",
+                    "finish",
+                    crate::subagent::SUBAGENT_SLOTS,
+                )
+                .expect("a free slot");
+            registry.finish(&settled, "the answer".to_string(), (1, 1), Vec::new());
+            let out = tool
+                .run(&serde_json::json!({ "subagent_id": settled }))
+                .await
+                .expect("a settled run reports itself");
+            assert_eq!(out["interrupted"], false);
+            assert_eq!(out["status"], "done");
+            assert_eq!(
+                registry.run(&settled).expect("run").result.as_deref(),
+                Some("the answer")
+            );
+        });
+    }
+
+    /// A preset's Rego module applies only when the reader trusted it. A
+    /// trusted preset narrows the baseline; an untrusted one is ignored rather
+    /// than failing, so the baseline and workspace policy still hold.
+    #[test]
+    fn a_trusted_preset_policy_narrows_and_an_untrusted_one_is_ignored() {
+        let root = scratch("preset-policy");
+        std::fs::write(root.join("secret.txt"), "shh").expect("secret");
+        std::fs::write(root.join("notes.txt"), "notes").expect("notes");
+        let rego = r#"package policy.preset
+
+# rule: no-secret-reads
+verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are not readable"} if {
+    input.action == "read"
+    contains(input.target.path, "secret")
+} else := {"allow": true, "rule": "preset-allow"}
+"#;
+        let mut settings = full_access(&root);
+        settings.global.presets.insert(
+            "strict".to_string(),
+            Preset {
+                plugins: vec!["files".to_string()],
+                policy: Some(rego.to_string()),
+                trusted: true,
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "strict".to_string();
+
+        let trusted = build(&settings);
+        let registry = trusted.agent.registry().expect("registry");
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("secret.txt").to_string_lossy() }),
+            )
+            .expect_err("the trusted preset's policy narrows the read");
+        assert!(error.to_string().contains("no-secret-reads"), "{error}");
+        registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("notes.txt").to_string_lossy() }),
+            )
+            .expect("an ordinary read still passes");
+
+        settings.global.presets.get_mut("strict").unwrap().trusted = false;
+        let untrusted = build(&settings);
+        untrusted
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("secret.txt").to_string_lossy() }),
+            )
+            .expect("an untrusted preset's policy is ignored");
+    }
+
+    /// The policy input already carries the preset id, before the preset UI
+    /// exists: the data document is where the authority half of a principal
+    /// lives.
+    #[test]
+    fn the_policy_carries_the_preset_id() {
+        let mut settings = bare();
+        settings.global.presets.insert(
+            "tight".to_string(),
+            Preset {
+                name: Some("tight".to_string()),
+                plugins: vec!["shell".to_string()],
+                description: None,
+                order: None,
+                policy: None,
+                trusted: false,
+                ..Default::default()
+            },
+        );
+        settings.global.default_preset = "tight".to_string();
+        let built = build(&settings);
+        assert_eq!(built.policy.data().preset, "tight");
+    }
+
+    /// A provider carries the choice as an id, and the settings document that
+    /// writes it never carries the secret.
+    #[test]
+    fn a_vault_choice_round_trips_without_the_secret() {
+        let mut settings = provider_without_a_credential();
+        if let Some(provider) = settings.global.providers.get_mut("work") {
+            provider.api_key_vault = Some("keys/chosen".to_string());
+        }
+        let secret = "sk-never-in-settings";
+        let vault = vault_holding("roundtrip", "keys/chosen", secret);
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert_eq!(built.agent.config().api_key, secret);
+
+        let text = toml::to_string(&settings.global).expect("the settings document");
+        assert!(
+            text.contains("api_key_vault = \"keys/chosen\""),
+            "the choice is serialized as an id: {text}"
+        );
+        assert!(!text.contains(secret), "the secret is in the settings tree");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_key =")),
+            "only the vault id is stored: {text}"
+        );
+        let back = crate::settings::global::GlobalSettings::from_toml(&text)
+            .expect("the provider round-trips");
+        assert_eq!(
+            back.providers
+                .get("work")
+                .and_then(|provider| provider.api_key_vault.as_deref()),
+            Some("keys/chosen"),
+            "the choice survives a round trip"
+        );
+    }
+
+    /// With no vault file, an empty key stays empty: environment authentication
+    /// is a real mode and the vault must not invent a refusal.
+    #[test]
+    fn no_vault_leaves_the_environment_path_alone() {
+        let settings = provider_without_a_credential();
+        let directory =
+            std::env::temp_dir().join(format!("bsh-caps-no-vault-{}", std::process::id()));
+        let vault = Vault::new(directory.join(".vault.bin"));
+        let built = build_agent(
+            &settings,
+            &vault,
+            &work_choice(),
+            &crate::mcp::McpPool::default(),
+        );
+        assert!(built.agent.config().api_key.is_empty());
+        assert!(
+            built.credential_error.is_none(),
+            "no vault is not a refusal"
+        );
+        assert!(crate::caps::credential_error(&settings, &vault, &work_choice()).is_none());
+    }
+
+    /// A contributed provider's models resolve through the same lookup a
+    /// hand-declared one does, and the reader's own tree still wins an id
+    /// collision.
+    ///
+    /// This is the seam that makes a DSH package's models usable: the model
+    /// layer reads ONE tree, so the composer menu, the send gate and the build
+    /// cannot disagree about whether a plugin's endpoint exists.
+    #[test]
+    fn a_contributed_provider_resolves_and_never_shadows_the_readers_own() {
+        use crate::settings::global::{GlobalSettings, ModelRef, Provider};
+        use std::collections::BTreeMap;
+
+        let mut global = GlobalSettings::default();
+        let mut node = BTreeMap::new();
+        node.insert(
+            "deepseek-v4.1-flash-free".to_string(),
+            ModelEntry {
+                model: "deepseek-v4.1-flash-free".to_string(),
+                api_mode: Some("chat".to_string()),
+                ..ModelEntry::default()
+            },
+        );
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "zen".to_string(),
+            Provider {
+                name: Some("OpenCode Zen".to_string()),
+                base_url: "https://opencode.ai/zen/v1".to_string(),
+                api_mode: Some("chat".to_string()),
+                models: node,
+                ..Provider::default()
+            },
+        );
+        let mut keys = BTreeMap::new();
+        keys.insert("zen".to_string(), false);
+        let mut owners = BTreeMap::new();
+        owners.insert("zen".to_string(), "@opencode2dsh/dsh-plugin".to_string());
+        global.set_plugin_providers(providers, keys, owners);
+
+        let reference = ModelRef {
+            provider: "zen".to_string(),
+            model: "deepseek-v4.1-flash-free".to_string(),
+        };
+        let (provider, leaf) = global.lookup(&reference).expect("a plugin model resolves");
+        assert_eq!(provider.base_url, "https://opencode.ai/zen/v1");
+        assert_eq!(leaf.model, "deepseek-v4.1-flash-free");
+        assert!(global.is_plugin_provider("zen"));
+        assert_eq!(
+            global.plugin_provider_owner("zen"),
+            Some("@opencode2dsh/dsh-plugin")
+        );
+        assert!(
+            !global.provider_requires_key("zen"),
+            "the package declared an anonymous lane"
+        );
+        assert!(global.provider_ids().contains(&"zen".to_string()));
+
+        // The reader declaring the same id takes it back, and the plugin's
+        // endpoint is no longer what a session resolves against.
+        global.providers.insert(
+            "zen".to_string(),
+            Provider {
+                base_url: "https://mine.example/v1".to_string(),
+                models: BTreeMap::from([(
+                    "deepseek-v4.1-flash-free".to_string(),
+                    ModelEntry {
+                        model: "deepseek-v4.1-flash-free".to_string(),
+                        ..ModelEntry::default()
+                    },
+                )]),
+                ..Provider::default()
+            },
+        );
+        let (provider, _) = global.lookup(&reference).expect("still resolves");
+        assert_eq!(
+            provider.base_url, "https://mine.example/v1",
+            "a hand-declared provider is never shadowed by a package"
+        );
+        assert!(!global.is_plugin_provider("zen"));
+        assert!(
+            global.provider_requires_key("zen"),
+            "a provider the reader declared is key-bearing again"
+        );
+    }
+
+    /// The lowering is a pure function of the declaration: a provider node
+    /// carries no credential, and every declared model lands as its own id.
+    #[test]
+    fn a_contributed_provider_lowers_without_a_credential() {
+        use agent::extensions::{ProviderContribution, ProviderModel};
+
+        let contribution = ProviderContribution::new("zen", "https://opencode.ai/zen/v1")
+            .with_name("OpenCode Zen")
+            .with_api_mode("chat")
+            .with_model(ProviderModel {
+                id: "glm-5.3-flash-free".to_string(),
+                name: Some("GLM 5.3 Flash".to_string()),
+                max_tokens: Some(8192),
+                input_types: Some(vec!["text".to_string(), "image".to_string()]),
+                reasoning_effort: None,
+            });
+        let node = plugin_provider_node(&contribution);
+        assert_eq!(node.base_url, "https://opencode.ai/zen/v1");
+        assert!(node.api_key_vault.is_none(), "a package ships no secret");
+        assert!(node.legacy_api_key.is_none());
+        assert!(
+            !node.declared,
+            "the pane must not offer to delete a package's provider as the reader's"
+        );
+        let leaf = node.models.get("glm-5.3-flash-free").expect("the model");
+        assert_eq!(leaf.model, "glm-5.3-flash-free");
+        assert_eq!(leaf.max_tokens, Some(8192));
+        assert_eq!(
+            leaf.input_types.as_deref(),
+            Some(["text".to_string(), "image".to_string()].as_slice())
+        );
+    }
+
+    /// A provider declared by an installed package reaches the settings the
+    /// build reads, and a package switched off contributes nothing.
+    ///
+    /// This is the whole seam end to end: a package directory on disk, the
+    /// inventory entry that names it, and the provider set the composer, the
+    /// send gate and the build all read.
+    #[test]
+    fn an_installed_package_contributes_its_providers_and_an_uninstalled_one_does_not() {
+        use crate::settings::global::{GlobalSettings, InstalledExtension, InstalledStandard};
+
+        let scratch =
+            std::env::temp_dir().join(format!("bsh-plugin-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let package = scratch.join("zen");
+        std::fs::create_dir_all(package.join("providers")).expect("the descriptor directory");
+        std::fs::write(
+            package.join("package.json"),
+            serde_json::json!({
+                "name": "@local/zen",
+                "version": "0.3.14",
+                "dsh": { "manifestVersion": 1 },
+            })
+            .to_string(),
+        )
+        .expect("the manifest");
+        std::fs::write(
+            package.join("providers/zen.json"),
+            serde_json::json!({
+                "id": "zen",
+                "name": "OpenCode Zen",
+                "base_url": "https://opencode.ai/zen/v1",
+                "apiMode": "chat",
+                "requiresKey": false,
+                "models": [
+                    { "id": "deepseek-v4.1-flash-free" },
+                    { "id": "glm-5.3-flash-free" },
+                ],
+            })
+            .to_string(),
+        )
+        .expect("the descriptor");
+
+        let mut settings = crate::settings::Settings {
+            global: GlobalSettings::default(),
+            ..crate::settings::Settings::default()
+        };
+        settings.global.extensions.push(InstalledExtension {
+            id: "@local/zen".to_string(),
+            name: "@local/zen".to_string(),
+            display_name: "Zen Models".to_string(),
+            description: String::new(),
+            version: "0.3.14".to_string(),
+            standard: InstalledStandard::Dsh,
+            source_label: "test".to_string(),
+            install_target: "@local/zen@0.3.14".to_string(),
+            path: Some(package.to_string_lossy().to_string()),
+            managed: true,
+            installed_at: 1_700_000_000,
+            trusted: false,
+            trusted_path: None,
+        });
+
+        refresh_plugin_providers(&mut settings);
+        assert!(
+            settings.global.is_plugin_provider("zen"),
+            "the installed package's provider is live"
+        );
+        assert_eq!(
+            settings.global.plugin_provider_owner("zen"),
+            Some("@local/zen")
+        );
+        assert!(
+            !settings.global.provider_requires_key("zen"),
+            "the package declared an anonymous lane"
+        );
+        let reference = crate::settings::global::ModelRef {
+            provider: "zen".to_string(),
+            model: "glm-5.3-flash-free".to_string(),
+        };
+        let (provider, leaf) = settings
+            .global
+            .lookup(&reference)
+            .expect("a plugin model resolves for the build");
+        assert_eq!(provider.base_url, "https://opencode.ai/zen/v1");
+        assert_eq!(leaf.model, "glm-5.3-flash-free");
+        // The composer's own catalogue reads the same set.
+        assert!(
+            settings
+                .catalogs_by_provider("zen")
+                .iter()
+                .any(|(id, models)| id == "zen" && models.len() == 2),
+            "the model picker offers the plugin's models"
+        );
+
+        // Removing the package clears every trace: the maps are rebuilt, never
+        // merged, so no stale endpoint survives an uninstall.
+        settings.global.extensions.clear();
+        refresh_plugin_providers(&mut settings);
+        assert!(
+            !settings.global.is_plugin_provider("zen"),
+            "no inventory entry means no contributed provider"
+        );
+        assert!(
+            settings.global.lookup(&reference).is_none(),
+            "and the model no longer resolves"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+    /// A capability chip has to name something the reader can reach.
+    ///
+    /// The registry accepts commands, panels and prompts, but bsh draws
+    /// none of them: the composer palette is a fixed list, nothing renders a
+    /// registry panel, and a prompt has no consumer. Listing them would put a
+    /// chip on a control that does not exist.
+    /// A launch refresh must open the extension host before it reads the
+    /// contributed provider cache: this is the seam that makes an installed
+    /// BSH package's provider appear in the picker at all.
+    #[test]
+    fn a_launch_refresh_surfaces_a_bsh_package_provider() {
+        let scratch =
+            std::env::temp_dir().join(format!("bsh-launch-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let root = scratch.join("extensions");
+        let package = scratch.join("pkg");
+        std::fs::create_dir_all(package.join("providers").join("models")).expect("descriptor dir");
+        std::fs::write(
+            package.join("extension.toml"),
+            r#"
+schema_version = "2.0"
+[extension]
+id = "com.example.keyless"
+name = "Keyless"
+version = "1.0.0"
+description = "keyless provider fixture"
+[compatibility]
+host = ">=3.0.0, <4.0.0"
+extension_api = "^1.0"
+[runtime]
+kind = "declarative"
+[capabilities]
+required = ["agent.tools.register"]
+[[contribution]]
+kind = "model-provider"
+id = "zen"
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            package.join("providers").join("models").join("zen.json"),
+            r#"{"name":"Open","base_url":"http://127.0.0.1:9/v1","api_mode":"chat","requires_key":false,"one":{"model":"one"}}"#,
+        )
+        .expect("descriptor");
+
+        let arguments: Vec<String> = vec![
+            "--root".into(),
+            root.display().to_string(),
+            "install".into(),
+            package.display().to_string(),
+        ];
+        assert_eq!(crate::extension::cli(&arguments), 0, "the fixture installs");
+        let mut settings = crate::settings::Settings {
+            save_root: Some(scratch.clone()),
+            ..Default::default()
+        };
+        refresh_plugin_providers(&mut settings);
+        assert!(
+            settings
+                .global
+                .is_plugin_provider("ext.com.example.keyless.zen"),
+            "the host provider is cached: {:?}",
+            settings.global.provider_ids()
+        );
+        assert!(
+            !settings
+                .global
+                .provider_requires_key("ext.com.example.keyless.zen"),
+            "the descriptor's keyless lane survives the refresh"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn only_the_capabilities_this_shell_draws_are_surfaced() {
+        use agent::extensions::Capability;
+
+        let loaded = vec![
+            Capability::Tools,
+            Capability::Hooks,
+            Capability::Skills,
+            Capability::Models,
+            Capability::Commands,
+            Capability::Panels,
+            Capability::Prompts,
+        ];
+        assert_eq!(
+            surfaced_capabilities(&loaded),
+            vec![
+                Capability::Tools,
+                Capability::Hooks,
+                Capability::Skills,
+                Capability::Models
+            ],
+            "the four kinds bsh draws survive, and the three it does not are dropped"
+        );
+
+        // A package whose whole payload was refused surfaces nothing, which is
+        // what the row beside its refusal disclosure has to say.
+        assert!(
+            surfaced_capabilities(&[]).is_empty(),
+            "nothing loaded means nothing to claim"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The preset network policy, proved end to end through a real shell.
+    //
+    // The observable of every case here is a SIDE EFFECT, not an error
+    // string: a listener that counts its hits, a marker file the command
+    // would have written, and the `network` field the bash tool reports.
+    // ------------------------------------------------------------------
+
+    /// The host's non-loopback IPv4 address, the only address a heel proxy
+    /// will forward to (it refuses a host-local target), so a probe can prove
+    /// a real connection was or was not made.
+    fn lan_address() -> Option<String> {
+        let candidates: &[(&str, &[&str])] = &[
+            ("/usr/sbin/ipconfig", &["getifaddr", "en0"]),
+            ("/usr/sbin/ipconfig", &["getifaddr", "en1"]),
+            (
+                "/bin/sh",
+                &["-c", "hostname -I 2>/dev/null | awk '{print $1}'"],
+            ),
+        ];
+        for (program, args) in candidates {
+            if !std::path::Path::new(program).exists() {
+                continue;
+            }
+            let Ok(output) = std::process::Command::new(program).args(*args).output() else {
+                continue;
+            };
+            let host = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if host.parse::<std::net::IpAddr>().is_ok()
+                && !host.starts_with("127.")
+                && !host.starts_with("169.254.")
+            {
+                return Some(host);
+            }
+        }
+        None
+    }
+
+    /// Serve HTTP 200 to every connection, counting the hits.
+    fn serve_http(
+        listener: std::net::TcpListener,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read as _, Write as _};
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let hits = std::sync::Arc::clone(&hits);
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while stream.read(&mut byte).unwrap_or(0) == 1 {
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    );
+                });
+            }
+        });
+    }
+
+    /// A settings document whose workspace allowlist is `entries`, with one
+    /// custom preset selected for the turn.
+    fn preset_build(
+        root: &std::path::Path,
+        entries: &str,
+        preset: Preset,
+    ) -> (Settings, BuiltAgent) {
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(root.join(".bsh/egress-allowlist"), entries).expect("egress list");
+        let mut settings = rooted(root);
+        settings.global.presets.insert("probe".to_string(), preset);
+        settings.global.default_preset = "probe".to_string();
+        let built = build(&settings);
+        (settings, built)
+    }
+
+    /// A shell-keeping preset that declares `egress = []` must refuse a
+    /// command whose literal endpoint the WORKSPACE allowlist permits: the
+    /// refusal names the preset's rule, no process side effect appears, the
+    /// listener sees no hit, and the derived spec has no proxy at all.
+    #[test]
+    fn a_deny_all_preset_refuses_a_workspace_allowed_endpoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("preset-egress-deny-all");
+        let (settings, built) = preset_build(
+            &root,
+            &format!("{host}\n"),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                // A DECLARED empty list: deny all network, even here.
+                egress: Some(Vec::new()),
+                ..Preset::default()
+            },
+        );
+        let url = format!("http://{host}:{port}/");
+        let command = format!("printf ran > ran.txt && curl -sS --max-time 3 -o /dev/null {url}");
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+        match bash.run(&serde_json::json!({ "command": command })) {
+            Err(agent::ToolError::Failed(message)) => assert!(
+                message.contains("preset-egress"),
+                "the refusal names the preset's rule: {message}"
+            ),
+            other => panic!("expected the preset to refuse the command, got {other:?}"),
+        }
+        assert!(
+            !root.join("ran.txt").exists(),
+            "the command's side effect happened before the network decision"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a refused command connected"
+        );
+
+        // The derived set is EMPTY, which is what tells the backend to start no
+        // proxy at all: the kernel denies.
+        let eff = settings.effective();
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            &eff.permission.effective,
+            agent::sandbox::Principal::new("bash", "session", "probe"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &agent::sandbox::Egress::DenyAll,
+            "a deny-all preset must derive no proxy"
+        );
+        assert!(!spec.egress().is_allowed(), "no proxy is the kernel deny");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A preset whose network policy touches variables the command tier cannot
+    /// see still has the KERNEL refuse it, and the tool result reports
+    /// `network: "deny-all"`.
+    #[test]
+    fn a_deny_all_preset_reports_deny_all_and_the_kernel_holds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("preset-egress-deny-all-kernel");
+        let (_settings, built) = preset_build(
+            &root,
+            &format!("{host}\n"),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                egress: Some(Vec::new()),
+                ..Preset::default()
+            },
+        );
+        // The endpoint is hidden in variables, so the command tier cannot name
+        // it and only the kernel can refuse the connection.
+        let command = format!(
+            "H={host}; P={port}; printf ran > ran.txt && curl -sS --max-time 3 -o /dev/null \"http://$H:$P/\""
+        );
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+        let result = bash
+            .run(&serde_json::json!({ "command": command }))
+            .expect("the command runs");
+        assert_eq!(
+            result["network"],
+            serde_json::json!("deny-all"),
+            "the honest signal for a deny-all preset: {result}"
+        );
+        assert!(
+            !result["success"].as_bool().unwrap_or(true),
+            "deny-all let the request out: {result}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a connection reached the listener"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A preset that intersects: the workspace allows A and B, the preset
+    /// allows A, so A is reachable through the proxy and B is refused with the
+    /// preset's rule named.
+    #[test]
+    fn an_intersecting_preset_reaches_what_both_allow_and_refuses_the_rest() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host_a) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        // A second address the workspace lists but the preset does not: the
+        // host's own address is enough because the preset keeps only A.
+        let listener_a = std::net::TcpListener::bind((host_a.as_str(), 0)).expect("a listener");
+        let port_a = listener_a.local_addr().expect("its port").port();
+        let hits_a = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener_a, std::sync::Arc::clone(&hits_a));
+
+        let root = scratch("preset-egress-intersect");
+        // The workspace lists TWO entries; the preset keeps the first.
+        let (_settings, built) = preset_build(
+            &root,
+            &format!("{host_a}\n203.0.113.9\n"),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                egress: Some(vec![host_a.clone()]),
+                ..Preset::default()
+            },
+        );
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+
+        // A: allowed by both tiers, so the proxy forwards it and the listener
+        // answers 200.
+        let allowed = bash
+            .run(&serde_json::json!({
+                "command": format!("curl -sS --max-time 3 http://{host_a}:{port_a}/")
+            }))
+            .expect("the command runs");
+        assert_eq!(
+            allowed["network"],
+            serde_json::json!("allowlist"),
+            "{allowed}"
+        );
+        assert!(allowed["success"].as_bool().unwrap_or(false), "{allowed}");
+        assert!(
+            allowed["stdout"].as_str().unwrap_or("").contains("ok"),
+            "{allowed}"
+        );
+        assert_eq!(
+            hits_a.load(Ordering::SeqCst),
+            1,
+            "the allowed endpoint was reached"
+        );
+
+        // B: allowed by the workspace, removed by the preset. The command tier
+        // refuses it and names the preset's rule.
+        match bash.run(&serde_json::json!({
+            "command": "curl -sS --max-time 3 -o /dev/null http://203.0.113.9/"
+        })) {
+            Err(agent::ToolError::Failed(message)) => assert!(
+                message.contains("preset-egress"),
+                "the preset rule refused the removed entry: {message}"
+            ),
+            other => panic!("expected the preset to refuse the removed entry, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Run one shell command from a build and return the structured result.
+    ///
+    /// A policy refusal is a panic here: every case below hides its write or
+    /// endpoint in a variable so the command tier must pass and the outcome is
+    /// decided by confinement, which is what the test is about.
+    fn bash_result(built: &BuiltAgent, command: &str) -> serde_json::Value {
+        built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash")
+            .run(&serde_json::json!({ "command": command }))
+            .unwrap_or_else(|error| panic!("the command tier refused: {error}"))
+    }
+
+    /// One settings tree with a full-access session and one preset carrying an
+    /// explicit sandbox choice.
+    fn preset_sandbox_build(
+        root: &std::path::Path,
+        sandbox: crate::settings::global::SandboxChoice,
+        permission: &str,
+        session_permission: &str,
+    ) -> (Settings, BuiltAgent) {
+        let mut settings = rooted(root);
+        settings.workspace.agent.permission = session_permission.to_string();
+        settings.global.presets.insert(
+            "probe".to_string(),
+            Preset {
+                permission: Some(permission.to_string()),
+                sandbox: Some(sandbox),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "probe".to_string();
+        let built = build(&settings);
+        (settings, built)
+    }
+
+    /// `sandbox = "none"` at full access is the widening arm working as
+    /// designed: the shell runs outside the workspace and writes a file there.
+    ///
+    /// The path arrives through a shell variable, so the command tier cannot
+    /// see it and the absence of the kernel boundary is what lets the write
+    /// land. This is the cost the docs state, proved rather than implied.
+    #[test]
+    fn a_full_access_preset_with_sandbox_none_runs_outside_the_workspace() {
+        let root = scratch("preset-sandbox-none-write");
+        let outside_dir = scratch("preset-sandbox-none-outside");
+        let outside = outside_dir.join(format!("escaped-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let (settings, built) = preset_sandbox_build(
+            &root,
+            crate::settings::global::SandboxChoice::Off,
+            FULL_ACCESS,
+            FULL_ACCESS,
+        );
+        let resolved = settings.effective();
+        assert!(
+            !resolved.sandbox.heel,
+            "the preset asked for an unconfined shell"
+        );
+        assert!(resolved.sandbox.off_by_preset);
+        assert!(resolved.sandbox.refusal.is_none());
+
+        let result = bash_result(
+            &built,
+            &format!("T=\"{}\"; printf escaped > \"$T\"", outside.display()),
+        );
+        assert_eq!(result["sandbox"], serde_json::json!("none"), "{result}");
+        assert_eq!(
+            result["sandbox_reason"],
+            serde_json::json!(agent::tools::bash::PRESET_SANDBOX_OFF_REASON),
+            "the result names who turned the sandbox off: {result}"
+        );
+        assert!(
+            result["success"].as_bool().unwrap_or(false),
+            "an unsandboxed command reached its outside target: {result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("the outside file"),
+            "escaped"
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The guard, in both narrower directions: a preset that turns the sandbox
+    /// off under a workspace-write or read-only ceiling is REFUSED with
+    /// `preset-sandbox-widens`, the effective sandbox stays heel, and the same
+    /// command leaves no marker.
+    #[test]
+    fn a_narrow_preset_cannot_turn_the_sandbox_off() {
+        for ceiling in [WORKSPACE_WRITE, READ_ONLY] {
+            let root = scratch(&format!("preset-sandbox-widens-{ceiling}"));
+            let outside_dir = scratch(&format!("preset-sandbox-widens-out-{ceiling}"));
+            let outside = outside_dir.join(format!("marker-{}-{ceiling}.txt", std::process::id()));
+            let _ = std::fs::remove_file(&outside);
+            let (settings, built) = preset_sandbox_build(
+                &root,
+                crate::settings::global::SandboxChoice::Off,
+                ceiling,
+                ceiling,
+            );
+            let resolved = settings.effective();
+            assert_eq!(
+                resolved.sandbox.refusal,
+                Some(crate::settings::resolve::PRESET_SANDBOX_WIDENS),
+                "{ceiling}: the declaration is refused, not silently ignored"
+            );
+            assert!(resolved.sandbox.heel, "{ceiling}: the shell stays confined");
+            assert!(!resolved.sandbox.off_by_preset);
+            assert_eq!(
+                settings.refusal_for(&SessionChoice::default()),
+                Some("composer.presetSandboxWidens"),
+                "{ceiling}: the send gate names the rule's locale key"
+            );
+
+            let registry = built.agent.registry().expect("registry");
+            if ceiling == WORKSPACE_WRITE {
+                let result = bash_result(
+                    &built,
+                    &format!("T=\"{}\"; printf escaped > \"$T\"", outside.display()),
+                );
+                assert_eq!(result["sandbox"], serde_json::json!("heel"), "{result}");
+                assert!(
+                    !result["success"].as_bool().unwrap_or(true),
+                    "the heel kernel let the outside write through: {result}"
+                );
+            } else {
+                assert!(
+                    registry.get("bash").is_none(),
+                    "read-only registers no shell, so the refused preset cannot run the command at all"
+                );
+            }
+            assert!(
+                !outside.exists(),
+                "{ceiling}: the command's marker exists, so it ran despite the refusal"
+            );
+            let _ = std::fs::remove_file(&outside);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The narrowing arm: `sandbox = "heel"` confines even a full-access
+    /// session, and the result reports the backend that actually ran.
+    #[test]
+    fn an_explicit_heel_confines_a_full_access_session() {
+        let root = scratch("preset-sandbox-heel-full");
+        let outside_dir = scratch("preset-sandbox-heel-outside");
+        let outside = outside_dir.join(format!("escaped-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let (settings, built) = preset_sandbox_build(
+            &root,
+            crate::settings::global::SandboxChoice::Heel,
+            FULL_ACCESS,
+            FULL_ACCESS,
+        );
+        let resolved = settings.effective();
+        assert_eq!(
+            resolved.permission.effective, FULL_ACCESS,
+            "the permission itself is still full access; heel is the extra ceiling"
+        );
+        assert!(resolved.sandbox.heel, "the preset narrowed the shell");
+
+        let result = bash_result(
+            &built,
+            &format!("T=\"{}\"; printf escaped > \"$T\"", outside.display()),
+        );
+        assert_eq!(result["sandbox"], serde_json::json!("heel"), "{result}");
+        assert!(
+            !result["success"].as_bool().unwrap_or(true),
+            "the heel kernel allowed the outside write: {result}"
+        );
+        assert!(!outside.exists(), "the sandbox let the write escape");
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The SANDBOX master switch, both directions, proved on the filesystem.
+    ///
+    /// Off: a command that assembles its target in a variable writes OUTSIDE the
+    /// workspace, because heel is not applied - and the result names the SETTINGS
+    /// switch, not a preset's arm and not the permission's release. On: the SAME
+    /// command is refused by heel and leaves no marker.
+    #[test]
+    fn the_sandbox_switch_off_releases_the_shell_and_names_itself() {
+        let root = scratch("sandbox-switch-shell");
+        let outside_dir = scratch("sandbox-switch-shell-out");
+        let outside = outside_dir.join(format!("escaped-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let command = format!("T=\"{}\"; printf escaped > \"$T\"", outside.display());
+
+        // ON: the premise, and the confinement the switch takes away.
+        let mut settings = rooted(&root);
+        let resolved = settings.effective();
+        assert!(
+            resolved.sandbox.heel,
+            "the premise: workspace-write confines"
+        );
+        assert!(!resolved.sandbox.off_by_settings);
+        let built = build(&settings);
+        let result = bash_result(&built, &command);
+        assert_eq!(result["sandbox"], serde_json::json!("heel"), "{result}");
+        assert!(
+            !result["success"].as_bool().unwrap_or(true),
+            "heel refused the outside write: {result}"
+        );
+        assert!(!outside.exists(), "the sandbox let the write escape");
+
+        // OFF: the same tree, one field.
+        settings.global.general.sandbox_enabled = Some(false);
+        let resolved = settings.effective();
+        assert!(
+            !resolved.sandbox.heel,
+            "heel is not applied while the switch is off"
+        );
+        assert!(resolved.sandbox.off_by_settings);
+        assert!(
+            resolved.sandbox.refusal.is_none(),
+            "the switch refuses no declaration"
+        );
+        assert_eq!(
+            crate::settings::resolve::sandbox_off_reason(&resolved.sandbox),
+            Some(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON)
+        );
+        let built = build(&settings);
+        let result = bash_result(&built, &command);
+        assert_eq!(result["sandbox"], serde_json::json!("none"), "{result}");
+        assert_eq!(
+            result["sandbox_reason"],
+            serde_json::json!(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON),
+            "the result names the SETTINGS switch, not the preset or the release: {result}"
+        );
+        assert!(
+            result["success"].as_bool().unwrap_or(false),
+            "an unsandboxed command reached its outside target: {result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("the outside file"),
+            "escaped"
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The master switch overrides EVERY preset's sandbox arm: the four shipped
+    /// presets and a custom `heel` one, each resolved heel=false with
+    /// the settings reason while off, and its declared arm again while on.
+    ///
+    /// The preset keeps applying everywhere else - it is still the authority, its
+    /// bundles still mount and its ceiling still caps - which is what keeps this
+    /// switch from being a second "presets off".
+    #[test]
+    fn the_sandbox_switch_overrides_every_preset_arm() {
+        let root = scratch("sandbox-switch-presets");
+        let mut settings = rooted(&root);
+        settings.global.presets.insert(
+            "heel-probe".to_string(),
+            Preset {
+                permission: Some(FULL_ACCESS.to_string()),
+                sandbox: Some(crate::settings::global::SandboxChoice::Heel),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                ..Preset::default()
+            },
+        );
+        for id in [
+            "standard",
+            "federation",
+            "creator",
+            "read-only",
+            "heel-probe",
+        ] {
+            settings.global.default_preset = id.to_string();
+            settings.global.general.sandbox_enabled = None;
+            let on = settings.effective();
+            assert_eq!(
+                on.preset_id, id,
+                "{id}: the preset is the authority while on"
+            );
+            assert!(
+                on.sandbox.heel,
+                "{id}: its declared arm confines while the switch is on"
+            );
+            assert!(!on.sandbox.off_by_settings, "{id}");
+
+            settings.global.general.sandbox_enabled = Some(false);
+            let off = settings.effective();
+            assert!(
+                !off.sandbox.heel,
+                "{id}: no preset can confine while the switch is off"
+            );
+            assert!(
+                off.sandbox.off_by_settings,
+                "{id}: the switch is what removed the confinement"
+            );
+            assert_eq!(
+                crate::settings::resolve::sandbox_off_reason(&off.sandbox),
+                Some(agent::tools::bash::SANDBOX_SETTINGS_OFF_REASON),
+                "{id}: exactly one reason, and it names the switch"
+            );
+            // The preset still applies: same authority, same bundles, same cap.
+            assert_eq!(off.preset_id, id, "{id}: the preset is NOT inert");
+            assert_eq!(
+                off.preset_plugins, on.preset_plugins,
+                "{id}: its bundles still mount"
+            );
+            assert_eq!(
+                off.permission.effective, on.permission.effective,
+                "{id}: its ceiling still caps the session"
+            );
+        }
+
+        // At FULL access the heel declaration is the only thing confining, so it
+        // is the sharpest proof that the switch overrides the ARM itself.
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        settings.global.default_preset = "heel-probe".to_string();
+        settings.global.general.sandbox_enabled = None;
+        assert!(
+            settings.effective().sandbox.heel,
+            "heel narrows a full-access session, which is why overriding it matters"
+        );
+        settings.global.general.sandbox_enabled = Some(false);
+        let off = settings.effective();
+        assert!(!off.sandbox.heel);
+        assert!(off.sandbox.off_by_settings);
+        assert!(
+            off.sandbox.overrides_preset(),
+            "the override is a visible fact, not an implicit one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Full access plus the switch off changes NOTHING, so the attribution stays
+    /// the permission's release. A switch that claimed the release would make the
+    /// reader think a setting they did not touch had widened the turn.
+    #[test]
+    fn full_access_with_the_sandbox_off_in_settings_keeps_the_release_reason() {
+        let root = scratch("sandbox-switch-full-access");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        settings.global.default_preset = "standard".to_string();
+        settings.global.general.sandbox_enabled = Some(false);
+        let resolved = settings.effective();
+        assert!(
+            !resolved.sandbox.heel,
+            "the permission had already released it"
+        );
+        assert!(
+            !resolved.sandbox.off_by_settings,
+            "no false attribution: the switch changed nothing here"
+        );
+        assert!(!resolved.sandbox.overrides_preset());
+        assert_eq!(
+            crate::settings::resolve::sandbox_off_reason(&resolved.sandbox),
+            None,
+            "the tool falls back to the release reason"
+        );
+        let built = build(&settings);
+        let result = bash_result(&built, "echo hi");
+        assert_eq!(result["sandbox"], serde_json::json!("none"), "{result}");
+        assert_eq!(
+            result["sandbox_reason"],
+            serde_json::json!(agent::tools::bash::SANDBOX_RELEASED_REASON),
+            "the release keeps its own reason: {result}"
+        );
+        assert!(
+            result["success"].as_bool().unwrap_or(false),
+            "a released command still runs: {result}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A workspace policy can see the RESOLVED sandbox state and refuse the
+    /// spawn on every unconfined arm.
+    ///
+    /// `data.sandbox_confined` is installed from the resolved `heel` answer on
+    /// every build, so it is false both when the switch is off AND when full
+    /// access releases the shell with the switch still on - the case the switch
+    /// alone would miss. This is the honest answer to "can a workspace deny an
+    /// unconfined shell": yes - the spawn question is still asked, and a denial
+    /// refuses the call before a process exists.
+    #[test]
+    fn a_workspace_policy_can_refuse_an_unconfined_shell_spawn() {
+        let root = scratch("policy-requires-sandbox");
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(
+            root.join(".bsh").join("policy.rego"),
+            r#"package policy.workspace
+
+# rule: require-sandbox
+verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace requires the sandbox"} if {
+    not data.sandbox_confined
+    input.action == "spawn"
+} else := {"allow": true, "rule": "workspace-allow"}
+"#,
+        )
+        .expect("the workspace policy");
+
+        let mut settings = rooted(&root);
+        let on = settings.effective();
+        let policy = crate::caps::policy_for_effective(&settings, &on);
+        assert!(
+            policy.data().sandbox_enabled && policy.data().sandbox_confined,
+            "the absent switch mirrors as enabled and confined"
+        );
+        assert!(
+            check_spawn(&policy, "bash", "session", "", &root.to_string_lossy()).is_ok(),
+            "with heel applicable the spawn is allowed"
+        );
+
+        settings.global.general.sandbox_enabled = Some(false);
+        let off = settings.effective();
+        let policy = crate::caps::policy_for_effective(&settings, &off);
+        assert!(
+            !policy.data().sandbox_enabled && !policy.data().sandbox_confined,
+            "the committed switch reaches both data keys"
+        );
+        let refusal = check_spawn(&policy, "bash", "session", "", &root.to_string_lossy())
+            .expect_err("the workspace requires confinement");
+        assert!(
+            refusal.contains("requires the sandbox"),
+            "the refusal is the module's own reason: {refusal}"
+        );
+
+        // Switch ON, full access: released, and the resolved key says so while
+        // the switch alone would still read true.
+        settings.global.general.sandbox_enabled = None;
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let released = settings.effective();
+        let policy = crate::caps::policy_for_effective(&settings, &released);
+        assert!(
+            policy.data().sandbox_enabled,
+            "the switch is on in this arm, so the switch key is not the answer"
+        );
+        assert!(
+            !policy.data().sandbox_confined,
+            "full access released the shell, and the resolved key follows"
+        );
+        assert!(
+            check_spawn(&policy, "bash", "session", "", &root.to_string_lossy()).is_err(),
+            "the workspace refuses the released spawn even with the switch on"
+        );
+
+        // Switch ON, full access, a preset that forces heel: confined again and
+        // allowed, so the resolved key does not over-refuse.
+        settings.global.presets.insert(
+            "heel-probe".to_string(),
+            Preset {
+                permission: Some(FULL_ACCESS.to_string()),
+                sandbox: Some(crate::settings::global::SandboxChoice::Heel),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "heel-probe".to_string();
+        let forced = settings.effective();
+        assert!(forced.sandbox.heel, "the premise: the preset confines");
+        let policy = crate::caps::policy_for_effective(&settings, &forced);
+        assert!(policy.data().sandbox_confined);
+        assert!(
+            check_spawn(&policy, "bash", "session", "", &root.to_string_lossy()).is_ok(),
+            "a preset-forced heel is confined, not refused: {:?}",
+            check_spawn(&policy, "bash", "session", "", &root.to_string_lossy())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The switch is a SANDBOX switch, not a preset switch: a read-only preset
+    /// still withholds the shell and a write-scope preset still refuses an
+    /// out-of-scope path while heel is off.
+    #[test]
+    fn the_sandbox_switch_keeps_the_presets_in_force() {
+        let root = scratch("sandbox-switch-presets-apply");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::create_dir_all(root.join("docs")).expect("docs");
+        let mut settings = rooted(&root);
+        settings.global.general.sandbox_enabled = Some(false);
+        settings.global.default_preset = "read-only".to_string();
+        let built = build(&settings);
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .is_none(),
+            "a read-only preset still withholds the shell while the sandbox is off"
+        );
+
+        settings.global.presets.insert(
+            "docs-only".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                write: Some(vec!["docs/**".to_string()]),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "docs-only".to_string();
+        let resolved = settings.effective();
+        assert!(resolved.sandbox.off_by_settings, "the premise: heel is off");
+        let built = build(&settings);
+        let outside = root.join("src").join("new.rs");
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": outside.to_string_lossy(),
+                    "content": "fn main() {}",
+                }),
+            )
+            .expect_err("the preset write scope still refuses the path");
+        assert!(error.to_string().contains("preset-write-scope"), "{error}");
+        assert!(!outside.exists());
+        // And the same tier still allows a write inside the declared scope.
+        built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": root.join("docs").join("note.md").to_string_lossy(),
+                    "content": "ok",
+                }),
+            )
+            .expect("the declared glob allows the write");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The inherited FULL-ACCESS arm as a user meets it: Federation declares no sandbox
+    /// field, so the shell is handed `workspace_root: None` and its cwd is the
+    /// app's launch directory, NOT the workspace. The policy must permit that
+    /// spawn by TIER (`spawn-shell-full-access`); a path-only policy refused
+    /// every command before a process existed, which is the reported bug.
+    #[test]
+    fn an_inherited_full_access_shell_spawns_where_the_release_puts_it() {
+        let root = scratch("full-access-inherited-spawn");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        settings.global.default_preset = "federation".to_string();
+        let resolved = settings.effective();
+        assert_eq!(resolved.permission.effective, FULL_ACCESS);
+        assert!(
+            !resolved.sandbox.heel && !resolved.sandbox.off_by_preset,
+            "the premise: Federation inherits, so the shell is released with no root"
+        );
+        let built = build(&settings);
+        assert_eq!(built.policy.data().permission, FULL_ACCESS);
+
+        // The path the tool asks about is the launch directory, which is what
+        // BashTool falls back to when no root is configured. It is NOT the
+        // workspace, which is why a path-only rule refused everything.
+        let launch = std::env::current_dir().expect("a launch directory");
+        assert!(
+            !launch.starts_with(&root),
+            "the premise: the launch directory is outside the scratch workspace"
+        );
+        let decision = built.policy.check(
+            &PolicyInput::new("bash", Action::Spawn, Target::path(&launch))
+                .with_session("session")
+                .with_preset("federation"),
+        );
+        assert!(
+            decision.is_allowed(),
+            "the released tier permits the shell: {decision:?}"
+        );
+        assert_eq!(decision.rule.as_deref(), Some("spawn-shell-full-access"));
+
+        let result = bash_result(&built, "echo hi");
+        assert_eq!(
+            result["stdout"].as_str().unwrap_or("").trim(),
+            "hi",
+            "{result}"
+        );
+        assert_eq!(result["exit_code"], serde_json::json!(0), "{result}");
+        assert!(result["success"].as_bool().unwrap_or(false), "{result}");
+        assert_eq!(result["sandbox"], serde_json::json!("none"), "{result}");
+        assert_eq!(
+            result["sandbox_reason"],
+            serde_json::json!(agent::tools::bash::SANDBOX_RELEASED_REASON),
+            "the release names itself: {result}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The preset NARROWING arm under full access still asks about the workspace
+    /// root: a heel preset hands the shell that root, so the spawn is the path
+    /// rule's and the command runs confined.
+    #[test]
+    fn a_heel_preset_under_full_access_spawns_at_the_workspace_root() {
+        let root = scratch("full-access-heel-spawn");
+        let (settings, built) = preset_sandbox_build(
+            &root,
+            crate::settings::global::SandboxChoice::Heel,
+            FULL_ACCESS,
+            FULL_ACCESS,
+        );
+        let resolved = settings.effective();
+        assert!(resolved.sandbox.heel, "the premise: the preset narrows");
+        assert_eq!(built.policy.data().permission, FULL_ACCESS);
+
+        let decision = built.policy.check(
+            &PolicyInput::new("bash", Action::Spawn, Target::path(root.clone()))
+                .with_session("session")
+                .with_preset("probe"),
+        );
+        assert!(decision.is_allowed(), "{decision:?}");
+        assert_eq!(
+            decision.rule.as_deref(),
+            Some("spawn-shell-in-workspace"),
+            "a confined shell is the path rule's, not the released arm's"
+        );
+
+        let result = bash_result(&built, "echo hi");
+        assert_eq!(
+            result["stdout"].as_str().unwrap_or("").trim(),
+            "hi",
+            "{result}"
+        );
+        assert_eq!(result["sandbox"], serde_json::json!("heel"), "{result}");
+        assert!(result["success"].as_bool().unwrap_or(false), "{result}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The two confined tiers keep their spawn answers, and the released arm
+    /// widens nothing else: at full access the same non-workspace path is
+    /// admitted only for `bash`, while another tool keeps the old rule.
+    #[test]
+    fn the_confined_tiers_keep_their_spawn_answers() {
+        let root = scratch("tier-spawn-answers");
+        let outside =
+            std::env::temp_dir().join(format!("bsh-spawn-outside-{}", std::process::id()));
+        let probe = |built: &BuiltAgent, tool: &str, target: &std::path::Path, preset: &str| {
+            built.policy.check(
+                &PolicyInput::new(tool, Action::Spawn, Target::path(target))
+                    .with_session("session")
+                    .with_preset(preset),
+            )
+        };
+
+        // Workspace Write: the shell spawns AT the root through the path rule,
+        // and a non-workspace target is still refused there.
+        let write = build(&rooted(&root));
+        assert_eq!(write.policy.data().permission, WORKSPACE_WRITE);
+        let at_root = probe(&write, "bash", &root, "");
+        assert!(at_root.is_allowed(), "{at_root:?}");
+        assert_eq!(at_root.rule.as_deref(), Some("spawn-shell-in-workspace"));
+        let elsewhere = probe(&write, "bash", &outside, "");
+        assert!(elsewhere.is_denied(), "{elsewhere:?}");
+        assert_eq!(elsewhere.rule.as_deref(), Some("spawn-not-allowed"));
+
+        // Read Only registers no shell at all, so there is no spawn to permit.
+        let mut read_only = rooted(&root);
+        read_only.workspace.agent.permission = READ_ONLY.to_string();
+        let built = build(&read_only);
+        assert_eq!(built.policy.data().permission, READ_ONLY);
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .is_none(),
+            "read-only keeps the shell out of the request"
+        );
+
+        // Full access: the non-workspace path is the released tier's answer for
+        // bash, and ONLY for bash - another process keeps the old rule.
+        let mut wide = rooted(&root);
+        wide.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&wide);
+        let released = probe(&built, "bash", &outside, "");
+        assert!(released.is_allowed(), "{released:?}");
+        assert_eq!(released.rule.as_deref(), Some("spawn-shell-full-access"));
+        let other = probe(&built, "python", &outside, "");
+        assert!(other.is_denied(), "{other:?}");
+        assert_eq!(other.rule.as_deref(), Some("spawn-not-allowed"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The shipped presets declare no toggle, so their effective sandbox is
+    /// exactly today's: heel under the default Workspace Write, and no
+    /// attribution when a full-access session inherits and is released.
+    #[test]
+    fn the_shipped_presets_keep_their_sandbox_behaviour() {
+        let mut settings = bare();
+        for id in ["standard", "federation", "creator", "read-only"] {
+            let preset = settings
+                .global
+                .preset(id)
+                .unwrap_or_else(|| panic!("the shipped {id}"));
+            assert_eq!(
+                preset.sandbox, None,
+                "the shipped {id} must not declare a sandbox choice"
+            );
+            settings.global.default_preset = id.to_string();
+            let resolved = settings.effective();
+            assert!(
+                resolved.sandbox.heel,
+                "{id} stays confined under the default Workspace Write"
+            );
+            assert!(!resolved.sandbox.off_by_preset, "{id} turns nothing off");
+            assert!(resolved.sandbox.refusal.is_none(), "{id} refuses nothing");
+            let built = build(&settings);
+            let spec = sandbox_spec_for(&built.policy, &resolved, "bash", "session");
+            assert_eq!(
+                spec.mode(),
+                if id == "read-only" {
+                    agent::sandbox::SandboxMode::ReadOnly
+                } else {
+                    agent::sandbox::SandboxMode::WorkspaceWrite
+                },
+                "{id}'s shell spec is today's tier"
+            );
+        }
+
+        // A full-access session that inherits Standard is still released: the
+        // absent field must not silently become a forced heel.
+        let mut wide = bare();
+        wide.workspace.agent.permission = FULL_ACCESS.to_string();
+        wide.global.default_preset = "standard".to_string();
+        let resolved = wide.effective();
+        assert!(
+            !resolved.sandbox.heel,
+            "today's full-access release survives an absent sandbox field"
+        );
+        assert!(!resolved.sandbox.off_by_preset);
+        let built = build(&wide);
+        let spec = sandbox_spec_for(&built.policy, &resolved, "bash", "session");
+        assert_eq!(spec.mode(), agent::sandbox::SandboxMode::FullAccess);
+    }
+
+    /// The egress consequence, stated as the tradeoff rather than hidden.
+    ///
+    /// With `sandbox = "none"` a command reaches a host the workspace allowlist
+    /// does NOT name (the endpoint is in a variable, so the command-tier scan
+    /// cannot see it either). With the same preset asking for heel, the proxy
+    /// refuses the same request and the listener sees no second hit. That is
+    /// the cost of turning the sandbox off: the allowlist is enforced by heel,
+    /// so no heel means no egress enforcement for shell commands.
+    #[test]
+    fn a_preset_that_turns_the_sandbox_off_also_bypasses_the_egress_allowlist() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("preset-sandbox-none-egress");
+        // The workspace allowlist names a DIFFERENT address, so this host is
+        // outside it.
+        std::fs::create_dir_all(root.join(".bsh")).expect(".bsh");
+        std::fs::write(root.join(".bsh/egress-allowlist"), "203.0.113.9\n")
+            .expect("egress allowlist");
+        let command = format!("H={host}; P={port}; curl -sS --max-time 3 \"http://$H:$P/\"");
+        // The listener's body, so "allowed" and "refused by the proxy" are
+        // distinguishable: heel's refusal is a body, not a curl exit code.
+        let reached = "ok";
+
+        // Off: the endpoint is reached. The command tier cannot name it (a
+        // variable), and there is no proxy to ask.
+        let (settings, built) = preset_sandbox_build(
+            &root,
+            crate::settings::global::SandboxChoice::Off,
+            FULL_ACCESS,
+            FULL_ACCESS,
+        );
+        assert!(!settings.effective().sandbox.heel);
+        let off = bash_result(&built, &command);
+        assert_eq!(off["sandbox"], serde_json::json!("none"), "{off}");
+        assert!(
+            off["stdout"].as_str().unwrap_or("").contains(reached),
+            "the unsandboxed request did not reach the listener: {off}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the unsandboxed shell ignored the workspace allowlist (this is the documented cost)"
+        );
+
+        // Heel: the same preset, confined. The proxy asks the policy for the
+        // resolved address and refuses it; no second connection arrives.
+        let (settings, built) = preset_sandbox_build(
+            &root,
+            crate::settings::global::SandboxChoice::Heel,
+            FULL_ACCESS,
+            FULL_ACCESS,
+        );
+        assert!(settings.effective().sandbox.heel);
+        let heel = bash_result(&built, &command);
+        assert_eq!(heel["sandbox"], serde_json::json!("heel"), "{heel}");
+        assert!(
+            !heel["stdout"].as_str().unwrap_or("").contains(reached),
+            "the heel proxy allowed an address outside the workspace allowlist: {heel}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a confined request reached the listener, so the allowlist did not hold"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A preset with no `egress` field inherits the workspace allowlist: the
+    /// derived proxy set is the whole workspace list, and the shell reports
+    /// `network: "allowlist"`.
+    #[test]
+    fn an_absent_preset_egress_inherits_the_workspace_list() {
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let root = scratch("preset-egress-inherit");
+        let (_settings, built) = preset_build(
+            &root,
+            &format!("{host}\n203.0.113.9\n"),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                // No egress field at all: inherit.
+                ..Preset::default()
+            },
+        );
+        assert!(
+            !built.policy.data().preset_egress_restricted,
+            "an absent field does not restrict"
+        );
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            WORKSPACE_WRITE,
+            agent::sandbox::Principal::new("bash", "session", "probe"),
+        );
+        match spec.egress() {
+            agent::sandbox::Egress::Allow(entries) => assert!(
+                entries.contains(&host) && entries.contains(&"203.0.113.9".to_string()),
+                "the whole workspace list is inherited: {entries:?}"
+            ),
+            other => panic!("an inherited list must derive a proxy, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The shipped read-only preset reads the workspace and needs no network,
+    /// so its own policy derives NO proxy - even on an UNRESTRICTED workspace
+    /// (no allowlist file). This is the shipped declaration, not a hand-built
+    /// one, and it proves the narrowing invariant: a preset's declared empty
+    /// reach denies without the workspace having to declare anything.
+    #[test]
+    fn the_shipped_read_only_preset_derives_no_proxy() {
+        let root = scratch("preset-read-only-network");
+        // NO workspace allowlist: egress is unrestricted before the preset.
+        assert!(!egress_allowlist_path(&root).exists());
+        let mut settings = rooted(&root);
+        settings.global.default_preset = "read-only".to_string();
+        let built = build(&settings);
+        assert!(
+            built.policy.data().egress_unrestricted,
+            "the premise: the workspace itself is open"
+        );
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            READ_ONLY,
+            agent::sandbox::Principal::new("bash", "session", "read-only"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &agent::sandbox::Egress::DenyAll,
+            "read-only needs no network, so it derives no proxy"
+        );
+        // And the policy refuses the address outright: the preset's declared
+        // empty reach denies even though the workspace itself is open.
+        let decision = built.policy.check(
+            &PolicyInput::new("mcp", Action::Egress, Target::host("h", "203.0.113.7"))
+                .with_preset("read-only"),
+        );
+        assert!(decision.is_denied(), "{decision:?}");
+        // Two tiers can refuse a read-only preset's egress and the FIRST module
+        // in source order reports: the generated session tier denies egress for
+        // a read-only effective permission, and the preset's own module denies
+        // it again. Either name is honest; what must NOT happen is the
+        // workspace's allowlist winning, which is what the assertion above
+        // rules out.
+        let rule = decision.rule.as_deref().unwrap_or("");
+        assert!(
+            rule == "session-read-only-egress"
+                || rule.starts_with("preset-egress")
+                || rule == "no-egress",
+            "an egress tier of the preset refused it, not the workspace list: {decision:?}"
+        );
+        // The preset's declaration itself is what restricts, and it is
+        // empty: the workspace's open default does not make it reachable.
+        assert!(
+            built.policy.data().preset_egress_restricted,
+            "declared, not absent"
+        );
+        assert!(
+            built.policy.data().preset_egress_allowlist.is_empty()
+                && built.policy.data().preset_egress_hosts.is_empty()
+                && built.policy.data().preset_egress_ports.is_empty(),
+            "read-only declares an empty reach"
+        );
+        assert!(
+            built
+                .policy
+                .rule_ids()
+                .iter()
+                .any(|id| id == "preset-egress-not-allowed"),
+            "the shipped read-only preset compiles the preset egress module: {:?}",
+            built.policy.rule_ids()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A preset WITH a list still narrows an unrestricted workspace: the
+    /// preset's entries are the whole reach, so a destination the open
+    /// workspace would have allowed is refused and the local listener sees no
+    /// hit. The workspace's openness is not a union with the preset.
+    #[test]
+    fn a_preset_with_a_list_still_narrows_an_unrestricted_workspace() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(host) = lan_address() else {
+            eprintln!("no non-loopback IPv4 address on this host; the egress probe needs one");
+            return;
+        };
+        let listener = std::net::TcpListener::bind((host.as_str(), 0)).expect("a listener");
+        let port = listener.local_addr().expect("its port").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        serve_http(listener, std::sync::Arc::clone(&hits));
+
+        let root = scratch("preset-egress-unrestricted-narrow");
+        assert!(
+            !egress_allowlist_path(&root).exists(),
+            "the premise: the workspace declares no file"
+        );
+        let mut settings = rooted(&root);
+        settings.global.presets.insert(
+            "probe".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                // A list that does NOT name the local endpoint.
+                egress: Some(vec!["203.0.113.9".to_string()]),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "probe".to_string();
+        let built = build(&settings);
+        assert!(
+            built.policy.data().egress_unrestricted,
+            "the workspace itself is open"
+        );
+        assert!(
+            built.policy.data().preset_egress_restricted,
+            "the preset declares a reach"
+        );
+        let spec = agent::sandbox::SandboxSpec::for_policy(
+            &built.policy,
+            WORKSPACE_WRITE,
+            agent::sandbox::Principal::new("bash", "session", "probe"),
+        );
+        assert_eq!(
+            spec.egress(),
+            &agent::sandbox::Egress::Allow(vec!["203.0.113.9".to_string()]),
+            "the preset's list is the reach, not the open workspace"
+        );
+
+        let bash = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("bash")
+            .expect("bash");
+        // The local endpoint is allowed by the OPEN workspace but not by the
+        // preset, so the preset's rule refuses it before a process exists.
+        match bash.run(&serde_json::json!({
+            "command": format!("curl -sS --max-time 3 -o /dev/null http://{host}:{port}/")
+        })) {
+            Err(agent::ToolError::Failed(message)) => assert!(
+                message.contains("preset-egress"),
+                "the preset's list refused the local endpoint: {message}"
+            ),
+            other => panic!("the preset must narrow the open workspace, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the local endpoint stayed unreachable through the preset"
+        );
+
+        // The entry the PRESET names is admitted by the policy: the list is the
+        // reach, not a deny of everything.
+        let listed = built.policy.check(
+            &PolicyInput::new("mcp", Action::Egress, Target::host("h", "203.0.113.9"))
+                .with_preset("probe"),
+        );
+        assert!(listed.is_allowed(), "{listed:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The port dimension narrows through a preset: a preset that lists only
+    /// port 443 refuses the same address at another port, naming the port rule.
+    #[test]
+    fn a_preset_port_list_refuses_the_wrong_port_with_its_own_rule() {
+        let root = scratch("preset-egress-ports");
+        let (_settings, built) = preset_build(
+            &root,
+            "203.0.113.7\n",
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["shell".to_string(), "files".to_string()],
+                egress: Some(vec!["203.0.113.7".to_string(), "443".to_string()]),
+                ..Preset::default()
+            },
+        );
+        assert_eq!(
+            built.policy.data().preset_egress_ports,
+            vec![443u16],
+            "the bare integer is classified as a port"
+        );
+        let ask = |port: u16| {
+            built.policy.check(
+                &PolicyInput::new(
+                    "mcp",
+                    Action::Egress,
+                    Target::host_on("h", "203.0.113.7", port),
+                )
+                .with_preset("probe"),
+            )
+        };
+        assert!(ask(443).is_allowed(), "the declared port is allowed");
+        let refused = ask(80);
+        assert!(refused.is_denied(), "{refused:?}");
+        assert_eq!(
+            refused.rule.as_deref(),
+            Some("preset-egress-port-not-allowed")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A preset that declares no read/write/deny/web_search/policy_mode resolves
+    /// EXACTLY as before: the shipped defaults install no scope restriction, and
+    /// the read-only preset keeps its own declared list. This is the "absent
+    /// field behaves as today" contract, asserted on the policy data a build
+    /// actually hands Rego.
+    #[test]
+    fn the_shipped_presets_resolve_the_same_scope_with_the_new_fields_absent() {
+        let root = scratch("preset-absent-defaults");
+        let standard = build(&rooted(&root));
+        let data = standard.policy.data();
+        assert!(
+            !data.preset_read_restricted && !data.preset_write_restricted,
+            "no declared list inherits the workspace"
+        );
+        assert!(data.preset_read_roots.is_empty());
+        assert!(
+            data.preset_read_globs.is_empty()
+                && data.preset_write_globs.is_empty()
+                && data.preset_deny_globs.is_empty(),
+            "standard declares no globs"
+        );
+        assert_eq!(
+            data.preset_deny_roots.len(),
+            6,
+            "the shipped secret list is untouched: {:?}",
+            data.preset_deny_roots
+        );
+        assert!(
+            !data.preset_egress_restricted,
+            "standard inherits the workspace reach"
+        );
+
+        let mut read_only_settings = rooted(&root);
+        read_only_settings.global.default_preset = "read-only".to_string();
+        let read_only = build(&read_only_settings);
+        let data = read_only.policy.data();
+        assert!(data.preset_read_restricted, "read-only declares reads");
+        assert_eq!(
+            data.preset_read_roots,
+            vec![root.to_string_lossy().to_string()],
+            "'.' resolves to the workspace root itself"
+        );
+        assert!(
+            data.preset_write_restricted && data.preset_write_roots.is_empty(),
+            "an empty write list allows no writes"
+        );
+        assert!(
+            data.preset_egress_restricted,
+            "read-only declares egress = [], a deny-all"
+        );
+        assert_eq!(data.permission, "read-only");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The glob scope reaches the TOOL boundary: a deny inside a granted write
+    /// scope refuses the call and names the preset rule; a write outside the
+    /// granted globs refuses; a read outside a declared read glob refuses while
+    /// one inside succeeds.
+    #[test]
+    fn a_preset_glob_scope_is_enforced_by_the_file_tools() {
+        let root = scratch("preset-glob-tools");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join("src").join("lib.rs"), "pub fn x() {}").expect("a source file");
+        std::fs::write(root.join("README.md"), "# readme").expect("a readme");
+        std::fs::create_dir_all(root.join("secrets")).expect("secrets");
+
+        // (a) Deny wins inside the workspace even when the tier and a broad
+        // write scope would allow it.
+        let mut settings = rooted(&root);
+        settings.global.presets.insert(
+            "guarded".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                write: Some(vec!["**".to_string()]),
+                deny: vec!["secrets/**".to_string()],
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "guarded".to_string();
+        let built = build(&settings);
+        let secret = root.join("secrets").join("key.pem");
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": secret.to_string_lossy(),
+                    "content": "secret",
+                }),
+            )
+            .expect_err("the deny scope refuses the write");
+        assert!(
+            error.to_string().contains("preset-deny-path"),
+            "the refusal names the scope rule: {error}"
+        );
+        assert!(!secret.exists(), "the refused write created nothing");
+
+        // (b) A write scope refuses outside its globs.
+        settings.global.presets.insert(
+            "docs-only".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                write: Some(vec!["docs/**".to_string()]),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "docs-only".to_string();
+        let built = build(&settings);
+        let outside = root.join("src").join("new.rs");
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": outside.to_string_lossy(),
+                    "content": "fn main() {}",
+                }),
+            )
+            .expect_err("the write scope refuses the path");
+        assert!(error.to_string().contains("preset-write-scope"), "{error}");
+        assert!(!outside.exists());
+        // The same preset writes inside its glob.
+        built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": root.join("docs").join("note.md").to_string_lossy(),
+                    "content": "ok",
+                }),
+            )
+            .expect("the declared glob allows the write");
+
+        // (c) A read scope refuses outside its globs and allows inside.
+        settings.global.presets.insert(
+            "sources".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                read: Some(vec!["src/**/*.rs".to_string()]),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "sources".to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("src").join("lib.rs").to_string_lossy() }),
+            )
+            .expect("a read inside the glob is allowed");
+        let error = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": root.join("README.md").to_string_lossy() }),
+            )
+            .expect_err("a read outside the glob is refused");
+        assert!(error.to_string().contains("preset-read-scope"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The preset and the workspace switch INTERSECT: `false` withdraws the
+    /// local tool even with the switch on, and `true` cannot re-offer it while
+    /// the switch is off. Only both agreeing offers search.
+    #[test]
+    fn a_presets_search_grant_intersects_the_workspace_switch() {
+        let root = scratch("preset-web-search");
+        let mut settings = rooted(&root);
+        settings.workspace.agent.web_tools_enabled = true;
+        settings.global.presets.insert(
+            "no-search".to_string(),
+            Preset {
+                web_search: Some(false),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "no-search".to_string();
+        let built = build(&settings);
+        assert!(
+            !tool_names(&built).iter().any(|name| name == "web_search"),
+            "the preset's refusal withdraws the local tool"
+        );
+        assert!(
+            !built.agent.config().web_search,
+            "and no hosted object is sent either"
+        );
+
+        settings.global.presets.insert(
+            "search".to_string(),
+            Preset {
+                web_search: Some(true),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "search".to_string();
+        settings.workspace.agent.web_tools_enabled = false;
+        let built = build(&settings);
+        assert!(
+            !tool_names(&built).iter().any(|name| name == "web_search"),
+            "the preset's grant cannot re-offer a tool the reader switched off"
+        );
+
+        // Both agreeing is the one state that offers it.
+        settings.workspace.agent.web_tools_enabled = true;
+        let built = build(&settings);
+        assert!(
+            tool_names(&built).iter().any(|name| name == "web_search"),
+            "the switch and the preset both grant it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The tool's requests carry the endpoint, key and budget the settings
+    /// pane writes - and the key comes from the vault, never the file.
+    #[test]
+    fn the_search_config_is_derived_from_the_settings_and_the_vault() {
+        let mut settings = bare();
+        settings.global.web_search.base_url = "https://search.internal/v1/tools".to_string();
+        settings.global.web_search.results_per_search = 25;
+        let vault = Vault::new(std::env::temp_dir().join("bsh-caps-websearch-absent"));
+        let config = web_search_config(&settings, &vault);
+        assert_eq!(config.base_url, "https://search.internal/v1/tools");
+        assert_eq!(config.results, 25);
+        assert!(config.api_key.is_empty(), "no entry means no key");
+
+        settings.global.web_search.results_per_search = 500;
+        let config = web_search_config(&settings, &vault);
+        assert_eq!(
+            config.results,
+            crate::web::MAX_RESULTS,
+            "an out-of-range budget clamps to the API's own ceiling"
+        );
+
+        // A provider whose wire is not the shipped shape: every shape field
+        // the section carries reaches the request, and an unknown method
+        // spelling falls back to POST rather than switching the wire silently.
+        settings.global.web_search.method = "GET".to_string();
+        settings.global.web_search.query_key = "q".to_string();
+        settings.global.web_search.count_key = String::new();
+        settings.global.web_search.snippet_key = "content".to_string();
+        let config = web_search_config(&settings, &vault);
+        assert_eq!(config.shape.method, crate::web::Method::Get);
+        assert_eq!(config.shape.query_key, "q");
+        assert!(config.shape.count_key.is_empty(), "empty means omitted");
+        assert_eq!(config.shape.snippet_key, "content");
+        settings.global.web_search.method = "PATCH".to_string();
+        let config = web_search_config(&settings, &vault);
+        assert_eq!(
+            config.shape.method,
+            crate::web::Method::Post,
+            "an unknown verb is the default, never a refusal the reader cannot fix"
+        );
+    }
+
+    /// One preset whose own policy refuses writes, in both modes: advisory
+    /// records the refusal and lets the call through; required refuses it and
+    /// leaves no side effect.
+    #[test]
+    fn policy_mode_decides_whether_a_preset_refusal_stops_the_call() {
+        let rego = "package policy.soft\n\n# rule: soft-deny-write\nverdict := {\"allow\": false, \"rule\": \"soft-deny-write\", \"reason\": \"this preset advises against writes\"} if {\n    input.action == \"write\"\n} else := {\"allow\": true}\n";
+        let root = scratch("preset-policy-mode");
+        let mut settings = rooted(&root);
+        settings.global.presets.insert(
+            "soft".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                policy: Some(rego.to_string()),
+                trusted: true,
+                policy_mode: Some(crate::settings::global::PolicyMode::Advisory),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "soft".to_string();
+        let built = build(&settings);
+        let target = root.join("notes.md");
+        built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "advisory",
+                }),
+            )
+            .expect("an advisory refusal lets the call proceed");
+        assert!(target.exists(), "the call's effect is real");
+        let advisories = built.policy.advisories();
+        assert_eq!(advisories.len(), 1, "{advisories:?}");
+        assert!(advisories[0].advisory);
+        assert_eq!(
+            advisories[0].rule.as_deref(),
+            Some("soft-deny-write"),
+            "the audit records the refusal verbatim"
+        );
+        assert_eq!(built.policy.advisories_total(), 1);
+
+        // The floor is not advisory: a write outside the workspace still fails.
+        let outside =
+            std::env::temp_dir().join(format!("bsh-advisory-outside-{}.md", std::process::id()));
+        let error = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": outside.to_string_lossy(),
+                    "content": "nope",
+                }),
+            )
+            .expect_err("advisory never widens the baseline");
+        assert!(
+            error.to_string().contains("write-outside-workspace")
+                || error.to_string().contains("escapes the workspace"),
+            "the floor still refuses outside the workspace: {error}"
+        );
+        assert!(!outside.exists());
+
+        // The SAME preset in required mode refuses the in-workspace write.
+        settings.global.presets.insert(
+            "soft".to_string(),
+            Preset {
+                permission: Some(WORKSPACE_WRITE.to_string()),
+                plugins: vec!["files".to_string()],
+                policy: Some(rego.to_string()),
+                trusted: true,
+                policy_mode: Some(crate::settings::global::PolicyMode::Required),
+                ..Preset::default()
+            },
+        );
+        let required = build(&settings);
+        let refused = root.join("required.md");
+        let error = required
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": refused.to_string_lossy(),
+                    "content": "required",
+                }),
+            )
+            .expect_err("required refuses the call");
+        assert!(error.to_string().contains("soft-deny-write"), "{error}");
+        assert!(!refused.exists(), "no side effect on a hard refusal");
+        assert!(required.policy.advisories().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path scope that cannot be honoured is a LOAD error naming the preset
+    /// and the field, never a silent default.
+    #[test]
+    fn an_unparsable_path_scope_names_the_preset_and_field() {
+        let text = "[presets.bad]\nread = [\"docs/[unclosed\"]\n";
+        let error = crate::settings::global::GlobalSettings::from_toml(text)
+            .expect_err("an unparsable glob is refused");
+        let message = error.to_string();
+        assert!(message.contains("bad"), "names the preset: {message}");
+        assert!(message.contains("read"), "names the field: {message}");
+        assert!(
+            message.contains("character class"),
+            "says what is wrong: {message}"
+        );
+
+        let escape = "[presets.bad]\nwrite = [\"../outside\"]\n";
+        let error = crate::settings::global::GlobalSettings::from_toml(escape)
+            .expect_err("a parent escape is refused");
+        assert!(error.to_string().contains("write"), "{error}");
+        assert!(error.to_string().contains(".."), "{error}");
+    }
+
+    /// Manual benchmark for the file tools, not a CI assertion.
+    ///
+    ///     cargo test -p bsh --lib bench_file_tools -- --ignored --nocapture
+    ///
+    /// A tool call is dominated by two things a unit test cannot see: the
+    /// policy evaluation and the filesystem work. This splits them so a
+    /// performance change is measured rather than claimed.
+    #[test]
+    #[ignore = "manual benchmark"]
+    fn bench_file_tools() {
+        use std::time::Instant;
+        let root = scratch("bench-file-tools");
+        let many = root.join("many");
+        std::fs::create_dir_all(&many).expect("many");
+        for index in 0..5_000 {
+            std::fs::write(many.join(format!("f{index:05}.txt")), b"").expect("entry");
+        }
+        let line = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+        let mut text = String::new();
+        while text.len() < 4 * 1024 * 1024 {
+            text.push_str(line);
+        }
+        let big = root.join("big.txt");
+        std::fs::write(&big, &text).expect("big");
+
+        let built = build(&rooted(&root));
+        let registry = built.agent.registry().expect("registry");
+        let rounds = 20_u32;
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            let start = Instant::now();
+            for _ in 0..rounds {
+                f();
+            }
+            println!("{label}: {:?} per call", start.elapsed() / rounds);
+        };
+        time("read 4MiB", &mut || {
+            registry
+                .execute(
+                    "read_file",
+                    &serde_json::json!({ "path": big.to_string_lossy() }),
+                )
+                .expect("read");
+        });
+        time("list 5k entries", &mut || {
+            registry
+                .execute(
+                    "list_dir",
+                    &serde_json::json!({ "path": many.to_string_lossy() }),
+                )
+                .expect("list");
+        });
+        let mut stamp = 0_u32;
+        time("write 1MiB", &mut || {
+            stamp += 1;
+            let content = format!("{stamp}\n{}", &text[..1024 * 1024]);
+            registry
+                .execute(
+                    "write_file",
+                    &serde_json::json!({
+                        "path": root.join("written.txt").to_string_lossy(),
+                        "content": content,
+                    }),
+                )
+                .expect("write");
+        });
+        let mut flip = false;
+        time("edit 4MiB replace_all", &mut || {
+            let (old, new) = if flip {
+                ("9876543210", "0123456789")
+            } else {
+                ("0123456789", "9876543210")
+            };
+            flip = !flip;
+            registry
+                .execute(
+                    "edit_file",
+                    &serde_json::json!({
+                        "path": big.to_string_lossy(),
+                        "old_string": old,
+                        "new_string": new,
+                        "replace_all": true,
+                    }),
+                )
+                .expect("edit");
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A child's user row is projected back to the annotation the reader typed,
+    /// even though the child's own agent holds the model-facing command block.
+    /// The parent's row never needs this: it stores the annotation itself.
+    #[test]
+    fn a_child_row_reads_back_as_its_command_annotation() {
+        let names = vec![crate::extension::CommandSurface {
+            name: "com_example_hello__greet".to_string(),
+            description: "Greet the reader".to_string(),
+            template: "Say hello from com.example.hello.".to_string(),
+        }];
+        let composed =
+            crate::command_invocation::compose(&names, "/com_example_hello__greet in one sentence")
+                .expect("the annotation composes");
+        let agent = agent::Agent::new(
+            agent::AgentConfig::default(),
+            std::sync::Arc::new(agent::agent::agentic::LlmProvider::new()),
+        );
+        crate::runner::Runner::seed_session(&agent, &[crate::model::ChatMessage::user(composed)]);
+        let rows = super::child_transcript(&agent);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.role == "user")
+                .map(|row| row.content.as_str()),
+            Some("/com_example_hello__greet in one sentence"),
+            "the child view shows the annotation, not the template: {rows:?}"
+        );
+    }
+}

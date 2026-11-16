@@ -1,0 +1,7 @@
+{
+  "name": "Extism Reader",
+  "description": "A read-only preset contributed by the Extism example",
+  "level": 1,
+  "permission": "read_only",
+  "plugins": ["shell", "files"]
+}

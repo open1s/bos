@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Render the GitHub release body for one version.
+#
+# The changelog entry is the human part; the rest is the install matrix and the
+# limitations a downloader needs before they run the binary. Written to stdout
+# so the workflow can hand it to action-gh-release as body_path.
+#
+# Usage: release-notes.sh 3.0.3 > notes.md
+
+set -euo pipefail
+
+version="${1:?usage: release-notes.sh <version>}"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+section="$(
+  awk -v tag="v$version" '
+    {
+      # A literal prefix test, not a regex: a version contains dots, and
+      # matching them as wildcards could pick the wrong heading.
+      prefix = "## " tag
+      if (substr($0, 1, length(prefix)) == prefix) {
+        tail = substr($0, length(prefix) + 1, 1)
+        if (tail == "" || tail == " ") { found = 1; next }
+      }
+      if (found && /^## /) { exit }
+      if (found) { print }
+    }
+  ' "$repo_root/CHANGELOG.md"
+)"
+
+if [[ -z "${section//[[:space:]]/}" ]]; then
+  section="_No changelog entry for this version._"
+fi
+# Drop the blank line between the changelog heading and its first bullet.
+section="$(printf '%s\n' "$section" | sed '/./,$!d')"
+
+# The install matrix is a literal template: artifact names are backticked
+# Markdown, and an unquoted heredoc would run them as commands. @VERSION@ and
+# @DEB@ are substituted after the block is emitted.
+{
+  printf '%s\n\n' "$section"
+  cat <<'TEMPLATE'
+## Install
+
+| Platform | Artifact | How |
+|---|---|---|
+| macOS (Apple silicon) | `bsh-@VERSION@-macos-arm64.dmg` | Open the dmg, drag **BSH** to Applications. |
+| Linux (x86_64) | `bsh-@VERSION@-linux-x86_64.AppImage` | `chmod +x` it and run it. Needs glibc 2.35 and WebKitGTK 4.1. |
+| Linux (arm64, when available) | `bsh-@VERSION@-linux-aarch64.AppImage` | Same, on an arm64 machine with glibc 2.39. |
+| Windows (x64) | `bsh-@VERSION@-windows-x64.msi` | Per-user install, no administrator rights required. |
+| Windows (arm64) | `bsh-@VERSION@-windows-arm64.msi` | Same, on Windows on Arm. |
+| Windows (portable) | `bsh-@VERSION@-windows-<arch>.zip` | Unzip and run `bsh.exe`. |
+
+The `.app.zip` files are the same signed bundles as the dmgs, for tools that
+prefer a zip.
+
+The Linux AppImage is one file per architecture; there is no deb, rpm or tarball.
+It carries bsh and the libraries your distribution is not guaranteed to have, and
+it deliberately does not carry WebKitGTK: WebKitGTK finds its helper processes at
+absolute paths compiled into the library, which no environment variable can
+relocate, so a copy inside the image could not be found. The one package it needs
+is named for you when it is missing.
+
+```bash
+chmod +x bsh-@VERSION@-linux-x86_64.AppImage
+./bsh-@VERSION@-linux-x86_64.AppImage                 # run
+./bsh-@VERSION@-linux-x86_64.AppImage --integrate     # add a menu entry
+```
+
+If it reports `Cannot mount AppImage`, this host has no FUSE 2: either install
+`libfuse2t64` (Ubuntu 24.04+) or `libfuse2` (22.04, Debian 12), or run it
+without FUSE: `./bsh-@VERSION@-linux-x86_64.AppImage --appimage-extract-and-run`.
+
+## Verification
+
+`SHA256SUMS` is attached next to the artifacts:
+
+```bash
+sha256sum --check SHA256SUMS
+```
+
+## Platform notes
+
+- **macOS** requires 11.0 or newer. Builds are signed when the Apple signing
+  identity is configured, and notarized when the notary secrets are too;
+  without them the app is ad-hoc signed, and Gatekeeper will refuse the first
+  launch. In that case use
+  **System Settings > Privacy & Security > Open Anyway**, or clear the
+  quarantine attribute:
+  `xattr -dr com.apple.quarantine /Applications/BSH.app`.
+- **Linux** x86_64 builds need glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+)
+  and WebKitGTK 4.1 (`libwebkit2gtk-4.1-0` on Debian and Ubuntu,
+  `webkit2gtk4.1` on Fedora, `webkit2gtk-4.1` on Arch); arm64 builds need
+  glibc 2.39 (Ubuntu 24.04+, Debian 13+). The arm64 job is best-effort because
+  GitHub's free arm64 runners are periodically preempted, so a release may carry
+  only the x86_64 image. A Wayland or X11 session is required. There is no
+  self-update: a new release replaces the file.
+- **Windows** builds are x64 and arm64 (Windows on Arm), and unsigned unless
+  the Windows signing secret is configured. The terminal pane is not available on Windows yet: the vendored
+  Ghostty surface only implements macOS and Wayland, so the pane reports that
+  it is unavailable. The browser pane needs the Edge WebView2 runtime, which
+  ships with Windows 10 and 11. If the app does not start, install the
+  Microsoft Visual C++ Redistributable (the MSVC runtime is linked dynamically).
+
+Release automation and signing setup:
+https://github.com/open1s/bos/blob/main/docs/bsh-release.md
+TEMPLATE
+} | sed -e "s/@VERSION@/$version/g"

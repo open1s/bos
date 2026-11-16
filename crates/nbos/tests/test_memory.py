@@ -1,0 +1,190 @@
+"""Tests for the high-level Python memory store."""
+
+import asyncio
+import json
+from pathlib import Path
+
+from nbos import Agent, AgentBuilder, Content, Memory, ToolRegistry
+
+REPO = Path(__file__).resolve().parents[3]
+FIXTURE = REPO / "crates" / "agent" / "tests" / "fixtures" / "memory_ranking.json"
+LINES_FIXTURE = REPO / "crates" / "agent" / "tests" / "fixtures" / "memory_lines.jsonl"
+
+
+def test_add_assigns_identity():
+    memory = Memory()
+    item = memory.add("the sky is blue")
+    assert item["content"] == "the sky is blue"
+    assert item["id"]
+    assert item["metadata"] is None
+    assert memory.len() == 1
+    assert not memory.is_empty()
+    assert len(memory) == 1
+
+
+def test_search_ranks_by_keyword_overlap():
+    memory = Memory()
+    memory.add("rust ownership and borrowing")
+    memory.add("python asyncio event loop")
+    memory.add("rust async runtimes")
+    hits = memory.search("rust async", 2)
+    assert [h["content"] for h in hits] == [
+        "rust async runtimes",
+        "rust ownership and borrowing",
+    ]
+
+
+def test_empty_query_returns_most_recent_first():
+    memory = Memory()
+    memory.add("first")
+    memory.add("second")
+    assert [h["content"] for h in memory.search("  ", 1)] == ["second"]
+
+
+def test_remove_and_clear():
+    memory = Memory()
+    first = memory.add("a")
+    memory.add("b")
+    assert memory.remove(first["id"]) is True
+    assert memory.remove(first["id"]) is False
+    assert memory.len() == 1
+    memory.clear()
+    assert memory.is_empty()
+
+
+def test_to_json_round_trips():
+    memory = Memory()
+    memory.add("x", {"source": "test"})
+    loaded = json.loads(memory.to_json())
+    assert loaded[0]["content"] == "x"
+    assert loaded[0]["metadata"] == {"source": "test"}
+
+
+def test_matches_the_shared_rust_fixture():
+    data = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    memory = Memory()
+    for content in data["items"]:
+        memory.add(content)
+    hits = memory.search(data["query"], data["limit"])
+    assert [h["content"] for h in hits] == data["expected"]
+
+
+class _FakeInner:
+    """Stands in for the native agent so injection is testable offline."""
+
+    def __init__(self) -> None:
+        self.seen: list = []
+
+    async def run_simple(self, content):
+        self.seen.append(content)
+        return "ok"
+
+    async def react(self, content):
+        self.seen.append(content)
+        return "ok"
+
+    async def stream(self, content):
+        self.seen.append(content)
+        return None
+
+
+def test_agent_ask_injects_recalled_memory():
+    memory = Memory()
+    memory.add("the deploy key lives in 1password")
+    memory.add("the office plant is a fern")
+    inner = _FakeInner()
+    agent = Agent(inner, ToolRegistry(), memory)
+    asyncio.run(agent.ask("where is the deploy key"))
+    assert inner.seen
+    assert "Relevant memory:" in inner.seen[0]
+    assert "the deploy key lives in 1password" in inner.seen[0]
+
+
+def test_agent_without_memory_is_untouched():
+    inner = _FakeInner()
+    agent = Agent(inner, ToolRegistry())
+    asyncio.run(agent.ask("hello"))
+    assert inner.seen == ["hello"]
+
+
+def test_agent_skips_memory_for_multimodal_content():
+    memory = Memory()
+    memory.add("the deploy key lives in 1password")
+    inner = _FakeInner()
+    agent = Agent(inner, ToolRegistry(), memory)
+    asyncio.run(agent.ask(Content.text("where is the deploy key")))
+    assert inner.seen
+    assert "Relevant memory:" not in inner.seen[0]
+
+
+def test_agent_with_memory_is_chainable():
+    agent = Agent(_FakeInner(), ToolRegistry())
+    memory = Memory()
+    assert agent.with_memory(memory) is agent
+    assert agent._memory is memory
+
+
+def test_builder_with_memory_is_chainable():
+    builder = AgentBuilder(None)
+    memory = Memory()
+    assert builder.with_memory(memory) is builder
+    assert builder._memory is memory
+
+
+def test_save_and_load_round_trip(tmp_path):
+    memory = Memory()
+    memory.add("first", {"source": "test"})
+    memory.add("second")
+    path = tmp_path / "memory.jsonl"
+    assert memory.save(str(path)) == 2
+    loaded = Memory.load(str(path))
+    assert [i["content"] for i in loaded.all()] == ["first", "second"]
+    assert loaded.all()[0]["metadata"] == {"source": "test"}
+
+
+def test_loads_the_shared_json_lines_fixture():
+    loaded = Memory.load(str(LINES_FIXTURE))
+    assert [i["content"] for i in loaded.all()] == [
+        "rust ownership and borrowing",
+        "the staging deploy needs VPN",
+    ]
+    assert loaded.all()[1]["metadata"] == {"source": "runbook"}
+
+
+def test_recall_limit_bounds_injection():
+    memory = Memory()
+    memory.add("rust async runtimes")
+    memory.add("rust ownership and borrowing")
+    inner = _FakeInner()
+    agent = Agent(inner, ToolRegistry(), memory, recall_limit=1)
+    asyncio.run(agent.ask("rust"))
+    assert inner.seen[0].count("\n- ") == 1
+
+
+def test_search_filters_by_metadata():
+    memory = Memory()
+    memory.add("deploy to staging", {"env": "staging"})
+    memory.add("deploy to prod", {"env": "prod"})
+    memory.add("deploy notes")
+    hits = memory.search("deploy", 5, {"env": "staging"})
+    assert [h["content"] for h in hits] == ["deploy to staging"]
+    assert len(memory.search("deploy", 5)) == 3
+
+
+def test_metadata_filter_is_type_strict():
+    memory = Memory()
+    memory.add("counted", {"n": 1})
+    assert memory.search("counted", 5, {"n": 1})
+    assert not memory.search("counted", 5, {"n": "1"})
+
+
+def test_max_items_evicts_the_oldest():
+    memory = Memory(max_items=2)
+    assert memory.max_items == 2
+    memory.add("first")
+    memory.add("second")
+    memory.add("third")
+    assert [i["content"] for i in memory.all()] == ["second", "third"]
+    assert memory.with_max_items(1) is memory
+    memory.add("fourth")
+    assert [i["content"] for i in memory.all()] == ["fourth"]

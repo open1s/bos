@@ -1,0 +1,17 @@
+{
+  "title": "Hooks",
+  "icon": null,
+  "location": "right",
+  "default_visibility": "visible",
+  "view": {
+    "schema_version": "1.0",
+    "revision": 1,
+    "root": {
+      "type": "column",
+      "children": [
+        {"type": "heading", "text": "Hook Demo", "level": 2},
+        {"type": "text", "text": "The hook demo records every host event it subscribes to. Call hook-log for the list."}
+      ]
+    }
+  }
+}

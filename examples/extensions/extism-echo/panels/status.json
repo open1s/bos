@@ -1,0 +1,17 @@
+{
+  "title": "Extism Status",
+  "icon": null,
+  "location": "right",
+  "default_visibility": "visible",
+  "view": {
+    "schema_version": "1.0",
+    "revision": 1,
+    "root": {
+      "type": "column",
+      "children": [
+        {"type": "heading", "text": "Extism", "level": 2},
+        {"type": "text", "text": "This panel comes from the Extism plugin's file."}
+      ]
+    }
+  }
+}

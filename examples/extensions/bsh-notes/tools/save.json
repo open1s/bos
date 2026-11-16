@@ -1,0 +1,10 @@
+{
+  "description": "Append one note to the workspace notes file",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": { "type": "string", "description": "Note text" }
+    },
+    "required": ["text"]
+  }
+}
