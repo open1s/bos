@@ -157,7 +157,11 @@ The module candidate mapper consumes typed module declarations and the caller-pr
 
 The graph builder starts only from crate roots supplied by the host. Each root has an independent logical module namespace, even when multiple roots reference the same source file. Inline module declarations create in-file module nodes; external declarations are followed only when exactly one conventional candidate exists and that candidate has a Rust parse result. Ambiguous, missing, attribute-dependent, and unparsed targets remain explicit declaration edges. Recovered, limited, failed, or missing target parses make graph coverage partial. Configurable node, edge, and logical-depth limits bound output. This is a navigation/retrieval graph, not compiler-equivalent module resolution: Cargo target discovery, `cfg` evaluation, macro-generated modules, and `#[path]` remain outside this stage.
 
-### 4.9 Cross-file resolution
+### 4.9 Rust import-to-module context (CI-09G)
+
+The import mapper consumes structured `ImportFact` records and the crate-root module graph. It supports explicit `crate::`, `self::`, and repeated `super::` roots, resolves only the longest known module prefix, and returns remaining path segments as member-path candidates. It preserves aliases and glob markers. Bare/unqualified paths are left unresolved because they may refer to the extern prelude or language-specific lexical rules. Multiple module nodes with the same logical path remain ambiguous. A module-prefix match does not resolve the imported symbol; symbol visibility, re-exports, macro expansion, dependency crates, and compiler configuration remain outside this stage.
+
+### 4.10 Cross-file resolution
 
 Resolution is a separate stage over extracted facts and workspace metadata. It may resolve:
 
@@ -168,7 +172,7 @@ Resolution is a separate stage over extracted facts and workspace metadata. It m
 
 Resolution output must retain its own provenance and diagnostics. Ambiguous candidates remain ambiguous; they are not collapsed to an arbitrary target.
 
-### 4.10 Relationship analysis and query
+### 4.11 Relationship analysis and query
 
 Relationship analysis is a deterministic transformation over extracted facts. A graph-shaped view may be built when it helps a query, but the underlying index must not require all records to be represented as graph nodes and edges. This stage must not perform parsing or filesystem access.
 
