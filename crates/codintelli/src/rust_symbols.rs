@@ -72,7 +72,10 @@ pub fn build_rust_scoped_symbols(
     parse_results: &[ParseResult],
     graph: &RustModuleGraph,
 ) -> Result<RustScopedSymbolReport, RustScopedSymbolError> {
-    if parse_results.iter().any(|result| result.workspace_id != graph.workspace_id) {
+    if parse_results
+        .iter()
+        .any(|result| result.workspace_id != graph.workspace_id)
+    {
         return Err(RustScopedSymbolError::WorkspaceMismatch);
     }
 
@@ -82,17 +85,26 @@ pub fn build_rust_scoped_symbols(
         if by_path.insert(result.relative_path.clone(), result).is_some() {
             return Err(RustScopedSymbolError::DuplicateParsePath(result.relative_path.clone()));
         }
-        if matches!(result.status, ParseStatus::Recovered | ParseStatus::Limited | ParseStatus::Failed) {
+        if matches!(
+            result.status,
+            ParseStatus::Recovered | ParseStatus::Limited | ParseStatus::Failed
+        ) {
             incomplete_source_paths.push(result.relative_path.clone());
         }
     }
 
     let mut symbols = Vec::new();
-    for node in graph.nodes.iter().filter(|node| node.kind != RustModuleNodeKind::Inline) {
+    for node in graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind != RustModuleNodeKind::Inline)
+    {
         let Some(parse) = by_path.get(&node.source_path) else {
             continue;
         };
-        if parse.language != crate::classification::LanguageId::Rust {
+        if parse.language != crate::classification::LanguageId::Rust
+            || parse.status == ParseStatus::Failed
+        {
             continue;
         }
         for fact in &parse.facts {
@@ -135,8 +147,20 @@ pub fn build_rust_scoped_symbols(
     }
 
     symbols.sort_unstable_by(|left, right| {
-        (&left.id.crate_root, &left.id.module_path, &left.name, &left.id.source_path, left.id.range)
-            .cmp(&(&right.id.crate_root, &right.id.module_path, &right.name, &right.id.source_path, right.id.range))
+        (
+            &left.id.crate_root,
+            &left.id.module_path,
+            &left.name,
+            &left.id.source_path,
+            left.id.range,
+        )
+            .cmp(&(
+                &right.id.crate_root,
+                &right.id.module_path,
+                &right.name,
+                &right.id.source_path,
+                right.id.range,
+            ))
     });
     incomplete_source_paths.sort();
     incomplete_source_paths.dedup();
@@ -206,7 +230,10 @@ mod tests {
         let report = build_rust_scoped_symbols(&[parse], &graph).expect("scoped symbol catalog");
         assert_eq!(report.symbols.len(), 2);
         assert_eq!(report.symbols[0].id.module_path, vec!["inner".to_owned()]);
-        assert_eq!(report.symbols[1].id.module_path, vec!["shared".to_owned(), "inner".to_owned()]);
+        assert_eq!(
+            report.symbols[1].id.module_path,
+            vec!["shared".to_owned(), "inner".to_owned()]
+        );
         assert_ne!(report.symbols[0].id.crate_root, report.symbols[1].id.crate_root);
     }
 }
