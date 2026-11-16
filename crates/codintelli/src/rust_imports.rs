@@ -545,13 +545,20 @@ mod tests {
             Vec::new(),
             id,
         );
+        let mut ambiguous = edge(&["shared"], RustModuleEdgeStatus::AmbiguousCandidates);
+        ambiguous.candidate_paths = vec![
+            PathBuf::from("src/shared.rs"),
+            PathBuf::from("src/shared/mod.rs"),
+        ];
         let graph = make_graph_with_edges(
             id,
             vec![node(&[], "src/lib.rs", RustModuleNodeKind::CrateRoot)],
-            vec![edge(&["shared"], RustModuleEdgeStatus::AmbiguousCandidates)],
+            vec![ambiguous],
         );
         let report = resolve_rust_import_module_candidates(&[parsed], &graph).expect("imports");
         assert_eq!(report.imports[0].status, RustImportResolutionStatus::AmbiguousModuleTarget);
+        assert_eq!(report.imports[0].candidate_source_paths.len(), 2);
+        assert_eq!(report.imports[0].candidate_source_paths.len(), 2);
     }
 
     #[test]
