@@ -109,7 +109,12 @@ impl LanguageProvider for RustProvider {
 fn classify_node(node: Node<'_>, source: &str) -> Option<(SyntaxFactKind, Option<String>)> {
     let kind = match node.kind() {
         "mod_item" => SyntaxFactKind::Module,
-        "function_item" if node.parent().is_some_and(|parent| parent.kind() == "impl_item") => {
+        "function_item"
+            if node
+                .parent()
+                .and_then(|parent| parent.parent())
+                .is_some_and(|grandparent| grandparent.kind() == "impl_item") =>
+        {
             SyntaxFactKind::Method
         }
         "function_item" => SyntaxFactKind::Function,
