@@ -75,7 +75,9 @@ pub struct SyntaxFact {
 pub enum ParseStatus {
     /// The provider parsed the complete file without syntax errors.
     Complete,
-    /// Parsing failed; no partial facts are claimed as complete.
+    /// The parser recovered from one or more syntax errors.
+    Recovered,
+    /// Parsing could not produce a syntax tree.
     Failed,
 }
 
@@ -134,6 +136,12 @@ pub enum ProviderError {
     /// The supplied path is not a non-empty, normal relative path.
     #[error("provider input path must be a non-empty workspace-relative path")]
     InvalidPath,
+    /// The Tree-sitter parser could not be configured.
+    #[error("failed to initialize language parser: {0}")]
+    ParserInitialization(String),
+    /// Tree-sitter aborted parsing before producing a syntax tree.
+    #[error("language parser aborted before producing a syntax tree")]
+    ParseAborted,
 }
 
 /// Pluggable syntax parser for one language.
