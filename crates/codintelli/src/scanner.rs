@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::{
-    fs::{WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs, WorkspaceFsError},
+    fs::{WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs},
     ScanBudget, ScanBudgetError, ScanUsage,
 };
 
@@ -188,9 +188,6 @@ fn record_budget_stop(
     });
 }
 
-#[allow(dead_code)]
-fn _filesystem_error_is_not_a_budget_error(_: &WorkspaceFsError) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,9 +231,9 @@ mod tests {
             report.entries.iter().map(|entry| entry.relative_path.as_path()).collect::<Vec<_>>(),
             vec![
                 std::path::Path::new("src"),
+                std::path::Path::new("src/lib.rs"),
                 std::path::Path::new("src/nested"),
                 std::path::Path::new("src/nested/mod.rs"),
-                std::path::Path::new("src/lib.rs"),
                 std::path::Path::new("z.rs"),
             ]
         );
