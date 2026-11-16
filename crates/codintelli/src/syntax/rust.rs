@@ -384,6 +384,7 @@ fn helper() {}
             .expect("parse within limits");
 
         assert_eq!(result.status, ParseStatus::Limited);
+        assert_eq!(result.limit_reason, Some(ParseLimitKind::Facts));
         assert_eq!(result.facts.len(), 1);
     }
 
@@ -407,6 +408,31 @@ fn helper() {}
             .expect("parse within node limit");
 
         assert_eq!(result.status, ParseStatus::Limited);
+        assert_eq!(result.limit_reason, Some(ParseLimitKind::SyntaxNodes));
+    }
+
+    #[test]
+    fn bounds_diagnostic_output() {
+        let budget = ScanBudget::new(ScanLimits::default());
+        let limits = ParseLimits {
+            max_nodes: 1000,
+            max_facts: 100,
+            max_diagnostics: 0,
+        };
+        let result = RustProvider
+            .parse_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"fn broken( {",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect("parse within diagnostic limit");
+
+        assert_eq!(result.status, ParseStatus::Limited);
+        assert_eq!(result.limit_reason, Some(ParseLimitKind::Diagnostics));
+        assert!(result.diagnostics.is_empty());
     }
 
     #[test]
