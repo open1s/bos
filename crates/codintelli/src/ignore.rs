@@ -162,10 +162,12 @@ impl IgnoreRule {
             IgnoreMatcher::DirectoryName(name) => {
                 let components = path.components().collect::<Vec<_>>();
                 components.iter().enumerate().any(|(index, component)| {
+                    let Component::Normal(value) = component else {
+                        return false;
+                    };
                     let is_directory_component =
                         index + 1 < components.len() || kind == WorkspaceEntryKind::Directory;
-                    is_directory_component
-                        && matches!(component, Component::Normal(value) if value == name.as_os_str())
+                    is_directory_component && *value == name.as_os_str()
                 })
             }
             IgnoreMatcher::Extension(extension) => {
@@ -276,13 +278,16 @@ impl IgnorePolicy {
 fn builtin_directory_match(path: &Path, kind: WorkspaceEntryKind) -> bool {
     let components = path.components().collect::<Vec<_>>();
     components.iter().enumerate().any(|(index, component)| {
+        let Component::Normal(value) = component else {
+            return false;
+        };
+        let value = *value;
         let is_directory_component =
             index + 1 < components.len() || kind == WorkspaceEntryKind::Directory;
-        matches!(component, Component::Normal(value)
-            if (is_directory_component || value == OsStr::new(".git"))
-                && BUILTIN_IGNORED_DIRECTORY_NAMES
-                    .iter()
-                    .any(|name| value == OsStr::new(name)))
+        (is_directory_component || value == OsStr::new(".git"))
+            && BUILTIN_IGNORED_DIRECTORY_NAMES
+                .iter()
+                .any(|name| value == OsStr::new(name))
     })
 }
 
