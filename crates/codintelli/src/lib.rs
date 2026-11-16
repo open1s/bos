@@ -22,6 +22,7 @@ pub mod fs;
 pub mod ignore;
 pub mod scan_budget;
 pub mod scanner;
+pub mod syntax;
 pub mod workspace;
 
 pub use ignore::{IgnoreAction, IgnorePolicy, IgnorePolicyError, IgnoreRule};
@@ -33,4 +34,9 @@ pub use scanner::{
     scan_workspace, scan_workspace_with_policy, ScanDiagnostic, ScanDiagnosticKind, ScanStatus,
     WorkspaceScanReport,
 };
+pub use syntax::{
+    LanguageProvider, ParseDiagnostic, ParseInput, ParseResult, ParseStatus, ProviderError,
+    SourceRange, SyntaxFact, SyntaxFactKind,
+};
+pub use syntax::rust::RustProvider;
 pub use workspace::{WorkspaceDescriptor, WorkspaceError, WorkspaceId, WorkspaceRegistry};

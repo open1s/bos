@@ -162,6 +162,29 @@ Initial query operations:
 
 Query results should return evidence references and completeness/coverage metadata, not only labels and IDs.
 
+## 4.7 First syntax provider: Rust
+
+The first provider uses Syn rather than Tree-sitter. This is a deliberate initial
+trade-off: Syn is pure Rust and avoids adding a C/C++ parser compilation
+toolchain to the core crate. Its parser is strict rather than error-recovering:
+a malformed file yields a failed parse result and a diagnostic, not a
+potentially misleading partial fact set. If tolerant parsing and editor-grade
+incremental reparsing become required, Tree-sitter can be evaluated as another
+provider behind the same contract.
+
+The provider contract is host-neutral and consumes only already-bounded UTF-8
+bytes. The caller must use `WorkspaceFs` and reserve file/aggregate bytes with
+`ScanBudget` before parsing. The provider does not read files, inspect Cargo
+metadata, invoke rustc, or execute workspace-controlled code.
+
+The initial Rust facts cover modules, free functions, methods, structs, enums,
+unions, traits, impl blocks, type aliases, constants, statics, imports, direct
+function-call expressions, and method-call expressions. Calls are syntax
+observations only; they are not resolved to declarations. Each fact carries a
+half-open byte range into the original UTF-8 source. Provider ID, parser
+version, schema version, workspace ID, and relative path are retained so
+persisted results can be invalidated or partitioned correctly.
+
 ## 5. Structural facts and optional graph view
 
 The exact Rust types will be introduced in a later implementation change. The following is a candidate contract for structural facts and an optional graph projection, not a mandate to model every indexed item as a graph entity.
