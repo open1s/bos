@@ -263,7 +263,7 @@ fn record_budget_stop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ScanLimits, WorkspaceDescriptor, WorkspaceId};
+    use crate::{IgnoreRule, IgnorePolicy, ScanLimits, WorkspaceDescriptor, WorkspaceId};
     use std::{fs, time::Duration};
     use tempfile::tempdir;
 
@@ -279,11 +279,19 @@ mod tests {
     }
 
     fn scan(root: &std::path::Path, limits: ScanLimits) -> WorkspaceScanReport {
+        scan_with_policy(root, limits, &IgnorePolicy::default())
+    }
+
+    fn scan_with_policy(
+        root: &std::path::Path,
+        limits: ScanLimits,
+        ignore: &IgnorePolicy,
+    ) -> WorkspaceScanReport {
         let descriptor = WorkspaceDescriptor::new(WorkspaceId::new(), root)
             .expect("create workspace descriptor");
         let fs = WorkspaceFs::open(&descriptor).expect("open workspace");
         let budget = ScanBudget::new(limits);
-        scan_workspace(&fs, &budget)
+        scan_workspace_with_policy(&fs, &budget, ignore)
     }
 
     #[test]
@@ -471,6 +479,80 @@ mod tests {
                 })
                 .count(),
             1
+        );
+    }
+
+
+    #[test]
+    fn default_policy_prunes_generated_directories_but_counts_their_entries() {
+        let root = tempdir().expect("create workspace");
+        fs::create_dir(root.path().join("src")).expect("create src");
+        fs::create_dir(root.path().join("target")).expect("create target");
+        fs::create_dir(root.path().join("node_modules")).expect("create node_modules");
+        fs::write(root.path().join("src/main.rs"), "fn main() {}").expect("write source");
+        fs::write(root.path().join("target/generated.rs"), "generated").expect("write generated");
+        fs::write(root.path().join("node_modules/pkg.js"), "package").expect("write package");
+
+        let report = scan(root.path(), limits());
+
+        assert_eq!(report.status, ScanStatus::Complete);
+        assert_eq!(report.ignored_entries, 2);
+        assert_eq!(report.directories_pruned, 2);
+        assert_eq!(report.usage.files, 1);
+        assert_eq!(report.usage.entries, 4);
+        assert_eq!(report.entries.len(), 2);
+        assert!(report.entries.iter().any(|entry| {
+            entry.relative_path == std::path::Path::new("src/main.rs")
+        }));
+        assert!(!report.entries.iter().any(|entry| {
+            entry.relative_path.starts_with("target")
+                || entry.relative_path.starts_with("node_modules")
+        }));
+    }
+
+    #[test]
+    fn include_rule_traverses_ignored_parent_only_to_reinclude_target() {
+        let root = tempdir().expect("create workspace");
+        fs::create_dir_all(root.path().join("target/keep")).expect("create keep");
+        fs::create_dir_all(root.path().join("target/drop")).expect("create drop");
+        fs::write(root.path().join("target/keep/main.rs"), "source").expect("write kept source");
+        fs::write(root.path().join("target/drop/generated.rs"), "generated")
+            .expect("write ignored source");
+
+        let mut ignore = IgnorePolicy::default();
+        ignore.push(IgnoreRule::include_path("target/keep/main.rs").unwrap());
+
+        let report = scan_with_policy(root.path(), limits(), &ignore);
+
+        assert_eq!(report.status, ScanStatus::Complete);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(
+            report.entries[0].relative_path,
+            std::path::Path::new("target/keep/main.rs")
+        );
+        assert_eq!(report.ignored_entries, 3);
+        assert_eq!(report.directories_pruned, 1);
+        assert_eq!(report.usage.files, 1);
+    }
+
+    #[test]
+    fn extension_exclusions_do_not_consume_accepted_file_budget() {
+        let root = tempdir().expect("create workspace");
+        fs::write(root.path().join("main.rs"), "source").expect("write source");
+        fs::write(root.path().join("debug.log"), "log").expect("write log");
+
+        let mut ignore = IgnorePolicy::default();
+        ignore.push(IgnoreRule::exclude_extension("log").unwrap());
+
+        let report = scan_with_policy(root.path(), limits(), &ignore);
+
+        assert_eq!(report.status, ScanStatus::Complete);
+        assert_eq!(report.ignored_entries, 1);
+        assert_eq!(report.usage.files, 1);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(
+            report.entries[0].relative_path,
+            std::path::Path::new("main.rs")
         );
     }
 
