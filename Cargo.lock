@@ -1991,6 +1991,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "codintelli"
+version = "4.1.12"
+
+[[package]]
 name = "config"
 version = "4.1.12"
 dependencies = [
