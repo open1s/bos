@@ -243,6 +243,7 @@ mod tests {
     };
 
     fn symbol(
+        workspace_id: WorkspaceId,
         crate_root: &str,
         module_path: &[&str],
         source_path: &str,
@@ -251,7 +252,7 @@ mod tests {
     ) -> RustScopedSymbol {
         RustScopedSymbol {
             id: RustScopedSymbolId {
-                workspace_id: WorkspaceId::new(),
+                workspace_id,
                 crate_root: PathBuf::from(crate_root),
                 module_path: module_path.iter().map(|part| (*part).to_owned()).collect(),
                 source_path: PathBuf::from(source_path),
@@ -263,7 +264,6 @@ mod tests {
     }
 
     fn module_import(
-        id: WorkspaceId,
         member_path: &[&str],
         is_glob: bool,
         alias: Option<&str>,
@@ -321,10 +321,9 @@ mod tests {
     #[test]
     fn maps_unique_member_candidate_and_applies_alias() {
         let id = WorkspaceId::new();
-        let mut item = symbol("src/lib.rs", &["model"], "src/model.rs", "Widget", 10);
-        item.id.workspace_id = id;
+        let item = symbol(id, "src/lib.rs", &["model"], "src/model.rs", "Widget", 10);
         let report = resolve(
-            vec![module_import(id, &["Widget"], false, Some("LocalWidget"))],
+            vec![module_import(&["Widget"], false, Some("LocalWidget"))],
             vec![item],
             RustModuleGraphStatus::Complete,
             Vec::new(),
@@ -338,8 +337,6 @@ mod tests {
         let id = WorkspaceId::new();
         let mut first = symbol("src/lib.rs", &["model"], "src/model.rs", "Widget", 10);
         let mut second = symbol("src/lib.rs", &["model"], "src/model.rs", "Widget", 40);
-        first.id.workspace_id = id;
-        second.id.workspace_id = id;
         let report = resolve(
             vec![module_import(id, &["Widget"], false, None)],
             vec![first, second],
@@ -355,8 +352,6 @@ mod tests {
         let id = WorkspaceId::new();
         let mut direct = symbol("src/lib.rs", &["model"], "src/model.rs", "Widget", 10);
         let mut nested = symbol("src/lib.rs", &["model", "inner"], "src/model.rs", "Hidden", 40);
-        direct.id.workspace_id = id;
-        nested.id.workspace_id = id;
         let report = resolve(
             vec![module_import(id, &[], true, None)],
             vec![direct, nested],
