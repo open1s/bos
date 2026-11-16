@@ -559,6 +559,39 @@ mod tests {
     }
 
     #[test]
+    fn applies_file_directory_rules_per_crate_root_context() {
+        let id = WorkspaceId::new();
+        let results = vec![
+            parsed("src/lib.rs", vec![module("foo", &[], false)], id),
+            parsed("src/foo.rs", vec![module("child", &[], false)], id),
+            parsed("src/foo/child.rs", Vec::new(), id),
+            parsed("src/child.rs", Vec::new(), id),
+        ];
+        let graph = build_rust_module_graph(
+            &results,
+            &[
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("src/foo.rs"),
+                PathBuf::from("src/foo/child.rs"),
+                PathBuf::from("src/child.rs"),
+            ],
+            &[PathBuf::from("src/lib.rs"), PathBuf::from("src/foo.rs")],
+            RustModuleGraphLimits::default(),
+        ).expect("multi-root module graph");
+
+        assert!(graph.nodes.iter().any(|node| {
+            node.crate_root == PathBuf::from("src/lib.rs")
+                && node.module_path == vec!["foo".to_owned(), "child".to_owned()]
+                && node.source_path == PathBuf::from("src/foo/child.rs")
+        }));
+        assert!(graph.nodes.iter().any(|node| {
+            node.crate_root == PathBuf::from("src/foo.rs")
+                && node.module_path == vec!["child".to_owned()]
+                && node.source_path == PathBuf::from("src/child.rs")
+        }));
+    }
+
+    #[test]
     fn preserves_ambiguous_candidates_without_traversing_them() {
         let id = WorkspaceId::new();
         let results = vec![parsed("src/lib.rs", vec![module("model", &[], false)], id)];
