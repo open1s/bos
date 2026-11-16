@@ -17,6 +17,7 @@
 //! root. Callers that need identity to survive restarts must persist the ID in
 //! host-managed metadata and supply it again when opening the workspace.
 
+pub mod classification;
 pub mod fs;
 pub mod ignore;
 pub mod scan_budget;
