@@ -265,9 +265,9 @@ fn builtin_directory_match(path: &Path, kind: WorkspaceEntryKind) -> bool {
     components.iter().enumerate().any(|(index, component)| {
         let is_directory_component =
             index + 1 < components.len() || kind == WorkspaceEntryKind::Directory;
-        is_directory_component
-            && matches!(component, Component::Normal(value)
-                if BUILTIN_IGNORED_DIRECTORY_NAMES
+        matches!(component, Component::Normal(value)
+            if (is_directory_component || value == OsStr::new(".git"))
+                && BUILTIN_IGNORED_DIRECTORY_NAMES
                     .iter()
                     .any(|name| value == OsStr::new(name)))
     })
@@ -398,3 +398,9 @@ mod tests {
         assert!(!policy.is_ignored(Path::new("target"), WorkspaceEntryKind::Directory));
     }
 }
+    #[test]
+    fn excludes_git_worktree_marker_file() {
+        let policy = IgnorePolicy::default();
+        assert!(policy.is_ignored(Path::new(".git"), WorkspaceEntryKind::File));
+    }
+
