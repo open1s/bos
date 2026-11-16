@@ -133,11 +133,46 @@ impl ScanBudget {
         Ok(())
     }
 
+    /// Record one accepted regular file without reserving its content bytes.
+    ///
+    /// This is used by inventory-only scans that do not read source contents.
+    pub fn record_file(&self) -> Result<(), ScanBudgetError> {
+        self.check()?;
+        let mut usage = self.usage.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.check()?;
+        let next_files = usage.files.saturating_add(1);
+        if next_files > self.limits.max_files {
+            return Err(ScanBudgetError::FileLimitExceeded);
+        }
+        usage.files = next_files;
+        Ok(())
+    }
+
+    /// Reserve content bytes for a file already accepted by the scan.
+    ///
+    /// The caller must cap the actual read to the configured per-file limit
+    /// and remaining aggregate byte allowance. Reservations are conservative
+    /// and are not refunded when a read fails or a file changes.
+    pub fn reserve_file_bytes(&self, size_bytes: u64) -> Result<(), ScanBudgetError> {
+        self.check()?;
+        if size_bytes > self.limits.max_file_bytes {
+            return Err(ScanBudgetError::FileTooLarge);
+        }
+        let mut usage = self.usage.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.check()?;
+        let next_bytes = usage.total_bytes.saturating_add(size_bytes);
+        if next_bytes > self.limits.max_total_bytes {
+            return Err(ScanBudgetError::TotalBytesLimitExceeded);
+        }
+        usage.total_bytes = next_bytes;
+        Ok(())
+    }
+
     /// Reserve one regular file and its known size before reading it.
     ///
-    /// The caller must still cap the actual read to the configured per-file
-    /// limit and the remaining aggregate byte allowance. Reservations are
-    /// conservative and are not refunded when a read fails or a file changes.
+    /// This convenience method atomically records the file and reserves its
+    /// bytes. Use record_file plus reserve_file_bytes when inventory and content
+    /// retrieval are separate stages.
     pub fn reserve_file(&self, size_bytes: u64) -> Result<(), ScanBudgetError> {
         self.check()?;
         if size_bytes > self.limits.max_file_bytes {
@@ -167,6 +202,11 @@ impl ScanBudget {
     /// Return the configured limits.
     pub fn limits(&self) -> &ScanLimits {
         &self.limits
+    }
+
+    /// Return the remaining aggregate directory-entry allowance.
+    pub fn remaining_entries(&self) -> u64 {
+        self.limits.max_entries.saturating_sub(self.usage().entries)
     }
 
     /// Return the remaining aggregate byte allowance.
@@ -271,4 +311,21 @@ mod tests {
         assert_eq!(accepted, 3);
         assert_eq!(budget.usage().entries, 3);
     }
+
+    #[test]
+    fn tracks_remaining_entries_and_inventory_files_separately_from_bytes() {
+        let budget = ScanBudget::new(limits());
+        assert_eq!(budget.remaining_entries(), 3);
+        budget.record_entry(0).unwrap();
+        assert_eq!(budget.remaining_entries(), 2);
+
+        budget.record_file().unwrap();
+        assert_eq!(budget.usage().files, 1);
+        assert_eq!(budget.usage().total_bytes, 0);
+
+        budget.reserve_file_bytes(6).unwrap();
+        assert_eq!(budget.remaining_bytes(), 4);
+        assert_eq!(budget.usage().files, 1);
+    }
+
 }
