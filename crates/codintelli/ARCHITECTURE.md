@@ -95,18 +95,20 @@ Initial built-in exclusions include VCS internals and common generated/dependenc
 
 The scanner must return a typed completion state: `Complete`, `Partial`, `Cancelled`, or `Failed`, with usage and diagnostics. A budget-exceeded scan is partial, never complete.
 
-### 4.2 Source snapshot and fingerprints
+### 4.2 Bounded source loading and syntax extraction
 
-Each file record should include:
+The initial source pipeline is implemented as a synchronous, sequential operation intended to run on a bounded host worker:
 
-- normalized workspace-relative path;
-- detected language/provider;
-- byte length;
-- content fingerprint (cryptographic digest);
-- last successful extraction version;
-- extraction status and diagnostic summary.
+1. Run the inventory scanner with the same shared ScanBudget.
+2. Classify accepted files using workspace-relative names and extensions.
+3. Select a registered LanguageProvider for source files.
+4. Reserve the no-follow metadata size against the aggregate byte budget before reading.
+5. Read through WorkspaceFs with a per-file limit equal to the reserved size.
+6. Parse only the bounded in-memory bytes and retain workspace identity, relative path, provider version, schema version, facts, and diagnostics.
 
-Fingerprints are content-derived, not absolute-path-derived. File identity for graph nodes must remain stable across moving the same workspace to another machine.
+A file that grows between enumeration and reading is rejected by the bounded read. Byte reservations are conservative and are not refunded after read or parse failure. Unsupported languages remain visible as unsupported results; they are not silently dropped from coverage accounting. Documentation, configuration, data, markup, style, and asset files remain in inventory but are not sent to source parsers by the initial pipeline.
+
+The first pipeline checks cancellation and deadlines between files. A parser currently processing one bounded file is not preempted by the orchestration layer; this is an explicit limitation until provider-level cancellation is wired and tested. No project commands, compilers, build scripts, package managers, or tests are executed.
 
 ### 4.3 Language provider registry
 
@@ -119,7 +121,7 @@ Initial implementation order:
 3. JSON, TOML, YAML and common manifest/config formats as data sources, not executable inputs.
 4. Additional languages through independently testable providers.
 
-Tree-sitter is a strong candidate for the parser substrate, but the parser API and grammar dependency strategy must be evaluated before freezing the public provider contract. A provider must declare its language ID, supported file kinds, parser version, and extraction schema version.
+Tree-sitter is the selected parser substrate for the first Rust provider. Additional language grammars should be added behind the same provider contract and evaluated independently for build portability, grammar maintenance, and resource behavior. A provider must declare its language ID, supported file kinds, parser version, and extraction schema version.
 
 ### 4.4 Structural extraction
 
@@ -323,7 +325,7 @@ The engine should expose host-neutral operations similar to:
 - query graph snapshots and evidence;
 - export a versioned snapshot.
 
-The exact sync/async boundary is intentionally not frozen here. The core indexing pipeline should be usable from synchronous library callers while allowing hosts to run it on bounded background workers. A future Ferris/Builtin adapter can map these operations into host tools without making the engine depend on Ferris.
+The source pipeline is synchronous and sequential today. Hosts must run it on bounded background workers; a future worker-pool API must preserve one shared budget, deterministic result ordering, cooperative cancellation, and explicit partial coverage. A future Ferris/Builtin adapter can map these operations into host tools without making the engine depend on Ferris.
 
 ## 10. Delivery sequence
 
@@ -336,10 +338,11 @@ The exact sync/async boundary is intentionally not frozen here. The core indexin
 | CI-05 | Ignore rules and file classification | Configurable exclusions; deterministic classification |
 | CI-06 | Typed source facts and relationship contracts | Versioned declarations/references/evidence; optional graph projection; validation tests |
 | CI-07 | Parser/provider seam + Rust provider | Deterministic source facts with source evidence |
-| CI-08 | Symbol/import resolution | Resolved edges with ambiguity preserved |
-| CI-09 | Incremental graph store | Atomic per-file replacement; last-known-good preservation |
-| CI-10 | Query API | File/symbol search, source retrieval, explain, references, optional neighbors/path/impact |
-| CI-11 | Optional export and host adapter | Versioned exports; integration remains outside engine |
+| CI-08 | Bounded source-to-facts pipeline | Inventory, classification, reserved reads, provider dispatch, explicit coverage |
+| CI-09 | Symbol/import resolution | Resolved edges with ambiguity preserved |
+| CI-10 | Incremental extraction store | Atomic per-file replacement; last-known-good preservation |
+| CI-11 | Query API | File/symbol search, source retrieval, explain, references, optional neighbors/path/impact |
+| CI-12 | Optional export and host adapter | Versioned exports; integration remains outside engine |
 
 Each stage should be independently reviewable and normally fit within a small PR. Do not implement graph persistence, semantic LLM extraction, clustering, or visualization before concrete query requirements justify them. Stabilize source-fact and evidence contracts first.
 

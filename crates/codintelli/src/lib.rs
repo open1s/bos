@@ -3,7 +3,7 @@
 
 //! Host-independent code intelligence primitives for the BOS workspace.
 //!
-//! `codintelli` is an engine crate, not a BSH or Ferris subsystem. It must not
+//! codintelli is an engine crate, not a BSH or Ferris subsystem. It must not
 //! depend on BSH, Ferris, GPUI, or a host runtime. Host-specific integration
 //! belongs in a separate adapter crate or in the host that embeds this engine.
 //!
@@ -20,6 +20,7 @@
 pub mod classification;
 pub mod fs;
 pub mod ignore;
+pub mod index;
 pub mod scan_budget;
 pub mod scanner;
 pub mod syntax;
@@ -28,6 +29,10 @@ pub mod workspace;
 pub use ignore::{IgnoreAction, IgnorePolicy, IgnorePolicyError, IgnoreRule};
 pub use fs::{
     DirectoryListing, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs, WorkspaceFsError,
+};
+pub use index::{
+    index_rust_workspace, index_workspace, SourceFileResult, SourceFileStatus,
+    SourceIndexDiagnostic, SourceIndexDiagnosticKind, SourceIndexReport, SourceIndexStatus,
 };
 pub use scan_budget::{ScanBudget, ScanBudgetError, ScanLimits, ScanUsage};
 pub use scanner::{
