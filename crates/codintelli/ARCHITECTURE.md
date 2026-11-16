@@ -159,7 +159,7 @@ The graph builder starts only from crate roots supplied by the host. Each root h
 
 ### 4.9 Rust import-to-module context (CI-09G)
 
-The import mapper consumes structured `ImportFact` records and the crate-root module graph. It supports explicit `crate::`, `self::`, and repeated `super::` roots, resolves only the longest known module prefix, and returns remaining path segments as member-path candidates. It preserves aliases and glob markers. Bare/unqualified paths are left unresolved because they may refer to the extern prelude or language-specific lexical rules. Multiple module nodes with the same logical path remain ambiguous. A module-prefix match does not resolve the imported symbol; symbol visibility, re-exports, macro expansion, dependency crates, and compiler configuration remain outside this stage.
+The import mapper consumes structured `ImportFact` records and the crate-root module graph. It supports explicit `crate::`, `self::`, and repeated `super::` roots, resolves only the longest known module prefix, and returns remaining path segments as member-path candidates. It preserves aliases and glob markers. Bare/unqualified paths are left unresolved because they may refer to the extern prelude or language-specific lexical rules. Multiple module nodes with the same logical path remain ambiguous. The mapper also propagates unresolved graph-edge states: attribute uncertainty, unparsed targets, depth limits, and ambiguous declarations are not collapsed into `NoModuleCandidate`. A module-prefix match does not resolve the imported symbol; symbol visibility, re-exports, macro expansion, dependency crates, and compiler configuration remain outside this stage.
 
 ### 4.10 Cross-file resolution
 
@@ -367,6 +367,9 @@ The source pipeline is synchronous and sequential today. Hosts must run it on bo
 | CI-09B | Symbol candidate catalog and conservative references | Deterministic declaration IDs; unique/ambiguous/unresolved candidates; no false resolved edges 
 | CI-09C | Structured Rust import facts | Tree-sitter import paths, grouped expansion, aliases, globs, lexical scope and source evidence |
 | CI-09D | Rust module declaration facts | Distinguish inline and external declarations, retain lexical scope and source evidence; no false file-resolution claim |
+| CI-09E | Conservative Rust module path candidates | Per-root conventional file candidates; preserve ambiguity and cfg/path uncertainty |
+| CI-09F | Crate-root-anchored module graph | Separate crate namespaces; bounded traversal of unique parsed candidates; explicit partial coverage |
+| CI-09G | Rust import-to-module context | Resolve explicit crate/self/super module prefixes; propagate unresolved graph-edge states; no false symbol resolution |
 | CI-10 | Incremental extraction store | Atomic per-file replacement; last-known-good preservation |
 | CI-11 | Query API | File/symbol search, source retrieval, explain, references, optional neighbors/path/impact |
 | CI-12 | Optional export and host adapter | Versioned exports; integration remains outside engine |
