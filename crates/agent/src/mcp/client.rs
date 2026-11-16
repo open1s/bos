@@ -200,10 +200,10 @@ impl McpClient {
                 "initialize",
                 Some(serde_json::json!({
                     "protocolVersion": "2025-03-26",
-                    "capabilities": {
-                        "roots": { "listChanged": true },
-                        "sampling": {}
-                    },
+                    // Advertise only what this client implements. Roots and
+                    // sampling were declared but never answered, so a server
+                    // that used them waited forever for a reply.
+                    "capabilities": {},
                     "clientInfo": {
                         "name": "brainos-agent",
                         "version": "1.0.0"
@@ -543,7 +543,38 @@ impl McpClient {
                         continue;
                     }
 
-                    if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&buffer) {
+                    let Ok(message) = serde_json::from_str::<serde_json::Value>(&buffer) else {
+                        // Not a protocol frame; a stray log line must not
+                        // desynchronize the exchange.
+                        continue;
+                    };
+                    if message.get("method").is_some() {
+                        // A server-initiated request or notification. This
+                        // client implements no server requests, so a request
+                        // is answered with JSON-RPC's "method not found"
+                        // instead of being dropped (which left the server
+                        // waiting).
+                        if let Some(request_id) = message.get("id") {
+                            if !request_id.is_null() {
+                                let method = message
+                                    .get("method")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("");
+                                let reply = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": request_id.clone(),
+                                    "error": {
+                                        "code": -32601,
+                                        "message": format!("Method not found: {method}")
+                                    }
+                                });
+                                transport.send(&serde_json::to_vec(&reply)?).await?;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(message) {
                         if resp.id == serde_json::json!(id) {
                             return Ok(resp);
                         }
@@ -628,6 +659,58 @@ impl McpClient {
 #[cfg(test)]
 mod tests {
     use super::McpClient;
+
+    /// A server request is answered with JSON-RPC "method not found" before
+    /// the real response is read, so the server is never left waiting.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_server_request_is_answered_before_the_response() {
+        use std::process::Command;
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let scratch = tempfile::tempdir().expect("scratch");
+        std::fs::write(
+            scratch.path().join("server.py"),
+            r#"
+import json, sys
+
+def read():
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(0)
+    return json.loads(line)
+
+def write(value):
+    sys.stdout.write(json.dumps(value) + "
+")
+    sys.stdout.flush()
+
+request = read()
+write({"jsonrpc": "2.0", "method": "notifications/message",
+       "params": {"level": "info", "data": "hello"}})
+write({"jsonrpc": "2.0", "id": 99, "method": "roots/list"})
+answer = read()
+assert answer.get("id") == 99, answer
+assert answer.get("error", {}).get("code") == -32601, answer
+write({"jsonrpc": "2.0", "id": request["id"],
+       "result": {"protocolVersion": "2025-03-26", "capabilities": {},
+                  "serverInfo": {"name": "probe", "version": "1"}}})
+for _ in sys.stdin:
+    pass
+"#,
+        )
+        .expect("server script");
+
+        let client = McpClient::spawn_with("python3", &["server.py"], &[], Some(scratch.path()))
+            .await
+            .expect("client")
+            .with_call_timeout(std::time::Duration::from_secs(5));
+        client
+            .initialize()
+            .await
+            .expect("a server request does not break initialization");
+    }
 
     #[test]
     fn parse_tool_call_result_accepts_success_payload() {

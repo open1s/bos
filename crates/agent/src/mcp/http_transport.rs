@@ -164,11 +164,9 @@ impl HttpTransport {
             *self.session_id.lock().unwrap() = Some(sid);
         }
 
-        if response.content_type.contains("text/event-stream") {
-            return self.parse_sse_response(&response.body);
-        }
-
-        if !(200..=299).contains(&response.status) && response.status != 202 {
+        // The status is checked before the body is interpreted: a server that
+        // fails with an SSE content type must not look like a response.
+        if !(200..=299).contains(&response.status) {
             if response.body.is_empty() {
                 return Err(HttpTransportError::Http(format!(
                     "HTTP {} (empty body)",
@@ -178,6 +176,10 @@ impl HttpTransport {
             return Err(HttpTransportError::Http(response.body));
         }
 
+        if response.content_type.contains("text/event-stream") {
+            return response_from_events(&response.body, msg.get("id"));
+        }
+
         Ok(response.body)
     }
 
@@ -185,23 +187,67 @@ impl HttpTransport {
     pub fn session_id(&self) -> Option<String> {
         self.session_id.lock().unwrap().clone()
     }
+}
 
-    fn parse_sse_response(&self, text: &str) -> Result<String, HttpTransportError> {
-        let mut last_data = String::new();
-        for line in text.lines() {
-            let trimmed = line.trim_end();
-            if let Some(stripped) = trimmed.strip_prefix("data: ") {
-                last_data = stripped.to_string();
-            } else if trimmed.is_empty() && !last_data.is_empty() {
-                return Ok(last_data.clone());
-            }
+/// Parse an SSE body into the JSON values it carries.
+///
+/// One event may span several `data:` lines (joined with newlines, per the
+/// SSE grammar), and `:` comment lines carry nothing. A line that is not a
+/// JSON value is skipped rather than failing the stream.
+fn sse_events(text: &str) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    let mut data = String::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            push_event(&mut events, &mut data);
+            continue;
         }
-        if !last_data.is_empty() {
-            Ok(last_data)
-        } else {
-            Err(HttpTransportError::Http("No data in SSE stream".into()))
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            data.push('\n');
         }
     }
+    push_event(&mut events, &mut data);
+    events
+}
+
+/// Turn the accumulated `data:` lines into one event.
+fn push_event(events: &mut Vec<serde_json::Value>, data: &mut String) {
+    if data.is_empty() {
+        return;
+    }
+    let payload = data.trim_end_matches('\n');
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+        events.push(value);
+    }
+    data.clear();
+}
+
+/// The JSON-RPC response event for `expected` in an SSE body.
+///
+/// The stream may carry server notifications (or requests) before the
+/// response, so the event is selected by the request id it answers. A
+/// notification request has no id and no response; its stream is drained and
+/// an empty body is returned.
+fn response_from_events(
+    text: &str,
+    expected: Option<&serde_json::Value>,
+) -> Result<String, HttpTransportError> {
+    let Some(expected) = expected else {
+        return Ok(String::new());
+    };
+    sse_events(text)
+        .iter()
+        .find(|event| event.get("method").is_none() && event.get("id") == Some(expected))
+        .map(serde_json::Value::to_string)
+        .ok_or_else(|| {
+            HttpTransportError::Http(format!(
+                "No JSON-RPC response for id {expected} in the SSE stream"
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -219,6 +265,52 @@ mod tests {
             std::io::Write::write_all(&mut stream, response).expect("write response");
         });
         (format!("http://{address}/mcp"), handle)
+    }
+
+    /// A stream may carry notifications before the response; the response is
+    /// selected by the request id it answers.
+    #[test]
+    fn an_sse_response_is_selected_by_request_id() {
+        let body = concat!(
+            ": keep-alive\n\n",
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",",
+            "\"params\":{\"level\":\"info\",\"data\":\"hi\"}}\n\n",
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"tools\":[]}}\n\n",
+        );
+        let id = serde_json::json!(7);
+        let selected = response_from_events(body, Some(&id)).expect("response event");
+        let value: serde_json::Value = serde_json::from_str(&selected).expect("json");
+        assert_eq!(value["id"], serde_json::json!(7));
+        assert_eq!(value["result"]["tools"], serde_json::json!([]));
+        assert!(response_from_events(body, Some(&serde_json::json!(8))).is_err());
+    }
+
+    /// A multi-line `data:` event is one value, and `data:` without a space
+    /// is still data.
+    #[test]
+    fn an_sse_event_may_span_lines() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\ndata: \"id\":3,\"result\":{}}\n\n";
+        let id = serde_json::json!(3);
+        assert!(response_from_events(body, Some(&id)).is_ok());
+    }
+
+    /// A failing status is an error even when the server labels the body as
+    /// an SSE stream.
+    #[tokio::test]
+    async fn an_error_status_wins_over_the_content_type() {
+        let (url, handle) = serve_once(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/event-stream\r\n\
+              Content-Length: 24\r\nConnection: close\r\n\r\ndata: {\"error\":\"boom\"}\n\n",
+        );
+        let transport = HttpTransport::new(url);
+        let error = transport
+            .send(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .await
+            .expect_err("500 is an error");
+        handle.join().expect("server thread");
+        assert!(error.to_string().contains("500"), "{error}");
     }
 
     #[test]

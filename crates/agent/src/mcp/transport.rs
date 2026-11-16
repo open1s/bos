@@ -49,6 +49,13 @@ async fn read_capped_line<R: AsyncBufRead + Unpin>(
             break;
         }
     }
+    if bytes.is_empty() {
+        // EOF with no bytes: the server died or closed its stdout. Reporting
+        // it as an empty line made the client poll until its iteration cap.
+        return Err(TransportError::Io(
+            "the MCP server closed its stdout".to_string(),
+        ));
+    }
     *line = String::from_utf8(bytes)
         .map_err(|e| TransportError::Io(format!("Line is not valid UTF-8: {e}")))?;
     Ok(())
@@ -109,7 +116,16 @@ impl StdioTransport {
         env: &[(&str, &str)],
         cwd: Option<&std::path::Path>,
     ) -> Result<Self, TransportError> {
-        let mut process = tokio::process::Command::new(command);
+        // The manifest names a program ("npx", "uvx", "python3"), not a path.
+        // Resolve it through the host's one program search, and give the child
+        // the extended PATH, so a server installed outside a Finder launch is
+        // spawnable and its own shebang (`#!/usr/bin/env node`) resolves.
+        let program = hostkit::programs::executable(command)
+            .unwrap_or_else(|| std::path::PathBuf::from(command));
+        let mut process = tokio::process::Command::new(program);
+        if let Some(path) = hostkit::programs::extended_path() {
+            process.env("PATH", path);
+        }
         process
             .args(args)
             .envs(env.iter().map(|(key, value)| (*key, *value)))
@@ -184,6 +200,41 @@ mod tests {
 
         read_capped_line(&mut reader, &mut line, 64).await.unwrap();
         assert_eq!(line, "second\n");
+    }
+
+    /// A bare command the launch environment never saw is spawned: the
+    /// reported case is an MCP server configured as `npx -y …` in a BSH
+    /// started from Finder.
+    /// A server that exits is reported as closed, not polled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eof_is_reported_as_a_closed_server() {
+        let mut transport = StdioTransport::spawn("sh", &["-c", "exit 0"])
+            .await
+            .expect("sh spawns");
+        let mut line = String::new();
+        let error = transport
+            .recv_line(&mut line)
+            .await
+            .expect_err("EOF is an error");
+        assert!(error.to_string().contains("closed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_bare_command_outside_the_launch_path_is_spawned() {
+        if hostkit::programs::executable("npx").is_none() {
+            return;
+        }
+        let mut transport = StdioTransport::spawn_with("npx", &["--version"], &[], None)
+            .await
+            .expect("npx spawns");
+        let mut line = String::new();
+        transport.recv_line(&mut line).await.expect("version line");
+        let _ = transport.shutdown().await;
+        assert!(
+            line.chars().any(|character| character.is_ascii_digit()),
+            "npx answered with a version: {line:?}"
+        );
     }
 
     /// The cap rejects an oversized line before it is fully buffered.

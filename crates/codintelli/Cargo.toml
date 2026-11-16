@@ -5,13 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Host-independent code intelligence engine"
+description = "language-agnostic code intelligence"
 
 [dependencies]
 cap-fs-ext = "=4.0.3"
 cap-std = "=4.0.3"
 thiserror.workspace = true
-tree-sitter = "=0.26.13"
+tree-sitter = "=0.27.2"
 tree-sitter-rust = "=0.24.2"
 uuid.workspace = true
 
