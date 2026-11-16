@@ -245,12 +245,12 @@ pub enum WorkspaceFsError {
     #[error("workspace file read limit is too large")]
     InvalidLimit,
 
-    /// A directory contains more eligible entries than the configured budget.
+    /// A directory contains more entries than the configured inspection budget.
     #[error("workspace directory exceeds the {max_entries}-entry limit: {path}")]
     EntryLimitExceeded {
         /// Directory whose entries exceeded the budget.
         path: PathBuf,
-        /// Maximum number of eligible entries accepted.
+        /// Maximum number of directory entries inspected.
         max_entries: usize,
     },
 }
