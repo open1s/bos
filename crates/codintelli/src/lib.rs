@@ -31,7 +31,7 @@ pub use fs::{
     DirectoryListing, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs, WorkspaceFsError,
 };
 pub use index::{
-    index_rust_workspace, index_workspace, SourceFileResult, SourceFileStatus,
+    index_rust_workspace, index_workspace, index_workspace_with_limits, SourceFileResult, SourceFileStatus,
     SourceIndexDiagnostic, SourceIndexDiagnosticKind, SourceIndexReport, SourceIndexStatus,
 };
 pub use scan_budget::{ScanBudget, ScanBudgetError, ScanLimits, ScanUsage};
@@ -40,7 +40,7 @@ pub use scanner::{
     WorkspaceScanReport,
 };
 pub use syntax::{
-    LanguageProvider, ParseDiagnostic, ParseInput, ParseResult, ParseStatus, ProviderError,
+    LanguageProvider, ParseControl, ParseDiagnostic, ParseInput, ParseLimits, ParseResult, ParseStatus, ProviderError,
     SourceRange, SyntaxFact, SyntaxFactKind,
 };
 pub use syntax::rust::RustProvider;

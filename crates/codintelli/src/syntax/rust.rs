@@ -3,13 +3,15 @@
 //! Tree-sitter owns lexical and syntactic parsing. This module only projects
 //! grammar nodes into codintelli's language-neutral syntax-fact contract.
 
-use tree_sitter::{Node, Parser};
+use std::ops::ControlFlow;
+
+use tree_sitter::{Node, ParseOptions, Parser, ParseState};
 
 use crate::classification::LanguageId;
 
 use super::{
     valid_relative_path, LanguageProvider, ParseDiagnostic, ParseInput, ParseResult, ParseStatus,
-    ProviderError, SourceRange, SyntaxFact, SyntaxFactKind,
+    ParseControl, ParseLimits, ProviderError, SourceRange, SyntaxFact, SyntaxFactKind,
 };
 
 /// Rust provider using the upstream Tree-sitter Rust grammar.
@@ -38,26 +40,96 @@ impl LanguageProvider for RustProvider {
     }
 
     fn parse(&self, input: ParseInput<'_>) -> Result<ParseResult, ProviderError> {
+        self.parse_bounded(input, None)
+    }
+
+    fn parse_with_control(
+        &self,
+        input: ParseInput<'_>,
+        control: &ParseControl<'_>,
+    ) -> Result<ParseResult, ProviderError> {
+        self.parse_bounded(input, Some(control))
+    }
+}
+
+impl RustProvider {
+    fn parse_bounded(
+        &self,
+        input: ParseInput<'_>,
+        control: Option<&ParseControl<'_>>,
+    ) -> Result<ParseResult, ProviderError> {
         if !valid_relative_path(input.relative_path) {
             return Err(ProviderError::InvalidPath);
         }
+        if let Some(control) = control {
+            control.check()?;
+        }
         let source = std::str::from_utf8(input.source)?;
+        let default_limits = ParseLimits::default();
+        let limits = control.map_or(&default_limits, ParseControl::limits);
         let mut parser = Parser::new();
         let language = tree_sitter_rust::LANGUAGE.into();
         parser
             .set_language(&language)
             .map_err(|error| ProviderError::ParserInitialization(error.to_string()))?;
 
-        let tree = parser.parse(source, None).ok_or(ProviderError::ParseAborted)?;
+        // Tree-sitter invokes this callback during parsing. Returning Break
+        // aborts the native parser cooperatively; reset prevents a later parse
+        // from resuming the cancelled parser's internal state.
+        let mut budget_error = None;
+        let mut progress = |_: &ParseState| match control.map(ParseControl::check) {
+            Some(Err(error)) => {
+                budget_error = Some(error);
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        };
+        let options = ParseOptions::new().progress_callback(&mut progress);
+        let tree = parser.parse_with_options(
+            &mut |offset, _| &input.source[offset..],
+            None,
+            Some(options),
+        );
+        drop(progress);
+        let Some(tree) = tree else {
+            parser.reset();
+            if let Some(error) = budget_error {
+                return Err(ProviderError::Budget(error));
+            }
+            if let Some(control) = control {
+                control.check()?;
+            }
+            return Err(ProviderError::ParseAborted);
+        };
+        if let Some(control) = control {
+            control.check()?;
+        }
+
         let root = tree.root_node();
         let mut facts = Vec::new();
         let mut diagnostics = Vec::new();
         let mut pending = vec![root];
+        let mut visited_nodes = 0usize;
+        let mut limited = false;
 
         // Iterative traversal avoids adding another recursive walk over
-        // potentially adversarially nested source syntax.
+        // potentially adversarially nested source syntax. The pending stack,
+        // visited nodes, facts, and diagnostics all have explicit bounds.
         while let Some(node) = pending.pop() {
+            if let Some(control) = control {
+                control.check()?;
+            }
+            visited_nodes = visited_nodes.saturating_add(1);
+            if visited_nodes > limits.max_nodes {
+                limited = true;
+                break;
+            }
+
             if node.is_error() || node.is_missing() {
+                if diagnostics.len() >= limits.max_diagnostics {
+                    limited = true;
+                    break;
+                }
                 diagnostics.push(ParseDiagnostic {
                     range: source_range(node, source.len()),
                     message: if node.is_missing() {
@@ -70,11 +142,20 @@ impl LanguageProvider for RustProvider {
 
             if let Some((kind, name)) = classify_node(node, source) {
                 if let Some(range) = source_range(node, source.len()) {
+                    if facts.len() >= limits.max_facts {
+                        limited = true;
+                        break;
+                    }
                     facts.push(SyntaxFact { kind, name, range });
                 }
             }
 
-            for index in (0..node.child_count()).rev() {
+            let child_count = node.child_count();
+            if pending.len().saturating_add(child_count) > limits.max_nodes {
+                limited = true;
+                break;
+            }
+            for index in (0..child_count).rev() {
                 if let Some(child) = node.child(index) {
                     pending.push(child);
                 }
@@ -86,7 +167,9 @@ impl LanguageProvider for RustProvider {
         });
         diagnostics.sort_unstable_by_key(|diagnostic| diagnostic.range);
 
-        let status = if diagnostics.is_empty() {
+        let status = if limited {
+            ParseStatus::Limited
+        } else if diagnostics.is_empty() {
             ParseStatus::Complete
         } else {
             ParseStatus::Recovered
@@ -172,7 +255,8 @@ fn source_range(node: Node<'_>, source_len: usize) -> Option<SourceRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WorkspaceId;
+    use crate::{ParseControl, ParseLimits, ScanBudget, ScanLimits, WorkspaceId};
+    use std::time::Duration;
     use std::path::{Path, PathBuf};
 
     fn parse(source: &str) -> ParseResult {
@@ -252,6 +336,76 @@ fn helper() {}
             .expect("parse source");
         assert_eq!(result.workspace_id, id);
         assert_eq!(result.relative_path, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn cooperatively_rejects_an_already_cancelled_scan() {
+        let budget = ScanBudget::new(ScanLimits::default());
+        budget.cancel();
+        let limits = ParseLimits::default();
+        let error = RustProvider
+            .parse_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"fn main() {}",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect_err("cancelled budget must stop parsing");
+
+        assert!(matches!(
+            error,
+            ProviderError::Budget(crate::ScanBudgetError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn bounds_fact_output_and_preserves_limited_status() {
+        let budget = ScanBudget::new(ScanLimits {
+            max_duration: Duration::from_secs(10),
+            ..ScanLimits::default()
+        });
+        let limits = ParseLimits {
+            max_nodes: 1000,
+            max_facts: 1,
+            max_diagnostics: 10,
+        };
+        let result = RustProvider
+            .parse_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"fn first() {} fn second() {}",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect("parse within limits");
+
+        assert_eq!(result.status, ParseStatus::Limited);
+        assert_eq!(result.facts.len(), 1);
+    }
+
+    #[test]
+    fn bounds_syntax_tree_traversal() {
+        let budget = ScanBudget::new(ScanLimits::default());
+        let limits = ParseLimits {
+            max_nodes: 1,
+            max_facts: 100,
+            max_diagnostics: 10,
+        };
+        let result = RustProvider
+            .parse_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"fn main() {}",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect("parse within node limit");
+
+        assert_eq!(result.status, ParseStatus::Limited);
     }
 
     #[test]

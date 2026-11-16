@@ -1,8 +1,8 @@
 //! Host-neutral syntax facts and language-provider contracts.
 
-use std::path::{Path, PathBuf};
+use std::{ops::ControlFlow, path::{Path, PathBuf}};
 
-use crate::{classification::LanguageId, WorkspaceId};
+use crate::{classification::LanguageId, ScanBudget, ScanBudgetError, WorkspaceId};
 
 pub mod rust;
 
@@ -79,6 +79,8 @@ pub enum ParseStatus {
     Recovered,
     /// Parsing could not produce a syntax tree.
     Failed,
+    /// Parsing stopped at a configured fact, diagnostic, or node limit.
+    Limited,
 }
 
 /// A parser diagnostic tied to the original source when a range is available.
@@ -142,6 +144,58 @@ pub enum ProviderError {
     /// Tree-sitter aborted parsing before producing a syntax tree.
     #[error("language parser aborted before producing a syntax tree")]
     ParseAborted,
+    /// Shared scan cancellation or deadline interrupted parsing.
+    #[error("parser interrupted by scan budget: {0}")]
+    Budget(#[from] ScanBudgetError),
+    /// Syntax tree traversal exceeded its configured node limit.
+    #[error("syntax node limit exceeded")]
+    NodeLimitExceeded,
+}
+
+/// Hard limits for syntax-tree projection into language-neutral facts.
+#[derive(Clone, Debug)]
+pub struct ParseLimits {
+    /// Maximum syntax nodes visited while extracting facts.
+    pub max_nodes: usize,
+    /// Maximum facts retained for one source file.
+    pub max_facts: usize,
+    /// Maximum diagnostics retained for one source file.
+    pub max_diagnostics: usize,
+}
+
+impl Default for ParseLimits {
+    fn default() -> Self {
+        Self {
+            max_nodes: 1_000_000,
+            max_facts: 100_000,
+            max_diagnostics: 10_000,
+        }
+    }
+}
+
+/// Cooperative parse control shared with the workspace indexing operation.
+pub struct ParseControl<'a> {
+    budget: &'a ScanBudget,
+    limits: &'a ParseLimits,
+}
+
+impl<'a> ParseControl<'a> {
+    /// Bind parser execution to the shared workspace budget and per-file limits.
+    #[must_use]
+    pub const fn new(budget: &'a ScanBudget, limits: &'a ParseLimits) -> Self {
+        Self { budget, limits }
+    }
+
+    /// Check cancellation and the shared workspace deadline.
+    pub fn check(&self) -> Result<(), ScanBudgetError> {
+        self.budget.check()
+    }
+
+    /// Return the per-file parser output limits.
+    #[must_use]
+    pub const fn limits(&self) -> &ParseLimits {
+        self.limits
+    }
 }
 
 /// Pluggable syntax parser for one language.
@@ -157,6 +211,22 @@ pub trait LanguageProvider: Send + Sync {
 
     /// Parse one already-bounded source file.
     fn parse(&self, input: ParseInput<'_>) -> Result<ParseResult, ProviderError>;
+
+    /// Parse with cooperative cancellation and per-file output limits.
+    ///
+    /// Providers should override this method to observe progress while parsing.
+    /// The default preserves compatibility for simple providers but can only
+    /// check the budget before and after their non-interruptible parse call.
+    fn parse_with_control(
+        &self,
+        input: ParseInput<'_>,
+        control: &ParseControl<'_>,
+    ) -> Result<ParseResult, ProviderError> {
+        control.check()?;
+        let result = self.parse(input)?;
+        control.check()?;
+        Ok(result)
+    }
 }
 
 pub(crate) fn valid_relative_path(path: &Path) -> bool {
