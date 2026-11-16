@@ -161,6 +161,28 @@ The graph builder starts only from crate roots supplied by the host. Each root h
 
 The import mapper consumes structured `ImportFact` records and the crate-root module graph. It supports explicit `crate::`, `self::`, and repeated `super::` roots, resolves only the longest known module prefix, and returns remaining path segments as member-path candidates. It preserves aliases and glob markers. Bare/unqualified paths are left unresolved because they may refer to the extern prelude or language-specific lexical rules. Multiple module nodes with the same logical path remain ambiguous. The mapper also propagates unresolved graph-edge states: attribute uncertainty, unparsed targets, depth limits, and ambiguous declarations are not collapsed into `NoModuleCandidate`. A module-prefix match does not resolve the imported symbol; symbol visibility, re-exports, macro expansion, dependency crates, and compiler configuration remain outside this stage.
 
+### 4.11 Rust import-to-scoped-symbol candidates (CI-09I)
+
+The import-symbol layer joins `RustImportResolutionReport` with
+`RustScopedSymbolReport`. For a module-prefix import with exactly one remaining
+member segment, it matches the declaration name inside the exact crate-root and
+module-path namespace. Explicit aliases become the candidate's local import
+name. Duplicate declarations remain ambiguous.
+
+Glob imports return direct module-scope declarations as a candidate set; they
+do not claim those declarations are actually imported because visibility and
+re-export rules are not evaluated. Impl methods are excluded from module-level
+matching because the current syntax facts do not yet preserve their containing
+type/impl namespace. Multi-segment member paths remain unsupported rather than
+being guessed as associated-item resolution.
+
+Every result retains the underlying module-resolution status. A missing symbol
+is reported as conclusive only when the target source and graph are complete;
+otherwise the result is marked incomplete. A unique candidate is not a
+compiler-resolved symbol. Visibility, cfg selection, re-exports, macro
+expansion, extern-prelude lookup, trait scope, enum-variant imports, and
+type-dependent associated-item resolution remain future work.
+
 ### 4.10 Crate-root-aware scoped Rust symbol catalog (CI-09H)
 
 The Rust provider now attaches lexical inline-module scope to each syntax fact and
