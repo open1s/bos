@@ -10,7 +10,7 @@ use tree_sitter::{Node, ParseOptions, Parser, ParseState};
 use crate::classification::LanguageId;
 
 use super::{
-    valid_relative_path, ImportFact, LanguageProvider, ParseDiagnostic, ParseInput, ParseResult,
+    valid_relative_path, ImportFact, RustModuleFact, LanguageProvider, ParseDiagnostic, ParseInput, ParseResult,
     ParseStatus, ParseControl, ParseLimitKind, ParseLimits, ProviderError, SourceRange,
     SyntaxFact, SyntaxFactKind,
 };
@@ -109,6 +109,7 @@ impl RustProvider {
         let root = tree.root_node();
         let mut facts = Vec::new();
         let mut imports = Vec::new();
+        let mut modules = Vec::new();
         let mut diagnostics = Vec::new();
         let mut pending = vec![root];
         let mut visited_nodes = 0usize;
@@ -142,6 +143,26 @@ impl RustProvider {
                 });
             }
 
+            if node.kind() == "mod_item" {
+                if let (Some(range), Some(name_node)) = (
+                    source_range(node, source.len()),
+                    node.child_by_field_name("name"),
+                ) {
+                    if facts.len().saturating_add(imports.len()).saturating_add(modules.len()) >= limits.max_facts {
+                        limit_reason = Some(ParseLimitKind::Facts);
+                        break;
+                    }
+                    if let Some(name) = text_for_node(name_node, source) {
+                        modules.push(RustModuleFact {
+                            scope_path: enclosing_module_path(node, source),
+                            name: name.trim_start_matches("r#").to_owned(),
+                            is_inline: node.child_by_field_name("body").is_some(),
+                            range,
+                        });
+                    }
+                }
+            }
+
             if node.kind() == "use_declaration" {
                 if let Some(range) = source_range(node, source.len()) {
                     let scope_path = enclosing_module_path(node, source);
@@ -152,7 +173,7 @@ impl RustProvider {
                         let mut expanded = Vec::new();
                         flatten_use_tree(argument, &[], source, &mut expanded);
                         for (path, alias, is_glob) in expanded {
-                            if facts.len().saturating_add(imports.len()) >= limits.max_facts {
+                            if facts.len().saturating_add(imports.len()).saturating_add(modules.len()) >= limits.max_facts {
                                 limit_reason = Some(ParseLimitKind::Facts);
                                 break;
                             }
@@ -173,7 +194,7 @@ impl RustProvider {
 
             if let Some((kind, name)) = classify_node(node, source) {
                 if let Some(range) = source_range(node, source.len()) {
-                    if facts.len() >= limits.max_facts {
+                    if facts.len().saturating_add(imports.len()).saturating_add(modules.len()) >= limits.max_facts {
                         limit_reason = Some(ParseLimitKind::Facts);
                         break;
                     }
@@ -201,6 +222,10 @@ impl RustProvider {
             (&left.scope_path, &left.path, &left.alias, left.is_glob, left.range)
                 .cmp(&(&right.scope_path, &right.path, &right.alias, right.is_glob, right.range))
         });
+        modules.sort_unstable_by(|left, right| {
+            (&left.scope_path, &left.name, left.is_inline, left.range)
+                .cmp(&(&right.scope_path, &right.name, right.is_inline, right.range))
+        });
 
         let status = if limit_reason.is_some() {
             ParseStatus::Limited
@@ -221,6 +246,7 @@ impl RustProvider {
             limit_reason,
             facts,
             imports,
+            modules,
             diagnostics,
         })
     }
@@ -410,6 +436,7 @@ fn helper() {}
         assert_eq!(result.status, ParseStatus::Complete);
         assert_eq!(result.imports.len(), 1);
         assert_eq!(result.imports[0].path, vec!["std", "fmt", "Debug"]);
+        assert!(result.modules.iter().any(|item| item.name == "nested" && item.is_inline));
         for kind in [
             SyntaxFactKind::Module,
             SyntaxFactKind::Import,
@@ -452,6 +479,17 @@ mod nested {
         assert!(result.imports.iter().any(|item| item.path == vec!["crate".to_owned(), "model".to_owned(), "State".to_owned()] && item.alias.as_deref() == Some("CurrentState")));
         assert!(result.imports.iter().any(|item| item.path == vec!["crate".to_owned(), "model".to_owned(), "nested".to_owned()] && item.is_glob));
         assert!(result.imports.iter().any(|item| item.path == vec!["super".to_owned(), "Widget".to_owned()] && item.scope_path == vec!["nested".to_owned()]));
+    }
+
+    #[test]
+    fn distinguishes_inline_and_external_module_declarations() {
+        let result = parse(r#"
+mod inline_child { mod nested; }
+mod external_child;
+"#);
+        assert!(result.modules.iter().any(|item| item.name == "inline_child" && item.is_inline && item.scope_path.is_empty()));
+        assert!(result.modules.iter().any(|item| item.name == "nested" && !item.is_inline && item.scope_path == vec!["inline_child".to_owned()]));
+        assert!(result.modules.iter().any(|item| item.name == "external_child" && !item.is_inline && item.scope_path.is_empty()));
     }
 
     #[test]
@@ -522,6 +560,30 @@ mod nested {
         assert_eq!(result.status, ParseStatus::Limited);
         assert_eq!(result.limit_reason, Some(ParseLimitKind::Facts));
         assert_eq!(result.facts.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_fact_limit_covers_syntax_import_and_module_records() {
+        let budget = ScanBudget::new(ScanLimits::default());
+        let limits = ParseLimits {
+            max_nodes: 1000,
+            max_facts: 2,
+            max_diagnostics: 10,
+        };
+        let result = RustProvider
+            .parse_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"mod child {} use crate::Thing; fn run() {}",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect("parse within aggregate fact limit");
+
+        assert_eq!(result.status, ParseStatus::Limited);
+        assert_eq!(result.limit_reason, Some(ParseLimitKind::Facts));
+        assert!(result.facts.len() + result.imports.len() + result.modules.len() <= 2);
     }
 
     #[test]

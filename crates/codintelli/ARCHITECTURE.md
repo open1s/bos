@@ -145,7 +145,11 @@ The initial resolver builds a deterministic declaration catalog from source-back
 
 This is intentionally conservative. The current Rust facts do not yet carry full lexical scope, module path, visibility, receiver type, trait-in-scope, or macro-expansion information. Consequently, same-name matching is useful for navigation and retrieval but is not semantic Rust name resolution. Grouped, glob, and aliased imports remain unsupported until the Tree-sitter provider emits structured import-path facts. Mixed workspace identities are rejected.
 
-### 4.6 Cross-file resolution
+### 4.6 Rust module declaration facts (CI-09D)
+
+The Rust provider emits typed module declarations in addition to generic syntax facts. Each declaration records its lexical inline-module scope, declared name, inline-versus-external form, and source range. This separates `mod child { ... }` from `mod child;`, which is required before attempting filesystem-based module lookup. These facts do not claim that an external module file exists, and do not yet account for `#[path]`, conditional compilation, macro-generated declarations, or Cargo target selection. Those conditions must remain explicit uncertainty in the later resolver rather than being guessed.
+
+### 4.7 Cross-file resolution
 
 Resolution is a separate stage over extracted facts and workspace metadata. It may resolve:
 
@@ -156,7 +160,7 @@ Resolution is a separate stage over extracted facts and workspace metadata. It m
 
 Resolution output must retain its own provenance and diagnostics. Ambiguous candidates remain ambiguous; they are not collapsed to an arbitrary target.
 
-### 4.7 Relationship analysis and query
+### 4.8 Relationship analysis and query
 
 Relationship analysis is a deterministic transformation over extracted facts. A graph-shaped view may be built when it helps a query, but the underlying index must not require all records to be represented as graph nodes and edges. This stage must not perform parsing or filesystem access.
 
@@ -348,7 +352,9 @@ The source pipeline is synchronous and sequential today. Hosts must run it on bo
 | CI-07 | Parser/provider seam + Rust provider | Deterministic source facts with source evidence |
 | CI-08 | Bounded source-to-facts pipeline | Inventory, classification, reserved reads, provider dispatch, explicit coverage |
 | CI-09A | Cooperative parser cancellation and output budgets | Tree-sitter progress cancellation; bounded nodes/facts/diagnostics; explicit limit reasons |
-| CI-09B | Symbol candidate catalog and conservative references | Deterministic declaration IDs; unique/ambiguous/unresolved candidates; no false resolved edges |\n| CI-09C | Structured Rust import and inline module-scope facts | Tree-sitter import paths, grouped expansion, aliases, globs, lexical scope and source evidence |
+| CI-09B | Symbol candidate catalog and conservative references | Deterministic declaration IDs; unique/ambiguous/unresolved candidates; no false resolved edges 
+| CI-09C | Structured Rust import facts | Tree-sitter import paths, grouped expansion, aliases, globs, lexical scope and source evidence |
+| CI-09D | Rust module declaration facts | Distinguish inline and external declarations, retain lexical scope and source evidence; no false file-resolution claim |
 | CI-10 | Incremental extraction store | Atomic per-file replacement; last-known-good preservation |
 | CI-11 | Query API | File/symbol search, source retrieval, explain, references, optional neighbors/path/impact |
 | CI-12 | Optional export and host adapter | Versioned exports; integration remains outside engine |
