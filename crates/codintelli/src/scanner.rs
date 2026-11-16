@@ -96,6 +96,10 @@ pub fn scan_workspace(
                 break;
             }
         };
+        if let Err(error) = budget.check() {
+            record_budget_stop(&mut status, &mut diagnostics, directory, error);
+            break;
+        }
         directories_scanned = directories_scanned.saturating_add(1);
 
         // Count all inspected entries, including omitted symlinks and special
@@ -118,9 +122,24 @@ pub fn scan_workspace(
             break;
         }
 
+        let mut file_limit_reported = false;
         for entry in listing.entries {
+            if let Err(error) = budget.check() {
+                record_budget_stop(
+                    &mut status,
+                    &mut diagnostics,
+                    directory.clone(),
+                    error,
+                );
+                accounting_failed = true;
+                break;
+            }
+
             match entry.kind {
                 WorkspaceEntryKind::File => {
+                    if file_limit_reported {
+                        continue;
+                    }
                     if let Err(error) = budget.record_file() {
                         record_budget_stop(
                             &mut status,
@@ -128,6 +147,13 @@ pub fn scan_workspace(
                             entry.relative_path,
                             error,
                         );
+                        if error == ScanBudgetError::Cancelled
+                            || error == ScanBudgetError::DeadlineExceeded
+                        {
+                            accounting_failed = true;
+                            break;
+                        }
+                        file_limit_reported = error == ScanBudgetError::FileLimitExceeded;
                         continue;
                     }
                     entries.push(entry);
@@ -147,6 +173,9 @@ pub fn scan_workspace(
                     }
                 }
             }
+        }
+        if accounting_failed {
+            break;
         }
 
         if listing.truncated {
