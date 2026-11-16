@@ -56,6 +56,37 @@ pub const MIN_MATCH_LIMIT: u32 = 1;
 /// Largest in-progress match limit accepted by the pinned Tree-sitter cursor.
 pub const MAX_MATCH_LIMIT: u32 = 65_536;
 
+/// Absolute maximum accepted value of [`QueryExecutionLimits::max_matches`].
+///
+/// Callers may configure any value from 1 through this constant. The default
+/// (10,000) is deliberately far lower so interactive retrieval stays small;
+/// batch indexing may raise the limit up to this documented ceiling.
+pub const MAX_RETAINED_MATCHES: usize = 1_000_000;
+
+/// Absolute maximum accepted value of [`QueryExecutionLimits::max_captures`].
+///
+/// Callers may configure any value from 1 through this constant. The default
+/// (100,000) is deliberately far lower so interactive retrieval stays small;
+/// batch indexing may raise the limit up to this documented ceiling.
+pub const MAX_RETAINED_CAPTURES: usize = 5_000_000;
+
+/// Absolute maximum accepted value of
+/// [`QueryRegistryLimits::max_query_source_bytes`].
+///
+/// Bounds the query source accepted for compilation before Tree-sitter sees
+/// it. The default (64 KiB) is far lower; this ceiling exists so a registry
+/// configured from external bundles cannot be handed an effectively
+/// unbounded definition.
+pub const MAX_QUERY_SOURCE_BYTES: usize = 1 << 20;
+
+/// Absolute maximum accepted value of
+/// [`QueryRegistryLimits::max_queries`].
+pub const MAX_REGISTRY_QUERIES: usize = 4_096;
+
+/// Absolute maximum accepted value of
+/// [`QueryRegistryLimits::max_total_source_bytes`].
+pub const MAX_REGISTRY_TOTAL_SOURCE_BYTES: usize = 8 << 20;
+
 /// Validate a query identifier or version.
 ///
 /// A valid identity is non-empty, no longer than the supplied byte maximum,
@@ -469,14 +500,53 @@ impl QueryRange {
 /// while streaming and are not substitutes for Tree-sitter's in-progress
 /// match limit, which bounds the cursor's match state and is configured with
 /// `match_limit`.
+///
+/// # Hard ceilings
+///
+/// Retained-output limits are caller-configurable between 1 and documented
+/// absolute maximums: [`MAX_RETAINED_MATCHES`] for `max_matches` and
+/// [`MAX_RETAINED_CAPTURES`] for `max_captures`. Values of 0 or above the
+/// ceiling are rejected with [`QueryExecutionError::InvalidOutputLimit`]
+/// before a cursor is created; nothing is clamped silently. These ceilings
+/// bound *retained result records*, not native memory: Tree-sitter cursor
+/// state, the parse tree, and the source snapshot are outside this contract,
+/// so output ceilings do not constitute a hard native-memory or RSS sandbox.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryExecutionLimits {
-    /// Maximum match records retained.
+    /// Maximum match records retained; 1 through [`MAX_RETAINED_MATCHES`].
     pub max_matches: usize,
-    /// Maximum capture records retained across all matches.
+    /// Maximum capture records retained across all matches; 1 through
+    /// [`MAX_RETAINED_CAPTURES`].
     pub max_captures: usize,
     /// Tree-sitter in-progress match limit; must be 1 through 65,536.
     pub match_limit: u32,
+}
+
+impl QueryExecutionLimits {
+    /// Validate every limit against its documented range.
+    ///
+    /// Returns the first violated field. Zero values are invalid because a
+    /// caller that wants no output should not execute the query at all.
+    pub fn validate(&self) -> Result<(), QueryExecutionError> {
+        if self.max_matches == 0 || self.max_matches > MAX_RETAINED_MATCHES {
+            return Err(QueryExecutionError::InvalidOutputLimit {
+                field: QueryOutputLimitField::MaxMatches,
+                value: self.max_matches,
+                max: MAX_RETAINED_MATCHES,
+            });
+        }
+        if self.max_captures == 0 || self.max_captures > MAX_RETAINED_CAPTURES {
+            return Err(QueryExecutionError::InvalidOutputLimit {
+                field: QueryOutputLimitField::MaxCaptures,
+                value: self.max_captures,
+                max: MAX_RETAINED_CAPTURES,
+            });
+        }
+        if !(MIN_MATCH_LIMIT..=MAX_MATCH_LIMIT).contains(&self.match_limit) {
+            return Err(QueryExecutionError::InvalidMatchLimit(self.match_limit));
+        }
+        Ok(())
+    }
 }
 
 impl Default for QueryExecutionLimits {
@@ -487,6 +557,15 @@ impl Default for QueryExecutionLimits {
             match_limit: MAX_MATCH_LIMIT,
         }
     }
+}
+
+/// Which output-limit field rejected a configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryOutputLimitField {
+    /// `max_matches` was 0 or above [`MAX_RETAINED_MATCHES`].
+    MaxMatches,
+    /// `max_captures` was 0 or above [`MAX_RETAINED_CAPTURES`].
+    MaxCaptures,
 }
 
 /// Options for one query execution.
@@ -614,6 +693,18 @@ pub enum QueryExecutionError {
     /// The Tree-sitter match limit is outside the binding's supported range.
     #[error("invalid Tree-sitter match limit {0}: expected 1 through 65,536")]
     InvalidMatchLimit(u32),
+    /// A retained-output limit is outside its documented range.
+    ///
+    /// Rejected before the cursor is created; nothing is clamped.
+    #[error("invalid output limit {field:?} = {value}: expected 1 through {max}")]
+    InvalidOutputLimit {
+        /// The rejected field.
+        field: QueryOutputLimitField,
+        /// Supplied value.
+        value: usize,
+        /// Documented absolute maximum for the field.
+        max: usize,
+    },
     /// The range is not valid for this document's source snapshot.
     #[error("query byte range {start}..{end} is invalid for a document of {source_len} bytes")]
     InvalidRange {
@@ -687,9 +778,7 @@ pub fn execute_query(
     ensure_compatible(registered, document)?;
 
     let limits = options.limits;
-    if !(MIN_MATCH_LIMIT..=MAX_MATCH_LIMIT).contains(&limits.match_limit) {
-        return Err(QueryExecutionError::InvalidMatchLimit(limits.match_limit));
-    }
+    limits.validate()?;
 
     let source = document.source();
     let source_len = source.len();
