@@ -33,6 +33,11 @@ The engine remains independent of BSH, Ferris, GPUI, MCP, and any particular age
 8. **Replaceable internals.** Extraction, retrieval, relationship analysis, persistence, and host integration have explicit seams.
 9. **No premature infrastructure.** Do not require a graph database, vector database, LLM, language server, or external service for the core MVP.
 
+10. **Parser-owned syntax tree.** Tree-sitter is the source of truth for syntax. codintelli must not create a parallel Rust AST or language-specific structural model that mirrors grammar nodes.
+11. **Queries over nodes, not AST projection.** Language intelligence should use Tree-sitter `Tree`, `Node`, `Query`, and `QueryCursor` directly. Query results may expose source ranges and capture names, but must not be reified into a second AST.
+12. **Generic indexing only.** Cross-file indexes may store generic identities, source locations, fingerprints, and query evidence. They must not define Rust-specific `Module`, `Import`, `Symbol`, or namespace object hierarchies as substitutes for Tree-sitter nodes.
+13. **No lossy syntax normalization.** Do not flatten Tree-sitter syntax into custom facts and then attempt to reconstruct grammar context later. Keep the original tree and source available for the lifetime of the parsed document.
+
 ## 3. Reference use: Graphify
 
 Graphify is useful as a reference for selected ideas, especially AST-grounded extraction, traceable relationships, incremental processing, and explainable graph queries. It is not the target architecture and does not define the codintelli feature set.
@@ -63,23 +68,86 @@ Source Snapshot + Fingerprints
 Language Provider Registry
         |
         v
-Deterministic AST Extraction
+Tree-sitter Parser (per-language grammar)
         |
         v
-Local Facts (declarations, references, imports, scopes)
+Native Tree + Bounded Source Snapshot
         |
-        v
-Cross-file Resolution
+        +------> Tree-sitter Queries / Node Traversal
+        |                    |
+        |                    v
+        |             Generic Query Evidence
         |
-        v
-Typed Knowledge Graph + Evidence
-        |
-        +------> Incremental Graph Store
-        |
-        +------> Query / Explain / Path / Impact
-        |
-        +------> Export adapters (JSON, GraphML, visualization, MCP)
+        +------> Generic File / Fingerprint Index
+                             |
+                             v
+                 Cross-file Candidate Queries
+                             |
+                             v
+                 Evidence-backed Agent Context
 ```
+
+### 4.0 Normative decision: Tree-sitter-native syntax access
+
+This decision supersedes the custom syntax-fact projection and Rust-specific
+structural-model direction described in the historical CI-09D through CI-09J
+sections below. Those sections document implementation history and migration
+inputs; they are not the target architecture.
+
+**Tree-sitter owns the AST.** codintelli must not define another Rust AST,
+including parallel `RustModule`, `RustImport`, `RustSymbol`, namespace,
+scope-tree, or declaration-node hierarchies. A Tree-sitter `Node` is the
+syntax node. Its grammar kind, fields, children, byte range, and parent/ancestor
+relationships are authoritative.
+
+The parser layer should return an owned parsed document containing:
+- the original bounded source snapshot (shared immutable bytes);
+- the native Tree-sitter `Tree`;
+- language/provider and grammar version metadata;
+- parse completion, cancellation, and diagnostic metadata.
+
+The document exposes the native tree and source bytes. Consumers traverse
+`Tree::root_node()` and use `Node` APIs directly. Reusable Tree-sitter
+`Query` objects and `QueryCursor` perform language-aware matching. A generic
+query result may contain a query/capture identifier, source path, byte range,
+and coverage state; it must not become a second syntax tree or language AST.
+
+**Lifetime and ownership.** The parsed document owns both source bytes and
+Tree-sitter tree. Nodes are borrowed views obtained from that tree and must not
+be persisted independently. Any API returning a Node must make the tree
+lifetime explicit; otherwise expose a closure-based traversal/query API to
+prevent dangling node references. Incremental parsing may pass the previous
+Tree-sitter tree to the parser, but the new tree is published atomically only
+after parsing completes.
+
+**Persistence.** Do not serialize a custom AST. Persist source fingerprints,
+provider/grammar versions, generic file metadata, and optional query evidence
+needed by concrete retrieval workflows. Reconstruct the Tree-sitter tree from
+the bounded source snapshot when required. Query evidence is disposable and
+versioned by query definition and grammar version.
+
+**Cross-file intelligence.** Implement candidate lookup as queries over native
+syntax trees plus generic workspace metadata. For example, a Rust import query
+may capture the relevant `use_declaration` node and its source range; it must
+not convert it into a custom `ImportFact` tree. A module declaration query may
+capture a `mod_item`; it must not create a parallel Rust module graph node as
+the syntax representation. Generic candidate records are allowed only where
+they represent cross-file lookup results rather than syntax-node substitutes.
+All candidates retain evidence and uncertainty; no compiler-equivalent
+resolution claim is permitted.
+
+**Scope of language-specific code.** Per-language code may contain Tree-sitter
+query strings, grammar-kind constants, and query execution helpers. It must not
+contain hand-built parsers or language-specific AST structs mirroring grammar
+constructs. Query definitions should be small, testable, versioned, and tied to
+the upstream grammar.
+
+**Migration consequence.** The current `SyntaxFact`, `ImportFact`,
+`RustModuleFact`, `RustScopedSymbol`, Rust module graph, and Rust import
+resolver are projection layers that must be retired or reduced to generic
+cross-file query results. Do not extend them with more Rust semantic fields.
+Keep the safe scanner, source budget, Tree-sitter parser setup, progress
+cancellation, and source-range primitives where they remain useful.
 
 ### 4.1 Workspace discovery
 
@@ -440,6 +508,24 @@ The source pipeline is synchronous and sequential today. Hosts must run it on bo
 | CI-12 | Optional export and host adapter | Versioned exports; integration remains outside engine |
 
 Each stage should be independently reviewable and normally fit within a small PR. Do not implement graph persistence, semantic LLM extraction, clustering, or visualization before concrete query requirements justify them. Stabilize source-fact and evidence contracts first.
+
+## 10.1 Tree-sitter-native migration plan
+
+| Step | Deliverable | Acceptance gate |
+|---|---|---|
+| TS-01 | Native parsed-document contract | Owns immutable source bytes and Tree-sitter `Tree`; no custom syntax AST |
+| TS-02 | Tree-sitter query registry | Versioned query definitions; direct `Query`/`QueryCursor` execution |
+| TS-03 | Generic query evidence | Capture name, source range, file identity, parse coverage; no language-specific syntax DTO |
+| TS-04 | Retire Rust syntax projections | Remove or deprecate `SyntaxFact`, `ImportFact`, `RustModuleFact`, and duplicate Rust graph/resolver layers |
+| TS-05 | Generic cross-file candidate index | Store only generic candidate identity and evidence; source syntax remains in Tree-sitter |
+| TS-06 | Query-driven retrieval | Agent context assembled from native syntax matches and bounded source slices |
+| TS-07 | Incremental native parsing | Reuse prior Tree-sitter trees safely; atomic replacement and grammar/query-version invalidation |
+
+Do not start namespace modeling or re-export resolution as custom Rust data
+models. Implement those workflows, if required, as Tree-sitter queries and
+generic evidence-backed cross-file candidate operations. Each migration step
+must remove redundant model surface rather than add another compatibility
+layer.
 
 ## 11. Open decisions
 
