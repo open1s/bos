@@ -265,7 +265,8 @@ mod tests {
             .collect::<Vec<_>>();
         let accepted = workers
             .into_iter()
-            .filter(|worker| worker.join().expect("worker join"))
+            .map(|worker| worker.join().expect("worker join"))
+            .filter(|accepted| *accepted)
             .count();
         assert_eq!(accepted, 3);
         assert_eq!(budget.usage().entries, 3);
