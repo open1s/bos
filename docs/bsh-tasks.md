@@ -91,6 +91,14 @@ Fields:
 - attempts: ordered list of (id, run kind, run id, started, ended, status,
   result summary, usage, error).
 - delivery: per attempt, delivered_at or never.
+- verification: a typed report on the task and each attempt: status
+  (not_requested | pending | passed | failed | inconclusive), verifier and
+  version, timestamp, bounded message, and structured evidence (kind,
+  reference, optional digest). Records written before this field migrate as
+  not_requested, never as passed.
+- execution_succeeded / verified_completion: separate booleans on the model and
+  board surfaces. A task may be execution-succeeded and verification-pending or
+  failed; only verified_completion may back a completion claim.
 
 Status rules:
 
@@ -102,6 +110,10 @@ Status rules:
 - unknown: a peer-owned task or delegation whose peer is unreachable; NOT a
   failure, and never a reason to fire locally.
 - succeeded / failed / cancelled / interrupted: terminal.
+- succeeded describes EXECUTION only. Verification is a separate dimension: a
+  successful run whose postcondition was not independently checked is not a
+  verified completion, and retrying a non-idempotent execution merely because
+  verification is pending is forbidden.
 
 ## Tiers and dispatch
 

@@ -968,9 +968,15 @@ impl Agent {
         // session exactly as it was.
         let after_tokens;
         let replaced;
+        let checkpoint;
         {
             let mut session = self.session.lock().unwrap();
-            replaced = session.install_priced_checkpoint(retain_tokens, &summary);
+            replaced = session.install_priced_checkpoint_with(
+                retain_tokens,
+                &summary,
+                Some(self.config.model.clone()),
+            );
+            checkpoint = session.checkpoints().last().cloned();
             after_tokens = session
                 .messages()
                 .iter()
@@ -985,6 +991,7 @@ impl Agent {
             before_tokens,
             after_tokens,
             summary,
+            checkpoint,
         }))
     }
 

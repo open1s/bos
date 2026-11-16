@@ -334,7 +334,9 @@ impl Runner {
             // thread. It is injected after the checkpoint so the fresh snapshot
             // cannot be summarized into the history it supersedes.
             let context = crate::context::TurnContext::from_facts_at(&facts, false, &time);
-            context.inject(&agent);
+            // The typed snapshot is built below, from the same facts, and its
+            // request blocks are what get injected: no separately rendered
+            // copy can drift from the assembled types (issue #411).
             // Surface the auto-injection as a chat event: the persona the build
             // composed, the runtime snapshot and the workspace instructions this
             // turn carried. Recorded on the prompt row, display only.
@@ -390,12 +392,44 @@ impl Runner {
                 {
                     blocks.push(block);
                 }
-                let snapshot = crate::context_assembly::AssemblySnapshot::build(blocks);
+                let instruction_sources = context
+                    .instructions
+                    .as_deref()
+                    .map(|_| crate::instructions::sources(std::path::Path::new(&facts.cwd)).join(","));
+                let versions = crate::context_assembly::SourceVersions {
+                    persona: Some(crate::context_assembly::digest_text(&assembly.base_prompt)),
+                    workspace_instructions: context.instructions.as_deref().map(|text| {
+                        format!(
+                            "{}:{}",
+                            crate::context_assembly::digest_text(text),
+                            instruction_sources.as_deref().unwrap_or("-")
+                        )
+                    }),
+                    memory_records: recall.records.clone(),
+                    tool_guidance: Some("tool-guidance@1".to_string()),
+                    provider: None,
+                    session: None,
+                    turn: Some(time.turn as u64),
+                };
+                // A content identity is opt-in: the key never lives in the
+                // repository, so logs cannot be dictionary-attacked by default.
+                let content_key = std::env::var("BSH_CONTEXT_CONTENT_KEY")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(String::into_bytes);
+                let snapshot = crate::context_assembly::AssemblySnapshot::build(
+                    blocks,
+                    versions,
+                    content_key.as_deref(),
+                );
+                // Inject from the immutable snapshot, after the checkpoint and
+                // before the first request.
+                crate::context::inject_snapshot(&agent, &snapshot);
 
                 // Per-request assembly diagnostics (issues #336/#346): counts,
                 // labels and token estimates derived from the typed assembly,
                 // never raw memory or workspace content.
-                let report = crate::context_assembly::assemble_report(
+                let mut report = crate::context_assembly::assemble_report(
                     persona_complete,
                     &assembly.base_prompt,
                     &persona,
@@ -406,16 +440,19 @@ impl Runner {
                     &recall,
                     agent::agent::context::estimate_tokens(input.as_text().unwrap_or_default()),
                 );
+                report.composition_fingerprint = snapshot.fingerprint().composition.clone();
+                report.content_fingerprint = snapshot.fingerprint().content.clone();
                 log::info!(
                     target: "bsh::context",
-                    "context assembly: persona_complete={} memory={} retrieval_hits={} est_tokens={} snapshot_tokens={} fingerprint={:016x} snapshot_fingerprint={:016x} retrieval_skip={}",
+                    "context assembly: persona_complete={} memory={} retrieval_hits={} est_tokens={} snapshot_tokens={} fingerprint={} snapshot_fingerprint={} content_fingerprint={} retrieval_skip={}",
                     report.persona_complete,
                     report.memory.label(),
                     report.retrieval_hits,
                     report.estimated_tokens,
                     snapshot.total_tokens(),
-                    report.fingerprint,
-                    snapshot.fingerprint(),
+                    report.composition_fingerprint.get(..16).unwrap_or(&report.composition_fingerprint),
+                    snapshot.fingerprint().composition_short(),
+                    report.content_fingerprint.as_deref().map(|value| &value[..16.min(value.len())]).unwrap_or("-"),
                     report.retrieval_skip.as_deref().unwrap_or("none")
                 );
                 // The memory block's provenance, read from the snapshot itself.
@@ -1006,7 +1043,43 @@ mod tests {
             "the instruction message follows the frame: {}",
             rows[2]
         );
-        assert_eq!(rows[3], "go", "the reader's line is last");
+        // Issue #411: the request text is rendered from the typed snapshot, so
+        // every injected block carries its source and trust boundary.
+        assert!(
+            rows[0]
+                .ends_with("<!-- bsh-context source=\"host-runtime\" trust=\"host-authority\" -->"),
+            "the runtime block names its host authority: {}",
+            rows[0]
+        );
+        assert!(
+            rows[1]
+                .ends_with("<!-- bsh-context source=\"time-context\" trust=\"host-authority\" -->"),
+            "the time block names its host authority: {}",
+            rows[1]
+        );
+        assert!(
+            rows[2].ends_with(
+                "<!-- bsh-context source=\"workspace-instructions\" trust=\"untrusted-data\" -->"
+            ),
+            "the workspace block is explicitly untrusted data: {}",
+            rows[2]
+        );
+        // Sources that stay in the system prompt are still named in the
+        // request manifest, so the adapter boundary can tell them apart.
+        assert!(
+            rows[0].contains("BSH-CONTEXT-MANIFEST-V1"),
+            "the request carries the typed manifest: {}",
+            rows[0]
+        );
+        assert!(
+            rows[0].contains("\"source\":\"persona\""),
+            "the persona is named in the manifest"
+        );
+        assert!(
+            rows[0].contains("\"source\":\"workspace-instructions\""),
+            "the workspace source is named in the manifest"
+        );
+        assert_eq!(rows[3], "go", "the reader's line is last and unframed");
         let _ = std::fs::remove_dir_all(&root);
     }
 

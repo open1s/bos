@@ -197,6 +197,101 @@ pub(crate) enum AttemptStatus {
     Unknown,
 }
 
+/// Whether the intended postcondition was independently verified (issue #414).
+///
+/// This is a dimension of its own: an attempt can finish successfully and the
+/// outcome still be unverified, pending, or wrong. Existing records migrate as
+/// [`VerificationStatus::NotRequested`], never as implicitly passed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VerificationStatus {
+    /// No verification contract was attached to the task.
+    #[default]
+    NotRequested,
+    /// A contract exists and verification has not concluded.
+    Pending,
+    /// Independent evidence satisfied the contract.
+    Passed,
+    /// The evidence contradicts the contract.
+    Failed,
+    /// Verification ran but could not decide (missing evidence, verifier error).
+    Inconclusive,
+}
+
+impl VerificationStatus {
+    /// Whether a verification contract was requested at all.
+    pub(crate) fn is_requested(self) -> bool {
+        !matches!(self, Self::NotRequested)
+    }
+
+    /// Whether the outcome is independently verified.
+    pub(crate) fn is_passed(self) -> bool {
+        matches!(self, Self::Passed)
+    }
+}
+
+/// One piece of evidence a verifier used (issue #414).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct VerificationEvidence {
+    /// What kind of evidence: `test`, `command`, `artifact`, `review` or `human`.
+    pub(crate) kind: String,
+    /// A stable reference: test name, command line, path, review or approval id.
+    pub(crate) reference: String,
+    /// A digest of the artifact, when the evidence is a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) digest: Option<String>,
+    /// A bounded, non-sensitive detail line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
+}
+
+/// The typed verification report (issue #414): status, verifier identity and
+/// the evidence, so completion claims can cite what actually supports them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct VerificationReport {
+    /// The verification state.
+    #[serde(default)]
+    pub(crate) status: VerificationStatus,
+    /// Who verified: a runtime verifier, a review, or a human.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verifier: Option<String>,
+    /// The verifier's version, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verifier_version: Option<String>,
+    /// When verification last concluded, in unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verified_ms: Option<u64>,
+    /// Structured evidence references.
+    #[serde(default)]
+    pub(crate) evidence: Vec<VerificationEvidence>,
+    /// Why verification failed or was inconclusive, bounded and non-sensitive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) message: Option<String>,
+}
+
+impl VerificationReport {
+    /// A report for a task that never asked for verification.
+    pub(crate) fn not_requested() -> Self {
+        Self::default()
+    }
+
+    /// Whether the outcome is independently verified.
+    pub(crate) fn is_verified(&self) -> bool {
+        self.status.is_passed()
+    }
+
+    /// The one-line state a board or a model-facing row shows.
+    pub(crate) fn label(&self) -> &'static str {
+        match self.status {
+            VerificationStatus::NotRequested => "not-requested",
+            VerificationStatus::Pending => "pending",
+            VerificationStatus::Passed => "passed",
+            VerificationStatus::Failed => "failed",
+            VerificationStatus::Inconclusive => "inconclusive",
+        }
+    }
+}
+
 /// What a finished attempt consumed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Usage {
@@ -311,6 +406,9 @@ pub(crate) struct Attempt {
     /// The exact-change set this attempt produced, when review is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) change_set_id: Option<String>,
+    /// Whether the postcondition was independently verified (issue #414).
+    #[serde(default)]
+    pub(crate) verification: VerificationReport,
 }
 
 impl Attempt {
@@ -328,7 +426,13 @@ impl Attempt {
             error: None,
             delivered_ms: None,
             change_set_id: None,
+            verification: VerificationReport::not_requested(),
         }
+    }
+
+    /// Whether this attempt finished execution and verification independently.
+    pub(crate) fn verified_success(&self) -> bool {
+        self.status == AttemptStatus::Succeeded && self.verification.is_verified()
     }
 }
 
@@ -393,6 +497,9 @@ pub(crate) struct Task {
     pub(crate) created_ms: u64,
     /// When it last changed, in unix milliseconds.
     pub(crate) updated_ms: u64,
+    /// Whether the intended outcome was independently verified (issue #414).
+    #[serde(default)]
+    pub(crate) verification: VerificationReport,
 }
 
 impl Task {
@@ -452,7 +559,30 @@ impl Task {
             mirror_checked_ms: 0,
             created_ms: now_ms,
             updated_ms: now_ms,
+            verification: VerificationReport::not_requested(),
         })
+    }
+
+    /// Whether execution succeeded. This says nothing about correctness.
+    pub(crate) fn execution_succeeded(&self) -> bool {
+        self.status == TaskStatus::Succeeded
+    }
+
+    /// Whether the task is both execution-succeeded and independently verified.
+    ///
+    /// A completion claim must use this, not [`Self::execution_succeeded`],
+    /// whenever a verification contract was requested.
+    pub(crate) fn verified_completion(&self) -> bool {
+        self.execution_succeeded() && self.verification.is_verified()
+    }
+
+    /// Whether verification is still owed for a successful execution.
+    pub(crate) fn verification_owed(&self) -> bool {
+        self.execution_succeeded()
+            && matches!(
+                self.verification.status,
+                VerificationStatus::Pending | VerificationStatus::Inconclusive
+            )
     }
 }
 
@@ -503,6 +633,8 @@ pub(crate) struct BoardRow {
     pub(crate) next_fire_ms: Option<u64>,
     /// How many attempts have been made.
     pub(crate) attempts: u32,
+    /// The verification state of the latest attempt (issue #414).
+    pub(crate) verification: VerificationStatus,
 }
 
 /// One section and its rows.
@@ -539,6 +671,11 @@ pub(crate) fn board(tasks: &[Task]) -> Board {
             created_ms: task.created_ms,
             next_fire_ms: task.trigger.next_fire_ms(),
             attempts: task.attempts.len() as u32,
+            verification: task
+                .attempts
+                .last()
+                .map(|attempt| attempt.verification.status)
+                .unwrap_or(task.verification.status),
         };
         match task.status.section() {
             BoardSectionKind::Running => running.push(row),
@@ -777,6 +914,7 @@ mod tests {
             mirror_checked_ms: 0,
             created_ms: 1_000,
             updated_ms: 1_000,
+            verification: VerificationReport::not_requested(),
         }
     }
 
@@ -1152,5 +1290,89 @@ mod tests {
         assert_eq!(report.rows[0].result.as_deref(), Some("done one"));
         assert_eq!(report.rows[1].state, Some(RunState::Failed));
         assert_eq!(report.rows[2].state, None);
+    }
+
+    /// A legacy record has no verification field: it migrates to
+    /// `not_requested`, never to an implicit pass (issue #414).
+    #[test]
+    fn a_legacy_attempt_migrates_to_not_requested() {
+        let legacy = serde_json::json!({
+            "id": "att-1",
+            "tier": "subagent",
+            "run": null,
+            "status": "succeeded",
+            "started_ms": 1,
+            "ended_ms": 2,
+            "result": "done",
+            "usage": null,
+            "error": null,
+            "delivered_ms": null
+        });
+        let attempt: Attempt = serde_json::from_value(legacy).expect("legacy attempt");
+        assert_eq!(
+            attempt.verification.status,
+            VerificationStatus::NotRequested
+        );
+        assert!(
+            !attempt.verified_success(),
+            "execution success is not verification"
+        );
+    }
+
+    /// Execution success and verification are separate dimensions: a
+    /// successful run with failed or missing evidence is not a verified
+    /// completion (issue #414).
+    #[test]
+    fn successful_execution_does_not_imply_verified_completion() {
+        let mut record = task("task-1");
+        record.status = TaskStatus::Succeeded;
+        record.attempts[0].status = AttemptStatus::Succeeded;
+        assert!(record.execution_succeeded());
+        assert!(!record.verified_completion());
+        assert!(
+            !record.verification_owed(),
+            "no contract was requested, so nothing is owed"
+        );
+
+        record.verification = VerificationReport {
+            status: VerificationStatus::Failed,
+            verifier: Some("cargo test".to_string()),
+            message: Some("postcondition failed".to_string()),
+            ..VerificationReport::default()
+        };
+        assert!(record.execution_succeeded());
+        assert!(!record.verified_completion());
+        assert!(
+            !record.verification_owed(),
+            "a failed verification is settled"
+        );
+
+        record.verification = VerificationReport {
+            status: VerificationStatus::Pending,
+            ..VerificationReport::default()
+        };
+        assert!(record.verification_owed());
+
+        record.verification.status = VerificationStatus::Passed;
+        assert!(record.verified_completion());
+    }
+
+    /// The board carries the latest attempt's verification state, so an
+    /// execution-succeeded row cannot silently look verified.
+    #[test]
+    fn the_board_row_carries_verification() {
+        let mut record = task("task-1");
+        record.status = TaskStatus::Succeeded;
+        record.attempts[0].status = AttemptStatus::Succeeded;
+        record.attempts[0].verification.status = VerificationStatus::Failed;
+        let board = board(&[record]);
+        let row = board
+            .sections
+            .iter()
+            .flat_map(|section| &section.rows)
+            .next()
+            .expect("one row");
+        assert_eq!(row.verification, VerificationStatus::Failed);
+        assert_eq!(row.status, TaskStatus::Succeeded);
     }
 }

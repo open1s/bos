@@ -246,13 +246,90 @@ impl TurnContext {
     }
 }
 
+/// Place the typed snapshot's request blocks at the head of the turn
+/// (issue #411). The messages are rendered from the immutable blocks, not
+/// rebuilt from the same prose, so the provider request cannot drift from the
+/// assembly; the transcript retains the source/trust footer as audit metadata.
+pub(crate) fn inject_snapshot(agent: &Agent, snapshot: &crate::context_assembly::AssemblySnapshot) {
+    // Every block is named in the manifest; the manifest rides with the first
+    // request block, so persona/memory (which stay in the system prompt today)
+    // remain distinguishable at the adapter boundary (issue #411).
+    let manifest = snapshot.provider_manifest();
+    let has_host_runtime = snapshot
+        .block(crate::context_assembly::ContextSource::HostRuntime)
+        .is_some();
+    let mut first = true;
+    let mut manifest_used = false;
+    let blocks: Vec<(crate::context_assembly::ContextSource, String)> = snapshot
+        .injected_blocks()
+        .map(|block| {
+            let carry_manifest = !manifest_used
+                && (block.source == crate::context_assembly::ContextSource::HostRuntime
+                    || (!has_host_runtime && first));
+            first = false;
+            if carry_manifest {
+                manifest_used = true;
+            }
+            (
+                block.source,
+                block.provider_text_with(carry_manifest.then_some(manifest.as_str())),
+            )
+        })
+        .collect();
+    if blocks.is_empty() {
+        return;
+    }
+    let mut session = agent.session();
+    let present: Vec<&str> = session
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            react::llm::LlmMessage::User { content } => content.as_text(),
+            _ => None,
+        })
+        .collect();
+    let mut injected: Vec<react::llm::LlmMessage> = Vec::new();
+    for (_, text) in &blocks {
+        if present.contains(&text.as_str()) {
+            continue;
+        }
+        injected.push(react::llm::LlmMessage::User {
+            content: react::llm::Content::Text(text.clone()),
+        });
+    }
+    if injected.is_empty() {
+        return;
+    }
+    let current_instructions = blocks
+        .iter()
+        .find(|(source, _)| {
+            *source == crate::context_assembly::ContextSource::WorkspaceInstructions
+        })
+        .map(|(_, text)| text.as_str());
+    let history = session.messages().iter().filter(|message| {
+        let Some(want) = current_instructions else {
+            return true;
+        };
+        match message {
+            react::llm::LlmMessage::User { content } => content
+                .as_text()
+                .map(|text| !is_instructions_user_text(text) || text == want)
+                .unwrap_or(true),
+            _ => true,
+        }
+    });
+    injected.extend(history.cloned());
+    session.restore_messages(injected);
+}
+
 /// Whether a user row is one of the harness's per-turn injections.
 ///
 /// The child transcript is read back from the agent's own session, where these
 /// rows exist; the reader's view should show the child's work, not the frame
 /// the harness put around it.
 pub(crate) fn is_injected_user_text(text: &str) -> bool {
-    text.starts_with(RUNTIME_CONTEXT_PREAMBLE)
+    text.contains(crate::context_assembly::CONTEXT_ENVELOPE_MARKER)
+        || text.starts_with(RUNTIME_CONTEXT_PREAMBLE)
         || text.starts_with(TIME_CONTEXT_PREAMBLE)
         || is_instructions_user_text(text)
         // The engine's closing request when a turn reaches its step guard. It is

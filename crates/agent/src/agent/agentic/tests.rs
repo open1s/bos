@@ -4318,3 +4318,119 @@ fn extension_prompt_section_removal_rejects_substring_matches() {
         "base persona\n\nextension section with suffix"
     );
 }
+
+// =========================================================================
+// Long-horizon reliability regression harness (issue #415)
+// =========================================================================
+//
+// A bounded, deterministic smoke subset: no provider credentials, no network,
+// no stochastic model. The corpus version is bumped when a scenario's expected
+// baseline changes, so a silent relaxation of the harness is visible in review.
+
+/// Version of the checked-in reliability scenario corpus.
+const RELIABILITY_CORPUS_VERSION: u32 = 1;
+
+/// Counters the smoke subset reports. The full harness (on-demand) extends
+/// this with task verification and tool fixtures.
+#[derive(Debug, Default)]
+struct ReliabilityMetrics {
+    scenarios: usize,
+    constraint_retention: usize,
+    conflict_visibility: usize,
+    recovery: usize,
+}
+
+fn debug_messages(messages: &[react::llm::LlmMessage]) -> String {
+    format!("{messages:?}")
+}
+
+#[tokio::test]
+async fn reliability_horizon_smoke_subset() {
+    assert_eq!(RELIABILITY_CORPUS_VERSION, 1, "corpus version is pinned");
+    let mut metrics = ReliabilityMetrics::default();
+
+    // Scenario 1: an explicit user constraint survives compaction in the
+    // recoverable source span, and a rebuild restores it.
+    let agent = agent_with_summary("summary keeps the work");
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user("CONSTRAINT: never force-push to main".to_string());
+        session.add_assistant("Understood.".to_string());
+    }
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let outcome = agent
+        .compact_now(0, &signal)
+        .await
+        .expect("compaction runs")
+        .expect("a checkpoint");
+    let checkpoint = outcome.checkpoint.expect("checkpoint metadata");
+    assert_eq!(
+        checkpoint.model.as_deref(),
+        Some(agent.config().model.as_str()),
+        "the checkpoint records the model that wrote it"
+    );
+    assert!(checkpoint.source_is_intact(), "the source digest matches");
+    let source = debug_messages(&checkpoint.source_span);
+    assert!(
+        source.contains("CONSTRAINT: never force-push to main"),
+        "the constraint is preserved in the source span: {source}"
+    );
+    metrics.constraint_retention += 1;
+
+    {
+        let mut session = agent.session();
+        let index = session.checkpoints().len() - 1;
+        assert!(session.restore_checkpoint(index), "the span rebuilds");
+        let restored = debug_messages(session.messages());
+        assert!(
+            restored.contains("CONSTRAINT: never force-push to main"),
+            "the restored history carries the constraint: {restored}"
+        );
+    }
+    metrics.recovery += 1;
+
+    // Scenario 2: contradictory decisions remain explicitly present in the
+    // recoverable source instead of being silently resolved by the summary.
+    let agent = agent_with_summary("decisions were merged");
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user("DECISION A: ship on Friday".to_string());
+        session.add_assistant("Noted A.".to_string());
+        session.add_user("DECISION B: hold the release".to_string());
+        session.add_assistant("Noted B.".to_string());
+    }
+    let outcome = agent
+        .compact_now(0, &signal)
+        .await
+        .expect("compaction runs")
+        .expect("a checkpoint");
+    let checkpoint = outcome.checkpoint.expect("checkpoint metadata");
+    let source = debug_messages(&checkpoint.source_span);
+    assert!(source.contains("DECISION A"), "{source}");
+    assert!(source.contains("DECISION B"), "{source}");
+    metrics.conflict_visibility += 1;
+
+    // Scenario 3: a restart boundary preserves the checkpoint and the rebuilt
+    // history, so recovery does not depend on process memory.
+    let serialized = {
+        let session = agent.session();
+        serde_json::to_string(&*session).expect("session serializes")
+    };
+    let mut reloaded: crate::agent::context::AgentSession =
+        serde_json::from_str(&serialized).expect("session reloads");
+    assert_eq!(
+        reloaded.checkpoints().len(),
+        1,
+        "checkpoint survives restart"
+    );
+    assert!(reloaded.restore_checkpoint(0), "restore after restart");
+    metrics.recovery += 1;
+
+    metrics.scenarios = 3;
+    assert_eq!(metrics.scenarios, 3);
+    assert_eq!(metrics.constraint_retention, 1);
+    assert_eq!(metrics.conflict_visibility, 1);
+    assert_eq!(metrics.recovery, 2);
+}

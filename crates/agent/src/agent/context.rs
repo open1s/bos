@@ -63,7 +63,7 @@ pub fn system_head_len(messages: &[Message]) -> usize {
 /// The counts are what the command reports, so the reader sees the same shape
 /// the compaction contract describes: how many history items the checkpoint
 /// replaced and how many tokens the session shed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CompactionOutcome {
     /// Messages the checkpoint replaced.
     pub replaced: usize,
@@ -73,6 +73,8 @@ pub struct CompactionOutcome {
     pub after_tokens: usize,
     /// The model-written checkpoint text, unframed.
     pub summary: String,
+    /// The recoverable checkpoint record, when it was archived (issue #413).
+    pub checkpoint: Option<Checkpoint>,
 }
 
 impl CompactionOutcome {
@@ -372,6 +374,109 @@ fn content_to_summary_string(content: &Content) -> String {
     }
 }
 
+/// A recoverable compaction checkpoint (issue #413).
+///
+/// It binds the model-written summary to the exact messages it replaced, their
+/// digest, the kept tail and the model identity, so the active session can be
+/// inspected and rebuilt from the original span instead of trusting the
+/// summary as established history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    /// The model/provider identity that wrote the summary, when known.
+    pub model: Option<String>,
+    /// When the checkpoint was installed (unix seconds).
+    pub created_at: u64,
+    /// The replaced span's start in the pre-compaction history.
+    pub source_start: usize,
+    /// The replaced span's end (exclusive).
+    pub source_end: usize,
+    /// SHA-256 over the canonical source span.
+    pub source_digest: String,
+    /// The messages the checkpoint replaced, preserved for rebuild.
+    pub source_span: Vec<Message>,
+    /// The messages kept verbatim after the checkpoint.
+    pub retained_tail: Vec<Message>,
+    /// The leading system instructions kept ahead of the checkpoint.
+    pub head: Vec<Message>,
+    /// The model-written summary.
+    pub summary: String,
+    /// The summary parsed into its fixed sections (issue #413), so a reader can
+    /// inspect constraints, decisions, conflicts and open tasks without
+    /// re-parsing prose.
+    #[serde(default)]
+    pub sections: std::collections::BTreeMap<String, String>,
+    /// Required sections the model omitted. A non-empty list flags a lossy
+    /// checkpoint instead of silently treating it as complete.
+    #[serde(default)]
+    pub missing_sections: Vec<String>,
+    /// Whether every required section was present.
+    #[serde(default)]
+    pub complete: bool,
+}
+
+/// The sections the compaction contract requires, in order.
+pub const CHECKPOINT_SECTIONS: [&str; 8] = [
+    "Primary Request and Intent",
+    "Key Technical Concepts",
+    "Files and Code",
+    "Errors and Fixes",
+    "Pending Jobs",
+    "Current Work",
+    "Next Step",
+    "Critical Context",
+];
+
+/// Parse the fixed checkpoint structure into named sections.
+fn parse_checkpoint_sections(summary: &str) -> std::collections::BTreeMap<String, String> {
+    let mut sections: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in summary.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            let name = heading.trim().to_string();
+            if !name.is_empty() {
+                sections.entry(name.clone()).or_default();
+                current = Some(name);
+            }
+        } else if let Some(name) = &current {
+            let entry = sections.entry(name.clone()).or_default();
+            if !entry.is_empty() {
+                entry.push('\n');
+            }
+            entry.push_str(line);
+        }
+    }
+    for value in sections.values_mut() {
+        *value = value.trim().to_string();
+    }
+    sections
+}
+
+impl Checkpoint {
+    /// Whether the preserved source still matches its digest.
+    pub fn source_is_intact(&self) -> bool {
+        digest_messages(&self.source_span) == self.source_digest
+    }
+
+    /// One named section of the summary, when the model wrote it.
+    pub fn section(&self, name: &str) -> Option<&str> {
+        self.sections.get(name).map(String::as_str)
+    }
+}
+
+/// SHA-256 over the canonical JSON of a message span.
+fn digest_messages(messages: &[Message]) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(messages).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// AgentSession stores conversation history and session state for the ReAct engine.
 /// Implements ReactSession trait for integration with the react crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +484,10 @@ pub struct AgentSession {
     messages: Vec<Message>,
     context: JsonValue,
     metadata: SessionMetadata,
+    /// Compaction checkpoints, oldest first (issue #413). Older session files
+    /// have no field and load with none.
+    #[serde(default)]
+    checkpoints: Vec<Checkpoint>,
 }
 
 /// Timestamps and counters stored with an [`AgentSession`].
@@ -403,6 +512,7 @@ impl AgentSession {
                 updated_at: current_timestamp(),
                 message_count: 0,
             },
+            checkpoints: Vec::new(),
         }
     }
 
@@ -629,7 +739,7 @@ impl AgentSession {
         let Some((removed, recent)) = self.split_for_compaction(keep_recent) else {
             return 0;
         };
-        self.replace_span_with_checkpoint(removed, recent, summary)
+        self.replace_span_with_checkpoint(removed, recent, summary, None)
     }
 
     /// Install a checkpoint over a token-priced span.
@@ -638,10 +748,45 @@ impl AgentSession {
     /// budget [`Self::split_for_compaction_at`] selected with, so the span the
     /// model was asked about is exactly the span this replaces.
     pub fn install_priced_checkpoint(&mut self, retain_tokens: usize, summary: &str) -> usize {
+        self.install_priced_checkpoint_with(retain_tokens, summary, None)
+    }
+
+    /// The priced form with the model identity recorded on the checkpoint
+    /// (issue #413).
+    pub fn install_priced_checkpoint_with(
+        &mut self,
+        retain_tokens: usize,
+        summary: &str,
+        model: Option<String>,
+    ) -> usize {
         let Some((removed, recent)) = self.split_for_compaction_at(retain_tokens) else {
             return 0;
         };
-        self.replace_span_with_checkpoint(removed, recent, summary)
+        self.replace_span_with_checkpoint(removed, recent, summary, model)
+    }
+
+    /// The checkpoints installed on this session, oldest first.
+    pub fn checkpoints(&self) -> &[Checkpoint] {
+        &self.checkpoints
+    }
+
+    /// Rebuild the active history from a checkpoint's preserved source span
+    /// (issue #413). Returns false for an unknown index.
+    ///
+    /// The head, the original span and the retained tail are restored exactly;
+    /// messages added after the checkpoint are not silently mixed in.
+    pub fn restore_checkpoint(&mut self, index: usize) -> bool {
+        let Some(checkpoint) = self.checkpoints.get(index).cloned() else {
+            return false;
+        };
+        if !checkpoint.source_is_intact() {
+            return false;
+        }
+        let mut restored = checkpoint.head.clone();
+        restored.extend(checkpoint.source_span.clone());
+        restored.extend(checkpoint.retained_tail.clone());
+        self.restore_messages(restored);
+        true
     }
 
     /// Put one checkpoint, framed in tags, in place of `removed` and ahead of
@@ -651,17 +796,47 @@ impl AgentSession {
         removed: Vec<Message>,
         recent: Vec<Message>,
         summary: &str,
+        model: Option<String>,
     ) -> usize {
-        let checkpoint = Message::User {
+        let checkpoint_message = Message::User {
             content: Content::Text(render_checkpoint(summary)),
         };
         // Any leading system prompt is instructions, not history: it is kept in
         // front of the checkpoint rather than folded into it.
         let head = system_head_len(&self.messages);
+        let source_start = head;
+        let source_end = head + removed.len();
+        let sections = parse_checkpoint_sections(summary);
+        let missing_sections: Vec<String> = CHECKPOINT_SECTIONS
+            .iter()
+            .filter(|name| !sections.contains_key(**name))
+            .map(|name| (*name).to_string())
+            .collect();
+        let complete = missing_sections.is_empty();
+        let record = Checkpoint {
+            model,
+            created_at: current_timestamp(),
+            source_start,
+            source_end,
+            source_digest: digest_messages(&removed),
+            source_span: removed.clone(),
+            retained_tail: recent.clone(),
+            head: self.messages[..head].to_vec(),
+            summary: summary.to_string(),
+            sections,
+            missing_sections,
+            complete,
+        };
         let mut compacted: Vec<Message> = self.messages[..head].to_vec();
-        compacted.push(checkpoint);
+        compacted.push(checkpoint_message);
         compacted.extend(recent);
         self.messages = compacted;
+        // Bound the archive so a long session cannot grow without limit; the
+        // newest checkpoints are the ones a rebuild is likely to need.
+        self.checkpoints.push(record);
+        if self.checkpoints.len() > 8 {
+            self.checkpoints.remove(0);
+        }
 
         match &mut self.context {
             JsonValue::Object(map) => {
@@ -2033,6 +2208,104 @@ mod budget_tests {
         assert_eq!(
             ContextBudget::default().estimate_session(&session),
             estimate_tokens(&format!("read_file {args}")) + 4
+        );
+    }
+
+    /// A checkpoint binds the summary to the source span, digest and model,
+    /// and the session can be rebuilt from the preserved span (issue #413).
+    #[test]
+    fn a_checkpoint_records_its_source_and_restores_it() {
+        let mut session = AgentSession::new();
+        session.push(Message::system("session rules"));
+        for index in 0..6 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        let original_len = session.messages().len();
+        let replaced = session.install_priced_checkpoint_with(
+            0,
+            "## Current Work\n- continue",
+            Some("vendor/model-1".to_string()),
+        );
+        assert!(replaced > 0, "history was folded");
+
+        let checkpoint = session.checkpoints().last().expect("checkpoint").clone();
+        assert_eq!(checkpoint.model.as_deref(), Some("vendor/model-1"));
+        assert_eq!(checkpoint.source_span.len(), replaced);
+        assert_eq!(checkpoint.source_start, 1, "the system head is not source");
+        assert_eq!(checkpoint.source_end, 1 + replaced);
+        assert!(checkpoint.source_is_intact());
+        assert_eq!(checkpoint.summary, "## Current Work\n- continue");
+        assert!(session.messages().len() < original_len);
+
+        let index = session.checkpoints().len() - 1;
+        assert!(session.restore_checkpoint(index), "the source rebuilds");
+        assert_eq!(
+            session.messages().len(),
+            original_len,
+            "the original span and retained tail are both restored"
+        );
+    }
+
+    /// A checkpoint whose preserved span no longer matches its digest is
+    /// refused rather than rebuilding from corrupt history (issue #413).
+    #[test]
+    fn a_tampered_checkpoint_refuses_to_restore() {
+        let mut session = AgentSession::new();
+        for index in 0..4 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        let replaced = session.install_priced_checkpoint(0, "summary");
+        assert!(replaced > 0);
+        session.checkpoints[0].source_span.clear();
+        assert!(!session.restore_checkpoint(0));
+    }
+
+    /// The fixed checkpoint structure is parsed, and a missing required
+    /// section flags the checkpoint instead of treating it as complete. The
+    /// preserved Critical Context keeps contradictory decisions explicit.
+    #[test]
+    fn a_checkpoint_parses_sections_and_flags_missing_ones() {
+        let summary = "## Primary Request and Intent\n- ship\n\n\
+             ## Key Technical Concepts\n- rust\n\n\
+             ## Files and Code\n- src/main.rs\n\n\
+             ## Errors and Fixes\n- none\n\n\
+             ## Pending Jobs\n- none\n\n\
+             ## Current Work\n- testing\n\n\
+             ## Next Step\n- run tests\n\n\
+             ## Critical Context\n- DECISION A: ship on Friday\n- DECISION B: hold the release";
+        let mut session = AgentSession::new();
+        for index in 0..4 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        assert!(session.install_priced_checkpoint(0, summary) > 0);
+        let checkpoint = session.checkpoints().last().expect("checkpoint");
+        assert!(checkpoint.complete, "every required section is present");
+        assert!(checkpoint.missing_sections.is_empty());
+        let critical = checkpoint.section("Critical Context").expect("section");
+        assert!(critical.contains("DECISION A"), "{critical}");
+        assert!(
+            critical.contains("DECISION B"),
+            "contradictory decisions stay explicit: {critical}"
+        );
+
+        let lossy = "## Primary Request and Intent\n- ship\n";
+        let mut session = AgentSession::new();
+        for index in 0..4 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        assert!(session.install_priced_checkpoint(0, lossy) > 0);
+        let checkpoint = session.checkpoints().last().expect("checkpoint");
+        assert!(!checkpoint.complete, "missing sections are flagged");
+        assert!(
+            checkpoint
+                .missing_sections
+                .contains(&"Critical Context".to_string()),
+            "{:?}",
+            checkpoint.missing_sections
         );
     }
 

@@ -595,6 +595,9 @@ fn task_json(task: &Task) -> Value {
         "input": task.input,
         "budget": task.budget,
         "retry": task.retry,
+        "execution_succeeded": task.execution_succeeded(),
+        "verified_completion": task.verified_completion(),
+        "verification": task.verification,
         "next_fire_ms": task.trigger.next_fire_ms(),
         "created_ms": task.created_ms,
         "updated_ms": task.updated_ms,
@@ -615,6 +618,8 @@ fn task_json(task: &Task) -> Value {
                     "started_ms": attempt.started_ms,
                     "ended_ms": attempt.ended_ms,
                     "delivered_ms": attempt.delivered_ms,
+                    "verified_success": attempt.verified_success(),
+                    "verification": attempt.verification,
                 })
             })
             .collect::<Vec<_>>(),
@@ -662,6 +667,13 @@ pub(crate) fn list_with(context: &TaskToolsContext, args: &Value) -> Result<Valu
                 "host": task.host,
                 "tier": task.tier,
                 "status": task.status,
+                "verification": task
+                    .attempts
+                    .last()
+                    .map(|attempt| attempt.verification.status)
+                    .unwrap_or(task.verification.status),
+                "execution_succeeded": task.execution_succeeded(),
+                "verified_completion": task.verified_completion(),
                 "next_fire_ms": task.trigger.next_fire_ms(),
             })
         })
