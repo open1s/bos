@@ -95,6 +95,8 @@ pub enum LanguageId {
     Dockerfile,
     /// Makefile syntax.
     Makefile,
+    /// Just task-runner syntax.
+    Justfile,
     /// Git ignore/attributes syntax.
     GitMetadata,
     /// Vue single-file components.
@@ -183,9 +185,10 @@ fn classify_well_known_name(name: &str) -> Option<FileClassification> {
 
     let value = match name {
         "dockerfile" => classification(Configuration, Some(Dockerfile), WellKnownFileName),
-        "makefile" | "gnumakefile" | "justfile" => {
+        "makefile" | "gnumakefile" => {
             classification(Configuration, Some(Makefile), WellKnownFileName)
         }
+        "justfile" => classification(Configuration, Some(Justfile), WellKnownFileName),
         "cargo.toml" | "pyproject.toml" => {
             classification(Configuration, Some(Toml), WellKnownFileName)
         }
@@ -252,6 +255,7 @@ fn classify_extension(extension: &str) -> FileClassification {
         "proto" => classification(Data, Some(ProtocolBuffers), Extension),
         "toml" => classification(Configuration, Some(Toml), Extension),
         "yaml" | "yml" => classification(Configuration, Some(Yaml), Extension),
+        "jsonc" => classification(Configuration, Some(Json), Extension),
         "ini" | "conf" | "cfg" | "properties" | "env" => {
             classification(Configuration, None, Extension)
         }
@@ -272,7 +276,10 @@ fn classify_extension(extension: &str) -> FileClassification {
         "svg" => classification(Asset, Some(Svg), Extension),
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "tif"
         | "tiff" | "pdf" | "woff" | "woff2" | "ttf" | "otf" | "eot" | "zip"
-        | "gz" | "wasm" => classification(Asset, None, Extension),
+        | "gz" | "wasm" | "exe" | "dll" | "so" | "dylib" | "a" | "lib"
+        | "o" | "obj" | "class" | "jar" | "war" | "ear" | "bin" | "dat" => {
+            classification(Asset, None, Extension)
+        }
         "txt" => classification(Documentation, None, Extension),
         _ => classification(
             FileCategory::Unknown,
