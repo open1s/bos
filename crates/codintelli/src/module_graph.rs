@@ -208,25 +208,6 @@ pub fn build_rust_module_graph(
         }
     }
 
-    // Candidate path rules depend on which root is active: a source file
-    // can be a crate root in one namespace and an external module in another.
-    let mut candidate_by_declaration = HashMap::new();
-    for root in &roots {
-        let candidate_report =
-            resolve_rust_module_candidates(parse_results, inventory_paths, std::slice::from_ref(root))?;
-        for candidate in candidate_report.modules {
-            candidate_by_declaration.insert(
-                (
-                    root.clone(),
-                    candidate.source_path.clone(),
-                    candidate.range.start_byte,
-                    candidate.range.end_byte,
-                ),
-                candidate,
-            );
-        }
-    }
-
     let mut graph = RustModuleGraph {
         workspace_id,
         crate_roots: roots.clone(),
@@ -270,6 +251,19 @@ pub fn build_rust_module_graph(
                     let mut scope = fact.scope_path.clone();
                     scope.push(fact.name.clone());
                     scope
+                })
+                .collect();
+            // Resolve only the current reachable file, not every file in the
+            // workspace. This keeps candidate projection proportional to the
+            // bounded graph traversal and preserves root-specific path rules.
+            let candidate_report = resolve_rust_module_candidates(
+                std::slice::from_ref(*parsed),
+                inventory_paths,
+                std::slice::from_ref(root),
+            )?;
+            let candidates_by_range: HashMap<_, _> = candidate_report.modules.iter()
+                .map(|candidate| {
+                    ((candidate.range.start_byte, candidate.range.end_byte), candidate)
                 })
                 .collect();
 
@@ -365,9 +359,7 @@ pub fn build_rust_module_graph(
                     continue;
                 }
 
-                let candidate = candidate_by_declaration.get(&(
-                    root.clone(),
-                    source_path.clone(),
+                let candidate = candidates_by_range.get(&(
                     fact.range.start_byte,
                     fact.range.end_byte,
                 ));
