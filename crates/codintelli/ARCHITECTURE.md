@@ -91,7 +91,7 @@ Responsibilities:
 - Enforce one shared `ScanBudget` for the entire scan.
 - Produce deterministic workspace-relative file records.
 
-Initial built-in exclusions should include VCS internals and common generated/dependency directories (for example `.git`, `target`, `node_modules`, and common build output directories). Exclusions must be configurable; they must not silently hide user source directories.
+Initial built-in exclusions include VCS internals and common generated/dependency directories such as `.git/.hg/.svn`, `target`, `node_modules`, `dist`, `build`, `.next`, `.turbo`, common Python virtual environments, and language-tool caches. Exclusions are configurable through ordered path-prefix, directory-name, and file-extension rules; the last matching rule wins. Built-ins are the initial exclusion layer and can be overridden by later explicit include rules. When an include targets content beneath an ignored directory, the scanner traverses that directory without returning it as an indexed entry. Ignored entries still count toward the global directory-entry budget, while excluded files do not consume the accepted-file budget. The initial policy is deliberately not a `.gitignore` parser; nested `.gitignore` discovery and full Git ignore semantics require a separate design.
 
 The scanner must return a typed completion state: `Complete`, `Partial`, `Cancelled`, or `Failed`, with usage and diagnostics. A budget-exceeded scan is partial, never complete.
 
