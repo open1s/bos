@@ -10,7 +10,7 @@ use crate::{
 /// Final state of a workspace inventory scan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScanStatus {
-    /// Every reachable directory was enumerated within the configured limits.
+    /// Every directory not pruned by the ignore policy was enumerated within limits.
     Complete,
     /// Some entries or directories were omitted because of a limit or error.
     Partial,
@@ -75,6 +75,9 @@ pub fn scan_workspace(
 }
 
 /// Scan a workspace using an explicit ignore policy and shared resource budget.
+///
+/// The policy is applied before accepted-file accounting. Ignored directory
+/// contents are not enumerated unless a later include rule may match below them.
 ///
 /// Later matching policy rules override earlier rules. Ignored entries still
 /// consume the directory-entry budget because they must be enumerated to apply
