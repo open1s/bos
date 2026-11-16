@@ -846,7 +846,7 @@ impl Shell {
     }
     /// The composer badge's reversal: the same switch, turned off.
     pub(crate) fn restore_execution_contract(&mut self, cx: &mut Context<Self>) {
-        // The badge's click is the same operation as the General toggle: turn
+        // The badge's click is the same operation as the Agent loop toggle: turn
         // the mode off for whoever owns the persona (workspace or preset).
         self.set_persona_complete(false, cx);
     }

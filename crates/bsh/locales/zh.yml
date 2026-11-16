@@ -541,6 +541,8 @@
 "settings.agent-loop": "Agent 循环"
 "settings.personaHelp": "开启：人设替代运行身份、工作流规则与工具指引，仅保留一段精简执行页脚。关闭：人设填充槽位，运行层围绕它发送。"
 "settings.personaCompleteTitle": "完整人设"
+"settings.personaOwnerPreset": "预设：{preset}"
+"settings.personaOwnerWorkspace": "工作区"
 "settings.personaCompleteOn": "已开启完整人设。"
 "settings.personaCompleteOff": "已关闭完整人设。"
 "settings.personaNeedsPrompt": "请先填写人设：完整人设需要有内容。"

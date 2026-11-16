@@ -850,9 +850,11 @@ fn build_agent_for_session_inner(
     // because an empty system prompt is never what a persona meant.
     // A complete persona is the reader's explicit choice: it replaces the
     // identity, the workflow and the per-tool sections, while the compact
-    // harness execution footer stays. The toggle lives in General and in the
-    // composer's permission menu, and the build reports the state so an
-    // off-contract turn is attributable to the setting.
+    // harness execution footer stays. The toggle lives in the Agent loop pane
+    // and in the composer's permission menu; it edits the document that OWNS
+    // the persona in force (the preset that ships it, else the workspace), and
+    // the build reports the state so an off-contract turn is attributable to
+    // the setting.
     let persona_complete = eff.persona_complete && !eff.llm_system_prompt().trim().is_empty();
     if persona_complete {
         log::warn!(
@@ -8035,6 +8037,88 @@ mod tests {
             "the fallback build keeps its guidance"
         );
         assert!(!built.agent.config().persona_complete);
+    }
+
+    /// The complete flag the build carries follows the persona's OWNER.
+    ///
+    /// A preset that ships a persona owns the flag: a preset saying
+    /// `complete = false` keeps the slot composition even when the workspace
+    /// flag is on, because that flag describes a different prompt. A preset
+    /// that ships no persona - or a blank one - leaves the workspace persona
+    /// and its own flag in force.
+    #[test]
+    fn the_complete_flag_follows_the_persona_owner() {
+        use crate::settings::global::Preset;
+
+        let mut settings = bare();
+        settings.workspace.agent.system_prompt = "workspace persona".to_string();
+        settings.workspace.agent.complete = true;
+        settings.global.default_preset = String::new();
+        let built = build(&settings);
+        assert!(
+            built.agent.config().persona_complete,
+            "the workspace owns the persona here"
+        );
+        assert!(built
+            .agent
+            .config()
+            .system_prompt
+            .starts_with("workspace persona"));
+
+        settings.global.presets.insert(
+            "slot".to_string(),
+            Preset {
+                system_prompt: Some("preset persona.".to_string()),
+                complete: false,
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "slot".to_string();
+        let built = build(&settings);
+        assert!(
+            !built.agent.config().persona_complete,
+            "the preset owns the flag, and it says off"
+        );
+        assert!(built
+            .agent
+            .config()
+            .system_prompt
+            .contains(agent::HARNESS_IDENTITY));
+
+        // The same preset with no persona: the workspace arm is back.
+        settings
+            .global
+            .presets
+            .get_mut("slot")
+            .expect("the preset")
+            .system_prompt = None;
+        let built = build(&settings);
+        assert!(built.agent.config().persona_complete);
+        assert!(built
+            .agent
+            .config()
+            .system_prompt
+            .starts_with("workspace persona"));
+
+        // A BLANK preset persona is no persona: it must not blank the
+        // workspace prompt or steal the flag.
+        settings
+            .global
+            .presets
+            .get_mut("slot")
+            .expect("the preset")
+            .system_prompt = Some("   ".to_string());
+        let built = build(&settings);
+        assert!(built.agent.config().persona_complete);
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .starts_with("workspace persona"),
+            "a blank preset persona leaves the workspace prompt alone: {}",
+            built.agent.config().system_prompt
+        );
     }
 
     /// The prompt and the request carry the same tool set: every guidance

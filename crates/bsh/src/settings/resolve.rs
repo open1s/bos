@@ -653,10 +653,17 @@ pub(crate) fn resolve_with_catalogue(
     // The complete-persona flag follows the persona in force: a preset that
     // ships its own persona owns the flag; a preset that ships none leaves the
     // workspace persona (and its flag) in charge.
-    let persona_complete = match preset
+    //
+    // A BLANK persona is no persona. The build refuses an empty prompt (an
+    // empty system prompt is never what a persona meant, so caps falls back to
+    // the default composition), and treating "" as an owner here would do two
+    // wrong things at once: it would drop a real workspace persona, and it
+    // would take the flag from a preset whose text does not exist.
+    let preset_persona = preset
         .as_ref()
-        .and_then(|preset| preset.system_prompt.as_deref())
-    {
+        .and_then(|preset| preset.system_prompt.as_ref())
+        .filter(|text| !text.trim().is_empty());
+    let persona_complete = match preset_persona {
         Some(_) => preset.as_ref().is_some_and(|preset| preset.complete),
         None => workspace.agent.complete,
     };
@@ -700,9 +707,7 @@ pub(crate) fn resolve_with_catalogue(
         preset_skills: preset.as_ref().and_then(|preset| preset.skills.clone()),
         preset_mcps: preset.as_ref().and_then(|preset| preset.mcps.clone()),
         preset_extensions: preset.as_ref().and_then(|preset| preset.extensions.clone()),
-        preset_system_prompt: preset
-            .as_ref()
-            .and_then(|preset| preset.system_prompt.clone()),
+        preset_system_prompt: preset_persona.cloned(),
         preset_policy: preset.as_ref().and_then(|preset| preset.policy.clone()),
         preset_trusted: preset
             .as_ref()
@@ -1741,6 +1746,68 @@ mcp_servers = [
             ],
             "the DEFAULT preset is restored as well, not silently cleared"
         );
+    }
+
+    /// The complete flag follows the persona IN FORCE: the same document the
+    /// prompt comes from owns the flag, and a blank preset persona is no
+    /// persona at all.
+    #[test]
+    fn the_complete_flag_follows_the_persona_in_force() {
+        use crate::settings::global::Preset;
+
+        let mut g = global();
+        let mut ws = workspace();
+        ws.agent.system_prompt = "workspace persona".to_string();
+        ws.agent.complete = true;
+        let session = choice("nvidia", "glm");
+
+        // No preset persona: the workspace owns the text and the flag.
+        let r = resolve(&g, &ws, Some(&entry()), &session);
+        assert_eq!(r.preset_system_prompt, None);
+        assert_eq!(r.system_prompt, "workspace persona");
+        assert!(r.persona_complete);
+
+        // A preset persona saying `complete = false` OWNS the flag: the
+        // workspace's on describes a different prompt and must not carry over.
+        g.presets.insert(
+            "slot".to_string(),
+            Preset {
+                system_prompt: Some("preset persona".to_string()),
+                complete: false,
+                ..Preset::default()
+            },
+        );
+        g.default_preset = "slot".to_string();
+        let r = resolve(&g, &ws, Some(&entry()), &session);
+        assert_eq!(r.preset_system_prompt.as_deref(), Some("preset persona"));
+        assert!(
+            !r.persona_complete,
+            "the workspace flag does not describe the preset persona"
+        );
+
+        // The same preset saying `complete = true`: on.
+        g.presets.get_mut("slot").expect("the preset").complete = true;
+        let r = resolve(&g, &ws, Some(&entry()), &session);
+        assert!(r.persona_complete);
+
+        // A BLANK preset persona is no persona: the workspace prompt and its
+        // own flag stay in force instead of being blanked out.
+        g.presets.get_mut("slot").unwrap().system_prompt = Some("   ".to_string());
+        let r = resolve(&g, &ws, Some(&entry()), &session);
+        assert_eq!(r.preset_system_prompt, None, "blank is not a persona");
+        assert_eq!(r.system_prompt, "workspace persona");
+        assert!(
+            r.persona_complete,
+            "the workspace flag still describes its persona"
+        );
+
+        // Presets off: neither the preset persona nor its flag applies.
+        g.presets.get_mut("slot").unwrap().system_prompt = Some("preset persona".to_string());
+        g.presets.get_mut("slot").unwrap().complete = true;
+        g.general.presets_enabled = Some(false);
+        let r = resolve(&g, &ws, Some(&entry()), &session);
+        assert_eq!(r.preset_system_prompt, None);
+        assert!(r.persona_complete, "the workspace arm is the only one left");
     }
 
     /// A preset that forced heel under a full-access session no longer forces

@@ -858,6 +858,27 @@ fn web_search_method_action(shell: &mut Shell, key: &str, cx: &mut Context<Shell
     cx.notify();
 }
 
+/// The document that owns the persona in force, as the persona row names it.
+///
+/// The complete switch edits this owner (see `Shell::set_persona_complete`), so
+/// the row names it instead of leaving a silent preset edit to look like a
+/// workspace edit. The persona in force is the preset's when the preset ships
+/// one (a blank persona is no persona), otherwise the workspace's.
+pub(crate) fn persona_owner_label(
+    effective: &crate::settings::Effective,
+    global: &crate::settings::global::GlobalSettings,
+    lang: crate::i18n::Lang,
+) -> String {
+    if effective.preset_system_prompt.is_some() && !effective.preset_id.is_empty() {
+        let name = global
+            .preset(&effective.preset_id)
+            .and_then(|preset| preset.name.clone())
+            .unwrap_or_else(|| effective.preset_id.clone());
+        return crate::i18n::tr_args(lang, "settings.personaOwnerPreset", &[("preset", name)]);
+    }
+    crate::i18n::tr(lang, "settings.personaOwnerWorkspace").to_string()
+}
+
 /// Attach or detach the memory store.
 fn memory_action(shell: &mut Shell, on: bool, cx: &mut Context<Shell>) {
     shell.state.draft_mut().workspace.agent.memory_enabled = on;
@@ -1858,16 +1879,37 @@ impl Shell {
         let effective = self.state.effective();
         let on = effective.persona_complete;
         let enabled = !effective.llm_system_prompt().trim().is_empty();
-        vec![self.preference_row(
-            "settings.personaCompleteTitle",
-            Some("settings.personaHelp"),
-            self.switch(
+        // WHO owns the flag is a reader-facing fact: the switch edits the
+        // preset that supplies the persona in force, or the workspace when the
+        // workspace supplies it. The pill names that document, so a press that
+        // quietly edits a preset cannot look like a workspace edit.
+        let owner = persona_owner_label(&effective, &self.state.settings.global, self.state.lang);
+        let control = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .debug_selector(|| "persona-owner".to_string())
+                    .max_w(px(180.0))
+                    .px(px(6.0))
+                    .py(px(1.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(theme::hover()))
+                    .child(txt(owner, 11.0, theme::muted()).text_ellipsis()),
+            )
+            .child(self.switch(
                 "persona-complete-toggle",
                 on,
                 enabled,
                 |shell, next, cx| shell.set_persona_complete(next, cx),
                 cx,
-            ),
+            ));
+        vec![self.preference_row(
+            "settings.personaCompleteTitle",
+            Some("settings.personaHelp"),
+            control,
         )]
     }
 
@@ -7887,8 +7929,13 @@ impl Shell {
                 )
             },
         ];
-        // The persona contract lives beside the agent-behaviour switches.
-        rows.extend(self.persona_help_rows(cx));
+        // The persona contract shapes the request, so it sits with the numbers
+        // above it and the switches follow. It also keeps the primary behaviour
+        // control above the pane's fold at the reference window size: the
+        // request fields and their hint lines pushed it out of the viewport,
+        // where its switch was still laid out but no longer reachable without
+        // scrolling.
+        rows.splice(3..3, self.persona_help_rows(cx));
         ("settings.agent-loop", "settings.agentLoopHint", rows)
     }
 
@@ -14909,6 +14956,60 @@ mod label_tests {
                 "{id} is named by a name, not by a URL (got {label})"
             );
         }
+    }
+
+    /// The persona row names the document the complete switch edits.
+    #[test]
+    fn the_persona_owner_label_follows_the_persona_in_force() {
+        use crate::i18n::Lang;
+        use crate::settings::global::Preset;
+        use crate::settings::Settings;
+        use crate::ui::settings::persona_owner_label;
+
+        let mut settings = Settings::default();
+        settings.workspace.agent.system_prompt = "workspace persona".to_string();
+        let effective = settings.effective();
+        assert_eq!(
+            persona_owner_label(&effective, &settings.global, Lang::En),
+            "Workspace"
+        );
+
+        settings.global.presets.insert(
+            "terse".to_string(),
+            Preset {
+                name: Some("Terse".to_string()),
+                system_prompt: Some("Be terse.".to_string()),
+                ..Preset::default()
+            },
+        );
+        settings.global.default_preset = "terse".to_string();
+        let effective = settings.effective();
+        assert_eq!(
+            persona_owner_label(&effective, &settings.global, Lang::En),
+            "Preset: Terse",
+            "the preset's own name names it"
+        );
+
+        // No declared name: the id names it, the way the roster does.
+        settings.global.presets.get_mut("terse").unwrap().name = None;
+        let effective = settings.effective();
+        assert_eq!(
+            persona_owner_label(&effective, &settings.global, Lang::En),
+            "Preset: terse"
+        );
+
+        // A blank persona is no persona: the workspace owns the row again.
+        settings
+            .global
+            .presets
+            .get_mut("terse")
+            .unwrap()
+            .system_prompt = Some("   ".to_string());
+        let effective = settings.effective();
+        assert_eq!(
+            persona_owner_label(&effective, &settings.global, Lang::En),
+            "Workspace"
+        );
     }
 
     #[test]

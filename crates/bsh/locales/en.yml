@@ -546,6 +546,8 @@
 "settings.agent-loop": "Agent loop"
 "settings.personaHelp": "On: the persona replaces the harness identity, workflow rules and per-tool guidance; only the compact execution footer stays. Off: the persona fills the slot and the harness layers surround it."
 "settings.personaCompleteTitle": "Complete persona"
+"settings.personaOwnerPreset": "Preset: {preset}"
+"settings.personaOwnerWorkspace": "Workspace"
 "settings.personaCompleteOn": "Complete persona on."
 "settings.personaCompleteOff": "Complete persona off."
 "settings.personaNeedsPrompt": "Write a persona first: complete persona needs one."

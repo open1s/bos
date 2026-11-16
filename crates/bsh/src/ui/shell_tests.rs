@@ -7977,6 +7977,10 @@ fn the_agent_loop_pane_toggles_the_complete_persona(cx: &mut TestAppContext) {
     let toggle = cx
         .debug_bounds("persona-complete-toggle")
         .expect("the persona switch is always shown");
+    assert!(
+        cx.debug_bounds("persona-owner").is_some(),
+        "the row names the document the switch edits"
+    );
     assert!(!cx.update(|_, cx| shell.read(cx).state.persona_complete));
 
     cx.simulate_click(toggle.center(), Modifiers::default());
