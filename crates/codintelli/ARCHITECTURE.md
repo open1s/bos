@@ -149,7 +149,11 @@ This is intentionally conservative. The current Rust facts do not yet carry full
 
 The Rust provider emits typed module declarations in addition to generic syntax facts. Each declaration records its lexical inline-module scope, declared name, inline-versus-external form, and source range. This separates `mod child { ... }` from `mod child;`, which is required before attempting filesystem-based module lookup. These facts do not claim that an external module file exists, and do not yet account for `#[path]`, conditional compilation, macro-generated declarations, or Cargo target selection. Those conditions must remain explicit uncertainty in the later resolver rather than being guessed.
 
-### 4.7 Cross-file resolution
+### 4.7 Rust module path candidates (CI-09E)
+
+The module candidate mapper consumes typed module declarations and the caller-provided workspace inventory. It checks both conventional layouts (`name.rs` and `name/mod.rs`) using the source-file directory rules. Crate roots are explicit host input; codintelli does not guess Cargo targets or execute Cargo metadata commands. Inline module scopes are reflected in candidate paths. If both conventional files exist, ambiguity is preserved. If neither exists, the result is `NoCandidate`, not a compiler error. Any declaration with outer attributes is skipped as uncertain because `cfg`, `cfg_attr`, and `path` require configuration-aware handling. A unique filesystem candidate is still only a path candidate, not a semantic or compiler-resolved module edge.
+
+### 4.8 Cross-file resolution
 
 Resolution is a separate stage over extracted facts and workspace metadata. It may resolve:
 
@@ -160,7 +164,7 @@ Resolution is a separate stage over extracted facts and workspace metadata. It m
 
 Resolution output must retain its own provenance and diagnostics. Ambiguous candidates remain ambiguous; they are not collapsed to an arbitrary target.
 
-### 4.8 Relationship analysis and query
+### 4.9 Relationship analysis and query
 
 Relationship analysis is a deterministic transformation over extracted facts. A graph-shaped view may be built when it helps a query, but the underlying index must not require all records to be represented as graph nodes and edges. This stage must not perform parsing or filesystem access.
 
