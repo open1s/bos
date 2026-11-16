@@ -194,7 +194,7 @@ impl RustProvider {
 
             if let Some((kind, name)) = classify_node(node, source) {
                 if let Some(range) = source_range(node, source.len()) {
-                    if facts.len() >= limits.max_facts {
+                    if facts.len().saturating_add(imports.len()).saturating_add(modules.len()) >= limits.max_facts {
                         limit_reason = Some(ParseLimitKind::Facts);
                         break;
                     }
@@ -560,6 +560,30 @@ mod external_child;
         assert_eq!(result.status, ParseStatus::Limited);
         assert_eq!(result.limit_reason, Some(ParseLimitKind::Facts));
         assert_eq!(result.facts.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_fact_limit_covers_syntax_import_and_module_records() {
+        let budget = ScanBudget::new(ScanLimits::default());
+        let limits = ParseLimits {
+            max_nodes: 1000,
+            max_facts: 2,
+            max_diagnostics: 10,
+        };
+        let result = RustProvider
+            .parse_with_control(
+                ParseInput {
+                    workspace_id: WorkspaceId::new(),
+                    relative_path: Path::new("src/lib.rs"),
+                    source: b"mod child {} use crate::Thing; fn run() {}",
+                },
+                &ParseControl::new(&budget, &limits),
+            )
+            .expect("parse within aggregate fact limit");
+
+        assert_eq!(result.status, ParseStatus::Limited);
+        assert_eq!(result.limit_reason, Some(ParseLimitKind::Facts));
+        assert!(result.facts.len() + result.imports.len() + result.modules.len() <= 2);
     }
 
     #[test]
