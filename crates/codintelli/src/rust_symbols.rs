@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use crate::{
-    module_graph::{RustModuleGraph, RustModuleGraphStatus},
+    module_graph::{RustModuleGraph, RustModuleGraphStatus, RustModuleNodeKind},
     syntax::{ParseResult, ParseStatus, SourceRange, SyntaxFactKind},
     WorkspaceId,
 };
@@ -88,7 +88,7 @@ pub fn build_rust_scoped_symbols(
     }
 
     let mut symbols = Vec::new();
-    for node in &graph.nodes {
+    for node in graph.nodes.iter().filter(|node| node.kind != RustModuleNodeKind::Inline) {
         let Some(parse) = by_path.get(&node.source_path) else {
             continue;
         };
