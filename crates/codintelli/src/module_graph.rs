@@ -274,6 +274,24 @@ pub fn build_rust_module_graph(
                     break;
                 }
 
+                if fact.has_attributes {
+                    if graph.status == RustModuleGraphStatus::Complete {
+                        graph.status = RustModuleGraphStatus::Partial;
+                    }
+                    if fact.is_inline {
+                        graph.edges.push(RustModuleEdge {
+                            crate_root: root.clone(),
+                            parent_module_path: parent_path,
+                            child_module_path: child_path,
+                            declaration_source: source_path.clone(),
+                            range: fact.range,
+                            candidate_paths: Vec::new(),
+                            status: RustModuleEdgeStatus::SkippedAttributedDeclaration,
+                        });
+                        continue;
+                    }
+                }
+
                 if fact.is_inline {
                     if child_path.len() > limits.max_depth {
                         graph.edges.push(RustModuleEdge {
@@ -515,6 +533,22 @@ mod tests {
         ).expect("module graph");
         assert_eq!(graph.edges[0].status, RustModuleEdgeStatus::AmbiguousCandidates);
         assert_eq!(graph.edges[0].candidate_paths.len(), 2);
+    }
+
+    #[test]
+    fn does_not_assume_attributed_inline_modules_are_active() {
+        let id = WorkspaceId::new();
+        let mut optional = module("optional", &[], true);
+        optional.has_attributes = true;
+        let graph = build_rust_module_graph(
+            &[parsed("src/lib.rs", vec![optional], id)],
+            &[PathBuf::from("src/lib.rs")],
+            &[PathBuf::from("src/lib.rs")],
+            RustModuleGraphLimits::default(),
+        ).expect("module graph");
+        assert_eq!(graph.status, RustModuleGraphStatus::Partial);
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.edges[0].status, RustModuleEdgeStatus::SkippedAttributedDeclaration);
     }
 
     #[test]
