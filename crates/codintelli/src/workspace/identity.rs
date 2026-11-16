@@ -1,6 +1,5 @@
 use std::{
-    fmt,
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -90,24 +89,19 @@ impl WorkspaceDescriptor {
     ///
     /// Returns WorkspaceError::Canonicalize if the path cannot be
     /// canonicalized, or WorkspaceError::NotDirectory if it is not a directory.
-    pub fn new(
-        id: WorkspaceId,
-        root: impl AsRef<Path>,
-    ) -> Result<Self, WorkspaceError> {
+    pub fn new(id: WorkspaceId, root: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
         let supplied_root = root.as_ref();
-        let canonical_root = fs::canonicalize(supplied_root).map_err(|source| {
-            WorkspaceError::Canonicalize {
+        let canonical_root =
+            fs::canonicalize(supplied_root).map_err(|source| WorkspaceError::Canonicalize {
                 path: supplied_root.to_path_buf(),
                 source,
-            }
-        })?;
+            })?;
 
-        let metadata = fs::metadata(&canonical_root).map_err(|source| {
-            WorkspaceError::Canonicalize {
+        let metadata =
+            fs::metadata(&canonical_root).map_err(|source| WorkspaceError::Canonicalize {
                 path: canonical_root.clone(),
                 source,
-            }
-        })?;
+            })?;
 
         if !metadata.is_dir() {
             return Err(WorkspaceError::NotDirectory {
@@ -115,10 +109,7 @@ impl WorkspaceDescriptor {
             });
         }
 
-        Ok(Self {
-            id,
-            canonical_root,
-        })
+        Ok(Self { id, canonical_root })
     }
 
     /// Return this workspace's opaque identity.
@@ -159,11 +150,9 @@ impl WorkspaceDescriptor {
             });
         }
 
-        let metadata = fs::metadata(&current).map_err(|source| {
-            WorkspaceError::Canonicalize {
-                path: current.clone(),
-                source,
-            }
+        let metadata = fs::metadata(&current).map_err(|source| WorkspaceError::Canonicalize {
+            path: current.clone(),
+            source,
         })?;
 
         if !metadata.is_dir() {
@@ -193,10 +182,7 @@ impl WorkspaceRegistry {
     ///
     /// Returns DuplicateId if an ID is already associated with another root,
     /// or DuplicateRoot if a root is already associated with another ID.
-    pub fn register(
-        &mut self,
-        descriptor: WorkspaceDescriptor,
-    ) -> Result<(), WorkspaceError> {
+    pub fn register(&mut self, descriptor: WorkspaceDescriptor) -> Result<(), WorkspaceError> {
         let id = descriptor.id();
         let root = descriptor.canonical_root().to_path_buf();
 
@@ -373,8 +359,14 @@ mod tests {
 
         assert_eq!(registry.len(), 2);
         assert_ne!(
-            registry.get(first_id).expect("first registered").canonical_root(),
-            registry.get(second_id).expect("second registered").canonical_root()
+            registry
+                .get(first_id)
+                .expect("first registered")
+                .canonical_root(),
+            registry
+                .get(second_id)
+                .expect("second registered")
+                .canonical_root()
         );
     }
 
