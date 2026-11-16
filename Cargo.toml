@@ -18,7 +18,8 @@ members = [
     "crates/ferris-sdk",
     "crates/ferris-bindings",
     "crates/ferris-smoke",
-    "crates/bsh"
+    "crates/bsh",
+    "crates/codintelli"
 ]
 resolver = "2"
 
