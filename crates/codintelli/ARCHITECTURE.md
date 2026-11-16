@@ -204,7 +204,7 @@ type-dependent associated-item resolution remain future work.
 ### 4.12 Declared Rust visibility facts (CI-09J)
 
 The Tree-sitter provider records the visibility modifier attached to Rust
-module-level declarations and `use` declarations: implicit private visibility,
+declarations and `use` declarations: implicit private visibility,
 `pub`, `pub(crate)`, `pub(super)`, `pub(self)`, and `pub(in path)`. Unknown
 modifier spellings are retained as unknown evidence rather than silently
 converted to private. The provider schema version is bumped when this fact
