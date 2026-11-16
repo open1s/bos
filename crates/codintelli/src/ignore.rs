@@ -152,7 +152,7 @@ impl IgnoreRule {
                     let is_directory_component =
                         index + 1 < components.len() || kind == WorkspaceEntryKind::Directory;
                     is_directory_component
-                        && matches!(component, Component::Normal(value) if value == name)
+                        && matches!(component, Component::Normal(value) if value == name.as_os_str())
                 })
             }
             IgnoreMatcher::Extension(extension) => {
