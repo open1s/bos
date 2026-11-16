@@ -23,7 +23,6 @@ use crate::WorkspaceDescriptor;
 mod read_dir;
 
 pub use read_dir::{DirectoryListing, WorkspaceEntry, WorkspaceEntryKind};
-pub use read_dir::{WorkspaceEntry, WorkspaceEntryKind};
 
 const MAX_PATH_DEPTH: usize = 256;
 
@@ -205,7 +204,7 @@ pub enum WorkspaceFsError {
     Io {
         /// Relative or root path associated with the operation.
         path: PathBuf,
-        /// Underlying filesystem error.
+        /// Underlying I/O error.
         #[source]
         source: io::Error,
     },
@@ -358,13 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_paths_exceeding_component_depth_limit() {
+    fn rejects_excessive_path_depth() {
         let root = tempdir().expect("create workspace");
         let workspace = workspace_fs(root.path());
-        let mut path = PathBuf::new();
-        for _ in 0..=MAX_PATH_DEPTH {
-            path.push("segment");
-        }
+        let path = (0..=MAX_PATH_DEPTH)
+            .map(|_| "x")
+            .collect::<Vec<_>>()
+            .join("/");
 
         assert!(matches!(
             workspace.read_file(path, 1024),
@@ -373,11 +372,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_file_is_readable_with_zero_limit() {
+    fn reads_empty_file_with_zero_limit() {
         let root = tempdir().expect("create workspace");
-        fs::write(root.path().join("empty.txt"), b"").expect("write empty file");
+        fs::write(root.path().join("empty"), "").expect("write empty");
         let workspace = workspace_fs(root.path());
 
-        assert_eq!(workspace.read_file("empty.txt", 0).expect("read empty"), b"");
+        assert_eq!(
+            workspace.read_file("empty", 0).expect("read empty"),
+            Vec::<u8>::new()
+        );
     }
 }
