@@ -148,3 +148,65 @@ pub fn build_rust_scoped_symbols(
         incomplete_source_paths,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        classification::LanguageId,
+        module_graph::{RustModuleNode, RustModuleNodeKind},
+        syntax::{ParseLimitKind, ParseStatus, SyntaxFact, SyntaxFactKind},
+    };
+
+    #[test]
+    fn keeps_shared_source_in_distinct_crate_root_namespaces() {
+        let workspace_id = WorkspaceId::new();
+        let source_path = PathBuf::from("src/shared.rs");
+        let parse = ParseResult {
+            workspace_id,
+            relative_path: source_path.clone(),
+            language: LanguageId::Rust,
+            provider_id: "test".to_owned(),
+            provider_version: "test".to_owned(),
+            schema_version: 2,
+            status: ParseStatus::Complete,
+            limit_reason: None::<ParseLimitKind>,
+            facts: vec![SyntaxFact {
+                kind: SyntaxFactKind::Function,
+                name: Some("run".to_owned()),
+                scope_path: vec!["inner".to_owned()],
+                is_module_scope: true,
+                range: SourceRange { start_byte: 0, end_byte: 12 },
+            }],
+            imports: Vec::new(),
+            modules: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let graph = RustModuleGraph {
+            workspace_id,
+            crate_roots: vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")],
+            nodes: vec![
+                RustModuleNode {
+                    crate_root: PathBuf::from("src/lib.rs"),
+                    module_path: Vec::new(),
+                    source_path: source_path.clone(),
+                    kind: RustModuleNodeKind::CrateRoot,
+                },
+                RustModuleNode {
+                    crate_root: PathBuf::from("src/main.rs"),
+                    module_path: vec!["shared".to_owned()],
+                    source_path: source_path.clone(),
+                    kind: RustModuleNodeKind::External,
+                },
+            ],
+            edges: Vec::new(),
+            status: RustModuleGraphStatus::Complete,
+        };
+
+        let report = build_rust_scoped_symbols(&[parse], &graph).expect("scoped symbol catalog");
+        assert_eq!(report.symbols.len(), 2);
+        assert_eq!(report.symbols[0].id.module_path, vec!["inner".to_owned()]);
+        assert_eq!(report.symbols[1].id.module_path, vec!["shared".to_owned(), "inner".to_owned()]);
+        assert_ne!(report.symbols[0].id.crate_root, report.symbols[1].id.crate_root);
+    }
+}
