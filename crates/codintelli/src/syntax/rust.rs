@@ -5,8 +5,6 @@
 //! syntax trees; unlike an error-recovering parser, malformed files produce a
 //! failed result with a diagnostic and no partial facts.
 
-use std::path::PathBuf;
-
 use proc_macro2::Span;
 use syn::{
     spanned::Spanned,
@@ -102,7 +100,10 @@ impl RustFactExtractor<'_> {
 
     fn source_spelling(&self, span: Span) -> Option<String> {
         let range = span_range(span, self.source.len())?;
-        self.source.get(range.start_byte..range.end_byte).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+        self.source.get(range.start_byte..range.end_byte)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
     }
 }
 
@@ -174,12 +175,14 @@ impl<'ast> Visit<'ast> for RustFactExtractor<'_> {
     }
 
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
-        self.push(SyntaxFactKind::Import, self.source_spelling(node.span()), node.span());
+        let name = self.source_spelling(node.span());
+        self.push(SyntaxFactKind::Import, name, node.span());
         visit::visit_item_use(self, node);
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        self.push(SyntaxFactKind::Call, self.source_spelling(node.func.span()), node.func.span());
+        let name = self.source_spelling(node.func.span());
+        self.push(SyntaxFactKind::Call, name, node.func.span());
         visit::visit_expr_call(self, node);
     }
 
@@ -193,7 +196,7 @@ impl<'ast> Visit<'ast> for RustFactExtractor<'_> {
 mod tests {
     use super::*;
     use crate::WorkspaceId;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn parse(source: &str) -> ParseResult {
         RustProvider
@@ -231,7 +234,10 @@ fn helper() {}
             SyntaxFactKind::Call,
             SyntaxFactKind::MethodCall,
         ] {
-            assert!(result.facts.iter().any(|fact| fact.kind == kind), "missing {kind:?}");
+            assert!(
+                result.facts.iter().any(|fact| fact.kind == kind),
+                "missing {kind:?}"
+            );
         }
         for fact in &result.facts {
             assert!(fact.range.end_byte <= source.len());
