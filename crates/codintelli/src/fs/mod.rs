@@ -13,11 +13,14 @@ use std::{
 };
 
 use cap_fs_ext::{
-    ambient_authority, DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt,
+    ambient_authority, DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt,
+    OpenOptionsSyncExt,
 };
 use cap_std::fs::{Dir, File, OpenOptions};
 
 use crate::WorkspaceDescriptor;
+
+const MAX_PATH_DEPTH: usize = 256;
 
 /// Read-only filesystem capability for one workspace root.
 pub struct WorkspaceFs {
@@ -65,6 +68,12 @@ impl WorkspaceFs {
     ) -> Result<Vec<u8>, WorkspaceFsError> {
         let relative_path = relative_path.as_ref();
         let components = normal_components(relative_path)?;
+        if components.len() > MAX_PATH_DEPTH {
+            return Err(WorkspaceFsError::PathTooDeep {
+                path: relative_path.to_path_buf(),
+                max_depth: MAX_PATH_DEPTH,
+            });
+        }
         if max_bytes == usize::MAX {
             return Err(WorkspaceFsError::InvalidLimit);
         }
@@ -93,6 +102,7 @@ impl WorkspaceFs {
         options
             .read(true)
             .follow(FollowSymlinks::No)
+            .maybe_dir(true)
             .nonblock(true);
 
         let file: File = parent
@@ -204,6 +214,15 @@ pub enum WorkspaceFsError {
         path: PathBuf,
         /// Maximum accepted size.
         max_bytes: usize,
+    },
+
+    /// The relative path exceeds the maximum component depth.
+    #[error("workspace path exceeds the {max_depth}-component limit: {path}")]
+    PathTooDeep {
+        /// Rejected path.
+        path: PathBuf,
+        /// Maximum accepted component count.
+        max_depth: usize,
     },
 
     /// The caller supplied an unrepresentable read limit.
