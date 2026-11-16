@@ -8,8 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    classification::LanguageId, syntax::valid_relative_path, ParseResult, RustModuleFact,
-    SourceRange, WorkspaceId,
+    classification::LanguageId, syntax::valid_relative_path, ParseResult, SourceRange, WorkspaceId,
 };
 
 /// State of a syntactic Rust module's file-path lookup.
@@ -188,7 +187,7 @@ fn module_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ParseStatus, SyntaxFact, SyntaxFactKind};
+    use crate::{ParseStatus, RustModuleFact, SyntaxFact, SyntaxFactKind};
 
     fn parsed_with_id(path: &str, modules: Vec<RustModuleFact>, workspace_id: WorkspaceId) -> ParseResult {
         ParseResult {
