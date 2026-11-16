@@ -12,7 +12,7 @@ use crate::{
     resolve_rust_module_candidates,
     rust_modules::{RustModuleResolutionError, RustModuleResolutionStatus},
     syntax::valid_relative_path,
-    ParseResult, SourceRange, WorkspaceId,
+    ParseResult, ParseStatus, SourceRange, WorkspaceId,
 };
 
 /// Resource limits for building a crate-root-anchored module graph.
@@ -103,6 +103,8 @@ pub struct RustModuleEdge {
 pub enum RustModuleGraphStatus {
     /// All reachable, unambiguous module declarations were visited.
     Complete,
+    /// Some parse results were recovered, limited, or failed.
+    Partial,
     /// A node or edge limit stopped graph construction.
     Limited,
 }
@@ -134,6 +136,9 @@ pub enum RustModuleGraphError {
     /// A crate root is not present in the source parse results.
     #[error("crate root has no parse result: {0}")]
     MissingCrateRoot(PathBuf),
+    /// A crate root is absent from the supplied workspace inventory.
+    #[error("crate root is absent from the workspace inventory: {0}")]
+    CrateRootNotInInventory(PathBuf),
     /// A crate root does not have Rust language facts.
     #[error("crate root is not a Rust source file: {0}")]
     NonRustCrateRoot(PathBuf),
@@ -190,6 +195,9 @@ pub fn build_rust_module_graph(
     roots.sort();
     roots.dedup();
     for root in &roots {
+        if !inventory_paths.contains(root) {
+            return Err(RustModuleGraphError::CrateRootNotInInventory(root.clone()));
+        }
         let result = by_path
             .get(root)
             .ok_or_else(|| RustModuleGraphError::MissingCrateRoot(root.clone()))?;
@@ -243,8 +251,12 @@ pub fn build_rust_module_graph(
                 continue;
             }
             let Some(parsed) = by_path.get(&source_path) else {
+                graph.status = RustModuleGraphStatus::Partial;
                 continue;
             };
+            if parsed.status != ParseStatus::Complete && graph.status == RustModuleGraphStatus::Complete {
+                graph.status = RustModuleGraphStatus::Partial;
+            }
 
             for fact in &parsed.modules {
                 if !valid_module_segment(&fact.name)
@@ -324,7 +336,9 @@ pub fn build_rust_module_graph(
                 let mut unique_target = None;
                 if candidate.status == RustModuleResolutionStatus::UniqueCandidate {
                     if let Some(target) = candidate.existing_candidates.first() {
-                        if by_path.get(target).is_some_and(|parsed| parsed.language == LanguageId::Rust) {
+                        if by_path.get(target).is_some_and(|parsed| {
+                            parsed.language == LanguageId::Rust && parsed.status != ParseStatus::Failed
+                        }) {
                             if child_path.len() > limits.max_depth {
                                 edge_status = RustModuleEdgeStatus::DepthLimit;
                             } else {
@@ -505,6 +519,7 @@ mod tests {
             RustModuleGraphLimits { max_nodes: 1, max_edges: 10, max_depth: 10 },
         ).expect("limited graph");
         assert_eq!(graph.status, RustModuleGraphStatus::Limited);
-        assert!(graph.edges.is_empty());
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.edges.len(), 1);
     }
 }
