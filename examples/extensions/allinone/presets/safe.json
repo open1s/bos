@@ -1,9 +1,0 @@
-{
-  "name": "All-in-One Safe",
-  "description": "A read-only preset contributed by the all-in-one demo",
-  "level": 1,
-  "permission": "read_only",
-  "plugins": [
-    "files"
-  ]
-}

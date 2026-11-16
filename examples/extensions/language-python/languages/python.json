@@ -1,6 +1,0 @@
-{
-  "name": "Python",
-  "extensions": ["py"],
-  "tool": "diagnose",
-  "syntax": "python"
-}

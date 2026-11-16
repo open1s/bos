@@ -1,7 +1,0 @@
-{
-  "description": "Describe this extension: identity, runtime, configuration, environment, recording window and the tools it contributes.",
-  "input_schema": {
-    "type": "object",
-    "properties": {}
-  }
-}

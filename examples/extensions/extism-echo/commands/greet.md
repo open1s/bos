@@ -1,1 +1,0 @@
-Say hello to {{input.name}} with the Extism command.

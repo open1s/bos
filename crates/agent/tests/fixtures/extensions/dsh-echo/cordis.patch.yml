@@ -1,4 +1,0 @@
-- insert:
-    - id: dsh-echo
-      name: '@local/dsh-echo'
-      config: {}

@@ -1,8 +1,0 @@
-{
-  "description": "Build a GitHub issue search URL",
-  "input_schema": {
-    "type": "object",
-    "properties": {"query": {"type": "string"}},
-    "required": ["query"]
-  }
-}

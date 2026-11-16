@@ -1,6 +1,0 @@
-{
-  "name": "Hook Demo Language",
-  "extensions": ["hookdemo"],
-  "tool": "hook-log",
-  "syntax": "rust"
-}

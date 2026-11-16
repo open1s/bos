@@ -1,7 +1,0 @@
-{
-  "description": "Return the configuration the host passed in the initialize handshake, plus the environment variables the runtime forwards.",
-  "input_schema": {
-    "type": "object",
-    "properties": {}
-  }
-}

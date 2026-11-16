@@ -1,5 +1,0 @@
-{
-  "name": "Hook Demo GitHub",
-  "kind": "github",
-  "action": "hook-log"
-}

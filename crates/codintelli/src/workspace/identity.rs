@@ -133,6 +133,47 @@ impl WorkspaceDescriptor {
         &self.canonical_root
     }
 
+    /// Re-resolve the root and reject a missing or redirected directory.
+    ///
+    /// This detects a root whose path now resolves elsewhere, such as a path
+    /// replaced by a symlink. It does not detect replacement by a different
+    /// directory at the exact same canonical path. Filesystem object identity
+    /// and race-resistant access belong to the later confinement layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns WorkspaceError::Canonicalize if the root is unavailable,
+    /// or WorkspaceError::RootChanged if it resolves to a different path.
+    pub fn verify_root(&self) -> Result<(), WorkspaceError> {
+        let current = fs::canonicalize(&self.canonical_root).map_err(|source| {
+            WorkspaceError::Canonicalize {
+                path: self.canonical_root.clone(),
+                source,
+            }
+        })?;
+
+        if current != self.canonical_root {
+            return Err(WorkspaceError::RootChanged {
+                expected: self.canonical_root.clone(),
+                actual: current,
+            });
+        }
+
+        let metadata = fs::metadata(&current).map_err(|source| {
+            WorkspaceError::Canonicalize {
+                path: current.clone(),
+                source,
+            }
+        })?;
+
+        if !metadata.is_dir() {
+            return Err(WorkspaceError::NotDirectory { path: current });
+        }
+
+        Ok(())
+    }
+}
+
 /// In-memory registry that enforces a one-to-one mapping between workspace
 /// IDs and canonical roots within one Engine instance.
 ///
@@ -209,47 +250,6 @@ impl WorkspaceRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
-    }
-}
-
-    /// Re-resolve the root and reject a missing or redirected directory.
-    ///
-    /// This detects a root whose path now resolves elsewhere, such as a path
-    /// replaced by a symlink. It does not detect replacement by a different
-    /// directory at the exact same canonical path. Filesystem object identity
-    /// and race-resistant access belong to the later confinement layer.
-    ///
-    /// # Errors
-    ///
-    /// Returns WorkspaceError::Canonicalize if the root is unavailable,
-    /// or WorkspaceError::RootChanged if it resolves to a different path.
-    pub fn verify_root(&self) -> Result<(), WorkspaceError> {
-        let current = fs::canonicalize(&self.canonical_root).map_err(|source| {
-            WorkspaceError::Canonicalize {
-                path: self.canonical_root.clone(),
-                source,
-            }
-        })?;
-
-        if current != self.canonical_root {
-            return Err(WorkspaceError::RootChanged {
-                expected: self.canonical_root.clone(),
-                actual: current,
-            });
-        }
-
-        let metadata = fs::metadata(&current).map_err(|source| {
-            WorkspaceError::Canonicalize {
-                path: current.clone(),
-                source,
-            }
-        })?;
-
-        if !metadata.is_dir() {
-            return Err(WorkspaceError::NotDirectory { path: current });
-        }
-
-        Ok(())
     }
 }
 
