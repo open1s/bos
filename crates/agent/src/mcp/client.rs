@@ -199,7 +199,7 @@ impl McpClient {
             .call(
                 "initialize",
                 Some(serde_json::json!({
-                    "protocolVersion": "2025-03-26",
+                    "protocolVersion": super::protocol::PROTOCOL_VERSION,
                     // Advertise only what this client implements. Roots and
                     // sampling were declared but never answered, so a server
                     // that used them waited forever for a reply.
@@ -560,14 +560,25 @@ impl McpClient {
                                     .get("method")
                                     .and_then(serde_json::Value::as_str)
                                     .unwrap_or("");
-                                let reply = serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": request_id.clone(),
-                                    "error": {
-                                        "code": -32601,
-                                        "message": format!("Method not found: {method}")
-                                    }
-                                });
+                                let reply = if method == "ping" {
+                                    // `ping` is the one request either peer
+                                    // may send; it must be answered, not
+                                    // refused.
+                                    serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": request_id.clone(),
+                                        "result": {}
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": request_id.clone(),
+                                        "error": {
+                                            "code": -32601,
+                                            "message": format!("Method not found: {method}")
+                                        }
+                                    })
+                                };
                                 transport.send(&serde_json::to_vec(&reply)?).await?;
                             }
                         }
@@ -682,8 +693,7 @@ def read():
     return json.loads(line)
 
 def write(value):
-    sys.stdout.write(json.dumps(value) + "
-")
+    sys.stdout.write(json.dumps(value) + "\n")
     sys.stdout.flush()
 
 request = read()
@@ -693,6 +703,10 @@ write({"jsonrpc": "2.0", "id": 99, "method": "roots/list"})
 answer = read()
 assert answer.get("id") == 99, answer
 assert answer.get("error", {}).get("code") == -32601, answer
+write({"jsonrpc": "2.0", "id": 100, "method": "ping"})
+answer = read()
+assert answer.get("id") == 100, answer
+assert answer.get("result") == {}, answer
 write({"jsonrpc": "2.0", "id": request["id"],
        "result": {"protocolVersion": "2025-03-26", "capabilities": {},
                   "serverInfo": {"name": "probe", "version": "1"}}})

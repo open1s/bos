@@ -65,6 +65,9 @@ pub struct JsonRpcError {
     pub data: Option<serde_json::Value>,
 }
 
+/// The MCP protocol revision this client speaks.
+pub const PROTOCOL_VERSION: &str = "2025-03-26";
+
 /// Capabilities advertised by an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCapabilities {

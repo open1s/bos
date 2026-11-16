@@ -71,7 +71,9 @@ fn post_json(
     let mut request = agent
         .post(base_url)
         .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream");
+        .header("Accept", "application/json, text/event-stream")
+        // Required on HTTP requests by the MCP transport specification.
+        .header("MCP-Protocol-Version", super::protocol::PROTOCOL_VERSION);
     if let Some(sid) = session_id {
         request = request.header("Mcp-Session-Id", sid);
     }
@@ -401,14 +403,45 @@ mod tests {
         assert_eq!(response.body, "{\"ok\":true}");
     }
 
+    /// The MCP transport specification requires the protocol version on HTTP
+    /// requests, alongside the dual accept type.
+    #[test]
+    fn the_protocol_version_header_is_sent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 4096];
+            let read = std::io::Read::read(&mut stream, &mut buffer).expect("read");
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .expect("write");
+            request
+        });
+        let url = format!("http://{address}/mcp");
+        post_json(&url, None, b"{}".to_vec(), None).expect("request");
+        let request = handle.join().expect("server thread").to_ascii_lowercase();
+        assert!(
+            request.contains("mcp-protocol-version: 2025-03-26"),
+            "{request}"
+        );
+        assert!(
+            request.contains("accept: application/json, text/event-stream"),
+            "{request}"
+        );
+    }
+
     #[test]
     fn the_sse_body_is_parsed_as_one_message() {
-        let transport = HttpTransport::new("http://127.0.0.1:1/mcp");
-        let body = "event: message\ndata: {\"a\":1}\n\n";
+        let body = "event: message\ndata: {\"id\":1,\"result\":{\"a\":1}}\n\n";
+        let id = serde_json::json!(1);
         assert_eq!(
-            transport.parse_sse_response(body).expect("data block"),
-            "{\"a\":1}"
+            response_from_events(body, Some(&id)).expect("data block"),
+            "{\"id\":1,\"result\":{\"a\":1}}"
         );
-        assert!(transport.parse_sse_response("event: ping\n").is_err());
+        assert!(response_from_events("event: ping\n", Some(&id)).is_err());
     }
 }
