@@ -1,58 +1,52 @@
-# codintelli Knowledge Graph Architecture
+# codintelli Code Intelligence Architecture
 
 Status: Proposed  
 Scope: Independent Rust code-intelligence engine in `crates/codintelli`  
-Reference: Graphify-Labs/graphify (architecture and product concepts only; no implementation copied)
+Reference: Graphify-Labs/graphify (one optional reference; not a requirements baseline)
 
 ## 1. Purpose
 
-Turn a workspace into a deterministic, explainable, incrementally maintainable code knowledge graph.
+Build an independent, resource-bounded code intelligence engine that turns a workspace into useful, verifiable context for tools and AI agents.
 
-The graph is a first-class representation of a codebase, not a vector index and not a collection of LLM-generated summaries. It should let callers answer:
+The primary product is not a graph. It is a set of composable capabilities that help answer practical codebase questions:
 
-- What symbols are defined in this workspace, and where?
-- Which modules import, call, implement, extend, or reference a symbol?
-- What is the dependency/call path between two symbols?
-- What may be affected by a proposed change?
-- Which facts came directly from source syntax, and which were resolved or inferred?
+- Find relevant files, symbols, declarations, and references.
+- Understand source structure and relationships when a language provider can establish them.
+- Retrieve bounded, source-grounded context for a task.
+- Explain where a result came from and how certain the relationship is.
+- Identify likely change impact when enough dependency information exists.
+- Update only the affected parts of an index as files change.
 
-The engine remains independent of BSH, Ferris, GPUI, MCP, and any particular agent runtime. Those systems may consume the engine through a future adapter.
+The engine may use several complementary representations: file inventory, text/search indexes, symbol tables, syntax facts, dependency records, and graph-shaped relationship views. No single representation is mandatory for every language or query.
+
+The engine remains independent of BSH, Ferris, GPUI, MCP, and any particular agent runtime. Those systems may consume it through a future adapter.
 
 ## 2. Design principles
 
-1. **Deterministic first.** Source-code structure is extracted locally from parsers. The same source snapshot and engine/parser versions should produce the same structural graph.
-2. **Evidence on every fact.** Nodes and edges retain source provenance. A consumer must be able to navigate from a graph fact back to the source range that supports it.
-3. **Extracted is not inferred.** Syntax directly present in source is distinct from cross-file resolution or heuristic inference. Never silently promote an unresolved guess to a fact.
-4. **Incremental by source unit.** A changed file is re-extracted and its outgoing evidence replaced atomically. A failed extraction must preserve the last known-good records for that file.
-5. **Partial is explicit.** A scan or graph build that hit a budget, cancellation, parser failure, or I/O error must not be reported as complete.
-6. **Bounded and non-executing.** Indexing never runs project code, build scripts, tests, package-manager hooks, or compiler plugins. All filesystem reads pass through `WorkspaceFs` and shared scan budgets.
-7. **Portable identity.** Persisted IDs and paths are workspace-relative. Never persist machine-specific absolute paths.
-8. **Storage is replaceable.** Extraction, graph semantics, persistence, and query APIs must not be coupled to one database or serialization format.
+1. **Use-case driven.** Add an index or representation only when it improves a defined code-intelligence query or workflow.
+2. **Layered fidelity.** Start with safe file discovery and text retrieval; add language-aware structure and resolution progressively. Unsupported languages must still have useful baseline behavior.
+3. **Evidence first.** Every structural result should be traceable to a workspace-relative source location. Do not present a heuristic as a parser-established fact.
+4. **Incremental by source unit.** Recompute only affected records where practical. A failed update must not destroy the last known-good index.
+5. **Partial is explicit.** Budget exhaustion, cancellation, unsupported syntax, parser errors, and I/O failures must be observable. Partial results must never be labeled complete.
+6. **Bounded and non-executing.** Indexing never runs project code, build scripts, tests, package-manager hooks, or compiler plugins.
+7. **Portable identity.** Persisted paths are workspace-relative. Machine-specific absolute paths are not part of index identity.
+8. **Replaceable internals.** Extraction, retrieval, relationship analysis, persistence, and host integration have explicit seams.
+9. **No premature infrastructure.** Do not require a graph database, vector database, LLM, language server, or external service for the core MVP.
 
-## 3. Reference analysis: what to adopt from Graphify
+## 3. Reference use: Graphify
 
-Graphify demonstrates a useful pipeline:
+Graphify is useful as a reference for selected ideas, especially AST-grounded extraction, traceable relationships, incremental processing, and explainable graph queries. It is not the target architecture and does not define the codintelli feature set.
 
-`detect → extract → build → analyze → report/export`
+We should evaluate each idea against codintelli's own goals:
 
-It also demonstrates several valuable product-level ideas:
+- Adopt a concept only when it solves a concrete code-context problem.
+- Prefer Rust-native, typed contracts and existing BOS workspace conventions.
+- Keep source extraction independent from relationship presentation.
+- Keep graph traversal as one possible query strategy, not the universal storage model.
+- Do not require Python, NetworkX, Agent Skills, report generation, clustering, visualization, or an LLM.
+- Do not copy Graphify's command structure, data schema, or dependency choices without independent evaluation.
 
-- AST-based structural extraction can be deterministic and local.
-- A graph supports explain, neighborhood, and path queries without requiring embeddings.
-- Explicit `EXTRACTED` versus `INFERRED` edge provenance makes graph claims auditable.
-- A persisted schema version is necessary for compatibility checks.
-- Per-file extraction and caching are the basis for incremental refresh.
-
-codintelli should adopt these concepts, but not Graphify's implementation choices as requirements. In particular:
-
-- Keep the core in Rust; do not port its Python module structure literally.
-- Use typed Rust data contracts rather than loosely structured dictionaries.
-- Keep parsers behind a language-provider seam; do not make a large fixed grammar set a prerequisite for the engine.
-- Do not require an LLM for source-code extraction. Optional semantic enrichment for documentation can be a later provider.
-- Do not make NetworkX, HTML visualization, MCP serving, clustering, or a vector database part of the core.
-- Treat external tools and language servers as optional providers/adapters, never as mandatory runtime dependencies.
-
-Reference repository: https://github.com/Graphify-Labs/graphify
+Reference: https://github.com/Graphify-Labs/graphify
 
 ## 4. Layered architecture
 
@@ -152,9 +146,9 @@ Resolution is a separate stage over extracted facts and workspace metadata. It m
 
 Resolution output must retain its own provenance and diagnostics. Ambiguous candidates remain ambiguous; they are not collapsed to an arbitrary target.
 
-### 4.6 Graph assembly and query
+### 4.6 Relationship analysis and query
 
-Graph assembly is a deterministic transformation from typed facts to a graph snapshot. It must not perform parsing or filesystem access.
+Relationship analysis is a deterministic transformation over extracted facts. A graph-shaped view may be built when it helps a query, but the underlying index must not require all records to be represented as graph nodes and edges. This stage must not perform parsing or filesystem access.
 
 Initial query operations:
 
@@ -168,13 +162,13 @@ Initial query operations:
 
 Query results should return evidence references and completeness/coverage metadata, not only labels and IDs.
 
-## 5. Graph data model
+## 5. Structural facts and optional graph view
 
-The exact Rust types will be introduced in a later implementation change. This section defines the semantic contract.
+The exact Rust types will be introduced in a later implementation change. The following is a candidate contract for structural facts and an optional graph projection, not a mandate to model every indexed item as a graph entity.
 
 ### 5.1 Node
 
-A node represents a source-backed entity or an explicitly modeled workspace artifact.
+In the optional graph projection, a node represents a source-backed entity or an explicitly modeled workspace artifact.
 
 Required semantic fields:
 
@@ -190,7 +184,7 @@ A node ID must not contain an absolute filesystem path. The initial stable-ID re
 
 ### 5.2 Edge
 
-An edge represents a directed relationship between two nodes.
+In the optional graph projection, an edge represents a directed relationship between two nodes.
 
 Initial relation vocabulary:
 
@@ -258,7 +252,7 @@ Graph-level status must include:
 
 ## 7. Persistence strategy
 
-Do not select a database prematurely.
+Do not select a database prematurely, and do not assume the graph projection is the primary persisted format.
 
 First define a storage-neutral graph snapshot and per-file extraction records. Then benchmark:
 
@@ -311,18 +305,19 @@ The exact sync/async boundary is intentionally not frozen here. The core indexin
 | CI-03 | Confined filesystem and shared budgets | No-follow access; bounded enumeration; cross-platform tests |
 | CI-04 | Recursive scanner | Global entry/depth/time/byte budgets; deterministic file inventory; explicit partial status |
 | CI-05 | Ignore rules and file classification | Configurable exclusions; deterministic classification |
-| CI-06 | Typed graph schema and validation | Versioned node/edge/evidence contracts; validation tests |
+| CI-06 | Typed source facts and relationship contracts | Versioned declarations/references/evidence; optional graph projection; validation tests |
 | CI-07 | Parser/provider seam + Rust provider | Deterministic source facts with source evidence |
 | CI-08 | Symbol/import resolution | Resolved edges with ambiguity preserved |
 | CI-09 | Incremental graph store | Atomic per-file replacement; last-known-good preservation |
-| CI-10 | Query API | Search, explain, neighbors, path, references, impact |
+| CI-10 | Query API | File/symbol search, source retrieval, explain, references, optional neighbors/path/impact |
 | CI-11 | Optional export and host adapter | Versioned exports; integration remains outside engine |
 
-Each stage should be independently reviewable and normally fit within a small PR. Do not implement graph persistence, semantic LLM extraction, clustering, or visualization before the graph schema and evidence contracts are stable.
+Each stage should be independently reviewable and normally fit within a small PR. Do not implement graph persistence, semantic LLM extraction, clustering, or visualization before concrete query requirements justify them. Stabilize source-fact and evidence contracts first.
 
 ## 11. Open decisions
 
-1. Tree-sitter grammar distribution: statically linked per-language crates versus feature-gated provider crates.
+1. Which code-context queries should be optimized first, and which indexes are justified by them?
+2. Tree-sitter grammar distribution: statically linked per-language crates versus feature-gated provider crates.
 2. Stable node ID canonicalization for overloaded functions and anonymous declarations.
 3. Whether graph snapshots use a directed multigraph internally or normalized node/edge tables.
 4. Which embedded persistence backend best meets write amplification, incremental replacement, and cross-platform requirements.
