@@ -1993,6 +1993,11 @@ dependencies = [
 [[package]]
 name = "codintelli"
 version = "4.1.12"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
+]
 
 [[package]]
 name = "config"
