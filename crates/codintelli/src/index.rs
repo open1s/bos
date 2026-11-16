@@ -53,6 +53,19 @@ pub struct SourceIndexDiagnostic {
     pub kind: SourceIndexDiagnosticKind,
 }
 
+/// Overall source-index coverage state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceIndexStatus {
+    /// Every supported source file was parsed without recovery.
+    Complete,
+    /// Some source files were unsupported, failed, or required parser recovery.
+    Partial,
+    /// The shared budget cancelled the operation.
+    Cancelled,
+    /// The workspace inventory itself failed.
+    Failed,
+}
+
 /// Per-file processing result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceFileResult {
@@ -69,6 +82,8 @@ pub struct SourceFileResult {
 /// Result of one inventory and source parsing pass.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceIndexReport {
+    /// Overall source-index coverage state.
+    pub status: SourceIndexStatus,
     /// Original inventory report, including completeness and diagnostics.
     pub scan: WorkspaceScanReport,
     /// Per-source-file results, ordered by workspace-relative path.
@@ -79,6 +94,8 @@ pub struct SourceIndexReport {
     pub parsed_files: u64,
     /// Source files without a matching provider.
     pub unsupported_files: u64,
+    /// Files parsed with error recovery.
+    pub recovered_files: u64,
     /// Files that failed during source loading or parsing.
     pub failed_files: u64,
 }
@@ -107,6 +124,7 @@ pub fn index_workspace(
     let mut diagnostics = Vec::new();
     let mut parsed_files = 0u64;
     let mut unsupported_files = 0u64;
+    let mut recovered_files = 0u64;
     let mut failed_files = 0u64;
 
     for entry in scan.entries.iter().filter(|entry| entry.kind == WorkspaceEntryKind::File) {
@@ -170,24 +188,6 @@ pub fn index_workspace(
             continue;
         };
 
-        if let Err(error) = budget.reserve_file_bytes(size_bytes) {
-            diagnostics.push(SourceIndexDiagnostic {
-                path: entry.relative_path.clone(),
-                kind: SourceIndexDiagnosticKind::Budget(error),
-            });
-            failed_files = failed_files.saturating_add(1);
-            files.push(SourceFileResult {
-                path: entry.relative_path.clone(),
-                language: Some(language),
-                status: SourceFileStatus::Failed,
-                parse: None,
-            });
-            if matches!(error, ScanBudgetError::Cancelled | ScanBudgetError::DeadlineExceeded) {
-                break;
-            }
-            continue;
-        }
-
         let max_bytes = match usize::try_from(size_bytes) {
             Ok(value) => value,
             Err(_) => {
@@ -205,6 +205,24 @@ pub fn index_workspace(
                 continue;
             }
         };
+
+        if let Err(error) = budget.reserve_file_bytes(size_bytes) {
+            diagnostics.push(SourceIndexDiagnostic {
+                path: entry.relative_path.clone(),
+                kind: SourceIndexDiagnosticKind::Budget(error),
+            });
+            failed_files = failed_files.saturating_add(1);
+            files.push(SourceFileResult {
+                path: entry.relative_path.clone(),
+                language: Some(language),
+                status: SourceFileStatus::Failed,
+                parse: None,
+            });
+            if matches!(error, ScanBudgetError::Cancelled | ScanBudgetError::DeadlineExceeded) {
+                break;
+            }
+            continue;
+        }
 
         let source = match workspace.read_file(&entry.relative_path, max_bytes) {
             Ok(source) => source,
@@ -239,6 +257,9 @@ pub fn index_workspace(
                     failed_files = failed_files.saturating_add(1);
                 } else {
                     parsed_files = parsed_files.saturating_add(1);
+                    if status == SourceFileStatus::Recovered {
+                        recovered_files = recovered_files.saturating_add(1);
+                    }
                 }
                 files.push(SourceFileResult {
                     path: entry.relative_path.clone(),
@@ -266,12 +287,26 @@ pub fn index_workspace(
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     diagnostics.sort_unstable_by(|left, right| left.path.cmp(&right.path));
 
+    let status = match scan.status {
+        ScanStatus::Cancelled => SourceIndexStatus::Cancelled,
+        ScanStatus::Failed => SourceIndexStatus::Failed,
+        ScanStatus::Partial => SourceIndexStatus::Partial,
+        ScanStatus::Complete
+            if failed_files > 0 || unsupported_files > 0 || recovered_files > 0 =>
+        {
+            SourceIndexStatus::Partial
+        }
+        ScanStatus::Complete => SourceIndexStatus::Complete,
+    };
+
     SourceIndexReport {
+        status,
         scan,
         files,
         diagnostics,
         parsed_files,
         unsupported_files,
+        recovered_files,
         failed_files,
     }
 }
@@ -325,6 +360,7 @@ mod tests {
         );
 
         assert_eq!(report.scan.status, ScanStatus::Complete);
+        assert_eq!(report.status, SourceIndexStatus::Complete);
         assert_eq!(report.parsed_files, 1);
         assert_eq!(report.unsupported_files, 0);
         assert_eq!(report.failed_files, 0);
@@ -358,6 +394,7 @@ mod tests {
 
         assert_eq!(report.scan.entries.len(), 1);
         assert_eq!(report.unsupported_files, 1);
+        assert_eq!(report.status, SourceIndexStatus::Partial);
         assert_eq!(report.files[0].status, SourceFileStatus::Unsupported);
         assert_eq!(budget.usage().total_bytes, 0);
     }
@@ -408,6 +445,8 @@ mod tests {
         );
 
         assert_eq!(report.parsed_files, 1);
+        assert_eq!(report.recovered_files, 1);
+        assert_eq!(report.status, SourceIndexStatus::Partial);
         assert_eq!(report.files[0].status, SourceFileStatus::Recovered);
         assert!(report.files[0]
             .parse
