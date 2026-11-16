@@ -219,8 +219,10 @@ continues to report source-backed candidates, not valid or compiler-resolved
 imports. Visibility-aware accessibility is a separate stage and must account
 for every ancestor module and the complete path from the crate root.
 
-The first visibility slice does not yet model field visibility, enum-variant
-visibility, macro visibility, or effective privacy across re-export chains.
+Trait members have no independent visibility modifier; their visibility fact
+remains absent rather than being mislabeled as private. The first visibility
+slice does not yet model field visibility, enum-variant visibility, macro
+visibility, or effective privacy across re-export chains.
 Those require explicit namespace and containment facts rather than inference
 from declaration names alone.
 
