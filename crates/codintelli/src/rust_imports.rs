@@ -61,6 +61,8 @@ pub struct RustImportResolution {
     pub target_module_path: Option<Vec<String>>,
     /// Source file for the target module, when uniquely identified.
     pub target_source_path: Option<PathBuf>,
+    /// Source-file candidates retained for ambiguous or incomplete outcomes.
+    pub candidate_source_paths: Vec<PathBuf>,
     /// Remaining path segments after the module prefix.
     pub member_path: Vec<String>,
     /// Source evidence for the import declaration.
@@ -294,7 +296,14 @@ fn resolve_one_import(
                 _ => RustImportResolutionStatus::NoModuleCandidate,
             }
         };
-        return make_unresolved(Some(crate_root), source, fact, status);
+        let mut unresolved = make_unresolved(Some(crate_root), source, fact, status);
+        unresolved.candidate_source_paths = unresolved_edges
+            .iter()
+            .flat_map(|edge| edge.candidate_paths.iter().cloned())
+            .collect();
+        unresolved.candidate_source_paths.sort();
+        unresolved.candidate_source_paths.dedup();
+        return unresolved;
     }
 
     if matches.is_empty() {
@@ -306,12 +315,19 @@ fn resolve_one_import(
         );
     }
     if matches.len() != 1 {
-        return make_unresolved(
+        let mut unresolved = make_unresolved(
             Some(crate_root),
             source,
             fact,
             RustImportResolutionStatus::AmbiguousModuleTarget,
         );
+        unresolved.candidate_source_paths = matches
+            .iter()
+            .map(|node| node.source_path.clone())
+            .collect();
+        unresolved.candidate_source_paths.sort();
+        unresolved.candidate_source_paths.dedup();
+        return unresolved;
     }
 
     let target = matches[0];
@@ -331,6 +347,7 @@ fn resolve_one_import(
         is_glob: fact.is_glob,
         target_module_path: Some(target.module_path.clone()),
         target_source_path: Some(target.source_path.clone()),
+        candidate_source_paths: Vec::new(),
         member_path,
         range: fact.range,
         status,
@@ -356,6 +373,7 @@ fn make_unresolved(
         is_glob: fact.is_glob,
         target_module_path: None,
         target_source_path: None,
+        candidate_source_paths: Vec::new(),
         member_path: Vec::new(),
         range: fact.range,
         status,
