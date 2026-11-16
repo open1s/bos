@@ -87,6 +87,8 @@ pub enum RustSymbolImportResolutionError {
     WorkspaceMismatch,
     #[error("module import report and symbol catalog have different graph completeness states")]
     GraphStatusMismatch,
+    #[error("symbol catalog contains a symbol from another workspace")]
+    SymbolWorkspaceMismatch,
 }
 
 /// Join module-prefix results with crate-root-aware source symbol candidates.
@@ -103,6 +105,13 @@ pub fn resolve_rust_import_symbols(
     }
     if module_report.graph_status != symbol_report.graph_status {
         return Err(RustSymbolImportResolutionError::GraphStatusMismatch);
+    }
+    if symbol_report
+        .symbols
+        .iter()
+        .any(|symbol| symbol.id.workspace_id != module_report.workspace_id)
+    {
+        return Err(RustSymbolImportResolutionError::SymbolWorkspaceMismatch);
     }
 
     let mut imports = Vec::with_capacity(module_report.imports.len());
@@ -169,6 +178,7 @@ fn resolve_one_import(
     let direct_symbols = symbols.iter().filter(|symbol| {
         symbol.id.crate_root == *crate_root
             && symbol.id.module_path == *module_path
+            && import.target_source_path.as_ref() == Some(&symbol.id.source_path)
             // Methods live in impl/type namespaces, which this first catalog
             // does not model. Do not expose them as module-level import targets.
             && symbol.id.kind != RustScopedSymbolKind::Method
@@ -374,6 +384,23 @@ mod tests {
             RustSymbolImportStatus::GlobCandidateSet
         );
         assert_eq!(report.imports[0].candidates.len(), 1);
+    }
+
+    #[test]
+    fn does_not_match_symbols_from_another_crate_root_or_source_file() {
+        let id = WorkspaceId::new();
+        let other_root = symbol(id, "src/main.rs", &["model"], "src/model.rs", "Widget", 10);
+        let wrong_file = symbol(id, "src/lib.rs", &["model"], "src/other.rs", "Widget", 40);
+        let report = resolve(
+            vec![module_import(&["Widget"], false, None)],
+            vec![other_root, wrong_file],
+            RustModuleGraphStatus::Complete,
+            Vec::new(),
+        );
+        assert_eq!(
+            report.imports[0].status,
+            RustSymbolImportStatus::NoSymbolCandidate
+        );
     }
 
     #[test]
