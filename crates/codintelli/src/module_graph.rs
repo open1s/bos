@@ -474,7 +474,7 @@ mod tests {
             scope_path: scope.iter().map(|part| (*part).to_owned()).collect(),
             name: name.to_owned(),
             is_inline: inline,
-            has_attributes: false,
+            has_resolution_attributes: false,
             range: SourceRange { start_byte: 10, end_byte: 20 },
         }
     }
