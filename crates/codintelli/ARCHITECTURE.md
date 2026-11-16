@@ -139,7 +139,13 @@ The first extraction tier is syntax-grounded and local:
 
 Extraction must not require package resolution, compiler execution, or build-script execution. When syntax does not identify a target unambiguously, preserve an unresolved reference fact rather than inventing a target node.
 
-### 4.5 Cross-file resolution
+### 4.5 Symbol candidate indexing (initial CI-09B slice)
+
+The initial resolver builds a deterministic declaration catalog from source-backed syntax facts and associates function calls, method calls, and a narrow subset of simple Rust imports with same-name declaration candidates. Candidate outcomes are explicit: no candidates, one candidate, multiple candidates, or unsupported import syntax. A single candidate is not labeled a resolved edge.
+
+This is intentionally conservative. The current Rust facts do not yet carry full lexical scope, module path, visibility, receiver type, trait-in-scope, or macro-expansion information. Consequently, same-name matching is useful for navigation and retrieval but is not semantic Rust name resolution. Grouped, glob, and aliased imports remain unsupported until the Tree-sitter provider emits structured import-path facts. Mixed workspace identities are rejected.
+
+### 4.6 Cross-file resolution
 
 Resolution is a separate stage over extracted facts and workspace metadata. It may resolve:
 
@@ -150,7 +156,7 @@ Resolution is a separate stage over extracted facts and workspace metadata. It m
 
 Resolution output must retain its own provenance and diagnostics. Ambiguous candidates remain ambiguous; they are not collapsed to an arbitrary target.
 
-### 4.6 Relationship analysis and query
+### 4.7 Relationship analysis and query
 
 Relationship analysis is a deterministic transformation over extracted facts. A graph-shaped view may be built when it helps a query, but the underlying index must not require all records to be represented as graph nodes and edges. This stage must not perform parsing or filesystem access.
 
@@ -342,7 +348,7 @@ The source pipeline is synchronous and sequential today. Hosts must run it on bo
 | CI-07 | Parser/provider seam + Rust provider | Deterministic source facts with source evidence |
 | CI-08 | Bounded source-to-facts pipeline | Inventory, classification, reserved reads, provider dispatch, explicit coverage |
 | CI-09A | Cooperative parser cancellation and output budgets | Tree-sitter progress cancellation; bounded nodes/facts/diagnostics; explicit limit reasons |
-| CI-09B | Symbol/import resolution | Resolved edges with ambiguity preserved |
+| CI-09B | Symbol candidate catalog and conservative references | Deterministic declaration IDs; unique/ambiguous/unresolved candidates; no false resolved edges |
 | CI-10 | Incremental extraction store | Atomic per-file replacement; last-known-good preservation |
 | CI-11 | Query API | File/symbol search, source retrieval, explain, references, optional neighbors/path/impact |
 | CI-12 | Optional export and host adapter | Versioned exports; integration remains outside engine |
