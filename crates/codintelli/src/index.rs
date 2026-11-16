@@ -112,10 +112,13 @@ pub struct SourceIndexReport {
 /// reading is rejected rather than silently exceeding the reservation.
 ///
 /// This operation is synchronous and sequential. Hosts should run it on a
-/// bounded background worker. Cancellation and deadlines are checked between
-/// files; a provider parsing one bounded file is not preempted by this
-/// function. No project commands, build scripts, compilers, or package
-/// managers are executed.
+/// bounded background worker. The Rust provider checks cancellation and the
+/// shared deadline through Tree-sitter's parse-progress callback and during
+/// syntax-tree projection. Providers that rely on the default trait method
+/// are only checked before and after their parse call. Per-file node, fact,
+/// and diagnostic output limits are enforced by providers that implement
+/// controlled parsing. No project commands, build scripts, compilers, or
+/// package managers are executed.
 pub fn index_workspace(
     workspace: &WorkspaceFs,
     budget: &ScanBudget,
@@ -515,10 +518,9 @@ mod tests {
         assert_eq!(report.status, SourceIndexStatus::Partial);
         assert_eq!(report.limited_files, 1);
         assert_eq!(report.files[0].status, SourceFileStatus::Limited);
-        assert_eq!(
-            report.files[0].parse.as_ref().expect("limited parse").facts.len(),
-            1
-        );
+        let parse = report.files[0].parse.as_ref().expect("limited parse");
+        assert_eq!(parse.facts.len(), 1);
+        assert_eq!(parse.limit_reason, Some(crate::ParseLimitKind::Facts));
     }
 
     #[test]
