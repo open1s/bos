@@ -301,7 +301,10 @@ fn enclosing_module_path(node: Node<'_>, source: &str) -> Vec<String> {
 fn is_module_scope(node: Node<'_>) -> bool {
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
-        if matches!(current.kind(), "function_item" | "function_signature_item" | "closure_expression" | "block") {
+        if matches!(
+            current.kind(),
+            "function_item" | "function_signature_item" | "closure_expression" | "block"
+        ) {
             return false;
         }
         ancestor = current.parent();
@@ -515,11 +518,19 @@ mod nested {
     }
 }
 "#);
-        let module_fn = result.facts.iter().find(|fact| fact.name.as_deref() == Some("visible_in_module")).expect("module function");
+        let module_fn = result
+            .facts
+            .iter()
+            .find(|fact| fact.name.as_deref() == Some("visible_in_module"))
+            .expect("module function");
         assert_eq!(module_fn.scope_path, vec!["nested".to_owned()]);
         assert!(module_fn.is_module_scope);
 
-        let local_fn = result.facts.iter().find(|fact| fact.name.as_deref() == Some("local_only")).expect("local function");
+        let local_fn = result
+            .facts
+            .iter()
+            .find(|fact| fact.name.as_deref() == Some("local_only"))
+            .expect("local function");
         assert_eq!(local_fn.scope_path, vec!["nested".to_owned()]);
         assert!(!local_fn.is_module_scope);
     }
