@@ -66,6 +66,11 @@ pub struct SyntaxFact {
     pub kind: SyntaxFactKind,
     /// Declared name or source spelling of a reference, when available.
     pub name: Option<String>,
+    /// Lexical inline-module scope, outermost first. This is source syntax context,
+    /// not a compiler-resolved crate/module identity.
+    pub scope_path: Vec<String>,
+    /// Whether this fact is in module scope rather than a function/block-local scope.
+    pub is_module_scope: bool,
     /// Exact source byte range.
     pub range: SourceRange,
 }
