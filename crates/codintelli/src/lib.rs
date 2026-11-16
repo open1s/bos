@@ -26,6 +26,7 @@ pub mod scanner;
 pub mod resolution;
 pub mod rust_modules;
 pub mod module_graph;
+pub mod rust_imports;
 pub mod syntax;
 pub mod workspace;
 
@@ -41,6 +42,10 @@ pub use module_graph::{
     build_rust_module_graph, RustModuleEdge, RustModuleEdgeStatus, RustModuleGraph,
     RustModuleGraphError, RustModuleGraphLimits, RustModuleGraphStatus, RustModuleNode,
     RustModuleNodeKind,
+};
+pub use rust_imports::{
+    resolve_rust_import_module_candidates, RustImportResolution, RustImportResolutionError,
+    RustImportResolutionReport, RustImportResolutionStatus,
 };
 pub use rust_modules::{
     resolve_rust_module_candidates, RustModuleResolution, RustModuleResolutionError,
