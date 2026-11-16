@@ -25,6 +25,22 @@ pub struct WorkspaceEntry {
     pub relative_path: PathBuf,
     /// Entry kind determined without following symbolic links.
     pub kind: WorkspaceEntryKind,
+    /// Size reported by no-follow metadata for regular files.
+    ///
+    /// This is a pre-read estimate. Callers must still enforce the byte limit
+    /// when opening and reading because the file may change after enumeration.
+    pub size_bytes: Option<u64>,
+}
+
+/// A bounded result from enumerating one directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryListing {
+    /// Eligible regular files and directories, sorted by workspace-relative path.
+    pub entries: Vec<WorkspaceEntry>,
+    /// Number of directory entries inspected, including symlinks and special files.
+    pub inspected_entries: usize,
+    /// Whether another entry existed after the inspection limit was reached.
+    pub truncated: bool,
 }
 
 impl WorkspaceFs {
@@ -45,6 +61,28 @@ impl WorkspaceFs {
         relative_path: impl AsRef<Path>,
         max_entries: usize,
     ) -> Result<Vec<WorkspaceEntry>, WorkspaceFsError> {
+        let relative_path = relative_path.as_ref();
+        let listing = self.read_dir_report(relative_path, max_entries)?;
+        if listing.truncated {
+            return Err(WorkspaceFsError::EntryLimitExceeded {
+                path: relative_path.to_path_buf(),
+                max_entries,
+            });
+        }
+        Ok(listing.entries)
+    }
+
+    /// Enumerate one directory and report bounded progress instead of failing
+    /// when more entries exist than the supplied limit.
+    ///
+    /// The returned inspection count includes symlinks and special files,
+    /// even though those entries are omitted from the returned entries. If
+    /// truncated is true, callers must treat the directory result as incomplete.
+    pub fn read_dir_report(
+        &self,
+        relative_path: impl AsRef<Path>,
+        max_entries: usize,
+    ) -> Result<DirectoryListing, WorkspaceFsError> {
         let relative_path = relative_path.as_ref();
         let components = directory_components(relative_path)?;
         if components.len() > super::MAX_PATH_DEPTH {
@@ -77,12 +115,11 @@ impl WorkspaceFs {
 
         let mut result = Vec::new();
         let mut inspected_entries = 0usize;
+        let mut truncated = false;
         for entry in entries {
             if inspected_entries == max_entries {
-                return Err(WorkspaceFsError::EntryLimitExceeded {
-                    path: relative_path.to_path_buf(),
-                    max_entries,
-                });
+                truncated = true;
+                break;
             }
             inspected_entries += 1;
 
@@ -101,10 +138,10 @@ impl WorkspaceFs {
                     source,
                 })?;
 
-            let kind = if metadata.is_file() {
-                WorkspaceEntryKind::File
+            let (kind, size_bytes) = if metadata.is_file() {
+                (WorkspaceEntryKind::File, Some(metadata.len()))
             } else if metadata.is_dir() {
-                WorkspaceEntryKind::Directory
+                (WorkspaceEntryKind::Directory, None)
             } else {
                 // Symlinks, sockets, pipes, devices, and other special entries
                 // are not eligible for indexing.
@@ -114,11 +151,16 @@ impl WorkspaceFs {
             result.push(WorkspaceEntry {
                 relative_path: relative_path.join(name),
                 kind,
+                size_bytes,
             });
         }
 
         result.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        Ok(result)
+        Ok(DirectoryListing {
+            entries: result,
+            inspected_entries,
+            truncated,
+        })
     }
 }
 
