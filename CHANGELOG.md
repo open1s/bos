@@ -1,5 +1,32 @@
 # Changelog
 
+## v4.1.11 (2026-11-16)
+
+- **A slow model is waited out, and the wait is a setting.** The vendor read
+  guard is an hour (was ten minutes) and the connect guard a minute, so a
+  reasoning model or a buffering gateway is no longer reported as
+  `Request timed out` while it is still working. One `llm_timeout_secs` now
+  bounds both the engine's per-call ceiling and the wire; the shipped 60s
+  framework default no longer cuts a turn.
+- **The retry budget is configurable.** `max_retries` is the engine's own
+  budget (counted after the first attempt, 0 disables retries) and reaches
+  Rust, the TOML surface, Python (`with_max_retries`) and JavaScript
+  (`maxRetries`); BSH configures no rate limiter, so the number the reader
+  picks is the number the loop obeys.
+- **The Agent loop is a first-class settings surface.** A rail cell carries
+  the request wait, sampling temperature and retry rows, the memory-capture
+  opt-in, the dispatch switch on the shared preference-row anatomy, and the
+  persona contract - which now names the document it edits and lives only
+  here, not in General as well.
+- **The complete-persona flag follows the persona's owner.** A preset that
+  ships a persona owns the flag even when the workspace flag says otherwise;
+  a blank preset persona is no persona, so it no longer blanks the workspace
+  prompt or steals the flag.
+- **Federation and the market.** The Federation pane's Work tab edits the
+  three remote-task caps (steps, tokens, deadline) with the same
+  refuse-not-clamp admission semantics as the file, and the extension
+  market's filter now sits above the list it narrows rather than at the top
+  of the pane.
 ## v4.1.10 (2026-11-15)
 
 - **Reliability kernel** (issues #347-#356): a transition is real only at the
