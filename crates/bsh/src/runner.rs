@@ -416,6 +416,35 @@ impl Runner {
                         agent::agent::context::estimate_tokens(&assembly.base_prompt)
                     ),
                 };
+                let system_prompt_version = match content_key.as_deref() {
+                    Some(key) => crate::context_assembly::keyed_digest(
+                        key,
+                        &format!(
+                            "{}\n{}",
+                            assembly.base_prompt,
+                            context.instructions.as_deref().unwrap_or("")
+                        ),
+                    ),
+                    None => format!(
+                        "prompt-chars:{}",
+                        assembly.base_prompt.chars().count()
+                            + context
+                                .instructions
+                                .as_deref()
+                                .map(str::chars)
+                                .map(Iterator::count)
+                                .unwrap_or(0)
+                    ),
+                };
+                let runtime_config = crate::context_assembly::digest_text(
+                    &serde_json::json!({
+                        "temperature": agent.config().temperature,
+                        "max_tokens": agent.config().max_tokens,
+                        "reasoning_effort": agent.config().reasoning_effort,
+                        "api_mode": agent.config().api_mode,
+                    })
+                    .to_string(),
+                );
                 // Identity inputs are derived from the actual advertised tools,
                 // adapter and memory revision, not hard-coded labels (#432).
                 let tool_schema_digest = crate::context_assembly::digest_text(
@@ -437,19 +466,29 @@ impl Runner {
                     tool_guidance: Some(format!("tools:{tool_schema_digest}")),
                     provider: Some(agent.config().model.clone()),
                     provider_adapter: Some(format!(
-                        "{}:{}",
+                        "{}:{}:react-{}",
                         agent
                             .config()
                             .model
                             .split_once('/')
                             .map(|(vendor, _)| vendor)
                             .unwrap_or("openai"),
-                        agent.config().api_mode
+                        agent.config().api_mode,
+                        react::llm::ADAPTER_VERSION
+                    )),
+                    provider_endpoint: Some(format!(
+                        "endpoint:{}",
+                        crate::context_assembly::digest_text(&agent.config().base_url)
                     )),
                     api_mode: Some(agent.config().api_mode.clone()),
                     tool_schema: Some(tool_schema_digest),
+                    tool_schema_revision: Some("tool-definitions-v1".to_string()),
                     memory_revision,
+                    memory_schema: Some(agent::memory::RECORD_SCHEMA.to_string()),
+                    system_prompt: Some(system_prompt_version),
+                    runtime_config: Some(runtime_config),
                     session: Some(session.clone()),
+                    session_state: Some(format!("messages:{}", transcript.len())),
                     turn: Some(time.turn as u64),
                 };
                 let snapshot = crate::context_assembly::AssemblySnapshot::build(

@@ -45,6 +45,8 @@ pub(crate) mod preset_catalogue;
 pub(crate) mod prompts;
 pub(crate) mod recent;
 pub(crate) mod reference;
+#[cfg(test)]
+mod reliability_harness;
 pub(crate) mod review;
 pub(crate) mod runner;
 pub(crate) mod schedule;

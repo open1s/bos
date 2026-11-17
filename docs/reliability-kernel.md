@@ -217,6 +217,22 @@ paths, not only asserted from fixture metadata. The task-side corpus
 attempt-bound verification, sandbox timeout and artifact-escape scenarios; those
 run in the task suite in `crates/bsh`.
 
+## Long-horizon executable harness (issue #431)
+
+`crates/bsh/src/reliability_harness.rs` executes every scenario in
+`crates/bsh/tests/data/reliability_long_horizon.json` through real persistence,
+task-store, retry, verifier and controlled-shell paths. It creates fresh
+`AgentSession` instances from serialized files (dropping the old object),
+injects crash remnants (Queued attempt without a run id), runs concurrent
+isolated sessions, measures archive/history/JSON growth, and classifies failures
+as functional, data-corruption, state-inconsistent or resource-exceeded. The test
+report names each scenario, its evidence and resource metrics. Covered domains:
+context consistency/growth, stale/conflicting memory, multi-round compaction and
+failure, checkpoint corruption/migration, task retry/duplicate/verification,
+tool failure, cancellation/timeout/process termination, process restart and
+reconciliation, multi-session isolation, provider request audit consistency, and
+bounded resource growth. No live model or network is used.
+
 ## Compaction critical facts (issue #429)
 
 Critical facts are structured, not keyword bags: subject, predicate, value,

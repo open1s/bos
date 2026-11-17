@@ -4,6 +4,9 @@ pub mod response;
 pub mod types;
 pub mod vendor;
 
+/// The adapter implementation version used in context identities (issue #432).
+pub const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use client::{LlmClient, LlmResponseResultFuture};
 pub use response::{
     LlmResponse, LlmResponseResult, StreamResponseAccumulator, StreamToken, TokenStream,

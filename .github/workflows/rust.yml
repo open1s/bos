@@ -97,6 +97,13 @@ jobs:
           xvfb-run -a cargo test --workspace --exclude jsbos --exclude nbos
           -- --skip browser::engine::tests
 
+      # Every long-horizon corpus scenario runs in the workspace suite; this
+      # explicit step keeps its per-scenario report visible on failure.
+      - name: Long-horizon reliability corpus
+        run: >-
+          cargo test -p bsh --lib long_horizon_reliability_corpus_executes
+          -- --nocapture
+
       # The shared OS-service crate carries the Windows process/path/env/ACL
       # code paths. Compile-verify them on every lane so a Windows-only
       # regression cannot land silently (issues #312, #313). No link is needed.

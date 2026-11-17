@@ -222,14 +222,26 @@ pub(crate) struct SourceVersions {
     pub(crate) provider: Option<String>,
     /// The provider adapter implementation/version.
     pub(crate) provider_adapter: Option<String>,
+    /// The provider endpoint/gateway identity.
+    pub(crate) provider_endpoint: Option<String>,
     /// The wire protocol/API mode.
     pub(crate) api_mode: Option<String>,
     /// A digest of the advertised tool schemas.
     pub(crate) tool_schema: Option<String>,
+    /// The tool-schema format revision.
+    pub(crate) tool_schema_revision: Option<String>,
     /// The memory revision, when one is known.
     pub(crate) memory_revision: Option<String>,
+    /// The memory record schema revision.
+    pub(crate) memory_schema: Option<String>,
+    /// The final system-prompt identity (keyed/coarse; never raw content).
+    pub(crate) system_prompt: Option<String>,
+    /// Runtime configuration that changes request semantics.
+    pub(crate) runtime_config: Option<String>,
     /// The session identity.
     pub(crate) session: Option<String>,
+    /// Coarse session-state version (e.g. message count).
+    pub(crate) session_state: Option<String>,
     /// The turn number.
     pub(crate) turn: Option<u64>,
 }
@@ -255,7 +267,7 @@ pub(crate) struct ContextFingerprint {
 }
 
 /// The current request-identity format (issue #422).
-pub(crate) const CONTEXT_FINGERPRINT_VERSION: u32 = 3;
+pub(crate) const CONTEXT_FINGERPRINT_VERSION: u32 = 4;
 
 impl ContextFingerprint {
     /// Compute both identities; `content_key` enables the content one.
@@ -266,7 +278,7 @@ impl ContextFingerprint {
     ) -> Self {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(b"bsh-context-composition-v3\0");
+        hasher.update(b"bsh-context-composition-v4\0");
         for block in blocks {
             hash_part(&mut hasher, block.source.label().as_bytes());
             hash_part(&mut hasher, trust_label(block.trust).as_bytes());
@@ -281,11 +293,17 @@ impl ContextFingerprint {
             versions.workspace_instructions.as_deref(),
             versions.tool_guidance.as_deref(),
             versions.tool_schema.as_deref(),
+            versions.tool_schema_revision.as_deref(),
             versions.provider.as_deref(),
             versions.provider_adapter.as_deref(),
+            versions.provider_endpoint.as_deref(),
             versions.api_mode.as_deref(),
             versions.memory_revision.as_deref(),
+            versions.memory_schema.as_deref(),
+            versions.system_prompt.as_deref(),
+            versions.runtime_config.as_deref(),
             versions.session.as_deref(),
+            versions.session_state.as_deref(),
         ] {
             hash_part(&mut hasher, version.unwrap_or("").as_bytes());
         }
@@ -299,15 +317,21 @@ impl ContextFingerprint {
         let composition = hex(&hasher.finalize());
 
         let mut execution_hasher = Sha256::new();
-        execution_hasher.update(b"bsh-context-execution-v3\0");
+        execution_hasher.update(b"bsh-context-execution-v4\0");
         for part in [
             versions.provider.as_deref(),
             versions.provider_adapter.as_deref(),
+            versions.provider_endpoint.as_deref(),
             versions.api_mode.as_deref(),
             versions.tool_guidance.as_deref(),
             versions.tool_schema.as_deref(),
+            versions.tool_schema_revision.as_deref(),
             versions.memory_revision.as_deref(),
+            versions.memory_schema.as_deref(),
+            versions.system_prompt.as_deref(),
+            versions.runtime_config.as_deref(),
             versions.session.as_deref(),
+            versions.session_state.as_deref(),
         ] {
             hash_part(&mut execution_hasher, part.unwrap_or("").as_bytes());
         }
@@ -488,7 +512,39 @@ impl AssemblySnapshot {
     /// The recording seam and diagnostics read the same fields, so a provider
     /// request cannot be assembled from a second, drifting path.
     pub(crate) fn typed_provider_request(&self) -> react::llm::ProviderRequest {
+        let mut versions = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("persona", self.versions.persona.as_ref()),
+            (
+                "instructions",
+                self.versions.workspace_instructions.as_ref(),
+            ),
+            ("provider", self.versions.provider.as_ref()),
+            ("adapter", self.versions.provider_adapter.as_ref()),
+            ("endpoint", self.versions.provider_endpoint.as_ref()),
+            ("api_mode", self.versions.api_mode.as_ref()),
+            ("tool_guidance", self.versions.tool_guidance.as_ref()),
+            ("tool_schema", self.versions.tool_schema.as_ref()),
+            (
+                "tool_schema_revision",
+                self.versions.tool_schema_revision.as_ref(),
+            ),
+            ("memory_revision", self.versions.memory_revision.as_ref()),
+            ("memory_schema", self.versions.memory_schema.as_ref()),
+            ("system_prompt", self.versions.system_prompt.as_ref()),
+            ("runtime_config", self.versions.runtime_config.as_ref()),
+            ("session", self.versions.session.as_ref()),
+            ("session_state", self.versions.session_state.as_ref()),
+        ] {
+            if let Some(value) = value {
+                versions.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(turn) = self.versions.turn {
+            versions.insert("turn".to_string(), turn.to_string());
+        }
         react::llm::ProviderRequest {
+            versions,
             provider: self.versions.provider.clone(),
             provider_adapter: self.versions.provider_adapter.clone(),
             composition: self.fingerprint.composition.clone(),

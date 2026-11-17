@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "scenarios": [
+    { "id": "context_multi_request_consistency", "domain": "context" },
+    { "id": "context_growth", "domain": "context" },
+    { "id": "memory_stale_conflict", "domain": "memory" },
+    { "id": "compaction_multi_round", "domain": "compaction" },
+    { "id": "compaction_failure_preserved", "domain": "compaction" },
+    { "id": "checkpoint_corruption_rejected", "domain": "checkpoint" },
+    { "id": "checkpoint_version_migration", "domain": "checkpoint" },
+    { "id": "task_retry_protocol", "domain": "task" },
+    { "id": "task_duplicate_side_effect", "domain": "task" },
+    { "id": "task_verification_failure", "domain": "task" },
+    { "id": "execution_tool_failure", "domain": "execution" },
+    { "id": "execution_cancel_timeout", "domain": "execution" },
+    { "id": "recovery_process_restart", "domain": "recovery" },
+    { "id": "recovery_reconciliation", "domain": "recovery" },
+    { "id": "isolation_multi_session", "domain": "isolation" },
+    { "id": "provider_request_consistency", "domain": "provider" },
+    { "id": "resource_growth_bounded", "domain": "resource" },
+    { "id": "long_run_multi_session_restart", "domain": "recovery" }
+  ]
+}

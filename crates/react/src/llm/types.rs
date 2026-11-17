@@ -885,6 +885,7 @@ impl ProviderRequest {
                 .collect::<Vec<_>>(),
             "input_chars": self.input.as_text().map(|text| text.chars().count()).unwrap_or(0),
             "tools": self.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
+            "versions": self.versions,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "reasoning_effort": self.reasoning_effort.map(|effort| effort.as_str()),
@@ -935,6 +936,9 @@ pub struct ProviderRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Wire protocol for this request.
     pub api_mode: ApiMode,
+    /// The version dimensions that produced this request (issue #432).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub versions: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
