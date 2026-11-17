@@ -219,9 +219,14 @@ run in the task suite in `crates/bsh`.
 
 ## Session schema and checkpoint archive (issues #419, #424)
 
-Serialized sessions carry a schema generation (current 3) and are validated
+Serialized sessions carry a schema generation (current 5) and are validated
 before mutation: a newer schema or a checkpoint whose archived source is missing
-is rejected, leaving the caller's session unchanged. Checkpoint source spans are
+is rejected, leaving the caller's session unchanged. Each current checkpoint
+stores its archive id, payload schema, canonical source digest, payload digest,
+payload byte length and source range; restore recomputes the payload digest and
+length and rejects mismatch, invalid ranges, missing metadata and unsupported
+schemas with distinct diagnostics. Pre-v5 checkpoints take an explicit legacy
+migration path that recomputes the same values and still rejects corruption. Checkpoint source spans are
 stored once in a digest-keyed archive and referenced by checkpoints. The archive
 has a total byte budget and a per-span budget; over-budget spans are explicitly
 omitted and marked unrecoverable, eviction is oldest-first and never removes the

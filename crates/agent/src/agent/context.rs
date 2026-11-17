@@ -431,6 +431,18 @@ pub struct Checkpoint {
     /// Whether the original span can still be rebuilt.
     #[serde(default = "checkpoint_recoverable_default")]
     pub recoverable: bool,
+    /// The archive entry id this checkpoint references (issue #428).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_id: Option<String>,
+    /// The archive payload schema this checkpoint was written with.
+    #[serde(default)]
+    pub archive_version: u32,
+    /// SHA-256 of the exact serialized archive payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_digest: Option<String>,
+    /// Exact serialized byte length of the archive payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_bytes: Option<usize>,
     /// The critical facts extracted from the shadowed source (issue #429).
     #[serde(default)]
     pub facts: Vec<CriticalFact>,
@@ -876,6 +888,8 @@ pub enum CheckpointSourceStatus {
     Unavailable,
     /// A source exists but failed a digest, length or identity check.
     Corrupted(String),
+    /// The archive/checkpoint schema is not supported by this build.
+    Incompatible(String),
 }
 
 impl std::fmt::Display for CheckpointSourceStatus {
@@ -884,6 +898,7 @@ impl std::fmt::Display for CheckpointSourceStatus {
             CheckpointSourceStatus::Valid => write!(f, "valid"),
             CheckpointSourceStatus::Unavailable => write!(f, "unavailable"),
             CheckpointSourceStatus::Corrupted(reason) => write!(f, "corrupted: {reason}"),
+            CheckpointSourceStatus::Incompatible(reason) => write!(f, "incompatible: {reason}"),
         }
     }
 }
@@ -904,6 +919,18 @@ impl Checkpoint {
     pub fn section(&self, name: &str) -> Option<&str> {
         self.sections.get(name).map(String::as_str)
     }
+}
+
+/// SHA-256 over arbitrary bytes (archive payload identity).
+fn digest_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// SHA-256 over the canonical JSON of a message span.
@@ -944,6 +971,9 @@ pub struct AgentSession {
     /// Recorded serialized byte size per archive entry, for integrity checks.
     #[serde(default)]
     archive_entry_bytes: std::collections::BTreeMap<String, usize>,
+    /// Full metadata for archived payloads (issue #428).
+    #[serde(default)]
+    archive_entries: std::collections::BTreeMap<String, ArchiveEntryMeta>,
     /// The total archive byte budget.
     #[serde(default = "checkpoint_archive_budget_default")]
     checkpoint_archive_budget: usize,
@@ -954,6 +984,19 @@ pub struct AgentSession {
 
 /// The current archive payload schema.
 pub const ARCHIVE_SCHEMA_VERSION: u32 = 1;
+
+/// Integrity metadata stored beside one archived payload (issue #428).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveEntryMeta {
+    /// The archive payload schema used when the entry was written.
+    pub schema: u32,
+    /// The canonical source-span digest.
+    pub source_digest: String,
+    /// SHA-256 of the serialized payload bytes.
+    pub payload_digest: String,
+    /// Exact serialized byte length.
+    pub bytes: usize,
+}
 
 fn archive_schema_default() -> u32 {
     ARCHIVE_SCHEMA_VERSION
@@ -968,7 +1011,7 @@ fn checkpoint_span_budget_default() -> usize {
 }
 
 /// The current serialized session schema (issue #419).
-pub const SESSION_SCHEMA_VERSION: u32 = 4;
+pub const SESSION_SCHEMA_VERSION: u32 = 5;
 
 /// Timestamps and counters stored with an [`AgentSession`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -997,6 +1040,7 @@ impl AgentSession {
             archive: std::collections::BTreeMap::new(),
             archive_schema: ARCHIVE_SCHEMA_VERSION,
             archive_entry_bytes: std::collections::BTreeMap::new(),
+            archive_entries: std::collections::BTreeMap::new(),
             checkpoint_archive_budget: DEFAULT_CHECKPOINT_ARCHIVE_BYTES,
             checkpoint_span_budget: DEFAULT_CHECKPOINT_SPAN_BYTES,
         }
@@ -1145,6 +1189,12 @@ impl AgentSession {
                         format!("checkpoint {index} source is corrupted: {reason}"),
                     ));
                 }
+                CheckpointSourceStatus::Incompatible(reason) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("checkpoint {index} archive is incompatible: {reason}"),
+                    ));
+                }
             }
         }
         self.messages = restored.messages;
@@ -1160,6 +1210,7 @@ impl AgentSession {
         self.archive = restored.archive;
         self.archive_schema = restored.archive_schema;
         self.archive_entry_bytes = restored.archive_entry_bytes;
+        self.archive_entries = restored.archive_entries;
         self.checkpoint_archive_budget = restored.checkpoint_archive_budget;
         self.checkpoint_span_budget = restored.checkpoint_span_budget;
         Ok(())
@@ -1350,39 +1401,139 @@ impl AgentSession {
         if checkpoint.source_omitted {
             return CheckpointSourceStatus::Unavailable;
         }
-        let expected_len = checkpoint
-            .source_end
-            .saturating_sub(checkpoint.source_start);
-        let source = if checkpoint.source_archived {
-            match self.archive.get(&checkpoint.source_digest) {
-                Some(messages) => messages.as_slice(),
-                None => return CheckpointSourceStatus::Unavailable,
-            }
-        } else {
-            checkpoint.source_span.as_slice()
-        };
-        if source.len() != expected_len {
+        if checkpoint.source_start > checkpoint.source_end {
             return CheckpointSourceStatus::Corrupted(format!(
-                "span length {} does not match recorded range {}..{}",
-                source.len(),
+                "invalid source range {}..{} (start > end)",
+                checkpoint.source_start, checkpoint.source_end
+            ));
+        }
+        let expected_len = checkpoint.source_end - checkpoint.source_start;
+        if !checkpoint.source_archived {
+            let source = checkpoint.source_span.as_slice();
+            if source.len() != expected_len {
+                return CheckpointSourceStatus::Corrupted(format!(
+                    "span length {} does not match recorded range {}..{}",
+                    source.len(),
+                    checkpoint.source_start,
+                    checkpoint.source_end
+                ));
+            }
+            let digest = digest_messages(source);
+            if digest != checkpoint.source_digest {
+                return CheckpointSourceStatus::Corrupted(format!(
+                    "inline digest {digest} does not match recorded {}",
+                    checkpoint.source_digest
+                ));
+            }
+            return CheckpointSourceStatus::Valid;
+        }
+
+        let Some(payload) = self.archive.get(&checkpoint.source_digest) else {
+            return CheckpointSourceStatus::Unavailable;
+        };
+        let payload_bytes = serde_json::to_vec(payload).unwrap_or_default();
+        let payload_digest = digest_bytes(&payload_bytes);
+        let source_digest = digest_messages(payload);
+        if payload.len() != expected_len {
+            return CheckpointSourceStatus::Corrupted(format!(
+                "archived span length {} does not match recorded range {}..{}",
+                payload.len(),
                 checkpoint.source_start,
                 checkpoint.source_end
             ));
         }
-        let digest = digest_messages(source);
-        if digest != checkpoint.source_digest {
+        if source_digest != checkpoint.source_digest {
             return CheckpointSourceStatus::Corrupted(format!(
-                "digest {digest} does not match recorded {}",
+                "archived source digest {source_digest} does not match recorded {}",
                 checkpoint.source_digest
             ));
         }
-        if let Some(recorded) = self.archive_entry_bytes.get(&checkpoint.source_digest) {
-            let actual = serde_json::to_vec(source)
-                .map(|bytes| bytes.len())
-                .unwrap_or(0);
-            if actual != *recorded {
+        if checkpoint.archive_version > ARCHIVE_SCHEMA_VERSION {
+            return CheckpointSourceStatus::Incompatible(format!(
+                "checkpoint archive schema {} is newer than {ARCHIVE_SCHEMA_VERSION}",
+                checkpoint.archive_version
+            ));
+        }
+        match self.archive_entries.get(&checkpoint.source_digest) {
+            Some(meta) => {
+                if meta.schema > ARCHIVE_SCHEMA_VERSION {
+                    return CheckpointSourceStatus::Incompatible(format!(
+                        "archive schema {} is newer than {ARCHIVE_SCHEMA_VERSION}",
+                        meta.schema
+                    ));
+                }
+                if meta.source_digest != checkpoint.source_digest {
+                    return CheckpointSourceStatus::Corrupted(
+                        "archive metadata source digest does not match the checkpoint".to_string(),
+                    );
+                }
+                if meta.payload_digest != payload_digest {
+                    return CheckpointSourceStatus::Corrupted(format!(
+                        "archive payload digest {payload_digest} does not match metadata {}",
+                        meta.payload_digest
+                    ));
+                }
+                if meta.bytes != payload_bytes.len() {
+                    return CheckpointSourceStatus::Corrupted(format!(
+                        "archive payload bytes {} do not match metadata {}",
+                        payload_bytes.len(),
+                        meta.bytes
+                    ));
+                }
+            }
+            None if checkpoint.archive_version >= ARCHIVE_SCHEMA_VERSION => {
+                return CheckpointSourceStatus::Corrupted(
+                    "archive metadata is missing for a current checkpoint".to_string(),
+                );
+            }
+            None => {}
+        }
+        if checkpoint.archive_version >= ARCHIVE_SCHEMA_VERSION {
+            let Some(archive_id) = &checkpoint.archive_id else {
+                return CheckpointSourceStatus::Corrupted(
+                    "checkpoint archive id is missing".to_string(),
+                );
+            };
+            if archive_id != &checkpoint.source_digest {
+                return CheckpointSourceStatus::Corrupted(
+                    "checkpoint archive id does not match the entry".to_string(),
+                );
+            }
+            let Some(recorded_digest) = &checkpoint.archive_digest else {
+                return CheckpointSourceStatus::Corrupted(
+                    "checkpoint archive payload digest is missing".to_string(),
+                );
+            };
+            if recorded_digest != &payload_digest {
                 return CheckpointSourceStatus::Corrupted(format!(
-                    "archive byte accounting {actual} does not match recorded {recorded}"
+                    "checkpoint archive digest {recorded_digest} does not match payload {payload_digest}"
+                ));
+            }
+            let Some(recorded_bytes) = checkpoint.archive_bytes else {
+                return CheckpointSourceStatus::Corrupted(
+                    "checkpoint archive byte length is missing".to_string(),
+                );
+            };
+            if recorded_bytes != payload_bytes.len() {
+                return CheckpointSourceStatus::Corrupted(format!(
+                    "checkpoint archive bytes {recorded_bytes} do not match payload {}",
+                    payload_bytes.len()
+                ));
+            }
+        } else if let Some(recorded_bytes) = checkpoint.archive_bytes {
+            if recorded_bytes != payload_bytes.len() {
+                return CheckpointSourceStatus::Corrupted(format!(
+                    "legacy checkpoint archive bytes {recorded_bytes} do not match payload {}",
+                    payload_bytes.len()
+                ));
+            }
+        }
+        if let Some(recorded) = self.archive_entry_bytes.get(&checkpoint.source_digest) {
+            if *recorded != payload_bytes.len() {
+                return CheckpointSourceStatus::Corrupted(format!(
+                    "archive byte accounting {} does not match payload {}",
+                    recorded,
+                    payload_bytes.len()
                 ));
             }
         }
@@ -1468,9 +1619,9 @@ impl AgentSession {
         let coverage = fact_coverage(summary, &removed);
         let coverage_complete = complete && coverage.complete();
         let digest = digest_messages(&removed);
-        let span_bytes = serde_json::to_vec(&removed)
-            .map(|bytes| bytes.len())
-            .unwrap_or(0);
+        let payload_bytes = serde_json::to_vec(&removed).unwrap_or_default();
+        let span_bytes = payload_bytes.len();
+        let payload_digest = digest_bytes(&payload_bytes);
         // Refer the source span once, keyed by digest, instead of copying it
         // into every checkpoint. A span over its budget is explicitly omitted
         // and marked unrecoverable (issue #424).
@@ -1482,8 +1633,27 @@ impl AgentSession {
                     .entry(digest.clone())
                     .or_insert_with(|| removed.clone());
                 self.archive_entry_bytes.insert(digest.clone(), span_bytes);
+                self.archive_entries.insert(
+                    digest.clone(),
+                    ArchiveEntryMeta {
+                        schema: ARCHIVE_SCHEMA_VERSION,
+                        source_digest: digest.clone(),
+                        payload_digest: payload_digest.clone(),
+                        bytes: span_bytes,
+                    },
+                );
                 (Vec::new(), true, false, true)
             };
+        let archive_fields = if source_archived {
+            (
+                Some(digest.clone()),
+                ARCHIVE_SCHEMA_VERSION,
+                Some(payload_digest),
+                Some(span_bytes),
+            )
+        } else {
+            (None, 0, None, None)
+        };
         let record = Checkpoint {
             model,
             created_at: current_timestamp(),
@@ -1500,6 +1670,10 @@ impl AgentSession {
             source_archived,
             source_omitted,
             recoverable,
+            archive_id: archive_fields.0,
+            archive_version: archive_fields.1,
+            archive_digest: archive_fields.2,
+            archive_bytes: archive_fields.3,
             facts: coverage.facts,
             missing_facts: coverage.missing,
             unsupported_claims: coverage.unsupported,
@@ -1558,6 +1732,7 @@ impl AgentSession {
         {
             self.archive.remove(&checkpoint.source_digest);
             self.archive_entry_bytes.remove(&checkpoint.source_digest);
+            self.archive_entries.remove(&checkpoint.source_digest);
         }
     }
 
@@ -3149,6 +3324,95 @@ mod budget_tests {
             .restore_from_json(&future.to_string())
             .expect_err("future archive schema refused");
         assert!(error.to_string().contains("archive schema"), "{error}");
+    }
+
+    /// Current checkpoints enforce payload digest, byte length and metadata;
+    /// an absent byte record is a hard failure, while a legacy checkpoint has
+    /// an explicit migration path that recomputes the values (issue #428).
+    #[test]
+    fn archive_payload_metadata_is_enforced() {
+        let make = || {
+            let mut session = AgentSession::new();
+            for index in 0..4 {
+                session.add_user(format!("u{index}"));
+                session.add_assistant(format!("a{index}"));
+            }
+            assert!(session.install_priced_checkpoint(0, "summary") > 0);
+            session
+        };
+
+        let mut session = make();
+        session.checkpoints[0].archive_digest = Some("00".to_string());
+        let before = session.messages().len();
+        assert!(matches!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Corrupted(_)
+        ));
+        assert!(!session.restore_checkpoint(0));
+        assert_eq!(
+            session.messages().len(),
+            before,
+            "a rejected restore leaves the active session untouched"
+        );
+
+        let mut session = make();
+        session.checkpoints[0].archive_bytes = Some(usize::MAX);
+        assert!(matches!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Corrupted(_)
+        ));
+
+        let mut session = make();
+        let digest = session.checkpoints[0].source_digest.clone();
+        session.archive_entries.remove(&digest);
+        assert!(matches!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Corrupted(_)
+        ));
+
+        let mut session = make();
+        session.checkpoints[0].source_start = 9;
+        session.checkpoints[0].source_end = 2;
+        assert!(matches!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Corrupted(_)
+        ));
+
+        let mut session = make();
+        session.checkpoints[0].archive_version = ARCHIVE_SCHEMA_VERSION + 1;
+        assert!(matches!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Incompatible(_)
+        ));
+        assert!(!session.restore_checkpoint(0));
+
+        // Explicit legacy migration: no v1 metadata, but the payload is
+        // recomputed and must still match the recorded source digest.
+        let mut session = make();
+        let digest = session.checkpoints[0].source_digest.clone();
+        session.checkpoints[0].archive_version = 0;
+        session.checkpoints[0].archive_id = None;
+        session.checkpoints[0].archive_digest = None;
+        session.checkpoints[0].archive_bytes = None;
+        session.archive_entries.remove(&digest);
+        assert_eq!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Valid
+        );
+        assert!(session.restore_checkpoint(0));
+
+        // A corrupted legacy payload still fails rather than migrating.
+        let mut session = make();
+        let digest = session.checkpoints[0].source_digest.clone();
+        session.checkpoints[0].archive_version = 0;
+        session.archive_entries.remove(&digest);
+        session.archive.get_mut(&digest).expect("archive")[0] = Message::User {
+            content: Content::Text("tampered".to_string()),
+        };
+        assert!(matches!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Corrupted(_)
+        ));
     }
 
     /// A checkpoint whose preserved span no longer matches its digest is
