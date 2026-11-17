@@ -7,10 +7,20 @@
 //! command or an admitted extension capability makes it relevant, and reports
 //! every other contribution with a reason.
 //!
+//! Activation has two levels:
+//!
+//! - an EXTENSION-level signal (an explicit command, an admitted capability the
+//!   task names, or a task that names the extension) selects all of that
+//!   extension's contributions;
+//! - otherwise each CONTRIBUTION is evaluated on its own declared description,
+//!   triggers, commands and tools. A later contribution can match while the
+//!   first does not.
+//!
 //! Relevance is lexical and derived from the extension's own declared
-//! metadata - its id, display name, contribution descriptions, and command ids.
-//! Nothing here knows what a particular ecosystem's vocabulary looks like, so
-//! no domain word list has to be maintained.
+//! metadata; nothing here knows what a particular ecosystem's vocabulary looks
+//! like, so no domain word list has to be maintained. The tokenizer is the
+//! memory-retrieval one, so a Chinese task and English metadata can meet on a
+//! shared CJK bigram.
 //!
 //! Selection is deterministic and bounded:
 //!
@@ -36,6 +46,28 @@ pub(crate) const MAX_ACTIVE_PER_EXTENSION: usize = 8 * 1024;
 /// Most bytes all extensions may activate in a single turn.
 pub(crate) const MAX_ACTIVE_TOTAL: usize = 24 * 1024;
 
+/// Small, deterministic bridge for the task verbs and nouns a Chinese reader
+/// uses with English extension metadata. This is not a keyword framework: it
+/// maps one CJK term to the canonical English word the metadata already
+/// carries, and every other term still matches through the shared tokenizer.
+const CJK_ALIASES: &[(&str, &str)] = &[
+    ("构建", "build"),
+    ("创建", "build"),
+    ("开发", "develop"),
+    ("设计", "design"),
+    ("验证", "validate"),
+    ("校验", "validate"),
+    ("发布", "publish"),
+    ("扩展", "extension"),
+    ("插件", "extension"),
+    ("修复", "fix"),
+    ("测试", "test"),
+    ("检查", "check"),
+    ("文档", "documentation"),
+    ("配置", "config"),
+    ("部署", "deploy"),
+];
+
 /// Language stop words, not domain vocabulary. They carry no topic on their
 /// own, so they never make a contribution relevant.
 const STOP_WORDS: &[&str] = &[
@@ -45,6 +77,15 @@ const STOP_WORDS: &[&str] = &[
     "all", "any", "its", "their", "our", "out", "not", "but", "also", "via", "per", "each", "more",
     "most", "some", "such", "than", "then",
 ];
+
+/// One contribution selected for this turn, with its own reason.
+#[derive(Debug, Clone)]
+pub(crate) struct ActivePrompt {
+    /// The contribution.
+    pub(crate) prompt: ConditionalPrompt,
+    /// Why this contribution is active.
+    pub(crate) reason: String,
+}
 
 /// One extension selected for this turn.
 #[derive(Debug, Clone)]
@@ -57,10 +98,10 @@ pub(crate) struct ActiveExtension {
     pub(crate) version: String,
     /// Trust level name.
     pub(crate) trust: String,
-    /// Why it activated: explicit command, admitted capability or task terms.
+    /// Extension-level reason, when the whole extension was selected.
     pub(crate) reason: String,
-    /// Included contributions.
-    pub(crate) prompts: Vec<ConditionalPrompt>,
+    /// Included contributions, each with its own reason.
+    pub(crate) prompts: Vec<ActivePrompt>,
     /// Bytes these contributions cost.
     pub(crate) bytes: usize,
 }
@@ -106,13 +147,18 @@ impl ActivationPlan {
 }
 
 /// Select the extension contributions one turn needs.
+///
+/// `admitted_tools` is the authoritative capability view, not the initial
+/// model-visible array: a deferred extension capability is absent from the
+/// array but still admitted, and naming it must activate its guidance.
 pub(crate) fn activate(
     prompts: &[ConditionalPrompt],
     task: &str,
-    tools: &[String],
+    admitted_tools: &[String],
     intent: ActionIntent,
 ) -> ActivationPlan {
     let task_tokens = tokenize(task);
+    let admitted: BTreeSet<&str> = admitted_tools.iter().map(String::as_str).collect();
     let mut groups: BTreeMap<&str, Vec<&ConditionalPrompt>> = BTreeMap::new();
     for prompt in prompts {
         groups
@@ -130,9 +176,22 @@ pub(crate) fn activate(
                 .then_with(|| left.kind.cmp(&right.kind))
         });
         let first = contributions[0];
-        let reason = activation_reason(first, &task_tokens, task, tools, intent);
-        let Some(reason) = reason else {
-            for prompt in contributions {
+        let extension_reason =
+            extension_signal(first, &contributions, &task_tokens, task, &admitted, intent);
+        let mut extension = ActiveExtension {
+            owner: first.owner.clone(),
+            name: first.owner_name.clone(),
+            version: first.version.clone(),
+            trust: first.trust.clone(),
+            reason: extension_reason.clone().unwrap_or_default(),
+            prompts: Vec::new(),
+            bytes: 0,
+        };
+        for prompt in contributions {
+            let reason = extension_reason
+                .clone()
+                .or_else(|| contribution_signal(prompt, &task_tokens, task, &admitted));
+            let Some(reason) = reason else {
                 plan.omissions.push(omission(
                     prompt,
                     if prompt.text.is_empty() {
@@ -141,23 +200,11 @@ pub(crate) fn activate(
                             .clone()
                             .unwrap_or_else(|| "empty contribution".to_string())
                     } else {
-                        "not relevant to this turn".to_string()
+                        "not relevant to this contribution".to_string()
                     },
                 ));
-            }
-            continue;
-        };
-
-        let mut extension = ActiveExtension {
-            owner: first.owner.clone(),
-            name: first.owner_name.clone(),
-            version: first.version.clone(),
-            trust: first.trust.clone(),
-            reason: reason.clone(),
-            prompts: Vec::new(),
-            bytes: 0,
-        };
-        for prompt in contributions {
+                continue;
+            };
             if prompt.text.is_empty() {
                 plan.omissions.push(omission(
                     prompt,
@@ -187,7 +234,10 @@ pub(crate) fn activate(
             }
             total = total.saturating_add(bytes);
             extension.bytes = extension.bytes.saturating_add(bytes);
-            extension.prompts.push(prompt.clone());
+            extension.prompts.push(ActivePrompt {
+                prompt: prompt.clone(),
+                reason,
+            });
         }
         if !extension.prompts.is_empty() {
             plan.active.push(extension);
@@ -196,19 +246,29 @@ pub(crate) fn activate(
     plan
 }
 
-/// Why an extension activates, if it does.
-///
-/// Strong signals are explicit and unambiguous: a command the reader invoked,
-/// a capability that is already admitted to the turn, and a task that names
-/// the extension. Weaker lexical signals are balanced against the turn's
-/// intent so a single shared word cannot turn a question into extension work.
-fn activation_reason(
+/// An extension-level signal: the whole extension is relevant.
+fn extension_signal(
     first: &ConditionalPrompt,
+    contributions: &[&ConditionalPrompt],
     task_tokens: &BTreeSet<String>,
     task: &str,
-    tools: &[String],
+    admitted: &BTreeSet<&str>,
     intent: ActionIntent,
 ) -> Option<String> {
+    // The authoritative capability view admits a deferred extension tool even
+    // when its schema is absent from the initial array. On a work turn that
+    // admitted capability is a reason to carry the extension's guidance; a
+    // conversation does not inherit it just because the tool is installed.
+    if intent == ActionIntent::Action
+        && contributions.iter().any(|prompt| {
+            prompt
+                .tools
+                .iter()
+                .any(|tool| admitted.contains(tool.as_str()))
+        })
+    {
+        return Some("extension capability is admitted for this work turn".to_string());
+    }
     if let Some(command) = first
         .commands
         .iter()
@@ -216,9 +276,10 @@ fn activation_reason(
     {
         return Some(format!("explicit command /{command}"));
     }
-    let prefix = format!("{}__", first.tool_namespace);
-    if let Some(tool) = tools.iter().find(|tool| tool.starts_with(&prefix)) {
-        return Some(format!("admitted capability {tool}"));
+    for prompt in contributions {
+        if let Some(tool) = named_capability(prompt, task_tokens, task, admitted) {
+            return Some(format!("task names admitted capability {tool}"));
+        }
     }
     let lower = task.to_lowercase();
     if lower.contains(&first.owner.to_lowercase())
@@ -226,27 +287,68 @@ fn activation_reason(
     {
         return Some("task names the extension".to_string());
     }
-
-    let identity = identity_tokens(first);
-    let metadata = metadata_tokens(first);
-    let identity_hits = identity.intersection(task_tokens).count();
-    let metadata_hits = metadata.intersection(task_tokens).count();
-    if identity_hits > 0 && intent == ActionIntent::Action {
-        return Some(format!(
-            "task shares {} with the extension name while asking for work",
-            identity
-                .intersection(task_tokens)
-                .next()
-                .cloned()
-                .unwrap_or_default()
-        ));
-    }
-    if metadata_hits >= 2 {
-        return Some(format!(
-            "task shares {metadata_hits} terms with the extension metadata"
-        ));
-    }
+    // A task sharing an identity term with the extension while asking for work
+    // selects the extension, not one contribution: the name is what was asked
+    // about.
     None
+}
+
+/// A contribution-level signal.
+fn contribution_signal(
+    prompt: &ConditionalPrompt,
+    task_tokens: &BTreeSet<String>,
+    task: &str,
+    admitted: &BTreeSet<&str>,
+) -> Option<String> {
+    if let Some(tool) = named_capability(prompt, task_tokens, task, admitted) {
+        return Some(format!("task names admitted capability {tool}"));
+    }
+    let mut metadata = BTreeSet::new();
+    for trigger in &prompt.triggers {
+        metadata.extend(tokenize(trigger));
+    }
+    for command in &prompt.commands {
+        metadata.extend(tokenize(command));
+    }
+    for tool in &prompt.tools {
+        metadata.extend(tokenize(tool));
+    }
+    let hits: Vec<&String> = metadata.intersection(task_tokens).collect();
+    if hits.len() >= 2 {
+        return Some(format!(
+            "task shares {} terms with this contribution",
+            hits.len()
+        ));
+    }
+    // A single shared term is too weak: "fix the failing build" shares "build"
+    // with an extension guide but asks nothing about that extension.
+    None
+}
+
+/// The contribution's tool that the task names AND the capability view admits.
+fn named_capability(
+    prompt: &ConditionalPrompt,
+    task_tokens: &BTreeSet<String>,
+    task: &str,
+    admitted: &BTreeSet<&str>,
+) -> Option<String> {
+    let lower_task = task.to_lowercase();
+    prompt.tools.iter().find_map(|tool| {
+        let admitted_tool = admitted.contains(tool.as_str());
+        if !admitted_tool {
+            return None;
+        }
+        let lower = tool.to_lowercase();
+        let named = if lower.contains("__") {
+            !lower_task.is_empty() && lower_task.contains(&lower)
+        } else {
+            tokenize(tool)
+                .into_iter()
+                .next()
+                .is_some_and(|term| task_tokens.contains(&term))
+        };
+        named.then(|| tool.clone())
+    })
 }
 
 /// The extension's own identity terms: its namespace and display name.
@@ -261,31 +363,25 @@ fn identity_tokens(prompt: &ConditionalPrompt) -> BTreeSet<String> {
     terms
 }
 
-/// Identity plus declared contribution and command terms.
-fn metadata_tokens(prompt: &ConditionalPrompt) -> BTreeSet<String> {
-    let mut terms = identity_tokens(prompt);
-    for trigger in &prompt.triggers {
-        terms.extend(tokenize(trigger));
-    }
-    for command in &prompt.commands {
-        terms.extend(tokenize(command));
+/// Normalize text to lowercase content terms.
+fn tokenize(text: &str) -> BTreeSet<String> {
+    let mut terms = BTreeSet::new();
+    for token in agent::memory::retrieval::tokenize(text) {
+        let token = token.strip_suffix('s').unwrap_or(&token).to_string();
+        let width = token.chars().count();
+        let cjk = !token.is_ascii();
+        let keep = if cjk { width >= 2 } else { width >= 3 };
+        if !keep || STOP_WORDS.contains(&token.as_str()) {
+            continue;
+        }
+        for (cjk_term, english) in CJK_ALIASES {
+            if token == *cjk_term {
+                terms.insert((*english).to_string());
+            }
+        }
+        terms.insert(token);
     }
     terms
-}
-
-/// Normalize text to lowercase content terms.
-///
-/// A trailing plural s is folded so "extensions" and "extension" are one term.
-/// CJK text has no whitespace and stays one term; that is the same tokenizer
-/// contract the memory retrieval uses.
-fn tokenize(text: &str) -> BTreeSet<String> {
-    text.split(|character: char| !character.is_alphanumeric())
-        .filter_map(|token| {
-            let token = token.to_lowercase();
-            let token = token.strip_suffix('s').unwrap_or(&token).to_string();
-            (token.chars().count() >= 3 && !STOP_WORDS.contains(&token.as_str())).then_some(token)
-        })
-        .collect()
 }
 
 fn omission(prompt: &ConditionalPrompt, reason: String) -> ExtensionOmission {
@@ -301,16 +397,17 @@ fn omission(prompt: &ConditionalPrompt, reason: String) -> ExtensionOmission {
 }
 
 /// Render one active contribution in the provider's block shape.
-///
-/// The header names the kind, the extension and the active version; the
-/// activation reason is model-visible so it can tell a workflow guide from a
-/// standing rule. The body is extension text and stays untrusted data.
-pub(crate) fn render(active: &ActiveExtension, prompt: &ConditionalPrompt) -> String {
+pub(crate) fn render(active: &ActiveExtension, selected: &ActivePrompt) -> String {
     format!(
         "## Extension {}: {} ({}@{})
 Activation: {}
 {}",
-        prompt.kind, prompt.description, active.owner, active.version, active.reason, prompt.text
+        selected.prompt.kind,
+        selected.prompt.description,
+        active.owner,
+        active.version,
+        selected.reason,
+        selected.prompt.text
     )
 }
 
@@ -329,121 +426,140 @@ mod tests {
             description: format!("{name} workflow"),
             text: text.to_string(),
             scope: Vec::new(),
-            triggers: vec![
-                "design".to_string(),
-                "build".to_string(),
-                "validate".to_string(),
-                "publish".to_string(),
-            ],
+            triggers: {
+                let mut terms = tokenize(owner);
+                terms.extend(tokenize(name));
+                for verb in ["design", "build", "validate", "publish"] {
+                    terms.insert(verb.to_string());
+                }
+                terms.into_iter().collect()
+            },
             commands: vec![
                 "devkit__scaffold".to_string(),
                 "devkit__validate".to_string(),
+            ],
+            tools: vec![
+                "devkit__scaffold".to_string(),
+                "scaffold".to_string(),
+                "validate".to_string(),
             ],
             tool_namespace: owner.rsplit('.').next().unwrap().to_string(),
             diagnostic: None,
         }
     }
 
-    #[test]
-    fn a_greeting_activates_nothing() {
-        let prompts = vec![prompt(
+    fn devkit() -> ConditionalPrompt {
+        prompt(
             "com.example.devkit",
             "Extension DevKit",
             "guide",
             "How to build extensions",
-        )];
-        let plan = activate(&prompts, "hello 8888", &[], ActionIntent::Unknown);
-        assert!(plan.is_empty());
-        assert_eq!(plan.omissions.len(), 1);
-        assert_eq!(plan.omissions[0].reason, "not relevant to this turn");
+        )
     }
 
     #[test]
-    fn extension_work_activates_the_extension_guide() {
-        let prompts = vec![prompt(
-            "com.example.devkit",
-            "Extension DevKit",
-            "guide",
-            "How to build extensions",
-        )];
+    fn a_greeting_activates_nothing() {
+        let plan = activate(&[devkit()], "hello 8888", &[], ActionIntent::Unknown);
+        assert!(plan.is_empty());
+        assert_eq!(plan.omissions.len(), 1);
+        assert_eq!(
+            plan.omissions[0].reason,
+            "not relevant to this contribution"
+        );
+    }
+
+    #[test]
+    fn extension_work_activates_the_guide() {
         let plan = activate(
-            &prompts,
+            &[devkit()],
             "build a new extension package",
             &[],
             ActionIntent::Action,
         );
         assert_eq!(plan.active.len(), 1);
-        assert!(plan.active[0].reason.contains("asking for work"));
+        assert!(plan.active[0].reason.is_empty());
+        assert!(plan.active[0].prompts[0].reason.contains("shares 2 terms"));
     }
 
     #[test]
     fn metadata_overlap_activates_without_an_action_verb() {
-        let prompts = vec![prompt(
-            "com.example.devkit",
-            "Extension DevKit",
-            "guide",
-            "How to build extensions",
-        )];
-        // "validate" comes from the command id, "extension" from the name.
         let plan = activate(
-            &prompts,
+            &[devkit()],
             "validate my extension",
             &[],
             ActionIntent::Unknown,
         );
-        assert_eq!(plan.active.len(), 1);
-        assert!(plan.active[0].reason.contains("shares"));
+        assert_eq!(plan.active.len(), 1, "{plan:?}");
+        assert!(plan.active[0].prompts[0].reason.contains("shares"));
     }
 
     #[test]
-    fn an_explicit_command_activates_before_the_task_text() {
-        let prompts = vec![prompt(
-            "com.example.devkit",
-            "Extension DevKit",
-            "guide",
-            "How to build extensions",
-        )];
+    fn an_explicit_command_activates_the_whole_extension() {
         let plan = activate(
-            &prompts,
+            &[devkit()],
             "<extension_command name=\"devkit__scaffold\">\nScaffold.\n</extension_command>",
             &[],
             ActionIntent::Unknown,
         );
         assert_eq!(plan.active.len(), 1);
         assert_eq!(plan.active[0].reason, "explicit command /devkit__scaffold");
+        assert!(plan.active[0].prompts[0]
+            .reason
+            .contains("explicit command"));
     }
 
     #[test]
-    fn an_admitted_extension_tool_activates_its_guide() {
-        let prompts = vec![prompt(
-            "com.example.devkit",
-            "Extension DevKit",
-            "guide",
-            "How to build extensions",
-        )];
+    fn a_named_admitted_capability_activates_even_when_withheld() {
         let plan = activate(
-            &prompts,
-            "do the task",
+            &[devkit()],
+            "run devkit__scaffold for this package",
             &["devkit__scaffold".to_string()],
             ActionIntent::Unknown,
         );
-        assert_eq!(plan.active.len(), 1);
-        assert_eq!(
-            plan.active[0].reason,
-            "admitted capability devkit__scaffold"
+        assert_eq!(plan.active.len(), 1, "{plan:?}");
+        assert!(plan.active[0].prompts[0]
+            .reason
+            .contains("admitted capability"));
+    }
+
+    #[test]
+    fn an_admitted_but_unnamed_capability_does_not_activate() {
+        let plan = activate(
+            &[devkit()],
+            "hello 8888",
+            &["devkit__scaffold".to_string()],
+            ActionIntent::Unknown,
         );
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn an_admitted_deferred_capability_activates_on_a_work_turn() {
+        let plan = activate(
+            &[devkit()],
+            "fix the failing build",
+            &["devkit__scaffold".to_string()],
+            ActionIntent::Action,
+        );
+        assert_eq!(plan.active.len(), 1, "{plan:?}");
+        assert!(plan.active[0].reason.contains("capability is admitted"));
+    }
+
+    #[test]
+    fn an_admitted_capability_does_not_activate_conversation() {
+        let plan = activate(
+            &[devkit()],
+            "hello 8888",
+            &["devkit__scaffold".to_string()],
+            ActionIntent::Unknown,
+        );
+        assert!(plan.is_empty());
     }
 
     #[test]
     fn a_plain_extension_question_is_not_extension_work() {
-        let prompts = vec![prompt(
-            "com.example.devkit",
-            "Extension DevKit",
-            "guide",
-            "How to build extensions",
-        )];
         let plan = activate(
-            &prompts,
+            &[devkit()],
             "what is a browser extension?",
             &[],
             ActionIntent::Explanation,
@@ -453,16 +569,76 @@ mod tests {
 
     #[test]
     fn an_unrelated_work_turn_does_not_activate_every_extension() {
-        let prompts = vec![prompt(
-            "com.example.devkit",
-            "Extension DevKit",
+        let plan = activate(
+            &[devkit()],
+            "fix the failing build",
+            &[],
+            ActionIntent::Action,
+        );
+        assert!(plan.is_empty(), "one shared word is not a topic: {plan:?}");
+    }
+
+    #[test]
+    fn a_chinese_task_activates_english_metadata() {
+        let mut zh = prompt(
+            "com.example.zh",
+            "扩展开发套件",
             "guide",
-            "How to build extensions",
-        )];
-        let plan = activate(&prompts, "fix the failing build", &[], ActionIntent::Action);
+            "扩展开发套件工作流",
+        );
+        // The declared metadata is English; the task is Chinese. Only a common
+        // semantic term can connect them.
+        zh.triggers = vec!["extension".to_string(), "build".to_string()];
+        zh.owner_name = "Extension Toolkit".to_string();
+        zh.commands.clear();
+        zh.tools.clear();
+        let plan = activate(&[zh], "帮我构建一个扩展", &[], ActionIntent::Action);
+        assert_eq!(plan.active.len(), 1, "{plan:?}");
+        assert!(plan.active[0].prompts[0].reason.contains("shares"));
+    }
+
+    #[test]
+    fn a_chinese_greeting_does_not_activate() {
+        let plan = activate(&[devkit()], "你好", &[], ActionIntent::Unknown);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn a_later_contribution_can_match_on_its_own() {
+        let mut first = prompt(
+            "com.example.tool",
+            "Toolkit",
+            "build-guide",
+            "Build workflow",
+        );
+        first.triggers = vec!["build".to_string()];
+        let mut second = prompt(
+            "com.example.tool",
+            "Toolkit",
+            "checklist",
+            "Validation checklist",
+        );
+        second.triggers = vec!["checklist".to_string(), "validate".to_string()];
+        let plan = activate(
+            &[first, second],
+            "validate the checklist",
+            &[],
+            ActionIntent::Unknown,
+        );
+        assert_eq!(plan.active.len(), 1, "{plan:?}");
+        let selected: Vec<&str> = plan.active[0]
+            .prompts
+            .iter()
+            .map(|selected| selected.prompt.id.as_str())
+            .collect();
+        assert_eq!(selected, vec!["checklist"]);
         assert!(
-            plan.is_empty(),
-            "one shared description word is not a topic: {plan:?}"
+            plan.omissions
+                .iter()
+                .any(|omission| omission.contribution == "build-guide"
+                    && omission.reason == "not relevant to this contribution"),
+            "the first contribution is reported: {:?}",
+            plan.omissions
         );
     }
 
@@ -487,14 +663,61 @@ mod tests {
             plan.omissions
                 .iter()
                 .any(|omission| omission.owner == "com.example.git"
-                    && omission.reason == "not relevant to this turn"),
+                    && omission.reason == "not relevant to this contribution"),
             "the unrelated extension is reported: {:?}",
             plan.omissions
         );
     }
 
     #[test]
-    fn the_aggregate_budget_omits_the_later_extensions() {
+    fn every_contribution_of_an_active_extension_is_included() {
+        let guide = prompt(
+            "com.example.devkit",
+            "Extension DevKit",
+            "guide",
+            "How to build extensions",
+        );
+        let checklist = prompt(
+            "com.example.devkit",
+            "Extension DevKit",
+            "checklist",
+            "Validation checklist",
+        );
+        let plan = activate(
+            &[guide, checklist],
+            "build a new extension package",
+            &[],
+            ActionIntent::Action,
+        );
+        assert_eq!(plan.active.len(), 1);
+        assert_eq!(plan.active[0].prompts.len(), 2);
+        assert!(plan.active[0]
+            .prompts
+            .iter()
+            .all(|selected| selected.reason.contains("shares")));
+    }
+
+    #[test]
+    fn budgets_omit_with_a_reason() {
+        let plan = activate(
+            &[prompt(
+                "com.example.devkit",
+                "Extension DevKit",
+                "guide",
+                &"x".repeat(MAX_ACTIVE_PER_EXTENSION + 1),
+            )],
+            "build an extension",
+            &[],
+            ActionIntent::Action,
+        );
+        assert!(plan.is_empty());
+        assert!(plan.omissions[0]
+            .reason
+            .contains("per-extension turn budget"));
+    }
+
+    #[test]
+    fn the_aggregate_budget_omits_later_extensions() {
         let boxed = |owner: &str, name: &str| prompt(owner, name, "guide", &"x".repeat(7 * 1024));
         let prompts = vec![
             boxed("com.example.one", "Extension One"),
@@ -504,34 +727,16 @@ mod tests {
         ];
         let plan = activate(&prompts, "build an extension", &[], ActionIntent::Action);
         assert!(plan.bytes() <= MAX_ACTIVE_TOTAL);
-        assert!(
-            plan.omissions
-                .iter()
-                .any(|omission| omission.reason.contains("aggregate turn budget")),
-            "the over-budget contribution is named: {:?}",
-            plan.omissions
-        );
-    }
-
-    #[test]
-    fn budgets_omit_with_a_reason() {
-        let prompts = vec![prompt(
-            "com.example.devkit",
-            "Extension DevKit",
-            "guide",
-            &"x".repeat(MAX_ACTIVE_PER_EXTENSION + 1),
-        )];
-        let plan = activate(&prompts, "build an extension", &[], ActionIntent::Action);
-        assert!(plan.is_empty());
-        assert_eq!(plan.omissions.len(), 1);
-        assert!(plan.omissions[0]
-            .reason
-            .contains("per-extension turn budget"));
+        assert!(plan
+            .omissions
+            .iter()
+            .any(|omission| omission.reason.contains("aggregate turn budget")));
     }
 
     #[test]
     fn denied_bodies_are_omitted_with_their_diagnostic() {
-        let mut denied = prompt("com.example.devkit", "Extension DevKit", "guide", "");
+        let mut denied = devkit();
+        denied.text.clear();
         denied.diagnostic = Some("capability agent.prompts.provide denied by policy".to_string());
         let plan = activate(&[denied], "build an extension", &[], ActionIntent::Action);
         assert!(plan.is_empty());

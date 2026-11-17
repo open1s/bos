@@ -311,12 +311,18 @@ when a package is installed (issue #436). They are stored with their extension
 id, version, trust, contribution id and declared terms, and the request
 assembly picks them per turn:
 
-- an explicit extension command activates its owner's contributions;
-- a capability already admitted to the turn activates its owner's;
-- a task that names the extension, or whose content terms match the extension's
-  own name and declared descriptions, activates it;
+- Extension-level: an explicit command, an admitted capability the task names,
+  or a task that names the extension selects the whole extension. The admitted
+  capabilities come from the current capability view, not from the initial
+  provider array, so a deferred tool can activate its guide while its schema is
+  withheld;
+- Contribution-level: otherwise each contribution is scored on its own
+  description, triggers, commands and tools. Two shared content terms select it;
+  a later contribution can match without the first. Matching is lexical through
+  the memory-retrieval tokenizer, with a small CJK-to-English bridge for Chinese
+  task verbs, so a Chinese request can match English metadata;
 - otherwise the body is omitted and the manifest records source extension, the
-  ext:<id>@<version>#<contribution> provenance and the reason.
+  ext:<id>@<version>#<contribution> provenance and the reason per contribution.
 
 An extension body is always untrusted data: it cannot grant a capability,
 weaken a permission or replace a host invariant. Per-extension and aggregate

@@ -1471,6 +1471,51 @@ fn a_conversation_carries_only_the_discovery_surface() {
     assert_eq!(direct, serde_json::json!("ok"));
 }
 
+/// Revoking a capability removes it from both the array and the discovery
+/// catalogue, even though the previous admission named it (issues #285/#435).
+#[test]
+fn a_revoked_capability_leaves_discovery_and_the_array() {
+    let mut agent = scoped_agent(&["read_file", "federation_search"]);
+    agent.set_action_intent(ActionIntent::Action);
+    let _ = agent.tool_admission();
+    let search = super::discovery::find_tool(
+        agent.registry().cloned(),
+        Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
+        Arc::new(std::sync::RwLock::new(None)),
+        super::discovery::Withheld::new(Vec::new(), Vec::new())
+            .with_budget(Arc::clone(&agent.schema_withheld)),
+    );
+    let reported = search
+        .run(&serde_json::json!({"name": "federation_search"}))
+        .expect("the search answers");
+    assert_eq!(
+        reported.get("name").and_then(|name| name.as_str()),
+        Some("federation_search"),
+        "the specialist is discoverable before revocation"
+    );
+
+    agent.set_registry(ToolRegistry::new());
+    let names = tool_names(agent.model_tools());
+    assert!(
+        !names.iter().any(|name| name == "federation_search"),
+        "the revoked capability is not advertised: {names:?}"
+    );
+    let after = super::discovery::find_tool(
+        agent.registry().cloned(),
+        Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
+        Arc::new(std::sync::RwLock::new(None)),
+        super::discovery::Withheld::new(Vec::new(), Vec::new())
+            .with_budget(Arc::clone(&agent.schema_withheld)),
+    );
+    let reported = after
+        .run(&serde_json::json!({"name": "federation_search"}))
+        .expect("the search answers");
+    assert!(
+        reported.get("name").is_none(),
+        "revocation removes it from discovery: {reported}"
+    );
+}
+
 /// A work turn carries the host's core and the discovery surface; a specialist
 /// stays out of the array and is found on demand.
 #[test]
@@ -1595,6 +1640,117 @@ fn a_conversation_does_not_carry_the_hosted_web_search() {
         work.iter().any(|name| name == "web_search"),
         "a work turn offers the hosted search again: {work:?}"
     );
+}
+
+/// Consecutive turns recompute the initial array from their own intent: a
+/// conversation followed by a work turn does not reuse the first turn's
+/// admission decision (issue #435 review).
+#[tokio::test]
+async fn consecutive_turns_recompute_the_tool_array() {
+    let (mut agent, _seen, requests) = action_agent(
+        vec![
+            Step::Text("Final Answer: hello"),
+            Step::Tool("read_file", "{}"),
+            Step::Text("Final Answer: fixed the build"),
+        ],
+        true,
+    );
+    agent.set_initial_tool_scope(react::tool::admission::InitialToolScope::new(
+        ["read_file"],
+        Vec::<String>::new(),
+    ));
+
+    agent.set_action_intent(ActionIntent::Unknown);
+    agent.react("hello 8888").await.expect("conversation turn");
+
+    agent.set_action_intent(ActionIntent::Action);
+    agent
+        .react("fix the failing build")
+        .await
+        .expect("work turn");
+
+    let requests = requests.lock().unwrap();
+    let conversation: Vec<String> = requests
+        .first()
+        .expect("a request")
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    assert!(
+        conversation.iter().any(|name| name == "find_tool"),
+        "conversation carries discovery: {conversation:?}"
+    );
+    assert!(
+        !conversation.iter().any(|name| name == "read_file"),
+        "conversation carries no workspace reader: {conversation:?}"
+    );
+
+    let work: Vec<String> = requests
+        .get(1)
+        .expect("the work request")
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    assert!(
+        work.iter().any(|name| name == "read_file"),
+        "the work turn carries the core: {work:?}"
+    );
+    // Nothing specialist is registered here, so the work turn needs no
+    // discovery surface: the core alone is the whole array.
+    assert!(
+        work.iter().all(|name| name != "find_tool"),
+        "no withheld tool means no search: {work:?}"
+    );
+}
+
+/// Federation, scheduling and MCP-surface specialists stay out of the initial
+/// work array, are reported by the admission decision, are discoverable through
+/// find_tool, and remain callable by name (issue #435 review).
+#[test]
+fn specialist_capabilities_are_discoverable_and_invokable() {
+    let agent = scoped_agent(&[
+        "read_file",
+        "federation_status",
+        "schedule_create",
+        "mcp__github_search",
+    ]);
+    agent.set_action_intent(ActionIntent::Action);
+    let admission = agent.tool_admission();
+    let withheld = admission.withheld_names();
+    for specialist in ["federation_status", "schedule_create", "mcp__github_search"] {
+        assert!(
+            withheld.contains(&specialist.to_string()),
+            "{specialist} is withheld and reported: {withheld:?}"
+        );
+    }
+
+    let search = super::discovery::find_tool(
+        agent.registry().cloned(),
+        Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
+        Arc::new(std::sync::RwLock::new(None)),
+        super::discovery::Withheld::new(Vec::new(), Vec::new())
+            .with_budget(Arc::clone(&agent.schema_withheld)),
+    );
+    for specialist in ["federation_status", "schedule_create", "mcp__github_search"] {
+        let reported = search
+            .run(&serde_json::json!({"name": specialist}))
+            .expect("the search answers");
+        assert_eq!(
+            reported.get("name").and_then(|name| name.as_str()),
+            Some(specialist),
+            "{specialist} is discoverable: {reported}"
+        );
+        let called = agent
+            .registry()
+            .expect("registry")
+            .get(specialist)
+            .expect("registered")
+            .run(&serde_json::json!({}))
+            .expect("the discovered tool runs");
+        assert_eq!(called, serde_json::json!("ok"));
+    }
 }
 
 /// A host that has not classified the turn keeps the broad historical array:

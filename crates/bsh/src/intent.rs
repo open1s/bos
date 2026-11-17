@@ -18,9 +18,12 @@
 //! 1. An explicit explanation verb ("explain", "summarize", "解释") is an
 //!    explanation even when it mentions an error.
 //! 2. A diagnostic question ("why ... fail", "what is wrong", "为什么失败")
-//!    or an imperative change verb ("fix", "add", "review", "修复") is action:
-//!    the answer has to be built from evidence.
-//! 3. A defect report with no clear ask is action.
+//!    or an imperative change verb ("fix", "add", "review", "修复") is action,
+//!    but only with a workspace referent, an action ask or a diagnostic form.
+//! 3. A generic defect word alone (error, problem, slow, broken) is NOT
+//!    action: "what is an error?", "my network is slow" and "I have a problem
+//!    with my phone" stay conversation. A defect statement with enough content
+//!    and no personal context ("login is broken") is a report and is action.
 //! 4. A bare conceptual opener ("what is", "how does", "是什么") is an
 //!    explanation; so is "show me how ...", ahead of the file-read verbs.
 //! 5. A read verb ("read", "open", "show", "查看") is action, but only when the
@@ -337,10 +340,7 @@ pub(crate) fn classify(text: &str) -> ActionIntent {
     if matches_any(&head, EXPLICIT_EXPLAIN) {
         return ActionIntent::Explanation;
     }
-    if matches_any(&head, WHY) && matches_any(&head, DEFECT) {
-        return ActionIntent::Action;
-    }
-    if matches_any(&head, DEFECT) {
+    if matches_any(&head, DEFECT) && defect_is_action(&lower, &head) {
         return ActionIntent::Action;
     }
     // A concept opener at the head of the message outranks a generic action
@@ -361,6 +361,63 @@ pub(crate) fn classify(text: &str) -> ActionIntent {
         };
     }
     local_semantics(&lower, &head).unwrap_or(ActionIntent::Unknown)
+}
+
+/// Personal context that makes a defect a user-world report, not workspace
+/// work: "my network is slow" is not a request to inspect this repository.
+const PERSONAL_CONTEXT: &[&str] = &[
+    "my", "our", "your", "i have", "i've", "i got", "我的", "我家",
+];
+
+/// Whether a defect word is enough to enter the work path.
+///
+/// A generic word (error, problem, slow, broken) must not route a turn by
+/// itself. Action needs an explicit workspace referent, an action verb or a
+/// diagnostic question; a personal report ("my phone") never qualifies.
+fn defect_is_action(lower: &str, padded_head: &str) -> bool {
+    let referent = matches_any(padded_head, WORKSPACE_REFERENCES)
+        || matches_any(padded_head, CODE_NOUNS)
+        || names_a_path(lower);
+    let personal = matches_any(padded_head, PERSONAL_CONTEXT);
+    if personal && !referent {
+        return false;
+    }
+    let question = lower.trim_end().ends_with('?') || lower.trim_end().ends_with('？');
+    let why = matches_any(padded_head, WHY);
+    let action = matches_any(padded_head, ACTION);
+    if question {
+        return why || action || referent;
+    }
+    referent || action || substance(lower) >= 3
+}
+
+/// Whether the message contains a path-like token ("src/main.rs", "./x").
+fn names_a_path(lower: &str) -> bool {
+    lower.split_whitespace().any(|token| {
+        token.contains('/')
+            || token.contains('\\')
+            || token.contains(".rs")
+            || token.contains(".toml")
+            || token.contains(".json")
+            || token.contains(".md")
+    })
+}
+
+/// A rough content mass: ASCII words plus CJK characters. It keeps a two-word
+/// topic ("error handling") from reading as a defect report.
+fn substance(lower: &str) -> usize {
+    let words = lower
+        .split_whitespace()
+        .filter(|word| {
+            word.chars()
+                .any(|character| character.is_ascii_alphanumeric())
+        })
+        .count();
+    let cjk = lower
+        .chars()
+        .filter(|character| !character.is_ascii() && character.is_alphanumeric())
+        .count();
+    words + cjk
 }
 
 /// Whether the message names something the request is about.
@@ -615,6 +672,39 @@ mod tests {
                 classify(prompt),
                 ActionIntent::Unknown,
                 "an objectless request is ambiguous, not a work order: {prompt}"
+            );
+        }
+    }
+
+    /// Generic defect vocabulary does not route a turn by itself, and personal
+    /// reports stay conversation; a workspace referent or an explicit ask keeps
+    /// the diagnostic path (issue #434 review).
+    #[test]
+    fn generic_defect_words_do_not_route_ordinary_messages() {
+        for prompt in [
+            "what is an error?",
+            "why is my network slow?",
+            "I have a problem with my phone",
+            "error handling",
+        ] {
+            assert_ne!(
+                classify(prompt),
+                ActionIntent::Action,
+                "a generic defect is not workspace work: {prompt}"
+            );
+        }
+        for prompt in [
+            "why does the build fail?",
+            "why is the build slow?",
+            "the parser gives a confusing error",
+            "fix the failing build",
+            "为什么构建失败",
+            "登录报错",
+        ] {
+            assert_eq!(
+                classify(prompt),
+                ActionIntent::Action,
+                "an explicit diagnostic/workspace defect stays actionable: {prompt}"
             );
         }
     }

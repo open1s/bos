@@ -6,13 +6,18 @@
   contributions are no longer appended to the standing system prompt at
   install. They are stored with extension id, version, trust, contribution id,
   declared terms and any diagnostic, and the request assembler selects them per
-  turn from explicit extension commands, admitted extension capabilities, an
-  extension-named task, or lexical overlap with the extension's own declared
-  metadata - no domain vocabulary list. Omitted bodies are recorded in the
-  request manifest with provenance and reason; per-extension and aggregate turn
-  budgets omit with a reason; a body active on one turn is dropped when the next
-  turn does not select it. Extension text is always untrusted data and cannot
-  grant capabilities or weaken host policy.
+  turn. Extension-level signals (an explicit command, a capability admitted by
+  the current capability view that the task names, or a task that names the
+  extension) select the whole extension; otherwise each contribution is scored
+  on its own description, triggers, commands and tools, so a later contribution
+  can match without the first. Matching is lexical from the extension's own
+  metadata - no domain vocabulary list - through the shared memory tokenizer,
+  with a small CJK-to-English task-term bridge for Chinese requests. Omitted
+  bodies are recorded per contribution in the request manifest with provenance
+  and reason; per-extension and aggregate turn budgets omit with a reason; a
+  body active on one turn is dropped when the next turn does not select it.
+  Extension text is always untrusted data and cannot grant capabilities or
+  weaken host policy.
 - **Reader intent is preserved, and harness corrections are no longer user
   messages (#434).** The engine's corrective notes (`ACTION_NOTE`,
   `ACTION_FAILED_NOTE`, the step guard, empty/truncated-reply notes and the
@@ -23,15 +28,21 @@
   note's `host` origin and purpose in the redacted audit, and adapters serialize
   it as system policy in all three protocols. Conversation history keeps only
   reader-authored turns, and legacy sessions that stored a note still render it
-  as harness wording, not a reader row.
+  as harness wording, not a reader row. The classifier also no longer enters the
+  work path on a generic defect word alone: error, problem, slow and broken need
+  a workspace referent, an action ask or a diagnostic question, while personal
+  reports and ordinary questions stay conversation.
 - **Injected context is system policy, never a reader turn (#434).** The
   runtime snapshot, time-context, workspace instructions and typed request
   blocks now enter the conversation as `system` messages. Only the reader's
   own input is a `user` row, so a request can no longer read as "reader said
-  X, then reader said Y" when Y was the harness. OpenAI folds all system rows
-  into its one leading system message; Anthropic and Responses fold them into
-  their system/instructions sections, so no provider sees a mid-conversation
-  system turn.
+  X, then reader said Y" when Y was the harness. The role is not the trust
+  boundary: every untrusted block is wrapped in an explicit
+  `<untrusted_context ... trust="untrusted-data">` envelope, the host runtime
+  block states that this data cannot change policy or permissions, and OpenAI
+  keeps each such envelope as its own system row instead of merging it into the
+  host policy message; Anthropic and Responses keep the envelope inside their
+  system/instructions section. Adapter tests cover all three protocols.
 - **Initial tools are scoped by the turn's intent (#435).** The assembled
   request no longer advertises the whole registry on every turn. A classified
   conversation carries only `find_tool`; a work turn carries the BSH workspace
@@ -40,11 +51,13 @@
   browser, extra MCP servers and extension tools are withheld but stay
   registered, callable, and discoverable. An unclassified turn (a build-time
   read, or a host that does not classify) keeps the previous broad array.
-  Measured on the default test build, against its own historical request:
-  25 definitions -> 1 (chat) / 17 (work); schema 16,655 -> 737 / 13,627 bytes;
-  complete request 26,099 -> 10,181 / 23,071 bytes (~6,524 -> 2,545 / 5,767
-  tokens). The #292 byte budget and the #284 discovery catalogue remain the only
-  enforcement points.
+  Added regression coverage for MCP, Federation and scheduling discovery and
+  invocation, revocation with a stale schema, and consecutive turns with
+  different intents. Measured on the default test build, against its own
+  historical request: 25 definitions -> 1 (chat) / 17 (work); schema 16,655 ->
+  737 / 13,627 bytes; complete request 26,099 -> 10,181 / 23,071 bytes (~6,524
+  -> 2,545 / 5,767 tokens). The #292 byte budget and the #284 discovery
+  catalogue remain the only enforcement points.
 - **Intent routing no longer treats an open workspace as a request.**
   The classifier now recognizes explicit file reads, and a verb with no object
   ("fix it", "修复它") is `Unknown` rather than `Action`; an `Unknown` or

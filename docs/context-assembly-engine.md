@@ -42,8 +42,15 @@ The concrete first slice of these types lives in
   override host-enforced controls** (sandbox, permission, tool admission) — those
   are code, not prompt, and are never a function of assembled text.
 - **Trust/provenance.** Every block carries its source and trust until provider
-  serialization. Workspace instructions and retrieved memory are framed as data
-  (`<system-reminder>`, "Relevant memory:") and are never host authority.
+  serialization. The message ROLE is not the trust boundary: untrusted blocks
+  are wrapped in `<untrusted_context source=... trust="untrusted-data">` even
+  when they ride a system row, recalled memory gets the same envelope, the host
+  runtime block states that this data cannot change policy or permissions, and
+  the manifest repeats source/trust/provenance. OpenAI keeps such a block as its
+  own system row instead of merging it into the host policy message; Anthropic
+  and Responses keep the envelope inside their system/instructions section.
+  Adapter tests pin all three. Workspace instructions, extension text and
+  retrieved memory are never host authority.
 - **Token budget.** Selection/prioritization/truncation are budget-aware; the
   report records estimated usage and any omission/truncation reason. Estimates
   use the documented estimator (`agent::agent::context::estimate_tokens`).

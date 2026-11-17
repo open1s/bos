@@ -328,6 +328,37 @@ impl Runner {
             if stop_task.load(Ordering::SeqCst) {
                 return;
             }
+            // What this turn asks for, decided once from the reader's own
+            // words before the stream opens. The engine uses it for the action
+            // contract (one corrective retry when an actionable turn is
+            // answered with prose only) and reports it on the turn outcome; it
+            // is never serialized to the provider.
+            let text = input.as_text().unwrap_or_default().to_string();
+            let mut intent = crate::intent::classify(&text);
+            // The lexical classifier is fast but has no semantics; an
+            // unclassified message gets one semantic second opinion from the
+            // configured model (bounded, cached, and abandoned on any error).
+            // Very short messages are greetings and skip the call.
+            // A slash-command invocation is already an explicit action; its
+            // composed block is not a message to classify semantically.
+            if intent == ActionIntent::Unknown
+                && text.trim().chars().count() >= 12
+                && !text.contains("<extension_command")
+            {
+                if let Some(classified) = agent.classify_intent_with_model(&text).await {
+                    intent = classified;
+                }
+            }
+            agent.set_action_intent(intent);
+            // The classifier is a provider request too: its usage joins the
+            // turn's totals instead of being billed invisibly.
+            if let Some(usage) = agent.take_auxiliary_usage() {
+                let _ = tx.send_blocking(AgentEvent::Usage {
+                    prompt: u64::from(usage.prompt_tokens),
+                    completion: u64::from(usage.completion_tokens),
+                    cached: u64::from(usage.cached_tokens),
+                });
+            }
             // The turn's own context is rendered HERE, on the runner's blocking
             // runtime: the snapshot is pure, but instruction discovery stats the
             // workspace, and the send path must not do file I/O on the UI
@@ -398,11 +429,7 @@ impl Runner {
                 // and the report, so the request and diagnostics cannot
                 // disagree about what was included and why.
                 let task_text = input.as_text().unwrap_or_default();
-                let tool_names: Vec<String> = agent
-                    .model_tools()
-                    .into_iter()
-                    .map(|tool| tool.name)
-                    .collect();
+                let tool_names = agent.capability_tool_names();
                 let extension_plan = crate::extension::activation::activate(
                     &agent.conditional_prompts(),
                     task_text,
@@ -411,8 +438,9 @@ impl Runner {
                 );
                 let mut extension_omissions = Vec::new();
                 for active in &extension_plan.active {
-                    for prompt in &active.prompts {
-                        let text = crate::extension::activation::render(active, prompt);
+                    for selected in &active.prompts {
+                        let prompt = &selected.prompt;
+                        let text = crate::extension::activation::render(active, selected);
                         blocks.push(crate::context_assembly::ContextBlock {
                             source: crate::context_assembly::ContextSource::Extension,
                             trust: crate::context_assembly::ContextSource::Extension.trust(),
@@ -435,7 +463,7 @@ impl Runner {
                             active.version,
                             prompt.id,
                             prompt.kind,
-                            active.reason,
+                            selected.reason,
                             prompt.text.len()
                         );
                     }
@@ -592,15 +620,23 @@ impl Runner {
                 // Extension inclusion/omission, from the same selection that
                 // built the blocks and the manifest (issue #436).
                 for active in &extension_plan.active {
-                    report.estimated_tokens = report
-                        .estimated_tokens
-                        .saturating_add(active.bytes / 4);
-                    report.sources.push(crate::context_assembly::SourceStatus {
-                        source: crate::context_assembly::ContextSource::Extension,
-                        included: true,
-                        reason: Some(active.reason.clone()),
-                        tokens: active.bytes / 4,
-                    });
+                    for selected in &active.prompts {
+                        let bytes = selected.prompt.text.len();
+                        report.estimated_tokens =
+                            report.estimated_tokens.saturating_add(bytes / 4);
+                        report.sources.push(crate::context_assembly::SourceStatus {
+                            source: crate::context_assembly::ContextSource::Extension,
+                            included: true,
+                            reason: Some(format!(
+                                "{}@{}#{}: {}",
+                                active.owner,
+                                active.version,
+                                selected.prompt.id,
+                                selected.reason
+                            )),
+                            tokens: bytes / 4,
+                        });
+                    }
                 }
                 for omission in snapshot.omissions() {
                     report.sources.push(crate::context_assembly::SourceStatus {
@@ -696,37 +732,6 @@ impl Runner {
                 }
             }
 
-            // What this turn asks for, decided once from the reader's own
-            // words before the stream opens. The engine uses it for the action
-            // contract (one corrective retry when an actionable turn is
-            // answered with prose only) and reports it on the turn outcome; it
-            // is never serialized to the provider.
-            let text = input.as_text().unwrap_or_default().to_string();
-            let mut intent = crate::intent::classify(&text);
-            // The lexical classifier is fast but has no semantics; an
-            // unclassified message gets one semantic second opinion from the
-            // configured model (bounded, cached, and abandoned on any error).
-            // Very short messages are greetings and skip the call.
-            // A slash-command invocation is already an explicit action; its
-            // composed block is not a message to classify semantically.
-            if intent == ActionIntent::Unknown
-                && text.trim().chars().count() >= 12
-                && !text.contains("<extension_command")
-            {
-                if let Some(classified) = agent.classify_intent_with_model(&text).await {
-                    intent = classified;
-                }
-            }
-            agent.set_action_intent(intent);
-            // The classifier is a provider request too: its usage joins the
-            // turn's totals instead of being billed invisibly.
-            if let Some(usage) = agent.take_auxiliary_usage() {
-                let _ = tx.send_blocking(AgentEvent::Usage {
-                    prompt: u64::from(usage.prompt_tokens),
-                    completion: u64::from(usage.completion_tokens),
-                    cached: u64::from(usage.cached_tokens),
-                });
-            }
             let mut tool_calls = 0usize;
             let mut tool_failures = 0usize;
             let mut tool_successes = 0usize;
@@ -739,11 +744,6 @@ impl Runner {
             // restored BEFORE the shell starts the next turn from the queue.
             let mut terminal_event = None;
             {
-                // What this turn asks for, decided once from the reader's own
-                // words before the stream opens. The engine uses it for the
-                // action contract (one corrective retry when an actionable turn
-                // is answered with prose only) and reports it on the turn
-                // outcome; it is never serialized to the provider.
                 let mut stream = agent.stream(input);
                 while let Some(item) = stream.next().await {
                     if stop_task.load(Ordering::SeqCst) {
@@ -1516,13 +1516,15 @@ mod tests {
             text: "DEVKIT-BODY: design, build, validate, publish.".to_string(),
             scope: Vec::new(),
             triggers: vec![
+                "extension".to_string(),
+                "devkit".to_string(),
                 "design".to_string(),
                 "build".to_string(),
                 "validate".to_string(),
                 "publish".to_string(),
-                "devkit".to_string(),
             ],
             commands: vec!["devkit__scaffold".to_string()],
+            tools: vec!["devkit__scaffold".to_string(), "scaffold".to_string()],
             tool_namespace: "devkit".to_string(),
             diagnostic: None,
         }
@@ -1604,8 +1606,118 @@ mod tests {
             request.manifest
         );
         assert!(
-            request.manifest.contains("not relevant to this turn"),
+            request
+                .manifest
+                .contains("not relevant to this contribution"),
             "the manifest carries the omission reason: {}",
+            request.manifest
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A deferred extension capability is absent from the initial array but
+    /// still admitted; on a work turn it activates the extension's guidance
+    /// (issue #436 review).
+    #[test]
+    fn an_admitted_deferred_capability_activates_the_extension() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut provider = agent::agent::agentic::LlmProvider::new();
+        provider.register_vendor(
+            "mock".to_string(),
+            Box::new(RequestCapturingLlm(seen.clone())),
+        );
+        let mut agent = agent::Agent::new(
+            agent::AgentConfig {
+                model: "mock-model".to_string(),
+                ..Default::default()
+            },
+            Arc::new(provider),
+        );
+        agent.add_tool(Arc::new(agent::tools::FunctionTool::new(
+            "devkit__scaffold",
+            "scaffold a package",
+            serde_json::json!({"type": "object"}),
+            |_args| Ok(serde_json::json!({"ok": true})),
+        )));
+        // The tool is admitted but withheld from the initial array.
+        agent.set_initial_tool_scope(react::tool::admission::InitialToolScope::new(
+            ["read_file"],
+            Vec::<String>::new(),
+        ));
+        agent.add_conditional_prompt(devkit_prompt());
+        let root = workspace("extension-capability");
+        let mut runner = Runner::new();
+        let receiver = spawn_turn(
+            &mut runner,
+            "extension-capability",
+            Arc::new(agent),
+            "fix the failing build",
+            &root,
+        );
+        drain(receiver);
+
+        let requests = seen.lock().unwrap();
+        let messages = format!("{:?}", requests.last().expect("a request").messages);
+        assert!(
+            messages.contains("DEVKIT-BODY"),
+            "the admitted capability activates its guidance: {messages}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Contributions are selected one by one: a task that matches only the
+    /// later contribution includes it and reports the first as omitted, with
+    /// each contribution's own reason (issue #436 review).
+    #[test]
+    fn extension_contributions_are_selected_and_reported_individually() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = request_capturing_agent(seen.clone());
+        let mut guide = devkit_prompt();
+        guide.id = "guide".to_string();
+        guide.text = "GUIDE-BODY".to_string();
+        guide.triggers = vec!["extension".to_string(), "build".to_string()];
+        let mut checklist = devkit_prompt();
+        checklist.id = "checklist".to_string();
+        checklist.text = "CHECKLIST-BODY".to_string();
+        checklist.triggers = vec!["checklist".to_string(), "validate".to_string()];
+        agent.add_conditional_prompt(guide);
+        agent.add_conditional_prompt(checklist);
+
+        let root = workspace("extension-contributions");
+        let mut runner = Runner::new();
+        let receiver = spawn_turn(
+            &mut runner,
+            "extension-contributions",
+            agent,
+            "validate the checklist",
+            &root,
+        );
+        drain(receiver);
+
+        let requests = seen.lock().unwrap();
+        let request = requests.last().expect("a request");
+        let messages = format!("{:?}", request.messages);
+        assert!(messages.contains("CHECKLIST-BODY"), "{messages}");
+        assert!(!messages.contains("GUIDE-BODY"), "{messages}");
+        assert!(
+            request
+                .manifest
+                .contains("com.example.devkit@1.2.0#checklist#prompt"),
+            "the included contribution is named: {}",
+            request.manifest
+        );
+        assert!(
+            request
+                .manifest
+                .contains("com.example.devkit@1.2.0#guide#prompt"),
+            "the omitted contribution is named: {}",
+            request.manifest
+        );
+        assert!(
+            request
+                .manifest
+                .contains("not relevant to this contribution"),
+            "the omission carries its reason: {}",
             request.manifest
         );
         let _ = std::fs::remove_dir_all(&root);

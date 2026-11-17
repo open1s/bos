@@ -359,6 +359,10 @@ pub struct ConditionalPrompt {
     /// Qualified commands owned by the extension; invoking one activates the
     /// extension's contributions explicitly.
     pub commands: Vec<String>,
+    /// Model-facing tool names the extension contributes (qualified and local).
+    /// Naming one in the task activates the extension's context even when the
+    /// tool itself is withheld from the initial array (issues #435/#436).
+    pub tools: Vec<String>,
     /// Sanitized namespace prefix every extension tool name starts with, without
     /// the trailing `__`.
     pub tool_namespace: String,
@@ -1661,6 +1665,17 @@ impl Agent {
     /// provider's cached prompt prefix.
     pub fn model_tools(&self) -> Vec<react::llm::LlmTool> {
         self.tool_admission().tools
+    }
+
+    /// Every tool the current Runtime/Workspace Capability View admits,
+    /// including definitions the initial array withholds.
+    ///
+    /// Extension prompt activation reads THIS, never the model-visible array:
+    /// an admitted deferred capability is absent from the request by design, and
+    /// its absence must not make its extension invisible to activation (issue
+    /// #436). Invocation authorization is still a separate decision.
+    pub fn capability_tool_names(&self) -> Vec<String> {
+        self.all_tools().into_iter().map(|tool| tool.name).collect()
     }
 
     /// Register an extension tool without requiring a mutable Agent.

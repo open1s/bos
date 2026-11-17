@@ -562,7 +562,15 @@ impl Agent {
                 }
             }
         };
-        let result = react::template::with_memory(&base, memory.block.as_deref());
+        // Recalled memory is untrusted data, not host policy. It stays in the
+        // system channel, but inside an explicit envelope so the role cannot
+        // promote it (issue #434 review).
+        let wrapped_memory = memory.block.as_deref().map(|block| {
+            format!(
+                "<untrusted_context source=\"retrieved-memory\" trust=\"untrusted-data\">\n{block}\n</untrusted_context>"
+            )
+        });
+        let result = react::template::with_memory(&base, wrapped_memory.as_deref());
         let assembly = PromptAssembly {
             system_prompt: result,
             base_prompt: base,

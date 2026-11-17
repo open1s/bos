@@ -465,7 +465,22 @@ impl ContextBlock {
     /// footer is generated from the typed block, so the request text cannot
     /// drift from the snapshot.
     pub(crate) fn provider_text_with(&self, manifest: Option<&str>) -> String {
-        let mut text = self.text.clone();
+        // Trust is a property of the BLOCK, not of the role the provider sees.
+        // Untrusted text is wrapped in an explicit envelope even though every
+        // context row now rides as a system message (issue #434): a role cannot
+        // be trusted to carry the distinction on its own, so the request marks
+        // it structurally and the host policy block states it.
+        let mut text = String::new();
+        if self.trust == Trust::UntrustedData {
+            text.push_str(&format!(
+                "<untrusted_context source=\"{}\" trust=\"untrusted-data\">\n",
+                self.source.label()
+            ));
+            text.push_str(&self.text);
+            text.push_str("\n</untrusted_context>");
+        } else {
+            text.push_str(&self.text);
+        }
         if let Some(manifest) = manifest {
             text.push_str("\nBSH-CONTEXT-MANIFEST-V1 ");
             text.push_str(manifest);

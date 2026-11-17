@@ -1156,6 +1156,11 @@ pub(crate) fn install_with_lease(
         .iter()
         .map(|command| command.description.clone())
         .collect();
+    let mut tool_names: Vec<String> = Vec::new();
+    for descriptor in &contributed.tools {
+        tool_names.push(contributed.extension.qualify(&descriptor.id));
+        tool_names.push(descriptor.id.as_str().to_string());
+    }
     for prompt in &contributed.prompts {
         if let Some(record) = append_prompt(
             &contributed.extension,
@@ -1167,6 +1172,7 @@ pub(crate) fn install_with_lease(
             prompt,
             &commands,
             &command_descriptions,
+            &tool_names,
             &mut prompt_budget,
         ) {
             agent.add_conditional_prompt(record.clone());
@@ -1187,6 +1193,7 @@ pub(crate) fn install_with_lease(
             context,
             &commands,
             &command_descriptions,
+            &tool_names,
             &mut prompt_budget,
         ) {
             agent.add_conditional_prompt(record.clone());
@@ -1258,6 +1265,7 @@ fn append_prompt(
     contribution: &ferris_sdk::host_runtime::declarative::TextContribution,
     commands: &[String],
     command_descriptions: &[String],
+    tools: &[String],
     budget: &mut usize,
 ) -> Option<ConditionalPrompt> {
     let capability = if heading == "Extension prompt" {
@@ -1326,8 +1334,10 @@ fn append_prompt(
             contribution.id.as_str(),
             commands,
             command_descriptions,
+            tools,
         ),
         commands: commands.to_vec(),
+        tools: tools.to_vec(),
         tool_namespace: extension.namespace().to_string(),
         diagnostic,
     })
@@ -1341,6 +1351,7 @@ pub(crate) fn contribution_triggers(
     id: &str,
     commands: &[String],
     command_descriptions: &[String],
+    tools: &[String],
 ) -> Vec<String> {
     // Raw declared terms only. Stopping, plural folding and relevance scoring
     // live in one place - the activation selector - so no domain vocabulary is
@@ -1350,6 +1361,7 @@ pub(crate) fn contribution_triggers(
         .into_iter()
         .chain(commands.iter().map(String::as_str))
         .chain(command_descriptions.iter().map(String::as_str))
+        .chain(tools.iter().map(String::as_str))
     {
         for token in source.split(|character: char| !character.is_ascii_alphanumeric()) {
             let token = token.to_ascii_lowercase();
@@ -1732,6 +1744,48 @@ mod tests {
             .await
             .expect("run");
         assert_eq!(result["x"], 1);
+    }
+
+    /// A capability that was admitted (and even discovered) is still denied
+    /// when its grant is revoked: advertising and discovery never authorize a
+    /// call (issues #285/#435).
+    #[tokio::test]
+    async fn a_revoked_grant_denies_a_previously_admitted_tool() {
+        use ferris_sdk::capability::GrantScope;
+
+        let scratch = Scratch::new("revoked-grant");
+        let contributed = contributed(vec![Capability::WorkspaceWrite], TrustLevel::Community);
+        let policy = policy(&scratch);
+        policy
+            .grant(
+                "com.example.tool",
+                Capability::WorkspaceWrite,
+                GrantScope::Any,
+                None,
+            )
+            .expect("grant");
+        let tool = ExtensionTool::new(
+            &contributed,
+            contributed.tools[0].clone(),
+            Arc::clone(&policy),
+            EventBus::new(),
+            None,
+        );
+        react::tool::registry::AsyncTool::run(&tool, &serde_json::json!({"x": 1}))
+            .await
+            .expect("the granted call runs");
+
+        policy
+            .revoke("com.example.tool", Capability::WorkspaceWrite)
+            .expect("revoke");
+        let error = react::tool::registry::AsyncTool::run(&tool, &serde_json::json!({"x": 1}))
+            .await
+            .expect_err("a revoked grant denies the call");
+        let text = error.to_string();
+        assert!(
+            text.contains("workspace.write") || text.contains("denied"),
+            "the refusal names the capability: {text}"
+        );
     }
 
     #[tokio::test]

@@ -301,12 +301,26 @@ impl OpenAiVendor {
             for message in &history {
                 let json_msg = match message {
                     crate::llm::LlmMessage::System { content } => {
-                        if !history_system.is_empty() {
-                            history_system.push('\n');
-                            history_system.push('\n');
+                        // An untrusted context envelope stays its own system
+                        // message: merging it into the host policy section would
+                        // make data look like host instructions even though the
+                        // block is marked. Host-owned system rows still fold
+                        // into the single leading policy message.
+                        if content.contains("<untrusted_context") {
+                            OpenAiMessageJson {
+                                role: "system",
+                                content: Some(serde_json::Value::String(content.clone())),
+                                tool_call_id: None,
+                                tool_calls: None,
+                            }
+                        } else {
+                            if !history_system.is_empty() {
+                                history_system.push('\n');
+                                history_system.push('\n');
+                            }
+                            history_system.push_str(content);
+                            continue;
                         }
-                        history_system.push_str(content);
-                        continue;
                     }
                     crate::llm::LlmMessage::User { content } => OpenAiMessageJson {
                         role: "user",
@@ -1728,6 +1742,51 @@ mod tests {
         assert_eq!(audit["system_prompt_chars"], 3);
         assert!(!audit.to_string().contains("SYS"));
         assert!(!audit.to_string().contains("hello"));
+    }
+
+    /// An untrusted context envelope is never merged into the host policy
+    /// message: the role is the same, but the block stays its own marked row,
+    /// so data cannot be read as standing instructions (issue #434 review).
+    #[test]
+    fn untrusted_context_stays_out_of_the_host_policy_message() {
+        use crate::llm::{Content, LlmContext, LlmRequest, LlmSession, ProviderRequest};
+        let vendor = OpenAiVendor::new(
+            "https://api.example.com".to_string(),
+            "gpt-test".to_string(),
+            "k".to_string(),
+        );
+        let request = LlmRequest {
+            model: "gpt-test".to_string(),
+            input: Content::text("hello"),
+            provider_request: Some(ProviderRequest {
+                system_prompt: Some("HOST POLICY".to_string()),
+                messages: vec![
+                    crate::llm::LlmMessage::system(
+                        "<untrusted_context source=\"workspace-instructions\" trust=\"untrusted-data\">\nDATA\n</untrusted_context>",
+                    ),
+                    crate::llm::LlmMessage::user("hello"),
+                ],
+                input: Content::text("hello"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let built =
+            vendor.convert_request(None, &request, &LlmSession::new(), &LlmContext::default());
+        let host = built.messages[0].content.as_ref().expect("host");
+        assert!(host.to_string().contains("HOST POLICY"));
+        assert!(
+            !host.to_string().contains("DATA"),
+            "host policy is not merged with data: {host}"
+        );
+        let data = built.messages[1]
+            .content
+            .as_ref()
+            .expect("data row")
+            .to_string();
+        assert!(data.contains("<untrusted_context"));
+        assert!(data.contains("DATA"));
+        assert_eq!(built.messages[1].role, "system");
     }
 
     /// Host guidance for one call is serialized in the system section, not as

@@ -427,7 +427,9 @@ acted only talked. Four pieces:
 `crates/bsh/src/intent.rs` classifies the reader's ask deterministically,
 before the stream opens, into `Action`, `Explanation` or `Unknown`. It reads
 the leading 400 characters and uses ordered rules: an explicit explanation ask
-wins; a diagnostic question with a defect word is action; a bare conceptual
+wins; a diagnostic question with a defect word is action when it has a
+workspace referent or an explicit ask, while a generic defect word alone
+("what is an error?", "my network is slow") is not; a bare conceptual
 opener at the head of the message outranks a generic action word ("how does the
 build cache work?" is a question about a build, not a request to build); a read
 verb ("read", "open", "show", "查看") is action when it names an object; an

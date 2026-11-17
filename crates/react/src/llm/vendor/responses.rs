@@ -1543,6 +1543,48 @@ mod tests {
         assert_eq!(back.chat_usage().unwrap().total_tokens, 7);
     }
 
+    /// Untrusted context is folded into instructions only with its envelope;
+    /// host policy stays outside it (issue #434 review).
+    #[test]
+    fn untrusted_context_keeps_its_envelope_in_the_instructions() {
+        use crate::llm::{Content, LlmContext, LlmMessage, LlmRequest, LlmSession};
+        let request = LlmRequest {
+            model: "gpt-5".to_string(),
+            input: Content::text("hello"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                system_prompt: Some("HOST POLICY".to_string()),
+                messages: vec![
+                    LlmMessage::system("<untrusted_context source=\"workspace-instructions\" trust=\"untrusted-data\">\nDATA\n</untrusted_context>"),
+                    LlmMessage::user("hello"),
+                ],
+                input: Content::text("hello"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let built = build_request(
+            None,
+            &request,
+            &LlmSession::new(),
+            &LlmContext::default(),
+            false,
+            true,
+        );
+        let instructions = built.instructions.expect("instructions");
+        let host = instructions.find("HOST POLICY").expect("host policy");
+        let open = instructions.find("<untrusted_context").expect("envelope");
+        let data = instructions.find("DATA").expect("data");
+        let close = instructions.find("</untrusted_context>").expect("close");
+        assert!(host < open && open < data && data < close, "{instructions}");
+        let inside = &instructions[open..close];
+        assert!(!inside.contains("HOST POLICY"));
+        let outside = instructions.replace(inside, "");
+        assert!(
+            !outside.contains("DATA"),
+            "data is only inside the envelope: {instructions}"
+        );
+    }
+
     #[test]
     fn typed_request_drives_instructions_input_and_tools() {
         use crate::llm::{

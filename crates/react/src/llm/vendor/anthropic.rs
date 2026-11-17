@@ -834,6 +834,43 @@ mod tests {
         assert!(capped.system.is_none());
     }
 
+    /// Untrusted context keeps its explicit envelope inside Anthropic's one
+    /// system channel; the host policy section is written first, and the data
+    /// is never bare (issue #434 review).
+    #[test]
+    fn untrusted_context_is_marked_inside_the_system_channel() {
+        use crate::llm::{Content, LlmMessage, LlmRequest};
+        let vendor = super::tests::vendor();
+        let request = LlmRequest {
+            model: "claude-3-5-sonnet-latest".to_string(),
+            input: Content::text("hello"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                system_prompt: Some("HOST POLICY".to_string()),
+                messages: vec![
+                    LlmMessage::system("<untrusted_context source=\"workspace-instructions\" trust=\"untrusted-data\">\nDATA\n</untrusted_context>"),
+                    LlmMessage::user("hello"),
+                ],
+                input: Content::text("hello"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let built = vendor.build_request(&None, &request, &(), &());
+        let system = built.system.expect("system");
+        let host = system.find("HOST POLICY").expect("host policy");
+        let open = system.find("<untrusted_context").expect("envelope");
+        let data = system.find("DATA").expect("data");
+        let close = system.find("</untrusted_context>").expect("close");
+        assert!(host < open && open < data && data < close, "{system}");
+        let inside = &system[open..close];
+        assert!(!inside.contains("HOST POLICY"));
+        let outside = system.replace(inside, "");
+        assert!(
+            !outside.contains("DATA"),
+            "data is only inside the envelope: {system}"
+        );
+    }
+
     #[test]
     fn typed_request_supplies_messages_system_and_tools() {
         use crate::llm::{Content, HostGuidance, LlmMessage, LlmRequest, LlmTool};
