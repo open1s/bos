@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "scenarios": [
+    { "id": "contract_creation_persists", "verification": "artifact" },
+    { "id": "attempt_binding_isolated", "verification": "artifact" },
+    { "id": "sandbox_timeout_stops_command", "verification": "command" },
+    { "id": "artifact_symlink_escape_refused", "verification": "artifact" }
+  ]
+}

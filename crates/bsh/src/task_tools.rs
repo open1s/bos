@@ -3386,11 +3386,72 @@ mod tests {
         .await;
         assert_eq!(unsandboxed.status, VerificationStatus::Inconclusive);
 
+        // A command that overruns the controlled shell's deadline is stopped
+        // by that runtime, not left running behind a timed-out await. This is
+        // the same BashTool path normal task execution uses (issue #418).
+        use agent::tools::bash::BashToolConfig;
+        use agent::Tool as _;
+        let bash = agent::tools::BashTool::new("bash")
+            .with_config(BashToolConfig {
+                timeout_secs: 1,
+                ..Default::default()
+            })
+            .with_workspace(root.to_str().expect("utf-8 workspace"));
+        let timed: VerificationShell = std::sync::Arc::new(move |command: &str| {
+            let response = bash
+                .run(&json!({ "command": command }))
+                .map_err(|error| format!("{error:?}"))?;
+            let code = response
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1) as i32;
+            Ok((code, String::new()))
+        });
+        let started = std::time::Instant::now();
+        let timeout = verify_contract(
+            &VerificationContract::Command {
+                command: "sleep 5".to_string(),
+            },
+            &root,
+            Some(&timed),
+        )
+        .await;
+        assert_ne!(timeout.status, VerificationStatus::Passed);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "the verifier returned after the controlled timeout"
+        );
+
         let review = verify_contract(&VerificationContract::Review, &root, None).await;
         assert_eq!(review.status, VerificationStatus::Inconclusive);
         assert!(!review.is_verified());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The task-side reliability scenarios are checked in and the corpus
+    /// version is pinned, so the harness cannot silently shrink (issue #423).
+    #[test]
+    fn task_reliability_corpus_is_checked_in() {
+        let corpus: Value =
+            serde_json::from_str(include_str!("../tests/data/reliability_tasks.json"))
+                .expect("corpus parses");
+        assert_eq!(corpus["version"].as_u64(), Some(1));
+        let ids: Vec<&str> = corpus["scenarios"]
+            .as_array()
+            .expect("scenarios")
+            .iter()
+            .map(|scenario| scenario["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "contract_creation_persists",
+                "attempt_binding_isolated",
+                "sandbox_timeout_stops_command",
+                "artifact_symlink_escape_refused",
+            ]
+        );
     }
 
     /// An unknown id is a refusal, not an empty report.

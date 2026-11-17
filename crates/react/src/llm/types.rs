@@ -848,7 +848,7 @@ pub struct ProviderRequestSource {
 /// It rides on LlmRequest but is never serialized to a provider: adapters
 /// flatten it into roles and text, and the recording seam can prove the request
 /// came from one snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderRequest {
     /// Composition identity (SHA-256 hex, no block text).
     pub composition: String,

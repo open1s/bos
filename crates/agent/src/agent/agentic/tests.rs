@@ -3547,6 +3547,32 @@ async fn compact_now_installs_a_model_written_checkpoint() {
     );
 }
 
+/// The described request carries the exact system prompt, history, model and
+/// advertised tools of the call (issue #421).
+#[test]
+fn the_provider_request_describes_the_exact_call() {
+    let agent = agent_with_summary("summary");
+    agent.set_provider_request(Some(react::llm::ProviderRequest::default()));
+    agent.session().add_user("hello".to_string());
+    let tools = vec![react::llm::LlmTool {
+        name: "bash".to_string(),
+        description: "run".to_string(),
+        parameters: serde_json::json!({"type": "object"}),
+        kind: Default::default(),
+        config: None,
+    }];
+    let described = agent
+        .describe_provider_request("system", &tools)
+        .expect("a typed request");
+    assert_eq!(described.system_prompt.as_deref(), Some("system"));
+    assert_eq!(described.model, agent.config().model);
+    assert!(
+        format!("{:?}", described.messages).contains("hello"),
+        "the history rides on the request"
+    );
+    assert_eq!(described.tool_names, vec!["bash".to_string()]);
+}
+
 /// A summary missing required sections is rejected before installation and
 /// the history is left untouched (issue #420).
 #[tokio::test]
