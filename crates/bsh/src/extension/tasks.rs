@@ -431,6 +431,22 @@ pub(crate) enum ApprovalDecision {
     Rejected,
 }
 
+/// The effective lifecycle state of one approval (issue #433).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ApprovalState {
+    /// Approved and currently usable.
+    Approved,
+    /// Rejected.
+    Rejected,
+    /// Explicitly revoked.
+    Revoked,
+    /// Past its expiry.
+    Expired,
+    /// Replaced by a newer approval.
+    Superseded,
+}
+
 /// A structured approval bound to one attempt (issue #433).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ApprovalReference {
@@ -446,6 +462,9 @@ pub(crate) struct ApprovalReference {
     pub(crate) evidence: String,
     /// A stable external reference id.
     pub(crate) reference: String,
+    /// Digest of the exact task/attempt/artifact content this approval covers.
+    #[serde(default)]
+    pub(crate) content_digest: String,
     /// When the approval was recorded.
     pub(crate) recorded_ms: u64,
     /// Optional expiry.
@@ -457,6 +476,25 @@ pub(crate) struct ApprovalReference {
     /// The approval that superseded this one, when any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) superseded_by: Option<String>,
+}
+
+impl ApprovalReference {
+    /// The lifecycle state at `now` (issue #433).
+    pub(crate) fn state(&self, now: u64) -> ApprovalState {
+        if self.revoked_ms.is_some() {
+            return ApprovalState::Revoked;
+        }
+        if self.superseded_by.is_some() {
+            return ApprovalState::Superseded;
+        }
+        if self.expires_ms.is_some_and(|expiry| now > expiry) {
+            return ApprovalState::Expired;
+        }
+        match self.decision {
+            ApprovalDecision::Approved => ApprovalState::Approved,
+            ApprovalDecision::Rejected => ApprovalState::Rejected,
+        }
+    }
 }
 
 /// A task-specific verification contract (issue #414).

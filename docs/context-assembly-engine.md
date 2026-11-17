@@ -100,18 +100,23 @@ Two identities are reported per assembly:
   block shapes (source, trust, provenance, inclusion) plus source versions: the
   persona's keyed digest or, without a key, a coarse length/token label; the
   workspace instruction digest and file names; each recalled memory
-  `<record-id>@<revision>`; the tool-guidance/schema digest; the provider/model,
-  provider adapter version and API mode; the memory revision; and the turn
-  number. It never contains block text.
+  `<record-id>@<revision>`; the tool-guidance/schema digest and format
+  revision; the provider/model, adapter implementation version, API mode and
+  endpoint digest; the memory snapshot revision and record-schema version; the
+  keyed/coarse system-prompt version; the semantics-bearing runtime-config digest;
+  session identity and coarse state version; and the turn number. It never
+  contains block text. Diagnostic-only values such as token estimates do not
+  move it.
 - **Content** (`ContextFingerprint::content`, HMAC-SHA256): canonicalized block
   bytes under `BSH_CONTEXT_CONTENT_KEY`, present only when that key is set.
   Without a key no content identity is produced, so logs cannot be dictionary-
   attacked.
 
 Intentional exclusions: provider registration order (BSH models no provider
-list at this layer), the session id (not known to the assembly call), and the
-content of persona, workspace and memory blocks from the composition identity.
-Logs distinguish the two values; the content one is `-` unless keyed.
+list at this layer) and the raw content of persona, workspace and memory blocks
+from the composition identity. Session identity/state are included when the host
+knows them. Logs distinguish both identities; the content one is `-` unless
+keyed.
 
 ### Typed provider request (issue #421)
 
@@ -122,8 +127,11 @@ the engine moves messages into its request buffer. The request
 fields are then taken from that same value: model, input, temperature, token
 cap, reasoning effort, API mode, full message history, system prompt and
 complete tool definitions, alongside composition/content/execution identities,
-the content key id, the block manifest and each block's source, trust,
-provenance and token estimate. It is attached to the request but never
+the content key id, the block manifest, each block's source, trust, provenance
+and token estimate, and a `versions` map (provider, adapter, endpoint, API mode,
+tool schema/revision, memory revision/schema, system prompt, runtime config,
+session/state and turn) for audit and historical request reconstruction. It is
+attached to the request but never
 serialized to the provider; adapters serialize it into roles and text and no
 longer read the live session/context for system prompt, messages or tools. A
 recording provider can structurally compare its snapshot with the wire payload;

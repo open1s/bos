@@ -873,6 +873,24 @@ mod tests {
             |versions: &mut SourceVersions| {
                 versions.memory_revision = Some("memory/2".to_string());
             },
+            |versions: &mut SourceVersions| {
+                versions.memory_schema = Some("memory-schema/2".to_string());
+            },
+            |versions: &mut SourceVersions| {
+                versions.provider_endpoint = Some("endpoint/2".to_string());
+            },
+            |versions: &mut SourceVersions| {
+                versions.system_prompt = Some("prompt/2".to_string());
+            },
+            |versions: &mut SourceVersions| {
+                versions.runtime_config = Some("runtime/2".to_string());
+            },
+            |versions: &mut SourceVersions| {
+                versions.tool_schema_revision = Some("tools/2".to_string());
+            },
+            |versions: &mut SourceVersions| {
+                versions.session_state = Some("messages/2".to_string());
+            },
         ] {
             let mut changed = versions.clone();
             mutate(&mut changed);
@@ -904,6 +922,14 @@ mod tests {
         let unkeyed = ContextFingerprint::compute(&blocks, &versions, None);
         assert!(unkeyed.content.is_none(), "no key, no content identity");
         assert_eq!(unkeyed.composition, a.composition);
+
+        // A diagnostic-only token estimate must not move a semantic identity.
+        let mut diagnostic = blocks.clone();
+        diagnostic[0].token_estimate += 100;
+        let unchanged =
+            ContextFingerprint::compute(&diagnostic, &versions, Some((b"test-key", None)));
+        assert_eq!(a.composition, unchanged.composition);
+        assert_eq!(a.execution, unchanged.execution);
     }
 
     /// The report reflects the typed assembly across success, missing
@@ -1169,6 +1195,17 @@ mod tests {
         assert_eq!(request.manifest, snapshot.provider_manifest());
         assert_eq!(request.sources.len(), 2);
         assert_eq!(request.sources[0].source, "persona");
+        assert_eq!(
+            request.versions.get("provider").map(String::as_str),
+            Some("vendor/model")
+        );
+        assert_eq!(
+            request.versions.get("tool_guidance").map(String::as_str),
+            Some("tool-guidance@1")
+        );
+        let audit = request.audit();
+        assert_eq!(audit["versions"]["model"], serde_json::Value::Null);
+        assert!(audit["versions"]["provider"] == "vendor/model");
         // The wire never carries the typed envelope.
         let llm = react::llm::LlmRequest {
             provider_request: Some(request.clone()),

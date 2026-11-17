@@ -602,6 +602,8 @@ pub(crate) struct RightPanel {
     pub(crate) tasks: std::cell::RefCell<Option<std::rc::Rc<Vec<crate::extension::tasks::Task>>>>,
     /// Task rows whose detail is expanded.
     pub(crate) expanded: std::collections::BTreeSet<String>,
+    /// The last approval failure shown in the task detail (issue #433).
+    pub(crate) task_approval_error: Option<String>,
     /// Whether the History section shows its rows.
     pub(crate) history_open: bool,
     /// Whether the graph fits itself to the pane (true) or keeps a manual zoom.
@@ -4540,22 +4542,41 @@ impl Shell {
                                     bash: None,
                                     jobs: None,
                                 };
-                                let _ = crate::task_tools::approve_with(
-                                    &context,
-                                    &serde_json::json!({
-                                        "task": task_id,
-                                        "attempt_id": attempt_id,
-                                        "approver": "reader",
-                                        "decision": "approved",
-                                        "scope": task_id,
-                                        "evidence": "approved in the Tasks pane",
-                                        "reference": format!("ui-{}", attempt_id)
-                                    }),
-                                );
-                                *this.right.tasks.borrow_mut() = None;
+                                let result = match crate::state::host_identity() {
+                                    Some(approver) => crate::task_tools::approve_with(
+                                        &context,
+                                        &serde_json::json!({
+                                            "task": task_id,
+                                            "attempt_id": attempt_id,
+                                            "approver": approver,
+                                            "decision": "approved",
+                                            "scope": task_id,
+                                            "evidence": "approved in the Tasks pane",
+                                            "reference": format!("ui-{}", attempt_id)
+                                        }),
+                                    ),
+                                    None => Err(agent::ToolError::Failed(
+                                        "no authenticated host identity is available".to_string(),
+                                    )),
+                                };
+                                match result {
+                                    Ok(_) => {
+                                        this.right.task_approval_error = None;
+                                        *this.right.tasks.borrow_mut() = None;
+                                    }
+                                    Err(error) => {
+                                        this.right.task_approval_error = Some(format!(
+                                            "{}: {error:?}",
+                                            lang.tr("right.tasks.approveFailed")
+                                        ));
+                                    }
+                                }
                                 cx.notify();
                             })),
                     );
+                }
+                if let Some(error) = &self.right.task_approval_error {
+                    detail = detail.child(txt(error.clone(), 11.0, theme::error()));
                 }
             }
             if !record.attempts.is_empty() {

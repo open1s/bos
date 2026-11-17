@@ -251,6 +251,23 @@ impl OpenAiVendor {
         self
     }
 
+    /// A redacted diagnostic preview of the wire payload this adapter builds
+    /// from a typed request (issue #431). Tests use it to prove the adapter
+    /// serializes the ProviderRequest rather than rebuilding from the session.
+    pub fn wire_preview<S: ReactSession, C: ReactContext>(
+        request: &LlmRequest,
+        session: &S,
+        context: &C,
+    ) -> serde_json::Value {
+        let vendor = OpenAiVendor::new(
+            "http://localhost".to_string(),
+            request.model.clone(),
+            "preview".to_string(),
+        );
+        serde_json::to_value(vendor.convert_request(None, request, session, context))
+            .unwrap_or_default()
+    }
+
     /// Start building an OpenAI vendor.
     pub fn builder() -> OpenAiVendorBuilder {
         OpenAiVendorBuilder::new()

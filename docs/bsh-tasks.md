@@ -147,10 +147,20 @@ the task.
 
 Review/human contracts are executable through a HOST-ONLY approval API
 (`approve_with`), not a model tool: a model that can call the approval path can
-forge an approver identity. A structured approval records approver, decision,
-scope, evidence, external reference, attempt id and optional expiry. Approval
-resolution ignores revoked, expired, superseded or attempt-mismatched records;
-the approval history is retained for audit and survives restart. A passed
+forge an approver identity. The Tasks-pane action derives the approver from the
+authenticated local host identity (`state::host_identity` -> `os:<user>`), not a
+fixed literal, and shows the API error inline when an approval fails.
+
+A structured approval records approver, decision, attempt, evidence, external
+reference, optional expiry, revocation/supersession state and a content digest
+covering task intent, attempt status/result/error, contract and artifact bytes.
+Changing any of that content invalidates the approval; join re-evaluates
+approval contracts on every settle. A newer approval for the same attempt and
+scope supersedes the prior active one. Scope must be the task id or a narrower
+`task:<id>:...` scope; global `*` approvals are refused. Revoked, expired,
+superseded, attempt-mismatched and content-mismatched approvals are
+Inconclusive; rejected approvals are Failed. History is retained for audit and
+survives restart. A passed
 report is only accepted when it names a non-model verifier and carries evidence.
 
 The verifier command runs through the turn's controlled shell (the same

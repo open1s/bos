@@ -14,9 +14,9 @@ use serde_json::{json, Value};
 
 use crate::extension::runs::{Limits, RunSpec, RunState, RunTier, Runs};
 use crate::extension::tasks::{
-    self, ApprovalDecision, ApprovalReference, Attempt, AttemptStatus, FileTasksStore, Host,
-    Origin, Task, TaskStatus, TasksStore, Tier, Trigger, VerificationContract,
-    VerificationEvidence, VerificationReport, VerificationStatus,
+    self, ApprovalDecision, ApprovalReference, ApprovalState, Attempt, AttemptStatus,
+    FileTasksStore, Host, Origin, Task, TaskStatus, TasksStore, Tier, Trigger,
+    VerificationContract, VerificationEvidence, VerificationReport, VerificationStatus,
 };
 
 /// What the tools need to know about the turn they run in.
@@ -403,22 +403,73 @@ pub(crate) fn approve_with(context: &TaskToolsContext, args: &Value) -> Result<V
         )));
     }
     let expires_ms = args.get("expires_ms").and_then(Value::as_u64);
+    let scope = args
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| record.id.clone());
+    if scope == "*" || (scope != record.id && !scope.starts_with(&format!("{}:", record.id))) {
+        return Err(ToolError::InvalidInput(
+            "approval scope must be the task id or a narrower task:<id>:... scope; global approval is refused"
+                .to_string(),
+        ));
+    }
+    if record
+        .approvals
+        .iter()
+        .any(|approval| approval.reference == reference)
+    {
+        return Err(ToolError::InvalidInput(format!(
+            "approval reference {reference} already exists"
+        )));
+    }
+    let content_digest = approval_target_digest(&record, &attempt_id, &context.workspace)
+        .ok_or_else(|| ToolError::Failed("approval content could not be hashed".to_string()))?;
+    // A newer approval for the same attempt/scope supersedes the prior active
+    // one, leaving an explicit audit trail rather than silently replacing it.
+    for prior in &mut record.approvals {
+        if prior.attempt_id == attempt_id
+            && prior.scope == scope
+            && matches!(
+                prior.state(now),
+                ApprovalState::Approved | ApprovalState::Rejected
+            )
+        {
+            prior.superseded_by = Some(reference.clone());
+        }
+    }
     record.approvals.push(ApprovalReference {
-        attempt_id,
+        attempt_id: attempt_id.clone(),
         approver: approver.to_string(),
         decision,
-        scope: args
-            .get("scope")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| record.id.clone()),
+        scope,
         evidence,
         reference,
+        content_digest,
         recorded_ms: now,
         expires_ms,
         revoked_ms: None,
         superseded_by: None,
     });
+    // A new approval/rejection must be re-resolved by the next join.
+    let current = record.attempts.last().map(|attempt| attempt.id.clone());
+    if current.as_deref() == Some(attempt_id.as_str()) {
+        let mut report = VerificationReport {
+            status: VerificationStatus::Inconclusive,
+            attempt_id: Some(attempt_id),
+            verifier: Some("approval".to_string()),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence: Vec::new(),
+            message: Some("approval recorded; awaiting join".to_string()),
+        };
+        record.verification = report.clone();
+        if let Some(attempt) = record.attempts.last_mut() {
+            attempt.verification = std::mem::take(&mut report);
+        }
+    }
     FileTasksStore
         .save(&context.workspace, &record)
         .map_err(|error| ToolError::Failed(format!("the task could not be saved: {error}")))?;
@@ -2146,19 +2197,27 @@ pub(crate) async fn join_with(
         // Execution success is not verification. A settled successful task
         // with a contract is verified by the runtime here, not by the model's
         // prose report (issue #414).
+        let approval_contract = matches!(
+            record.verification_contract,
+            Some(VerificationContract::Review | VerificationContract::Human)
+        );
         if state.is_settled()
             && record.status == TaskStatus::Succeeded
-            && !matches!(
-                record.verification.status,
-                VerificationStatus::Passed | VerificationStatus::Failed
-            )
+            && (approval_contract
+                || !matches!(
+                    record.verification.status,
+                    VerificationStatus::Passed | VerificationStatus::Failed
+                ))
         {
             if let Some(contract) = record.verification_contract.clone() {
                 let attempt_id = record.attempts.last().map(|attempt| attempt.id.clone());
                 let mut report = match &contract {
-                    VerificationContract::Review | VerificationContract::Human => {
-                        approval_report(record, attempt_id.as_deref().unwrap_or(""), now)
-                    }
+                    VerificationContract::Review | VerificationContract::Human => approval_report(
+                        record,
+                        attempt_id.as_deref().unwrap_or(""),
+                        now,
+                        &context.workspace,
+                    ),
                     _ => {
                         verify_contract(&contract, &context.workspace, verification_shell.as_ref())
                             .await
@@ -2211,17 +2270,53 @@ pub(crate) async fn join_with(
     }))
 }
 
-/// SHA-256 of a file's bytes, lowercase hex.
-fn file_sha256(path: &std::path::Path) -> std::io::Result<String> {
+/// SHA-256 of arbitrary bytes, lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path)?;
-    let digest = Sha256::digest(&bytes);
+    let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
     }
-    Ok(out)
+    out
+}
+
+/// SHA-256 of a file's bytes, lowercase hex.
+fn file_sha256(path: &std::path::Path) -> std::io::Result<String> {
+    Ok(sha256_hex(&std::fs::read(path)?))
+}
+
+/// The exact content an approval covers (issue #433): task + attempt outcome +
+/// artifact bytes. Any change produces a different digest and invalidates the
+/// approval.
+fn approval_target_digest(
+    task: &Task,
+    attempt_id: &str,
+    workspace: &std::path::Path,
+) -> Option<String> {
+    let attempt = task
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)?;
+    let artifact = match &task.verification_contract {
+        Some(VerificationContract::Artifact { path, .. }) => {
+            let target = workspace.join(path);
+            file_sha256(&target).ok()
+        }
+        _ => None,
+    };
+    let payload = json!({
+        "task": task.id,
+        "intent": task.intent,
+        "attempt": attempt.id,
+        "status": attempt.status,
+        "result": attempt.result,
+        "error": attempt.error,
+        "artifact_digest": artifact,
+        "contract": task.verification_contract,
+    });
+    Some(sha256_hex(payload.to_string().as_bytes()))
 }
 
 /// Run a task's verification contract deterministically (issue #414).
@@ -2378,57 +2473,93 @@ pub(crate) async fn verify_contract(
 }
 
 /// Resolve a review/human contract from the task's approvals (issue #433).
-fn approval_report(task: &Task, attempt_id: &str, now: u64) -> VerificationReport {
+fn approval_report(
+    task: &Task,
+    attempt_id: &str,
+    now: u64,
+    workspace: &std::path::Path,
+) -> VerificationReport {
     let approval = task.approvals.iter().rev().find(|approval| {
         approval.attempt_id == attempt_id
-            && approval.revoked_ms.is_none()
-            && approval.superseded_by.is_none()
-            && approval
-                .expires_ms
-                .map(|expiry| now <= expiry)
-                .unwrap_or(true)
-            && (approval.scope == task.id || approval.scope == "*")
+            && (approval.scope == task.id || approval.scope.starts_with(&format!("{}:", task.id)))
     });
-    match approval {
-        Some(approval) if approval.decision == ApprovalDecision::Approved => VerificationReport {
-            status: VerificationStatus::Passed,
-            attempt_id: Some(attempt_id.to_string()),
-            verifier: Some(format!("approval:{}", approval.approver)),
-            verifier_version: None,
-            verified_ms: Some(now),
-            evidence: vec![VerificationEvidence {
-                kind: "approval".to_string(),
-                reference: approval.reference.clone(),
-                digest: None,
-                detail: Some(approval.evidence.clone()),
-            }],
-            message: None,
-        },
-        Some(approval) => VerificationReport {
-            status: VerificationStatus::Failed,
-            attempt_id: Some(attempt_id.to_string()),
-            verifier: Some(format!("approval:{}", approval.approver)),
-            verifier_version: None,
-            verified_ms: Some(now),
-            evidence: vec![VerificationEvidence {
-                kind: "approval".to_string(),
-                reference: approval.reference.clone(),
-                digest: None,
-                detail: Some(approval.evidence.clone()),
-            }],
-            message: Some("the approval was rejected".to_string()),
-        },
-        None => VerificationReport {
+    let Some(approval) = approval else {
+        return VerificationReport {
             status: VerificationStatus::Inconclusive,
             attempt_id: Some(attempt_id.to_string()),
             verifier: Some("approval".to_string()),
             verifier_version: None,
             verified_ms: Some(now),
             evidence: Vec::new(),
+            message: Some("no approval matches this attempt/scope".to_string()),
+        };
+    };
+    let state = approval.state(now);
+    let current_digest = approval_target_digest(task, attempt_id, workspace).unwrap_or_default();
+    let digest_matches =
+        !approval.content_digest.is_empty() && approval.content_digest == current_digest;
+    let evidence = vec![VerificationEvidence {
+        kind: "approval".to_string(),
+        reference: approval.reference.clone(),
+        digest: Some(approval.content_digest.clone()),
+        detail: Some(approval.evidence.clone()),
+    }];
+    match state {
+        ApprovalState::Approved if digest_matches => VerificationReport {
+            status: VerificationStatus::Passed,
+            attempt_id: Some(attempt_id.to_string()),
+            verifier: Some(format!("approval:{}", approval.approver)),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence,
+            message: None,
+        },
+        ApprovalState::Rejected => VerificationReport {
+            status: VerificationStatus::Failed,
+            attempt_id: Some(attempt_id.to_string()),
+            verifier: Some(format!("approval:{}", approval.approver)),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence,
+            message: Some("the approval was rejected".to_string()),
+        },
+        ApprovalState::Approved => VerificationReport {
+            status: VerificationStatus::Inconclusive,
+            attempt_id: Some(attempt_id.to_string()),
+            verifier: Some(format!("approval:{}", approval.approver)),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence,
             message: Some(
-                "no valid approval matches this attempt (missing, expired, revoked or scope mismatch)"
-                    .to_string(),
+                "the approved content changed; the approval no longer applies".to_string(),
             ),
+        },
+        ApprovalState::Revoked => VerificationReport {
+            status: VerificationStatus::Inconclusive,
+            attempt_id: Some(attempt_id.to_string()),
+            verifier: Some("approval".to_string()),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence,
+            message: Some("the approval was revoked".to_string()),
+        },
+        ApprovalState::Expired => VerificationReport {
+            status: VerificationStatus::Inconclusive,
+            attempt_id: Some(attempt_id.to_string()),
+            verifier: Some("approval".to_string()),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence,
+            message: Some("the approval expired".to_string()),
+        },
+        ApprovalState::Superseded => VerificationReport {
+            status: VerificationStatus::Inconclusive,
+            attempt_id: Some(attempt_id.to_string()),
+            verifier: Some("approval".to_string()),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence,
+            message: Some("the approval was superseded".to_string()),
         },
     }
 }
@@ -4339,6 +4470,120 @@ mod tests {
             command.contains("BSH_IDEMPOTENCY_KEY='order-7'"),
             "{command}"
         );
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// Approvals bind the exact content and supersede the previous active
+    /// approval; a changed payload invalidates the old approval (#433).
+    #[tokio::test]
+    async fn approvals_bind_content_and_supersede() {
+        let context = context("approval-content");
+        let fake = Fake::new();
+        let runs = Runs::with(fake.clone());
+        let value = create_with(
+            &runs,
+            &context,
+            &json!({
+                "intent": "Release review",
+                "retry_policy": "idempotent",
+                "verification_contract": {"kind": "review"}
+            }),
+        )
+        .await
+        .expect("created");
+        let id = value["task"].as_str().expect("id").to_string();
+        {
+            let mut runs = fake.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").state = RunState::Succeeded;
+        }
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        approve_with(
+            &context,
+            &json!({
+                "task": id,
+                "approver": "os:alice",
+                "decision": "approved",
+                "evidence": "reviewed",
+                "reference": "approval-1"
+            }),
+        )
+        .expect("approval");
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let task = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(task.verification.status, VerificationStatus::Passed);
+        assert!(!task.approvals[0].content_digest.is_empty());
+
+        // Changed content invalidates the approval.
+        let mut changed = task.clone();
+        changed.intent = "Release review with a new artifact".to_string();
+        FileTasksStore
+            .save(&context.workspace, &changed)
+            .expect("save");
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let task = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(task.verification.status, VerificationStatus::Inconclusive);
+        assert!(
+            task.verification
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("content changed"),
+            "{:?}",
+            task.verification.message
+        );
+
+        // A new approval supersedes the previous active one.
+        approve_with(
+            &context,
+            &json!({
+                "task": id,
+                "approver": "os:alice",
+                "decision": "rejected",
+                "evidence": "new artifact rejected",
+                "reference": "approval-2"
+            }),
+        )
+        .expect("new approval");
+        let task = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(task.approvals.len(), 2);
+        assert_eq!(
+            task.approvals[0].superseded_by.as_deref(),
+            Some("approval-2")
+        );
+        assert_eq!(
+            task.approvals[1].state(crate::settings::unix_now().saturating_mul(1_000)),
+            crate::extension::tasks::ApprovalState::Rejected
+        );
+
+        // A global scope is refused.
+        let error = approve_with(
+            &context,
+            &json!({
+                "task": id,
+                "approver": "os:alice",
+                "decision": "approved",
+                "scope": "*",
+                "evidence": "x",
+                "reference": "approval-3"
+            }),
+        )
+        .expect_err("global approval refused");
+        assert!(format!("{error:?}").contains("global approval"));
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 

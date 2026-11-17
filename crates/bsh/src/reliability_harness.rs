@@ -761,7 +761,9 @@ fn scenario_isolation_multi_session() -> Result<ScenarioEvidence, HarnessFailure
 }
 
 fn scenario_provider_request_consistency() -> Result<ScenarioEvidence, HarnessFailure> {
-    use react::llm::{Content, LlmMessage, LlmTool, ProviderRequest};
+    use react::llm::{
+        Content, LlmContext, LlmMessage, LlmRequest, LlmSession, LlmTool, ProviderRequest,
+    };
     let request = || ProviderRequest {
         model: "vendor/model".to_string(),
         provider: Some("vendor".to_string()),
@@ -797,7 +799,48 @@ fn scenario_provider_request_consistency() -> Result<ScenarioEvidence, HarnessFa
     if first["message_count"] != 2 || first["tools"][0] != "bash" {
         return Err(functional("audit omitted request structure"));
     }
-    Ok(ScenarioEvidence::default().note("typed request audit is stable and redacted"))
+    let typed = request();
+    let llm = LlmRequest {
+        model: typed.model.clone(),
+        input: typed.input.clone(),
+        provider_request: Some(typed.clone()),
+        ..Default::default()
+    };
+    let openai = react::llm::vendor::openai::OpenAiVendor::wire_preview(
+        &llm,
+        &LlmSession::new(),
+        &LlmContext::default(),
+    );
+    if openai["messages"][0]["content"] != "secret system" {
+        return Err(inconsistent(
+            "OpenAI adapter did not use the typed system prompt",
+        ));
+    }
+    if openai["tools"][0]["function"]["name"] != "bash" {
+        return Err(inconsistent("OpenAI adapter did not use the typed tools"));
+    }
+    let responses = react::llm::vendor::responses::build_request(
+        None,
+        &llm,
+        &LlmSession::new(),
+        &LlmContext::default(),
+        false,
+        true,
+    );
+    let responses =
+        serde_json::to_value(responses).map_err(|error| functional(error.to_string()))?;
+    if responses["instructions"] != "secret system" {
+        return Err(inconsistent(
+            "Responses adapter did not use the typed system prompt",
+        ));
+    }
+    if !responses.to_string().contains("bash") {
+        return Err(inconsistent(
+            "Responses adapter did not use the typed tools",
+        ));
+    }
+    Ok(ScenarioEvidence::default()
+        .note("typed request audit stable; OpenAI and Responses wire previews match"))
 }
 
 fn scenario_resource_growth_bounded() -> Result<ScenarioEvidence, HarnessFailure> {

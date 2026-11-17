@@ -6518,6 +6518,17 @@ fn session_roots(settings: &Settings) -> Vec<(String, String)> {
         .map(|workspace| (workspace.id.clone(), workspace.root.clone()))
         .collect()
 }
+/// The authenticated local host identity used for trusted approvals
+/// (issue #433). It comes from the process context, never from model input.
+pub(crate) fn host_identity() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .map(|user| user.trim().to_string())
+        .filter(|user| !user.is_empty())
+        .map(|user| format!("os:{user}"))
+}
+
 #[cfg(test)]
 mod tests {
     fn image_fixture() -> super::Attachment {
