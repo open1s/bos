@@ -540,7 +540,12 @@ pub fn build_request(
     stream: bool,
     parallel_tool_calls: bool,
 ) -> ResponsesRequest {
-    let tools = serialize_tools(context.tools());
+    let tools = serialize_tools(
+        req.provider_request
+            .as_ref()
+            .map(|provider| provider.tools.as_slice())
+            .or_else(|| context.tools()),
+    );
     let parallel = tools.as_ref().map(|_| parallel_tool_calls);
     ResponsesRequest {
         model: req.model.clone(),

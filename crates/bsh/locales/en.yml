@@ -1657,6 +1657,7 @@
 "right.tasks.live": "Live"
 "right.tasks.board": "Task board"
 "right.tasks.verification": "Verification"
+"right.tasks.approve": "Approve"
 "right.tasks.verifyPending": "pending"
 "right.tasks.verifyPassed": "passed"
 "right.tasks.verifyFailed": "failed"

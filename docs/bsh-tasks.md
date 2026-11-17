@@ -128,12 +128,15 @@ new pending attempt without reusing the prior report.
 Each task carries an explicit retry policy (`idempotent`, `non-idempotent`,
 `unknown`; default unknown/fail-closed) and persisted per-attempt side-effect
 records. Non-idempotent retries require `confirm_side_effects=true`; unknown
-ones additionally require a `compensation` path. Idempotency keys are stored on
+ones additionally require a `compensation` command, which is executed through
+the controlled shell and must succeed before the retry starts. A failed
+non-idempotent execution is treated as a possible partial effect. Idempotency keys are stored on
 the task.
 
-Review/human contracts are executable through `task_approve`: a structured
-approval records approver, decision, scope, evidence, external reference,
-attempt id and optional expiry. A model cannot approve its own task. Approval
+Review/human contracts are executable through a HOST-ONLY approval API
+(`approve_with`), not a model tool: a model that can call the approval path can
+forge an approver identity. A structured approval records approver, decision,
+scope, evidence, external reference, attempt id and optional expiry. Approval
 resolution ignores revoked, expired, superseded or attempt-mismatched records;
 the approval history is retained for audit and survives restart. A passed
 report is only accepted when it names a non-model verifier and carries evidence.

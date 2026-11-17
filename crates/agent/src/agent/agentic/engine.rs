@@ -646,15 +646,22 @@ impl Agent {
             .as_ref()
             .expect("a prepared context for this run")
             .tools
-            .as_slice();
-        let system_prompt = self.system_prompt_for(&task_content, tools).await;
+            .clone();
+        let system_prompt = self.system_prompt_for(&task_content, &tools).await;
+        // system_prompt_for can add a discovery tool (load_skill); snapshot the
+        // FINAL array so the typed request and adapter see the same set (#427).
+        let tools = context
+            .as_ref()
+            .expect("a prepared context for this run")
+            .tools
+            .clone();
         let prompt_text = task_content.as_text().unwrap_or_default().to_string();
 
         // Snapshot the exact live history BEFORE it is moved into the
         // request; the descriptor and the wire request must agree (issue #427).
         let provider_request = self.describe_provider_request(
             &system_prompt,
-            tools,
+            &tools,
             session_restore.session().messages(),
             &task_content,
         );
@@ -685,6 +692,12 @@ impl Agent {
                 ..Default::default()
             },
         };
+
+        // The adapters must serialize the SAME tool definitions the typed
+        // request describes, not an independently rebuilt set (issue #427).
+        if let (Some(typed), Some(context)) = (&provider_request, context.as_mut()) {
+            context.tools = typed.tools.clone();
+        }
 
         let engine_start = std::time::Instant::now();
         let result = engine
@@ -1105,6 +1118,9 @@ impl Agent {
                 session_restore.session().messages(),
                 &task_content,
             );
+            if let Some(typed) = &provider_request {
+                context.tools = typed.tools.clone();
+            }
             let request = match &provider_request {
                 Some(typed) => LlmRequest {
                     model: typed.model.clone(),

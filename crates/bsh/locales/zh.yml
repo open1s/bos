@@ -1642,6 +1642,7 @@
 "right.tasks.live": "实时"
 "right.tasks.board": "任务板"
 "right.tasks.verification": "验证"
+"right.tasks.approve": "批准"
 "right.tasks.verifyPending": "待验证"
 "right.tasks.verifyPassed": "已通过"
 "right.tasks.verifyFailed": "未通过"

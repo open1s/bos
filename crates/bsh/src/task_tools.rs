@@ -45,7 +45,6 @@ pub(crate) fn attach(agent: &mut Agent, context: TaskToolsContext) {
     attach_status(agent, context.clone());
     attach_list(agent, context.clone());
     attach_retry(agent, context.clone());
-    attach_approve(agent, context.clone());
     attach_graph(agent, context);
 }
 
@@ -301,7 +300,11 @@ fn attach_retry(agent: &mut Agent, context: TaskToolsContext) {
 }
 
 /// Record or revoke a review/human approval (issue #433).
-fn approve_with(context: &TaskToolsContext, args: &Value) -> Result<Value, ToolError> {
+///
+/// Host-only: this is NOT registered as a model tool, because a model that can
+/// call it can forge an approver identity. The UI/approval integration calls
+/// this function directly.
+pub(crate) fn approve_with(context: &TaskToolsContext, args: &Value) -> Result<Value, ToolError> {
     let id = args
         .get("task")
         .and_then(Value::as_str)
@@ -428,35 +431,6 @@ fn approve_with(context: &TaskToolsContext, args: &Value) -> Result<Value, ToolE
         .save(&context.workspace, &record)
         .map_err(|error| ToolError::Failed(format!("the task could not be saved: {error}")))?;
     Ok(json!({"task": id, "approvals": record.approvals}))
-}
-
-fn attach_approve(agent: &mut Agent, context: TaskToolsContext) {
-    let tool = AsyncFunctionTool::from_fn(
-        "task_approve",
-        "Record or revoke a structured review/human approval bound to one task attempt. A model cannot approve its own task; approvals cannot verify a later retry.",
-        json!({
-            "type": "object",
-            "properties": {
-                "task": { "type": "string", "description": "The task id." },
-                "approver": { "type": "string", "description": "The human/external approver identity." },
-                "decision": { "type": "string", "enum": ["approved", "rejected"] },
-                "scope": { "type": "string", "description": "The approved scope; defaults to the task id." },
-                "evidence": { "type": "string", "description": "Evidence supporting the decision." },
-                "reference": { "type": "string", "description": "The external approval reference id." },
-                "attempt_id": { "type": "string", "description": "The attempt to bind; defaults to the current attempt." },
-                "expires_ms": { "type": "integer", "description": "Optional expiry in unix milliseconds." },
-                "revoke": { "type": "boolean", "description": "Revoke the latest matching approval." }
-            },
-            "required": ["task"]
-        }),
-        move |args| {
-            let context = context.clone();
-            async move { approve_with(&context, &args) }
-        },
-    );
-    if let Err(error) = agent.try_add_async_tool(Arc::new(tool)) {
-        log::warn!("task_approve tool was not registered: {error}");
-    }
 }
 
 /// The status tool.
@@ -720,8 +694,42 @@ pub(crate) async fn retry_with(
                 .unwrap_or(false);
             if risky && (!confirmed || compensation.is_empty()) {
                 return Err(ToolError::Failed(
-                    "this task's side-effect status is unknown; pass confirm_side_effects=true and a compensation/recovery path before retrying".to_string(),
+                    "this task's side-effect status is unknown; pass confirm_side_effects=true and a compensation/recovery command before retrying".to_string(),
                 ));
+            }
+            if risky && confirmed && !compensation.is_empty() {
+                // Compensation is executed through the same controlled shell
+                // as verification; a string is not accepted as proof.
+                let Some(bash) = context.bash.clone() else {
+                    return Err(ToolError::Failed(
+                        "no controlled shell is available to run the compensation command"
+                            .to_string(),
+                    ));
+                };
+                let response = bash
+                    .run(&json!({ "command": compensation }))
+                    .map_err(|error| {
+                        ToolError::Failed(format!("the compensation command failed: {error:?}"))
+                    })?;
+                let succeeded = response
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .map(|code| code == 0)
+                    .or_else(|| response.get("success").and_then(Value::as_bool))
+                    .unwrap_or(false);
+                if !succeeded {
+                    return Err(ToolError::Failed(
+                        "the compensation command did not succeed; the retry is refused"
+                            .to_string(),
+                    ));
+                }
+                if let Some(attempt) = record.attempts.last() {
+                    if let Some(effect) = record.side_effects.get_mut(&attempt.id) {
+                        effect.status = tasks::SideEffectStatus::Compensated;
+                        effect.detail = format!("compensation ran: {compensation}");
+                        effect.recorded_ms = crate::settings::unix_now().saturating_mul(1_000);
+                    }
+                }
             }
         }
     }
@@ -1908,7 +1916,12 @@ pub(crate) async fn join_with(
                             tasks::SideEffectStatus::Unknown
                         }
                         (RunState::Succeeded, _) => tasks::SideEffectStatus::Completed,
-                        (RunState::Failed, _) => tasks::SideEffectStatus::Failed,
+                        (RunState::Failed, tasks::RetryPolicy::Idempotent) => {
+                            tasks::SideEffectStatus::Failed
+                        }
+                        // A failed non-idempotent execution may still have
+                        // produced a partial effect (issue #430).
+                        (RunState::Failed, _) => tasks::SideEffectStatus::Unknown,
                         (RunState::Cancelled, _) => tasks::SideEffectStatus::Unknown,
                         _ => effect.status,
                     };
@@ -2390,7 +2403,10 @@ mod tests {
         assert!(registry.get_async("task_create").is_some());
         assert!(registry.get_async("task_join").is_some());
         assert!(registry.get_async("task_cancel").is_some());
-        assert!(registry.get_async("task_approve").is_some());
+        assert!(
+            registry.get_async("task_approve").is_none(),
+            "approval submission is host-only, not a model tool"
+        );
     }
 
     /// create saves a running record whose attempt names the started run.
@@ -3815,7 +3831,11 @@ mod tests {
     /// confirmation; idempotent retries do not (issue #430).
     #[tokio::test]
     async fn retry_policy_guards_repeated_side_effects() {
-        let context = context("retry-policy");
+        let mut context = context("retry-policy");
+        context.bash = Some(std::sync::Arc::new(
+            agent::tools::BashTool::new("bash")
+                .with_workspace(context.workspace.to_str().expect("utf-8 workspace")),
+        ));
         let fake = Fake::new();
         let runs = Runs::with(fake.clone());
         let value = create_with(
@@ -3868,7 +3888,8 @@ mod tests {
         {
             let mut runs = fake.runs.lock().expect("runs");
             let snapshot = runs.get_mut("run-3").expect("third run");
-            snapshot.state = RunState::Succeeded;
+            // A failed execution may still have produced a partial effect.
+            snapshot.state = RunState::Failed;
         }
         join_with(&runs, &context, &json!({"tasks": [unknown_id.clone()]}))
             .await
@@ -3887,11 +3908,26 @@ mod tests {
             &json!({
                 "task": unknown_id,
                 "confirm_side_effects": true,
-                "compensation": "inspect the external record and roll back"
+                "compensation": "echo rolled-back > compensated.txt"
             }),
         )
         .await
         .expect("compensated retry");
+        assert!(
+            context.workspace.join("compensated.txt").exists(),
+            "the compensation command actually ran"
+        );
+        let reconciled = FileTasksStore
+            .load(&context.workspace, &unknown_id)
+            .expect("load")
+            .expect("record");
+        assert!(
+            reconciled
+                .side_effects
+                .values()
+                .any(|effect| effect.status == tasks::SideEffectStatus::Compensated),
+            "compensation is recorded"
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 

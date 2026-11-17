@@ -436,11 +436,20 @@ impl Runner {
                     memory_records: recall.records.clone(),
                     tool_guidance: Some(format!("tools:{tool_schema_digest}")),
                     provider: Some(agent.config().model.clone()),
-                    provider_adapter: Some(format!("bsh/{}", env!("CARGO_PKG_VERSION"))),
+                    provider_adapter: Some(format!(
+                        "{}:{}",
+                        agent
+                            .config()
+                            .model
+                            .split_once('/')
+                            .map(|(vendor, _)| vendor)
+                            .unwrap_or("openai"),
+                        agent.config().api_mode
+                    )),
                     api_mode: Some(agent.config().api_mode.clone()),
                     tool_schema: Some(tool_schema_digest),
                     memory_revision,
-                    session: None,
+                    session: Some(session.clone()),
                     turn: Some(time.turn as u64),
                 };
                 let snapshot = crate::context_assembly::AssemblySnapshot::build(

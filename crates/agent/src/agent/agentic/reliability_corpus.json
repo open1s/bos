@@ -9,6 +9,7 @@
     { "id": "repeated_compaction_retains_facts", "description": "Critical facts survive successive checkpoints" },
     { "id": "tool_evidence_omission_rejected", "description": "A summary omitting tool-verified evidence is rejected" },
     { "id": "multi_session_isolation", "description": "Checkpoints and history stay isolated per session" },
-    { "id": "provider_request_matches_history", "description": "The typed request describes the live history and input" }
+    { "id": "provider_request_matches_history", "description": "The typed request describes the live history and input" },
+    { "id": "long_run_multi_restart", "description": "Repeated compaction and restart keep facts and stay bounded" }
   ]
 }

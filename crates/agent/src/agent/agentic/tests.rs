@@ -3634,6 +3634,25 @@ async fn compaction_rejects_omitted_ordinary_critical_facts() {
     assert!(!checkpoint.facts.is_empty());
 }
 
+/// Coverage keeps negation polarity: a summary that says the opposite of a
+/// constraint is a contradiction, not coverage (issue #429).
+#[tokio::test]
+async fn compaction_rejects_a_negation_reversal() {
+    let agent = agent_with_summary(&complete_summary("- Deploy on Friday"));
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user("Never deploy on Friday".to_string());
+        session.add_assistant("Noted.".to_string());
+    }
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("reversed constraint rejected");
+    assert!(error.to_string().contains("contradicts"), "{error}");
+}
+
 /// A summary marker claim with a token absent from the source is unsupported
 /// (issue #429).
 #[tokio::test]
@@ -3658,6 +3677,7 @@ async fn compaction_rejects_invented_decision_claims() {
 /// A provider that records the typed request the real engine hands it.
 struct RecordingProvider {
     seen: Arc<std::sync::Mutex<Option<react::llm::ProviderRequest>>>,
+    tools_seen: Arc<std::sync::Mutex<Vec<react::llm::LlmTool>>>,
 }
 
 #[async_trait]
@@ -3667,9 +3687,10 @@ impl LlmClient<AgentSession, AgentReactContext> for RecordingProvider {
         _persona: Option<String>,
         req: LlmRequest,
         _session: &mut AgentSession,
-        _context: &mut AgentReactContext,
+        context: &mut AgentReactContext,
     ) -> Result<LlmResponse, LlmError> {
         *self.seen.lock().unwrap() = req.provider_request.clone();
+        *self.tools_seen.lock().unwrap() = context.tools.clone();
         Ok(make_text_response("recorded".to_string()))
     }
 
@@ -3678,9 +3699,10 @@ impl LlmClient<AgentSession, AgentReactContext> for RecordingProvider {
         _persona: Option<String>,
         req: LlmRequest,
         _session: &mut AgentSession,
-        _context: &mut AgentReactContext,
+        context: &mut AgentReactContext,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
         *self.seen.lock().unwrap() = req.provider_request.clone();
+        *self.tools_seen.lock().unwrap() = context.tools.clone();
         Ok(Box::pin(futures::stream::iter(vec![
             Ok(StreamToken::Text("recorded".to_string())),
             Ok(StreamToken::Done),
@@ -3699,10 +3721,14 @@ async fn the_engine_sends_the_live_history_in_the_typed_request() {
     use futures::StreamExt;
 
     let seen = Arc::new(std::sync::Mutex::new(None));
+    let tools_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut provider = LlmProvider::new();
     provider.register_vendor(
         "mock".to_string(),
-        Box::new(RecordingProvider { seen: seen.clone() }),
+        Box::new(RecordingProvider {
+            seen: seen.clone(),
+            tools_seen: tools_seen.clone(),
+        }),
     );
     let agent = Agent::new(
         AgentConfig {
@@ -3715,6 +3741,14 @@ async fn the_engine_sends_the_live_history_in_the_typed_request() {
         composition: "composition-1".to_string(),
         ..Default::default()
     }));
+    agent
+        .add_live_tool(Arc::new(crate::tools::FunctionTool::new(
+            "bash",
+            "run a command",
+            serde_json::json!({"type": "object"}),
+            |_| Ok(serde_json::json!({"ok": true})),
+        )))
+        .expect("live tool");
     agent.session().add_user("prior history".to_string());
     let mut stream = agent.stream("current input");
     while stream.next().await.is_some() {}
@@ -3727,6 +3761,17 @@ async fn the_engine_sends_the_live_history_in_the_typed_request() {
     assert_eq!(captured.input, react::llm::Content::text("current input"));
     assert_eq!(captured.model, "mock-model");
     assert_eq!(captured.composition, "composition-1");
+    assert!(
+        captured.tools.iter().any(|tool| tool.name == "bash"),
+        "the typed request carries the full tool definition"
+    );
+    let adapter_tools = tools_seen.lock().unwrap().clone();
+    assert!(
+        adapter_tools.iter().any(|tool| tool.name == "bash"),
+        "the adapter's context sees the live tool"
+    );
+    // The adapter itself prefers the typed tool list; the OpenAI unit test
+    // pins that precedence with a stale context list.
 }
 
 /// A summary missing required sections is rejected before installation and
@@ -4630,6 +4675,7 @@ struct ReliabilityMetrics {
     tool_evidence_rejected: usize,
     sessions_isolated: usize,
     provider_consistency: usize,
+    long_run_cycles: usize,
 }
 
 fn debug_messages(messages: &[react::llm::LlmMessage]) -> String {
@@ -4651,6 +4697,7 @@ async fn reliability_horizon_smoke_subset() {
             "tool_evidence_omission_rejected".to_string(),
             "multi_session_isolation".to_string(),
             "provider_request_matches_history".to_string(),
+            "long_run_multi_restart".to_string(),
         ],
         "the checked-in corpus is the scenario list this smoke run executes"
     );
@@ -4864,8 +4911,52 @@ async fn reliability_horizon_smoke_subset() {
     assert_eq!(described.input, input);
     metrics.provider_consistency += 1;
 
-    metrics.scenarios = 9;
-    assert_eq!(metrics.scenarios, 9);
+    // Scenario 10: a long run with repeated compaction and a restart after
+    // every cycle keeps the constraint and stays bounded.
+    let agent = agent_with_summary(&complete_summary(
+        "- CONSTRAINT: keep the public API stable",
+    ));
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user("CONSTRAINT: keep the public API stable".to_string());
+        session.add_assistant("Understood.".to_string());
+    }
+    for cycle in 0..8 {
+        {
+            let mut session = agent.session();
+            for index in 0..2 {
+                session.add_user(format!("cycle {cycle} work {index} {}", "q".repeat(400)));
+                session.add_assistant(format!("cycle {cycle} reply {index} {}", "r".repeat(400)));
+            }
+        }
+        agent
+            .compact_now(0, &signal)
+            .await
+            .expect("long-run compaction runs")
+            .expect("long-run checkpoint");
+        let json = agent.session().to_json_string().expect("serializes");
+        let mut session = agent.session();
+        session.restore_from_json(&json).expect("restart restores");
+        let index = session.checkpoints().len() - 1;
+        assert_eq!(
+            session.checkpoint_source_status(index),
+            crate::agent::context::CheckpointSourceStatus::Valid,
+            "cycle {cycle} source remains valid"
+        );
+        assert!(
+            !session.archive_budget_exceeded(),
+            "cycle {cycle} archive stays within budget"
+        );
+        assert!(
+            session.messages().len() < 40,
+            "cycle {cycle} history stays compacted"
+        );
+        metrics.long_run_cycles += 1;
+    }
+
+    metrics.scenarios = 10;
+    assert_eq!(metrics.scenarios, 10);
     assert_eq!(metrics.constraint_retention, 1);
     assert_eq!(metrics.conflict_visibility, 1);
     assert_eq!(metrics.recovery, 2);
@@ -4874,6 +4965,7 @@ async fn reliability_horizon_smoke_subset() {
     assert_eq!(metrics.tool_evidence_rejected, 1);
     assert_eq!(metrics.sessions_isolated, 1);
     assert_eq!(metrics.provider_consistency, 1);
+    assert_eq!(metrics.long_run_cycles, 8);
     assert!(metrics.archive_bytes > 0);
 }
 

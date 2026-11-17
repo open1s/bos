@@ -325,8 +325,14 @@ impl OpenAiVendor {
             });
         }
 
-        let tools: Vec<serde_json::Value> = context
-            .tools()
+        // Prefer the typed request's tool set: the adapter must serialize the
+        // same definitions the request snapshot describes (issue #427).
+        let typed_tools = req
+            .provider_request
+            .as_ref()
+            .map(|provider| provider.tools.as_slice());
+        let tools: Vec<serde_json::Value> = typed_tools
+            .or_else(|| context.tools())
             .map(|tools| {
                 tools
                     .iter()
@@ -1616,5 +1622,43 @@ mod tests {
             );
             assert!(body["messages"].is_array());
         }
+    }
+
+    #[test]
+    fn typed_request_tools_are_the_adapter_source() {
+        use crate::llm::{Content, LlmContext, LlmRequest, LlmSession, LlmTool};
+        let vendor = OpenAiVendor::new(
+            "https://api.example.com".to_string(),
+            "gpt-test".to_string(),
+            "k".to_string(),
+        );
+        let context = LlmContext {
+            tools: vec![LlmTool {
+                name: "context-tool".to_string(),
+                description: "stale".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                kind: Default::default(),
+                config: None,
+            }],
+            ..Default::default()
+        };
+        let request = LlmRequest {
+            model: "gpt-test".to_string(),
+            input: Content::text("hello"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                tools: vec![LlmTool {
+                    name: "typed-tool".to_string(),
+                    description: "from the snapshot".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    kind: Default::default(),
+                    config: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let built = vendor.convert_request(None, &request, &LlmSession::new(), &context);
+        let tools = built.tools.expect("tools serialized");
+        assert_eq!(tools[0]["function"]["name"], "typed-tool");
     }
 }

@@ -4500,6 +4500,63 @@ impl Shell {
                     11.0,
                     theme::faint(),
                 ));
+                let review_contract = matches!(
+                    record.verification_contract,
+                    Some(
+                        crate::extension::tasks::VerificationContract::Review
+                            | crate::extension::tasks::VerificationContract::Human
+                    )
+                );
+                if review_contract
+                    && record.verification.status
+                        != crate::extension::tasks::VerificationStatus::Passed
+                {
+                    let task_id = record.id.clone();
+                    let attempt_id = record
+                        .attempts
+                        .last()
+                        .map(|attempt| attempt.id.clone())
+                        .unwrap_or_default();
+                    let workspace = self.task_workspace_root();
+                    let button_id = format!("task-approve-{}", task_id);
+                    detail = detail.child(
+                        div()
+                            .id(SharedString::from(button_id.clone()))
+                            .debug_selector({
+                                let id = button_id.clone();
+                                move || id.clone()
+                            })
+                            .cursor_pointer()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(6.0))
+                            .hover(|style| style.bg(rgb(theme::hover())))
+                            .child(txt(lang.tr("right.tasks.approve"), 11.0, theme::accent()))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                let context = crate::task_tools::TaskToolsContext {
+                                    session: "ui".to_string(),
+                                    workspace: workspace.clone(),
+                                    subagents: None,
+                                    bash: None,
+                                    jobs: None,
+                                };
+                                let _ = crate::task_tools::approve_with(
+                                    &context,
+                                    &serde_json::json!({
+                                        "task": task_id,
+                                        "attempt_id": attempt_id,
+                                        "approver": "reader",
+                                        "decision": "approved",
+                                        "scope": task_id,
+                                        "evidence": "approved in the Tasks pane",
+                                        "reference": format!("ui-{}", attempt_id)
+                                    }),
+                                );
+                                *this.right.tasks.borrow_mut() = None;
+                                cx.notify();
+                            })),
+                    );
+                }
             }
             if !record.attempts.is_empty() {
                 detail = detail

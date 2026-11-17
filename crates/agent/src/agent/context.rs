@@ -484,6 +484,8 @@ pub struct FactCoverage {
     pub facts: Vec<CriticalFact>,
     /// Facts the summary does not cover.
     pub missing: Vec<CriticalFact>,
+    /// Facts the summary covers with the opposite negation polarity.
+    pub contradicted: Vec<CriticalFact>,
     /// Summary marker claims absent from the source.
     pub unsupported: Vec<String>,
 }
@@ -491,7 +493,7 @@ pub struct FactCoverage {
 impl FactCoverage {
     /// Whether the summary covers every fact and invents none.
     pub fn complete(&self) -> bool {
-        self.missing.is_empty() && self.unsupported.is_empty()
+        self.missing.is_empty() && self.contradicted.is_empty() && self.unsupported.is_empty()
     }
 }
 
@@ -594,6 +596,17 @@ pub fn validate_checkpoint(summary: &str, source: &[Message]) -> Result<(), Stri
             names.join("; ")
         ));
     }
+    if !coverage.contradicted.is_empty() {
+        let names: Vec<String> = coverage
+            .contradicted
+            .iter()
+            .map(|fact| format!("{:?}: {}", fact.kind, fact.text))
+            .collect();
+        return Err(format!(
+            "the summary contradicts critical fact(s) by negation: {}",
+            names.join("; ")
+        ));
+    }
     if !coverage.unsupported.is_empty() {
         return Err(format!(
             "the summary contains unsupported claim(s): {}",
@@ -635,7 +648,8 @@ fn message_text_and_trust(message: &Message) -> (String, &'static str) {
 pub fn extract_critical_facts(source: &[Message]) -> Vec<CriticalFact> {
     let mut facts: Vec<CriticalFact> = Vec::new();
     for (index, message) in source.iter().enumerate() {
-        let (text, trust) = message_text_and_trust(message);
+        let (mut text, trust) = message_text_and_trust(message);
+        text = text.replace("</compacted-summary>", "");
         if trust == "tool" {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
@@ -722,6 +736,15 @@ fn fact_keywords(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn negative_polarity(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        " not ", "not ", "never", "no ", "don't", "do not", "without", "avoid", "must not",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 fn fact_covered(fact: &CriticalFact, summary_lower: &str) -> bool {
     let keywords = fact_keywords(&fact.text);
     if keywords.is_empty() {
@@ -741,12 +764,35 @@ fn fact_covered(fact: &CriticalFact, summary_lower: &str) -> bool {
 /// claims (issue #429).
 pub fn fact_coverage(summary: &str, source: &[Message]) -> FactCoverage {
     let facts = extract_critical_facts(source);
-    let summary_lower = summary.to_ascii_lowercase();
-    let missing: Vec<CriticalFact> = facts
-        .iter()
-        .filter(|fact| !fact_covered(fact, &summary_lower))
-        .cloned()
+    let sentences: Vec<String> = summary
+        .split(['\n', '.', ';'])
+        .map(str::trim)
+        .filter(|sentence| !sentence.is_empty())
+        .map(str::to_string)
         .collect();
+    let mut missing = Vec::new();
+    let mut contradicted = Vec::new();
+    for fact in &facts {
+        let polarity = negative_polarity(&fact.text);
+        let mut covered = false;
+        let mut opposite = false;
+        for sentence in &sentences {
+            if fact_covered(fact, &sentence.to_ascii_lowercase()) {
+                if negative_polarity(sentence) == polarity {
+                    covered = true;
+                } else {
+                    opposite = true;
+                }
+            }
+        }
+        if !covered {
+            if opposite {
+                contradicted.push(fact.clone());
+            } else {
+                missing.push(fact.clone());
+            }
+        }
+    }
     let source_lower = source
         .iter()
         .map(|message| message_text_and_trust(message).0.to_ascii_lowercase())
@@ -789,6 +835,7 @@ pub fn fact_coverage(summary: &str, source: &[Message]) -> FactCoverage {
     FactCoverage {
         facts,
         missing,
+        contradicted,
         unsupported,
     }
 }
@@ -809,6 +856,7 @@ fn explicit_constraints(source: &[Message]) -> Vec<String> {
             Message::Assistant { content } => content.as_str(),
             Message::AssistantToolCall { .. } | Message::ToolResult { .. } => "",
         };
+        let text = text.replace("</compacted-summary>", "");
         for line in text.lines() {
             let trimmed = line.trim().trim_start_matches(&['-', '*', ' '][..]).trim();
             if trimmed.to_ascii_lowercase().starts_with("constraint:") {
@@ -890,12 +938,25 @@ pub struct AgentSession {
     /// (issue #424): repeated or identical spans are stored once.
     #[serde(default)]
     archive: std::collections::BTreeMap<String, Vec<Message>>,
+    /// The archive payload schema (issue #428).
+    #[serde(default = "archive_schema_default")]
+    archive_schema: u32,
+    /// Recorded serialized byte size per archive entry, for integrity checks.
+    #[serde(default)]
+    archive_entry_bytes: std::collections::BTreeMap<String, usize>,
     /// The total archive byte budget.
     #[serde(default = "checkpoint_archive_budget_default")]
     checkpoint_archive_budget: usize,
     /// The per-checkpoint source-span byte budget.
     #[serde(default = "checkpoint_span_budget_default")]
     checkpoint_span_budget: usize,
+}
+
+/// The current archive payload schema.
+pub const ARCHIVE_SCHEMA_VERSION: u32 = 1;
+
+fn archive_schema_default() -> u32 {
+    ARCHIVE_SCHEMA_VERSION
 }
 
 fn checkpoint_archive_budget_default() -> usize {
@@ -907,7 +968,7 @@ fn checkpoint_span_budget_default() -> usize {
 }
 
 /// The current serialized session schema (issue #419).
-pub const SESSION_SCHEMA_VERSION: u32 = 3;
+pub const SESSION_SCHEMA_VERSION: u32 = 4;
 
 /// Timestamps and counters stored with an [`AgentSession`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -934,6 +995,8 @@ impl AgentSession {
             schema_version: SESSION_SCHEMA_VERSION,
             checkpoints: Vec::new(),
             archive: std::collections::BTreeMap::new(),
+            archive_schema: ARCHIVE_SCHEMA_VERSION,
+            archive_entry_bytes: std::collections::BTreeMap::new(),
             checkpoint_archive_budget: DEFAULT_CHECKPOINT_ARCHIVE_BYTES,
             checkpoint_span_budget: DEFAULT_CHECKPOINT_SPAN_BYTES,
         }
@@ -1045,6 +1108,15 @@ impl AgentSession {
         let restored: AgentSession = serde_json::from_str(json).map_err(std::io::Error::other)?;
         // Validate before mutating: a rejected file must leave the caller's
         // session exactly as it was.
+        if restored.archive_schema > ARCHIVE_SCHEMA_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "archive schema {} is newer than this build supports ({ARCHIVE_SCHEMA_VERSION})",
+                    restored.archive_schema
+                ),
+            ));
+        }
         if restored.schema_version > SESSION_SCHEMA_VERSION {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1086,6 +1158,8 @@ impl AgentSession {
         };
         self.checkpoints = restored.checkpoints;
         self.archive = restored.archive;
+        self.archive_schema = restored.archive_schema;
+        self.archive_entry_bytes = restored.archive_entry_bytes;
         self.checkpoint_archive_budget = restored.checkpoint_archive_budget;
         self.checkpoint_span_budget = restored.checkpoint_span_budget;
         Ok(())
@@ -1302,6 +1376,16 @@ impl AgentSession {
                 checkpoint.source_digest
             ));
         }
+        if let Some(recorded) = self.archive_entry_bytes.get(&checkpoint.source_digest) {
+            let actual = serde_json::to_vec(source)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0);
+            if actual != *recorded {
+                return CheckpointSourceStatus::Corrupted(format!(
+                    "archive byte accounting {actual} does not match recorded {recorded}"
+                ));
+            }
+        }
         CheckpointSourceStatus::Valid
     }
 
@@ -1397,6 +1481,7 @@ impl AgentSession {
                 self.archive
                     .entry(digest.clone())
                     .or_insert_with(|| removed.clone());
+                self.archive_entry_bytes.insert(digest.clone(), span_bytes);
                 (Vec::new(), true, false, true)
             };
         let record = Checkpoint {
@@ -1472,6 +1557,7 @@ impl AgentSession {
             .any(|other| other.source_digest == checkpoint.source_digest)
         {
             self.archive.remove(&checkpoint.source_digest);
+            self.archive_entry_bytes.remove(&checkpoint.source_digest);
         }
     }
 
@@ -3031,7 +3117,7 @@ mod budget_tests {
         assert!(!session.restore_checkpoint(0));
 
         session.archive.insert(
-            digest,
+            digest.clone(),
             vec![Message::User {
                 content: Content::Text("short".to_string()),
             }],
@@ -3041,6 +3127,28 @@ mod budget_tests {
             session.checkpoint_source_status(0),
             CheckpointSourceStatus::Corrupted(_)
         ));
+
+        // Byte accounting and archive schema are part of the integrity check.
+        let mut session = AgentSession::new();
+        for index in 0..4 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        assert!(session.install_priced_checkpoint(0, "summary") > 0);
+        let digest = session.checkpoints()[0].source_digest.clone();
+        *session.archive_entry_bytes.get_mut(&digest).expect("bytes") += 1;
+        assert!(matches!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Corrupted(_)
+        ));
+        let json = session.to_json_string().expect("serializes");
+        let mut future: serde_json::Value = serde_json::from_str(&json).expect("json");
+        future["archive_schema"] = serde_json::json!(ARCHIVE_SCHEMA_VERSION + 1);
+        let mut target = AgentSession::new();
+        let error = target
+            .restore_from_json(&future.to_string())
+            .expect_err("future archive schema refused");
+        assert!(error.to_string().contains("archive schema"), "{error}");
     }
 
     /// A checkpoint whose preserved span no longer matches its digest is

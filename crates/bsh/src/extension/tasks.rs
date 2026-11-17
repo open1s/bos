@@ -337,6 +337,8 @@ pub(crate) enum SideEffectStatus {
     Completed,
     /// The effect failed or was rolled back.
     Failed,
+    /// A compensation path ran successfully.
+    Compensated,
     /// The attempt may have produced an effect but cannot prove it.
     Unknown,
 }

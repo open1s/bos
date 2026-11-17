@@ -123,7 +123,8 @@ complete tool definitions, alongside composition/content/execution identities,
 the content key id, the block manifest and each block's source, trust,
 provenance and token estimate. It is attached to the request but never
 serialized to the provider; adapters flatten it into roles and text, and a
-recording provider can compare it with the wire payload. A content edit cannot
+recording provider can compare it with the wire payload; adapters prefer the
+typed tool definitions over independently rebuilt ones. A content edit cannot
 change the execution identity; a key rotation changes only the content
 identity while recording the new key id.
 

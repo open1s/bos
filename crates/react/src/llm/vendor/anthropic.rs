@@ -319,8 +319,12 @@ impl AnthropicVendor {
             }
         }
 
-        let tools: Vec<AnthropicTool> = context
-            .tools()
+        let typed_tools = request
+            .provider_request
+            .as_ref()
+            .map(|provider| provider.tools.as_slice());
+        let tools: Vec<AnthropicTool> = typed_tools
+            .or_else(|| context.tools())
             .map(|tools| {
                 tools
                     .iter()
