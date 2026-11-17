@@ -348,6 +348,54 @@ Because it can only narrow, it is a reader convenience rather than a security
 boundary; use `policy.rego` for a rule that must hold against a caller who
 ignores the tool.
 
+### The file tools' result contract
+
+Every built-in file tool answers in one small LLM-oriented envelope. The
+tool-specific payload (`content`, `matches`, `entries`, `files`, ...) keeps its
+existing shape; the shared fields add meaning without moving data:
+
+- `tool` names the producer; `status` is `ok`, `empty`, `partial` or `error`.
+- `truncated` is always present. It is true when a line/row/entry budget or the
+  batch byte cap stopped the result early.
+- `next` is present only when a continuation exists, and its value is the
+  exact argument object for the next call: `read_file`/`read_files` use
+  `{"offset": N}`, `glob`/`grep` use `{"limit": N}`. A result with no
+  `next` is complete; a result with `next` says exactly how to continue.
+- `count` is the number of returned items (`lines`, `matches`, `entries`,
+  `files`). `read_files` and `apply_patch` also report `failed`/`returned`,
+  and every per-file entry carries its own `status` and `truncated`.
+- `hint` is one recovery sentence, present only when the payload alone would
+  mislead: an empty glob, an offset past EOF, or a spent context row budget.
+
+`read_file` returns raw `content` plus `start_line`, `end_line` and
+`total_lines` for a file inside the read ceiling; a window in a larger file
+reports `total_lines: null` rather than scanning the rest. An empty file and
+an offset past EOF are distinguished by `status` and `hint`, because empty
+`content` alone reads as "the file is empty". A batch cut in the middle of a
+line points `next.offset` at that same line, so the continuation re-reads the
+partial line instead of skipping it. A first line larger than the read-window
+ceiling is refused rather than returned as an empty page whose `next` would
+point at the same line forever.
+
+`grep` accepts up to 2000 context rows per side. A call without `limit` gets at
+least one full context window (2 x context + 1 rows, capped at the row
+maximum). The row budget also reserves its last row for the match, so a wide
+before-context cannot spend the budget and stop the search before the match
+appears. Context rows count toward `limit`; a cut result reports `truncated`
+and `next` (or a hint that the row maximum was reached). `glob` and `list_dir`
+report `count` and `truncated`, and `glob` names the two common empty-result
+causes in its `hint`.
+
+The mutating tools use the same envelope: `write_file` reports
+`operation`, `bytes` and `unchanged`; `edit_file` reports `replacements` and
+`unchanged`; `apply_patch` reports per-file `status` plus `failed` and
+`changed_files`; `sed` reports `changed`, `bytes` and, when retained,
+`diff`/`diff_truncated` with a hint that the rest is readable through
+`read_file`. A refused call is still a tool error, not an envelope: its message
+names the path and the reason (a binary file, an out-of-workspace path, an
+ambiguous edit), and a batch keeps that text in the per-file `error` field with
+`status: "error"`.
+
 - system_prompt replaces the workspace prompt for the chats that select the
   preset; absent keeps the workspace prompt. It is the persona the LLM call
   receives.

@@ -4133,6 +4133,17 @@ struct ReadOutcome {
     /// file, and a model that mis-computed the offset takes it as "the file
     /// is empty". The flag says which one happened.
     past_end: bool,
+    /// The 1-based first line of the returned window.
+    start_line: usize,
+    /// The 1-based last line the window returned; zero when it returned none.
+    end_line: usize,
+    /// The file's total line count when it is known.
+    ///
+    /// A file inside the read ceiling is scanned to EOF even for a window, so
+    /// its total is exact. A larger file stops at the window and reports None
+    /// rather than reading gigabytes for a label; the next argument is the
+    /// continuation either way.
+    total_lines: Option<usize>,
 }
 
 /// One directory listing, as `list_dir` reports it.
@@ -4241,16 +4252,25 @@ fn read_whole(target: &Path) -> Result<ReadOutcome, ToolError> {
         return Err(read_ceiling(target, bytes.len() as u64));
     }
     let content = utf8_text(target, bytes, 0)?;
+    let total_lines = content.lines().count();
     Ok(ReadOutcome {
         content,
         truncated: false,
         past_end: false,
+        start_line: 1,
+        end_line: total_lines,
+        total_lines: Some(total_lines),
     })
 }
 
 /// Read one line window without loading the rest of the file.
 fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome, ToolError> {
-    let (file, _) = open_regular(target)?;
+    let (file, meta) = open_regular(target)?;
+    // A file inside the read ceiling is scanned to EOF so the model gets an
+    // exact total, not a guess. A larger file stops at the window and reports
+    // total_lines: null, because counting its lines would read the whole thing
+    // for a label.
+    let count_total = meta.len() <= MAX_READ_BYTES as u64;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut line: Vec<u8> = Vec::new();
     let mut out: Vec<u8> = Vec::new();
@@ -4271,24 +4291,47 @@ fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome
             break;
         }
         if index >= offset {
-            if kept == limit || out.len() + line.len() > MAX_WINDOW_BYTES {
+            if kept < limit && out.len() + line.len() <= MAX_WINDOW_BYTES {
+                if kept == 0 {
+                    base = consumed;
+                }
+                out.extend_from_slice(&line);
+                kept += 1;
+            } else {
+                // A window that cannot return even its first line must say so:
+                // an empty page whose next offset is the same line would be an infinite
+                // retry loop for the model.
+                if kept == 0 && out.len() + line.len() > MAX_WINDOW_BYTES {
+                    return Err(ToolError::Failed(format!(
+                        "line {index} is {} bytes, past the {MAX_WINDOW_BYTES} byte read window; read from an earlier offset",
+                        line.len()
+                    )));
+                }
                 truncated = true;
-                break;
+                if !count_total {
+                    break;
+                }
             }
-            if kept == 0 {
-                base = consumed;
-            }
-            out.extend_from_slice(&line);
-            kept += 1;
         }
         consumed += read;
         index += 1;
     }
     let content = utf8_text(target, out, base)?;
+    // A counted scan reaches EOF, so the index has seen every line (the last
+    // read returned 0 and did not increment it). A stopped scan has not.
+    let total_lines = count_total.then_some(index.saturating_sub(1));
+    let end_line = if kept == 0 {
+        offset.saturating_sub(1)
+    } else {
+        offset.saturating_add(kept).saturating_sub(1)
+    };
     Ok(ReadOutcome {
         content,
         truncated,
         past_end: kept == 0 && offset > 1,
+        start_line: offset,
+        end_line,
+        total_lines,
     })
 }
 
@@ -4576,7 +4619,7 @@ pub(crate) fn glob_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "glob",
-        "Find files whose paths match a glob pattern. It matches paths, not file contents. Ignored and hidden files, and dependency or build trees, are skipped unless include_ignored is set. A pattern with no separator matches the file name at any depth; a separator anchors it. Up to limit paths are returned, sorted.",
+        "Find files by path pattern (not contents). Ignored, hidden, and dependency/build trees are skipped unless include_ignored; a pattern without '/' matches basenames at any depth. Returns up to limit paths, sorted; truncated means more matched.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -4643,17 +4686,35 @@ pub(crate) fn glob_tool(
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect();
+            let count = matches.len();
             let empty = matches.is_empty();
+            let next = (found.truncated && limit < crate::glob::MAX_RESULTS).then(|| {
+                serde_json::json!({
+                    "limit": limit.saturating_mul(2).min(crate::glob::MAX_RESULTS)
+                })
+            });
             let mut result = serde_json::json!({
                 "path": search_root.display().to_string(),
                 "pattern": pattern,
+                "count": count,
                 "matches": matches,
                 "truncated": found.truncated,
             });
             if empty {
                 result["hint"] =
                     serde_json::json!(glob_empty_hint(&pattern, &search_root, include_ignored));
+            } else if found.truncated {
+                result["hint"] = serde_json::json!(
+                    "more paths matched than limit; narrow the pattern or raise limit"
+                );
             }
+            crate::file_result::finish(
+                &mut result,
+                "glob",
+                crate::file_result::status(empty, found.truncated),
+                found.truncated,
+                next,
+            );
             Ok(result)
         },
     )
@@ -4669,7 +4730,7 @@ pub(crate) fn grep_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "grep",
-        "Search file contents with a ripgrep regular expression; returns each matching line with its file and 1-based line number. A named file is always searched; directories skip ignored, hidden and dependency/build trees unless include_ignored. Case-sensitive unless case_insensitive.",
+        "Search file contents with a ripgrep regex; rows carry path, 1-based line and text. A named file is always searched; directories skip ignored/hidden/build trees unless include_ignored. Case-sensitive unless case_insensitive. context adds kind=context rows and counts toward limit; truncated and hint report a cut.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -4677,9 +4738,9 @@ pub(crate) fn grep_tool(
                 "path": { "type": "string", "description": "File or directory to search; directories recurse. Defaults to the workspace root." },
                 "case_insensitive": { "type": "boolean", "description": "Match without case sensitivity. Defaults to false." },
                 "include_ignored": { "type": "boolean", "description": "Also search hidden, ignored and dependency/build paths." },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max matching rows; check truncated before assuming completeness." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Max rows returned (matches plus context); check truncated." },
                 "invert": { "type": "boolean", "description": "Return non-matching lines instead of matching ones." },
-                "context": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Surrounding lines per match (0-20)." },
+                "context": { "type": "integer", "minimum": 0, "maximum": 2000, "description": "0-2000 lines each side; context rows count toward limit." },
                 "files_without_match": { "type": "boolean", "description": "Return paths of files with no match instead of rows." },
                 "include": { "type": "string", "description": "One glob filter, e.g. '*.rs'; negation unsupported." },
                 "text": { "type": "boolean", "description": "Search binary files as text." }
@@ -4702,13 +4763,6 @@ pub(crate) fn grep_tool(
                 .get("include_ignored")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let limit = arg_positive(args, "limit")?.unwrap_or(crate::grep::DEFAULT_RESULTS);
-            if limit > crate::grep::MAX_RESULTS {
-                return Err(ToolError::InvalidInput(format!(
-                    "limit must be at most {}",
-                    crate::grep::MAX_RESULTS
-                )));
-            }
             let flag = |key: &str| {
                 args.get(key)
                     .and_then(serde_json::Value::as_bool)
@@ -4734,6 +4788,21 @@ pub(crate) fn grep_tool(
                 }
                 None => 0,
             };
+            // A context window is for reading a block around a hit, so when the
+            // caller does not pin a row budget, make the default cover the
+            // first hit's window. Otherwise the before-context rows could spend
+            // the default 50 and push the match itself out of the result.
+            let limit = match arg_positive(args, "limit")? {
+                Some(limit) => limit,
+                None if context > 0 => (context.saturating_mul(2) + 1).min(crate::grep::MAX_RESULTS),
+                None => crate::grep::DEFAULT_RESULTS,
+            };
+            if limit > crate::grep::MAX_RESULTS {
+                return Err(ToolError::InvalidInput(format!(
+                    "limit must be at most {}",
+                    crate::grep::MAX_RESULTS
+                )));
+            }
             let include = args
                 .get("include")
                 .and_then(serde_json::Value::as_str)
@@ -4785,10 +4854,17 @@ pub(crate) fn grep_tool(
                     row
                 })
                 .collect();
+            let count = matches.len();
             let empty = matches.is_empty() && found.binary.is_empty();
+            let next = (found.truncated && limit < crate::grep::MAX_RESULTS).then(|| {
+                serde_json::json!({
+                    "limit": limit.saturating_mul(2).min(crate::grep::MAX_RESULTS)
+                })
+            });
             let mut result = serde_json::json!({
                 "path": search_root.display().to_string(),
                 "pattern": pattern,
+                "count": count,
                 "matches": matches,
                 "truncated": found.truncated,
             });
@@ -4816,7 +4892,24 @@ pub(crate) fn grep_tool(
             }
             if empty && found.unmatched.is_empty() {
                 result["hint"] = serde_json::json!(crate::grep::hint(&query, &search_root));
+            } else if found.truncated {
+                result["hint"] = serde_json::json!(if limit < crate::grep::MAX_RESULTS {
+                    if context > 0 {
+                        "row limit reached; context rows count toward limit, so raise limit to see the whole block"
+                    } else {
+                        "row limit reached; raise limit to continue"
+                    }
+                } else {
+                    "row maximum reached; narrow the pattern or read the block with read_file"
+                });
             }
+            crate::file_result::finish(
+                &mut result,
+                "grep",
+                crate::file_result::status(empty, found.truncated),
+                found.truncated,
+                next,
+            );
             Ok(result)
         },
     )
@@ -4832,13 +4925,13 @@ pub(crate) fn read_file_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "read_file",
-        "Read a UTF-8 text file. Paths may be absolute or relative to the workspace. A path excluded by the workspace's .bsh/.ignore is refused. A file past the read ceiling is refused; pass offset (1-based line) and limit to read a window of a large file instead.",
+        "Read a UTF-8 text file. Paths are absolute or workspace-relative; .bsh/.ignore exclusions are refused. Returns start_line, end_line, total_lines when known, and next={offset} while more lines remain.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path of the UTF-8 text file to read, relative to the workspace or absolute inside the allowed workspace." },
                 "offset": { "type": "integer", "minimum": 1, "description": "1-based starting line. Omit to start at the beginning." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to return from offset. Use this to page through large files." }
+                "limit": { "type": "integer", "minimum": 1, "description": "Max lines from offset; next continues." }
             },
             "required": ["path"],
             "additionalProperties": false
@@ -4868,15 +4961,55 @@ pub(crate) fn read_file_tool(
                 content,
                 truncated,
                 past_end,
+                start_line,
+                end_line,
+                total_lines,
             } = read;
             let bytes = content.len();
-            Ok(serde_json::json!({
+            let empty = content.is_empty();
+            let count = if empty {
+                0
+            } else {
+                end_line.saturating_sub(start_line).saturating_add(1)
+            };
+            let next_offset = truncated.then_some(end_line.saturating_add(1));
+            let next = next_offset.map(|offset| serde_json::json!({ "offset": offset }));
+            let mut result = serde_json::json!({
                 "path": target.display().to_string(),
                 "content": content,
+                "count": count,
+                "start_line": start_line,
+                "end_line": end_line,
+                "total_lines": total_lines,
                 "bytes": bytes,
-                "truncated": truncated,
                 "past_end": past_end,
-            }))
+            });
+            if let Some(next) = next_offset {
+                let of = total_lines
+                    .map(|total| format!(" of {total}"))
+                    .unwrap_or_default();
+                result["hint"] = serde_json::json!(format!(
+                    "showing lines {start_line}-{end_line}{of}; continue with offset {next}"
+                ));
+            } else if past_end {
+                let total = match total_lines {
+                    Some(total) => format!("total_lines is {total}"),
+                    None => "total_lines is unknown for this large file".to_string(),
+                };
+                result["hint"] = serde_json::json!(format!(
+                    "offset {start_line} is past the last line; {total}"
+                ));
+            } else if empty {
+                result["hint"] = serde_json::json!("the file is empty");
+            }
+            crate::file_result::finish(
+                &mut result,
+                "read_file",
+                crate::file_result::status(empty, truncated),
+                truncated,
+                next,
+            );
+            Ok(result)
         },
     )
 }
@@ -4891,7 +5024,7 @@ pub(crate) fn read_files_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "read_files",
-        "Read up to 10 UTF-8 text files in one call. Each file is independently checked against workspace and read permissions. The combined returned content is capped at 1 MiB; inspect each entry's truncated or error field before relying on the result.",
+        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next. Combined content is capped at 1 MiB; inspect each entry's truncated or error field.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -4976,6 +5109,8 @@ pub(crate) fn read_files_tool(
                     Err(error) => {
                         results.push(serde_json::json!({
                             "path": raw,
+                            "status": crate::file_result::ERROR,
+                            "truncated": false,
                             "error": error.to_string()
                         }));
                         continue;
@@ -4996,9 +5131,16 @@ pub(crate) fn read_files_tool(
                         truncated = true;
                         return Ok(serde_json::json!({
                             "path": target.display().to_string(),
+                            "status": crate::file_result::PARTIAL,
                             "content": "",
+                            "count": 0,
+                            "start_line": offset.unwrap_or(1),
+                            "end_line": 0,
+                            "total_lines": null,
                             "bytes": 0,
                             "truncated": true,
+                            "next": { "offset": offset.unwrap_or(1) },
+                            "past_end": false,
                             "reason": "combined batch output budget reached"
                         }));
                     }
@@ -5014,6 +5156,9 @@ pub(crate) fn read_files_tool(
                     let ReadOutcome {
                         content,
                         truncated: file_truncated,
+                        past_end,
+                        start_line,
+                        total_lines,
                         ..
                     } = read;
                     let content_bytes = content.as_bytes();
@@ -5023,19 +5168,46 @@ pub(crate) fn read_files_tool(
                         boundary -= 1;
                     }
                     let returned = &content[..boundary];
-                    let was_truncated = file_truncated || boundary < content.len();
+                    let cut_mid_line = boundary < content.len();
+                    let was_truncated = file_truncated || cut_mid_line;
                     if was_truncated {
                         truncated = true;
                     }
+                    let returned_lines = returned.lines().count();
+                    let end_line = if returned_lines == 0 {
+                        start_line.saturating_sub(1)
+                    } else {
+                        start_line
+                            .saturating_add(returned_lines)
+                            .saturating_sub(1)
+                    };
                     let bytes = returned.len();
                     remaining -= bytes;
                     total_bytes += bytes;
-                    Ok(serde_json::json!({
+                    // A batch cut in the middle of a line returns that line
+                    // only partially, so the continuation has to read it again;
+                    // a file-level window always ends on a line boundary.
+                    let next_offset = if returned_lines == 0 {
+                        start_line
+                    } else {
+                        end_line.saturating_add(usize::from(!cut_mid_line))
+                    };
+                    let mut file_result = serde_json::json!({
                         "path": target.display().to_string(),
+                        "status": crate::file_result::status(returned_lines == 0, was_truncated),
                         "content": returned,
+                        "count": returned_lines,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "total_lines": total_lines,
                         "bytes": bytes,
-                        "truncated": was_truncated
-                    }))
+                        "truncated": was_truncated,
+                        "past_end": past_end
+                    });
+                    if was_truncated {
+                        file_result["next"] = serde_json::json!({ "offset": next_offset });
+                    }
+                    Ok(file_result)
                 })();
 
                 match result {
@@ -5047,13 +5219,34 @@ pub(crate) fn read_files_tool(
                 }
             }
 
-            Ok(serde_json::json!({
+            let failed = results
+                .iter()
+                .filter(|file| file["status"].as_str() == Some(crate::file_result::ERROR))
+                .count();
+            let returned = results.len().saturating_sub(failed);
+            let empty = results
+                .iter()
+                .all(|file| file["status"].as_str() == Some(crate::file_result::EMPTY));
+            let status = if failed == results.len() {
+                crate::file_result::ERROR
+            } else if failed > 0 || truncated {
+                crate::file_result::PARTIAL
+            } else if empty {
+                crate::file_result::EMPTY
+            } else {
+                crate::file_result::OK
+            };
+            let mut result = serde_json::json!({
                 "files": results,
                 "count": paths.len(),
+                "returned": returned,
+                "failed": failed,
                 "bytes": total_bytes,
                 "truncated": truncated,
                 "max_bytes": MAX_BATCH_READ_BYTES
-            }))
+            });
+            crate::file_result::finish(&mut result, "read_files", status, truncated, None);
+            Ok(result)
         },
     )
 }
@@ -5289,6 +5482,8 @@ fn apply_patch_tool(
                     }
                     Ok(serde_json::json!({
                         "path": target.display().to_string(),
+                        "status": crate::file_result::OK,
+                        "truncated": false,
                         "replacements": replacements,
                         "bytes": content.len(),
                         "unchanged": unchanged
@@ -5299,16 +5494,32 @@ fn apply_patch_tool(
                     Ok(value) => results.push(value),
                     Err(error) => results.push(serde_json::json!({
                         "path": raw,
+                        "status": crate::file_result::ERROR,
+                        "truncated": false,
                         "error": error.to_string()
                     })),
                 }
             }
 
-            Ok(serde_json::json!({
+            let failed = results
+                .iter()
+                .filter(|file| file["status"].as_str() == Some(crate::file_result::ERROR))
+                .count();
+            let status = if failed == results.len() {
+                crate::file_result::ERROR
+            } else if failed > 0 {
+                crate::file_result::PARTIAL
+            } else {
+                crate::file_result::OK
+            };
+            let mut result = serde_json::json!({
                 "files": results,
                 "count": changes.len(),
+                "failed": failed,
                 "changed_files": changed_files
-            }))
+            });
+            crate::file_result::finish(&mut result, "apply_patch", status, false, None);
+            Ok(result)
         },
     )
 }
@@ -5371,11 +5582,20 @@ fn write_file_tool(
                     runtime.record(&target, operation, before, "write_file");
                 }
             }
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "path": target.display().to_string(),
+                "operation": if existed { "update" } else { "create" },
                 "bytes": outcome.bytes,
                 "unchanged": outcome.unchanged,
-            }))
+            });
+            crate::file_result::finish(
+                &mut result,
+                "write_file",
+                crate::file_result::OK,
+                false,
+                None,
+            );
+            Ok(result)
         },
     )
 }
@@ -5469,11 +5689,19 @@ fn edit_file_tool(
                     runtime.record(&target, ChangeOperation::Edit, before, "edit_file");
                 }
             }
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "path": target.display().to_string(),
                 "replacements": outcome.replacements,
                 "unchanged": unchanged,
-            }))
+            });
+            crate::file_result::finish(
+                &mut result,
+                "edit_file",
+                crate::file_result::OK,
+                false,
+                None,
+            );
+            Ok(result)
         },
     )
 }
@@ -5614,6 +5842,12 @@ fn sed_tool(
                     runtime.record(&target, ChangeOperation::Edit, before, "sed");
                 }
             }
+            let empty = dry_run && outcome.content.as_ref().is_none_or(String::is_empty);
+            let truncated = if dry_run {
+                outcome.truncated
+            } else {
+                outcome.diff_truncated
+            };
             let mut result = serde_json::json!({
                 "path": target.display().to_string(),
                 "changed": outcome.changed,
@@ -5648,6 +5882,20 @@ fn sed_tool(
             if let Some(backup) = &backup {
                 result["backup"] = serde_json::json!(backup.display().to_string());
             }
+            if truncated {
+                result["hint"] = serde_json::json!(if dry_run {
+                    "the dry-run content was truncated; read the file with read_file for the rest"
+                } else {
+                    "the diff was truncated; read the file with read_file for the rest"
+                });
+            }
+            crate::file_result::finish(
+                &mut result,
+                "sed",
+                crate::file_result::status(empty, truncated),
+                truncated,
+                None,
+            );
             Ok(result)
         },
     )
@@ -5663,7 +5911,7 @@ fn list_dir_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "list_dir",
-        "List a directory's entries (name and kind), sorted by name. Entries excluded by the workspace's .bsh/.ignore are omitted. Up to 2000 entries are returned; truncated reports a larger directory.",
+        "List a directory's entries (name and kind), sorted. .bsh/.ignore exclusions are omitted; up to 2000 entries, truncated means more.",
         serde_json::json!({
             "type": "object",
             "properties": { "path": { "type": "string", "description": "Directory to list, relative to the workspace or absolute inside the allowed workspace." } },
@@ -5685,11 +5933,26 @@ fn list_dir_tool(
                 &target,
             )?;
             let listing = list_entries(&target, rules.as_ref())?;
-            Ok(serde_json::json!({
+            let count = listing.entries.len();
+            let mut result = serde_json::json!({
                 "path": target.display().to_string(),
+                "count": count,
                 "entries": listing.entries,
                 "truncated": listing.truncated,
-            }))
+            });
+            if listing.truncated {
+                result["hint"] = serde_json::json!(
+                    "more entries existed than this listing returns; list a subdirectory or narrow the path"
+                );
+            }
+            crate::file_result::finish(
+                &mut result,
+                "list_dir",
+                crate::file_result::status(count == 0, listing.truncated),
+                listing.truncated,
+                None,
+            );
+            Ok(result)
         },
     )
 }
@@ -10841,6 +11104,12 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .expect("a small file reads whole");
         assert_eq!(whole["content"], body);
         assert_eq!(whole["truncated"], false);
+        assert_eq!(whole["start_line"], 1);
+        assert_eq!(whole["end_line"], 100);
+        assert_eq!(whole["total_lines"], 100);
+        assert_eq!(whole["tool"], "read_file");
+        assert_eq!(whole["status"], "ok");
+        assert!(whole.get("next").is_none());
 
         let window = registry
             .execute(
@@ -10855,6 +11124,28 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(window["content"], "line 10\nline 11\nline 12\n");
         assert_eq!(window["truncated"], true);
         assert_eq!(window["past_end"], false);
+        assert_eq!(window["start_line"], 10);
+        assert_eq!(window["end_line"], 12);
+        assert_eq!(window["total_lines"], 100);
+        assert_eq!(window["status"], "partial");
+        assert_eq!(window["next"]["offset"], 13);
+
+        // The last page reaches EOF, so it can report the exact file length and
+        // does not offer a continuation past the end.
+        let tail = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({
+                    "path": lines.to_string_lossy(),
+                    "offset": 95,
+                    "limit": 10,
+                }),
+            )
+            .expect("the tail reads");
+        assert_eq!(tail["end_line"], 100);
+        assert_eq!(tail["total_lines"], 100);
+        assert_eq!(tail["status"], "ok");
+        assert!(tail.get("next").is_none());
 
         let past = registry
             .execute(
@@ -10871,6 +11162,28 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             past["past_end"], true,
             "an empty window past the last line says so, so it cannot be read as an empty file"
         );
+        assert_eq!(past["status"], "empty");
+        assert_eq!(past["total_lines"], 100);
+        assert!(
+            past["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("past the last line"),
+            "{past}"
+        );
+
+        let empty = root.join("empty.txt");
+        std::fs::write(&empty, "").expect("empty");
+        let empty = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": empty.to_string_lossy() }),
+            )
+            .expect("an empty file reads");
+        assert_eq!(empty["total_lines"], 0);
+        assert_eq!(empty["end_line"], 0);
+        assert_eq!(empty["status"], "empty");
+        assert_eq!(empty["hint"], "the file is empty");
     }
 
     #[test]
@@ -10892,9 +11205,19 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("batch call returns per-file outcomes");
 
+        assert_eq!(result["tool"], "read_files");
+        assert_eq!(result["status"], "partial");
         assert_eq!(result["count"], 3);
+        assert_eq!(result["returned"], 2);
+        assert_eq!(result["failed"], 1);
+        assert_eq!(result["files"][0]["status"], "ok");
         assert_eq!(result["files"][0]["content"], "fn a() {}");
+        assert_eq!(result["files"][0]["start_line"], 1);
+        assert_eq!(result["files"][0]["end_line"], 1);
+        assert_eq!(result["files"][0]["total_lines"], 1);
+        assert!(result["files"][0].get("next").is_none());
         assert_eq!(result["files"][1]["content"], "fn b() {}");
+        assert_eq!(result["files"][2]["status"], "error");
         assert!(result["files"][2]["error"].as_str().is_some());
         assert!(!result.to_string().contains("outside-secret"));
         assert_eq!(result["truncated"], false);
@@ -10941,6 +11264,13 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             MAX_BATCH_READ_BYTES as u64
         );
         assert!(result["files"][1]["truncated"].as_bool().unwrap());
+        assert_eq!(result["status"], "partial");
+        // The batch cut b.txt in the middle of its one long line. The
+        // continuation must re-read that line, not skip to the next one.
+        assert_eq!(result["files"][1]["start_line"], 1);
+        assert_eq!(result["files"][1]["end_line"], 1);
+        assert_eq!(result["files"][1]["status"], "partial");
+        assert_eq!(result["files"][1]["next"]["offset"], 1);
     }
 
     /// A binary file and a directory are refused by name instead of being
@@ -12074,10 +12404,90 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let too_much = registry
             .execute(
                 "grep",
-                &serde_json::json!({ "pattern": "needle", "context": 21 }),
+                &serde_json::json!({ "pattern": "needle", "context": crate::grep::MAX_CONTEXT + 1 }),
             )
             .expect_err("context is bounded");
         assert!(too_much.to_string().contains("context"), "{too_much}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A wide context window is a file-reading capability, not only a search
+    /// nicety: one call can return the whole function around a hit, so a model
+    /// does not have to open three windows (or an interpreter) to see it.
+    #[test]
+    fn a_wide_grep_context_returns_a_whole_block() {
+        let root = scratch("grep-wide-context");
+        let mut body = String::new();
+        for line in 1..=80 {
+            match line {
+                40 => body.push_str("function target(){\n"),
+                60 => body.push_str("}\n"),
+                _ => body.push_str(&format!("line {line}\n")),
+            }
+        }
+        std::fs::write(root.join("game.js"), body).expect("game");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let found = registry
+            .execute(
+                "grep",
+                &serde_json::json!({
+                    "pattern": "function target",
+                    "path": "game.js",
+                    "context": 25,
+                    "limit": 200,
+                }),
+            )
+            .expect("a wide context window is accepted");
+        let rows = found["matches"].as_array().expect("matches");
+        assert_eq!(rows.first().map(|row| row["line"].as_u64()), Some(Some(15)));
+        assert_eq!(rows.last().map(|row| row["line"].as_u64()), Some(Some(65)));
+        assert!(
+            rows.iter()
+                .any(|row| row["line"] == 40 && row["text"] == "function target(){"),
+            "the match itself is in the window: {found}"
+        );
+        assert_eq!(found["truncated"], false);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A context window larger than the row budget must not spend the whole
+    /// budget on before-context and stop the search before the match appears.
+    #[test]
+    fn a_grep_context_window_never_hides_its_match() {
+        let root = scratch("grep-context-match");
+        let mut body = String::new();
+        for line in 1..=100 {
+            if line == 50 {
+                body.push_str("TARGET\n");
+            } else {
+                body.push_str(&format!("line {line}\n"));
+            }
+        }
+        std::fs::write(root.join("game.js"), body).expect("game");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let found = registry
+            .execute(
+                "grep",
+                &serde_json::json!({
+                    "pattern": "TARGET",
+                    "path": "game.js",
+                    "context": 100,
+                    "limit": 10,
+                }),
+            )
+            .expect("a context window larger than the row budget is accepted");
+        let rows = found["matches"].as_array().expect("matches");
+        assert!(
+            rows.iter()
+                .any(|row| row["line"] == 50 && row["text"] == "TARGET"),
+            "the match survives its own before-context: {found}"
+        );
+        assert_eq!(found["truncated"], true);
+        assert_eq!(found["status"], "partial");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -15452,5 +15862,66 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
             Some("/com_example_hello__greet in one sentence"),
             "the child view shows the annotation, not the template: {rows:?}"
         );
+    }
+
+    /// The contract is shared, not per-tool folklore: every built-in file tool
+    /// names itself, says whether it is complete, and offers a continuation as
+    /// an argument object when one exists.
+    #[test]
+    fn every_file_tool_result_carries_the_shared_contract() {
+        let root = scratch("file-result-contract");
+        std::fs::write(root.join("a.txt"), "needle").expect("a");
+        std::fs::write(root.join("b.txt"), "other").expect("b");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("glob", serde_json::json!({ "pattern": "*.txt" })),
+            ("grep", serde_json::json!({ "pattern": "needle" })),
+            ("read_file", serde_json::json!({ "path": "a.txt" })),
+            (
+                "read_files",
+                serde_json::json!({ "paths": ["a.txt", "b.txt"] }),
+            ),
+            ("list_dir", serde_json::json!({ "path": "." })),
+            (
+                "write_file",
+                serde_json::json!({ "path": "new.txt", "content": "new" }),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({
+                    "path": "a.txt",
+                    "old_string": "needle",
+                    "new_string": "changed"
+                }),
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({
+                    "changes": [{
+                        "path": "a.txt",
+                        "edits": [{ "old_string": "changed", "new_string": "patched" }]
+                    }]
+                }),
+            ),
+            (
+                "sed",
+                serde_json::json!({ "path": "a.txt", "script": "s/patched/final/" }),
+            ),
+        ];
+
+        for (tool, args) in cases {
+            let value = registry
+                .execute(tool, &args)
+                .unwrap_or_else(|error| panic!("{tool} failed: {error}"));
+            assert_eq!(value["tool"], tool, "self-describing result: {value}");
+            assert_eq!(value["status"], "ok", "{tool}: {value}");
+            assert_eq!(value["truncated"], false, "{tool}: {value}");
+            if let Some(next) = value.get("next") {
+                assert!(next.is_object(), "{tool} next is arguments: {value}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

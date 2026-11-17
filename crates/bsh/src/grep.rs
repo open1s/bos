@@ -35,20 +35,26 @@ use ignore::overrides::{Override, OverrideBuilder};
 use crate::glob::{build_walker, relative_to, MAX_PATTERN_BYTES};
 
 /// The most rows one call returns by default.
-pub(crate) const DEFAULT_RESULTS: usize = 50;
+pub(crate) const DEFAULT_RESULTS: usize = 500;
 
 /// The most rows one call may ask for.
-pub(crate) const MAX_RESULTS: usize = 500;
+pub(crate) const MAX_RESULTS: usize = 2000;
 
 /// The most context lines one call may ask for on each side of a match.
-pub(crate) const MAX_CONTEXT: usize = 20;
+///
+/// The cap is deliberately wide enough to return a whole function or a markup
+/// block around one match. A model that must open a file, count lines and read
+/// three windows to see a function reaches for an interpreter instead; one
+/// grep with context reaches the same text in one call. The row budget still
+/// bounds the payload, so the context is a capability, not a blank cheque.
+pub(crate) const MAX_CONTEXT: usize = 2000;
 
 /// The largest file the searcher opens, in bytes.
 ///
 /// Grep is line oriented and usually pointed at source; a multi-megabyte file
 /// is more likely to be a log or generated data than the line wanted, and the
 /// bound keeps one file from dominating a call.
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 40 * 1024 * 1024;
 
 /// The widest line one row reports, in characters.
 const MAX_LINE_CHARS: usize = 300;
@@ -472,9 +478,13 @@ impl<M: Matcher, W: io::Write> Sink for Emit<'_, '_, M, W> {
     }
 
     fn context(&mut self, searcher: &Searcher, ctx: &SinkContext<'_>) -> io::Result<bool> {
-        if self.rows >= self.budget {
+        // Reserve the last row for a match. A wide before-context window must
+        // not spend the whole budget and then stop the search before the match
+        // that asked for it is ever printed. Skipping the excess context keeps
+        // the searcher moving; the match can still take the reserved row.
+        if self.rows.saturating_add(1) >= self.budget {
             self.exceeded = true;
-            return Ok(false);
+            return Ok(true);
         }
         let keep = self.json.context(searcher, ctx)?;
         self.rows += 1;
