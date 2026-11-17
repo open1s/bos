@@ -1,5 +1,13 @@
 # Changelog
 
+## v4.1.16 (2026-11-17)
+
+- **The Windows extension test compiles again.** The Windows-only
+  path-normalization test now imports `Path`/`PathBuf` and the
+  `normalize_path`/`resolve_path` helpers from its own module; v4.1.15's tag
+  stopped the Windows extensions and rust workspace checks at test-compile time
+  with ten missing-symbol errors, without any product-behavior change.
+
 ## v4.1.15 (2026-11-17)
 
 - **File tools return model-oriented results.** Every built-in file tool now
