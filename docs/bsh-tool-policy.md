@@ -407,6 +407,21 @@ message names the path and the reason (a binary file, an out-of-workspace path,
 an ambiguous edit), and a batch keeps that text in the per-file `error` field
 with `status: "error"`.
 
+### Cross-platform file semantics
+
+- Paths keep a Windows drive or UNC prefix during lexical normalization. A
+  drive-relative path (`C:file`) and a rooted path without a drive (`\file`)
+  are refused on Windows instead of being joined to the workspace and
+  changing drives.
+- Every replacing write goes through one platform seam: `rename` on Unix and
+  `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows. `std::fs::rename`
+  alone fails on Windows when the destination exists, so it cannot back
+  `write_file`, `edit_file`, `apply_patch` or `sed`.
+- The per-path write lock folds case on Windows, where `New.txt` and `new.txt`
+  are one file.
+- Reads and writes are byte-preserving. CRLF is kept, and an edit miss whose
+  block uses bare LF in a CRLF file says so in the error.
+
 - system_prompt replaces the workspace prompt for the chats that select the
   preset; absent keeps the workspace prompt. It is the persona the LLM call
   receives.

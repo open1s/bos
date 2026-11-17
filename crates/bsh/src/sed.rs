@@ -386,7 +386,7 @@ fn rewrite_private(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let kept = temporary
         .keep()
         .map_err(|error| Error::Failed(format!("rewriting {}: {error}", path.display())))?;
-    if let Err(error) = fs::rename(&kept, path) {
+    if let Err(error) = crate::atomic_replace::replace(&kept, path) {
         let _ = fs::remove_file(&kept);
         return Err(Error::Failed(format!(
             "rewriting {}: {error}",
@@ -438,7 +438,7 @@ impl CopyTarget {
     /// Keep the processed copy and move it over the original in one rename.
     fn replace(self, target: &Path) -> Result<(), Error> {
         let path = self.keep(target)?;
-        if let Err(error) = fs::rename(&path, target) {
+        if let Err(error) = crate::atomic_replace::replace(&path, target) {
             let _ = fs::remove_file(&path);
             return Err(Error::Failed(format!(
                 "replacing {}: {error}",
@@ -455,7 +455,7 @@ impl CopyTarget {
     /// failed second rename restores the backup so the target is never lost.
     fn replace_with_backup(self, target: &Path, backup: &Path) -> Result<(), Error> {
         let path = self.keep(target)?;
-        if let Err(error) = fs::rename(target, backup) {
+        if let Err(error) = crate::atomic_replace::replace(target, backup) {
             let _ = fs::remove_file(&path);
             return Err(Error::Failed(format!(
                 "moving {} to {}: {error}",
@@ -463,10 +463,10 @@ impl CopyTarget {
                 backup.display()
             )));
         }
-        if let Err(error) = fs::rename(&path, target) {
+        if let Err(error) = crate::atomic_replace::replace(&path, target) {
             // Put the original back before reporting; a stranded backup is
             // recoverable, a missing target is not.
-            let _ = fs::rename(backup, target);
+            let _ = crate::atomic_replace::replace(backup, target);
             let _ = fs::remove_file(&path);
             return Err(Error::Failed(format!(
                 "replacing {}: {error}",

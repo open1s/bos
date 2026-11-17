@@ -222,9 +222,10 @@ winresource = "0.1.34"
 # The Windows terminal pane's PTY host: ConPTY spawns the shell attached to a
 # pseudoconsole (issue #296). Windows-only; macOS/Linux use the Ghostty surface.
 [target.'cfg(windows)'.dependencies]
-conpty = "0.5"
+conpty = "0.7.0"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Threading",
 ] }

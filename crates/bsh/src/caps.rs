@@ -2562,6 +2562,27 @@ fn resolve_path(root: Option<&Path>, raw: &str, enforce: bool) -> Result<PathBuf
         return Err("path must not be empty".to_string());
     }
     let raw_path = Path::new(raw);
+    // A drive-relative Windows path (C:foo) has a prefix but no root. Joining
+    // it to the workspace would produce a path the policy cannot check
+    // consistently, so refuse it and ask for the absolute spelling.
+    #[cfg(windows)]
+    {
+        if raw_path.has_root() && !raw_path.is_absolute() {
+            return Err(format!(
+                "{raw} is rooted without a drive; use an absolute path such as C:\\folder\\file"
+            ));
+        }
+        if raw_path
+            .components()
+            .next()
+            .is_some_and(|component| matches!(component, Component::Prefix(_)))
+            && !raw_path.has_root()
+        {
+            return Err(format!(
+                "{raw} is drive-relative; use an absolute path such as C:\\folder\\file"
+            ));
+        }
+    }
     let Some(root) = root else {
         // A turn with no workspace root has nothing to resolve a RELATIVE path
         // against. Handing the bare relative string to the policy produced the
@@ -2614,7 +2635,10 @@ fn normalize_path(path: &Path) -> PathBuf {
             Component::ParentDir => {
                 out.pop();
             }
-            Component::RootDir => out = PathBuf::from(std::path::MAIN_SEPARATOR.to_string()),
+            // Push the separator instead of replacing the buffer: on Windows
+            // the drive or UNC prefix is a separate component, and replacing
+            // here would turn C:\work into \work on the current drive.
+            Component::RootDir => out.push(std::path::MAIN_SEPARATOR.to_string()),
             Component::Prefix(prefix) => out = PathBuf::from(prefix.as_os_str()),
             Component::Normal(part) => out.push(part),
         }
@@ -4445,7 +4469,7 @@ fn write_bytes(target: &Path, bytes: &[u8]) -> Result<WriteOutcome, ToolError> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(mode));
     }
-    if let Err(error) = fs::rename(&temp, target) {
+    if let Err(error) = crate::atomic_replace::replace(&temp, target) {
         let _ = fs::remove_file(&temp);
         return Err(failed(target, &error));
     }
@@ -4593,7 +4617,24 @@ fn file_lock(path: &Path) -> Arc<Mutex<()>> {
     let mut locks = locks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    locks.entry(path.to_path_buf()).or_default().clone()
+    locks.entry(lock_key(path)).or_default().clone()
+}
+
+/// The key one path uses in the per-path lock table.
+///
+/// Windows paths are case-insensitive, so New.txt and new.txt are one file.
+/// Resolving a not-yet-existing target cannot canonicalize the leaf, so the
+/// key folds case there; an existing target already resolved through
+/// canonicalize and keeps its real spelling. Unix keeps the exact key.
+fn lock_key(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
 }
 
 /// The sentence an empty glob result carries.
@@ -11056,6 +11097,32 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let message = error.to_string();
         assert!(message.contains("escapes the workspace"), "{message}");
         assert!(!message.contains("outside-secret"), "the file was read");
+    }
+
+    /// A Windows drive or UNC prefix survives lexical normalization.
+    ///
+    /// Replacing the buffer at RootDir would turn C:\work\file into
+    /// \work\file on the current drive and let a relative read escape the
+    /// workspace on a different volume.
+    #[test]
+    #[cfg(windows)]
+    fn a_windows_prefix_survives_normalization() {
+        assert_eq!(
+            normalize_path(Path::new(r"C:\work\game\..\file.txt")),
+            PathBuf::from(r"C:\work\file.txt")
+        );
+        assert_eq!(
+            normalize_path(Path::new(r"\\server\share\dir\..\file.txt")),
+            PathBuf::from(r"\\server\share\file.txt")
+        );
+        assert!(
+            resolve_path(Some(Path::new(r"C:\ws")), "C:file.txt", false).is_err(),
+            "a drive-relative path is refused instead of being joined to the workspace"
+        );
+        assert!(
+            resolve_path(Some(Path::new(r"C:\ws")), r"\Windows\file.txt", false).is_err(),
+            "a rooted path without a drive is refused instead of changing drives"
+        );
     }
 
     /// A RELATIVE path is resolved against the workspace root, not refused.

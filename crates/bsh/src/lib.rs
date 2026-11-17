@@ -10,6 +10,7 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 pub(crate) mod assets;
+pub(crate) mod atomic_replace;
 pub(crate) mod audit;
 pub(crate) mod browser;
 pub(crate) mod caps;
