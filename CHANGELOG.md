@@ -1,6 +1,14 @@
 # Changelog
 
-## v4.1.17 (2026-11-17)
+## v4.1.18 (2026-11-17)
+
+- **Release-gate fixes.** Federation capability tests now pass the required
+  `read_file` offset; the stale `codintelli` query-limit doc links no longer
+  fail the docs build; and Extension prompt activation no longer fires merely
+  because an extension tool is admitted - the task must name the capability, so
+  an unrelated research turn does not carry the Extension DevKit workflow.
+  Extension injection rows also name the contribution id, so two contributions
+  of one package are distinguishable.
 
 - **Extension instructions activate per task (#436).** Prompt and context
   contributions are no longer appended to the standing system prompt at

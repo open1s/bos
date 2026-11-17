@@ -2078,7 +2078,7 @@ mod tests {
             .invoke(
                 &provider_id,
                 &capability,
-                json!({ "path": "a.txt" }),
+                json!({ "path": "a.txt", "offset": 1 }),
                 &context,
             )
             .await
@@ -2217,7 +2217,7 @@ mod tests {
                     result_contract: Some(
                         json!({
                             "capability": "builtin/read_file",
-                            "input": { "path": "a.txt" }
+                            "input": { "path": "a.txt", "offset": 1 }
                         })
                         .to_string(),
                     ),
@@ -2347,7 +2347,7 @@ mod tests {
                     result_contract: Some(
                         json!({
                             "capability": "builtin/read_file",
-                            "input": { "path": "a.txt" }
+                            "input": { "path": "a.txt", "offset": 1 }
                         })
                         .to_string(),
                     ),
@@ -3302,7 +3302,7 @@ mod tests {
             .invoke(
                 &a_id,
                 &"builtin/read_file".parse().expect("a capability"),
-                json!({ "path": "hello.txt" }),
+                json!({ "path": "hello.txt", "offset": 1 }),
                 &context,
             )
             .await
@@ -3367,7 +3367,7 @@ mod tests {
             .invoke(
                 &a_id,
                 &"builtin/read_file".parse().expect("a capability"),
-                json!({ "path": "hello.txt" }),
+                json!({ "path": "hello.txt", "offset": 1 }),
                 &context,
             )
             .await;
