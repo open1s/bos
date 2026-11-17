@@ -125,6 +125,7 @@
 "slash.compactProviderWindow": "The summarizer request exceeded the model window; the history was reduced to its oldest and newest parts and the request still failed: {error}"
 "slash.compactEmpty": "The summarizer returned an empty summary; the history is unchanged."
 "slash.compactIncomplete": "The checkpoint was rejected and the history is unchanged: {reason}"
+"slash.compactInconclusive": "The checkpoint could not be proven semantically equivalent; the history is unchanged: {reason}"
 "slash.compactNotSmaller": "The summary would not shrink the context ({framed} >= {span} tokens); the history is unchanged."
 "slash.compactFailed": "Compaction failed: {error}"
 "slash.compactCommit": "Compaction did not finish cleanly; some session history may have changed. Inspect the current session state before retrying."

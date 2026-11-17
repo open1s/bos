@@ -217,6 +217,21 @@ paths, not only asserted from fixture metadata. The task-side corpus
 attempt-bound verification, sandbox timeout and artifact-escape scenarios; those
 run in the task suite in `crates/bsh`.
 
+## Compaction critical facts (issue #429)
+
+Critical facts are structured, not keyword bags: subject, predicate, value,
+polarity, condition + canonical condition kind, scope, source span index and
+trust. Extraction recognizes goals, constraints, decisions, assumptions, open
+tasks/questions, conflicts and tool-verified results. Coverage requires each
+fact to match a summary sentence on structure, polarity, exact normalized
+quantities (numbers/units/time ranges) and the same condition kind (only-if is
+not after, unless is not except, not-only stays additive). Chinese constraints
+use 2-character n-grams plus Chinese negation/condition markers. Multiple
+conflicting facts must all survive; omitting one is a rejection. If equivalence
+cannot be proven, compaction returns `InconclusiveCheckpoint` and leaves the
+source history intact. Missing facts, contradictions and inconclusive facts are
+recorded on the checkpoint for structured comparison.
+
 ## Session schema and checkpoint archive (issues #419, #424)
 
 Serialized sessions carry a schema generation (current 5) and are validated

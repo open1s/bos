@@ -1013,9 +1013,12 @@ impl Agent {
         // span is still intact at this point.
         if let Err(reason) = crate::agent::context::validate_checkpoint(&summary, &span) {
             log::warn!("compaction checkpoint rejected by the semantic gate: {reason}");
-            return Err(AgentError::Compaction(
-                crate::agent::context::CompactionFailure::IncompleteCheckpoint { reason },
-            ));
+            let failure = if reason.starts_with("cannot prove semantic equivalence") {
+                crate::agent::context::CompactionFailure::InconclusiveCheckpoint { reason }
+            } else {
+                crate::agent::context::CompactionFailure::IncompleteCheckpoint { reason }
+            };
+            return Err(AgentError::Compaction(failure));
         }
 
         // Install only now: a failed or cancelled request must leave the

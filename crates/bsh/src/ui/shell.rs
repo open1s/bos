@@ -193,6 +193,11 @@ pub(crate) fn compact_failure_text(
             "slash.compactIncomplete",
             &[("reason", reason.clone())],
         ),
+        CompactionFailure::InconclusiveCheckpoint { reason } => crate::i18n::tr_args(
+            lang,
+            "slash.compactInconclusive",
+            &[("reason", reason.clone())],
+        ),
         CompactionFailure::NotSmaller {
             framed_tokens,
             span_tokens,

@@ -3730,6 +3730,228 @@ async fn compaction_rejects_a_negation_reversal() {
     assert!(error.to_string().contains("contradicts"), "{error}");
 }
 
+/// Conditions, exceptions and additives are preserved as semantics, not as
+/// loose keyword co-occurrence (issue #429).
+#[tokio::test]
+async fn compaction_preserves_conditions_and_exceptions() {
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    for (source_line, good, bad) in [
+        (
+            "Deploy unless tests pass",
+            "- Deploy unless tests pass",
+            "- Deploy after tests pass",
+        ),
+        (
+            "All regions except EU may deploy",
+            "- All regions except EU may deploy",
+            "- All regions may deploy",
+        ),
+        (
+            "Not only tests but also lint must pass",
+            "- Not only tests but also lint must pass",
+            "- Tests pass",
+        ),
+    ] {
+        let agent = agent_with_summary(&complete_summary(good));
+        four_messages(&agent);
+        {
+            let mut session = agent.session();
+            session.add_user(source_line.to_string());
+            session.add_assistant("Noted.".to_string());
+        }
+        agent
+            .compact_now(0, &signal)
+            .await
+            .expect("faithful condition installs")
+            .expect("checkpoint");
+
+        let agent = agent_with_summary(&complete_summary(bad));
+        four_messages(&agent);
+        {
+            let mut session = agent.session();
+            session.add_user(source_line.to_string());
+            session.add_assistant("Noted.".to_string());
+        }
+        let error = agent
+            .compact_now(0, &signal)
+            .await
+            .expect_err("changed condition is refused");
+        assert!(
+            error.to_string().contains("inconclusive")
+                || error.to_string().contains("critical fact"),
+            "{source_line}: {error}"
+        );
+    }
+}
+
+/// Unprovable condition equivalence is reported as Inconclusive, not as a
+/// generic missing fact (issue #429).
+#[tokio::test]
+async fn compaction_returns_inconclusive_for_unprovable_semantics() {
+    let agent = agent_with_summary(&complete_summary("- Deploy after tests pass"));
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user("Deploy unless tests pass".to_string());
+        session.add_assistant("Noted.".to_string());
+    }
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("unprovable condition");
+    assert!(
+        matches!(
+            error,
+            AgentError::Compaction(CompactionFailure::InconclusiveCheckpoint { .. })
+        ),
+        "{error:?}"
+    );
+}
+
+/// Chinese negation and constraints participate in the same structured gate.
+#[tokio::test]
+async fn compaction_preserves_chinese_negation() {
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let make = || {
+        let agent = agent_with_summary(&complete_summary("- 周五不要部署"));
+        four_messages(&agent);
+        {
+            let mut session = agent.session();
+            session.add_user("不要 在周五 部署".to_string());
+            session.add_assistant("好的".to_string());
+        }
+        agent
+    };
+    let agent = make();
+    agent
+        .compact_now(0, &signal)
+        .await
+        .expect("Chinese paraphrase installs")
+        .expect("checkpoint");
+
+    let agent = agent_with_summary(&complete_summary("- 周五可以部署"));
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user("不要 在周五 部署".to_string());
+        session.add_assistant("好的".to_string());
+    }
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("Chinese negation reversal refused");
+    assert!(error.to_string().contains("contradict"), "{error}");
+}
+
+/// Numbers, units and time ranges cannot be simplified away.
+#[tokio::test]
+async fn compaction_preserves_numbers_units_and_time_ranges() {
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let source = "Timeout must be 30s and deploy window is 09:00-17:00";
+    let agent = agent_with_summary(&complete_summary(
+        "- Timeout 30s, deploy window 09:00-17:00",
+    ));
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user(source.to_string());
+        session.add_assistant("Noted.".to_string());
+    }
+    agent
+        .compact_now(0, &signal)
+        .await
+        .expect("faithful numbers install")
+        .expect("checkpoint");
+
+    let agent = agent_with_summary(&complete_summary("- Timeout 30 seconds, window 09:00"));
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user(source.to_string());
+        session.add_assistant("Noted.".to_string());
+    }
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("dropping 17:00 is refused");
+    assert!(
+        error.to_string().contains("inconclusive") || error.to_string().contains("critical fact"),
+        "{error}"
+    );
+}
+
+/// Conflicting facts must both remain visible; a summary cannot pick one.
+#[tokio::test]
+async fn compaction_preserves_conflicting_facts() {
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let agent = agent_with_summary(&complete_summary(
+        "- CONFLICT: pool size 10; CONFLICT: pool size 20",
+    ));
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user("CONFLICT: pool size 10".to_string());
+        session.add_assistant("Noted.".to_string());
+        session.add_user("CONFLICT: pool size 20".to_string());
+        session.add_assistant("Noted.".to_string());
+    }
+    agent
+        .compact_now(0, &signal)
+        .await
+        .expect("both conflicts install")
+        .expect("checkpoint");
+
+    let agent = agent_with_summary(&complete_summary("- CONFLICT: pool size 10"));
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user("CONFLICT: pool size 10".to_string());
+        session.add_assistant("Noted.".to_string());
+        session.add_user("CONFLICT: pool size 20".to_string());
+        session.add_assistant("Noted.".to_string());
+    }
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("dropping one side of a conflict is refused");
+    assert!(
+        error.to_string().contains("inconclusive") || error.to_string().contains("critical fact"),
+        "{error}"
+    );
+}
+
+/// Critical facts expose a structured comparison surface, not just text.
+#[test]
+fn critical_facts_are_structured_and_traceable() {
+    use crate::agent::context::extract_critical_facts;
+    let mut session = AgentSession::new();
+    session.add_user("Deploy unless tests pass at 09:00".to_string());
+    session.add_user("不要 在周五 部署".to_string());
+    let facts = extract_critical_facts(session.messages());
+    assert_eq!(facts.len(), 2);
+    let english = &facts[0];
+    assert_eq!(
+        english.kind,
+        crate::agent::context::CriticalFactKind::Constraint
+    );
+    assert_eq!(
+        english.polarity,
+        crate::agent::context::FactPolarity::Positive
+    );
+    assert_eq!(english.condition_kind.as_deref(), Some("unless"));
+    assert!(english.condition.as_deref().unwrap_or("").contains("tests"));
+    assert!(english.value.contains("09:00"));
+    assert_eq!(english.source_index, 0);
+    assert_eq!(english.trust, "user");
+    let chinese = &facts[1];
+    assert_eq!(
+        chinese.polarity,
+        crate::agent::context::FactPolarity::Negative
+    );
+    assert_eq!(chinese.source_index, 1);
+}
+
 /// A summary marker claim with a token absent from the source is unsupported
 /// (issue #429).
 #[tokio::test]
@@ -4837,7 +5059,9 @@ async fn reliability_horizon_smoke_subset() {
 
     // Scenario 2: contradictory decisions remain explicitly present in the
     // recoverable source instead of being silently resolved by the summary.
-    let agent = agent_with_summary(&complete_summary("- DECISION A and B recorded"));
+    let agent = agent_with_summary(&complete_summary(
+        "- DECISION A: ship on Friday; DECISION B: hold the release",
+    ));
     four_messages(&agent);
     {
         let mut session = agent.session();

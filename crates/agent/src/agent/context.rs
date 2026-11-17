@@ -130,6 +130,14 @@ pub enum CompactionFailure {
         /// The actionable reason shown to the reader/model.
         reason: String,
     },
+    /// The summary cannot be proven semantically equivalent to the source
+    /// (conditions, quantities or structure do not line up). The history was
+    /// left untouched.
+    #[error("checkpoint inconclusive: {reason}")]
+    InconclusiveCheckpoint {
+        /// The actionable reason shown to the reader/model.
+        reason: String,
+    },
 }
 
 impl CompactionFailure {
@@ -449,6 +457,9 @@ pub struct Checkpoint {
     /// Facts the summary failed to cover.
     #[serde(default)]
     pub missing_facts: Vec<CriticalFact>,
+    /// Facts whose semantic equivalence could not be proven.
+    #[serde(default)]
+    pub inconclusive_facts: Vec<CriticalFact>,
     /// Summary claims not supported by the source.
     #[serde(default)]
     pub unsupported_claims: Vec<String>,
@@ -462,18 +473,36 @@ pub struct Checkpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CriticalFactKind {
+    /// A plain asserted fact.
+    Fact,
     /// The user's goal.
     Goal,
     /// An explicit or ordinary-language constraint.
     Constraint,
     /// A decision or rejected alternative.
     Decision,
+    /// An assumption the work depends on.
+    Assumption,
     /// Pending work or a dependency.
     OpenTask,
+    /// An item that still needs confirmation.
+    OpenQuestion,
     /// An unresolved conflict.
     Conflict,
     /// A tool-verified outcome.
     VerifiedResult,
+}
+
+/// The truth polarity of a critical fact (issue #429).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactPolarity {
+    /// Asserted affirmatively.
+    Positive,
+    /// Negated or prohibited.
+    Negative,
+    /// The text did not make the polarity clear.
+    Unknown,
 }
 
 /// One critical fact bound to the message it came from (issue #429).
@@ -481,7 +510,24 @@ pub enum CriticalFactKind {
 pub struct CriticalFact {
     /// What kind of fact this is.
     pub kind: CriticalFactKind,
-    /// The source line, trimmed.
+    /// The normalized subject, when it can be identified.
+    pub subject: String,
+    /// The normalized predicate/action.
+    pub predicate: String,
+    /// The object/value, including normalized numbers and units.
+    pub value: String,
+    /// Affirmed or negated/prohibited.
+    pub polarity: FactPolarity,
+    /// A condition/exception such as unless, except, if or 除非.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    /// The canonical condition kind (only-if, unless, except, not-only...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_kind: Option<String>,
+    /// The scope the fact applies to (for/all/within/仅...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// The original source line, trimmed (traceability).
     pub text: String,
     /// The message index in the shadowed span.
     pub source_index: usize,
@@ -498,6 +544,9 @@ pub struct FactCoverage {
     pub missing: Vec<CriticalFact>,
     /// Facts the summary covers with the opposite negation polarity.
     pub contradicted: Vec<CriticalFact>,
+    /// Facts whose equivalence cannot be proven (conditions, numbers, scope or
+    /// structure do not line up).
+    pub inconclusive: Vec<CriticalFact>,
     /// Summary marker claims absent from the source.
     pub unsupported: Vec<String>,
 }
@@ -505,7 +554,10 @@ pub struct FactCoverage {
 impl FactCoverage {
     /// Whether the summary covers every fact and invents none.
     pub fn complete(&self) -> bool {
-        self.missing.is_empty() && self.contradicted.is_empty() && self.unsupported.is_empty()
+        self.missing.is_empty()
+            && self.contradicted.is_empty()
+            && self.inconclusive.is_empty()
+            && self.unsupported.is_empty()
     }
 }
 
@@ -619,6 +671,17 @@ pub fn validate_checkpoint(summary: &str, source: &[Message]) -> Result<(), Stri
             names.join("; ")
         ));
     }
+    if !coverage.inconclusive.is_empty() {
+        let names: Vec<String> = coverage
+            .inconclusive
+            .iter()
+            .map(|fact| format!("{:?}: {}", fact.kind, fact.text))
+            .collect();
+        return Err(format!(
+            "cannot prove semantic equivalence (inconclusive) for critical fact(s): {}",
+            names.join("; ")
+        ));
+    }
     if !coverage.unsupported.is_empty() {
         return Err(format!(
             "the summary contains unsupported claim(s): {}",
@@ -652,6 +715,305 @@ fn message_text_and_trust(message: &Message) -> (String, &'static str) {
     }
 }
 
+/// Normalized quantities and time expressions in a fact or sentence.
+fn extract_quantities(text: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut quantities = Vec::new();
+    let chars: Vec<char> = lower.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index].is_ascii_digit() {
+            let start = index;
+            while index < chars.len() && (chars[index].is_ascii_digit() || chars[index] == '.') {
+                index += 1;
+            }
+            let number: String = chars[start..index].iter().collect();
+            // HH:MM time-of-day is one quantity, not two bare numbers.
+            if index + 2 < chars.len()
+                && chars[index] == ':'
+                && chars[index + 1].is_ascii_digit()
+                && chars[index + 2].is_ascii_digit()
+            {
+                quantities.push(format!("{number}:{}{}", chars[index + 1], chars[index + 2]));
+                index += 3;
+                continue;
+            }
+            let rest: String = chars[index..].iter().take(12).collect();
+            let unit = if rest.starts_with("ms") {
+                Some("ms")
+            } else if rest.starts_with("seconds")
+                || rest.starts_with("second")
+                || rest.starts_with("sec")
+                || rest.starts_with("s ")
+                || rest.starts_with("s,")
+                || rest.starts_with("s") && !rest.starts_with("sh")
+            {
+                Some("s")
+            } else if rest.starts_with("minutes")
+                || rest.starts_with("minute")
+                || rest.starts_with("min")
+                || rest.starts_with("m ")
+                || rest.starts_with("m,")
+            {
+                Some("m")
+            } else if rest.starts_with("hours")
+                || rest.starts_with("hour")
+                || rest.starts_with("hr")
+                || rest.starts_with("h ")
+                || rest.starts_with("h,")
+            {
+                Some("h")
+            } else if rest.starts_with("days") || rest.starts_with("day") || rest.starts_with("d ")
+            {
+                Some("d")
+            } else if rest.starts_with('%') {
+                Some("%")
+            } else if rest.starts_with("mb") {
+                Some("mb")
+            } else if rest.starts_with("gb") {
+                Some("gb")
+            } else if rest.starts_with("kb") {
+                Some("kb")
+            } else {
+                None
+            };
+            if let Some(unit) = unit {
+                quantities.push(format!("{number}{unit}"));
+                index += unit.len();
+            } else {
+                quantities.push(number);
+            }
+        } else if "天日周月年小时分钟秒次元".contains(chars[index]) {
+            // Chinese unit attached to the preceding number: reconstruct it.
+            let start = quantities.len().saturating_sub(1);
+            if let Some(last) = quantities.get_mut(start) {
+                if last.chars().all(|c| c.is_ascii_digit()) {
+                    let unit = match chars[index] {
+                        '天' | '日' => "d",
+                        '周' => "w",
+                        '月' => "mo",
+                        '年' => "y",
+                        '小' => "h",
+                        '时' => "h",
+                        '分' => "m",
+                        '钟' => "m",
+                        '秒' => "s",
+                        '次' => "x",
+                        '元' => "cny",
+                        _ => "",
+                    };
+                    last.push_str(unit);
+                }
+            }
+            index += 1;
+        } else {
+            index += 1;
+        }
+    }
+    const TIMES: &[&str] = &[
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+        "周一",
+        "周二",
+        "周三",
+        "周四",
+        "周五",
+        "周六",
+        "周日",
+        "周一",
+        "上午",
+        "下午",
+        "晚上",
+        "今天",
+        "明天",
+        "昨天",
+    ];
+    for time in TIMES {
+        if lower.contains(time) {
+            quantities.push((*time).to_string());
+        }
+    }
+    quantities.sort();
+    quantities.dedup();
+    quantities
+}
+
+fn condition_marker(lower: &str) -> Option<(&'static str, usize)> {
+    const MARKERS: &[&str] = &[
+        "not only", "only if", "unless", "except", "within", "before", "after", "until", "如果",
+        "除非", "除了", "只有", "不仅", "之前", "之后", "以内",
+    ];
+    MARKERS
+        .iter()
+        .filter_map(|marker| lower.find(marker).map(|index| (*marker, index)))
+        .min_by_key(|(_, index)| *index)
+}
+
+fn scope_marker(lower: &str) -> Option<(&'static str, usize)> {
+    const MARKERS: &[&str] = &["for all", "across", "for ", "all ", "仅", "所有", "对于"];
+    MARKERS
+        .iter()
+        .filter_map(|marker| lower.find(marker).map(|index| (*marker, index)))
+        .min_by_key(|(_, index)| *index)
+}
+
+/// Parse the structured semantics of one fact-like line.
+struct FactSemantics {
+    subject: String,
+    predicate: String,
+    value: String,
+    polarity: FactPolarity,
+    condition: Option<String>,
+    condition_kind: Option<String>,
+    scope: Option<String>,
+}
+
+fn canonical_condition(marker: &str) -> &'static str {
+    match marker {
+        "only if" => "only-if",
+        "not only" => "not-only",
+        "if " => "if",
+        "when " => "when",
+        "unless" => "unless",
+        "except" => "except",
+        "within" => "within",
+        "before" => "before",
+        "after" => "after",
+        "until" => "until",
+        "如果" => "如果",
+        "除非" => "除非",
+        "除了" => "除了",
+        "只有" => "only-if",
+        "不仅" => "not-only",
+        "之前" => "before",
+        "之后" => "after",
+        "以内" => "within",
+        _ => "condition",
+    }
+}
+
+fn parse_fact_semantics(text: &str) -> FactSemantics {
+    let lower = text.trim().to_ascii_lowercase();
+    let mut core = lower.clone();
+    for marker in [
+        "constraint:",
+        "decision:",
+        "todo:",
+        "conflict:",
+        "goal:",
+        "objective:",
+        "pending:",
+        "next step:",
+        "assumption:",
+        "question:",
+    ] {
+        if let Some(rest) = core.strip_prefix(marker) {
+            core = rest.trim().to_string();
+        }
+    }
+    let condition_kind =
+        condition_marker(&lower).map(|(marker, _)| canonical_condition(marker).to_string());
+    let condition = condition_marker(&lower)
+        .map(|(marker, index)| lower[index + marker.len()..].trim().to_string())
+        .filter(|value| !value.is_empty());
+    let scope = scope_marker(&lower)
+        .map(|(marker, index)| lower[index + marker.len()..].trim().to_string())
+        .filter(|value| !value.is_empty());
+    let not_only = lower.contains("not only");
+    let negative = !not_only && negative_polarity(&lower);
+    let polarity = if negative {
+        FactPolarity::Negative
+    } else if not_only || !core.is_empty() {
+        FactPolarity::Positive
+    } else {
+        FactPolarity::Unknown
+    };
+    for marker in [
+        "must not", "do not", "don't", "never", "must", "should", "please", "不要", "禁止", "不得",
+        "不能", "不可", "必须", "请",
+    ] {
+        core = core.replace(marker, " ");
+    }
+    // Isolate the conditioned/main clause before parsing subject/object.
+    if let Some((_, index)) = condition_marker(&core) {
+        core = core[..index].to_string();
+    }
+    let quantities = extract_quantities(&lower).join(" ");
+    if !lower.is_ascii() {
+        // Chinese has no whitespace-delimited subject/predicate; keep the
+        // normalized clause as the predicate and quantities as the value.
+        let predicate = core.split_whitespace().collect::<Vec<_>>().join(" ");
+        return FactSemantics {
+            subject: String::new(),
+            predicate: if predicate.is_empty() {
+                lower.clone()
+            } else {
+                predicate
+            },
+            value: quantities,
+            polarity,
+            condition,
+            condition_kind,
+            scope,
+        };
+    }
+    let mut subject = String::new();
+    let mut predicate = String::new();
+    let mut value = String::new();
+    let mut left = core.trim().to_string();
+    for separator in [
+        " is ", " are ", " on ", " to ", " in ", " at ", " as ", " from ", " into ", " with ",
+        " by ",
+    ] {
+        if let Some(index) = left.find(separator) {
+            value = left[index + separator.len()..].trim().to_string();
+            left = left[..index].trim().to_string();
+            break;
+        }
+    }
+    let words: Vec<&str> = left.split_whitespace().collect();
+    if let Some((last, rest)) = words.split_last() {
+        predicate = (*last).to_string();
+        subject = rest.join(" ");
+    }
+    if predicate.is_empty() {
+        predicate = lower.clone();
+    }
+    if !quantities.is_empty() {
+        if value.is_empty() {
+            value = quantities;
+        } else {
+            value = format!("{value} {quantities}");
+        }
+    }
+    FactSemantics {
+        subject,
+        predicate,
+        value,
+        polarity,
+        condition,
+        condition_kind,
+        scope,
+    }
+}
+
 /// Extract the critical facts a summary must preserve (issue #429).
 ///
 /// This is intentionally deterministic and conservative: explicit markers,
@@ -665,8 +1027,16 @@ pub fn extract_critical_facts(source: &[Message]) -> Vec<CriticalFact> {
         if trust == "tool" {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
+                let semantics = parse_fact_semantics(trimmed);
                 facts.push(CriticalFact {
                     kind: CriticalFactKind::VerifiedResult,
+                    subject: semantics.subject,
+                    predicate: semantics.predicate,
+                    value: semantics.value,
+                    polarity: semantics.polarity,
+                    condition: semantics.condition,
+                    condition_kind: semantics.condition_kind,
+                    scope: semantics.scope,
                     text: trimmed.chars().take(200).collect(),
                     source_index: index,
                     trust: trust.to_string(),
@@ -709,11 +1079,30 @@ pub fn extract_critical_facts(source: &[Message]) -> Vec<CriticalFact> {
                 CriticalFactKind::OpenTask
             } else if lower.contains("conflict:") || lower.contains("contradict") {
                 CriticalFactKind::Conflict
+            } else if lower.contains("assumption:")
+                || lower.contains("assume ")
+                || lower.contains("假设")
+            {
+                CriticalFactKind::Assumption
+            } else if lower.contains("question:")
+                || lower.contains("open question")
+                || lower.contains("needs confirmation")
+                || lower.contains("待确认")
+            {
+                CriticalFactKind::OpenQuestion
             } else {
                 continue;
             };
+            let semantics = parse_fact_semantics(line);
             facts.push(CriticalFact {
                 kind,
+                subject: semantics.subject,
+                predicate: semantics.predicate,
+                value: semantics.value,
+                polarity: semantics.polarity,
+                condition: semantics.condition,
+                condition_kind: semantics.condition_kind,
+                scope: semantics.scope,
                 text: line.chars().take(200).collect(),
                 source_index: index,
                 trust: trust.to_string(),
@@ -732,6 +1121,19 @@ fn ordinary_constraint(lower: &str) -> bool {
         || lower.contains("do not ")
         || lower.contains("don't ")
         || lower.contains("required to ")
+        || lower.contains(" unless ")
+        || lower.contains(" except ")
+        || lower.contains(" only if ")
+        || lower.contains("not only ")
+        || lower.contains("不要")
+        || lower.contains("禁止")
+        || lower.contains("不得")
+        || lower.contains("不能")
+        || lower.contains("不可")
+        || lower.contains("除非")
+        || lower.contains("除了")
+        || lower.contains("只有")
+        || lower.contains("不仅")
 }
 
 fn fact_keywords(text: &str) -> Vec<String> {
@@ -739,37 +1141,117 @@ fn fact_keywords(text: &str) -> Vec<String> {
         "the", "and", "for", "with", "that", "this", "from", "into", "must", "not", "never",
         "should", "would", "could", "use", "using", "was", "were", "are", "have", "has", "but",
     ];
-    text.split(|c: char| !c.is_alphanumeric())
-        .map(|word| word.to_ascii_lowercase())
-        .filter(|word| {
-            let min = if !word.is_ascii() { 2 } else { 3 };
-            word.chars().count() >= min && !STOP.contains(&word.as_str())
-        })
-        .collect()
+    let mut out = Vec::new();
+    for word in text.split(|c: char| !c.is_alphanumeric()) {
+        let word = word.to_ascii_lowercase();
+        if word.is_empty() {
+            continue;
+        }
+        if word.is_ascii() {
+            if word.chars().count() >= 3 && !STOP.contains(&word.as_str()) {
+                out.push(word);
+            }
+        } else {
+            // Chinese has no word delimiters here: 2-character n-grams make
+            // paraphrase matching meaningful without a full segmenter.
+            let chars: Vec<char> = word.chars().collect();
+            if chars.len() <= 2 {
+                out.push(word);
+            } else {
+                for pair in chars.windows(2) {
+                    out.push(pair.iter().collect());
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn negative_polarity(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
+    let lower = text
+        .to_ascii_lowercase()
+        .replace("not only", " ")
+        .replace("不仅", " ");
     [
-        " not ", "not ", "never", "no ", "don't", "do not", "without", "avoid", "must not",
+        " not ", "not ", "never", "no ", "don't", "do not", "without", "avoid", "must not", "不要",
+        "禁止", "不得", "不能", "不可", "勿", "别",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
 }
 
-fn fact_covered(fact: &CriticalFact, summary_lower: &str) -> bool {
-    let keywords = fact_keywords(&fact.text);
-    if keywords.is_empty() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredMatch {
+    Covered,
+    Opposite,
+    Inconclusive,
+    NoCandidate,
+}
+
+fn keywords_cover(required: &[String], haystack: &str) -> bool {
+    if required.is_empty() {
         return true;
     }
-    let hits = keywords
+    let hits = required
         .iter()
-        .filter(|keyword| summary_lower.contains(keyword.as_str()))
+        .filter(|keyword| haystack.contains(keyword.as_str()))
         .count();
-    hits * 2 >= keywords.len()
-        || keywords
+    hits * 2 >= required.len()
+        || required
             .iter()
-            .any(|keyword| keyword.chars().count() >= 6 && summary_lower.contains(keyword.as_str()))
+            .any(|keyword| keyword.chars().count() >= 6 && haystack.contains(keyword.as_str()))
+}
+
+fn structured_fact_match(fact: &CriticalFact, sentence: &str) -> StructuredMatch {
+    let sentence_lower = sentence.to_ascii_lowercase();
+    let keywords = fact_keywords(&fact.text);
+    if keywords.is_empty() {
+        return StructuredMatch::Covered;
+    }
+    if !keywords_cover(&keywords, &sentence_lower) {
+        return StructuredMatch::NoCandidate;
+    }
+    // Numbers, units and time expressions must survive exactly.
+    for quantity in extract_quantities(&fact.text) {
+        if !sentence_lower.contains(&quantity) {
+            return StructuredMatch::Inconclusive;
+        }
+    }
+    // The condition KIND is semantic: only-if must not become after.
+    if let Some(kind) = &fact.condition_kind {
+        let sentence_kind =
+            condition_marker(&sentence_lower).map(|(marker, _)| canonical_condition(marker));
+        if sentence_kind != Some(kind.as_str()) {
+            return StructuredMatch::Inconclusive;
+        }
+    }
+    // Conditions/exceptions must survive, with their own terms.
+    if let Some(condition) = &fact.condition {
+        let condition_keywords = fact_keywords(condition);
+        let has_marker = condition_marker(&sentence_lower).is_some();
+        if !has_marker && !keywords_cover(&condition_keywords, &sentence_lower) {
+            return StructuredMatch::Inconclusive;
+        }
+    }
+    if let Some(scope) = &fact.scope {
+        let scope_keywords = fact_keywords(scope);
+        if !keywords_cover(&scope_keywords, &sentence_lower) {
+            return StructuredMatch::Inconclusive;
+        }
+    }
+    let sentence_negative = negative_polarity(&sentence_lower);
+    let fact_negative = fact.polarity == FactPolarity::Negative;
+    if fact.polarity != FactPolarity::Unknown && sentence_negative != fact_negative {
+        return StructuredMatch::Opposite;
+    }
+    // The predicate must be present too; keyword overlap alone is not enough.
+    let predicate = fact_keywords(&fact.predicate);
+    if !keywords_cover(&predicate, &sentence_lower) {
+        return StructuredMatch::Inconclusive;
+    }
+    StructuredMatch::Covered
 }
 
 /// Validate summary coverage of critical facts and reject invented marker
@@ -784,25 +1266,31 @@ pub fn fact_coverage(summary: &str, source: &[Message]) -> FactCoverage {
         .collect();
     let mut missing = Vec::new();
     let mut contradicted = Vec::new();
+    let mut inconclusive = Vec::new();
     for fact in &facts {
-        let polarity = negative_polarity(&fact.text);
         let mut covered = false;
         let mut opposite = false;
+        let mut ambiguous = false;
         for sentence in &sentences {
-            if fact_covered(fact, &sentence.to_ascii_lowercase()) {
-                if negative_polarity(sentence) == polarity {
+            match structured_fact_match(fact, sentence) {
+                StructuredMatch::Covered => {
                     covered = true;
-                } else {
-                    opposite = true;
+                    break;
                 }
+                StructuredMatch::Opposite => opposite = true,
+                StructuredMatch::Inconclusive => ambiguous = true,
+                StructuredMatch::NoCandidate => {}
             }
         }
-        if !covered {
-            if opposite {
-                contradicted.push(fact.clone());
-            } else {
-                missing.push(fact.clone());
-            }
+        if covered {
+            continue;
+        }
+        if opposite {
+            contradicted.push(fact.clone());
+        } else if ambiguous {
+            inconclusive.push(fact.clone());
+        } else {
+            missing.push(fact.clone());
         }
     }
     let source_lower = source
@@ -848,6 +1336,7 @@ pub fn fact_coverage(summary: &str, source: &[Message]) -> FactCoverage {
         facts,
         missing,
         contradicted,
+        inconclusive,
         unsupported,
     }
 }
@@ -1676,6 +2165,7 @@ impl AgentSession {
             archive_bytes: archive_fields.3,
             facts: coverage.facts,
             missing_facts: coverage.missing,
+            inconclusive_facts: coverage.inconclusive,
             unsupported_claims: coverage.unsupported,
             coverage_complete,
         };
