@@ -434,7 +434,6 @@ impl Runner {
                     &agent.conditional_prompts(),
                     task_text,
                     &tool_names,
-                    agent.action_intent(),
                 );
                 let mut extension_omissions = Vec::new();
                 for active in &extension_plan.active {
@@ -454,7 +453,13 @@ impl Runner {
                         injections.push(crate::model::ContextInjection {
                             kind: "extension".to_string(),
                             content: text,
-                            source: format!("{}@{}", active.owner, active.version),
+                            // Name the contribution, not only the package: two
+                            // contributions of one extension must not draw two
+                            // indistinguishable rows (issue #436 review).
+                            source: format!(
+                                "{}@{}#{}",
+                                active.owner, active.version, prompt.id
+                            ),
                         });
                         log::debug!(
                             target: "bsh::context",
@@ -1651,7 +1656,7 @@ mod tests {
             &mut runner,
             "extension-capability",
             Arc::new(agent),
-            "fix the failing build",
+            "run devkit__scaffold for this build",
             &root,
         );
         drain(receiver);

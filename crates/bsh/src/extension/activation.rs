@@ -38,7 +38,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent::agent::ConditionalPrompt;
-use react::llm::ActionIntent;
 
 /// Most bytes one extension may activate in a single turn.
 pub(crate) const MAX_ACTIVE_PER_EXTENSION: usize = 8 * 1024;
@@ -155,7 +154,6 @@ pub(crate) fn activate(
     prompts: &[ConditionalPrompt],
     task: &str,
     admitted_tools: &[String],
-    intent: ActionIntent,
 ) -> ActivationPlan {
     let task_tokens = tokenize(task);
     let admitted: BTreeSet<&str> = admitted_tools.iter().map(String::as_str).collect();
@@ -177,7 +175,7 @@ pub(crate) fn activate(
         });
         let first = contributions[0];
         let extension_reason =
-            extension_signal(first, &contributions, &task_tokens, task, &admitted, intent);
+            extension_signal(first, &contributions, &task_tokens, task, &admitted);
         let mut extension = ActiveExtension {
             owner: first.owner.clone(),
             name: first.owner_name.clone(),
@@ -253,22 +251,11 @@ fn extension_signal(
     task_tokens: &BTreeSet<String>,
     task: &str,
     admitted: &BTreeSet<&str>,
-    intent: ActionIntent,
 ) -> Option<String> {
-    // The authoritative capability view admits a deferred extension tool even
-    // when its schema is absent from the initial array. On a work turn that
-    // admitted capability is a reason to carry the extension's guidance; a
-    // conversation does not inherit it just because the tool is installed.
-    if intent == ActionIntent::Action
-        && contributions.iter().any(|prompt| {
-            prompt
-                .tools
-                .iter()
-                .any(|tool| admitted.contains(tool.as_str()))
-        })
-    {
-        return Some("extension capability is admitted for this work turn".to_string());
-    }
+    // An admitted capability is relevant only when THIS task names it. Merely
+    // having an extension tool installed must not inject its guide into an
+    // unrelated work turn (issue #436 review): a research question about LLMs
+    // must not carry the extension-development workflow.
     if let Some(command) = first
         .commands
         .iter()
@@ -287,9 +274,6 @@ fn extension_signal(
     {
         return Some("task names the extension".to_string());
     }
-    // A task sharing an identity term with the extension while asking for work
-    // selects the extension, not one contribution: the name is what was asked
-    // about.
     None
 }
 
@@ -459,7 +443,7 @@ mod tests {
 
     #[test]
     fn a_greeting_activates_nothing() {
-        let plan = activate(&[devkit()], "hello 8888", &[], ActionIntent::Unknown);
+        let plan = activate(&[devkit()], "hello 8888", &[]);
         assert!(plan.is_empty());
         assert_eq!(plan.omissions.len(), 1);
         assert_eq!(
@@ -470,12 +454,7 @@ mod tests {
 
     #[test]
     fn extension_work_activates_the_guide() {
-        let plan = activate(
-            &[devkit()],
-            "build a new extension package",
-            &[],
-            ActionIntent::Action,
-        );
+        let plan = activate(&[devkit()], "build a new extension package", &[]);
         assert_eq!(plan.active.len(), 1);
         assert!(plan.active[0].reason.is_empty());
         assert!(plan.active[0].prompts[0].reason.contains("shares 2 terms"));
@@ -483,12 +462,7 @@ mod tests {
 
     #[test]
     fn metadata_overlap_activates_without_an_action_verb() {
-        let plan = activate(
-            &[devkit()],
-            "validate my extension",
-            &[],
-            ActionIntent::Unknown,
-        );
+        let plan = activate(&[devkit()], "validate my extension", &[]);
         assert_eq!(plan.active.len(), 1, "{plan:?}");
         assert!(plan.active[0].prompts[0].reason.contains("shares"));
     }
@@ -499,7 +473,6 @@ mod tests {
             &[devkit()],
             "<extension_command name=\"devkit__scaffold\">\nScaffold.\n</extension_command>",
             &[],
-            ActionIntent::Unknown,
         );
         assert_eq!(plan.active.len(), 1);
         assert_eq!(plan.active[0].reason, "explicit command /devkit__scaffold");
@@ -514,7 +487,6 @@ mod tests {
             &[devkit()],
             "run devkit__scaffold for this package",
             &["devkit__scaffold".to_string()],
-            ActionIntent::Unknown,
         );
         assert_eq!(plan.active.len(), 1, "{plan:?}");
         assert!(plan.active[0].prompts[0]
@@ -524,57 +496,50 @@ mod tests {
 
     #[test]
     fn an_admitted_but_unnamed_capability_does_not_activate() {
-        let plan = activate(
-            &[devkit()],
-            "hello 8888",
-            &["devkit__scaffold".to_string()],
-            ActionIntent::Unknown,
-        );
+        let plan = activate(&[devkit()], "hello 8888", &["devkit__scaffold".to_string()]);
         assert!(plan.is_empty());
     }
 
     #[test]
-    fn an_admitted_deferred_capability_activates_on_a_work_turn() {
+    fn an_admitted_deferred_capability_activates_when_the_task_names_it() {
         let plan = activate(
             &[devkit()],
-            "fix the failing build",
+            "run devkit__scaffold for this build",
             &["devkit__scaffold".to_string()],
-            ActionIntent::Action,
         );
         assert_eq!(plan.active.len(), 1, "{plan:?}");
-        assert!(plan.active[0].reason.contains("capability is admitted"));
+        assert!(plan.active[0]
+            .reason
+            .contains("task names admitted capability"));
+    }
+
+    /// The reported regression: an admitted extension tool does not make a
+    /// research turn about LLMs carry the extension workflow.
+    #[test]
+    fn a_research_turn_does_not_activate_an_unrelated_extension() {
+        let plan = activate(
+            &[devkit()],
+            "research the latest llm papers",
+            &["devkit__scaffold".to_string()],
+        );
+        assert!(plan.is_empty(), "{plan:?}");
     }
 
     #[test]
     fn an_admitted_capability_does_not_activate_conversation() {
-        let plan = activate(
-            &[devkit()],
-            "hello 8888",
-            &["devkit__scaffold".to_string()],
-            ActionIntent::Unknown,
-        );
+        let plan = activate(&[devkit()], "hello 8888", &["devkit__scaffold".to_string()]);
         assert!(plan.is_empty());
     }
 
     #[test]
     fn a_plain_extension_question_is_not_extension_work() {
-        let plan = activate(
-            &[devkit()],
-            "what is a browser extension?",
-            &[],
-            ActionIntent::Explanation,
-        );
+        let plan = activate(&[devkit()], "what is a browser extension?", &[]);
         assert!(plan.is_empty());
     }
 
     #[test]
     fn an_unrelated_work_turn_does_not_activate_every_extension() {
-        let plan = activate(
-            &[devkit()],
-            "fix the failing build",
-            &[],
-            ActionIntent::Action,
-        );
+        let plan = activate(&[devkit()], "fix the failing build", &[]);
         assert!(plan.is_empty(), "one shared word is not a topic: {plan:?}");
     }
 
@@ -592,14 +557,14 @@ mod tests {
         zh.owner_name = "Extension Toolkit".to_string();
         zh.commands.clear();
         zh.tools.clear();
-        let plan = activate(&[zh], "帮我构建一个扩展", &[], ActionIntent::Action);
+        let plan = activate(&[zh], "帮我构建一个扩展", &[]);
         assert_eq!(plan.active.len(), 1, "{plan:?}");
         assert!(plan.active[0].prompts[0].reason.contains("shares"));
     }
 
     #[test]
     fn a_chinese_greeting_does_not_activate() {
-        let plan = activate(&[devkit()], "你好", &[], ActionIntent::Unknown);
+        let plan = activate(&[devkit()], "你好", &[]);
         assert!(plan.is_empty());
     }
 
@@ -619,12 +584,7 @@ mod tests {
             "Validation checklist",
         );
         second.triggers = vec!["checklist".to_string(), "validate".to_string()];
-        let plan = activate(
-            &[first, second],
-            "validate the checklist",
-            &[],
-            ActionIntent::Unknown,
-        );
+        let plan = activate(&[first, second], "validate the checklist", &[]);
         assert_eq!(plan.active.len(), 1, "{plan:?}");
         let selected: Vec<&str> = plan.active[0]
             .prompts
@@ -651,12 +611,7 @@ mod tests {
             "How to build extensions",
         );
         let git = prompt("com.example.git", "Git Helper", "guide", "Git workflow");
-        let plan = activate(
-            &[git, devkit],
-            "build a new extension package",
-            &[],
-            ActionIntent::Action,
-        );
+        let plan = activate(&[git, devkit], "build a new extension package", &[]);
         assert_eq!(plan.active.len(), 1);
         assert_eq!(plan.active[0].owner, "com.example.devkit");
         assert!(
@@ -683,12 +638,7 @@ mod tests {
             "checklist",
             "Validation checklist",
         );
-        let plan = activate(
-            &[guide, checklist],
-            "build a new extension package",
-            &[],
-            ActionIntent::Action,
-        );
+        let plan = activate(&[guide, checklist], "build a new extension package", &[]);
         assert_eq!(plan.active.len(), 1);
         assert_eq!(plan.active[0].prompts.len(), 2);
         assert!(plan.active[0]
@@ -708,7 +658,6 @@ mod tests {
             )],
             "build an extension",
             &[],
-            ActionIntent::Action,
         );
         assert!(plan.is_empty());
         assert!(plan.omissions[0]
@@ -725,7 +674,7 @@ mod tests {
             boxed("com.example.three", "Extension Three"),
             boxed("com.example.four", "Extension Four"),
         ];
-        let plan = activate(&prompts, "build an extension", &[], ActionIntent::Action);
+        let plan = activate(&prompts, "build an extension", &[]);
         assert!(plan.bytes() <= MAX_ACTIVE_TOTAL);
         assert!(plan
             .omissions
@@ -738,7 +687,7 @@ mod tests {
         let mut denied = devkit();
         denied.text.clear();
         denied.diagnostic = Some("capability agent.prompts.provide denied by policy".to_string());
-        let plan = activate(&[denied], "build an extension", &[], ActionIntent::Action);
+        let plan = activate(&[denied], "build an extension", &[]);
         assert!(plan.is_empty());
         assert!(plan.omissions[0].reason.contains("denied by policy"));
     }
