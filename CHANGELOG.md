@@ -13,6 +13,14 @@
   it as system policy in all three protocols. Conversation history keeps only
   reader-authored turns, and legacy sessions that stored a note still render it
   as harness wording, not a reader row.
+- **Injected context is system policy, never a reader turn (#434).** The
+  runtime snapshot, time-context, workspace instructions and typed request
+  blocks now enter the conversation as `system` messages. Only the reader's
+  own input is a `user` row, so a request can no longer read as "reader said
+  X, then reader said Y" when Y was the harness. OpenAI folds all system rows
+  into its one leading system message; Anthropic and Responses fold them into
+  their system/instructions sections, so no provider sees a mid-conversation
+  system turn.
 - **Intent routing no longer treats an open workspace as a request.**
   The classifier now recognizes explicit file reads, and a verb with no object
   ("fix it", "修复它") is `Unknown` rather than `Action`; an `Unknown` or

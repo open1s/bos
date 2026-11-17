@@ -292,15 +292,22 @@ impl OpenAiVendor {
                 .map(<[crate::llm::LlmMessage]>::to_vec)
                 .unwrap_or_default()
         };
+        // Host context rows are system sections, not conversation turns. They
+        // are folded into the ONE leading system message so a request can never
+        // read as a second user instruction (issue #434), and so providers that
+        // accept only a leading system message keep working.
+        let mut history_system = String::new();
         {
             for message in &history {
                 let json_msg = match message {
-                    crate::llm::LlmMessage::System { content } => OpenAiMessageJson {
-                        role: "system",
-                        content: Some(serde_json::Value::String(content.clone())),
-                        tool_call_id: None,
-                        tool_calls: None,
-                    },
+                    crate::llm::LlmMessage::System { content } => {
+                        if !history_system.is_empty() {
+                            history_system.push('\n');
+                            history_system.push('\n');
+                        }
+                        history_system.push_str(content);
+                        continue;
+                    }
                     crate::llm::LlmMessage::User { content } => OpenAiMessageJson {
                         role: "user",
                         content: Some(serialize_content(content)),
@@ -422,6 +429,14 @@ impl OpenAiVendor {
                     extra_system_prompt.push_str(&format!("Instructions:\n{}\n", inst_texts));
                 }
             }
+        }
+
+        if !history_system.is_empty() {
+            if !extra_system_prompt.is_empty() {
+                extra_system_prompt.push('\n');
+                extra_system_prompt.push('\n');
+            }
+            extra_system_prompt.push_str(&history_system);
         }
 
         messages.insert(
@@ -1736,6 +1751,7 @@ mod tests {
                 system_prompt: Some("SYS".to_string()),
                 host_guidance: vec![HostGuidance::new("action-retry", "ACT NOW")],
                 messages: vec![
+                    crate::llm::LlmMessage::system("HOST CONTEXT"),
                     crate::llm::LlmMessage::user("hello 8888"),
                     crate::llm::LlmMessage::assistant("I will start by reading."),
                 ],
@@ -1753,6 +1769,10 @@ mod tests {
             .expect("a system string");
         assert!(system.contains("SYS"));
         assert!(system.contains("ACT NOW"), "guidance is host policy");
+        assert!(
+            system.contains("HOST CONTEXT"),
+            "injected context is a system section too (issue #434)"
+        );
         assert_eq!(built.messages[1].role, "user");
         assert_eq!(
             built.messages[1].content,

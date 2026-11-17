@@ -969,13 +969,11 @@ mod tests {
         assert!(
             messages[..checkpoint].iter().all(|message| matches!(
                 message,
-                react::LlmMessage::User { content }
-                    if content
-                        .as_text()
-                        .is_some_and(|text| text.starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE)
-                            || text.starts_with(crate::context::TIME_CONTEXT_PREAMBLE))
+                react::LlmMessage::System { content }
+                    if content.starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE)
+                        || content.starts_with(crate::context::TIME_CONTEXT_PREAMBLE)
             )),
-            "only the injected frame precedes the checkpoint: {messages:?}"
+            "only the injected system frame precedes the checkpoint: {messages:?}"
         );
         assert!(
             matches!(
@@ -986,11 +984,31 @@ mod tests {
         );
     }
 
-    /// A vendor that records the user rows of the request the engine builds.
+    /// A vendor that records the text row and role of the request the engine
+    /// builds.
     ///
     /// Recording the session at the stream call proves the injected context is
-    /// what the provider would receive, not merely a value the shell stored.
-    struct ContextCapturingLlm(Arc<std::sync::Mutex<Vec<String>>>);
+    /// what the provider would receive, not merely a value the shell stored -
+    /// including that context is a system row and the reader's line is the only
+    /// user row (issue #434).
+    struct ContextCapturingLlm(Arc<std::sync::Mutex<Vec<(&'static str, String)>>>);
+
+    /// The (role, text) rows one turn's provider request carried.
+    type CapturedRows = Arc<std::sync::Mutex<Vec<(&'static str, String)>>>;
+
+    /// The row texts, in wire order.
+    fn captured_text(rows: &CapturedRows) -> Vec<String> {
+        rows.lock()
+            .unwrap()
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect()
+    }
+
+    /// The row roles, in wire order.
+    fn captured_roles(rows: &CapturedRows) -> Vec<&'static str> {
+        rows.lock().unwrap().iter().map(|(role, _)| *role).collect()
+    }
 
     #[async_trait::async_trait]
     impl agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContext>
@@ -1017,7 +1035,10 @@ mod tests {
                 .messages()
                 .iter()
                 .filter_map(|message| match message {
-                    react::LlmMessage::User { content } => content.as_text().map(str::to_string),
+                    react::LlmMessage::System { content } => Some(("system", content.clone())),
+                    react::LlmMessage::User { content } => {
+                        content.as_text().map(|text| ("user", text.to_string()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -1049,7 +1070,7 @@ mod tests {
         dir
     }
 
-    fn capturing_agent(seen: Arc<std::sync::Mutex<Vec<String>>>) -> Arc<agent::Agent> {
+    fn capturing_agent(seen: CapturedRows) -> Arc<agent::Agent> {
         let mut provider = agent::agent::agentic::LlmProvider::new();
         provider.register_vendor("mock".to_string(), Box::new(ContextCapturingLlm(seen)));
         Arc::new(agent::Agent::new(
@@ -1071,11 +1092,11 @@ mod tests {
         });
     }
 
-    /// The first user message of a turn is the runtime snapshot; the workspace
-    /// instructions follow it; the reader's own line comes last. This is the
-    /// order the reference's loop builds.
+    /// The first context row of a turn is the runtime snapshot; the workspace
+    /// instructions follow it; the reader's own line comes last. Context rows
+    /// are system messages, never user messages (issue #434).
     #[test]
-    fn the_first_user_message_of_a_turn_carries_the_live_facts() {
+    fn the_first_context_row_of_a_turn_carries_the_live_facts() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let agent = capturing_agent(seen.clone());
         let root = workspace("context");
@@ -1102,15 +1123,20 @@ mod tests {
             None,
         );
         drain(receiver);
-        let rows = seen.lock().unwrap().clone();
+        let rows = captured_text(&seen);
         assert_eq!(
             rows.len(),
             4,
             "snapshot, time, instructions, input: {rows:?}"
         );
+        assert_eq!(
+            captured_roles(&seen),
+            vec!["system", "system", "system", "user"],
+            "context is system policy; only the reader's line is a user row"
+        );
         assert!(
             rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE),
-            "the first user message is the snapshot: {}",
+            "the first context row is the snapshot: {}",
             rows[0]
         );
         assert!(
@@ -1204,7 +1230,7 @@ mod tests {
             None,
         );
         drain(receiver);
-        let rows = seen.lock().unwrap().clone();
+        let rows = captured_text(&seen);
         assert_eq!(rows.len(), 3, "snapshot, time and input only: {rows:?}");
         assert!(rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE));
         assert!(rows[1].starts_with(crate::context::TIME_CONTEXT_PREAMBLE));
@@ -1242,7 +1268,7 @@ mod tests {
             &context,
         ));
         assert!(result.is_ok(), "the child turn runs: {result:?}");
-        let rows = seen.lock().unwrap().clone();
+        let rows = captured_text(&seen);
         assert_eq!(rows.len(), 3, "snapshot, time and input: {rows:?}");
         assert!(rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE));
         assert!(
@@ -1419,7 +1445,7 @@ mod tests {
             None,
         );
         drain(receiver);
-        let rows = seen.lock().unwrap().clone();
+        let rows = captured_text(&seen);
         assert_eq!(rows.len(), 4, "snapshot, time, history, input: {rows:?}");
         assert!(
             rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE),
@@ -1468,7 +1494,7 @@ mod tests {
             &follow,
         ));
         assert!(second.is_ok(), "the follow-up runs: {second:?}");
-        let rows = seen.lock().unwrap().clone();
+        let rows = captured_text(&seen);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.contains("Instructions from: AGENTS.md"))

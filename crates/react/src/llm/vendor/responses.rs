@@ -548,14 +548,28 @@ pub fn build_request(
     );
     let parallel = tools.as_ref().map(|_| parallel_tool_calls);
     let (instructions, input) = match req.provider_request.as_ref() {
-        Some(provider) => (
-            // Instructions carry the authored prompt plus host guidance for
-            // this call; guidance never joins the input items (issue #434).
-            provider
-                .wire_system_prompt()
-                .filter(|text| !text.is_empty()),
-            build_input(Some(&provider.messages), &provider.input),
-        ),
+        Some(provider) => {
+            // Instructions carry the authored prompt, host guidance for this
+            // call, and every host context row from the snapshot. None of them
+            // is a conversation item: the request reads as one system section
+            // plus the reader's own turns (issue #434).
+            let mut instructions = provider.wire_system_prompt().unwrap_or_default();
+            for message in &provider.messages {
+                if let LlmMessage::System { content } = message {
+                    if content.is_empty() {
+                        continue;
+                    }
+                    if !instructions.is_empty() {
+                        instructions.push_str("\n\n");
+                    }
+                    instructions.push_str(content);
+                }
+            }
+            (
+                (!instructions.is_empty()).then_some(instructions),
+                build_input(Some(&provider.messages), &provider.input),
+            )
+        }
         None => (
             build_instructions(
                 persona,
@@ -1541,6 +1555,7 @@ mod tests {
                 system_prompt: Some("SYS".to_string()),
                 host_guidance: vec![HostGuidance::new("action-retry", "ACT NOW")],
                 messages: vec![
+                    LlmMessage::system("HOST CONTEXT"),
                     LlmMessage::user("hello"),
                     LlmMessage::assistant("hi"),
                     LlmMessage::user("next"),
@@ -1570,6 +1585,10 @@ mod tests {
         assert!(
             instructions.contains("ACT NOW"),
             "host guidance is an instruction, not an input item (issue #434)"
+        );
+        assert!(
+            instructions.contains("HOST CONTEXT"),
+            "injected context is folded into instructions too (issue #434)"
         );
         let json = serde_json::to_string(&built).expect("serializes");
         assert!(json.contains("hello"), "{json}");

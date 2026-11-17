@@ -10,9 +10,14 @@
 //!
 //! This module builds the snapshot from the SAME [`Effective`] the turn's build
 //! uses - not from a second read of the settings - and the runner injects it as
-//! the first user message of every turn. It is rebuilt on every turn, never
+//! the first system message of every turn. It is rebuilt on every turn, never
 //! cached: a switch flipped between turns is named on the next turn, and the
 //! turn already streaming keeps the facts it was built with.
+//!
+//! Injected context never carries the `user` role: the reader's own messages
+//! are the only user rows in a request. Harness context is system policy, so a
+//! request cannot read as "reader said X, then reader said Y" when Y was the
+//! harness (issue #434).
 //!
 //! The sandbox sentence uses the three reason strings the bash result and the
 //! audit page already print ([`crate::settings`], [`agent::tools::bash`]),
@@ -127,7 +132,7 @@ impl RuntimeFacts {
     }
 }
 
-/// The user messages a turn carries in front of its own input: the runtime
+/// The system messages a turn carries in front of its own input: the runtime
 /// snapshot, the time-context, and the framed workspace instructions.
 ///
 /// All are rebuilt per turn. `instructions` is `None` when the workspace has
@@ -191,22 +196,16 @@ impl TurnContext {
     /// A render without instructions removes nothing.
     pub(crate) fn inject(&self, agent: &Agent) {
         let mut session = agent.session();
-        let present: Vec<&str> = session
-            .messages()
-            .iter()
-            .filter_map(|message| match message {
-                react::llm::LlmMessage::User { content } => content.as_text(),
-                _ => None,
-            })
-            .collect();
+        let present: Vec<&str> = session.messages().iter().filter_map(message_text).collect();
         let mut injected: Vec<react::llm::LlmMessage> = Vec::new();
         for text in self.injected_messages() {
             if present.contains(&text) {
                 continue;
             }
-            injected.push(react::llm::LlmMessage::User {
-                content: react::llm::Content::Text(text.to_string()),
-            });
+            // Host context is not something the reader said. It rides as a
+            // system row: a user row is reserved for the reader's own input
+            // (issue #434).
+            injected.push(react::llm::LlmMessage::system(text.to_string()));
         }
         if injected.is_empty() {
             return;
@@ -221,6 +220,9 @@ impl TurnContext {
                     .as_text()
                     .map(|text| !is_instructions_user_text(text) || text == want)
                     .unwrap_or(true),
+                react::llm::LlmMessage::System { content } => {
+                    !is_instructions_user_text(content) || content == want
+                }
                 _ => true,
             }
         });
@@ -280,22 +282,15 @@ pub(crate) fn inject_snapshot(agent: &Agent, snapshot: &crate::context_assembly:
         return;
     }
     let mut session = agent.session();
-    let present: Vec<&str> = session
-        .messages()
-        .iter()
-        .filter_map(|message| match message {
-            react::llm::LlmMessage::User { content } => content.as_text(),
-            _ => None,
-        })
-        .collect();
+    let present: Vec<&str> = session.messages().iter().filter_map(message_text).collect();
     let mut injected: Vec<react::llm::LlmMessage> = Vec::new();
     for (_, text) in &blocks {
         if present.contains(&text.as_str()) {
             continue;
         }
-        injected.push(react::llm::LlmMessage::User {
-            content: react::llm::Content::Text(text.clone()),
-        });
+        // Every request block is host-supplied context, so it is a system row.
+        // The reader's own input is the only user row in a turn (issue #434).
+        injected.push(react::llm::LlmMessage::system(text.clone()));
     }
     if injected.is_empty() {
         return;
@@ -315,6 +310,9 @@ pub(crate) fn inject_snapshot(agent: &Agent, snapshot: &crate::context_assembly:
                 .as_text()
                 .map(|text| !is_instructions_user_text(text) || text == want)
                 .unwrap_or(true),
+            react::llm::LlmMessage::System { content } => {
+                !is_instructions_user_text(content) || content == want
+            }
             _ => true,
         }
     });
@@ -322,11 +320,24 @@ pub(crate) fn inject_snapshot(agent: &Agent, snapshot: &crate::context_assembly:
     session.restore_messages(injected);
 }
 
+/// The text of a conversation row that carries reader or host prose.
+///
+/// Both roles are read because injected context used to be a `user` row and is
+/// a `system` row now (issue #434); dedup and replay must work across both.
+fn message_text(message: &react::llm::LlmMessage) -> Option<&str> {
+    match message {
+        react::llm::LlmMessage::User { content } => content.as_text(),
+        react::llm::LlmMessage::System { content } => Some(content.as_str()),
+        _ => None,
+    }
+}
+
 /// Whether a user row is one of the harness's per-turn injections.
 ///
-/// The child transcript is read back from the agent's own session, where these
-/// rows exist; the reader's view should show the child's work, not the frame
-/// the harness put around it.
+/// The child transcript is read back from the agent's own session, where legacy
+/// sessions still carry these rows as user messages; the reader's view should
+/// show the child's work, not the frame the harness put around it. New turns
+/// carry the same text as system rows, which the transcript never draws.
 pub(crate) fn is_injected_user_text(text: &str) -> bool {
     text.contains(crate::context_assembly::CONTEXT_ENVELOPE_MARKER)
         || text.starts_with(RUNTIME_CONTEXT_PREAMBLE)
@@ -664,8 +675,8 @@ mod tests {
         assert!(is_injected_user_text(&block), "the frame is not a user row");
     }
 
-    /// The first user message names the workspace top level, so step one can
-    /// read the file it needs instead of spending a round trip on list_dir.
+    /// The first context message names the workspace top level, so step one
+    /// can read the file it needs instead of spending a round trip on list_dir.
     #[test]
     fn the_snapshot_names_the_workspace_layout() {
         let root = scratch("layout");
@@ -856,21 +867,67 @@ mod tests {
         let agent = Agent::new(agent::AgentConfig::default(), provider);
         context.inject(&agent);
         let session = agent.session();
-        let user_rows: Vec<&str> = session
+        let context_rows: Vec<&str> = session
             .messages()
             .iter()
             .filter_map(|message| match message {
-                react::llm::LlmMessage::User { content } => content.as_text(),
+                react::llm::LlmMessage::System { content } => Some(content.as_str()),
                 _ => None,
             })
             .collect();
-        assert_eq!(user_rows.len(), 3, "{user_rows:?}");
-        assert!(user_rows[0].starts_with(RUNTIME_CONTEXT_PREAMBLE));
-        assert!(user_rows[1].starts_with(TIME_CONTEXT_PREAMBLE));
-        assert!(user_rows[2].contains("Instructions from: AGENTS.md"));
+        assert_eq!(context_rows.len(), 3, "{context_rows:?}");
+        assert!(context_rows[0].starts_with(RUNTIME_CONTEXT_PREAMBLE));
+        assert!(context_rows[1].starts_with(TIME_CONTEXT_PREAMBLE));
+        assert!(context_rows[2].contains("Instructions from: AGENTS.md"));
         assert!(
-            user_rows.iter().all(|row| !row.is_empty()),
+            context_rows.iter().all(|row| !row.is_empty()),
             "no empty injected message"
+        );
+        // Context never claims the reader said it (issue #434).
+        assert!(
+            session
+                .messages()
+                .iter()
+                .all(|message| !matches!(message, react::llm::LlmMessage::User { .. })),
+            "no context row is a user message: {:?}",
+            session.messages()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Injected context is harness policy, so it rides as system rows; the
+    /// reader's own message is the only user row in the request (issue #434).
+    #[test]
+    fn context_injection_uses_the_system_role_and_never_the_user_role() {
+        let root = scratch("roles");
+        std::fs::write(root.join("AGENTS.md"), "workspace rule").expect("the file");
+        let context = TurnContext::from_facts(&facts(&rooted(&root)), false);
+        let provider = std::sync::Arc::new(agent::agent::agentic::LlmProvider::new());
+        let agent = Agent::new(agent::AgentConfig::default(), provider);
+        context.inject(&agent);
+        agent
+            .session()
+            .add_user_content(react::llm::Content::Text("hello 8888".to_string()));
+
+        let session = agent.session();
+        let roles: Vec<&str> = session
+            .messages()
+            .iter()
+            .map(|message| match message {
+                react::llm::LlmMessage::System { .. } => "system",
+                react::llm::LlmMessage::User { .. } => "user",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["system", "system", "system", "user"],
+            "snapshot, time and instructions are system; only the reader is user"
+        );
+        assert_eq!(
+            session.messages().last().and_then(message_text),
+            Some("hello 8888"),
+            "the reader's line is preserved verbatim"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -933,14 +990,7 @@ mod tests {
         follow.inject(&agent);
 
         let session = agent.session();
-        let rows: Vec<&str> = session
-            .messages()
-            .iter()
-            .filter_map(|message| match message {
-                react::llm::LlmMessage::User { content } => content.as_text(),
-                _ => None,
-            })
-            .collect();
+        let rows: Vec<&str> = session.messages().iter().filter_map(message_text).collect();
         assert_eq!(
             rows.iter()
                 .filter(|row| row.contains("Instructions from: AGENTS.md"))
@@ -988,20 +1038,14 @@ mod tests {
             .session()
             .messages()
             .iter()
-            .filter_map(|message| match message {
-                react::llm::LlmMessage::User { content } => content.as_text().map(str::to_string),
-                _ => None,
-            })
+            .filter_map(|message| message_text(message).map(str::to_string))
             .collect();
         context.inject(&agent);
         let after: Vec<String> = agent
             .session()
             .messages()
             .iter()
-            .filter_map(|message| match message {
-                react::llm::LlmMessage::User { content } => content.as_text().map(str::to_string),
-                _ => None,
-            })
+            .filter_map(|message| message_text(message).map(str::to_string))
             .collect();
         assert_eq!(
             before, after,
@@ -1027,14 +1071,7 @@ mod tests {
         TurnContext::from_facts(&facts(&rooted(&root)), false).inject(&agent);
 
         let session = agent.session();
-        let rows: Vec<&str> = session
-            .messages()
-            .iter()
-            .filter_map(|message| match message {
-                react::llm::LlmMessage::User { content } => content.as_text(),
-                _ => None,
-            })
-            .collect();
+        let rows: Vec<&str> = session.messages().iter().filter_map(message_text).collect();
         let blocks: Vec<&&str> = rows
             .iter()
             .filter(|row| row.contains("Instructions from: AGENTS.md"))
@@ -1079,14 +1116,7 @@ mod tests {
         };
         bare.inject(&agent);
         let session = agent.session();
-        let rows: Vec<&str> = session
-            .messages()
-            .iter()
-            .filter_map(|message| match message {
-                react::llm::LlmMessage::User { content } => content.as_text(),
-                _ => None,
-            })
-            .collect();
+        let rows: Vec<&str> = session.messages().iter().filter_map(message_text).collect();
         assert_eq!(
             rows[0], "fresh time row",
             "the new row still lands: {rows:?}"

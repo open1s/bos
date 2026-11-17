@@ -68,8 +68,8 @@ the mechanics as bullets, so the priority survives a skim.
 | 4 | Product context | `HARNESS_CONTEXT` | `bsh` | when the persona is not `complete` |
 | 5 | Tool sections | `agent::prompts::TOOL_GUIDANCE` then `bsh::prompts::TOOL_GUIDANCE` | both | only for registered tools |
 | 6 | Per-turn plan directive | `PLAN_DIRECTIVE` | `bsh` | plan mode only |
-| 7 | Workspace instructions | `instructions::render` | `bsh` | every turn, framed as a user-role reminder |
-| 8 | Runtime snapshot | `context::render_snapshot` | `bsh` | every turn, first user message |
+| 7 | Workspace instructions | `instructions::render` | `bsh` | every turn, framed as an untrusted-data system reminder |
+| 8 | Runtime snapshot | `context::render_snapshot` | `bsh` | every turn, first system message |
 
 A subagent child inherits the parent's layers, drops the delegation tail
 (`## Delegating with subagents`) because a leaf cannot delegate again, and
@@ -453,7 +453,18 @@ message**: `LlmRequest::host_guidance` carries it, and the request snapshot
 composes it into that one call's system prompt (`ProviderRequest::wire_system_prompt`)
 while the conversation keeps only the reader's own turns. It never becomes a
 `user` row in history, replay or diagnostics; the redacted audit lists each
-note with `origin: host` and its `purpose` (issue #434). The turn outcome
+note with `origin: host` and its `purpose` (issue #434).
+
+**Host context is not the reader.** The same rule covers context injection: the
+runtime snapshot, time-context, workspace instructions and every typed request
+block enter the conversation as `system` messages. Only the reader's own input
+is a `user` row, so a request cannot read as two consecutive reader messages
+when the second one was the harness. OpenAI folds all system rows into its one
+leading system message; Anthropic and Responses fold them into their
+system/instructions section, so no provider receives a system turn in the
+middle of the conversation (issue #434).
+
+The turn outcome
 records successful and failed call counts, and an `Action` turn that closes with no successful call
 logs a warning even when the retry was spent. The runner repeats that fact
 where the reader is looking: `AgentEvent::ActionMissed` sets the status-bar
