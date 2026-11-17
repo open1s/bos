@@ -28,6 +28,10 @@ fn refresh_provider_snapshot<S: ReactSession, C: ReactContext>(
     if let Some(persona) = persona {
         provider.system_prompt = Some(persona.clone());
     }
+    // Host corrections belong to THIS call only (issue #434): they ride
+    // outside the message list and are dropped once the call is made, so no
+    // reader turn is ever followed by a synthetic reader instruction.
+    provider.host_guidance = request.host_guidance.clone();
     request.provider_request = Some(provider);
 }
 

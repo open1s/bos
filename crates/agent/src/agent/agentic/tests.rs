@@ -1370,6 +1370,11 @@ fn the_admitted_array_is_stable_across_registration_order() {
 // Action-first turns (issue #293)
 // =========================================================================
 
+/// Reader turns recorded by the scripted mock, one list per model call.
+type SeenTurns = Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+/// Typed requests recorded by the scripted mock, one per model call.
+type SeenRequests = Arc<std::sync::Mutex<Vec<react::llm::ProviderRequest>>>;
+
 /// One scripted model step.
 enum Step {
     /// A prose reply with no tool call.
@@ -1378,13 +1383,14 @@ enum Step {
     Tool(&'static str, &'static str),
 }
 
-/// A model that plays a fixed script and records the user messages the engine
-/// appends, so a test can see the corrective action note rather than infer it.
+/// A model that plays a fixed script and records both the reader turns and the
+/// typed requests the engine sends, so a test can see host guidance separately
+/// from conversation rather than infer it.
 struct ActionLlm {
     step: std::sync::atomic::AtomicUsize,
     script: Vec<Step>,
-    seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
-    requests: Arc<std::sync::Mutex<Vec<react::llm::ProviderRequest>>>,
+    seen: SeenTurns,
+    requests: SeenRequests,
 }
 
 impl ActionLlm {
@@ -1458,11 +1464,13 @@ impl LlmClient<AgentSession, AgentReactContext> for ActionLlm {
 }
 
 /// An agent with the scripted model and, when asked, one workspace-shaped tool.
-fn action_agent(
-    script: Vec<Step>,
-    with_tool: bool,
-) -> (Agent, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+///
+/// Returns the per-call user turns and the per-call typed requests, so a test
+/// can assert both what the reader said and which host guidance rode on the
+/// request (never on the conversation, issue #434).
+fn action_agent(script: Vec<Step>, with_tool: bool) -> (Agent, SeenTurns, SeenRequests) {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut provider = LlmProvider::new();
     provider.register_vendor(
         "mock".to_string(),
@@ -1470,7 +1478,7 @@ fn action_agent(
             step: std::sync::atomic::AtomicUsize::new(0),
             script,
             seen: seen.clone(),
-            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            requests: requests.clone(),
         }),
     );
     let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
@@ -1482,7 +1490,7 @@ fn action_agent(
             |_args| Ok(serde_json::json!({"content": "ok"})),
         )));
     }
-    (agent, seen)
+    (agent, seen, requests)
 }
 
 /// Like [`action_agent`], but exposes the per-call typed requests.
@@ -1517,28 +1525,41 @@ fn action_agent_recording(
     (agent, requests)
 }
 
-/// How many action notes the LAST model call saw in its session.
+/// The "act" note on the last call, the common case.
+fn action_retry_notes(requests: &SeenRequests) -> usize {
+    action_notes(requests, "action-retry")
+}
+
+/// The "your attempt failed" note on the last call.
+fn action_failed_notes(requests: &SeenRequests) -> usize {
+    action_notes(requests, "action-failed")
+}
+
+/// How many host-guidance notes with this purpose the turn's requests carried.
 ///
-/// The mock records the session at every call, so this reads what the engine
-/// actually sent rather than the post-run transcript.
-fn action_notes(seen: &Arc<std::sync::Mutex<Vec<Vec<String>>>>) -> usize {
-    seen.lock()
+/// The mock records the typed request at every call, so this reads the requests
+/// the provider would serialize - not the post-run transcript. The note is host
+/// guidance, never a user message (issue #434).
+fn action_notes(requests: &SeenRequests, purpose: &str) -> usize {
+    requests
+        .lock()
         .unwrap()
-        .last()
-        .map(|turns| {
-            turns
+        .iter()
+        .map(|request| {
+            request
+                .host_guidance
                 .iter()
-                .filter(|text| text.as_str() == react::engine::ACTION_NOTE)
+                .filter(|guidance| guidance.purpose == purpose)
                 .count()
         })
-        .unwrap_or(0)
+        .sum()
 }
 
 /// An actionable turn answered with prose only is sent back to work once: the
 /// next step calls a tool, and the turn ends with the work done.
 #[tokio::test]
 async fn an_action_turn_is_sent_back_to_work_after_a_prose_only_reply() {
-    let (agent, seen) = action_agent(
+    let (agent, seen, requests) = action_agent(
         vec![
             Step::Text("Here is how I would fix it: open the file and change the guard."),
             Step::Tool("read_file", "{}"),
@@ -1557,7 +1578,7 @@ async fn an_action_turn_is_sent_back_to_work_after_a_prose_only_reply() {
         "the real answer closes the turn: {answer}"
     );
     assert_eq!(
-        action_notes(&seen),
+        action_retry_notes(&requests),
         1,
         "the engine asked once for work, not a plan"
     );
@@ -1566,13 +1587,44 @@ async fn an_action_turn_is_sent_back_to_work_after_a_prose_only_reply() {
         3,
         "step two acts, step three reports"
     );
+    // The note is host guidance, never a reader turn (issue #434).
+    let second = requests.lock().unwrap()[1].clone();
+    assert!(
+        second.messages.iter().all(|message| !matches!(
+            message,
+            react::llm::LlmMessage::User { content }
+                if content.as_text().is_some_and(|text| text == react::engine::ACTION_NOTE)
+        )),
+        "the retry note is not a user message: {:?}",
+        second.messages
+    );
+    assert!(
+        second
+            .wire_system_prompt()
+            .is_some_and(|prompt| prompt.contains(react::engine::ACTION_NOTE)),
+        "the retry note is host guidance in the system prompt"
+    );
+    // The reader's own turn is intact and unmixed.
+    let users: Vec<&str> = second
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            react::llm::LlmMessage::User { content } => content.as_text(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        users,
+        vec!["fix the failing guard"],
+        "history is reader-authored"
+    );
 }
 
 /// The nudge is spent once: a model that keeps explaining is allowed to close
 /// the turn with its second answer rather than looping.
 #[tokio::test]
 async fn the_action_nudge_is_spent_once() {
-    let (agent, seen) = action_agent(
+    let (agent, seen, requests) = action_agent(
         vec![
             Step::Text("I would start by reading the parser."),
             Step::Text("Final Answer: still a plan."),
@@ -1588,14 +1640,19 @@ async fn the_action_nudge_is_spent_once() {
         "the second answer closes the turn: {answer}"
     );
     assert_eq!(seen.lock().unwrap().len(), 2, "one retry, not a loop");
-    assert_eq!(action_notes(&seen), 1, "the note was sent exactly once");
+    assert_eq!(
+        action_retry_notes(&requests),
+        1,
+        "the note was sent exactly once"
+    );
 }
 
 /// An explanation turn never pays for the action policy: prose is the
 /// deliverable, so a talk-only reply is the answer.
 #[tokio::test]
 async fn an_explanation_turn_is_not_nudged() {
-    let (agent, seen) = action_agent(vec![Step::Text("Final Answer: it works by caching.")], true);
+    let (agent, seen, requests) =
+        action_agent(vec![Step::Text("Final Answer: it works by caching.")], true);
     agent.set_action_intent(ActionIntent::Explanation);
     let answer = agent
         .react("explain how the cache works")
@@ -1603,7 +1660,7 @@ async fn an_explanation_turn_is_not_nudged() {
         .expect("the turn");
 
     assert!(answer.contains("caching"), "{answer}");
-    assert_eq!(action_notes(&seen), 0);
+    assert_eq!(action_retry_notes(&requests), 0);
     assert_eq!(seen.lock().unwrap().len(), 1, "one request, no retry");
 }
 
@@ -1611,7 +1668,7 @@ async fn an_explanation_turn_is_not_nudged() {
 /// spend a retry asking it to.
 #[tokio::test]
 async fn an_action_turn_without_tools_is_not_nudged() {
-    let (agent, seen) = action_agent(
+    let (agent, _seen, requests) = action_agent(
         vec![Step::Text("Final Answer: no tool is available.")],
         false,
     );
@@ -1619,19 +1676,20 @@ async fn an_action_turn_without_tools_is_not_nudged() {
     let answer = agent.react("fix the guard").await.expect("the turn");
 
     assert!(answer.contains("no tool is available"), "{answer}");
-    assert_eq!(action_notes(&seen), 0);
+    assert_eq!(action_retry_notes(&requests), 0);
 }
 
 /// A reply that ends in a question is the contract's "ask once when the request
 /// is too vague" arm, not a dodge.
 #[tokio::test]
 async fn a_question_reply_to_an_action_turn_is_not_nudged() {
-    let (agent, seen) = action_agent(vec![Step::Text("Which file should I change?")], true);
+    let (agent, _seen, requests) =
+        action_agent(vec![Step::Text("Which file should I change?")], true);
     agent.set_action_intent(ActionIntent::Action);
     let answer = agent.react("make it better").await.expect("the turn");
 
     assert!(answer.contains("Which file"), "{answer}");
-    assert_eq!(action_notes(&seen), 0);
+    assert_eq!(action_retry_notes(&requests), 0);
 }
 
 /// The streaming path applies the same contract: a prose-only step is held open
@@ -1640,7 +1698,7 @@ async fn a_question_reply_to_an_action_turn_is_not_nudged() {
 async fn an_action_turn_is_sent_back_to_work_on_the_streaming_path() {
     use futures::StreamExt;
 
-    let (agent, seen) = action_agent(
+    let (agent, seen, requests) = action_agent(
         vec![
             Step::Text("I would inspect the file first."),
             Step::Tool("read_file", "{}"),
@@ -1658,7 +1716,7 @@ async fn an_action_turn_is_sent_back_to_work_on_the_streaming_path() {
         }
     }
     assert!(answer.contains("inspected it"), "{answer}");
-    assert_eq!(action_notes(&seen), 1);
+    assert_eq!(action_retry_notes(&requests), 1);
     assert_eq!(seen.lock().unwrap().len(), 3);
 }
 
@@ -1701,6 +1759,7 @@ async fn each_tool_step_gets_a_fresh_complete_request_snapshot() {
 /// A classifier vendor: answers ACTION and counts how many requests it served.
 struct ClassifyLlm {
     calls: Arc<std::sync::atomic::AtomicUsize>,
+    answer: &'static str,
 }
 
 #[async_trait]
@@ -1713,7 +1772,7 @@ impl LlmClient<AgentSession, AgentReactContext> for ClassifyLlm {
         _context: &mut AgentReactContext,
     ) -> Result<LlmResponse, LlmError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(make_text_response("ACTION".to_string()))
+        Ok(make_text_response(self.answer.to_string()))
     }
 
     async fn stream_complete(
@@ -1779,6 +1838,7 @@ async fn the_model_classifier_answers_unknown_turns_and_caches() {
         "mock".to_string(),
         Box::new(ClassifyLlm {
             calls: calls.clone(),
+            answer: "ACTION",
         }),
     );
     let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
@@ -1811,6 +1871,32 @@ async fn the_model_classifier_answers_unknown_turns_and_caches() {
     );
 }
 
+/// A classifier that reads a greeting as conversation keeps the turn
+/// unrouted: the label maps to Unknown, so no execution policy can follow the
+/// reader's greeting (issue #434).
+#[tokio::test]
+async fn the_model_classifier_keeps_conversation_unrouted() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(ClassifyLlm {
+            calls: calls.clone(),
+            answer: "CONVERSATION",
+        }),
+    );
+    let agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+
+    assert_eq!(
+        agent
+            .classify_intent_with_model("hello there, how are you today?")
+            .await,
+        Some(ActionIntent::Unknown),
+        "conversation carries no execution policy"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 /// A classifier failure is not a turn failure: the caller keeps its lexical
 /// answer instead of losing the message to an unavailable vendor.
 #[tokio::test]
@@ -1827,10 +1913,9 @@ async fn a_classifier_failure_keeps_the_lexical_answer() {
 }
 
 /// An agent with the scripted model and one tool that always fails.
-fn action_agent_with_failing_tool(
-    script: Vec<Step>,
-) -> (Agent, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+fn action_agent_with_failing_tool(script: Vec<Step>) -> (Agent, SeenTurns, SeenRequests) {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut provider = LlmProvider::new();
     provider.register_vendor(
         "mock".to_string(),
@@ -1838,7 +1923,7 @@ fn action_agent_with_failing_tool(
             step: std::sync::atomic::AtomicUsize::new(0),
             script,
             seen: seen.clone(),
-            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            requests: requests.clone(),
         }),
     );
     let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
@@ -1852,38 +1937,96 @@ fn action_agent_with_failing_tool(
             ))
         },
     )));
-    (agent, seen)
+    (agent, seen, requests)
 }
 
-/// An unclassified turn that promises to act instead of acting still gets the
-/// one retry: the classifier is conservative, but the talk-only shape is not.
+/// An unclassified turn is not work. Prose that happens to promise an action
+/// ("I will start by...") must not earn an execution directive: the host does
+/// not know this was a coding request, and guessing is what put a workspace
+/// directive after a greeting (issue #434).
 #[tokio::test]
-async fn an_unclassified_turn_that_promises_to_act_is_nudged() {
-    let (agent, seen) = action_agent(
+async fn an_unclassified_turn_is_not_nudged_into_work() {
+    // The captured BSH request that opened issue #434: the same greeting, then
+    // a synthetic engine directive in the user role.
+    let raw = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/issue-434-captured-request.json"
+    ))
+    .expect("the captured-request fixture");
+    let captured: serde_json::Value = serde_json::from_str(&raw).expect("fixture json");
+    assert_eq!(captured["captured_messages"][0]["text"], "hello 8888");
+    assert_eq!(captured["captured_messages"][1]["role"], "user");
+    assert_eq!(
+        captured["captured_messages"][1]["text"],
+        react::engine::ACTION_NOTE,
+        "the captured synthetic row is the engine's action note"
+    );
+
+    let (agent, seen, requests) = action_agent(
         vec![
-            Step::Text("I will start by reading the parser."),
+            Step::Text("I will start by reading the parser if you like."),
             Step::Tool("read_file", "{}"),
             Step::Text("Final Answer: read the parser."),
         ],
         true,
     );
-    // Unknown is the default; the promise is what earns the retry.
     agent.set_action_intent(ActionIntent::Unknown);
     let answer = agent
-        .react("the parser is confusing")
+        .react(captured["replay"]["input"].as_str().expect("input"))
         .await
         .expect("the turn");
 
-    assert!(answer.contains("read the parser"), "{answer}");
-    assert_eq!(action_notes(&seen), 1);
-    assert_eq!(seen.lock().unwrap().len(), 3);
+    assert!(answer.contains("reading the parser"), "{answer}");
+    assert_eq!(
+        action_retry_notes(&requests),
+        0,
+        "conversation stays conversation"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1, "one request, no retry");
+    let request = requests.lock().unwrap().last().cloned().expect("a request");
+    assert!(
+        request.host_guidance.is_empty(),
+        "no host directive rides a greeting: {:?}",
+        request.host_guidance
+    );
+    assert!(
+        request.messages.iter().all(|message| !matches!(
+            message,
+            react::llm::LlmMessage::User { content }
+                if content.as_text().is_some_and(|text| text == react::engine::ACTION_NOTE)
+        )),
+        "no synthetic user instruction is serialized: {:?}",
+        request.messages
+    );
+    // The serialized history carries the reader's turn once, unmodified.
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .filter(|message| matches!(
+                message,
+                react::llm::LlmMessage::User { content }
+                    if content.as_text().is_some_and(|text| text == "hello 8888")
+            ))
+            .count(),
+        1,
+        "the reader's message appears once, unmodified"
+    );
+    assert!(
+        agent
+            .session()
+            .messages()
+            .iter()
+            .all(|message| !matches!(message, react::llm::LlmMessage::ToolResult { .. })),
+        "no workspace tool ran for a greeting"
+    );
 }
 
 /// The promise guard does not override an explicit explanation request: an
 /// explanation may say "first, I will explain..." and must not be sent to act.
 #[tokio::test]
 async fn an_explanation_turn_that_promises_to_explain_is_not_nudged() {
-    let (agent, seen) = action_agent(
+    let (agent, seen, requests) = action_agent(
         vec![Step::Text(
             "First, I will explain how the cache works: it stores...",
         )],
@@ -1893,7 +2036,7 @@ async fn an_explanation_turn_that_promises_to_explain_is_not_nudged() {
     let answer = agent.react("explain the cache").await.expect("the turn");
 
     assert!(answer.contains("stores"), "{answer}");
-    assert_eq!(action_notes(&seen), 0);
+    assert_eq!(action_retry_notes(&requests), 0);
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
 
@@ -1901,7 +2044,7 @@ async fn an_explanation_turn_that_promises_to_explain_is_not_nudged() {
 /// a completion claim and asks for the exact failure instead - once.
 #[tokio::test]
 async fn a_failed_action_attempt_is_sent_back_to_report_the_failure() {
-    let (agent, seen) = action_agent_with_failing_tool(vec![
+    let (agent, seen, requests) = action_agent_with_failing_tool(vec![
         Step::Tool("read_file", "{}"),
         Step::Text("Final Answer: done, the file is fixed."),
         Step::Text("Final Answer: the read was refused with permission denied."),
@@ -1914,12 +2057,25 @@ async fn a_failed_action_attempt_is_sent_back_to_report_the_failure() {
         "the honest failure report closes the turn: {answer}"
     );
     assert_eq!(seen.lock().unwrap().len(), 3, "one failure retry");
-    let notes = seen.lock().unwrap().last().cloned().unwrap_or_default();
+    assert_eq!(
+        action_failed_notes(&requests),
+        1,
+        "the failed-attempt note rode on the last request"
+    );
+    let last = requests.lock().unwrap().last().cloned().expect("a request");
     assert!(
-        notes
-            .iter()
-            .any(|text| text == react::engine::ACTION_FAILED_NOTE),
-        "the failed-attempt note was sent: {notes:?}"
+        last.messages.iter().all(|message| !matches!(
+            message,
+            react::llm::LlmMessage::User { content }
+                if content.as_text().is_some_and(|text| text.contains("Every tool call this turn failed"))
+        )),
+        "the note is not a user message: {:?}",
+        last.messages
+    );
+    assert!(
+        last.wire_system_prompt()
+            .is_some_and(|prompt| prompt.contains(react::engine::ACTION_FAILED_NOTE)),
+        "the note is host guidance in the system prompt"
     );
 }
 
@@ -1959,7 +2115,7 @@ fn flaky_tool(
 #[tokio::test]
 async fn a_transient_read_only_failure_is_retried_once() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let (mut agent, seen) = action_agent(
+    let (mut agent, _seen, requests) = action_agent(
         vec![
             Step::Tool("probe", "{}"),
             Step::Text("Final Answer: read it."),
@@ -1977,7 +2133,7 @@ async fn a_transient_read_only_failure_is_retried_once() {
         "one transient retry ran the tool again"
     );
     assert_eq!(
-        action_notes(&seen),
+        action_retry_notes(&requests),
         0,
         "the retry did not need a model nudge"
     );
@@ -1988,7 +2144,7 @@ async fn a_transient_read_only_failure_is_retried_once() {
 #[tokio::test]
 async fn a_declared_write_tool_is_not_retried() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let (mut agent, _seen) = action_agent(
+    let (mut agent, _seen, _requests) = action_agent(
         vec![
             Step::Tool("probe", "{}"),
             Step::Text("Final Answer: failed."),

@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- **Reader intent is preserved, and harness corrections are no longer user
+  messages (#434).** The engine's corrective notes (`ACTION_NOTE`,
+  `ACTION_FAILED_NOTE`, the step guard, empty/truncated-reply notes and the
+  repeated-failure note) used to be appended to the session as `user` turns, so
+  a provider could see a greeting followed by a synthetic instruction to do
+  workspace work. They now ride on `LlmRequest::host_guidance` for one call and
+  compose into that request's system prompt; `ProviderRequest` records each
+  note's `host` origin and purpose in the redacted audit, and adapters serialize
+  it as system policy in all three protocols. Conversation history keeps only
+  reader-authored turns, and legacy sessions that stored a note still render it
+  as harness wording, not a reader row.
+- **Intent routing no longer treats an open workspace as a request.**
+  The classifier now recognizes explicit file reads, and a verb with no object
+  ("fix it", "修复它") is `Unknown` rather than `Action`; an `Unknown` or
+  `Explanation` turn is never nudged into tools. The semantic classifier gains a
+  `CONVERSATION` label, and both the workflow contract and the BSH product
+  context say an open workspace is context, never evidence of intent.
+
 ## v4.1.16 (2026-11-17)
 
 - **The Windows extension test compiles again.** The Windows-only

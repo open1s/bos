@@ -382,7 +382,9 @@ impl OpenAiVendor {
 
         let mut extra_system_prompt = String::new();
         if let Some(provider) = typed {
-            extra_system_prompt.push_str(provider.system_prompt.as_deref().unwrap_or(""));
+            // The typed system prompt plus this call's host guidance: one
+            // system section, never a synthetic user turn (issue #434).
+            extra_system_prompt.push_str(provider.wire_system_prompt().as_deref().unwrap_or(""));
         } else {
             if let Some(p) = &persona {
                 extra_system_prompt.push_str(&format!("Persona: {}\n", p));
@@ -1294,6 +1296,7 @@ mod tests {
             request_id: None,
             intent: Default::default(),
             provider_request: None,
+            host_guidance: Vec::new(),
         };
         let outcome = vendor
             .complete(
@@ -1710,5 +1713,63 @@ mod tests {
         assert_eq!(audit["system_prompt_chars"], 3);
         assert!(!audit.to_string().contains("SYS"));
         assert!(!audit.to_string().contains("hello"));
+    }
+
+    /// Host guidance for one call is serialized in the system section, not as
+    /// a reader turn: the adapter boundary keeps the two distinguishable
+    /// (issue #434).
+    #[test]
+    fn host_guidance_is_system_policy_not_a_user_message() {
+        use crate::llm::{
+            Content, HostGuidance, LlmContext, LlmRequest, LlmSession, ProviderRequest,
+        };
+        let vendor = OpenAiVendor::new(
+            "https://api.example.com".to_string(),
+            "gpt-test".to_string(),
+            "k".to_string(),
+        );
+        let context = LlmContext::default();
+        let request = LlmRequest {
+            model: "gpt-test".to_string(),
+            input: Content::text("hello 8888"),
+            provider_request: Some(ProviderRequest {
+                system_prompt: Some("SYS".to_string()),
+                host_guidance: vec![HostGuidance::new("action-retry", "ACT NOW")],
+                messages: vec![
+                    crate::llm::LlmMessage::user("hello 8888"),
+                    crate::llm::LlmMessage::assistant("I will start by reading."),
+                ],
+                input: Content::text("hello 8888"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let built = vendor.convert_request(None, &request, &LlmSession::new(), &context);
+        assert_eq!(built.messages.len(), 3, "system + the reader's own history");
+        let system = built.messages[0]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str())
+            .expect("a system string");
+        assert!(system.contains("SYS"));
+        assert!(system.contains("ACT NOW"), "guidance is host policy");
+        assert_eq!(built.messages[1].role, "user");
+        assert_eq!(
+            built.messages[1].content,
+            Some(serde_json::json!("hello 8888"))
+        );
+        for message in &built.messages[1..] {
+            assert_ne!(message.role, "system", "no late system turn");
+            assert!(
+                !message
+                    .content
+                    .as_ref()
+                    .is_some_and(|value| value.to_string().contains("ACT NOW")),
+                "guidance never appears as a conversation row"
+            );
+        }
+        let audit = request.provider_request.as_ref().expect("typed").audit();
+        assert_eq!(audit["host_guidance"][0]["origin"], "host");
+        assert_eq!(audit["host_guidance"][0]["purpose"], "action-retry");
     }
 }

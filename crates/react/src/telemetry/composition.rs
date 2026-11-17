@@ -18,13 +18,18 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{Content, LlmMessage, LlmTool, Skill};
+use crate::llm::{Content, HostGuidance, LlmMessage, LlmTool, Skill};
 
 /// The byte sizes that make up one request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestComposition {
     /// The system prompt this request carries.
     pub system_bytes: usize,
+    /// The host guidance composed into that system prompt for this call.
+    ///
+    /// Guidance is runtime policy, not conversation (issue #434); it is
+    /// counted here so the system total the provider bills is attributed.
+    pub guidance_bytes: usize,
     /// Every advertised tool definition, name and schema.
     pub tools_bytes: usize,
     /// How many definitions the array carries.
@@ -52,7 +57,24 @@ impl RequestComposition {
         history: Option<&[LlmMessage]>,
         input: &Content,
     ) -> Self {
-        let system_bytes = persona.map_or(0, str::len);
+        Self::measure_with_guidance(persona, tools, skills, history, input, &[])
+    }
+
+    /// Price one request, including the host guidance composed into its system
+    /// prompt for this call (issue #434).
+    pub fn measure_with_guidance(
+        persona: Option<&str>,
+        tools: &[LlmTool],
+        skills: Option<&[Skill]>,
+        history: Option<&[LlmMessage]>,
+        input: &Content,
+        guidance: &[HostGuidance],
+    ) -> Self {
+        let guidance_bytes = guidance
+            .iter()
+            .map(|entry| entry.purpose.len() + entry.content.len())
+            .sum::<usize>();
+        let system_bytes = persona.map_or(0, str::len).saturating_add(guidance_bytes);
         let mut tools_bytes = 0usize;
         let mut largest_tool_bytes = 0usize;
         let mut largest_tool: Option<String> = None;
@@ -74,6 +96,7 @@ impl RequestComposition {
             .saturating_add(input_bytes);
         Self {
             system_bytes,
+            guidance_bytes,
             tools_bytes,
             tool_count: tools.len(),
             largest_tool_bytes,
@@ -149,6 +172,33 @@ mod tests {
                 + composition.skills_bytes
                 + composition.history_bytes
                 + composition.input_bytes
+        );
+    }
+
+    /// Guidance is system policy for this call, so its bytes belong to the
+    /// system prompt the provider bills - and to no other bucket (issue #434).
+    #[test]
+    fn host_guidance_is_priced_into_the_system_prompt() {
+        let guidance = [HostGuidance::new("action-retry", "call a tool now")];
+        let composition = RequestComposition::measure_with_guidance(
+            Some("sys"),
+            &[],
+            None,
+            None,
+            &Content::text("hello"),
+            &guidance,
+        );
+        assert_eq!(
+            composition.guidance_bytes,
+            "action-retry".len() + "call a tool now".len()
+        );
+        assert_eq!(
+            composition.system_bytes,
+            "sys".len() + composition.guidance_bytes
+        );
+        assert_eq!(
+            composition.total_bytes,
+            composition.system_bytes + composition.input_bytes
         );
     }
 

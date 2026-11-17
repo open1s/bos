@@ -525,6 +525,7 @@ async fn a_guarded_turn_ends_with_an_answer_not_a_truncation() {
 /// is the answer.
 struct BlankThenAnswerLlm {
     index: Arc<AtomicUsize>,
+    requests: Arc<std::sync::Mutex<Vec<react::llm::ProviderRequest>>>,
 }
 
 #[async_trait]
@@ -542,10 +543,13 @@ impl LlmClient<LlmSession, LlmContext> for BlankThenAnswerLlm {
     async fn stream_complete(
         &self,
         _persona: Option<String>,
-        _request: LlmRequest,
+        request: LlmRequest,
         _session: &mut LlmSession,
         _context: &mut LlmContext,
     ) -> Result<TokenStream, LlmError> {
+        if let Some(snapshot) = request.provider_request.clone() {
+            self.requests.lock().unwrap().push(snapshot);
+        }
         let i = self.index.fetch_add(1, Ordering::SeqCst);
         let tokens: Vec<Result<react::llm::StreamToken, LlmError>> = if i == 0 {
             vec![Ok(react::llm::StreamToken::Done)]
@@ -571,8 +575,10 @@ async fn a_blank_stream_step_is_retried_instead_of_ending_on_silence() {
     use futures::StreamExt;
     use react::llm::LlmMessage;
 
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let llm = BlankThenAnswerLlm {
         index: Arc::new(AtomicUsize::new(0)),
+        requests: requests.clone(),
     };
     let mut engine = ReActEngineBuilder::<TestApp>::new()
         .llm(Box::new(llm))
@@ -602,14 +608,33 @@ async fn a_blank_stream_step_is_retried_instead_of_ending_on_silence() {
 
     assert!(done, "the turn still closes");
     assert_eq!(answer, "4", "the retry produced the answer, not silence");
+    // The retry directive is host guidance on the second request, not a second
+    // reader turn (issue #434).
     assert!(
-        session.history.iter().any(|message| matches!(
+        session.history.iter().all(|message| !matches!(
             message,
             LlmMessage::User { content }
                 if content.as_text() == Some(react::engine::EMPTY_ANSWER_NOTE)
         )),
-        "the retry directive is a harness note: {:?}",
+        "no synthetic user turn in the history: {:?}",
         session.history
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "one blank step, one retry");
+    assert_eq!(
+        requests[1]
+            .host_guidance
+            .iter()
+            .map(|guidance| guidance.purpose.as_str())
+            .collect::<Vec<_>>(),
+        vec!["empty-answer"],
+        "the retry directive rides the second request"
+    );
+    assert!(
+        requests[1]
+            .wire_system_prompt()
+            .is_some_and(|prompt| prompt.contains(react::engine::EMPTY_ANSWER_NOTE)),
+        "the directive is host policy in the system prompt"
     );
 }
 

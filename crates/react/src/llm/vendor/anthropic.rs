@@ -275,7 +275,10 @@ impl AnthropicVendor {
         let mut system_parts: Vec<String> = Vec::new();
         let typed = request.provider_request.as_ref();
         if let Some(provider) = typed {
-            system_parts.extend(provider.system_prompt.clone());
+            // The typed system prompt plus this call's host guidance: Anthropic
+            // has a top-level system section, so guidance stays out of the
+            // message list (issue #434).
+            system_parts.extend(provider.wire_system_prompt());
         } else if let Some(persona) = persona {
             if !persona.is_empty() {
                 system_parts.push(persona.clone());
@@ -753,6 +756,7 @@ mod tests {
             request_id: None,
             intent: Default::default(),
             provider_request: None,
+            host_guidance: Vec::new(),
         }
     }
 
@@ -832,13 +836,14 @@ mod tests {
 
     #[test]
     fn typed_request_supplies_messages_system_and_tools() {
-        use crate::llm::{Content, LlmMessage, LlmRequest, LlmTool};
+        use crate::llm::{Content, HostGuidance, LlmMessage, LlmRequest, LlmTool};
         let vendor = super::tests::vendor();
         let request = LlmRequest {
             model: "claude-3-5-sonnet-latest".to_string(),
             input: Content::text("next"),
             provider_request: Some(crate::llm::ProviderRequest {
                 system_prompt: Some("SYS".to_string()),
+                host_guidance: vec![HostGuidance::new("action-retry", "ACT NOW")],
                 messages: vec![
                     LlmMessage::user("hello"),
                     LlmMessage::assistant("hi"),
@@ -857,8 +862,13 @@ mod tests {
             ..Default::default()
         };
         let built = vendor.build_request(&None, &request, &(), &());
-        assert_eq!(built.system.as_deref(), Some("SYS"));
-        assert_eq!(built.messages.len(), 3);
+        let system = built.system.as_deref().expect("a system section");
+        assert!(system.starts_with("SYS"));
+        assert!(
+            system.contains("ACT NOW"),
+            "host guidance is top-level system policy (issue #434)"
+        );
+        assert_eq!(built.messages.len(), 3, "guidance is not a message");
         assert_eq!(built.tools.expect("tools")[0].name, "typed-tool");
     }
 }

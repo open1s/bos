@@ -265,7 +265,10 @@ pub enum ActionIntent {
     Action,
     /// An explanation or conceptual question: prose is the deliverable.
     Explanation,
-    /// The host did not classify the turn, so the engine applies no policy.
+    /// Ordinary conversation, or a turn the host did not classify: the engine
+    /// applies no execution policy, because assuming work from workspace
+    /// presence is exactly what put a synthetic instruction after a greeting
+    /// (issue #434).
     #[default]
     Unknown,
 }
@@ -835,6 +838,33 @@ impl ReactContext for LlmContext {
     }
 }
 
+/// One piece of host-generated guidance attached to a single provider call.
+///
+/// Harness corrections ("call a tool now", "the same failure repeated") are not
+/// reader messages. They used to be appended to the conversation as a
+/// `user` turn, which made the provider see a second reader instruction and
+/// could override what the reader actually asked (issue #434). Guidance now
+/// rides outside the message list: it is composed into the request's system
+/// prompt for exactly one call and named in the request diagnostics by its
+/// purpose, so it can never be mistaken for reader-authored history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostGuidance {
+    /// Stable purpose id, e.g. `action-retry` or `step-guard`.
+    pub purpose: String,
+    /// The directive text. Never appended to the conversation.
+    pub content: String,
+}
+
+impl HostGuidance {
+    /// Create one piece of host guidance.
+    pub fn new(purpose: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            purpose: purpose.into(),
+            content: content.into(),
+        }
+    }
+}
+
 /// One source named by the typed provider request (issue #421).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ProviderRequestSource {
@@ -855,6 +885,35 @@ pub struct ProviderRequestSource {
 /// flatten it into roles and text, and the recording seam can prove the request
 /// came from one snapshot.
 impl ProviderRequest {
+    /// The system prompt exactly as an adapter must serialize it: the authored
+    /// prompt, then the host guidance for this call.
+    ///
+    /// Host guidance is kept out of `messages` on purpose. A provider sees one
+    /// system section and one conversation; guidance that is runtime policy
+    /// belongs to the former, so a reader turn can never be followed by a
+    /// synthetic reader instruction (issue #434).
+    pub fn wire_system_prompt(&self) -> Option<String> {
+        if self.host_guidance.is_empty() {
+            return self.system_prompt.clone();
+        }
+        let mut out = self.system_prompt.clone().unwrap_or_default();
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("## Harness guidance\n");
+        out.push_str(
+            "This section is written by the harness, not by the reader. It is runtime policy for this request only.\n",
+        );
+        for guidance in &self.host_guidance {
+            out.push_str("- [");
+            out.push_str(&guidance.purpose);
+            out.push_str("] ");
+            out.push_str(&guidance.content);
+            out.push('\n');
+        }
+        Some(out)
+    }
+
     /// A redacted audit view: identities, counts, roles and option values, but
     /// no system prompt, message text or tool schema bodies. This is the shape
     /// tracing/diagnostics may persist for an HTTP request audit (issue #427).
@@ -882,6 +941,17 @@ impl ProviderRequest {
                     LlmMessage::ToolResult { content, .. } => ("tool_result", content.chars().count()),
                 })
                 .map(|(role, chars)| serde_json::json!({"role": role, "chars": chars}))
+                .collect::<Vec<_>>(),
+            "host_guidance": self
+                .host_guidance
+                .iter()
+                .map(|guidance| {
+                    serde_json::json!({
+                        "origin": "host",
+                        "purpose": guidance.purpose,
+                        "chars": guidance.content.chars().count(),
+                    })
+                })
                 .collect::<Vec<_>>(),
             "input_chars": self.input.as_text().map(|text| text.chars().count()).unwrap_or(0),
             "tools": self.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
@@ -918,10 +988,17 @@ pub struct ProviderRequest {
     pub provider: Option<String>,
     /// The provider adapter implementation/version.
     pub provider_adapter: Option<String>,
-    /// The system prompt the provider will receive.
+    /// The authored system prompt. Adapters serialize
+    /// [`Self::wire_system_prompt`], which appends this call's host guidance;
+    /// the provider receives that composition, never this field alone when
+    /// guidance is present (issue #434).
     pub system_prompt: Option<String>,
     /// The conversation history as it will be serialized.
     pub messages: Vec<LlmMessage>,
+    /// Host-generated guidance for this call. Composed into
+    /// [`Self::wire_system_prompt`], never appended to `messages` (#434).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_guidance: Vec<HostGuidance>,
     /// Advertised tool names, in wire order.
     pub tool_names: Vec<String>,
     /// The complete tool definitions, in wire order.
@@ -984,6 +1061,14 @@ pub struct LlmRequest {
     /// Not serialized: the provider wire carries the flattened form.
     #[serde(skip)]
     pub provider_request: Option<ProviderRequest>,
+    /// Host-generated guidance for the NEXT provider call only (issue #434).
+    ///
+    /// The engine pushes a corrective note here instead of into the session, so
+    /// the note is composed into the system prompt of exactly one request and
+    /// never becomes conversation history. Not serialized: the typed request
+    /// carries the copy an adapter reads.
+    #[serde(skip)]
+    pub host_guidance: Vec<HostGuidance>,
 }
 
 /// Selects the protocol used for a single LLM request.
@@ -1066,6 +1151,7 @@ impl LlmRequest {
             request_id: None,
             intent: ActionIntent::Unknown,
             provider_request: None,
+            host_guidance: Vec::new(),
         }
     }
 
@@ -1433,5 +1519,32 @@ mod tests {
             catalog.contains("do not call load_skill again"),
             "a direct invocation is not loaded twice: {catalog}"
         );
+    }
+
+    /// Host guidance is runtime policy for one call: it composes into the
+    /// system prompt and is named in the audit by origin and purpose, never a
+    /// message (issue #434).
+    #[test]
+    fn host_guidance_rides_in_the_system_prompt_and_the_audit() {
+        let request = super::ProviderRequest {
+            system_prompt: Some("You are a coding agent.".to_string()),
+            host_guidance: vec![super::HostGuidance::new("action-retry", "Call a tool now.")],
+            ..Default::default()
+        };
+        let wire = request.wire_system_prompt().expect("a prompt");
+        assert!(wire.starts_with("You are a coding agent."));
+        assert!(wire.contains("## Harness guidance"));
+        assert!(wire.contains("[action-retry] Call a tool now."));
+        assert!(request.messages.is_empty(), "guidance is not a message");
+        let audit = request.audit();
+        assert_eq!(audit["host_guidance"][0]["origin"], "host");
+        assert_eq!(audit["host_guidance"][0]["purpose"], "action-retry");
+
+        let bare = super::ProviderRequest {
+            host_guidance: Vec::new(),
+            system_prompt: None,
+            ..Default::default()
+        };
+        assert_eq!(bare.wire_system_prompt(), None);
     }
 }

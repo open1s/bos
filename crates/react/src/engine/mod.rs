@@ -1,6 +1,6 @@
 //! The ReAct engine: an LLM loop with tools, skills, streaming, and telemetry.
 
-use crate::llm::types::{load_skill_tool, ReactContext, ReactSession};
+use crate::llm::types::{load_skill_tool, HostGuidance, ReactContext, ReactSession};
 use crate::llm::vendor::responses::{ResponsesContentPart, ResponsesItem};
 use crate::llm::{
     ActionIntent, LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, StreamToken,
@@ -111,40 +111,6 @@ pub const ACTION_NOTE: &str = "This request asks for work in the workspace, and 
 /// model is asked for the exact failure instead of a report of work it did not
 /// finish.
 pub const ACTION_FAILED_NOTE: &str = "Every tool call this turn failed, so nothing was done or verified. Do not report the work as complete. Report the exact failure, what you tried and what must change in the environment; fix the cause and retry only if you can.";
-
-/// Phrases that promise work instead of doing it.
-///
-/// Used only for an UNCLASSIFIED turn: the reader's ask was not routed, but a
-/// reply that says "I will start by..." and calls nothing is the talk-only
-/// pattern this contract exists to stop. An EXPLANATION turn never consults
-/// this list.
-const DEFERRED_ACTION: &[&str] = &[
-    "i will ",
-    "i'll ",
-    "i am going to",
-    "i'm going to",
-    "let me ",
-    "first, i",
-    "first i",
-    "next, i",
-    "here's the plan",
-    "here is the plan",
-    "i would ",
-    "we should ",
-    "step 1",
-    "我会",
-    "我来",
-    "我先",
-    "让我先",
-    "接下来我",
-];
-
-/// Whether a reply is a promise to act later rather than an answer.
-fn looks_like_deferred_action(text: &str) -> bool {
-    let text = text.to_lowercase();
-    let padded = format!(" {} ", text.replace(&['\n', '\r', '\t'][..], " "));
-    DEFERRED_ACTION.iter().any(|phrase| padded.contains(phrase))
-}
 
 /// What the model is told when the same tool failure repeats three times.
 ///
@@ -368,12 +334,13 @@ fn emit_request_composition<S: ReactSession, C: ReactContext>(
     session: &S,
     context: &C,
 ) {
-    let composition = crate::telemetry::RequestComposition::measure(
+    let composition = crate::telemetry::RequestComposition::measure_with_guidance(
         persona,
         context.tools().unwrap_or_default(),
         context.skills(),
         session.history(),
         &request.input,
+        &request.host_guidance,
     );
     telemetry.emit(&TelemetryEvent::RequestComposition {
         turn,
@@ -385,11 +352,11 @@ fn emit_request_composition<S: ReactSession, C: ReactContext>(
 
 /// Whether a reply should be sent back to work.
 ///
-/// Two signals, bounded by the same escapes:
-///
-/// - a classified ACTION turn answered with prose and no tool call;
-/// - an UNCLASSIFIED turn whose reply promises to act ("I will start by...")
-///   instead of answering. A classified EXPLANATION turn is never nudged.
+/// One signal: a classified ACTION turn answered with prose and no tool call.
+/// An UNCLASSIFIED turn is ordinary conversation or a question the classifier
+/// could not route, and an EXPLANATION turn's prose is the deliverable, so
+/// neither is nudged. Guessing that an unrouted turn wanted work is what let a
+/// greeting inherit a workspace directive (issue #434).
 ///
 /// The escapes are deliberate: a turn with no acting tools cannot act, a turn
 /// that already attempted a tool is handled by the failure path instead, and a
@@ -411,11 +378,7 @@ fn action_nudge_due<C: ReactContext>(
     if text.trim_end().ends_with('?') || text.trim_end().ends_with('？') {
         return false;
     }
-    match intent {
-        ActionIntent::Action => true,
-        ActionIntent::Unknown => looks_like_deferred_action(text),
-        ActionIntent::Explanation => false,
-    }
+    intent == ActionIntent::Action
 }
 
 /// Whether the request carries a tool that can act on the workspace.
@@ -484,21 +447,22 @@ fn failed_action_nudge_due(intent: ActionIntent, closing: bool, trace: &TurnTrac
 ///
 /// The order is the diagnosis order: a reply with no attempt gets "act", and
 /// only an attempt whose every call failed gets "report the failure instead of
-/// claiming success".
+/// claiming success". Each note is host guidance for the next request, not a
+/// conversation message (issue #434).
 fn action_retry_note<C: ReactContext>(
     intent: ActionIntent,
     context: &C,
     closing: bool,
     trace: &mut TurnTrace,
     text: &str,
-) -> Option<&'static str> {
+) -> Option<HostGuidance> {
     if action_nudge_due(intent, context, closing, trace, text) {
         trace.action_nudged = true;
-        return Some(ACTION_NOTE);
+        return Some(HostGuidance::new("action-retry", ACTION_NOTE));
     }
     if failed_action_nudge_due(intent, closing, trace) {
         trace.action_failed_nudged = true;
-        return Some(ACTION_FAILED_NOTE);
+        return Some(HostGuidance::new("action-failed", ACTION_FAILED_NOTE));
     }
     None
 }
@@ -721,7 +685,9 @@ impl<A: ReActApp> ReActEngine<A> {
                     break;
                 }
                 closing = true;
-                session.push(LlmMessage::user_text(STEP_GUARD_NOTE));
+                request
+                    .host_guidance
+                    .push(HostGuidance::new("step-guard", STEP_GUARD_NOTE));
             }
             steps += 1;
 
@@ -765,6 +731,9 @@ impl<A: ReActApp> ReActEngine<A> {
                 Ok(Err(e)) => return Err(e),
                 Err(_) => return Err(ReactError::Timeout("LLM prediction timed out".to_string())),
             };
+            // Guidance is scoped to the call that just ran: the next step starts
+            // from the authored prompt unless it earns a note of its own (#434).
+            request.host_guidance.clear();
 
             self.react_app
                 .after_llm_response(
@@ -1021,7 +990,10 @@ impl<A: ReActApp> ReActEngine<A> {
                                 let failure_text = result_text;
                                 if repeated.note(&observed, &failure_text) {
                                     closing = true;
-                                    session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
+                                    request.host_guidance.push(HostGuidance::new(
+                                        "repeat-failure",
+                                        REPEAT_FAILURE_NOTE,
+                                    ));
                                 }
                             }
                         }
@@ -1046,7 +1018,9 @@ impl<A: ReActApp> ReActEngine<A> {
                         // one directed retry instead of closing on silence.
                         if !found_tool_call && thought.trim().is_empty() && !nudged {
                             nudged = true;
-                            session.push(LlmMessage::user_text(EMPTY_ANSWER_NOTE));
+                            request
+                                .host_guidance
+                                .push(HostGuidance::new("empty-answer", EMPTY_ANSWER_NOTE));
                             continue 'turn;
                         }
 
@@ -1057,7 +1031,9 @@ impl<A: ReActApp> ReActEngine<A> {
                         // session, so the note asks for the next part only.
                         if finish == Some("length") && !closing && truncations < TRUNCATION_LIMIT {
                             truncations += 1;
-                            session.push(LlmMessage::user_text(TRUNCATED_NOTE));
+                            request
+                                .host_guidance
+                                .push(HostGuidance::new("truncated", TRUNCATED_NOTE));
                             continue 'turn;
                         }
                         // An ACTION turn answered with prose only has not done
@@ -1071,7 +1047,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 &mut trace,
                                 &thought,
                             ) {
-                                session.push(LlmMessage::user_text(note));
+                                request.host_guidance.push(note);
                                 continue 'turn;
                             }
                         }
@@ -1266,7 +1242,10 @@ impl<A: ReActApp> ReActEngine<A> {
                                 let failure_text = result_text;
                                 if repeated.note(&observed, &failure_text) {
                                     closing = true;
-                                    session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
+                                    request.host_guidance.push(HostGuidance::new(
+                                        "repeat-failure",
+                                        REPEAT_FAILURE_NOTE,
+                                    ));
                                 }
                             }
                             ResponsesItem::Message { content, .. } => {
@@ -1301,7 +1280,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                 &mut trace,
                                 &thought,
                             ) {
-                                session.push(LlmMessage::user_text(note));
+                                request.host_guidance.push(note);
                                 continue 'turn;
                             }
                         }
@@ -1416,7 +1395,9 @@ impl<A: ReActApp> ReActEngine<A> {
                         break;
                     }
                     closing = true;
-                    session.push(LlmMessage::user_text(STEP_GUARD_NOTE));
+                    request
+                        .host_guidance
+                        .push(HostGuidance::new("step-guard", STEP_GUARD_NOTE));
                 }
                 steps += 1;
 
@@ -1453,6 +1434,10 @@ impl<A: ReActApp> ReActEngine<A> {
                         break;
                     }
                 };
+                // Guidance is scoped to the call that just ran: the next step
+                // starts from the authored prompt unless it earns its own note
+                // (issue #434).
+                request.host_guidance.clear();
 
                 futures::pin_mut!(llm_stream);
                 let mut full_response = String::new();
@@ -1664,7 +1649,9 @@ impl<A: ReActApp> ReActEngine<A> {
                             // three strikes and the turn closes with a report.
                             if repeated.note(&observed, &result_text) {
                                 closing = true;
-                                session.push(LlmMessage::user_text(REPEAT_FAILURE_NOTE));
+                                request
+                                        .host_guidance
+                                        .push(HostGuidance::new("repeat-failure", REPEAT_FAILURE_NOTE));
                             }
                         }
                         Err(e) => {
@@ -1708,7 +1695,9 @@ impl<A: ReActApp> ReActEngine<A> {
                     && truncations < TRUNCATION_LIMIT
                 {
                     truncations += 1;
-                    session.push(LlmMessage::user_text(TRUNCATED_NOTE));
+                    request
+                            .host_guidance
+                            .push(HostGuidance::new("truncated", TRUNCATED_NOTE));
                     continue;
                 }
 
@@ -1718,7 +1707,9 @@ impl<A: ReActApp> ReActEngine<A> {
                     // can act on - a tool call or an answer - then close.
                     if full_response.trim().is_empty() && !nudged {
                         nudged = true;
-                        session.push(LlmMessage::user_text(EMPTY_ANSWER_NOTE));
+                        request
+                                .host_guidance
+                                .push(HostGuidance::new("empty-answer", EMPTY_ANSWER_NOTE));
                         continue;
                     }
                     // A turn ends only when nothing waits for its next step.
@@ -1741,7 +1732,7 @@ impl<A: ReActApp> ReActEngine<A> {
                         &mut trace,
                         &full_response,
                     ) {
-                        session.push(LlmMessage::user_text(note));
+                        request.host_guidance.push(note);
                         continue;
                     }
                     self.react_app.on_final_answer(&full_response, session, context).await;

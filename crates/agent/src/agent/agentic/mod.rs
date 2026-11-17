@@ -687,7 +687,7 @@ impl Agent {
     ///
     /// The host's lexical classifier runs first; this is the fallback that
     /// gives an UNKNOWN turn a semantic second opinion. Errors, a timeout and a
-    /// reply that names neither label return None, so the caller keeps the
+    /// reply that names none of the labels return None, so the caller keeps the
     /// lexical answer instead of losing the turn. The request is bounded to
     /// two thousand characters and eight output tokens - the classifier is a
     /// label, not a turn - and the answer is cached by message so a repeated
@@ -769,7 +769,11 @@ impl Agent {
             }
         }
         let answer = response.text()?.to_lowercase();
-        let intent = if answer.contains("action") {
+        let intent = if answer.contains("conversation") {
+            // Ordinary conversation is not a task: keep the turn unrouted so
+            // no execution directive follows the reader's greeting (issue #434).
+            ActionIntent::Unknown
+        } else if answer.contains("action") {
             ActionIntent::Action
         } else if answer.contains("explanation") || answer.contains("explain") {
             ActionIntent::Explanation

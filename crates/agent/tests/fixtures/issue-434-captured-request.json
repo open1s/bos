@@ -1,0 +1,22 @@
+{
+  "issue": 434,
+  "title": "Preserve user intent and keep harness directives out of user-authored messages",
+  "captured_from": "BSH provider request",
+  "note": "The captured shape: a reader message followed by a synthetic harness directive serialized in the user role. This build must not reproduce it.",
+  "captured_messages": [
+    {
+      "role": "user",
+      "origin": "reader",
+      "text": "hello 8888"
+    },
+    {
+      "role": "user",
+      "origin": "harness",
+      "text": "This request asks for work in the workspace, and no tool has run this turn. Do not answer with instructions, a plan or a promise. Call the tools now - inspect the relevant files, run the failing command, make the change - then report what you did and what you verified. If you genuinely cannot act, say what blocks you; never claim work you did not do."
+    }
+  ],
+  "replay": {
+    "input": "hello 8888",
+    "model_reply": "I will start by reading the parser."
+  }
+}

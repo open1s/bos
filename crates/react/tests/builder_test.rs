@@ -353,6 +353,7 @@ fn test_react_with_request() {
         request_id: None,
         intent: Default::default(),
         provider_request: None,
+        host_guidance: Vec::new(),
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();

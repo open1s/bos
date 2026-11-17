@@ -22,7 +22,10 @@
 //!    the answer has to be built from evidence.
 //! 3. A defect report with no clear ask is action.
 //! 4. A bare conceptual opener ("what is", "how does", "是什么") is an
-//!    explanation.
+//!    explanation; so is "show me how ...", ahead of the file-read verbs.
+//! 5. A read verb ("read", "open", "show", "查看") is action, but only when the
+//!    message names what to read. A verb with no object ("fix it") is
+//!    materially incomplete, so it is UNKNOWN and gets no execution policy.
 //!
 //! Only the ask sentence is read: a pasted stack trace or a quoted document later
 //! in the message cannot flip the classification.
@@ -113,9 +116,104 @@ const CONCEPT_OPENERS: &[&str] = &[
     "how does",
     "how did",
     "what does",
+    "show me how",
+    "show me what",
+    "tell me how",
+    "tell me what",
     "是什么",
     "怎么理解",
     "是什么原理",
+];
+
+/// Verbs that ask to open or read workspace material.
+///
+/// A read is a concrete action even when it changes nothing: it needs a tool,
+/// and a prose answer would not satisfy it. It is listed apart from ACTION
+/// because "show me how X works" is a concept question, not a file read, so the
+/// concept openers must win first.
+const FILE_READ: &[&str] = &[
+    "read",
+    "open",
+    "show",
+    "view",
+    "display",
+    "print",
+    "cat",
+    "list",
+    "browse",
+    "look at",
+    "dump",
+    "查看",
+    "打开",
+    "读取",
+    "列出",
+    "看一下",
+    "看下",
+];
+
+/// Words that name no object on their own.
+///
+/// A request built only from a verb and these words ("fix it", "make it
+/// better") does not carry a complete intent: the referent lives in the
+/// conversation, not in the workspace being open. The classifier answers
+/// ActionIntent::Unknown for it, so the engine applies no execution policy and
+/// the model can ask the one question that resolves it (issue #434).
+const NO_OBJECT: &[&str] = &[
+    "a",
+    "an",
+    "the",
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "its",
+    "them",
+    "they",
+    "one",
+    "thing",
+    "stuff",
+    "something",
+    "anything",
+    "please",
+    "me",
+    "my",
+    "our",
+    "your",
+    "again",
+    "now",
+    "here",
+    "there",
+    "some",
+    "any",
+    "more",
+    "better",
+    "faster",
+    "nicer",
+    "cleaner",
+    "simpler",
+    "working",
+    "right",
+    "good",
+    "properly",
+    "correctly",
+    "这个",
+    "那个",
+    "这些",
+    "那些",
+    "它",
+    "这",
+    "那",
+    "一下",
+    "下",
+    "吧",
+    "呢",
+    "啊",
+    "了",
+    "请",
+    "再",
+    "一些",
+    "点",
 ];
 
 /// Words that name a defect or a diagnostic task. With a question word they
@@ -252,10 +350,62 @@ pub(crate) fn classify(text: &str) -> ActionIntent {
     if matches_any(&head, CONCEPT_OPENERS) {
         return ActionIntent::Explanation;
     }
-    if matches_any(&head, ACTION) {
-        return ActionIntent::Action;
+    if matches_any(&head, ACTION) || matches_any(&head, FILE_READ) {
+        // A verb alone is not a complete intent. "Fix it" and "make it better"
+        // name no object, so their referent is only in the conversation; an
+        // open workspace is not evidence of what the reader meant (issue #434).
+        return if names_a_concrete_object(&lower, &head) {
+            ActionIntent::Action
+        } else {
+            ActionIntent::Unknown
+        };
     }
     local_semantics(&lower, &head).unwrap_or(ActionIntent::Unknown)
+}
+
+/// Whether the message names something the request is about.
+///
+/// Workspace and code-object references are conclusive. Otherwise the first
+/// action verb is discounted - it is the ask, not the object - and any
+/// remaining content word counts. Filler and deictic words never do, which is
+/// what turns "fix it" into an ambiguous request rather than a work order.
+fn names_a_concrete_object(lower: &str, padded_head: &str) -> bool {
+    if matches_any(padded_head, WORKSPACE_REFERENCES) || matches_any(padded_head, CODE_NOUNS) {
+        return true;
+    }
+    let mut verb_skipped = false;
+    for token in lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '/' || c == '.' || c == '_' || c == '-'))
+    {
+        if token.chars().count() < 2
+            || token.chars().all(|c| c.is_ascii_digit())
+            || !token.is_ascii()
+        {
+            continue;
+        }
+        if !verb_skipped && (ACTION.contains(&token) || FILE_READ.contains(&token)) {
+            verb_skipped = true;
+            continue;
+        }
+        if NO_OBJECT.contains(&token) {
+            continue;
+        }
+        return true;
+    }
+    // CJK is not whitespace-separated. Strip one ask verb and the filler, and
+    // treat any remaining letter as the object: "修复它" has none, "修复登录"
+    // has one.
+    let mut rest = lower.to_string();
+    for verb in ACTION.iter().chain(FILE_READ.iter()) {
+        if let Some(position) = rest.find(verb) {
+            rest.replace_range(position..position + verb.len(), " ");
+            break;
+        }
+    }
+    for filler in NO_OBJECT {
+        rest = rest.replace(filler, " ");
+    }
+    rest.chars().any(|c| !c.is_ascii() && c.is_alphanumeric())
 }
 
 /// The local feature classifier: the semantic fallback used when no model is
@@ -421,5 +571,62 @@ mod tests {
             classify(&format!("hello {filler} fix it")),
             ActionIntent::Unknown
         );
+    }
+
+    /// The five shapes issue #434 names: ordinary conversation stays ordinary,
+    /// explicit reads and changes enter the work path, and a materially
+    /// ambiguous terse request gets no execution policy.
+    #[test]
+    fn intent_is_complete_enough_to_tell_conversation_from_work() {
+        for prompt in [
+            "hello 8888",
+            "hi",
+            "thanks!",
+            "where is the parser defined?",
+            "what does the retry logic do?",
+        ] {
+            assert_ne!(
+                classify(prompt),
+                ActionIntent::Action,
+                "ordinary conversation must not become work: {prompt}"
+            );
+        }
+        for prompt in [
+            "read crates/bsh/src/intent.rs",
+            "open the config",
+            "show me the failing test",
+            "list the files in src",
+            "fix the retry logic",
+            "add a test for the parser",
+            "review this change",
+            "implement the cache eviction",
+            "修复登录问题",
+        ] {
+            assert_eq!(classify(prompt), ActionIntent::Action, "work: {prompt}");
+        }
+        for prompt in [
+            "fix it",
+            "check this",
+            "make it better",
+            "修复它",
+            "看一下这个",
+        ] {
+            assert_eq!(
+                classify(prompt),
+                ActionIntent::Unknown,
+                "an objectless request is ambiguous, not a work order: {prompt}"
+            );
+        }
+    }
+
+    /// A read request is work, but a concept question that happens to use
+    /// "show" is not: the concept opener must win.
+    #[test]
+    fn a_read_verb_does_not_turn_a_concept_question_into_work() {
+        assert_eq!(
+            classify("show me how the cache works"),
+            ActionIntent::Explanation
+        );
+        assert_eq!(classify("show me the cache module"), ActionIntent::Action);
     }
 }

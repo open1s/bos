@@ -549,9 +549,10 @@ pub fn build_request(
     let parallel = tools.as_ref().map(|_| parallel_tool_calls);
     let (instructions, input) = match req.provider_request.as_ref() {
         Some(provider) => (
+            // Instructions carry the authored prompt plus host guidance for
+            // this call; guidance never joins the input items (issue #434).
             provider
-                .system_prompt
-                .clone()
+                .wire_system_prompt()
                 .filter(|text| !text.is_empty()),
             build_input(Some(&provider.messages), &provider.input),
         ),
@@ -1265,6 +1266,7 @@ mod tests {
             request_id: None,
             intent: Default::default(),
             provider_request: None,
+            host_guidance: Vec::new(),
         };
 
         let built = build_request(None, &req, &session, &context, false, true);
@@ -1529,12 +1531,15 @@ mod tests {
 
     #[test]
     fn typed_request_drives_instructions_input_and_tools() {
-        use crate::llm::{Content, LlmContext, LlmMessage, LlmRequest, LlmSession, LlmTool};
+        use crate::llm::{
+            Content, HostGuidance, LlmContext, LlmMessage, LlmRequest, LlmSession, LlmTool,
+        };
         let request = LlmRequest {
             model: "gpt-5".to_string(),
             input: Content::text("next"),
             provider_request: Some(crate::llm::ProviderRequest {
                 system_prompt: Some("SYS".to_string()),
+                host_guidance: vec![HostGuidance::new("action-retry", "ACT NOW")],
                 messages: vec![
                     LlmMessage::user("hello"),
                     LlmMessage::assistant("hi"),
@@ -1560,9 +1565,23 @@ mod tests {
             false,
             true,
         );
-        assert_eq!(built.instructions.as_deref(), Some("SYS"));
+        let instructions = built.instructions.as_deref().expect("instructions");
+        assert!(instructions.starts_with("SYS"));
+        assert!(
+            instructions.contains("ACT NOW"),
+            "host guidance is an instruction, not an input item (issue #434)"
+        );
         let json = serde_json::to_string(&built).expect("serializes");
         assert!(json.contains("hello"), "{json}");
         assert!(json.contains("typed-tool"), "{json}");
+        assert_eq!(
+            built
+                .input
+                .iter()
+                .filter(|item| matches!(item, ResponsesInputItem::Message { role, .. } if role == "user"))
+                .count(),
+            2,
+            "guidance adds no reader item"
+        );
     }
 }

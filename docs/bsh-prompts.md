@@ -224,8 +224,9 @@ The BSH product context adds the facts the code cannot reveal:
 - a message during a turn is queued for the next turn, not injected;
 - the Stop button is a decision, not a failure to retry;
 - `.bsh/` is internal and denied;
-- a terse request in an open workspace is work in the code; say which reading
-  you take when it is equally likely to be a question;
+- an open workspace is context, not an instruction: a greeting or plain
+  question stays conversation, and a terse request with an unclear referent is
+  clarified before anything is touched;
 
 Plan mode is the one mode that overrides the start-now rule, and it says so in
 the directive: inspect and propose first, then wait for the reader's approval.
@@ -363,6 +364,8 @@ call or the reply, before any correction from the reader.
 | "fix the failing test" | repo open | inspect the failing test, edit, run it, report the result | Fix route; the first move is a tool call |
 | "explain how the cache works" | repo open | answer directly from general knowledge; open the cache file only if the question is about this implementation | Explain route; no unnecessary workspace calls |
 | "make it better" | file open | ask: faster, simpler or more correct, and which screen or file; offer those options, best first | Name the object, change and done condition before acting |
+| "hello 8888" | repo open | answer conversationally; no tool, no workspace inspection | An open workspace is context, not a request (issue #434) |
+| "read crates/bsh/src/intent.rs" | repo open | read the file and answer from it | A read is an action with a named object (issue #434) |
 | "fix the app" | no file, no symptom | ask which screen and what happened; do not open a random file | Too vague to act on; ask, do not guess |
 | "fix this" + button screenshot | app | ask: bug report or code change? | Product context: a screenshot is evidence, not a task |
 | "actually keep the old API" | mid-turn | fold the constraint into the current task | A later message corrects the current task |
@@ -403,19 +406,25 @@ before the stream opens, into `Action`, `Explanation` or `Unknown`. It reads
 the leading 400 characters and uses ordered rules: an explicit explanation ask
 wins; a diagnostic question with a defect word is action; a bare conceptual
 opener at the head of the message outranks a generic action word ("how does the
-build cache work?" is a question about a build, not a request to build); an
-imperative change verb is action. The local stage never reads the workspace or
-reaches the provider.
+build cache work?" is a question about a build, not a request to build); a read
+verb ("read", "open", "show", "查看") is action when it names an object; an
+imperative change verb is action when it names an object. A request built only
+from a verb and deictic filler ("fix it", "make it better", "修复它") is
+materially incomplete: it classifies `Unknown`, so no execution policy applies
+and the model can ask the one question that resolves it. Workspace presence is
+never evidence of intent (issue #434). The local stage never reads the workspace
+or reaches the provider.
 
 An `Unknown` answer is not final: when the message is longer than a greeting,
 `Agent::classify_intent_with_model` asks the configured model once with
-`INTENT_CLASSIFIER_PROMPT` - two labels, one word, eight output tokens,
-temperature 0, 8-second timeout. The answer is cached process-wide by message
+`INTENT_CLASSIFIER_PROMPT` - three labels (action, explanation, conversation),
+one word, eight output tokens, temperature 0, 8-second timeout. The answer is cached process-wide by message
 and model - the shell builds an agent per turn, so a per-agent cache would
 repay it - and a repeated message is served from that cache. A failure, a
 timeout or an unparseable reply keeps the lexical answer instead of losing the
-turn. Messages shorter than a greeting skip the call, and a slash-command
-invocation skips it too: the command block is already an explicit action, not a
+turn. A `conversation` label maps back to `Unknown`: a greeting, thanks or
+small talk is not a task. Messages shorter than a greeting skip the call, and a
+slash-command invocation skips it too: the command block is already an explicit action, not a
 sentence to classify. A transient provider failure is retried (twice, with
 backoff, plus any registered fallback provider); the classifier's own usage is
 drained into the turn's usage report, so it is metered instead of billed
@@ -429,19 +438,23 @@ whether the contract is enforced.
 classification to the engine. A prose reply earns one note, chosen by
 diagnosis:
 
-- `ACTION_NOTE` when the turn was classified `Action` and no tool ran, **and**
-  when an UNCLASSIFIED turn answered with a promise to act ("I will start
-  by...") instead of an answer. The second arm is what keeps an unclassified
-  turn from falling back to prompt-only behaviour; an explicit `Explanation`
-  turn is never nudged, and a reply ending in a question is the contract's own
-  ask-once arm.
+- `ACTION_NOTE` when the turn was classified `Action` and no tool ran. A
+  classified `Explanation` turn and an `Unknown` turn are never nudged: an
+  unrouted turn is conversation or an unresolved question, and guessing that it
+  wanted work is what put a workspace directive after a greeting (issue #434).
+  A reply ending in a question is the contract's own ask-once arm.
 - `ACTION_FAILED_NOTE` when the turn did call tools and every call failed. The
   retry cannot make an environment succeed, but it refuses a completion claim
   built on no successful evidence and asks for the exact failure instead.
 
 Each retry is spent once per turn; a turn with no acting tools (the skill
-loaders do not count) is never nudged. The turn outcome records successful and
-failed call counts, and an `Action` turn that closes with no successful call
+loaders do not count) is never nudged. The note is **host guidance, not a
+message**: `LlmRequest::host_guidance` carries it, and the request snapshot
+composes it into that one call's system prompt (`ProviderRequest::wire_system_prompt`)
+while the conversation keeps only the reader's own turns. It never becomes a
+`user` row in history, replay or diagnostics; the redacted audit lists each
+note with `origin: host` and its `purpose` (issue #434). The turn outcome
+records successful and failed call counts, and an `Action` turn that closes with no successful call
 logs a warning even when the retry was spent. The runner repeats that fact
 where the reader is looking: `AgentEvent::ActionMissed` sets the status-bar
 notice ("... {calls} calls, {failures} failed ...") before the terminal

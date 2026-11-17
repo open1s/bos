@@ -66,6 +66,7 @@ fn make_simple_request(model: &str) -> LlmRequest {
         request_id: None,
         intent: Default::default(),
         provider_request: None,
+        host_guidance: Vec::new(),
     }
 }
 
@@ -359,6 +360,7 @@ async fn test_nvidia_response_parsing() {
         request_id: None,
         intent: Default::default(),
         provider_request: None,
+        host_guidance: Vec::new(),
     };
     let result = match vendor
         .complete(
@@ -519,6 +521,7 @@ async fn test_nvidia_tool_calls_stream_with_config() {
         request_id: None,
         intent: Default::default(),
         provider_request: None,
+        host_guidance: Vec::new(),
     };
 
     let stream_result = vendor
@@ -670,6 +673,7 @@ async fn test_responses_api_complete() {
         request_id: None,
         intent: Default::default(),
         provider_request: None,
+        host_guidance: Vec::new(),
     };
     if request.model.is_empty() {
         request.model = "gpt-4".to_string();
@@ -750,6 +754,7 @@ async fn test_responses_api_stream() {
         request_id: None,
         intent: Default::default(),
         provider_request: None,
+        host_guidance: Vec::new(),
     };
     if request.model.is_empty() {
         request.model = "gpt-4".to_string();

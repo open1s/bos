@@ -339,6 +339,14 @@ pub(crate) fn is_injected_user_text(text: &str) -> bool {
         // The engine's one retry when a step came back empty: also harness
         // wording, never a row the caller wrote.
         || text.starts_with(react::engine::EMPTY_ANSWER_NOTE)
+        // Corrections the engine used to append as user turns. New turns keep
+        // them out of the conversation entirely (issue #434); these checks let
+        // a restored or captured session from before that fix replay without
+        // drawing harness wording as something the reader said.
+        || text.starts_with(react::engine::ACTION_NOTE)
+        || text.starts_with(react::engine::ACTION_FAILED_NOTE)
+        || text.starts_with(react::engine::REPEAT_FAILURE_NOTE)
+        || text.starts_with(react::engine::TRUNCATED_NOTE)
 }
 
 /// Whether a user row is the framed workspace-instructions block.
@@ -523,6 +531,12 @@ mod tests {
     fn the_step_guard_note_is_not_a_user_row() {
         assert!(is_injected_user_text(react::engine::STEP_GUARD_NOTE));
         assert!(is_injected_user_text(react::engine::EMPTY_ANSWER_NOTE));
+        // Every corrective note is harness wording, including the ones older
+        // sessions stored as user rows (issue #434).
+        assert!(is_injected_user_text(react::engine::ACTION_NOTE));
+        assert!(is_injected_user_text(react::engine::ACTION_FAILED_NOTE));
+        assert!(is_injected_user_text(react::engine::REPEAT_FAILURE_NOTE));
+        assert!(is_injected_user_text(react::engine::TRUNCATED_NOTE));
         assert!(
             !is_injected_user_text("Please fix the failing test."),
             "a real request still draws as a user row"

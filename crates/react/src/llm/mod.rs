@@ -13,9 +13,9 @@ pub use response::{
 };
 pub use types::{
     render_skill_catalog, ActionIntent, ApiMode, Binary, BinarySource, ChunkCallback, Content,
-    ContentPart, Instruction, LlmContext, LlmError, LlmMessage, LlmRequest, LlmSession, LlmTool,
-    LlmToolKind, ProviderRequest, ProviderRequestSource, ReactContext, ReactSession,
-    ReasoningEffort, Rule, Skill, Stringfy, VendorBuilderError,
+    ContentPart, HostGuidance, Instruction, LlmContext, LlmError, LlmMessage, LlmRequest,
+    LlmSession, LlmTool, LlmToolKind, ProviderRequest, ProviderRequestSource, ReactContext,
+    ReactSession, ReasoningEffort, Rule, Skill, Stringfy, VendorBuilderError,
 };
 pub use vendor::ChatMessage as OpenAiMessage;
 pub use vendor::*;
