@@ -1,5 +1,36 @@
 # Changelog
 
+## v4.1.15 (2026-11-17)
+
+- **File tools return model-oriented results.** Every built-in file tool now
+  reports `tool`, `status` (`ok`/`empty`/`partial`/`error`), `next`
+  continuation arguments, `count`, and a recovery `hint` instead of
+  `true`/`false` flags. `read_file`/`read_files` report exact line ranges and
+  totals, a partial window carries `next.offset`, and a batch cut in the middle
+  of a line re-reads that line rather than skipping it.
+- **`read_file` requires a 1-based offset.** The first line is `1`, not `0`;
+  `limit` remains optional, and there is no implicit whole-file read.
+- **Search returns a block, not only a hit.** `grep` accepts up to 2,000 context
+  rows per side, sizes the default row budget to the first window, and reserves
+  a row for the match so before-context cannot hide it. `glob` and `list_dir`
+  report counts and continuation hints.
+- **Mutations return local context.** `write_file`, `edit_file`, `apply_patch`
+  and `sed` report an outcome word and a bounded changed-line diff (20 lines)
+  with `diff_status`; a successful edit with a cut diff is never mislabeled as
+  a partial edit. `sed` adds `mode` and `content_status` for dry runs.
+- **The Windows file path is real now.** Overwrites use `MoveFileExW` with
+  `MOVEFILE_REPLACE_EXISTING` (std `rename` fails on an existing Windows
+  target); drive and UNC prefixes survive normalization; drive-relative and
+  rooted-without-drive paths are refused; write locks fold case. CRLF is kept
+  and an edit miss that used bare LF in a CRLF file says so.
+- **Context and task reliability.** Typed request context with versioned
+  fingerprints, checkpoint and archive digests, structured critical facts,
+  retry as an authorized deduplicated compensating protocol, runtime task
+  verification, session restore, and a long-horizon/restart/crash corpus
+  (#416-#433).
+- **codintelli resource limits.** Query and native parse paths now enforce the
+  shared scan budget and cancellation contract (#398-#403).
+
 ## v4.1.14 (2026-11-16)
 
 - **MCP stdio servers start from the program you installed.** A server
