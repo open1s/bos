@@ -374,8 +374,11 @@ There are no `truncated`/`unchanged`/`changed` booleans. Completeness is a word
 (`status`), continuation is an argument object (`next`), and a change is an
 outcome word (`created`, `updated`, `patched`, `unchanged`, `changed`).
 
-`read_file` returns raw `content` plus `start_line`, `end_line` and
-`total_lines` for a file inside the read ceiling; a window in a larger file
+`read_file` requires `offset`, and every line number is 1-based: the first
+line is offset 1, `start_line`/`end_line`/`total_lines` use the same base, and
+`next.offset` is `end_line + 1`. Offset 0 is refused rather than silently
+meaning the first line. It returns raw `content` plus `start_line`, `end_line`
+and `total_lines` for a file inside the read ceiling; a window in a larger file
 reports `total_lines: null` rather than scanning the rest. An empty file and
 an offset past EOF are distinguished by `status` and `hint`, because empty
 `content` alone reads as "the file is empty". A batch cut in the middle of a

@@ -32,7 +32,7 @@ pub(crate) const GREP: &str =
 /// Use the batch variant when several known files need inspection, avoiding
 /// repeated tool-call envelopes while retaining a bounded aggregate result.
 pub(crate) const READ_FILE: &str =
-    "Use the read_file tool — not shell commands like cat — to inspect one text file. Use offset and limit to continue reading large files.";
+    "Use the read_file tool — not shell commands like cat — to inspect one text file. offset is required and 1-based (the first line is 1, not 0); use limit to page through a large file.";
 
 pub(crate) const READ_FILES: &str =
     "When you need to inspect several known files, use read_files once instead of making repeated read_file calls. It accepts up to 10 distinct paths, applies offset and limit to each file, and caps combined returned content at 1 MiB; inspect each file's truncated or error field.";

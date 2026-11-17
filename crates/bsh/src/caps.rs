@@ -4978,20 +4978,25 @@ pub(crate) fn read_file_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "read_file",
-        "Read a UTF-8 text file. Paths are absolute or workspace-relative; .bsh/.ignore exclusions are refused. Returns start_line, end_line, total_lines when known, and next={offset} while more lines remain.",
+        "Read a UTF-8 text file from a required 1-based offset line. Paths are absolute or workspace-relative; .bsh/.ignore exclusions are refused. Returns start_line, end_line, total_lines when known, and next={offset} while more lines remain.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path of the UTF-8 text file to read, relative to the workspace or absolute inside the allowed workspace." },
-                "offset": { "type": "integer", "minimum": 1, "description": "1-based starting line. Omit to start at the beginning." },
+                "offset": { "type": "integer", "minimum": 1, "description": "Required 1-based starting line: the first line is 1, not 0. Line numbers and next offsets use the same base." },
                 "limit": { "type": "integer", "minimum": 1, "description": "Max lines from offset; next continues." }
             },
-            "required": ["path"],
+            "required": ["path", "offset"],
             "additionalProperties": false
         }),
         move |args| {
             let raw = arg_str(args, "path")?;
-            let offset = arg_positive(args, "offset")?;
+            let offset = arg_positive(args, "offset")?.ok_or_else(|| {
+                ToolError::InvalidInput(
+                    "offset is required: pass the 1-based starting line (use 1 to start at the beginning)"
+                        .to_string(),
+                )
+            })?;
             let limit = arg_positive(args, "limit")?;
             let target =
                 resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
@@ -5004,12 +5009,7 @@ pub(crate) fn read_file_tool(
                 Action::Read,
                 &target,
             )?;
-            let read = match (offset, limit) {
-                (None, None) => read_whole(&target)?,
-                (offset, limit) => {
-                    read_window(&target, offset.unwrap_or(1), limit.unwrap_or(usize::MAX))?
-                }
-            };
+            let read = read_window(&target, offset, limit.unwrap_or(usize::MAX))?;
             let ReadOutcome {
                 content,
                 truncated,
@@ -7876,7 +7876,7 @@ mod tests {
         // differs (the shim reports the provider's classification), which is
         // why the equivalence is a class.
         if raw.get("read_file").is_some() {
-            let missing = serde_json::json!({ "path": "/definitely/not/here" });
+            let missing = serde_json::json!({ "offset": 1, "path": "/definitely/not/here" });
             let left = raw.execute("read_file", &missing).unwrap_err();
             let right = shims.execute("read_file", &missing).unwrap_err();
             assert!(matches!(left, ToolError::Failed(_)), "{left:?}");
@@ -10815,7 +10815,7 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
         let inside = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("inside.txt").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("inside.txt").to_string_lossy() }),
             )
             .expect("an in-workspace read is allowed");
         assert_eq!(inside["content"], "inside-content");
@@ -10823,7 +10823,7 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
         let error = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": outside.to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": outside.to_string_lossy() }),
             )
             .expect_err("a read outside the workspace is refused");
         let message = error.to_string();
@@ -10861,13 +10861,13 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("notes.txt").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("notes.txt").to_string_lossy() }),
             )
             .expect("an ordinary read passes both policies");
         let error = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("secret.txt").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("secret.txt").to_string_lossy() }),
             )
             .expect_err("the workspace rule narrows the baseline");
         assert!(error.to_string().contains("no-secret-reads"), "{error}");
@@ -11076,7 +11076,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let inside = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("alias.txt").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("alias.txt").to_string_lossy() }),
             )
             .expect("an in-workspace link is readable");
         assert_eq!(inside["content"], "inside-content");
@@ -11091,7 +11091,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let error = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("notes.txt").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("notes.txt").to_string_lossy() }),
             )
             .expect_err("a link out of the workspace is refused");
         let message = error.to_string();
@@ -11138,7 +11138,10 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
         let out = registry
-            .execute("read_file", &serde_json::json!({ "path": "Cargo.toml" }))
+            .execute(
+                "read_file",
+                &serde_json::json!({ "offset": 1, "path": "Cargo.toml" }),
+            )
             .expect("a relative in-workspace path reads");
         assert_eq!(out["content"], "[package]");
     }
@@ -11159,7 +11162,10 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let built = build(&settings);
         let registry = built.agent.registry().expect("registry");
         let out = registry
-            .execute("read_file", &serde_json::json!({ "path": "Cargo.toml" }))
+            .execute(
+                "read_file",
+                &serde_json::json!({ "offset": 1, "path": "Cargo.toml" }),
+            )
             .expect("a relative in-workspace path reads at full access");
         assert_eq!(out["content"], "[package]");
 
@@ -11168,7 +11174,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let error = registry
             .execute(
                 "read_file",
-                &serde_json::json!({
+                &serde_json::json!({ "offset": 1,
                     "path": outside.join("secret.txt").to_string_lossy()
                 }),
             )
@@ -11179,36 +11185,20 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         );
     }
 
-    /// A file past the ceiling is refused with the arguments that read a
-    /// window; a window returns exactly its lines and says more remain.
+    /// A window returns exactly its lines and says more remain.
     #[test]
-    fn a_large_read_is_refused_and_a_window_is_exact() {
+    fn a_window_is_exact_and_reports_continuation() {
         let root = scratch("read-window");
-        let huge = root.join("huge.txt");
-        // Sparse, so the test does not write 9MiB: the ceiling is decided from
-        // the metadata before a byte is read.
-        let file = std::fs::File::create(&huge).expect("huge");
-        file.set_len(9 * 1024 * 1024).expect("len");
         let lines = root.join("lines.txt");
         let body: String = (1..=100).map(|number| format!("line {number}\n")).collect();
         std::fs::write(&lines, &body).expect("lines");
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
 
-        let error = registry
-            .execute(
-                "read_file",
-                &serde_json::json!({ "path": huge.to_string_lossy() }),
-            )
-            .expect_err("a 9MiB file is past the ceiling");
-        let message = error.to_string();
-        assert!(message.contains("read ceiling"), "{message}");
-        assert!(message.contains("offset"), "{message}");
-
         let whole = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": lines.to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": lines.to_string_lossy() }),
             )
             .expect("a small file reads whole");
         assert_eq!(whole["content"], body);
@@ -11278,13 +11268,57 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let empty = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": empty.to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": empty.to_string_lossy() }),
             )
             .expect("an empty file reads");
         assert_eq!(empty["total_lines"], 0);
         assert_eq!(empty["end_line"], 0);
         assert_eq!(empty["status"], "empty");
         assert_eq!(empty["hint"], "the file is empty");
+    }
+
+    /// The offset is part of the interface, not a default: a call without it is
+    /// refused before the file is opened, so the model always states where the
+    /// read starts.
+    #[test]
+    fn read_file_requires_an_offset() {
+        let root = scratch("read-offset-required");
+        std::fs::write(root.join("a.txt"), "needle").expect("a");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let error = registry
+            .execute("read_file", &serde_json::json!({ "path": "a.txt" }))
+            .expect_err("offset is required");
+        assert!(error.to_string().contains("offset"), "{error}");
+    }
+
+    /// Line numbers are 1-based everywhere: the first line is offset 1, the
+    /// next continuation is end_line + 1, and offset 0 is refused rather than
+    /// silently meaning the first line.
+    #[test]
+    fn read_file_offsets_are_one_based() {
+        let root = scratch("read-offset-base");
+        std::fs::write(root.join("a.txt"), "first\nsecond\n").expect("a");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let first = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": "a.txt", "offset": 1, "limit": 1 }),
+            )
+            .expect("offset 1 reads the first line");
+        assert_eq!(first["content"], "first\n");
+        assert_eq!(first["start_line"], 1);
+        assert_eq!(first["next"]["offset"], 2);
+
+        let zero = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": "a.txt", "offset": 0 }),
+            )
+            .expect_err("offset 0 is not the first line");
+        assert!(zero.to_string().contains("offset"), "{zero}");
     }
 
     #[test]
@@ -11383,7 +11417,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let binary = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("blob.bin").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("blob.bin").to_string_lossy() }),
             )
             .expect_err("a binary file is refused");
         let message = binary.to_string();
@@ -11414,7 +11448,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let directory = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.to_string_lossy() }),
             )
             .expect_err("a directory is refused");
         assert!(
@@ -11940,7 +11974,10 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let registry = built.agent.registry().expect("registry");
 
         registry
-            .execute("read_file", &serde_json::json!({ "path": "keep.txt" }))
+            .execute(
+                "read_file",
+                &serde_json::json!({ "offset": 1, "path": "keep.txt" }),
+            )
             .expect("the first call succeeds");
         let file = root.join(".bsh").join(".ignore");
         let text = std::fs::read_to_string(&file).expect("the ignore file was created");
@@ -11976,7 +12013,10 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     #[test]
     fn every_file_tool_creates_the_ignore_file_when_missing() {
         let cases: [(&str, serde_json::Value); 9] = [
-            ("read_file", serde_json::json!({ "path": "a.txt" })),
+            (
+                "read_file",
+                serde_json::json!({ "offset": 1, "path": "a.txt" }),
+            ),
             ("read_files", serde_json::json!({ "paths": ["a.txt"] })),
             (
                 "write_file",
@@ -12041,14 +12081,17 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let registry = built.agent.registry().expect("registry");
 
         let read = registry
-            .execute("read_file", &serde_json::json!({ "path": "keep.txt" }))
+            .execute(
+                "read_file",
+                &serde_json::json!({ "offset": 1, "path": "keep.txt" }),
+            )
             .expect("an allowed file still reads");
         assert_eq!(read["content"], "needle keep");
 
         let refused = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": "secret/key.txt" }),
+                &serde_json::json!({ "offset": 1, "path": "secret/key.txt" }),
             )
             .expect_err("an excluded file is refused");
         let message = refused.to_string();
@@ -12096,7 +12139,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let reserved = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": ".bsh/settings/settings.toml" }),
+                &serde_json::json!({ "offset": 1, "path": ".bsh/settings/settings.toml" }),
             )
             .expect_err("the harness directory is always excluded");
         assert!(
@@ -12685,7 +12728,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("notes.txt").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("notes.txt").to_string_lossy() }),
             )
             .expect("an in-workspace read survives a broken policy");
         let error = registry
@@ -13738,14 +13781,14 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let error = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("secret.txt").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("secret.txt").to_string_lossy() }),
             )
             .expect_err("the trusted preset's policy narrows the read");
         assert!(error.to_string().contains("no-secret-reads"), "{error}");
         registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("notes.txt").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("notes.txt").to_string_lossy() }),
             )
             .expect("an ordinary read still passes");
 
@@ -13757,7 +13800,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .expect("registry")
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("secret.txt").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("secret.txt").to_string_lossy() }),
             )
             .expect("an untrusted preset's policy is ignored");
     }
@@ -15668,13 +15711,13 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
         registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("src").join("lib.rs").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("src").join("lib.rs").to_string_lossy() }),
             )
             .expect("a read inside the glob is allowed");
         let error = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": root.join("README.md").to_string_lossy() }),
+                &serde_json::json!({ "offset": 1, "path": root.join("README.md").to_string_lossy() }),
             )
             .expect_err("a read outside the glob is refused");
         assert!(error.to_string().contains("preset-read-scope"), "{error}");
@@ -15934,7 +15977,7 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
             registry
                 .execute(
                     "read_file",
-                    &serde_json::json!({ "path": big.to_string_lossy() }),
+                    &serde_json::json!({ "offset": 1, "path": big.to_string_lossy() }),
                 )
                 .expect("read");
         });
@@ -16025,7 +16068,10 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
         let cases: Vec<(&str, serde_json::Value)> = vec![
             ("glob", serde_json::json!({ "pattern": "*.txt" })),
             ("grep", serde_json::json!({ "pattern": "needle" })),
-            ("read_file", serde_json::json!({ "path": "a.txt" })),
+            (
+                "read_file",
+                serde_json::json!({ "offset": 1, "path": "a.txt" }),
+            ),
             (
                 "read_files",
                 serde_json::json!({ "paths": ["a.txt", "b.txt"] }),
