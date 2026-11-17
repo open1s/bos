@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v4.1.17 (2026-11-17)
 
 - **Extension instructions activate per task (#436).** Prompt and context
   contributions are no longer appended to the standing system prompt at
