@@ -557,11 +557,15 @@ impl ferris_sdk::LeaseHost for BshLeaseHost<'_> {
         self.agent.remove_live_async_tools(tools)
     }
 
-    fn remove_prompts(&mut self, _owner: &str, sections: &[String]) -> usize {
-        sections
+    fn remove_prompts(&mut self, owner: &str, sections: &[String]) -> usize {
+        // Extension prompts are task-scoped records now (issue #436), not live
+        // system-prompt sections; clear the owner's records and any legacy
+        // section the SDK still names.
+        let legacy = sections
             .iter()
             .filter(|section| self.agent.remove_live_prompt_section(section))
-            .count()
+            .count();
+        legacy + self.agent.clear_conditional_prompts(owner)
     }
 
     fn remove_skills(&mut self, _owner: &str, paths: &[std::path::PathBuf]) -> usize {
@@ -2593,6 +2597,7 @@ impl ExtensionHost {
             let contributed = contribution::Contributed {
                 extension: entry.package.id().clone(),
                 name: entry.package.manifest.extension.name.clone(),
+                version: entry.package.version().to_string(),
                 runtime: Arc::clone(runtime),
                 trust: entry.package.trust,
                 tools: tools.clone(),
@@ -2682,6 +2687,7 @@ impl ExtensionHost {
             let contributed = contribution::Contributed {
                 extension: entry.package.id().clone(),
                 name: entry.package.manifest.extension.name.clone(),
+                version: entry.package.version().to_string(),
                 runtime: Arc::clone(runtime),
                 trust: entry.package.trust,
                 tools: tools.clone(),

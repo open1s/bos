@@ -23,6 +23,7 @@
 // module; code outside it still has to be wired to be accepted.
 #![allow(dead_code)]
 
+pub(crate) mod activation;
 mod agent;
 pub(crate) mod agent_surface;
 use std::sync::Arc;

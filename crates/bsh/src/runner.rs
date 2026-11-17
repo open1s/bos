@@ -392,6 +392,73 @@ impl Runner {
                 {
                     blocks.push(block);
                 }
+                // Extension instructions are task-scoped (issue #436): an
+                // installed package is not a request for its workflow guide.
+                // The same selection feeds the blocks, the manifest omissions
+                // and the report, so the request and diagnostics cannot
+                // disagree about what was included and why.
+                let task_text = input.as_text().unwrap_or_default();
+                let tool_names: Vec<String> = agent
+                    .model_tools()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect();
+                let extension_plan = crate::extension::activation::activate(
+                    &agent.conditional_prompts(),
+                    task_text,
+                    &tool_names,
+                    agent.action_intent(),
+                );
+                let mut extension_omissions = Vec::new();
+                for active in &extension_plan.active {
+                    for prompt in &active.prompts {
+                        let text = crate::extension::activation::render(active, prompt);
+                        blocks.push(crate::context_assembly::ContextBlock {
+                            source: crate::context_assembly::ContextSource::Extension,
+                            trust: crate::context_assembly::ContextSource::Extension.trust(),
+                            token_estimate: agent::agent::context::estimate_tokens(&text),
+                            provenance: Some(format!(
+                                "ext:{}@{}#{}#{}",
+                                active.owner, active.version, prompt.id, prompt.kind
+                            )),
+                            text: text.clone(),
+                        });
+                        injections.push(crate::model::ContextInjection {
+                            kind: "extension".to_string(),
+                            content: text,
+                            source: format!("{}@{}", active.owner, active.version),
+                        });
+                        log::debug!(
+                            target: "bsh::context",
+                            "extension context active: {}@{}#{} kind={} reason={} bytes={}",
+                            active.owner,
+                            active.version,
+                            prompt.id,
+                            prompt.kind,
+                            active.reason,
+                            prompt.text.len()
+                        );
+                    }
+                }
+                for omission in &extension_plan.omissions {
+                    extension_omissions.push(crate::context_assembly::ContextOmission {
+                        source: crate::context_assembly::ContextSource::Extension,
+                        provenance: format!(
+                            "ext:{}@{}#{}#{}",
+                            omission.owner, omission.version, omission.contribution, omission.kind
+                        ),
+                        reason: omission.reason.clone(),
+                        tokens: omission.bytes / 4,
+                    });
+                    log::debug!(
+                        target: "bsh::context",
+                        "extension context omitted: {}@{}#{} reason={}",
+                        omission.owner,
+                        omission.version,
+                        omission.contribution,
+                        omission.reason
+                    );
+                }
                 let instruction_sources = context
                     .instructions
                     .as_deref()
@@ -497,7 +564,8 @@ impl Runner {
                     content_key
                         .as_deref()
                         .map(|key| (key, content_key_id.as_deref())),
-                );
+                )
+                .with_omissions(extension_omissions);
                 // Inject from the immutable snapshot, after the checkpoint and
                 // before the first request. The same snapshot becomes the
                 // typed request the engine attaches to every provider call
@@ -521,6 +589,30 @@ impl Runner {
                 );
                 report.composition_fingerprint = snapshot.fingerprint().composition.clone();
                 report.content_fingerprint = snapshot.fingerprint().content.clone();
+                // Extension inclusion/omission, from the same selection that
+                // built the blocks and the manifest (issue #436).
+                for active in &extension_plan.active {
+                    report.estimated_tokens = report
+                        .estimated_tokens
+                        .saturating_add(active.bytes / 4);
+                    report.sources.push(crate::context_assembly::SourceStatus {
+                        source: crate::context_assembly::ContextSource::Extension,
+                        included: true,
+                        reason: Some(active.reason.clone()),
+                        tokens: active.bytes / 4,
+                    });
+                }
+                for omission in snapshot.omissions() {
+                    report.sources.push(crate::context_assembly::SourceStatus {
+                        source: crate::context_assembly::ContextSource::Extension,
+                        included: false,
+                        reason: Some(format!(
+                            "{}: {}",
+                            omission.provenance, omission.reason
+                        )),
+                        tokens: omission.tokens,
+                    });
+                }
                 log::info!(
                     target: "bsh::context",
                     "context assembly: persona_complete={} memory={} retrieval_hits={} est_tokens={} snapshot_tokens={} fingerprint={} snapshot_fingerprint={} content_fingerprint={} retrieval_skip={}",
@@ -1070,6 +1162,47 @@ mod tests {
         dir
     }
 
+    /// Records the typed provider request the engine actually sent.
+    struct RequestCapturingLlm(Arc<std::sync::Mutex<Vec<react::llm::ProviderRequest>>>);
+
+    #[async_trait::async_trait]
+    impl agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContext>
+        for RequestCapturingLlm
+    {
+        async fn complete(
+            &self,
+            _persona: Option<String>,
+            request: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> react::llm::LlmResponseResult {
+            if let Some(snapshot) = request.provider_request.clone() {
+                self.0.lock().unwrap().push(snapshot);
+            }
+            Ok(summary_response("ok"))
+        }
+
+        async fn stream_complete(
+            &self,
+            _persona: Option<String>,
+            request: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> Result<react::llm::TokenStream, react::llm::LlmError> {
+            if let Some(snapshot) = request.provider_request.clone() {
+                self.0.lock().unwrap().push(snapshot);
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(react::llm::StreamToken::Text("ok".to_string())),
+                Ok(react::llm::StreamToken::Done),
+            ])))
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "request-capturing-mock"
+        }
+    }
+
     /// Records the tool names the provider request actually carried.
     struct AdmissionCapturingLlm(Arc<std::sync::Mutex<Vec<Vec<String>>>>);
 
@@ -1367,6 +1500,153 @@ mod tests {
         assert!(
             !names.iter().any(|name| name == "federation_search"),
             "the specialist stays out of the initial array: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn devkit_prompt() -> agent::agent::ConditionalPrompt {
+        agent::agent::ConditionalPrompt {
+            owner: "com.example.devkit".to_string(),
+            owner_name: "Extension DevKit".to_string(),
+            version: "1.2.0".to_string(),
+            trust: "community".to_string(),
+            id: "guide".to_string(),
+            kind: "prompt".to_string(),
+            description: "Extension DevKit workflow".to_string(),
+            text: "DEVKIT-BODY: design, build, validate, publish.".to_string(),
+            scope: Vec::new(),
+            triggers: vec![
+                "design".to_string(),
+                "build".to_string(),
+                "validate".to_string(),
+                "publish".to_string(),
+                "devkit".to_string(),
+            ],
+            commands: vec!["devkit__scaffold".to_string()],
+            tool_namespace: "devkit".to_string(),
+            diagnostic: None,
+        }
+    }
+
+    fn request_capturing_agent(
+        seen: Arc<std::sync::Mutex<Vec<react::llm::ProviderRequest>>>,
+    ) -> Arc<agent::Agent> {
+        let mut provider = agent::agent::agentic::LlmProvider::new();
+        provider.register_vendor("mock".to_string(), Box::new(RequestCapturingLlm(seen)));
+        Arc::new(agent::Agent::new(
+            agent::AgentConfig {
+                model: "mock-model".to_string(),
+                ..Default::default()
+            },
+            Arc::new(provider),
+        ))
+    }
+
+    fn spawn_turn(
+        runner: &mut Runner,
+        id: &str,
+        agent: Arc<agent::Agent>,
+        text: &str,
+        root: &std::path::Path,
+    ) -> async_channel::Receiver<AgentEvent> {
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        runner.spawn(
+            id,
+            agent,
+            react::llm::Content::Text(text.to_string()),
+            Vec::new(),
+            facts,
+            None,
+            1_000,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
+            None,
+        )
+    }
+
+    /// A greeting does not carry an installed extension's workflow body: the
+    /// manifest names the omission and its reason (issue #436).
+    #[test]
+    fn a_greeting_does_not_inject_extension_instructions() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = request_capturing_agent(seen.clone());
+        agent.add_conditional_prompt(devkit_prompt());
+        let root = workspace("extension-chat");
+        let mut runner = Runner::new();
+        let receiver = spawn_turn(&mut runner, "extension-chat", agent, "hello 8888", &root);
+        drain(receiver);
+
+        let requests = seen.lock().unwrap();
+        let request = requests.last().expect("a recorded request");
+        let messages = format!("{:?}", request.messages);
+        assert!(
+            !messages.contains("DEVKIT-BODY"),
+            "the body is not a message: {messages}"
+        );
+        assert!(
+            !request
+                .wire_system_prompt()
+                .is_some_and(|prompt| prompt.contains("DEVKIT-BODY")),
+            "the body is not the system prompt"
+        );
+        assert!(
+            request
+                .manifest
+                .contains("com.example.devkit@1.2.0#guide#prompt"),
+            "the manifest names the omitted contribution: {}",
+            request.manifest
+        );
+        assert!(
+            request.manifest.contains("not relevant to this turn"),
+            "the manifest carries the omission reason: {}",
+            request.manifest
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Explicit extension work injects the body once, with the extension's id
+    /// and version in the manifest (issue #436).
+    #[test]
+    fn extension_work_injects_the_body_with_provenance() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = request_capturing_agent(seen.clone());
+        agent.add_conditional_prompt(devkit_prompt());
+        let root = workspace("extension-work");
+        let mut runner = Runner::new();
+        let receiver = spawn_turn(
+            &mut runner,
+            "extension-work",
+            agent,
+            "build a new extension package",
+            &root,
+        );
+        drain(receiver);
+
+        let requests = seen.lock().unwrap();
+        let request = requests.last().expect("a recorded request");
+        let messages = format!("{:?}", request.messages);
+        assert!(
+            messages.contains("DEVKIT-BODY"),
+            "the active body rides as a context row: {messages}"
+        );
+        assert!(
+            request
+                .manifest
+                .contains("com.example.devkit@1.2.0#guide#prompt"),
+            "the manifest names the included contribution: {}",
+            request.manifest
+        );
+        assert!(
+            request.manifest.contains("\"included\":true"),
+            "the included block is marked: {}",
+            request.manifest
         );
         let _ = std::fs::remove_dir_all(&root);
     }

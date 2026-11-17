@@ -303,8 +303,26 @@ Which surface a kind reaches is part of the contract, not an implementation deta
 | Surface | Kinds | Where it lands |
 |---|---|---|
 | Model-callable | tool | the build registry, as a namespaced live tool - withheld from the request's array until `find_tool` selects it |
-| Model-readable | prompt, context, skill | the system prompt, or the skill catalogue |
+| Model-readable | prompt, context, skill | a task-scoped request block, or the skill catalogue |
 | Reader-only | command, panel, theme, workflow | the host's plugin registry and inventory |
+
+Prompt and context contributions are not appended to the standing system prompt
+when a package is installed (issue #436). They are stored with their extension
+id, version, trust, contribution id and declared terms, and the request
+assembly picks them per turn:
+
+- an explicit extension command activates its owner's contributions;
+- a capability already admitted to the turn activates its owner's;
+- a task that names the extension, or whose content terms match the extension's
+  own name and declared descriptions, activates it;
+- otherwise the body is omitted and the manifest records source extension, the
+  ext:<id>@<version>#<contribution> provenance and the reason.
+
+An extension body is always untrusted data: it cannot grant a capability,
+weaken a permission or replace a host invariant. Per-extension and aggregate
+turn budgets bound activation; a denied, empty, truncated or over-budget body is
+reported with its reason instead of disappearing. A body injected on one turn
+is removed from the conversation when the next turn does not select it.
 
 A package's tools are DEFERRED: registered and callable, but not part of the
 request's tool array, because one install contributes a family and every schema

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Extension instructions activate per task (#436).** Prompt and context
+  contributions are no longer appended to the standing system prompt at
+  install. They are stored with extension id, version, trust, contribution id,
+  declared terms and any diagnostic, and the request assembler selects them per
+  turn from explicit extension commands, admitted extension capabilities, an
+  extension-named task, or lexical overlap with the extension's own declared
+  metadata - no domain vocabulary list. Omitted bodies are recorded in the
+  request manifest with provenance and reason; per-extension and aggregate turn
+  budgets omit with a reason; a body active on one turn is dropped when the next
+  turn does not select it. Extension text is always untrusted data and cannot
+  grant capabilities or weaken host policy.
 - **Reader intent is preserved, and harness corrections are no longer user
   messages (#434).** The engine's corrective notes (`ACTION_NOTE`,
   `ACTION_FAILED_NOTE`, the step guard, empty/truncated-reply notes and the

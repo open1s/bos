@@ -5694,6 +5694,7 @@ fn inject_kind_key(kind: &str) -> &'static str {
     match kind {
         "persona" => "inject.persona",
         "instructions" => "inject.instructions",
+        "extension" => "inject.extension",
         _ => "inject.context",
     }
 }

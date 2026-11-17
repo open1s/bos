@@ -7,7 +7,9 @@ pub mod hooks;
 pub mod plugin;
 pub mod prompts;
 
-pub use self::agentic::{Agent, AgentConfig, FallbackProvider, DEFAULT_SYSTEM_PROMPT};
+pub use self::agentic::{
+    Agent, AgentConfig, ConditionalPrompt, FallbackProvider, DEFAULT_SYSTEM_PROMPT,
+};
 pub use context::{
     AgentReActApp, AgentReactContext, AgentSession, CompactionFailure, CompactionOutcome,
     MessageContext, SteerMailbox, SteerMessage, CHECKPOINT_PREAMBLE, COMPACTION_INSTRUCTION,

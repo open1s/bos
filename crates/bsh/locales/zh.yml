@@ -821,6 +821,7 @@
 "inject.persona": "人格"
 "inject.context": "运行时上下文"
 "inject.instructions": "工作区指令"
+"inject.extension": "扩展指令"
 "queue.settingsChanged": "本回合开始后预设或权限已更改；该消息会等待下一回合。"
 
 # 通用设置各行的文案。与参考实现同名的行沿用上文已有的

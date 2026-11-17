@@ -324,6 +324,48 @@ impl AgentConfig {
     }
 }
 
+/// One host-supplied prompt contribution that is active only when a turn
+/// makes it relevant (issue #436).
+///
+/// An installed extension is not a request for its workflow instructions. The
+/// host stores contributions here with their provenance and activation terms,
+/// and its request assembly injects only the ones the current task, an explicit
+/// command or an admitted capability selects. Extension text is always data,
+/// never host policy: it cannot grant a capability or weaken a permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalPrompt {
+    /// Owning extension id.
+    pub owner: String,
+    /// Display name of the owning extension.
+    pub owner_name: String,
+    /// Active package version, recorded in the request manifest.
+    pub version: String,
+    /// Trust level name (`builtin`, `verified`, `community`, `local`,
+    /// `unknown`).
+    pub trust: String,
+    /// Contribution id, unique inside the owner.
+    pub id: String,
+    /// `prompt` or `context`, for diagnostics.
+    pub kind: String,
+    /// One-line contribution description.
+    pub description: String,
+    /// The body. Empty when the contribution was denied or over an install
+    /// budget; `diagnostic` then carries the reason.
+    pub text: String,
+    /// Workspace-relative globs declared by the contribution.
+    pub scope: Vec<String>,
+    /// Lowercase task terms that make this contribution relevant.
+    pub triggers: Vec<String>,
+    /// Qualified commands owned by the extension; invoking one activates the
+    /// extension's contributions explicitly.
+    pub commands: Vec<String>,
+    /// Sanitized namespace prefix every extension tool name starts with, without
+    /// the trailing `__`.
+    pub tool_namespace: String,
+    /// Why the body is empty or shortened, when it is.
+    pub diagnostic: Option<String>,
+}
+
 /// Agent is the main abstraction for AI agents with LLM integration,
 /// tool registries, and skill management.
 #[qserde::Archive]
@@ -385,6 +427,10 @@ pub struct Agent {
     /// Extension prompt fragments that can change while the agent is shared.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     live_prompts: Arc<std::sync::RwLock<Vec<String>>>,
+    /// Extension prompt/context contributions, activated per turn by the host
+    /// (issue #436). They are not part of the standing system prompt.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    conditional_prompts: Arc<std::sync::RwLock<Vec<ConditionalPrompt>>>,
     /// Extension skills that can change while the agent is shared.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     live_skills: Arc<std::sync::RwLock<Vec<crate::skills::SkillContent>>>,
@@ -524,6 +570,7 @@ impl Agent {
             ))),
             live_tools: Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
             live_prompts: Arc::new(std::sync::RwLock::new(Vec::new())),
+            conditional_prompts: Arc::new(std::sync::RwLock::new(Vec::new())),
             live_skills: Arc::new(std::sync::RwLock::new(Vec::new())),
             skill_catalogue: false,
             deferred_tools: Vec::new(),
@@ -1676,6 +1723,57 @@ impl Agent {
         removed
     }
 
+    /// Register one task-scoped extension prompt contribution.
+    ///
+    /// A repeated owner+id+kind replaces the earlier record, so an upgraded
+    /// package cannot leave a stale instruction body behind (issue #436).
+    pub fn add_conditional_prompt(&self, prompt: ConditionalPrompt) {
+        let mut prompts = self
+            .conditional_prompts
+            .write()
+            .expect("conditional prompt registry");
+        if let Some(existing) = prompts.iter_mut().find(|existing| {
+            existing.owner == prompt.owner
+                && existing.id == prompt.id
+                && existing.kind == prompt.kind
+        }) {
+            *existing = prompt;
+        } else {
+            prompts.push(prompt);
+        }
+    }
+
+    /// Remove one owner's contributions by id; returns how many left.
+    pub fn remove_conditional_prompts(&self, owner: &str, ids: &[String]) -> usize {
+        let mut prompts = self
+            .conditional_prompts
+            .write()
+            .expect("conditional prompt registry");
+        let before = prompts.len();
+        prompts.retain(|prompt| prompt.owner != owner || !ids.iter().any(|id| id == &prompt.id));
+        before - prompts.len()
+    }
+
+    /// Remove every contribution owned by an extension; returns how many left.
+    pub fn clear_conditional_prompts(&self, owner: &str) -> usize {
+        let mut prompts = self
+            .conditional_prompts
+            .write()
+            .expect("conditional prompt registry");
+        let before = prompts.len();
+        prompts.retain(|prompt| prompt.owner != owner);
+        before - prompts.len()
+    }
+
+    /// Snapshot the task-scoped contributions. The host selects from this list
+    /// at request assembly; the agent never injects them on its own.
+    pub fn conditional_prompts(&self) -> Vec<ConditionalPrompt> {
+        self.conditional_prompts
+            .read()
+            .map(|prompts| prompts.clone())
+            .unwrap_or_default()
+    }
+
     /// Register one live extension skill.
     pub fn add_live_skill(&self, skill: crate::skills::SkillContent) {
         self.live_skills
@@ -2471,6 +2569,7 @@ impl Clone for Agent {
             skill_runtime: Arc::clone(&self.skill_runtime),
             live_tools: Arc::clone(&self.live_tools),
             live_prompts: Arc::clone(&self.live_prompts),
+            conditional_prompts: Arc::clone(&self.conditional_prompts),
             live_skills: Arc::clone(&self.live_skills),
             skill_catalogue: self.skill_catalogue,
             deferred_tools: self.deferred_tools.clone(),

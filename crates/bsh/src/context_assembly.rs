@@ -27,6 +27,9 @@ pub(crate) enum ContextSource {
     RetrievedMemory,
     /// Capability / per-tool guidance.
     ToolGuidance,
+    /// An extension-provided prompt or workspace context, active only for a
+    /// relevant turn (issue #436). Always data, never host policy.
+    Extension,
     /// The reader's own conversation input.
     UserInput,
 }
@@ -57,6 +60,7 @@ impl ContextSource {
             ContextSource::HostRuntime
             | ContextSource::TimeContext
             | ContextSource::ToolGuidance => Trust::HostAuthority,
+            ContextSource::Extension => Trust::UntrustedData,
         }
     }
 
@@ -68,6 +72,7 @@ impl ContextSource {
             "context" => Some(ContextSource::HostRuntime),
             "time" => Some(ContextSource::TimeContext),
             "instructions" => Some(ContextSource::WorkspaceInstructions),
+            "extension" => Some(ContextSource::Extension),
             _ => None,
         }
     }
@@ -81,6 +86,7 @@ impl ContextSource {
             ContextSource::WorkspaceInstructions => "workspace-instructions",
             ContextSource::RetrievedMemory => "retrieved-memory",
             ContextSource::ToolGuidance => "tool-guidance",
+            ContextSource::Extension => "extension",
             ContextSource::UserInput => "user-input",
         }
     }
@@ -485,6 +491,23 @@ pub(crate) struct AssemblySnapshot {
     blocks: Vec<ContextBlock>,
     fingerprint: ContextFingerprint,
     versions: SourceVersions,
+    /// Contributions the assembly deliberately left out, with source,
+    /// provenance and reason. They never reach the provider, but the request
+    /// manifest must be able to explain the omission (issue #436).
+    omissions: Vec<ContextOmission>,
+}
+
+/// One source the assembly left out of the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextOmission {
+    /// The source kind.
+    pub(crate) source: ContextSource,
+    /// Source identity, for example `ext:com.example.devkit@1.2.0#guide`.
+    pub(crate) provenance: String,
+    /// Why it was omitted.
+    pub(crate) reason: String,
+    /// Estimated tokens it would have cost.
+    pub(crate) tokens: usize,
 }
 
 impl AssemblySnapshot {
@@ -500,7 +523,19 @@ impl AssemblySnapshot {
             blocks,
             fingerprint,
             versions,
+            omissions: Vec::new(),
         }
+    }
+
+    /// Record the contributions this assembly left out, with their reasons.
+    pub(crate) fn with_omissions(mut self, omissions: Vec<ContextOmission>) -> Self {
+        self.omissions = omissions;
+        self
+    }
+
+    /// The omitted contributions.
+    pub(crate) fn omissions(&self) -> &[ContextOmission] {
+        &self.omissions
     }
 
     /// The blocks, in composition order.
@@ -585,7 +620,20 @@ impl AssemblySnapshot {
                 })
             })
             .collect();
-        serde_json::json!({"version": 1, "blocks": blocks}).to_string()
+        let omitted: Vec<serde_json::Value> = self
+            .omissions
+            .iter()
+            .map(|omission| {
+                serde_json::json!({
+                    "source": omission.source.label(),
+                    "provenance": omission.provenance,
+                    "reason": omission.reason,
+                    "tokens": omission.tokens,
+                    "included": false,
+                })
+            })
+            .collect();
+        serde_json::json!({"version": 1, "blocks": blocks, "omitted": omitted}).to_string()
     }
 
     /// The blocks that ride as request messages rather than in the system
@@ -601,6 +649,7 @@ impl AssemblySnapshot {
                 ContextSource::HostRuntime
                     | ContextSource::TimeContext
                     | ContextSource::WorkspaceInstructions
+                    | ContextSource::Extension
             )
         })
     }
@@ -764,6 +813,11 @@ mod tests {
         assert_eq!(ContextSource::RetrievedMemory.trust(), Trust::UntrustedData);
         assert_eq!(ContextSource::UserInput.trust(), Trust::UntrustedData);
         assert_eq!(ContextSource::Persona.trust(), Trust::UntrustedData);
+        assert_eq!(
+            ContextSource::Extension.trust(),
+            Trust::UntrustedData,
+            "extension instructions are data, never host authority"
+        );
         assert_eq!(ContextSource::HostRuntime.trust(), Trust::HostAuthority);
         assert_eq!(ContextSource::TimeContext.trust(), Trust::HostAuthority);
         assert_eq!(ContextSource::ToolGuidance.trust(), Trust::HostAuthority);
@@ -1247,8 +1301,22 @@ mod tests {
                 ..SourceVersions::default()
             },
             None,
-        );
+        )
+        .with_omissions(vec![ContextOmission {
+            source: ContextSource::Extension,
+            provenance: "ext:com.example.devkit@1.2.0#guide#prompt".to_string(),
+            reason: "not relevant to this turn".to_string(),
+            tokens: 4,
+        }]);
         let manifest = snapshot.provider_manifest();
+        assert!(
+            manifest.contains("\"omitted\""),
+            "the manifest carries omitted contributions: {manifest}"
+        );
+        assert!(
+            manifest.contains("ext:com.example.devkit@1.2.0#guide#prompt"),
+            "the omission names the extension provenance: {manifest}"
+        );
         for expected in [
             "\"source\":\"persona\"",
             "\"source\":\"host-runtime\"",

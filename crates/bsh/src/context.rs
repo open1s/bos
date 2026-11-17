@@ -292,26 +292,47 @@ pub(crate) fn inject_snapshot(agent: &Agent, snapshot: &crate::context_assembly:
         // The reader's own input is the only user row in a turn (issue #434).
         injected.push(react::llm::LlmMessage::system(text.clone()));
     }
-    if injected.is_empty() {
-        return;
-    }
+    // No early return: even when no NEW block landed, a stale extension row
+    // from the previous turn must still be dropped (issue #436).
     let current_instructions = blocks
         .iter()
         .find(|(source, _)| {
             *source == crate::context_assembly::ContextSource::WorkspaceInstructions
         })
         .map(|(_, text)| text.as_str());
+    // Extension instructions are active for THIS turn only. A row injected on
+    // an earlier turn is dropped unless the current selection re-injects it,
+    // so a greeting never inherits the last extension task's workflow (issue
+    // #436).
+    let active_extensions: std::collections::BTreeSet<&str> = blocks
+        .iter()
+        .filter(|(source, _)| *source == crate::context_assembly::ContextSource::Extension)
+        .map(|(_, text)| text.as_str())
+        .collect();
     let history = session.messages().iter().filter(|message| {
         let Some(want) = current_instructions else {
-            return true;
+            return match message {
+                react::llm::LlmMessage::User { content } => content
+                    .as_text()
+                    .map(|text| !is_extension_context_text(text))
+                    .unwrap_or(true),
+                react::llm::LlmMessage::System { content } => !is_extension_context_text(content),
+                _ => true,
+            };
         };
         match message {
             react::llm::LlmMessage::User { content } => content
                 .as_text()
-                .map(|text| !is_instructions_user_text(text) || text == want)
+                .map(|text| {
+                    (!is_instructions_user_text(text) && !is_extension_context_text(text))
+                        || text == want
+                        || active_extensions.contains(text)
+                })
                 .unwrap_or(true),
             react::llm::LlmMessage::System { content } => {
-                !is_instructions_user_text(content) || content == want
+                (!is_instructions_user_text(content) && !is_extension_context_text(content))
+                    || content == want
+                    || active_extensions.contains(content.as_str())
             }
             _ => true,
         }
@@ -330,6 +351,14 @@ fn message_text(message: &react::llm::LlmMessage) -> Option<&str> {
         react::llm::LlmMessage::System { content } => Some(content.as_str()),
         _ => None,
     }
+}
+
+/// Whether a row carries an extension-provided context block.
+///
+/// Such a row is active for exactly the turn that selected it; the next turn's
+/// injection drops it unless the selection includes it again (issue #436).
+pub(crate) fn is_extension_context_text(text: &str) -> bool {
+    text.contains("<!-- bsh-context source=\"extension\"")
 }
 
 /// Whether a user row is one of the harness's per-turn injections.
@@ -893,6 +922,51 @@ mod tests {
             session.messages()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Extension instructions are active for one turn only: the next turn's
+    /// injection drops the previous body unless it selects it again (issue
+    /// #436).
+    #[test]
+    fn a_stale_extension_block_is_removed_on_the_next_turn() {
+        use crate::context_assembly::{
+            AssemblySnapshot, ContextBlock, ContextSource, SourceVersions,
+        };
+        let provider = std::sync::Arc::new(agent::agent::agentic::LlmProvider::new());
+        let agent = Agent::new(agent::AgentConfig::default(), provider);
+
+        let extension = ContextBlock {
+            source: ContextSource::Extension,
+            trust: ContextSource::Extension.trust(),
+            text: "DEVKIT-BODY".to_string(),
+            token_estimate: 3,
+            provenance: Some("ext:com.example.devkit@1.2.0#guide#prompt".to_string()),
+        };
+        let first = AssemblySnapshot::build(vec![extension], SourceVersions::default(), None);
+        crate::context::inject_snapshot(&agent, &first);
+        assert!(
+            agent.session().messages().iter().any(|message| {
+                message_text(message).is_some_and(|text| text.contains("DEVKIT-BODY"))
+            }),
+            "the active body was injected"
+        );
+
+        let host = ContextBlock {
+            source: ContextSource::HostRuntime,
+            trust: ContextSource::HostRuntime.trust(),
+            text: "runtime context".to_string(),
+            token_estimate: 2,
+            provenance: Some("runtime-context".to_string()),
+        };
+        let second = AssemblySnapshot::build(vec![host], SourceVersions::default(), None);
+        crate::context::inject_snapshot(&agent, &second);
+        assert!(
+            agent.session().messages().iter().all(|message| {
+                !message_text(message).is_some_and(|text| text.contains("DEVKIT-BODY"))
+            }),
+            "the previous turn's extension body does not survive: {:?}",
+            agent.session().messages()
+        );
     }
 
     /// Injected context is harness policy, so it rides as system rows; the

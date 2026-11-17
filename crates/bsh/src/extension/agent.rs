@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use crate::plugins::PluginInfo;
 
+use agent::agent::ConditionalPrompt;
 use ferris_sdk::capability::{CallScope, Capability, PolicyEngine};
 use ferris_sdk::composable::Fiber;
 use ferris_sdk::events::{topics, EventBus, ExtensionEvent};
@@ -40,6 +41,8 @@ pub(crate) struct Contributed {
     pub(crate) extension: ExtensionId,
     /// Display name.
     pub(crate) name: String,
+    /// Active package version, recorded in the prompt manifest (issue #436).
+    pub(crate) version: String,
     /// Runtime that executes the tools.
     pub(crate) runtime: Arc<dyn Runtime>,
     /// Trust level used for policy.
@@ -84,7 +87,10 @@ pub(crate) struct ContributionLease {
     owner: String,
     tools: Vec<String>,
     tool_handles: Vec<Arc<dyn react::tool::registry::AsyncTool>>,
-    prompt_sections: Vec<String>,
+    /// The task-scoped prompt records this activation installed. A revoke or
+    /// suspend removes them from the agent; a resume puts the same records
+    /// back (issue #436).
+    prompts: Vec<ConditionalPrompt>,
     skill_paths: Vec<PathBuf>,
     /// The skill content this activation installed, kept for a resume.
     ///
@@ -119,11 +125,12 @@ impl ContributionLease {
             calls.wait_empty(Duration::from_secs(2)).await
         });
         let tools = agent.remove_live_async_tools(&self.tools);
-        let prompts = self
-            .prompt_sections
+        let ids: Vec<String> = self
+            .prompts
             .iter()
-            .filter(|section| agent.remove_live_prompt_section(section))
-            .count();
+            .map(|prompt| prompt.id.clone())
+            .collect();
+        let prompts = agent.remove_conditional_prompts(&self.owner, &ids);
         let skills = agent.remove_live_skills_by_paths(&self.skill_paths);
         let items = registry.remove_owner(&self.owner);
         (tools + prompts + skills + items, drained)
@@ -140,11 +147,12 @@ impl ContributionLease {
             calls.wait_empty(Duration::from_secs(2)).await
         });
         let tools = agent.remove_live_async_tools(&self.tools);
-        let prompts = self
-            .prompt_sections
+        let ids: Vec<String> = self
+            .prompts
             .iter()
-            .filter(|section| agent.remove_live_prompt_section(section))
-            .count();
+            .map(|prompt| prompt.id.clone())
+            .collect();
+        let prompts = agent.remove_conditional_prompts(&self.owner, &ids);
         let skills = agent.remove_live_skills_by_paths(&self.skill_paths);
         tools + prompts + skills
     }
@@ -163,8 +171,8 @@ impl ContributionLease {
                 restored += 1;
             }
         }
-        for section in &self.prompt_sections {
-            agent.add_live_prompt_section(section.clone());
+        for prompt in &self.prompts {
+            agent.add_conditional_prompt(prompt.clone());
             restored += 1;
         }
         for skill in &self.skills {
@@ -204,7 +212,7 @@ impl ferris_sdk::ContributionLease for ContributionLease {
         self.active.store(false, Ordering::SeqCst);
         self.calls.close();
         host.remove_tools(&self.owner, &self.tools);
-        host.remove_prompts(&self.owner, &self.prompt_sections);
+        host.remove_prompts(&self.owner, &[]);
         host.remove_skills(&self.owner, &self.skill_paths);
         host.remove_registry_owner(&self.owner);
         // Cancellation is a signal; wait, bounded, for the calls to actually
@@ -1137,34 +1145,52 @@ pub(crate) fn install_with_lease(
         }
     }
     let mut prompt_budget = 0usize;
-    let mut prompt_sections = Vec::new();
+    let mut prompt_records = Vec::new();
+    let commands: Vec<String> = contributed
+        .commands
+        .iter()
+        .map(|command| contributed.extension.qualify(&command.id))
+        .collect();
+    let command_descriptions: Vec<String> = contributed
+        .commands
+        .iter()
+        .map(|command| command.description.clone())
+        .collect();
     for prompt in &contributed.prompts {
-        if let Some(section) = append_prompt(
-            agent,
+        if let Some(record) = append_prompt(
             &contributed.extension,
+            &contributed.name,
+            &contributed.version,
             contributed.trust,
             &policy,
             "Extension prompt",
             prompt,
+            &commands,
+            &command_descriptions,
             &mut prompt_budget,
         ) {
-            prompt_sections.push(section);
+            agent.add_conditional_prompt(record.clone());
+            prompt_records.push(record);
         }
     }
     for context in &contributed.contexts {
         if !context_matches(context, contributed.workspace.as_deref()) {
             continue;
         }
-        if let Some(section) = append_prompt(
-            agent,
+        if let Some(record) = append_prompt(
             &contributed.extension,
+            &contributed.name,
+            &contributed.version,
             contributed.trust,
             &policy,
             "Extension context",
             context,
+            &commands,
+            &command_descriptions,
             &mut prompt_budget,
         ) {
-            prompt_sections.push(section);
+            agent.add_conditional_prompt(record.clone());
+            prompt_records.push(record);
         }
     }
     let mut skill_paths = Vec::new();
@@ -1197,7 +1223,7 @@ pub(crate) fn install_with_lease(
         owner: contributed.extension.as_str().to_string(),
         tools: installed_tools.clone(),
         tool_handles: installed_handles,
-        prompt_sections,
+        prompts: prompt_records,
         skill_paths,
         skills,
         active,
@@ -1214,43 +1240,125 @@ pub(crate) fn install_with_lease(
     )
 }
 
+/// Build one task-scoped prompt contribution without appending it to the
+/// standing system prompt (issue #436).
+///
+/// The text is stored with its provenance and activation terms; the host's
+/// request assembly decides per turn whether it is relevant. A denied, empty,
+/// oversized or over-budget contribution is still recorded, with an explicit
+/// diagnostic, so the omission can be reported instead of disappearing.
+#[allow(clippy::too_many_arguments)]
 fn append_prompt(
-    agent: &mut agent::Agent,
     extension: &ExtensionId,
+    name: &str,
+    version: &str,
     trust: TrustLevel,
     policy: &PolicyEngine,
     heading: &str,
     contribution: &ferris_sdk::host_runtime::declarative::TextContribution,
+    commands: &[String],
+    command_descriptions: &[String],
     budget: &mut usize,
-) -> Option<String> {
+) -> Option<ConditionalPrompt> {
     let capability = if heading == "Extension prompt" {
         Capability::AgentPromptsProvide
     } else {
         Capability::AgentContextProvide
     };
-    if policy
+    let kind = if heading == "Extension prompt" {
+        "prompt"
+    } else {
+        "context"
+    };
+    let mut diagnostic = None;
+    let text = if policy
         .authorize_call(extension.as_str(), trust, capability, &CallScope::default())
         .is_err()
     {
-        return None;
+        diagnostic = Some(format!(
+            "capability {} denied by policy",
+            if kind == "prompt" {
+                "agent.prompts.provide"
+            } else {
+                "agent.context.provide"
+            }
+        ));
+        String::new()
+    } else {
+        let trimmed = contribution.text.trim();
+        if trimmed.is_empty() {
+            diagnostic = Some("empty contribution".to_string());
+            String::new()
+        } else {
+            let truncated = truncate(trimmed, MAX_PROMPT_SECTION);
+            if truncated.len() < trimmed.len() {
+                diagnostic = Some(format!(
+                    "truncated from {} to {} bytes",
+                    trimmed.len(),
+                    truncated.len()
+                ));
+            }
+            if *budget + truncated.len() > MAX_TOTAL_PROMPT {
+                diagnostic = Some(format!(
+                    "over the aggregate extension prompt budget ({MAX_TOTAL_PROMPT} bytes)"
+                ));
+                String::new()
+            } else {
+                *budget += truncated.len();
+                truncated.to_string()
+            }
+        }
+    };
+    Some(ConditionalPrompt {
+        owner: extension.as_str().to_string(),
+        owner_name: name.to_string(),
+        version: version.to_string(),
+        trust: trust.as_str().to_string(),
+        id: contribution.id.as_str().to_string(),
+        kind: kind.to_string(),
+        description: contribution.description.clone(),
+        text,
+        scope: contribution.scope.clone(),
+        triggers: contribution_triggers(
+            extension.as_str(),
+            name,
+            &contribution.description,
+            contribution.id.as_str(),
+            commands,
+            command_descriptions,
+        ),
+        commands: commands.to_vec(),
+        tool_namespace: extension.namespace().to_string(),
+        diagnostic,
+    })
+}
+
+/// Lowercase task terms that make an extension contribution relevant.
+pub(crate) fn contribution_triggers(
+    owner: &str,
+    name: &str,
+    description: &str,
+    id: &str,
+    commands: &[String],
+    command_descriptions: &[String],
+) -> Vec<String> {
+    // Raw declared terms only. Stopping, plural folding and relevance scoring
+    // live in one place - the activation selector - so no domain vocabulary is
+    // maintained here.
+    let mut terms = std::collections::BTreeSet::new();
+    for source in [owner, name, description, id]
+        .into_iter()
+        .chain(commands.iter().map(String::as_str))
+        .chain(command_descriptions.iter().map(String::as_str))
+    {
+        for token in source.split(|character: char| !character.is_ascii_alphanumeric()) {
+            let token = token.to_ascii_lowercase();
+            if token.chars().count() >= 3 {
+                terms.insert(token);
+            }
+        }
     }
-    let text = contribution.text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let section = format!(
-        "## {heading}: {} ({})
-{}",
-        contribution.description,
-        extension,
-        truncate(text, MAX_PROMPT_SECTION)
-    );
-    if *budget + section.len() > MAX_TOTAL_PROMPT {
-        return None;
-    }
-    *budget += section.len();
-    agent.add_live_prompt_section(&section);
-    Some(section)
+    terms.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -1500,6 +1608,7 @@ mod tests {
         Contributed {
             extension,
             name: "Tool".to_string(),
+            version: "0.0.0".to_string(),
             runtime: Arc::new(EchoRuntime),
             trust,
             tools: vec![ToolDescriptor {
@@ -1520,6 +1629,91 @@ mod tests {
             max_output_bytes: 1024 * 1024,
             max_concurrent_calls: 4,
         }
+    }
+
+    /// A prompt contribution is stored as task-scoped metadata, not appended
+    /// to the standing system prompt; the lease removes it on revoke and the
+    /// version travels with the record (issue #436).
+    #[tokio::test]
+    async fn prompts_are_task_scoped_and_revocable() {
+        use ferris_sdk::capability::GrantScope;
+        use ferris_sdk::host_runtime::declarative::{CommandContribution, TextContribution};
+
+        let scratch = Scratch::new("prompt-scope");
+        let mut contributed = contributed(vec![], TrustLevel::Builtin);
+        contributed.prompts = vec![TextContribution {
+            id: ferris_sdk::types::ContributionId::parse("guide").expect("id"),
+            description: "Extension DevKit".to_string(),
+            text: "Devkit workflow: design, build, validate, publish.".to_string(),
+            scope: Vec::new(),
+        }];
+        contributed.commands = vec![CommandContribution {
+            id: ferris_sdk::types::ContributionId::parse("scaffold").expect("id"),
+            description: "Scaffold a package".to_string(),
+            template: "Scaffold the package.".to_string(),
+        }];
+        let policy = policy(&scratch);
+        policy
+            .grant(
+                "com.example.tool",
+                Capability::AgentPromptsProvide,
+                GrantScope::Any,
+                None,
+            )
+            .expect("grant");
+        let mut agent = agent::Agent::new(
+            agent::AgentConfig::default(),
+            Arc::new(agent::agent::agentic::LlmProvider::new()),
+        );
+        let mut registry = agent::plugins::PluginRegistry::new();
+        let (_, lease) = install_with_lease(
+            &mut agent,
+            &mut registry,
+            &contributed,
+            Arc::clone(&policy),
+            EventBus::new(),
+            None,
+        );
+
+        assert!(
+            !agent
+                .config()
+                .system_prompt
+                .contains("Devkit workflow: design"),
+            "the body is not part of the standing prompt"
+        );
+        let records = agent.conditional_prompts();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].version, "0.0.0");
+        assert_eq!(records[0].kind, "prompt");
+        assert!(records[0].triggers.iter().any(|term| term == "devkit"));
+        assert!(records[0]
+            .commands
+            .iter()
+            .any(|command| command == "tool__scaffold"));
+
+        // An upgraded install replaces the old record instead of stacking it.
+        let mut upgraded = contributed.clone();
+        upgraded.version = "2.0.0".to_string();
+        upgraded.prompts[0].text = "Devkit 2 workflow.".to_string();
+        let (_, lease2) = install_with_lease(
+            &mut agent,
+            &mut registry,
+            &upgraded,
+            Arc::clone(&policy),
+            EventBus::new(),
+            None,
+        );
+        let records = agent.conditional_prompts();
+        assert_eq!(records.len(), 1, "same owner/id/kind replaces");
+        assert_eq!(records[0].version, "2.0.0");
+
+        lease.revoke(&mut agent, &mut registry);
+        lease2.revoke(&mut agent, &mut registry);
+        assert!(
+            agent.conditional_prompts().is_empty(),
+            "revoke removes the stored contribution"
+        );
     }
 
     #[tokio::test]
@@ -1932,7 +2126,7 @@ mod tests {
             owner: "com.example.tool".to_string(),
             tools: vec![tool.name().to_string()],
             tool_handles: vec![tool.clone() as Arc<dyn react::tool::registry::AsyncTool>],
-            prompt_sections: Vec::new(),
+            prompts: Vec::new(),
             skill_paths: Vec::new(),
             skills: Vec::new(),
             active: Arc::clone(&tool.active),

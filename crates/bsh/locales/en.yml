@@ -826,6 +826,7 @@
 "inject.persona": "persona"
 "inject.context": "runtime context"
 "inject.instructions": "workspace instructions"
+"inject.extension": "extension instructions"
 "queue.settingsChanged": "The preset or permission changed after this turn started; the message waits for the next turn."
 
 # General-pane rows. `settings.language`, `settings.appearance`,
