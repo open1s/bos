@@ -854,6 +854,49 @@ pub struct ProviderRequestSource {
 /// It rides on LlmRequest but is never serialized to a provider: adapters
 /// flatten it into roles and text, and the recording seam can prove the request
 /// came from one snapshot.
+impl ProviderRequest {
+    /// A redacted audit view: identities, counts, roles and option values, but
+    /// no system prompt, message text or tool schema bodies. This is the shape
+    /// tracing/diagnostics may persist for an HTTP request audit (issue #427).
+    pub fn audit(&self) -> serde_json::Value {
+        serde_json::json!({
+            "model": self.model,
+            "provider": self.provider,
+            "provider_adapter": self.provider_adapter,
+            "composition": self.composition,
+            "content_identity_present": self.content.is_some(),
+            "execution": self.execution,
+            "content_key_id": self.content_key_id,
+            "system_prompt_chars": self.system_prompt.as_ref().map(|text| text.chars().count()),
+            "message_count": self.messages.len(),
+            "messages": self
+                .messages
+                .iter()
+                .map(|message| match message {
+                    LlmMessage::System { content } => ("system", content.chars().count()),
+                    LlmMessage::User { content } => {
+                        ("user", content.as_text().map(|text| text.chars().count()).unwrap_or(0))
+                    }
+                    LlmMessage::Assistant { content } => ("assistant", content.chars().count()),
+                    LlmMessage::AssistantToolCall { .. } => ("tool_call", 0),
+                    LlmMessage::ToolResult { content, .. } => ("tool_result", content.chars().count()),
+                })
+                .map(|(role, chars)| serde_json::json!({"role": role, "chars": chars}))
+                .collect::<Vec<_>>(),
+            "input_chars": self.input.as_text().map(|text| text.chars().count()).unwrap_or(0),
+            "tools": self.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "reasoning_effort": self.reasoning_effort.map(|effort| effort.as_str()),
+            "api_mode": self.api_mode,
+        })
+    }
+}
+
+/// The immutable semantic request for one provider call (issue #427).
+///
+/// Adapters serialize this value; they do not rebuild the request from the
+/// live session or context.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderRequest {
     /// Composition identity (SHA-256 hex, no block text).
@@ -870,6 +913,10 @@ pub struct ProviderRequest {
     pub sources: Vec<ProviderRequestSource>,
     /// The model this request asks for.
     pub model: String,
+    /// The provider/model identity reported by the host.
+    pub provider: Option<String>,
+    /// The provider adapter implementation/version.
+    pub provider_adapter: Option<String>,
     /// The system prompt the provider will receive.
     pub system_prompt: Option<String>,
     /// The conversation history as it will be serialized.

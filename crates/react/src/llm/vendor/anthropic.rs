@@ -273,14 +273,25 @@ impl AnthropicVendor {
         };
 
         let mut system_parts: Vec<String> = Vec::new();
-        if let Some(persona) = persona {
+        let typed = request.provider_request.as_ref();
+        if let Some(provider) = typed {
+            system_parts.extend(provider.system_prompt.clone());
+        } else if let Some(persona) = persona {
             if !persona.is_empty() {
                 system_parts.push(persona.clone());
             }
         }
         let mut messages: Vec<AnthropicMessage> = Vec::new();
-        if let Some(history) = session.history() {
-            for message in history {
+        let history: Vec<crate::llm::LlmMessage> = if let Some(provider) = typed {
+            provider.messages.clone()
+        } else {
+            session
+                .history()
+                .map(<[crate::llm::LlmMessage]>::to_vec)
+                .unwrap_or_default()
+        };
+        {
+            for message in &history {
                 match message {
                     LlmMessage::System { content } => system_parts.push(content.clone()),
                     LlmMessage::User { content } => messages.push(AnthropicMessage {
@@ -817,5 +828,37 @@ mod tests {
         let capped = vendor.build_request(&None, &request(Some(64)), &(), &());
         assert_eq!(capped.max_tokens, 64);
         assert!(capped.system.is_none());
+    }
+
+    #[test]
+    fn typed_request_supplies_messages_system_and_tools() {
+        use crate::llm::{Content, LlmMessage, LlmRequest, LlmTool};
+        let vendor = super::tests::vendor();
+        let request = LlmRequest {
+            model: "claude-3-5-sonnet-latest".to_string(),
+            input: Content::text("next"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                system_prompt: Some("SYS".to_string()),
+                messages: vec![
+                    LlmMessage::user("hello"),
+                    LlmMessage::assistant("hi"),
+                    LlmMessage::user("next"),
+                ],
+                input: Content::text("next"),
+                tools: vec![LlmTool {
+                    name: "typed-tool".to_string(),
+                    description: "from snapshot".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    kind: Default::default(),
+                    config: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let built = vendor.build_request(&None, &request, &(), &());
+        assert_eq!(built.system.as_deref(), Some("SYS"));
+        assert_eq!(built.messages.len(), 3);
+        assert_eq!(built.tools.expect("tools")[0].name, "typed-tool");
     }
 }

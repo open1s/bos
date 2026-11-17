@@ -115,16 +115,20 @@ Logs distinguish the two values; the content one is `-` unless keyed.
 
 ### Typed provider request (issue #421)
 
-Every provider call carries an immutable `ProviderRequest` built from the LIVE
-session before the engine moves messages into its request buffer. The request
+Every provider call carries an immutable `ProviderRequest`, rebuilt from the
+LIVE session immediately before that call (including every retry and every
+ReAct step, so tool results are present in the next request). It is built before
+the engine moves messages into its request buffer. The request
 fields are then taken from that same value: model, input, temperature, token
 cap, reasoning effort, API mode, full message history, system prompt and
 complete tool definitions, alongside composition/content/execution identities,
 the content key id, the block manifest and each block's source, trust,
 provenance and token estimate. It is attached to the request but never
-serialized to the provider; adapters flatten it into roles and text, and a
-recording provider can compare it with the wire payload; adapters prefer the
-typed tool definitions over independently rebuilt ones. A content edit cannot
+serialized to the provider; adapters serialize it into roles and text and no
+longer read the live session/context for system prompt, messages or tools. A
+recording provider can structurally compare its snapshot with the wire payload;
+`ProviderRequest::audit()` returns a redacted identity/structure view for HTTP
+request auditing. A content edit cannot
 change the execution identity; a key rotation changes only the content
 identity while recording the new key id.
 

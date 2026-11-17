@@ -619,6 +619,33 @@ impl Agent {
             .and_then(|request| request.clone())
     }
 
+    /// A full typed snapshot for an auxiliary one-shot request (classifier or
+    /// summarizer). Auxiliary calls are model calls too, so they carry the same
+    /// immutable request shape (issue #427).
+    pub(crate) fn auxiliary_provider_request(
+        &self,
+        input: react::llm::Content,
+        system_prompt: String,
+        max_tokens: Option<u32>,
+        temperature: f32,
+    ) -> react::llm::ProviderRequest {
+        react::llm::ProviderRequest {
+            model: self.config.model.clone(),
+            system_prompt: Some(system_prompt),
+            messages: vec![react::llm::LlmMessage::user(input.clone())],
+            input,
+            temperature: Some(temperature),
+            max_tokens,
+            reasoning_effort: self
+                .config
+                .reasoning_effort
+                .as_deref()
+                .map(react::llm::ReasoningEffort::from_name),
+            api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
+            ..Default::default()
+        }
+    }
+
     /// Complete the typed request with the exact system prompt, history, model
     /// and advertised tools of the call being built (issue #421). The returned
     /// value describes the request the provider will receive, not only the
@@ -630,10 +657,18 @@ impl Agent {
         history: &[react::llm::LlmMessage],
         input: &react::llm::Content,
     ) -> Option<react::llm::ProviderRequest> {
-        let mut request = self.provider_request()?;
+        // Every model call has a typed snapshot, even when the host did not
+        // pre-populate identities: adapters never need to fall back to reading
+        // the session (issue #427).
+        let mut request = self.provider_request().unwrap_or_default();
         request.model = self.config.model.clone();
         request.system_prompt = Some(system_prompt.to_string());
         request.messages = history.to_vec();
+        // The snapshot's message list includes the current input; adapters
+        // serialize it directly and never append a second copy (#427).
+        request
+            .messages
+            .push(react::llm::LlmMessage::user(input.clone()));
         request.tool_names = tools.iter().map(|tool| tool.name.clone()).collect();
         request.tools = tools.to_vec();
         request.input = input.clone();
@@ -675,12 +710,20 @@ impl Agent {
             }
         }
         let bounded: String = text.chars().take(2_000).collect();
+        let input = Content::text(format!("User message:\n{bounded}"));
+        let provider_request = self.auxiliary_provider_request(
+            input.clone(),
+            self.config.system_prompt.clone(),
+            Some(8),
+            0.0,
+        );
         let request = LlmRequest {
             model: self.config.model.clone(),
-            input: Content::text(format!("User message:\n{bounded}")),
+            input,
             temperature: Some(0.0),
             max_tokens: Some(8),
             api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
+            provider_request: Some(provider_request),
             ..Default::default()
         };
         // One retry for a transient provider failure, so a brief outage does

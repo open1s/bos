@@ -1384,6 +1384,7 @@ struct ActionLlm {
     step: std::sync::atomic::AtomicUsize,
     script: Vec<Step>,
     seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    requests: Arc<std::sync::Mutex<Vec<react::llm::ProviderRequest>>>,
 }
 
 impl ActionLlm {
@@ -1399,10 +1400,13 @@ impl LlmClient<AgentSession, AgentReactContext> for ActionLlm {
     async fn complete(
         &self,
         _persona: Option<String>,
-        _req: LlmRequest,
+        req: LlmRequest,
         session: &mut AgentSession,
         _context: &mut AgentReactContext,
     ) -> Result<LlmResponse, LlmError> {
+        if let Some(request) = req.provider_request.clone() {
+            self.requests.lock().unwrap().push(request);
+        }
         Ok(match self.next(session) {
             Some(Step::Text(text)) => make_text_response((*text).to_string()),
             Some(Step::Tool(name, args)) => make_tool_call_response(name, args),
@@ -1413,10 +1417,13 @@ impl LlmClient<AgentSession, AgentReactContext> for ActionLlm {
     async fn stream_complete(
         &self,
         _persona: Option<String>,
-        _req: LlmRequest,
+        req: LlmRequest,
         session: &mut AgentSession,
         _context: &mut AgentReactContext,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        if let Some(request) = req.provider_request.clone() {
+            self.requests.lock().unwrap().push(request);
+        }
         let tokens: Vec<Result<StreamToken, LlmError>> = match self.next(session) {
             Some(Step::Text(text)) => vec![
                 Ok(StreamToken::Text((*text).to_string())),
@@ -1463,6 +1470,7 @@ fn action_agent(
             step: std::sync::atomic::AtomicUsize::new(0),
             script,
             seen: seen.clone(),
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
         }),
     );
     let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
@@ -1475,6 +1483,38 @@ fn action_agent(
         )));
     }
     (agent, seen)
+}
+
+/// Like [`action_agent`], but exposes the per-call typed requests.
+fn action_agent_recording(
+    script: Vec<Step>,
+    with_tool: bool,
+) -> (
+    Agent,
+    Arc<std::sync::Mutex<Vec<react::llm::ProviderRequest>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(ActionLlm {
+            step: std::sync::atomic::AtomicUsize::new(0),
+            script,
+            seen,
+            requests: requests.clone(),
+        }),
+    );
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));
+    if with_tool {
+        agent.add_tool(Arc::new(FunctionTool::new(
+            "read_file",
+            "read a file",
+            serde_json::json!({"type": "object"}),
+            |_args| Ok(serde_json::json!({"content": "ok"})),
+        )));
+    }
+    (agent, requests)
 }
 
 /// How many action notes the LAST model call saw in its session.
@@ -1622,6 +1662,42 @@ async fn an_action_turn_is_sent_back_to_work_on_the_streaming_path() {
     assert_eq!(seen.lock().unwrap().len(), 3);
 }
 
+/// Each ReAct step gets a fresh typed request; messages produced by a tool call
+/// are present in the NEXT request (issue #427).
+#[tokio::test]
+async fn each_tool_step_gets_a_fresh_complete_request_snapshot() {
+    use futures::StreamExt;
+
+    let (agent, requests) = action_agent_recording(
+        vec![
+            Step::Tool("read_file", "{}"),
+            Step::Tool("read_file", "{}"),
+            Step::Text("Final Answer: done"),
+        ],
+        true,
+    );
+    let mut stream = agent.stream("inspect twice");
+    while stream.next().await.is_some() {}
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 3, "one snapshot per model call");
+    let second = format!("{:?}", requests[1].messages);
+    assert!(
+        second.contains("ok"),
+        "the first tool result is in the next request: {second}"
+    );
+    let third = format!("{:?}", requests[2].messages);
+    assert!(
+        third.matches("ok").count() >= 2,
+        "both tool results are in the third request: {third}"
+    );
+    // Each snapshot is a full request, not an increment.
+    assert_eq!(
+        requests[1].input,
+        react::llm::Content::text("inspect twice")
+    );
+    assert!(!requests[1].tools.is_empty());
+}
+
 /// A classifier vendor: answers ACTION and counts how many requests it served.
 struct ClassifyLlm {
     calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -1762,6 +1838,7 @@ fn action_agent_with_failing_tool(
             step: std::sync::atomic::AtomicUsize::new(0),
             script,
             seen: seen.clone(),
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
         }),
     );
     let mut agent = Agent::new(AgentConfig::default(), Arc::new(provider));

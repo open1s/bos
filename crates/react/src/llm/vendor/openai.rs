@@ -264,8 +264,19 @@ impl OpenAiVendor {
         context: &impl crate::llm::types::ReactContext,
     ) -> OpenAiRequest {
         let mut messages = Vec::new();
-        if let Some(history) = session.history() {
-            for message in history {
+        // With a typed request, the adapter serializes the snapshot's history
+        // plus its current input; it does not read the live session (#427).
+        let typed = req.provider_request.as_ref();
+        let history: Vec<crate::llm::LlmMessage> = if let Some(provider) = typed {
+            provider.messages.clone()
+        } else {
+            session
+                .history()
+                .map(<[crate::llm::LlmMessage]>::to_vec)
+                .unwrap_or_default()
+        };
+        {
+            for message in &history {
                 let json_msg = match message {
                     crate::llm::LlmMessage::System { content } => OpenAiMessageJson {
                         role: "system",
@@ -353,41 +364,44 @@ impl OpenAiVendor {
         let tools = if tools.is_empty() { None } else { Some(tools) };
 
         let mut extra_system_prompt = String::new();
-
-        if let Some(p) = &persona {
-            extra_system_prompt.push_str(&format!("Persona: {}\n", p));
-        }
-
-        if let Some(skills) = context.skills() {
-            // The catalogue is ranked against THIS request and bounded; see
-            // render_skill_catalog. Listing every skill's description cost a
-            // measured 36 KB of a 41 KB prompt on every step.
-            extra_system_prompt.push_str(&crate::llm::render_skill_catalog(
-                skills,
-                req.input.as_text().unwrap_or_default(),
-            ));
-        }
-
-        if let Some(rules) = context.rules() {
-            if !rules.is_empty() {
-                let rule_texts = rules
-                    .iter()
-                    .map(|r| r.content.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                extra_system_prompt
-                    .push_str(&format!("You should follow below rules:\n{}\n", rule_texts));
+        if let Some(provider) = typed {
+            extra_system_prompt.push_str(provider.system_prompt.as_deref().unwrap_or(""));
+        } else {
+            if let Some(p) = &persona {
+                extra_system_prompt.push_str(&format!("Persona: {}\n", p));
             }
-        }
 
-        if let Some(instructions) = context.instructions() {
-            if !instructions.is_empty() {
-                let inst_texts = instructions
-                    .iter()
-                    .map(|i| format!("- {}: {}", i.name, i.description))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                extra_system_prompt.push_str(&format!("Instructions:\n{}\n", inst_texts));
+            if let Some(skills) = context.skills() {
+                // The catalogue is ranked against THIS request and bounded; see
+                // render_skill_catalog. Listing every skill's description cost a
+                // measured 36 KB of a 41 KB prompt on every step.
+                extra_system_prompt.push_str(&crate::llm::render_skill_catalog(
+                    skills,
+                    req.input.as_text().unwrap_or_default(),
+                ));
+            }
+
+            if let Some(rules) = context.rules() {
+                if !rules.is_empty() {
+                    let rule_texts = rules
+                        .iter()
+                        .map(|r| r.content.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    extra_system_prompt
+                        .push_str(&format!("You should follow below rules:\n{}\n", rule_texts));
+                }
+            }
+
+            if let Some(instructions) = context.instructions() {
+                if !instructions.is_empty() {
+                    let inst_texts = instructions
+                        .iter()
+                        .map(|i| format!("- {}: {}", i.name, i.description))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    extra_system_prompt.push_str(&format!("Instructions:\n{}\n", inst_texts));
+                }
             }
         }
 
@@ -1646,6 +1660,13 @@ mod tests {
             model: "gpt-test".to_string(),
             input: Content::text("hello"),
             provider_request: Some(crate::llm::ProviderRequest {
+                system_prompt: Some("SYS".to_string()),
+                messages: vec![
+                    crate::llm::LlmMessage::user("hello"),
+                    crate::llm::LlmMessage::assistant("hi"),
+                    crate::llm::LlmMessage::user("next"),
+                ],
+                input: Content::text("next"),
                 tools: vec![LlmTool {
                     name: "typed-tool".to_string(),
                     description: "from the snapshot".to_string(),
@@ -1660,5 +1681,17 @@ mod tests {
         let built = vendor.convert_request(None, &request, &LlmSession::new(), &context);
         let tools = built.tools.expect("tools serialized");
         assert_eq!(tools[0]["function"]["name"], "typed-tool");
+        assert_eq!(built.messages.len(), 4, "system + typed history");
+        assert_eq!(built.messages[0].role, "system");
+        assert_eq!(built.messages[0].content, Some(serde_json::json!("SYS")));
+        assert_eq!(built.messages[1].role, "user");
+        assert_eq!(built.messages[2].role, "assistant");
+        assert_eq!(built.messages[3].role, "user");
+        assert_eq!(built.messages[3].content, Some(serde_json::json!("next")));
+        let audit = request.provider_request.as_ref().expect("typed").audit();
+        assert_eq!(audit["message_count"], 3);
+        assert_eq!(audit["system_prompt_chars"], 3);
+        assert!(!audit.to_string().contains("SYS"));
+        assert!(!audit.to_string().contains("hello"));
     }
 }

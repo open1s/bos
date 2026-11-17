@@ -460,6 +460,7 @@ pub(crate) const CONTEXT_ENVELOPE_MARKER: &str = "<!-- bsh-context ";
 pub(crate) struct AssemblySnapshot {
     blocks: Vec<ContextBlock>,
     fingerprint: ContextFingerprint,
+    versions: SourceVersions,
 }
 
 impl AssemblySnapshot {
@@ -474,6 +475,7 @@ impl AssemblySnapshot {
         Self {
             blocks,
             fingerprint,
+            versions,
         }
     }
 
@@ -487,6 +489,8 @@ impl AssemblySnapshot {
     /// request cannot be assembled from a second, drifting path.
     pub(crate) fn typed_provider_request(&self) -> react::llm::ProviderRequest {
         react::llm::ProviderRequest {
+            provider: self.versions.provider.clone(),
+            provider_adapter: self.versions.provider_adapter.clone(),
             composition: self.fingerprint.composition.clone(),
             content: self.fingerprint.content.clone(),
             execution: self.fingerprint.execution.clone(),

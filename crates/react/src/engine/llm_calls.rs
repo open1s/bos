@@ -1,5 +1,36 @@
 use super::*;
 
+/// Rebuild the typed request from the LIVE session and context immediately
+/// before a provider call (issue #427). Every retry and every ReAct step gets
+/// its own immutable snapshot, including tool results produced since the last
+/// call.
+fn refresh_provider_snapshot<S: ReactSession, C: ReactContext>(
+    request: &mut LlmRequest,
+    persona: &Option<String>,
+    session: &S,
+    context: &C,
+) {
+    let mut provider = request.provider_request.take().unwrap_or_default();
+    provider.model = request.model.clone();
+    provider.input = request.input.clone();
+    provider.temperature = request.temperature;
+    provider.max_tokens = request.max_tokens;
+    provider.reasoning_effort = request.reasoning_effort;
+    provider.api_mode = request.api_mode;
+    provider.messages = session
+        .history()
+        .map(<[LlmMessage]>::to_vec)
+        .unwrap_or_default();
+    provider.tools = context
+        .tools()
+        .map(<[crate::llm::LlmTool]>::to_vec)
+        .unwrap_or_default();
+    if let Some(persona) = persona {
+        provider.system_prompt = Some(persona.clone());
+    }
+    request.provider_request = Some(provider);
+}
+
 impl<A: ReActApp> ReActEngine<A> {
     /// Whether an LLM error is worth retrying.
     ///
@@ -13,13 +44,14 @@ impl<A: ReActApp> ReActEngine<A> {
     pub async fn call_llm(
         &mut self,
         persona: Option<String>,
-        request: LlmRequest,
+        mut request: LlmRequest,
         session: &mut A::Session,
         context: &mut A::Context,
     ) -> Result<LlmResponse, ReactError>
     where
         A::Session: ReactSession,
     {
+        refresh_provider_snapshot(&mut request, &persona, session, context);
         let max_retries = self
             .resilience
             .as_ref()
@@ -117,13 +149,14 @@ impl<A: ReActApp> ReActEngine<A> {
     pub async fn call_llm_stream(
         &self,
         persona: Option<String>,
-        request: LlmRequest,
+        mut request: LlmRequest,
         session: &mut A::Session,
         context: &mut A::Context,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, ReactError>
     where
         A::Session: ReactSession,
     {
+        refresh_provider_snapshot(&mut request, &persona, session, context);
         // The same retry contract as `call_llm`: a provider that answers 429 or
         // 503 before the stream opens is transient, and the streaming path is
         // the one the interactive turn uses. Measured: a quota 429 failed the

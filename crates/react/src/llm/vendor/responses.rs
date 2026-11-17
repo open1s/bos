@@ -547,15 +547,28 @@ pub fn build_request(
             .or_else(|| context.tools()),
     );
     let parallel = tools.as_ref().map(|_| parallel_tool_calls);
+    let (instructions, input) = match req.provider_request.as_ref() {
+        Some(provider) => (
+            provider
+                .system_prompt
+                .clone()
+                .filter(|text| !text.is_empty()),
+            build_input(Some(&provider.messages), &provider.input),
+        ),
+        None => (
+            build_instructions(
+                persona,
+                req.input.as_text().unwrap_or_default(),
+                session,
+                context,
+            ),
+            build_input(session.history(), &req.input),
+        ),
+    };
     ResponsesRequest {
         model: req.model.clone(),
-        instructions: build_instructions(
-            persona,
-            req.input.as_text().unwrap_or_default(),
-            session,
-            context,
-        ),
-        input: build_input(session.history(), &req.input),
+        instructions,
+        input,
         tools,
         temperature: req.temperature,
         top_p: req.top_p,
@@ -1512,5 +1525,44 @@ mod tests {
         let back: ResponsesResponse = serde_json::from_str(&serialized).unwrap();
         assert_eq!(back.output_text(), "");
         assert_eq!(back.chat_usage().unwrap().total_tokens, 7);
+    }
+
+    #[test]
+    fn typed_request_drives_instructions_input_and_tools() {
+        use crate::llm::{Content, LlmContext, LlmMessage, LlmRequest, LlmSession, LlmTool};
+        let request = LlmRequest {
+            model: "gpt-5".to_string(),
+            input: Content::text("next"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                system_prompt: Some("SYS".to_string()),
+                messages: vec![
+                    LlmMessage::user("hello"),
+                    LlmMessage::assistant("hi"),
+                    LlmMessage::user("next"),
+                ],
+                input: Content::text("next"),
+                tools: vec![LlmTool {
+                    name: "typed-tool".to_string(),
+                    description: "from snapshot".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    kind: Default::default(),
+                    config: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let built = build_request(
+            None,
+            &request,
+            &LlmSession::new(),
+            &LlmContext::default(),
+            false,
+            true,
+        );
+        assert_eq!(built.instructions.as_deref(), Some("SYS"));
+        let json = serde_json::to_string(&built).expect("serializes");
+        assert!(json.contains("hello"), "{json}");
+        assert!(json.contains("typed-tool"), "{json}");
     }
 }

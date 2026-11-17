@@ -934,9 +934,16 @@ impl Agent {
             .map_or(crate::agent::context::COMPACTION_MAX_OUTPUT_TOKENS, |cap| {
                 cap.min(crate::agent::context::COMPACTION_MAX_OUTPUT_TOKENS)
             });
+        let input = Content::Text(prompt);
+        let provider_request = self.auxiliary_provider_request(
+            input.clone(),
+            self.config.system_prompt.clone(),
+            Some(summary_cap),
+            0.0,
+        );
         let request = LlmRequest {
             model: self.config.model.clone(),
-            input: Content::Text(prompt),
+            input,
             temperature: Some(0.0),
             max_tokens: Some(summary_cap),
             reasoning_effort: self
@@ -945,6 +952,7 @@ impl Agent {
                 .as_deref()
                 .map(react::llm::ReasoningEffort::from_name),
             api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
+            provider_request: Some(provider_request),
             ..Default::default()
         };
 
