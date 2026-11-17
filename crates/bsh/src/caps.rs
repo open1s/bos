@@ -11107,6 +11107,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     #[test]
     #[cfg(windows)]
     fn a_windows_prefix_survives_normalization() {
+        use super::{normalize_path, resolve_path};
+        use std::path::{Path, PathBuf};
+
         assert_eq!(
             normalize_path(Path::new(r"C:\work\game\..\file.txt")),
             PathBuf::from(r"C:\work\file.txt")
