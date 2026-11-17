@@ -109,7 +109,6 @@ impl RustProvider {
             None,
             Some(options),
         );
-        drop(progress);
 
         let Some(tree) = tree else {
             parser.reset();
@@ -173,7 +172,6 @@ impl RustProvider {
             None,
             Some(options),
         );
-        drop(progress);
         let Some(tree) = tree else {
             parser.reset();
             if let Some(error) = budget_error {
