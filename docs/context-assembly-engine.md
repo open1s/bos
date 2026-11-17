@@ -100,8 +100,9 @@ Two identities are reported per assembly:
   block shapes (source, trust, provenance, inclusion) plus source versions: the
   persona's keyed digest or, without a key, a coarse length/token label; the
   workspace instruction digest and file names; each recalled memory
-  `<record-id>@<revision>`; the tool-guidance version; the provider/model
-  identity; and the turn number. It never contains block text.
+  `<record-id>@<revision>`; the tool-guidance/schema digest; the provider/model,
+  provider adapter version and API mode; the memory revision; and the turn
+  number. It never contains block text.
 - **Content** (`ContextFingerprint::content`, HMAC-SHA256): canonicalized block
   bytes under `BSH_CONTEXT_CONTENT_KEY`, present only when that key is set.
   Without a key no content identity is produced, so logs cannot be dictionary-
@@ -114,15 +115,17 @@ Logs distinguish the two values; the content one is `-` unless keyed.
 
 ### Typed provider request (issue #421)
 
-Every provider call carries an immutable `ProviderRequest` built from the same
-snapshot as the assembly report: composition/content/execution identities, the
-content key id, the block manifest, each block's source/trust/provenance and
-token estimate, plus the exact model, system prompt, serialized message history
-and advertised tool names of the call. It is attached to the request but never
+Every provider call carries an immutable `ProviderRequest` built from the LIVE
+session before the engine moves messages into its request buffer. The request
+fields are then taken from that same value: model, input, temperature, token
+cap, reasoning effort, API mode, full message history, system prompt and
+complete tool definitions, alongside composition/content/execution identities,
+the content key id, the block manifest and each block's source, trust,
+provenance and token estimate. It is attached to the request but never
 serialized to the provider; adapters flatten it into roles and text, and a
-recording provider can prove the wire request came from that snapshot. A content edit cannot change the
-execution identity, and a key rotation changes only the content identity while
-recording the new key id.
+recording provider can compare it with the wire payload. A content edit cannot
+change the execution identity; a key rotation changes only the content
+identity while recording the new key id.
 
 ### Adapter flattening (documented)
 

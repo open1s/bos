@@ -119,15 +119,24 @@ Verification execution: a task's `verification_contract` is run by the host
 runtime after a successful settle. The contract is created through
 `task_create`'s structured `verification_contract` field (command, artifact,
 review or human) and is validated before execution; peer-owned tasks cannot
-carry a local contract. Each report names the immutable attempt that produced
+carry a local contract. A command runs through the controlled shell with the
+runtime's sandbox and timeout; an artifact is checked for existence/digest
+inside the workspace. Each report names the immutable attempt that produced
 it, task-level status is derived from the current attempt, and a retry starts a
-new pending attempt without reusing the prior report. A successful execution
-whose verification is still owed is not blindly retried.
- — a command through the host shell with a
-60-second deadline, or an artifact existence/digest check. Review and human
-contracts need an external approval reference and conclude `inconclusive`;
-they are never satisfied by model self-attestation. A passed report is only
-accepted when it names a non-model verifier and carries evidence.
+new pending attempt without reusing the prior report.
+
+Each task carries an explicit retry policy (`idempotent`, `non-idempotent`,
+`unknown`; default unknown/fail-closed) and persisted per-attempt side-effect
+records. Non-idempotent retries require `confirm_side_effects=true`; unknown
+ones additionally require a `compensation` path. Idempotency keys are stored on
+the task.
+
+Review/human contracts are executable through `task_approve`: a structured
+approval records approver, decision, scope, evidence, external reference,
+attempt id and optional expiry. A model cannot approve its own task. Approval
+resolution ignores revoked, expired, superseded or attempt-mismatched records;
+the approval history is retained for audit and survives restart. A passed
+report is only accepted when it names a non-model verifier and carries evidence.
 
 The verifier command runs through the turn's controlled shell (the same
 sandbox, policy, working directory and resource limits as normal execution),

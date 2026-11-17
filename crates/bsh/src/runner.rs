@@ -416,6 +416,14 @@ impl Runner {
                         agent::agent::context::estimate_tokens(&assembly.base_prompt)
                     ),
                 };
+                // Identity inputs are derived from the actual advertised tools,
+                // adapter and memory revision, not hard-coded labels (#432).
+                let tool_schema_digest = crate::context_assembly::digest_text(
+                    &serde_json::to_string(&agent.all_tools()).unwrap_or_default(),
+                );
+                let memory_revision = (!recall.records.is_empty()).then(|| {
+                    crate::context_assembly::digest_text(&recall.records.join(","))
+                });
                 let versions = crate::context_assembly::SourceVersions {
                     persona: Some(persona_version),
                     workspace_instructions: context.instructions.as_deref().map(|text| {
@@ -426,8 +434,12 @@ impl Runner {
                         )
                     }),
                     memory_records: recall.records.clone(),
-                    tool_guidance: Some("tool-guidance@1".to_string()),
+                    tool_guidance: Some(format!("tools:{tool_schema_digest}")),
                     provider: Some(agent.config().model.clone()),
+                    provider_adapter: Some(format!("bsh/{}", env!("CARGO_PKG_VERSION"))),
+                    api_mode: Some(agent.config().api_mode.clone()),
+                    tool_schema: Some(tool_schema_digest),
+                    memory_revision,
                     session: None,
                     turn: Some(time.turn as u64),
                 };

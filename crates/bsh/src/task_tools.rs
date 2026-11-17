@@ -14,8 +14,9 @@ use serde_json::{json, Value};
 
 use crate::extension::runs::{Limits, RunSpec, RunState, RunTier, Runs};
 use crate::extension::tasks::{
-    self, Attempt, AttemptStatus, FileTasksStore, Host, Origin, Task, TaskStatus, TasksStore, Tier,
-    Trigger, VerificationContract, VerificationEvidence, VerificationReport, VerificationStatus,
+    self, ApprovalDecision, ApprovalReference, Attempt, AttemptStatus, FileTasksStore, Host,
+    Origin, Task, TaskStatus, TasksStore, Tier, Trigger, VerificationContract,
+    VerificationEvidence, VerificationReport, VerificationStatus,
 };
 
 /// What the tools need to know about the turn they run in.
@@ -44,6 +45,7 @@ pub(crate) fn attach(agent: &mut Agent, context: TaskToolsContext) {
     attach_status(agent, context.clone());
     attach_list(agent, context.clone());
     attach_retry(agent, context.clone());
+    attach_approve(agent, context.clone());
     attach_graph(agent, context);
 }
 
@@ -107,6 +109,15 @@ fn attach_create(agent: &mut Agent, context: TaskToolsContext) {
                         "digest": { "type": "string" }
                     },
                     "required": ["kind"]
+                },
+                "retry_policy": {
+                    "type": "string",
+                    "enum": ["idempotent", "non-idempotent", "unknown"],
+                    "description": "How safely this task may be retried. Unknown (the default) fails closed."
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Optional stable key the executor can use to deduplicate side effects."
                 }
             },
             "required": ["intent"]
@@ -260,6 +271,14 @@ fn attach_retry(agent: &mut Agent, context: TaskToolsContext) {
                 "task": {
                     "type": "string",
                     "description": "The task id returned by task_create."
+                },
+                "confirm_side_effects": {
+                    "type": "boolean",
+                    "description": "Confirm that a non-idempotent or unknown-side-effect attempt may be repeated."
+                },
+                "compensation": {
+                    "type": "string",
+                    "description": "The recovery/compensation path for an unknown-side-effect retry."
                 }
             },
             "required": ["task"]
@@ -278,6 +297,165 @@ fn attach_retry(agent: &mut Agent, context: TaskToolsContext) {
         agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
     {
         log::warn!("task_retry tool was not registered: {error}");
+    }
+}
+
+/// Record or revoke a review/human approval (issue #433).
+fn approve_with(context: &TaskToolsContext, args: &Value) -> Result<Value, ToolError> {
+    let id = args
+        .get("task")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| ToolError::InvalidInput("task is required".to_string()))?;
+    let mut record = FileTasksStore
+        .load(&context.workspace, id)
+        .map_err(|error| ToolError::Failed(format!("the task could not be read: {error}")))?
+        .ok_or_else(|| ToolError::Failed(format!("unknown task {id}")))?;
+    let now = crate::settings::unix_now().saturating_mul(1_000);
+    if args.get("revoke").and_then(Value::as_bool).unwrap_or(false) {
+        let reference = args.get("reference").and_then(Value::as_str).map(str::trim);
+        let Some(approval) = record.approvals.iter_mut().rev().find(|approval| {
+            approval.revoked_ms.is_none()
+                && reference
+                    .map(|reference| approval.reference == reference)
+                    .unwrap_or(true)
+        }) else {
+            return Err(ToolError::Failed(
+                "no matching active approval to revoke".to_string(),
+            ));
+        };
+        approval.revoked_ms = Some(now);
+        // Revocation invalidates the current verification so the next join
+        // re-resolves the approval instead of keeping a stale Passed result.
+        let attempt_id = record.attempts.last().map(|attempt| attempt.id.clone());
+        record.verification = VerificationReport {
+            status: VerificationStatus::Inconclusive,
+            attempt_id: attempt_id.clone(),
+            verifier: Some("approval".to_string()),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence: Vec::new(),
+            message: Some("the approval was revoked".to_string()),
+        };
+        if let Some(attempt) = record.attempts.last_mut() {
+            attempt.verification = record.verification.clone();
+        }
+        FileTasksStore
+            .save(&context.workspace, &record)
+            .map_err(|error| ToolError::Failed(format!("the task could not be saved: {error}")))?;
+        return Ok(json!({"task": id, "approvals": record.approvals}));
+    }
+    let approver = args
+        .get("approver")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|approver| !approver.is_empty())
+        .ok_or_else(|| ToolError::InvalidInput("approver is required".to_string()))?;
+    if matches!(
+        approver.to_ascii_lowercase().as_str(),
+        "model" | "assistant" | "self"
+    ) {
+        return Err(ToolError::InvalidInput(
+            "a model cannot approve its own task; name the human or external reviewer".to_string(),
+        ));
+    }
+    let decision = match args
+        .get("decision")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("approved")
+    {
+        "approved" | "approve" => ApprovalDecision::Approved,
+        "rejected" | "reject" => ApprovalDecision::Rejected,
+        other => {
+            return Err(ToolError::InvalidInput(format!(
+                "unknown approval decision {other}; use approved or rejected"
+            )));
+        }
+    };
+    let reference = args
+        .get("reference")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+        .ok_or_else(|| {
+            ToolError::InvalidInput("an external approval reference is required".to_string())
+        })?
+        .to_string();
+    let evidence = args
+        .get("evidence")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|evidence| !evidence.is_empty())
+        .ok_or_else(|| ToolError::InvalidInput("approval evidence is required".to_string()))?
+        .to_string();
+    let attempt_id = match args.get("attempt_id").and_then(Value::as_str) {
+        Some(attempt_id) => attempt_id.to_string(),
+        None => record
+            .attempts
+            .last()
+            .map(|attempt| attempt.id.clone())
+            .ok_or_else(|| ToolError::Failed("the task has no attempt to approve".to_string()))?,
+    };
+    if !record
+        .attempts
+        .iter()
+        .any(|attempt| attempt.id == attempt_id)
+    {
+        return Err(ToolError::InvalidInput(format!(
+            "attempt {attempt_id} does not belong to task {id}"
+        )));
+    }
+    let expires_ms = args.get("expires_ms").and_then(Value::as_u64);
+    record.approvals.push(ApprovalReference {
+        attempt_id,
+        approver: approver.to_string(),
+        decision,
+        scope: args
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| record.id.clone()),
+        evidence,
+        reference,
+        recorded_ms: now,
+        expires_ms,
+        revoked_ms: None,
+        superseded_by: None,
+    });
+    FileTasksStore
+        .save(&context.workspace, &record)
+        .map_err(|error| ToolError::Failed(format!("the task could not be saved: {error}")))?;
+    Ok(json!({"task": id, "approvals": record.approvals}))
+}
+
+fn attach_approve(agent: &mut Agent, context: TaskToolsContext) {
+    let tool = AsyncFunctionTool::from_fn(
+        "task_approve",
+        "Record or revoke a structured review/human approval bound to one task attempt. A model cannot approve its own task; approvals cannot verify a later retry.",
+        json!({
+            "type": "object",
+            "properties": {
+                "task": { "type": "string", "description": "The task id." },
+                "approver": { "type": "string", "description": "The human/external approver identity." },
+                "decision": { "type": "string", "enum": ["approved", "rejected"] },
+                "scope": { "type": "string", "description": "The approved scope; defaults to the task id." },
+                "evidence": { "type": "string", "description": "Evidence supporting the decision." },
+                "reference": { "type": "string", "description": "The external approval reference id." },
+                "attempt_id": { "type": "string", "description": "The attempt to bind; defaults to the current attempt." },
+                "expires_ms": { "type": "integer", "description": "Optional expiry in unix milliseconds." },
+                "revoke": { "type": "boolean", "description": "Revoke the latest matching approval." }
+            },
+            "required": ["task"]
+        }),
+        move |args| {
+            let context = context.clone();
+            async move { approve_with(&context, &args) }
+        },
+    );
+    if let Err(error) = agent.try_add_async_tool(Arc::new(tool)) {
+        log::warn!("task_approve tool was not registered: {error}");
     }
 }
 
@@ -502,13 +680,50 @@ pub(crate) async fn retry_with(
             "the task has used all of its attempts".to_string(),
         ));
     }
-    // Retrying an execution whose verification is still owed could repeat a
-    // non-idempotent side effect while the original outcome is unproven.
-    // Verify, cancel, or wait instead of blindly re-running (issue #417).
-    if record.execution_succeeded() && record.verification_owed() {
-        return Err(ToolError::Failed(
-            "the task executed but its verification is still owed; re-verify the current attempt instead of retrying a non-idempotent execution".to_string(),
-        ));
+    // Retry safety is derived from the current attempt's persisted side-effect
+    // evidence, not from task-level status (issue #430).
+    let current_effect = record
+        .attempts
+        .last()
+        .and_then(|attempt| record.side_effects.get(&attempt.id));
+    let confirmed = args
+        .get("confirm_side_effects")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let compensation = args
+        .get("compensation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    match record.retry_policy {
+        tasks::RetryPolicy::Idempotent => {}
+        tasks::RetryPolicy::NonIdempotent => {
+            let risky = current_effect
+                .map(|effect| {
+                    matches!(
+                        effect.status,
+                        tasks::SideEffectStatus::Started
+                            | tasks::SideEffectStatus::Completed
+                            | tasks::SideEffectStatus::Unknown
+                    )
+                })
+                .unwrap_or(false);
+            if risky && !confirmed {
+                return Err(ToolError::Failed(
+                    "this non-idempotent task may already have produced a side effect; pass confirm_side_effects=true after verifying or compensating it".to_string(),
+                ));
+            }
+        }
+        tasks::RetryPolicy::Unknown => {
+            let risky = current_effect
+                .map(|effect| effect.status != tasks::SideEffectStatus::None)
+                .unwrap_or(false);
+            if risky && (!confirmed || compensation.is_empty()) {
+                return Err(ToolError::Failed(
+                    "this task's side-effect status is unknown; pass confirm_side_effects=true and a compensation/recovery path before retrying".to_string(),
+                ));
+            }
+        }
     }
     let now = crate::settings::unix_now().saturating_mul(1_000);
     let run = match record.tier {
@@ -592,6 +807,7 @@ pub(crate) async fn retry_with(
     attempt.started_ms = Some(now);
     record.attempts.push(attempt);
     mark_attempt_pending(&mut record);
+    mark_side_effect_started(&mut record);
     record.status = TaskStatus::Running;
     record.updated_ms = now;
     FileTasksStore
@@ -619,6 +835,10 @@ fn task_json(task: &Task) -> Value {
         "verified_completion": task.verified_completion(),
         "verification": task.verification,
         "verification_contract": task.verification_contract,
+        "retry_policy": task.retry_policy,
+        "idempotency_key": task.idempotency_key,
+        "side_effects": task.side_effects,
+        "approvals": task.approvals,
         "next_fire_ms": task.trigger.next_fire_ms(),
         "created_ms": task.created_ms,
         "updated_ms": task.updated_ms,
@@ -1009,6 +1229,44 @@ fn parse_trigger(args: &Value, now: u64) -> Result<Trigger, ToolError> {
     ))
 }
 
+/// Parse a retry policy, defaulting to Unknown (fail closed) (issue #430).
+fn parse_retry_policy(args: &Value) -> Result<tasks::RetryPolicy, ToolError> {
+    match args
+        .get("retry_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+    {
+        "idempotent" => Ok(tasks::RetryPolicy::Idempotent),
+        "non-idempotent" | "non_idempotent" => Ok(tasks::RetryPolicy::NonIdempotent),
+        "unknown" => Ok(tasks::RetryPolicy::Unknown),
+        other => Err(ToolError::InvalidInput(format!(
+            "unknown retry_policy {other}; use idempotent, non-idempotent or unknown"
+        ))),
+    }
+}
+
+/// Record that an attempt started and may have external effects.
+fn mark_side_effect_started(task: &mut Task) {
+    let Some(attempt) = task.attempts.last() else {
+        return;
+    };
+    let status = match task.retry_policy {
+        tasks::RetryPolicy::Idempotent | tasks::RetryPolicy::NonIdempotent => {
+            tasks::SideEffectStatus::Started
+        }
+        tasks::RetryPolicy::Unknown => tasks::SideEffectStatus::Unknown,
+    };
+    task.side_effects.insert(
+        attempt.id.clone(),
+        tasks::SideEffectRecord {
+            status,
+            idempotency_key: task.idempotency_key.clone(),
+            detail: format!("attempt {} started", attempt.id),
+            recorded_ms: crate::settings::unix_now().saturating_mul(1_000),
+        },
+    );
+}
+
 /// Parse and validate a verification contract from the tool input.
 ///
 /// Invalid input is refused before any task is created or executed. A
@@ -1194,6 +1452,13 @@ pub(crate) async fn create_with(
     let now = crate::settings::unix_now().saturating_mul(1_000);
     let trigger = parse_trigger(args, now)?;
     let verification_contract = parse_verification_contract(args, tier)?;
+    let retry_policy = parse_retry_policy(args)?;
+    let idempotency_key = args
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string);
     if !deps.is_empty() && (tier != Tier::Turn || matches!(trigger, Trigger::Now)) {
         return Err(ToolError::InvalidInput(
             "dependencies are supported on scheduled turn tasks".to_string(),
@@ -1218,6 +1483,8 @@ pub(crate) async fn create_with(
         now,
     )
     .map_err(|refusal| ToolError::Failed(refusal.message().to_string()))?;
+    task.retry_policy = retry_policy;
+    task.idempotency_key = idempotency_key;
     if let Some(contract) = verification_contract {
         task.verification_contract = Some(contract);
         task.verification = VerificationReport {
@@ -1306,6 +1573,7 @@ pub(crate) async fn create_with(
         attempt.started_ms = Some(now);
         task.attempts.push(attempt);
         mark_attempt_pending(&mut task);
+        mark_side_effect_started(&mut task);
         task.status = TaskStatus::Running;
         task.updated_ms = now;
         FileTasksStore
@@ -1390,6 +1658,7 @@ pub(crate) async fn create_with(
         attempt.started_ms = Some(now);
         task.attempts.push(attempt);
         mark_attempt_pending(&mut task);
+        mark_side_effect_started(&mut task);
         task.status = TaskStatus::Running;
         task.updated_ms = now;
         FileTasksStore
@@ -1434,6 +1703,7 @@ pub(crate) async fn create_with(
         attempt.started_ms = Some(now);
         task.attempts.push(attempt);
         mark_attempt_pending(&mut task);
+        mark_side_effect_started(&mut task);
         task.status = TaskStatus::Running;
         task.updated_ms = now;
         FileTasksStore
@@ -1468,6 +1738,7 @@ pub(crate) async fn create_with(
     attempt.started_ms = Some(now);
     task.attempts.push(attempt);
     mark_attempt_pending(&mut task);
+    mark_side_effect_started(&mut task);
     task.status = TaskStatus::Running;
     task.updated_ms = now;
     FileTasksStore
@@ -1629,6 +1900,22 @@ pub(crate) async fn join_with(
             if row.error.is_some() {
                 attempt.error = row.error.clone();
             }
+            if state.is_settled() {
+                let policy = record.retry_policy;
+                if let Some(effect) = record.side_effects.get_mut(&attempt.id) {
+                    effect.status = match (state, policy) {
+                        (RunState::Succeeded, tasks::RetryPolicy::Unknown) => {
+                            tasks::SideEffectStatus::Unknown
+                        }
+                        (RunState::Succeeded, _) => tasks::SideEffectStatus::Completed,
+                        (RunState::Failed, _) => tasks::SideEffectStatus::Failed,
+                        (RunState::Cancelled, _) => tasks::SideEffectStatus::Unknown,
+                        _ => effect.status,
+                    };
+                    effect.recorded_ms = now;
+                    effect.detail = format!("attempt {} settled as {:?}", attempt.id, state);
+                }
+            }
         }
         // Execution success is not verification. A settled successful task
         // with a contract is verified by the runtime here, not by the model's
@@ -1641,12 +1928,19 @@ pub(crate) async fn join_with(
             )
         {
             if let Some(contract) = record.verification_contract.clone() {
-                let mut report =
-                    verify_contract(&contract, &context.workspace, verification_shell.as_ref())
-                        .await;
+                let attempt_id = record.attempts.last().map(|attempt| attempt.id.clone());
+                let mut report = match &contract {
+                    VerificationContract::Review | VerificationContract::Human => {
+                        approval_report(record, attempt_id.as_deref().unwrap_or(""), now)
+                    }
+                    _ => {
+                        verify_contract(&contract, &context.workspace, verification_shell.as_ref())
+                            .await
+                    }
+                };
                 // Bind the report to the attempt that produced this outcome:
                 // a previous attempt's report can never satisfy it (issue #417).
-                report.attempt_id = record.attempts.last().map(|attempt| attempt.id.clone());
+                report.attempt_id = attempt_id;
                 record.verification = report.clone();
                 if let Some(attempt) = record.attempts.last_mut() {
                     attempt.verification = report;
@@ -1840,6 +2134,62 @@ pub(crate) async fn verify_contract(
             verified_ms: Some(crate::settings::unix_now().saturating_mul(1_000)),
             evidence: Vec::new(),
             message: Some("this contract needs an external approval reference".to_string()),
+        },
+    }
+}
+
+/// Resolve a review/human contract from the task's approvals (issue #433).
+fn approval_report(task: &Task, attempt_id: &str, now: u64) -> VerificationReport {
+    let approval = task.approvals.iter().rev().find(|approval| {
+        approval.attempt_id == attempt_id
+            && approval.revoked_ms.is_none()
+            && approval.superseded_by.is_none()
+            && approval
+                .expires_ms
+                .map(|expiry| now <= expiry)
+                .unwrap_or(true)
+            && (approval.scope == task.id || approval.scope == "*")
+    });
+    match approval {
+        Some(approval) if approval.decision == ApprovalDecision::Approved => VerificationReport {
+            status: VerificationStatus::Passed,
+            attempt_id: Some(attempt_id.to_string()),
+            verifier: Some(format!("approval:{}", approval.approver)),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence: vec![VerificationEvidence {
+                kind: "approval".to_string(),
+                reference: approval.reference.clone(),
+                digest: None,
+                detail: Some(approval.evidence.clone()),
+            }],
+            message: None,
+        },
+        Some(approval) => VerificationReport {
+            status: VerificationStatus::Failed,
+            attempt_id: Some(attempt_id.to_string()),
+            verifier: Some(format!("approval:{}", approval.approver)),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence: vec![VerificationEvidence {
+                kind: "approval".to_string(),
+                reference: approval.reference.clone(),
+                digest: None,
+                detail: Some(approval.evidence.clone()),
+            }],
+            message: Some("the approval was rejected".to_string()),
+        },
+        None => VerificationReport {
+            status: VerificationStatus::Inconclusive,
+            attempt_id: Some(attempt_id.to_string()),
+            verifier: Some("approval".to_string()),
+            verifier_version: None,
+            verified_ms: Some(now),
+            evidence: Vec::new(),
+            message: Some(
+                "no valid approval matches this attempt (missing, expired, revoked or scope mismatch)"
+                    .to_string(),
+            ),
         },
     }
 }
@@ -2040,6 +2390,7 @@ mod tests {
         assert!(registry.get_async("task_create").is_some());
         assert!(registry.get_async("task_join").is_some());
         assert!(registry.get_async("task_cancel").is_some());
+        assert!(registry.get_async("task_approve").is_some());
     }
 
     /// create saves a running record whose attempt names the started run.
@@ -2172,6 +2523,7 @@ mod tests {
             &context,
             &json!({
                 "intent": "Verify the artifact",
+                "retry_policy": "idempotent",
                 "verification_contract": {"kind": "artifact", "path": "artifact.txt"}
             }),
         )
@@ -2274,7 +2626,11 @@ mod tests {
         let value = create_with(
             &runs,
             &context,
-            &json!({"intent": "Review", "verification_contract": {"kind": "review"}}),
+            &json!({
+                "intent": "Review",
+                "retry_policy": "non-idempotent",
+                "verification_contract": {"kind": "review"}
+            }),
         )
         .await
         .expect("created");
@@ -2291,10 +2647,7 @@ mod tests {
         let error = retry_with(&runs, &context, &json!({"task": id}))
             .await
             .expect_err("retry refused");
-        assert!(
-            format!("{error:?}").contains("verification is still owed"),
-            "{error:?}"
-        );
+        assert!(format!("{error:?}").contains("non-idempotent"), "{error:?}");
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -2963,9 +3316,13 @@ mod tests {
         let context = context("retry");
         let fake = Fake::new();
         let runs = Runs::with(fake);
-        let value = create_with(&runs, &context, &json!({"intent": "Review"}))
-            .await
-            .expect("created");
+        let value = create_with(
+            &runs,
+            &context,
+            &json!({"intent": "Review", "retry_policy": "idempotent"}),
+        )
+        .await
+        .expect("created");
         let id = value["task"].as_str().expect("id").to_string();
         let mut record = FileTasksStore
             .load(&context.workspace, &id)
@@ -3452,6 +3809,340 @@ mod tests {
                 "artifact_symlink_escape_refused",
             ]
         );
+    }
+
+    /// Non-idempotent and unknown-side-effect retries require explicit
+    /// confirmation; idempotent retries do not (issue #430).
+    #[tokio::test]
+    async fn retry_policy_guards_repeated_side_effects() {
+        let context = context("retry-policy");
+        let fake = Fake::new();
+        let runs = Runs::with(fake.clone());
+        let value = create_with(
+            &runs,
+            &context,
+            &json!({"intent": "Deploy", "retry_policy": "non-idempotent"}),
+        )
+        .await
+        .expect("created");
+        let id = value["task"].as_str().expect("id").to_string();
+        {
+            let mut runs = fake.runs.lock().expect("runs");
+            let snapshot = runs.get_mut("run-1").expect("run");
+            snapshot.state = RunState::Succeeded;
+        }
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let settled = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(settled.retry_policy, tasks::RetryPolicy::NonIdempotent);
+        assert_eq!(
+            settled
+                .side_effects
+                .values()
+                .next()
+                .map(|effect| effect.status),
+            Some(tasks::SideEffectStatus::Completed)
+        );
+
+        let denied = retry_with(&runs, &context, &json!({"task": id.clone()}))
+            .await
+            .expect_err("unconfirmed non-idempotent retry refused");
+        assert!(format!("{denied:?}").contains("non-idempotent"));
+
+        retry_with(
+            &runs,
+            &context,
+            &json!({"task": id.clone(), "confirm_side_effects": true}),
+        )
+        .await
+        .expect("confirmed retry");
+
+        let unknown = create_with(&runs, &context, &json!({"intent": "Unknown effect"}))
+            .await
+            .expect("created");
+        let unknown_id = unknown["task"].as_str().expect("id").to_string();
+        {
+            let mut runs = fake.runs.lock().expect("runs");
+            let snapshot = runs.get_mut("run-3").expect("third run");
+            snapshot.state = RunState::Succeeded;
+        }
+        join_with(&runs, &context, &json!({"tasks": [unknown_id.clone()]}))
+            .await
+            .expect("join");
+        let denied = retry_with(
+            &runs,
+            &context,
+            &json!({"task": unknown_id.clone(), "confirm_side_effects": true}),
+        )
+        .await
+        .expect_err("unknown effect needs a compensation path");
+        assert!(format!("{denied:?}").contains("compensation"));
+        retry_with(
+            &runs,
+            &context,
+            &json!({
+                "task": unknown_id,
+                "confirm_side_effects": true,
+                "compensation": "inspect the external record and roll back"
+            }),
+        )
+        .await
+        .expect("compensated retry");
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// Every checked-in task scenario is executed through the real task paths
+    /// (issue #431), not merely asserted from the fixture.
+    #[tokio::test]
+    async fn task_reliability_corpus_executes() {
+        let corpus: Value =
+            serde_json::from_str(include_str!("../tests/data/reliability_tasks.json"))
+                .expect("corpus parses");
+        let context = context("task-corpus");
+        let fake = Fake::new();
+        let runs = Runs::with(fake);
+        for scenario in corpus["scenarios"].as_array().expect("scenarios") {
+            match scenario["id"].as_str().expect("id") {
+                "contract_creation_persists" => {
+                    let value = create_with(
+                        &runs,
+                        &context,
+                        &json!({
+                            "intent": "corpus contract",
+                            "retry_policy": "idempotent",
+                            "verification_contract": {"kind": "artifact", "path": "artifact.txt"}
+                        }),
+                    )
+                    .await
+                    .expect("created");
+                    let task = FileTasksStore
+                        .load(&context.workspace, value["task"].as_str().expect("id"))
+                        .expect("load")
+                        .expect("record");
+                    assert!(task.verification_contract.is_some());
+                    assert_eq!(task.verification.status, VerificationStatus::Pending);
+                }
+                "attempt_binding_isolated" => {
+                    let value = create_with(
+                        &runs,
+                        &context,
+                        &json!({
+                            "intent": "corpus binding",
+                            "retry_policy": "idempotent",
+                            "verification_contract": {"kind": "review"}
+                        }),
+                    )
+                    .await
+                    .expect("created");
+                    let task = FileTasksStore
+                        .load(&context.workspace, value["task"].as_str().expect("id"))
+                        .expect("load")
+                        .expect("record");
+                    let attempt = task.attempts.last().expect("attempt");
+                    assert_eq!(
+                        attempt.verification.attempt_id.as_deref(),
+                        Some(attempt.id.as_str())
+                    );
+                }
+                "sandbox_timeout_stops_command" => {
+                    let shell: VerificationShell = std::sync::Arc::new(|_| {
+                        Err("controlled runtime stopped the command".into())
+                    });
+                    let report = verify_contract(
+                        &VerificationContract::Command {
+                            command: "sleep 5".to_string(),
+                        },
+                        &context.workspace,
+                        Some(&shell),
+                    )
+                    .await;
+                    assert_ne!(report.status, VerificationStatus::Passed);
+                }
+                "artifact_symlink_escape_refused" => {
+                    #[cfg(unix)]
+                    {
+                        std::fs::write(context.workspace.join("artifact.txt"), "done")
+                            .expect("artifact");
+                        let link = context.workspace.join("escape.txt");
+                        let _ = std::fs::remove_file(&link);
+                        std::os::unix::fs::symlink("/etc/passwd", &link).expect("symlink");
+                        let report = verify_contract(
+                            &VerificationContract::Artifact {
+                                path: "escape.txt".to_string(),
+                                digest: None,
+                            },
+                            &context.workspace,
+                            None,
+                        )
+                        .await;
+                        assert_eq!(report.status, VerificationStatus::Failed);
+                    }
+                }
+                other => panic!("unhandled corpus scenario {other}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// Review/human approvals bind to one attempt, can be revoked/expired,
+    /// and never verify a later retry (issue #433).
+    #[tokio::test]
+    async fn approvals_verify_only_their_attempt() {
+        let context = context("approvals");
+        let fake = Fake::new();
+        let runs = Runs::with(fake.clone());
+        let value = create_with(
+            &runs,
+            &context,
+            &json!({
+                "intent": "Approve the release",
+                "retry_policy": "idempotent",
+                "verification_contract": {"kind": "human"}
+            }),
+        )
+        .await
+        .expect("created");
+        let id = value["task"].as_str().expect("id").to_string();
+        {
+            let mut runs = fake.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").state = RunState::Succeeded;
+        }
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let task = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(task.verification.status, VerificationStatus::Inconclusive);
+
+        let error = approve_with(
+            &context,
+            &json!({"task": id, "approver": "model", "evidence": "x", "reference": "r"}),
+        )
+        .expect_err("model cannot self-approve");
+        assert!(format!("{error:?}").contains("cannot approve"));
+
+        let approved = approve_with(
+            &context,
+            &json!({
+                "task": id,
+                "approver": "alice",
+                "decision": "approved",
+                "scope": id,
+                "evidence": "reviewed the artifact",
+                "reference": "approval-1"
+            }),
+        )
+        .expect("approval recorded");
+        let attempt_one = approved["approvals"][0]["attempt_id"]
+            .as_str()
+            .expect("attempt")
+            .to_string();
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let task = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(task.verification.status, VerificationStatus::Passed);
+        assert!(task.verified_completion());
+
+        retry_with(&runs, &context, &json!({"task": id.clone()}))
+            .await
+            .expect("retry");
+        {
+            let mut runs = fake.runs.lock().expect("runs");
+            runs.get_mut("run-2").expect("second run").state = RunState::Succeeded;
+        }
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let task = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(
+            task.verification.status,
+            VerificationStatus::Inconclusive,
+            "attempt one's approval cannot verify attempt two"
+        );
+        let attempt_two = task.attempts.last().expect("attempt").id.clone();
+        approve_with(
+            &context,
+            &json!({
+                "task": id,
+                "attempt_id": attempt_two,
+                "approver": "alice",
+                "decision": "approved",
+                "evidence": "reviewed the retry",
+                "reference": "approval-2"
+            }),
+        )
+        .expect("second approval");
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let task = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(task.verification.status, VerificationStatus::Passed);
+        assert_eq!(task.approvals.len(), 2, "audit history retained");
+
+        approve_with(
+            &context,
+            &json!({"task": id, "revoke": true, "reference": "approval-2"}),
+        )
+        .expect("revoked");
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let task = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(task.verification.status, VerificationStatus::Inconclusive);
+        assert!(
+            task.approvals
+                .iter()
+                .any(|approval| approval.revoked_ms.is_some()),
+            "revocation is audited"
+        );
+
+        approve_with(
+            &context,
+            &json!({
+                "task": id,
+                "attempt_id": task.attempts.last().expect("attempt").id,
+                "approver": "alice",
+                "decision": "approved",
+                "evidence": "expired review",
+                "reference": "approval-3",
+                "expires_ms": 1
+            }),
+        )
+        .expect("expired approval recorded");
+        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+            .await
+            .expect("join");
+        let task = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        assert_eq!(
+            task.verification.status,
+            VerificationStatus::Inconclusive,
+            "an expired approval cannot verify"
+        );
+        assert_eq!(task.approvals.len(), 3, "approval history survives restart");
+        let _ = attempt_one;
+        let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
     /// An unknown id is a refusal, not an empty report.

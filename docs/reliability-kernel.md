@@ -209,7 +209,10 @@ An on-demand long-history variant is marked `#[ignore]` and runs with
 `cargo test -p agent --lib reliability_horizon_extended -- --ignored`.
 
 The harness reports counters for constraint retention, conflict visibility,
-recovery, rejected lossy checkpoints and archive bytes. The task-side corpus
+recovery, rejected lossy checkpoints, repeated compaction, tool-evidence
+rejection, session isolation, provider-request consistency and archive bytes.
+Every corpus scenario is executed through the real compaction/restore/request
+paths, not only asserted from fixture metadata. The task-side corpus
 `crates/bsh/tests/data/reliability_tasks.json` pins contract creation,
 attempt-bound verification, sandbox timeout and artifact-escape scenarios; those
 run in the task suite in `crates/bsh`.

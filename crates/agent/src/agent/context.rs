@@ -431,6 +431,68 @@ pub struct Checkpoint {
     /// Whether the original span can still be rebuilt.
     #[serde(default = "checkpoint_recoverable_default")]
     pub recoverable: bool,
+    /// The critical facts extracted from the shadowed source (issue #429).
+    #[serde(default)]
+    pub facts: Vec<CriticalFact>,
+    /// Facts the summary failed to cover.
+    #[serde(default)]
+    pub missing_facts: Vec<CriticalFact>,
+    /// Summary claims not supported by the source.
+    #[serde(default)]
+    pub unsupported_claims: Vec<String>,
+    /// Whether all extracted facts were covered and no unsupported claim was
+    /// found.
+    #[serde(default)]
+    pub coverage_complete: bool,
+}
+
+/// The kind of a critical fact (issue #429).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriticalFactKind {
+    /// The user's goal.
+    Goal,
+    /// An explicit or ordinary-language constraint.
+    Constraint,
+    /// A decision or rejected alternative.
+    Decision,
+    /// Pending work or a dependency.
+    OpenTask,
+    /// An unresolved conflict.
+    Conflict,
+    /// A tool-verified outcome.
+    VerifiedResult,
+}
+
+/// One critical fact bound to the message it came from (issue #429).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CriticalFact {
+    /// What kind of fact this is.
+    pub kind: CriticalFactKind,
+    /// The source line, trimmed.
+    pub text: String,
+    /// The message index in the shadowed span.
+    pub source_index: usize,
+    /// The source class: user, assistant, tool or system.
+    pub trust: String,
+}
+
+/// The semantic validation result for one summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FactCoverage {
+    /// Facts extracted from the source.
+    pub facts: Vec<CriticalFact>,
+    /// Facts the summary does not cover.
+    pub missing: Vec<CriticalFact>,
+    /// Summary marker claims absent from the source.
+    pub unsupported: Vec<String>,
+}
+
+impl FactCoverage {
+    /// Whether the summary covers every fact and invents none.
+    pub fn complete(&self) -> bool {
+        self.missing.is_empty() && self.unsupported.is_empty()
+    }
 }
 
 fn checkpoint_recoverable_default() -> bool {
@@ -520,7 +582,215 @@ pub fn validate_checkpoint(summary: &str, source: &[Message]) -> Result<(), Stri
             ));
         }
     }
+    let coverage = fact_coverage(summary, source);
+    if !coverage.missing.is_empty() {
+        let names: Vec<String> = coverage
+            .missing
+            .iter()
+            .map(|fact| format!("{:?}: {}", fact.kind, fact.text))
+            .collect();
+        return Err(format!(
+            "the summary does not cover critical fact(s): {}",
+            names.join("; ")
+        ));
+    }
+    if !coverage.unsupported.is_empty() {
+        return Err(format!(
+            "the summary contains unsupported claim(s): {}",
+            coverage.unsupported.join("; ")
+        ));
+    }
     Ok(())
+}
+
+/// The text and trust class of one message.
+fn message_text_and_trust(message: &Message) -> (String, &'static str) {
+    match message {
+        Message::System { content } => (content.clone(), "system"),
+        Message::User { content } => {
+            let text = match content {
+                Content::Text(text) => text.clone(),
+                Content::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        react::llm::ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            (text, "user")
+        }
+        Message::Assistant { content } => (content.clone(), "assistant"),
+        Message::ToolResult { content, .. } => (content.clone(), "tool"),
+        Message::AssistantToolCall { .. } => (String::new(), "assistant"),
+    }
+}
+
+/// Extract the critical facts a summary must preserve (issue #429).
+///
+/// This is intentionally deterministic and conservative: explicit markers,
+/// ordinary-language constraint verbs in USER turns, the first user goal, and
+/// tool results. Paraphrases are matched by keyword coverage, not exact text.
+pub fn extract_critical_facts(source: &[Message]) -> Vec<CriticalFact> {
+    let mut facts: Vec<CriticalFact> = Vec::new();
+    for (index, message) in source.iter().enumerate() {
+        let (text, trust) = message_text_and_trust(message);
+        if trust == "tool" {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                facts.push(CriticalFact {
+                    kind: CriticalFactKind::VerifiedResult,
+                    text: trimmed.chars().take(200).collect(),
+                    source_index: index,
+                    trust: trust.to_string(),
+                });
+            }
+        }
+        // Goals, constraints, decisions, open tasks and conflicts are the
+        // reader's facts; assistant acknowledgements such as "Decided." are
+        // not independent critical facts. Tool outcomes are handled above.
+        if trust != "user" {
+            continue;
+        }
+        for line in text.lines() {
+            let line = line.trim().trim_start_matches(&['-', '*', ' '][..]).trim();
+            if line.is_empty() {
+                continue;
+            }
+            let lower = line.to_ascii_lowercase();
+            let kind = if lower.contains("constraint:")
+                || (trust == "user" && ordinary_constraint(&lower))
+            {
+                CriticalFactKind::Constraint
+            } else if lower.starts_with("goal:")
+                || lower.contains("goal:")
+                || lower.starts_with("objective:")
+            {
+                CriticalFactKind::Goal
+            } else if lower.starts_with("decision")
+                || lower.contains("decision:")
+                || lower.contains("decided")
+                || lower.contains("we chose")
+                || lower.contains("rejected alternative")
+            {
+                CriticalFactKind::Decision
+            } else if lower.contains("todo:")
+                || lower.contains("pending:")
+                || lower.contains("next step:")
+                || lower.contains("still need")
+            {
+                CriticalFactKind::OpenTask
+            } else if lower.contains("conflict:") || lower.contains("contradict") {
+                CriticalFactKind::Conflict
+            } else {
+                continue;
+            };
+            facts.push(CriticalFact {
+                kind,
+                text: line.chars().take(200).collect(),
+                source_index: index,
+                trust: trust.to_string(),
+            });
+        }
+    }
+    facts.sort_by(|a, b| (a.source_index, &a.text).cmp(&(b.source_index, &b.text)));
+    facts.dedup_by(|a, b| a.kind == b.kind && a.text == b.text);
+    facts
+}
+
+fn ordinary_constraint(lower: &str) -> bool {
+    lower.starts_with("never ")
+        || lower.contains(" must ")
+        || lower.contains("must not")
+        || lower.contains("do not ")
+        || lower.contains("don't ")
+        || lower.contains("required to ")
+}
+
+fn fact_keywords(text: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "that", "this", "from", "into", "must", "not", "never",
+        "should", "would", "could", "use", "using", "was", "were", "are", "have", "has", "but",
+    ];
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(|word| word.to_ascii_lowercase())
+        .filter(|word| {
+            let min = if !word.is_ascii() { 2 } else { 3 };
+            word.chars().count() >= min && !STOP.contains(&word.as_str())
+        })
+        .collect()
+}
+
+fn fact_covered(fact: &CriticalFact, summary_lower: &str) -> bool {
+    let keywords = fact_keywords(&fact.text);
+    if keywords.is_empty() {
+        return true;
+    }
+    let hits = keywords
+        .iter()
+        .filter(|keyword| summary_lower.contains(keyword.as_str()))
+        .count();
+    hits * 2 >= keywords.len()
+        || keywords
+            .iter()
+            .any(|keyword| keyword.chars().count() >= 6 && summary_lower.contains(keyword.as_str()))
+}
+
+/// Validate summary coverage of critical facts and reject invented marker
+/// claims (issue #429).
+pub fn fact_coverage(summary: &str, source: &[Message]) -> FactCoverage {
+    let facts = extract_critical_facts(source);
+    let summary_lower = summary.to_ascii_lowercase();
+    let missing: Vec<CriticalFact> = facts
+        .iter()
+        .filter(|fact| !fact_covered(fact, &summary_lower))
+        .cloned()
+        .collect();
+    let source_lower = source
+        .iter()
+        .map(|message| message_text_and_trust(message).0.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut unsupported = Vec::new();
+    for line in summary.lines() {
+        let lower = line.trim().to_ascii_lowercase();
+        let claimed = lower.contains("decision:")
+            || lower.contains("constraint:")
+            || lower.contains("conflict:")
+            || lower.contains("todo:");
+        if !claimed {
+            continue;
+        }
+        // The marker word itself is not evidence; a claim needs at least one
+        // distinctive token that the source actually contains.
+        let markers = [
+            "decision",
+            "constraint",
+            "conflict",
+            "todo",
+            "pending",
+            "goal",
+        ];
+        let keywords: Vec<String> = fact_keywords(line)
+            .into_iter()
+            .filter(|keyword| !markers.contains(&keyword.as_str()))
+            .collect();
+        if keywords.is_empty() {
+            continue;
+        }
+        let supported = keywords
+            .iter()
+            .any(|keyword| source_lower.contains(keyword.as_str()));
+        if !supported {
+            unsupported.push(line.trim().to_string());
+        }
+    }
+    FactCoverage {
+        facts,
+        missing,
+        unsupported,
+    }
 }
 
 /// Explicit constraints in a span, for the semantic gate.
@@ -549,17 +819,35 @@ fn explicit_constraints(source: &[Message]) -> Vec<String> {
     constraints
 }
 
-impl Checkpoint {
-    /// Whether the preserved source still matches its digest.
-    ///
-    /// An archived span was verified when it entered the session archive; an
-    /// omitted span is explicitly not recoverable.
-    pub fn source_is_intact(&self) -> bool {
-        if self.source_omitted {
-            return false;
+/// The recoverability of one checkpoint's source (issue #428).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointSourceStatus {
+    /// The source resolves and its digest matches.
+    Valid,
+    /// No source is retained (omitted or a missing archive entry).
+    Unavailable,
+    /// A source exists but failed a digest, length or identity check.
+    Corrupted(String),
+}
+
+impl std::fmt::Display for CheckpointSourceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckpointSourceStatus::Valid => write!(f, "valid"),
+            CheckpointSourceStatus::Unavailable => write!(f, "unavailable"),
+            CheckpointSourceStatus::Corrupted(reason) => write!(f, "corrupted: {reason}"),
         }
-        if self.source_archived {
-            return true;
+    }
+}
+
+impl Checkpoint {
+    /// Whether an INLINE preserved source matches its digest.
+    ///
+    /// Archived spans require the session archive to recompute the digest; use
+    /// [`AgentSession::checkpoint_source_status`] for those (issue #428).
+    pub fn source_is_intact(&self) -> bool {
+        if self.source_omitted || self.source_archived {
+            return false;
         }
         digest_messages(&self.source_span) == self.source_digest
     }
@@ -677,6 +965,15 @@ impl AgentSession {
         self.update_metadata();
     }
 
+    /// Append a tool result to the history (issue #429 harnesses).
+    pub fn add_tool_result(&mut self, tool_call_id: String, content: String) {
+        self.messages.push(Message::ToolResult {
+            tool_call_id,
+            content,
+        });
+        self.update_metadata();
+    }
+
     fn update_metadata(&mut self) {
         self.metadata.updated_at = current_timestamp();
         self.metadata.message_count = self.messages.len();
@@ -757,23 +1054,25 @@ impl AgentSession {
                 ),
             ));
         }
-        for checkpoint in &restored.checkpoints {
-            if checkpoint.source_omitted {
-                continue;
-            }
-            let intact = if checkpoint.source_archived {
-                restored.archive.contains_key(&checkpoint.source_digest)
-            } else {
-                checkpoint.source_is_intact()
-            };
-            if !intact {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "checkpoint at source {}..{} failed its source check",
-                        checkpoint.source_start, checkpoint.source_end
-                    ),
-                ));
+        for index in 0..restored.checkpoints.len() {
+            match restored.checkpoint_source_status(index) {
+                CheckpointSourceStatus::Valid => {}
+                CheckpointSourceStatus::Unavailable => {
+                    // An explicitly omitted span is allowed to restore as
+                    // unrecoverable; a missing archive entry is not.
+                    if !restored.checkpoints[index].source_omitted {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("checkpoint {index} source is unavailable"),
+                        ));
+                    }
+                }
+                CheckpointSourceStatus::Corrupted(reason) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("checkpoint {index} source is corrupted: {reason}"),
+                    ));
+                }
             }
         }
         self.messages = restored.messages;
@@ -954,7 +1253,7 @@ impl AgentSession {
         let Some(checkpoint) = self.checkpoints.get(index).cloned() else {
             return false;
         };
-        if !checkpoint.source_is_intact() {
+        if self.checkpoint_source_status(index) != CheckpointSourceStatus::Valid {
             return false;
         }
         let Some(source) = self.checkpoint_source(index).map(<[Message]>::to_vec) else {
@@ -965,6 +1264,45 @@ impl AgentSession {
         restored.extend(checkpoint.retained_tail.clone());
         self.restore_messages(restored);
         true
+    }
+
+    /// Resolve and verify one checkpoint's source against its recorded digest
+    /// (issue #428). Presence of an archive key is not enough: the payload,
+    /// length and digest must all agree.
+    pub fn checkpoint_source_status(&self, index: usize) -> CheckpointSourceStatus {
+        let Some(checkpoint) = self.checkpoints.get(index) else {
+            return CheckpointSourceStatus::Unavailable;
+        };
+        if checkpoint.source_omitted {
+            return CheckpointSourceStatus::Unavailable;
+        }
+        let expected_len = checkpoint
+            .source_end
+            .saturating_sub(checkpoint.source_start);
+        let source = if checkpoint.source_archived {
+            match self.archive.get(&checkpoint.source_digest) {
+                Some(messages) => messages.as_slice(),
+                None => return CheckpointSourceStatus::Unavailable,
+            }
+        } else {
+            checkpoint.source_span.as_slice()
+        };
+        if source.len() != expected_len {
+            return CheckpointSourceStatus::Corrupted(format!(
+                "span length {} does not match recorded range {}..{}",
+                source.len(),
+                checkpoint.source_start,
+                checkpoint.source_end
+            ));
+        }
+        let digest = digest_messages(source);
+        if digest != checkpoint.source_digest {
+            return CheckpointSourceStatus::Corrupted(format!(
+                "digest {digest} does not match recorded {}",
+                checkpoint.source_digest
+            ));
+        }
+        CheckpointSourceStatus::Valid
     }
 
     /// The preserved source span for checkpoint `index`, from the archive or a
@@ -1043,6 +1381,8 @@ impl AgentSession {
             .map(|name| (*name).to_string())
             .collect();
         let complete = missing_sections.is_empty();
+        let coverage = fact_coverage(summary, &removed);
+        let coverage_complete = complete && coverage.complete();
         let digest = digest_messages(&removed);
         let span_bytes = serde_json::to_vec(&removed)
             .map(|bytes| bytes.len())
@@ -1075,6 +1415,10 @@ impl AgentSession {
             source_archived,
             source_omitted,
             recoverable,
+            facts: coverage.facts,
+            missing_facts: coverage.missing,
+            unsupported_claims: coverage.unsupported,
+            coverage_complete,
         };
         let mut compacted: Vec<Message> = self.messages[..head].to_vec();
         compacted.push(checkpoint_message);
@@ -2510,7 +2854,10 @@ mod budget_tests {
         );
         assert_eq!(checkpoint.source_start, 1, "the system head is not source");
         assert_eq!(checkpoint.source_end, 1 + replaced);
-        assert!(checkpoint.source_is_intact());
+        assert_eq!(
+            session.checkpoint_source_status(index),
+            CheckpointSourceStatus::Valid
+        );
         assert_eq!(checkpoint.summary, "## Current Work\n- continue");
         assert!(session.messages().len() < original_len);
 
@@ -2561,7 +2908,11 @@ mod budget_tests {
         let error = target
             .restore_from_json(&tampered.to_string())
             .expect_err("tampered checkpoint refused");
-        assert!(error.to_string().contains("source check"), "{error}");
+        assert!(
+            error.to_string().contains("source is unavailable")
+                || error.to_string().contains("source is corrupted"),
+            "{error}"
+        );
         assert_eq!(
             target.messages().len(),
             1,
@@ -2647,6 +2998,49 @@ mod budget_tests {
         assert!(!checkpoint.source_is_intact());
         assert!(!session.restore_checkpoint(0));
         assert_eq!(session.archive_bytes(), 0);
+    }
+
+    /// Mutating an archived payload while preserving its map key is detected
+    /// by recomputing the digest on restore (issue #428).
+    #[test]
+    fn a_corrupted_archive_payload_is_rejected() {
+        let mut session = AgentSession::new();
+        for index in 0..4 {
+            session.add_user(format!("u{index}"));
+            session.add_assistant(format!("a{index}"));
+        }
+        assert!(session.install_priced_checkpoint(0, "summary") > 0);
+        let digest = session.checkpoints()[0].source_digest.clone();
+        {
+            let messages = session.archive.get_mut(&digest).expect("archived span");
+            messages[0] = Message::User {
+                content: Content::Text("tampered".to_string()),
+            };
+        }
+        assert!(matches!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Corrupted(_)
+        ));
+        assert!(!session.restore_checkpoint(0));
+
+        session.archive.remove(&digest);
+        assert_eq!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Unavailable
+        );
+        assert!(!session.restore_checkpoint(0));
+
+        session.archive.insert(
+            digest,
+            vec![Message::User {
+                content: Content::Text("short".to_string()),
+            }],
+        );
+        session.checkpoints[0].source_end += 1;
+        assert!(matches!(
+            session.checkpoint_source_status(0),
+            CheckpointSourceStatus::Corrupted(_)
+        ));
     }
 
     /// A checkpoint whose preserved span no longer matches its digest is

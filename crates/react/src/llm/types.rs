@@ -169,6 +169,12 @@ impl<'a> From<&'a String> for Content {
     }
 }
 
+impl Default for Content {
+    fn default() -> Self {
+        Content::Text(String::new())
+    }
+}
+
 impl Content {
     /// Create text content.
     pub fn text(text: impl Into<String>) -> Self {
@@ -870,6 +876,18 @@ pub struct ProviderRequest {
     pub messages: Vec<LlmMessage>,
     /// Advertised tool names, in wire order.
     pub tool_names: Vec<String>,
+    /// The complete tool definitions, in wire order.
+    pub tools: Vec<LlmTool>,
+    /// The current input this call adds.
+    pub input: Content,
+    /// Sampling temperature.
+    pub temperature: Option<f32>,
+    /// Completion token cap.
+    pub max_tokens: Option<u32>,
+    /// Reasoning effort sent to the provider.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Wire protocol for this request.
+    pub api_mode: ApiMode,
 }
 
 #[derive(Clone, Deserialize, Serialize)]

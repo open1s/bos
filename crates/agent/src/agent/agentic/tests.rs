@@ -3561,8 +3561,10 @@ fn the_provider_request_describes_the_exact_call() {
         kind: Default::default(),
         config: None,
     }];
+    let history = agent.session().messages().to_vec();
+    let input = react::llm::Content::text("current input");
     let described = agent
-        .describe_provider_request("system", &tools)
+        .describe_provider_request("system", &tools, &history, &input)
         .expect("a typed request");
     assert_eq!(described.system_prompt.as_deref(), Some("system"));
     assert_eq!(described.model, agent.config().model);
@@ -3571,6 +3573,160 @@ fn the_provider_request_describes_the_exact_call() {
         "the history rides on the request"
     );
     assert_eq!(described.tool_names, vec!["bash".to_string()]);
+    assert_eq!(described.tools.len(), 1);
+    assert_eq!(described.input, input);
+    assert!(described.temperature.is_some());
+    assert_eq!(described.api_mode, react::llm::ApiMode::Chat);
+}
+
+/// Ordinary-language constraints, decisions, open tasks, conflicts and
+/// tool-verified results must be covered; a paraphrase is accepted, an omission
+/// is rejected (issue #429).
+#[tokio::test]
+async fn compaction_rejects_omitted_ordinary_critical_facts() {
+    let source = |agent: &Agent| {
+        four_messages(agent);
+        let mut session = agent.session();
+        session.add_user("Never deploy on Friday".to_string());
+        session.add_assistant("Noted.".to_string());
+        session.add_user("DECISION: use Postgres".to_string());
+        session.add_assistant("Decided.".to_string());
+        session.add_user("TODO: migrate users".to_string());
+        session.add_assistant("Tracked.".to_string());
+        session.add_user("CONFLICT: pool 10 vs 20".to_string());
+        session.add_assistant("Open.".to_string());
+        session.add_tool_result("call-1".to_string(), "tests passed: 42".to_string());
+    };
+
+    let agent = agent_with_summary(&complete_summary("- everything is done"));
+    source(&agent);
+    let before = agent.session().messages().len();
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("omitted critical facts are rejected");
+    assert!(error.to_string().contains("critical fact"), "{error}");
+    assert_eq!(agent.session().messages().len(), before);
+
+    // A paraphrase covers the same facts without exact markers.
+    let agent = agent_with_summary(&complete_summary(
+        "- Do not deploy on Fridays; we chose Postgres; still need to migrate users; \
+         the pool conflict 10 vs 20 remains; tests passed 42",
+    ));
+    source(&agent);
+    agent
+        .compact_now(0, &signal)
+        .await
+        .expect("a faithful paraphrase installs")
+        .expect("a checkpoint");
+    let checkpoint = agent
+        .session()
+        .checkpoints()
+        .last()
+        .cloned()
+        .expect("checkpoint");
+    assert!(
+        checkpoint.coverage_complete,
+        "{:?}",
+        checkpoint.missing_facts
+    );
+    assert!(!checkpoint.facts.is_empty());
+}
+
+/// A summary marker claim with a token absent from the source is unsupported
+/// (issue #429).
+#[tokio::test]
+async fn compaction_rejects_invented_decision_claims() {
+    let agent = agent_with_summary(&complete_summary(
+        "- DECISION: use Postgres\n- DECISION: use MongoDB",
+    ));
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_user("DECISION: use Postgres".to_string());
+        session.add_assistant("Decided.".to_string());
+    }
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("invented claim rejected");
+    assert!(error.to_string().contains("unsupported"), "{error}");
+}
+
+/// A provider that records the typed request the real engine hands it.
+struct RecordingProvider {
+    seen: Arc<std::sync::Mutex<Option<react::llm::ProviderRequest>>>,
+}
+
+#[async_trait]
+impl LlmClient<AgentSession, AgentReactContext> for RecordingProvider {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<LlmResponse, LlmError> {
+        *self.seen.lock().unwrap() = req.provider_request.clone();
+        Ok(make_text_response("recorded".to_string()))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        req: LlmRequest,
+        _session: &mut AgentSession,
+        _context: &mut AgentReactContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamToken, LlmError>> + Send>>, LlmError> {
+        *self.seen.lock().unwrap() = req.provider_request.clone();
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(StreamToken::Text("recorded".to_string())),
+            Ok(StreamToken::Done),
+        ])))
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "recording-provider"
+    }
+}
+
+/// The real engine path hands the provider the complete live history and the
+/// current input, not an empty post-move session (issue #427).
+#[tokio::test]
+async fn the_engine_sends_the_live_history_in_the_typed_request() {
+    use futures::StreamExt;
+
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let mut provider = LlmProvider::new();
+    provider.register_vendor(
+        "mock".to_string(),
+        Box::new(RecordingProvider { seen: seen.clone() }),
+    );
+    let agent = Agent::new(
+        AgentConfig {
+            model: "mock-model".to_string(),
+            ..Default::default()
+        },
+        Arc::new(provider),
+    );
+    agent.set_provider_request(Some(react::llm::ProviderRequest {
+        composition: "composition-1".to_string(),
+        ..Default::default()
+    }));
+    agent.session().add_user("prior history".to_string());
+    let mut stream = agent.stream("current input");
+    while stream.next().await.is_some() {}
+    let captured = seen.lock().unwrap().clone().expect("a recorded request");
+    assert!(
+        format!("{:?}", captured.messages).contains("prior history"),
+        "the live history is present: {:?}",
+        captured.messages
+    );
+    assert_eq!(captured.input, react::llm::Content::text("current input"));
+    assert_eq!(captured.model, "mock-model");
+    assert_eq!(captured.composition, "composition-1");
 }
 
 /// A summary missing required sections is rejected before installation and
@@ -4470,6 +4626,10 @@ struct ReliabilityMetrics {
     recovery: usize,
     lossy_checkpoint_rejected: usize,
     archive_bytes: usize,
+    repeated_compaction: usize,
+    tool_evidence_rejected: usize,
+    sessions_isolated: usize,
+    provider_consistency: usize,
 }
 
 fn debug_messages(messages: &[react::llm::LlmMessage]) -> String {
@@ -4487,6 +4647,10 @@ async fn reliability_horizon_smoke_subset() {
             "restart_preserves_checkpoint".to_string(),
             "lossy_checkpoint_rejected".to_string(),
             "checkpoint_archive_bounded".to_string(),
+            "repeated_compaction_retains_facts".to_string(),
+            "tool_evidence_omission_rejected".to_string(),
+            "multi_session_isolation".to_string(),
+            "provider_request_matches_history".to_string(),
         ],
         "the checked-in corpus is the scenario list this smoke run executes"
     );
@@ -4513,11 +4677,15 @@ async fn reliability_horizon_smoke_subset() {
         Some(agent.config().model.as_str()),
         "the checkpoint records the model that wrote it"
     );
-    assert!(checkpoint.source_is_intact(), "the source digest matches");
     let index = {
         let session = agent.session();
         session.checkpoints().len() - 1
     };
+    assert_eq!(
+        agent.session().checkpoint_source_status(index),
+        crate::agent::context::CheckpointSourceStatus::Valid,
+        "the archived source digest matches"
+    );
     let source = {
         let session = agent.session();
         session
@@ -4630,12 +4798,82 @@ async fn reliability_horizon_smoke_subset() {
     assert!(archive_bytes > 0);
     metrics.archive_bytes = archive_bytes;
 
-    metrics.scenarios = 5;
-    assert_eq!(metrics.scenarios, 5);
+    // Scenario 6: a second compaction over the first checkpoint keeps the
+    // critical facts rather than laundering them away.
+    {
+        let mut session = agent.session();
+        for index in 0..6 {
+            session.add_user(format!("more {index} {}", "z".repeat(300)));
+            session.add_assistant(format!("reply {index} {}", "w".repeat(300)));
+        }
+        session.add_user("continue the budgeted archive work".to_string());
+        session.add_assistant("Understood.".to_string());
+    }
+    agent
+        .compact_now(0, &signal)
+        .await
+        .expect("second compaction runs")
+        .expect("second checkpoint");
+    let latest = agent
+        .session()
+        .checkpoints()
+        .last()
+        .cloned()
+        .expect("checkpoint");
+    assert!(latest.coverage_complete, "{:?}", latest.missing_facts);
+    metrics.repeated_compaction += 1;
+
+    // Scenario 7: a tool-verified result omitted from the summary is rejected.
+    let agent = agent_with_summary(&complete_summary("- no tool results"));
+    four_messages(&agent);
+    {
+        let mut session = agent.session();
+        session.add_tool_result("call-7".to_string(), "tests failed: 3".to_string());
+        session.add_assistant("I will inspect the failures.".to_string());
+    }
+    let error = agent
+        .compact_now(0, &signal)
+        .await
+        .expect_err("tool evidence omission rejected");
+    assert!(error.to_string().contains("critical fact"), "{error}");
+    metrics.tool_evidence_rejected += 1;
+
+    // Scenario 8: two sessions never share checkpoints or history.
+    let first = agent_with_summary(&complete_summary("- session one"));
+    let second = agent_with_summary(&complete_summary("- session two"));
+    four_messages(&first);
+    first
+        .compact_now(0, &signal)
+        .await
+        .expect("first compacts")
+        .expect("checkpoint");
+    assert_eq!(second.session().checkpoints().len(), 0);
+    assert_eq!(second.session().messages().len(), 0);
+    metrics.sessions_isolated += 1;
+
+    // Scenario 9: the typed request describes the live history and input.
+    let agent = agent_with_summary("provider");
+    agent.set_provider_request(Some(react::llm::ProviderRequest::default()));
+    agent.session().add_user("live history".to_string());
+    let history = agent.session().messages().to_vec();
+    let input = react::llm::Content::text("current input");
+    let described = agent
+        .describe_provider_request("system", &[], &history, &input)
+        .expect("typed request");
+    assert!(format!("{:?}", described.messages).contains("live history"));
+    assert_eq!(described.input, input);
+    metrics.provider_consistency += 1;
+
+    metrics.scenarios = 9;
+    assert_eq!(metrics.scenarios, 9);
     assert_eq!(metrics.constraint_retention, 1);
     assert_eq!(metrics.conflict_visibility, 1);
     assert_eq!(metrics.recovery, 2);
     assert_eq!(metrics.lossy_checkpoint_rejected, 1);
+    assert_eq!(metrics.repeated_compaction, 1);
+    assert_eq!(metrics.tool_evidence_rejected, 1);
+    assert_eq!(metrics.sessions_isolated, 1);
+    assert_eq!(metrics.provider_consistency, 1);
     assert!(metrics.archive_bytes > 0);
 }
 

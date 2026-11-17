@@ -220,6 +220,14 @@ pub(crate) struct SourceVersions {
     pub(crate) tool_guidance: Option<String>,
     /// The provider id and version, when the caller knows it.
     pub(crate) provider: Option<String>,
+    /// The provider adapter implementation/version.
+    pub(crate) provider_adapter: Option<String>,
+    /// The wire protocol/API mode.
+    pub(crate) api_mode: Option<String>,
+    /// A digest of the advertised tool schemas.
+    pub(crate) tool_schema: Option<String>,
+    /// The memory revision, when one is known.
+    pub(crate) memory_revision: Option<String>,
     /// The session identity.
     pub(crate) session: Option<String>,
     /// The turn number.
@@ -247,7 +255,7 @@ pub(crate) struct ContextFingerprint {
 }
 
 /// The current request-identity format (issue #422).
-pub(crate) const CONTEXT_FINGERPRINT_VERSION: u32 = 2;
+pub(crate) const CONTEXT_FINGERPRINT_VERSION: u32 = 3;
 
 impl ContextFingerprint {
     /// Compute both identities; `content_key` enables the content one.
@@ -258,7 +266,7 @@ impl ContextFingerprint {
     ) -> Self {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(b"bsh-context-composition-v2\0");
+        hasher.update(b"bsh-context-composition-v3\0");
         for block in blocks {
             hash_part(&mut hasher, block.source.label().as_bytes());
             hash_part(&mut hasher, trust_label(block.trust).as_bytes());
@@ -272,7 +280,11 @@ impl ContextFingerprint {
             versions.persona.as_deref(),
             versions.workspace_instructions.as_deref(),
             versions.tool_guidance.as_deref(),
+            versions.tool_schema.as_deref(),
             versions.provider.as_deref(),
+            versions.provider_adapter.as_deref(),
+            versions.api_mode.as_deref(),
+            versions.memory_revision.as_deref(),
             versions.session.as_deref(),
         ] {
             hash_part(&mut hasher, version.unwrap_or("").as_bytes());
@@ -287,10 +299,14 @@ impl ContextFingerprint {
         let composition = hex(&hasher.finalize());
 
         let mut execution_hasher = Sha256::new();
-        execution_hasher.update(b"bsh-context-execution-v2\0");
+        execution_hasher.update(b"bsh-context-execution-v3\0");
         for part in [
             versions.provider.as_deref(),
+            versions.provider_adapter.as_deref(),
+            versions.api_mode.as_deref(),
             versions.tool_guidance.as_deref(),
+            versions.tool_schema.as_deref(),
+            versions.memory_revision.as_deref(),
             versions.session.as_deref(),
         ] {
             hash_part(&mut execution_hasher, part.unwrap_or("").as_bytes());
@@ -781,6 +797,28 @@ mod tests {
             Some((b"test-key", None)),
         );
         assert_ne!(a.execution, moved_execution.execution);
+
+        // Adapter, protocol, tool schema and memory revision are part of the
+        // execution identity; presentation-only text edits are not (#432).
+        for mutate in [
+            |versions: &mut SourceVersions| {
+                versions.provider_adapter = Some("adapter/2".to_string());
+            },
+            |versions: &mut SourceVersions| {
+                versions.api_mode = Some("responses".to_string());
+            },
+            |versions: &mut SourceVersions| {
+                versions.tool_schema = Some("schema/2".to_string());
+            },
+            |versions: &mut SourceVersions| {
+                versions.memory_revision = Some("memory/2".to_string());
+            },
+        ] {
+            let mut changed = versions.clone();
+            mutate(&mut changed);
+            let moved = ContextFingerprint::compute(&blocks, &changed, Some((b"test-key", None)));
+            assert_ne!(a.execution, moved.execution);
+        }
 
         let mut moved = versions.clone();
         moved.persona = Some("rev-2".to_string());

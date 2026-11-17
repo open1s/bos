@@ -309,6 +309,92 @@ impl VerificationReport {
     }
 }
 
+/// How safely a task may be retried (issue #430).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetryPolicy {
+    /// The task has no external side effects and may be retried freely.
+    Idempotent,
+    /// The task can perform a non-idempotent external action; a retry needs
+    /// explicit confirmation.
+    NonIdempotent,
+    /// Side-effect status is unknown; a retry needs confirmation and a
+    /// compensation/recovery path.
+    #[default]
+    Unknown,
+}
+
+/// What one attempt did to the outside world (issue #430).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SideEffectStatus {
+    /// No external effect is known.
+    #[default]
+    None,
+    /// Execution started; completion is not yet known.
+    Started,
+    /// The effect completed.
+    Completed,
+    /// The effect failed or was rolled back.
+    Failed,
+    /// The attempt may have produced an effect but cannot prove it.
+    Unknown,
+}
+
+/// One persisted side-effect record, keyed by attempt id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SideEffectRecord {
+    /// The current state of the effect.
+    pub(crate) status: SideEffectStatus,
+    /// A stable idempotency key when the executor supports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) idempotency_key: Option<String>,
+    /// Human-readable evidence or description.
+    #[serde(default)]
+    pub(crate) detail: String,
+    /// When the record was last updated.
+    #[serde(default)]
+    pub(crate) recorded_ms: u64,
+}
+
+/// A review/human approval decision (issue #433).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ApprovalDecision {
+    /// The approver accepted the attempt.
+    Approved,
+    /// The approver rejected the attempt.
+    Rejected,
+}
+
+/// A structured approval bound to one attempt (issue #433).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ApprovalReference {
+    /// The attempt this approval may verify.
+    pub(crate) attempt_id: String,
+    /// The approver's identity.
+    pub(crate) approver: String,
+    /// The decision.
+    pub(crate) decision: ApprovalDecision,
+    /// What was approved (task id / artifact scope).
+    pub(crate) scope: String,
+    /// Evidence or the external approval reference.
+    pub(crate) evidence: String,
+    /// A stable external reference id.
+    pub(crate) reference: String,
+    /// When the approval was recorded.
+    pub(crate) recorded_ms: u64,
+    /// Optional expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_ms: Option<u64>,
+    /// When the approval was revoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) revoked_ms: Option<u64>,
+    /// The approval that superseded this one, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) superseded_by: Option<String>,
+}
+
 /// A task-specific verification contract (issue #414).
 ///
 /// The contract names what a deterministic verifier may check; a model's
@@ -551,6 +637,18 @@ pub(crate) struct Task {
     /// The contract a verifier must satisfy, when verification was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verification_contract: Option<VerificationContract>,
+    /// How safely this task may be retried (issue #430).
+    #[serde(default)]
+    pub(crate) retry_policy: RetryPolicy,
+    /// A stable idempotency key the executor can use to deduplicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) idempotency_key: Option<String>,
+    /// Side-effect evidence, keyed by attempt id.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) side_effects: std::collections::BTreeMap<String, SideEffectRecord>,
+    /// Review/human approvals, retained as audit history (issue #433).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) approvals: Vec<ApprovalReference>,
 }
 
 impl Task {
@@ -612,6 +710,10 @@ impl Task {
             updated_ms: now_ms,
             verification: VerificationReport::not_requested(),
             verification_contract: None,
+            retry_policy: RetryPolicy::Unknown,
+            idempotency_key: None,
+            side_effects: std::collections::BTreeMap::new(),
+            approvals: Vec::new(),
         })
     }
 
@@ -986,6 +1088,10 @@ mod tests {
             updated_ms: 1_000,
             verification: VerificationReport::not_requested(),
             verification_contract: None,
+            retry_policy: RetryPolicy::Unknown,
+            idempotency_key: None,
+            side_effects: std::collections::BTreeMap::new(),
+            approvals: Vec::new(),
         }
     }
 

@@ -1,25 +1,14 @@
 {
   "version": 1,
   "scenarios": [
-    {
-      "id": "constraint_survives_compaction",
-      "description": "An explicit constraint is preserved in the checkpoint source and restored"
-    },
-    {
-      "id": "conflicting_decisions_visible",
-      "description": "Contradictory decisions remain explicit in the preserved source"
-    },
-    {
-      "id": "restart_preserves_checkpoint",
-      "description": "Checkpoint and rebuilt history survive serialization"
-    },
-    {
-      "id": "lossy_checkpoint_rejected",
-      "description": "A summary missing required sections is rejected and leaves history intact"
-    },
-    {
-      "id": "checkpoint_archive_bounded",
-      "description": "A successful checkpoint stores its source by reference within budget"
-    }
+    { "id": "constraint_survives_compaction", "description": "An explicit constraint is preserved and restored" },
+    { "id": "conflicting_decisions_visible", "description": "Contradictory decisions remain explicit" },
+    { "id": "restart_preserves_checkpoint", "description": "Checkpoint and history survive serialization" },
+    { "id": "lossy_checkpoint_rejected", "description": "A summary missing required sections is rejected" },
+    { "id": "checkpoint_archive_bounded", "description": "Checkpoint source is archived within budget" },
+    { "id": "repeated_compaction_retains_facts", "description": "Critical facts survive successive checkpoints" },
+    { "id": "tool_evidence_omission_rejected", "description": "A summary omitting tool-verified evidence is rejected" },
+    { "id": "multi_session_isolation", "description": "Checkpoints and history stay isolated per session" },
+    { "id": "provider_request_matches_history", "description": "The typed request describes the live history and input" }
   ]
 }

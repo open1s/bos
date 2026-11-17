@@ -627,12 +627,24 @@ impl Agent {
         &self,
         system_prompt: &str,
         tools: &[react::llm::LlmTool],
+        history: &[react::llm::LlmMessage],
+        input: &react::llm::Content,
     ) -> Option<react::llm::ProviderRequest> {
         let mut request = self.provider_request()?;
         request.model = self.config.model.clone();
         request.system_prompt = Some(system_prompt.to_string());
-        request.messages = self.session().messages().to_vec();
+        request.messages = history.to_vec();
         request.tool_names = tools.iter().map(|tool| tool.name.clone()).collect();
+        request.tools = tools.to_vec();
+        request.input = input.clone();
+        request.temperature = Some(self.config.temperature);
+        request.max_tokens = self.config.max_tokens;
+        request.reasoning_effort = self
+            .config
+            .reasoning_effort
+            .as_deref()
+            .map(react::llm::ReasoningEffort::from_name);
+        request.api_mode = react::llm::ApiMode::from_name(&self.config.api_mode);
         Some(request)
     }
 

@@ -38,6 +38,10 @@ impl<'a> SessionRestore<'a> {
         }
     }
 
+    fn session(&self) -> &AgentSession {
+        self.session.as_ref().expect("a live restore session")
+    }
+
     fn session_mut(&mut self) -> &mut AgentSession {
         self.session
             .as_mut()
@@ -646,23 +650,40 @@ impl Agent {
         let system_prompt = self.system_prompt_for(&task_content, tools).await;
         let prompt_text = task_content.as_text().unwrap_or_default().to_string();
 
-        let provider_request = self.describe_provider_request(&system_prompt, tools);
-        let request = LlmRequest {
-            model: self.config.model.clone(),
-            input: task_content,
-            temperature: Some(self.config.temperature),
-            max_tokens: self.config.max_tokens,
-            reasoning_effort: self
-                .config
-                .reasoning_effort
-                .as_deref()
-                .map(react::llm::ReasoningEffort::from_name),
-            api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
-            // What the host classified this turn as: the engine applies the
-            // action contract from it, and never sends it to the provider.
-            intent: self.action_intent(),
-            provider_request,
-            ..Default::default()
+        // Snapshot the exact live history BEFORE it is moved into the
+        // request; the descriptor and the wire request must agree (issue #427).
+        let provider_request = self.describe_provider_request(
+            &system_prompt,
+            tools,
+            session_restore.session().messages(),
+            &task_content,
+        );
+        let request = match &provider_request {
+            Some(typed) => LlmRequest {
+                model: typed.model.clone(),
+                input: typed.input.clone(),
+                temperature: typed.temperature,
+                max_tokens: typed.max_tokens,
+                reasoning_effort: typed.reasoning_effort,
+                api_mode: typed.api_mode,
+                intent: self.action_intent(),
+                provider_request: Some(typed.clone()),
+                ..Default::default()
+            },
+            None => LlmRequest {
+                model: self.config.model.clone(),
+                input: task_content,
+                temperature: Some(self.config.temperature),
+                max_tokens: self.config.max_tokens,
+                reasoning_effort: self
+                    .config
+                    .reasoning_effort
+                    .as_deref()
+                    .map(react::llm::ReasoningEffort::from_name),
+                api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
+                intent: self.action_intent(),
+                ..Default::default()
+            },
         };
 
         let engine_start = std::time::Instant::now();
@@ -1078,22 +1099,38 @@ impl Agent {
                 .system_prompt_for(&task_content, context.tools.as_slice())
                 .await;
             let prompt_text = task_content.as_text().unwrap_or_default().to_string();
-            let provider_request =
-                self.describe_provider_request(&system_prompt, context.tools.as_slice());
-            let request = LlmRequest {
-                model: self.config.model.clone(),
-                input: task_content,
-                temperature: Some(self.config.temperature),
-                max_tokens: self.config.max_tokens,
-                reasoning_effort: self
-                    .config
-                    .reasoning_effort
-                    .as_deref()
-                    .map(react::llm::ReasoningEffort::from_name),
-                api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
-                intent: self.action_intent(),
-                provider_request,
-                ..Default::default()
+            let provider_request = self.describe_provider_request(
+                &system_prompt,
+                context.tools.as_slice(),
+                session_restore.session().messages(),
+                &task_content,
+            );
+            let request = match &provider_request {
+                Some(typed) => LlmRequest {
+                    model: typed.model.clone(),
+                    input: typed.input.clone(),
+                    temperature: typed.temperature,
+                    max_tokens: typed.max_tokens,
+                    reasoning_effort: typed.reasoning_effort,
+                    api_mode: typed.api_mode,
+                    intent: self.action_intent(),
+                    provider_request: Some(typed.clone()),
+                    ..Default::default()
+                },
+                None => LlmRequest {
+                    model: self.config.model.clone(),
+                    input: task_content,
+                    temperature: Some(self.config.temperature),
+                    max_tokens: self.config.max_tokens,
+                    reasoning_effort: self
+                        .config
+                        .reasoning_effort
+                        .as_deref()
+                        .map(react::llm::ReasoningEffort::from_name),
+                    api_mode: react::llm::ApiMode::from_name(&self.config.api_mode),
+                    intent: self.action_intent(),
+                    ..Default::default()
+                },
             };
 
             // The terminal token is held back until the run's bookkeeping has
