@@ -328,19 +328,78 @@ pub(crate) enum RetryPolicy {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SideEffectStatus {
-    /// No external effect is known.
+    /// The attempt has not started.
     #[default]
-    None,
+    #[serde(rename = "none", alias = "not_started")]
+    NotStarted,
     /// Execution started; completion is not yet known.
     Started,
     /// The effect completed.
     Completed,
-    /// The effect failed or was rolled back.
+    /// The effect failed, but failure does not prove there was no side effect.
     Failed,
-    /// A compensation path ran successfully.
+    /// A compensation command is currently running.
+    Compensating,
+    /// A compensation command ran, without independent verification.
     Compensated,
+    /// Compensation was independently verified.
+    Verified,
     /// The attempt may have produced an effect but cannot prove it.
     Unknown,
+}
+
+/// One compensation execution and its verification (issue #430).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompensationRecord {
+    /// The command that performed the compensation.
+    pub(crate) command: String,
+    /// An optional independent verification command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verification: Option<String>,
+    /// The compensation command's exit code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) exit_code: Option<i32>,
+    /// Whether the verification command ran and passed.
+    #[serde(default)]
+    pub(crate) verified: bool,
+    /// When the record was last updated.
+    pub(crate) recorded_ms: u64,
+    /// A bounded summary of the compensation output.
+    #[serde(default)]
+    pub(crate) output: String,
+}
+
+/// The host's assessment of the original attempt's side effects (issue #430).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetrySideEffectState {
+    /// The original operation did not happen.
+    NoEffect,
+    /// The original operation completed.
+    Completed,
+    /// The original operation partially executed.
+    Partial,
+    /// The current external state is unknown.
+    Unknown,
+}
+
+/// A host/UI authorization to retry a risky attempt (issue #430).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RetryAuthorization {
+    /// Who authorized the retry.
+    pub(crate) approved_by: String,
+    /// Why the retry is safe under the assessed state.
+    pub(crate) reason: String,
+    /// The host's side-effect assessment.
+    pub(crate) side_effect_state: RetrySideEffectState,
+    /// The compensation command for Partial/Unknown states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compensation_command: Option<String>,
+    /// The independent command that verifies compensation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compensation_verification: Option<String>,
+    /// When authorization was granted.
+    pub(crate) approved_ms: u64,
 }
 
 /// One persisted side-effect record, keyed by attempt id.
@@ -357,6 +416,9 @@ pub(crate) struct SideEffectRecord {
     /// When the record was last updated.
     #[serde(default)]
     pub(crate) recorded_ms: u64,
+    /// Compensation execution/verification, when one was attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compensation: Option<CompensationRecord>,
 }
 
 /// A review/human approval decision (issue #433).
@@ -651,6 +713,13 @@ pub(crate) struct Task {
     /// Review/human approvals, retained as audit history (issue #433).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) approvals: Vec<ApprovalReference>,
+    /// Host retry authorizations, retained as audit history (issue #430).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) retry_authorizations: Vec<RetryAuthorization>,
+    /// Results recorded by idempotency key, so the same key never repeats an
+    /// external effect (issue #430).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) idempotency_results: std::collections::BTreeMap<String, String>,
 }
 
 impl Task {
@@ -716,6 +785,8 @@ impl Task {
             idempotency_key: None,
             side_effects: std::collections::BTreeMap::new(),
             approvals: Vec::new(),
+            retry_authorizations: Vec::new(),
+            idempotency_results: std::collections::BTreeMap::new(),
         })
     }
 
@@ -1094,6 +1165,8 @@ mod tests {
             idempotency_key: None,
             side_effects: std::collections::BTreeMap::new(),
             approvals: Vec::new(),
+            retry_authorizations: Vec::new(),
+            idempotency_results: std::collections::BTreeMap::new(),
         }
     }
 

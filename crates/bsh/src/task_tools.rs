@@ -270,14 +270,6 @@ fn attach_retry(agent: &mut Agent, context: TaskToolsContext) {
                 "task": {
                     "type": "string",
                     "description": "The task id returned by task_create."
-                },
-                "confirm_side_effects": {
-                    "type": "boolean",
-                    "description": "Confirm that a non-idempotent or unknown-side-effect attempt may be repeated."
-                },
-                "compensation": {
-                    "type": "string",
-                    "description": "The recovery/compensation path for an unknown-side-effect retry."
                 }
             },
             "required": ["task"]
@@ -593,6 +585,25 @@ pub(crate) fn reconcile(
             continue;
         }
         let Some(run) = attempt.run.clone() else {
+            // The attempt was persisted before its run started, or the process
+            // died before the run id was saved. It is not safe to re-execute.
+            task.status = TaskStatus::Interrupted;
+            task.updated_ms = now;
+            if let Some(attempt) = task.attempts.last_mut() {
+                attempt.status = AttemptStatus::Interrupted;
+                attempt.ended_ms = Some(now);
+                attempt.error = Some("process died before the run was recorded".to_string());
+            }
+            if let Some(attempt) = task.attempts.last() {
+                if let Some(effect) = task.side_effects.get_mut(&attempt.id) {
+                    effect.status = tasks::SideEffectStatus::Unknown;
+                    effect.detail =
+                        "attempt was interrupted before its run was recorded".to_string();
+                    effect.recorded_ms = now;
+                }
+            }
+            let _ = FileTasksStore.save(workspace, &task);
+            changed += 1;
             continue;
         };
         let live = match task.tier {
@@ -626,11 +637,34 @@ pub(crate) fn reconcile(
     changed
 }
 
-/// Start a new attempt for a settled task.
+/// Start a new attempt for a settled task (model-facing path).
+///
+/// Non-idempotent or unknown-side-effect tasks require a host/UI
+/// authorization; a model cannot pass its own confirmation boolean.
 pub(crate) async fn retry_with(
     runs: &Runs,
     context: &TaskToolsContext,
     args: &Value,
+) -> Result<Value, ToolError> {
+    retry_inner(runs, context, args, None).await
+}
+
+/// Start a retry under a trusted host/UI authorization (issue #430).
+#[allow(dead_code)] // host/UI entry point; the model tool never calls it
+pub(crate) async fn retry_with_authorization(
+    runs: &Runs,
+    context: &TaskToolsContext,
+    args: &Value,
+    authorization: tasks::RetryAuthorization,
+) -> Result<Value, ToolError> {
+    retry_inner(runs, context, args, Some(authorization)).await
+}
+
+async fn retry_inner(
+    runs: &Runs,
+    context: &TaskToolsContext,
+    args: &Value,
+    authorization: Option<tasks::RetryAuthorization>,
 ) -> Result<Value, ToolError> {
     let id = args
         .get("task")
@@ -644,6 +678,37 @@ pub(crate) async fn retry_with(
     else {
         return Err(ToolError::Failed(format!("unknown task {id}")));
     };
+    let now = crate::settings::unix_now().saturating_mul(1_000);
+    // A Queued/Running attempt with no recorded run id is a crash remnant,
+    // not a live run: mark it Interrupted and require a fresh authorization.
+    let mut reconciled = false;
+    if let Some(attempt) = record.attempts.last() {
+        if matches!(
+            attempt.status,
+            AttemptStatus::Queued | AttemptStatus::Running
+        ) && attempt.run.is_none()
+        {
+            let attempt_id = attempt.id.clone();
+            if let Some(attempt) = record.attempts.last_mut() {
+                attempt.status = AttemptStatus::Interrupted;
+                attempt.ended_ms = Some(now);
+                attempt.error = Some("process died before the run was recorded".to_string());
+            }
+            if let Some(effect) = record.side_effects.get_mut(&attempt_id) {
+                effect.status = tasks::SideEffectStatus::Unknown;
+                effect.detail = "attempt was interrupted before its run was recorded".to_string();
+                effect.recorded_ms = now;
+            }
+            record.status = TaskStatus::Interrupted;
+            record.updated_ms = now;
+            reconciled = true;
+        }
+    }
+    if reconciled {
+        FileTasksStore
+            .save(&context.workspace, &record)
+            .map_err(|error| ToolError::Failed(format!("the task could not be saved: {error}")))?;
+    }
     if record.active_attempt().is_some() {
         return Err(ToolError::Failed(
             "the task still has a live attempt; stop it before retrying".to_string(),
@@ -654,86 +719,210 @@ pub(crate) async fn retry_with(
             "the task has used all of its attempts".to_string(),
         ));
     }
-    // Retry safety is derived from the current attempt's persisted side-effect
-    // evidence, not from task-level status (issue #430).
-    let current_effect = record
-        .attempts
-        .last()
-        .and_then(|attempt| record.side_effects.get(&attempt.id));
-    let confirmed = args
-        .get("confirm_side_effects")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let compensation = args
-        .get("compensation")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
+    // Idempotency dedup: a completed key returns its recorded result without
+    // executing again; an in-flight/unknown key is refused (issue #430).
+    if let Some(key) = record.idempotency_key.clone() {
+        if let Some(result) = record.idempotency_results.get(&key).cloned() {
+            return Ok(json!({
+                "task": id,
+                "state": "succeeded",
+                "deduplicated": true,
+                "result": result,
+            }));
+        }
+        let prior = record.side_effects.values().any(|effect| {
+            effect.idempotency_key.as_deref() == Some(key.as_str())
+                && !matches!(
+                    effect.status,
+                    tasks::SideEffectStatus::NotStarted | tasks::SideEffectStatus::Failed
+                )
+        });
+        if prior {
+            return Err(ToolError::Failed(format!(
+                "idempotency key {key} was already started or completed; refusing to repeat the external effect"
+            )));
+        }
+    }
     match record.retry_policy {
         tasks::RetryPolicy::Idempotent => {}
-        tasks::RetryPolicy::NonIdempotent => {
-            let risky = current_effect
-                .map(|effect| {
-                    matches!(
-                        effect.status,
-                        tasks::SideEffectStatus::Started
-                            | tasks::SideEffectStatus::Completed
-                            | tasks::SideEffectStatus::Unknown
-                    )
-                })
-                .unwrap_or(false);
-            if risky && !confirmed {
+        tasks::RetryPolicy::NonIdempotent | tasks::RetryPolicy::Unknown => {
+            // A model-facing retry never carries this: authorization is a
+            // host/UI API value, not a boolean in the tool input.
+            let Some(authorization) = authorization else {
                 return Err(ToolError::Failed(
-                    "this non-idempotent task may already have produced a side effect; pass confirm_side_effects=true after verifying or compensating it".to_string(),
+                    "this task requires host authorization to retry; confirm_side_effects is not accepted from the model".to_string(),
+                ));
+            };
+            if authorization.approved_by.trim().is_empty() || authorization.reason.trim().is_empty()
+            {
+                return Err(ToolError::InvalidInput(
+                    "retry authorization needs an approver and a reason".to_string(),
                 ));
             }
-        }
-        tasks::RetryPolicy::Unknown => {
-            let risky = current_effect
-                .map(|effect| effect.status != tasks::SideEffectStatus::None)
-                .unwrap_or(false);
-            if risky && (!confirmed || compensation.is_empty()) {
+            if authorization.side_effect_state == tasks::RetrySideEffectState::Completed {
                 return Err(ToolError::Failed(
-                    "this task's side-effect status is unknown; pass confirm_side_effects=true and a compensation/recovery command before retrying".to_string(),
+                    "the host reports the original side effect completed; retrying a non-idempotent operation would duplicate it".to_string(),
                 ));
             }
-            if risky && confirmed && !compensation.is_empty() {
-                // Compensation is executed through the same controlled shell
-                // as verification; a string is not accepted as proof.
+            if matches!(
+                authorization.side_effect_state,
+                tasks::RetrySideEffectState::Partial | tasks::RetrySideEffectState::Unknown
+            ) {
+                let compensation = authorization
+                    .compensation_command
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::InvalidInput(
+                            "partial/unknown side effects need a compensation command".to_string(),
+                        )
+                    })?
+                    .to_string();
+                let verification = authorization
+                    .compensation_verification
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::InvalidInput(
+                            "partial/unknown side effects need an independent compensation verification command".to_string(),
+                        )
+                    })?
+                    .to_string();
+                let attempt_id = record
+                    .attempts
+                    .last()
+                    .map(|attempt| attempt.id.clone())
+                    .ok_or_else(|| ToolError::Failed("the task has no attempt".to_string()))?;
+                record.retry_authorizations.push(authorization.clone());
                 let Some(bash) = context.bash.clone() else {
                     return Err(ToolError::Failed(
-                        "no controlled shell is available to run the compensation command"
-                            .to_string(),
+                        "no controlled shell is available to run compensation".to_string(),
                     ));
                 };
-                let response = bash
-                    .run(&json!({ "command": compensation }))
-                    .map_err(|error| {
-                        ToolError::Failed(format!("the compensation command failed: {error:?}"))
+                let run_command = |command: &str| -> Result<(bool, i32, String), ToolError> {
+                    let response = bash.run(&json!({ "command": command })).map_err(|error| {
+                        ToolError::Failed(format!("the command could not run: {error:?}"))
                     })?;
-                let succeeded = response
-                    .get("exit_code")
-                    .and_then(Value::as_i64)
-                    .map(|code| code == 0)
-                    .or_else(|| response.get("success").and_then(Value::as_bool))
-                    .unwrap_or(false);
-                if !succeeded {
+                    let code = response
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(-1) as i32;
+                    let ok = response
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .map(|code| code == 0)
+                        .unwrap_or_else(|| {
+                            response
+                                .get("success")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                        });
+                    let output = response
+                        .get("stdout")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .chars()
+                        .take(2000)
+                        .collect();
+                    Ok((ok, code, output))
+                };
+                if let Some(effect) = record.side_effects.get_mut(&attempt_id) {
+                    effect.status = tasks::SideEffectStatus::Compensating;
+                    effect.compensation = Some(tasks::CompensationRecord {
+                        command: compensation.clone(),
+                        verification: Some(verification.clone()),
+                        exit_code: None,
+                        verified: false,
+                        recorded_ms: now,
+                        output: String::new(),
+                    });
+                    effect.detail = "compensation started".to_string();
+                }
+                FileTasksStore
+                    .save(&context.workspace, &record)
+                    .map_err(|error| {
+                        ToolError::Failed(format!("the task could not be saved: {error}"))
+                    })?;
+                let (comp_ok, comp_code, comp_output) = run_command(&compensation)?;
+                if let Some(effect) = record.side_effects.get_mut(&attempt_id) {
+                    if let Some(comp) = effect.compensation.as_mut() {
+                        comp.exit_code = Some(comp_code);
+                        comp.output = comp_output.clone();
+                        comp.recorded_ms = now;
+                    }
+                    effect.status = if comp_ok {
+                        tasks::SideEffectStatus::Compensated
+                    } else {
+                        tasks::SideEffectStatus::Unknown
+                    };
+                    effect.detail = if comp_ok {
+                        "compensation command exited 0; awaiting verification".to_string()
+                    } else {
+                        "compensation command failed; state remains unknown".to_string()
+                    };
+                }
+                FileTasksStore
+                    .save(&context.workspace, &record)
+                    .map_err(|error| {
+                        ToolError::Failed(format!("the task could not be saved: {error}"))
+                    })?;
+                if !comp_ok {
                     return Err(ToolError::Failed(
-                        "the compensation command did not succeed; the retry is refused"
+                        "the compensation command failed; the retry is refused".to_string(),
+                    ));
+                }
+                let (verify_ok, verify_code, verify_output) = run_command(&verification)?;
+                if let Some(effect) = record.side_effects.get_mut(&attempt_id) {
+                    if let Some(comp) = effect.compensation.as_mut() {
+                        comp.verified = verify_ok;
+                        comp.output = format!(
+                            "{comp_output}
+--- verify ({verify_code}) ---
+{verify_output}"
+                        );
+                        comp.recorded_ms = now;
+                    }
+                    effect.status = if verify_ok {
+                        tasks::SideEffectStatus::Verified
+                    } else {
+                        tasks::SideEffectStatus::Compensated
+                    };
+                    effect.detail = if verify_ok {
+                        "compensation independently verified".to_string()
+                    } else {
+                        "compensation ran but verification failed".to_string()
+                    };
+                }
+                FileTasksStore
+                    .save(&context.workspace, &record)
+                    .map_err(|error| {
+                        ToolError::Failed(format!("the task could not be saved: {error}"))
+                    })?;
+                if !verify_ok {
+                    return Err(ToolError::Failed(
+                        "compensation verification failed; the task is not marked recovered"
                             .to_string(),
                     ));
                 }
-                if let Some(attempt) = record.attempts.last() {
-                    if let Some(effect) = record.side_effects.get_mut(&attempt.id) {
-                        effect.status = tasks::SideEffectStatus::Compensated;
-                        effect.detail = format!("compensation ran: {compensation}");
-                        effect.recorded_ms = crate::settings::unix_now().saturating_mul(1_000);
-                    }
-                }
+            } else {
+                record.retry_authorizations.push(authorization.clone());
             }
         }
     }
     let now = crate::settings::unix_now().saturating_mul(1_000);
+    // Persist the attempt BEFORE starting the run. A crash between these two
+    // steps leaves a Queued attempt with no run id that reconciliation marks
+    // Interrupted; it is never silently re-executed (issue #430).
+    let attempt_id = format!("{}-{}", record.id, record.attempts.len() + 1);
+    let mut queued = Attempt::queued(attempt_id.clone(), record.tier);
+    queued.status = AttemptStatus::Queued;
+    record.attempts.push(queued);
+    record.updated_ms = now;
+    FileTasksStore
+        .save(&context.workspace, &record)
+        .map_err(|error| ToolError::Failed(format!("the task could not be saved: {error}")))?;
     let run = match record.tier {
         Tier::Turn => {
             let spec = RunSpec {
@@ -765,6 +954,12 @@ pub(crate) async fn retry_with(
                 return Err(ToolError::Failed(
                     "the task has no command to run".to_string(),
                 ));
+            };
+            let command = match record.idempotency_key.as_deref() {
+                Some(key) if !command.contains("BSH_IDEMPOTENCY_KEY=") => {
+                    with_idempotency(&command, key)
+                }
+                _ => command,
             };
             let Some(bash) = context.bash.clone() else {
                 return Err(ToolError::Failed(
@@ -808,12 +1003,11 @@ pub(crate) async fn retry_with(
             ));
         }
     };
-    let attempt_id = format!("{}-{}", record.id, record.attempts.len() + 1);
-    let mut attempt = Attempt::queued(attempt_id, record.tier);
-    attempt.run = Some(run.clone());
-    attempt.status = AttemptStatus::Running;
-    attempt.started_ms = Some(now);
-    record.attempts.push(attempt);
+    if let Some(attempt) = record.attempts.last_mut() {
+        attempt.run = Some(run.clone());
+        attempt.status = AttemptStatus::Running;
+        attempt.started_ms = Some(now);
+    }
     mark_attempt_pending(&mut record);
     mark_side_effect_started(&mut record);
     record.status = TaskStatus::Running;
@@ -846,6 +1040,8 @@ fn task_json(task: &Task) -> Value {
         "retry_policy": task.retry_policy,
         "idempotency_key": task.idempotency_key,
         "side_effects": task.side_effects,
+        "retry_authorizations": task.retry_authorizations,
+        "idempotency_results": task.idempotency_results,
         "approvals": task.approvals,
         "next_fire_ms": task.trigger.next_fire_ms(),
         "created_ms": task.created_ms,
@@ -1253,6 +1449,16 @@ fn parse_retry_policy(args: &Value) -> Result<tasks::RetryPolicy, ToolError> {
     }
 }
 
+/// Shell-quote one value for an environment assignment (issue #430).
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Prefix a job command with the idempotency key so the executor can dedup.
+fn with_idempotency(command: &str, key: &str) -> String {
+    format!("BSH_IDEMPOTENCY_KEY={} {}", shell_quote(key), command)
+}
+
 /// Record that an attempt started and may have external effects.
 fn mark_side_effect_started(task: &mut Task) {
     let Some(attempt) = task.attempts.last() else {
@@ -1271,6 +1477,7 @@ fn mark_side_effect_started(task: &mut Task) {
             idempotency_key: task.idempotency_key.clone(),
             detail: format!("attempt {} started", attempt.id),
             recorded_ms: crate::settings::unix_now().saturating_mul(1_000),
+            compensation: None,
         },
     );
 }
@@ -1564,6 +1771,10 @@ pub(crate) async fn create_with(
                 "the shell tool is not available in this turn".to_string(),
             ));
         };
+        let command = match task.idempotency_key.as_deref() {
+            Some(key) => with_idempotency(command, key),
+            None => command.to_string(),
+        };
         let response = bash
             .run(&json!({ "command": command, "run_in_background": true }))
             .map_err(|error| {
@@ -1574,7 +1785,7 @@ pub(crate) async fn create_with(
                 "the shell did not report a job id".to_string(),
             ));
         };
-        task.command = Some(command.to_string());
+        task.command = Some(command);
         let mut attempt = Attempt::queued(format!("{id}-1"), Tier::Job);
         attempt.run = Some(job.to_string());
         attempt.status = AttemptStatus::Running;
@@ -1603,10 +1814,12 @@ pub(crate) async fn create_with(
         // A scheduled job or delegation stores what it will need when its
         // clock fires; the dispatcher starts it later.
         if tier == Tier::Job {
-            task.command = args
-                .get("command")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            task.command = args.get("command").and_then(Value::as_str).map(|command| {
+                match task.idempotency_key.as_deref() {
+                    Some(key) => with_idempotency(command, key),
+                    None => command.to_string(),
+                }
+            });
             if task
                 .command
                 .as_deref()
@@ -1958,6 +2171,19 @@ pub(crate) async fn join_with(
                 if let Some(attempt) = record.attempts.last_mut() {
                     attempt.verification = report;
                 }
+            }
+        }
+        // Record a completed idempotency key so a later retry can return the
+        // same result without executing the external effect again (#430).
+        if record.status == TaskStatus::Succeeded {
+            if let (Some(key), Some(result)) = (
+                record.idempotency_key.clone(),
+                record
+                    .attempts
+                    .last()
+                    .and_then(|attempt| attempt.result.clone()),
+            ) {
+                record.idempotency_results.entry(key).or_insert(result);
             }
         }
         let _ = FileTasksStore.save(&context.workspace, record);
@@ -2663,7 +2889,10 @@ mod tests {
         let error = retry_with(&runs, &context, &json!({"task": id}))
             .await
             .expect_err("retry refused");
-        assert!(format!("{error:?}").contains("non-idempotent"), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("host authorization"),
+            "{error:?}"
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -3427,6 +3656,7 @@ mod tests {
         task.target = Some("node-b".to_string());
         task.capability = Some("review".to_string());
         task.input = Some(json!({"path": "src"}));
+        task.retry_policy = tasks::RetryPolicy::Idempotent;
         task.status = TaskStatus::Failed;
         let mut attempt = Attempt::queued("a1", Tier::Delegation);
         attempt.status = AttemptStatus::Failed;
@@ -3828,217 +4058,22 @@ mod tests {
     }
 
     /// Non-idempotent and unknown-side-effect retries require explicit
-    /// confirmation; idempotent retries do not (issue #430).
+    /// The retry protocol: host authorization, compensation verification and
+    /// idempotency-key dedup (issue #430).
     #[tokio::test]
     async fn retry_policy_guards_repeated_side_effects() {
-        let mut context = context("retry-policy");
+        let mut context = context("retry-protocol");
         context.bash = Some(std::sync::Arc::new(
             agent::tools::BashTool::new("bash")
                 .with_workspace(context.workspace.to_str().expect("utf-8 workspace")),
         ));
         let fake = Fake::new();
         let runs = Runs::with(fake.clone());
+
         let value = create_with(
             &runs,
             &context,
             &json!({"intent": "Deploy", "retry_policy": "non-idempotent"}),
-        )
-        .await
-        .expect("created");
-        let id = value["task"].as_str().expect("id").to_string();
-        {
-            let mut runs = fake.runs.lock().expect("runs");
-            let snapshot = runs.get_mut("run-1").expect("run");
-            snapshot.state = RunState::Succeeded;
-        }
-        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
-            .await
-            .expect("join");
-        let settled = FileTasksStore
-            .load(&context.workspace, &id)
-            .expect("load")
-            .expect("record");
-        assert_eq!(settled.retry_policy, tasks::RetryPolicy::NonIdempotent);
-        assert_eq!(
-            settled
-                .side_effects
-                .values()
-                .next()
-                .map(|effect| effect.status),
-            Some(tasks::SideEffectStatus::Completed)
-        );
-
-        let denied = retry_with(&runs, &context, &json!({"task": id.clone()}))
-            .await
-            .expect_err("unconfirmed non-idempotent retry refused");
-        assert!(format!("{denied:?}").contains("non-idempotent"));
-
-        retry_with(
-            &runs,
-            &context,
-            &json!({"task": id.clone(), "confirm_side_effects": true}),
-        )
-        .await
-        .expect("confirmed retry");
-
-        let unknown = create_with(&runs, &context, &json!({"intent": "Unknown effect"}))
-            .await
-            .expect("created");
-        let unknown_id = unknown["task"].as_str().expect("id").to_string();
-        {
-            let mut runs = fake.runs.lock().expect("runs");
-            let snapshot = runs.get_mut("run-3").expect("third run");
-            // A failed execution may still have produced a partial effect.
-            snapshot.state = RunState::Failed;
-        }
-        join_with(&runs, &context, &json!({"tasks": [unknown_id.clone()]}))
-            .await
-            .expect("join");
-        let denied = retry_with(
-            &runs,
-            &context,
-            &json!({"task": unknown_id.clone(), "confirm_side_effects": true}),
-        )
-        .await
-        .expect_err("unknown effect needs a compensation path");
-        assert!(format!("{denied:?}").contains("compensation"));
-        retry_with(
-            &runs,
-            &context,
-            &json!({
-                "task": unknown_id,
-                "confirm_side_effects": true,
-                "compensation": "echo rolled-back > compensated.txt"
-            }),
-        )
-        .await
-        .expect("compensated retry");
-        assert!(
-            context.workspace.join("compensated.txt").exists(),
-            "the compensation command actually ran"
-        );
-        let reconciled = FileTasksStore
-            .load(&context.workspace, &unknown_id)
-            .expect("load")
-            .expect("record");
-        assert!(
-            reconciled
-                .side_effects
-                .values()
-                .any(|effect| effect.status == tasks::SideEffectStatus::Compensated),
-            "compensation is recorded"
-        );
-        let _ = std::fs::remove_dir_all(&context.workspace);
-    }
-
-    /// Every checked-in task scenario is executed through the real task paths
-    /// (issue #431), not merely asserted from the fixture.
-    #[tokio::test]
-    async fn task_reliability_corpus_executes() {
-        let corpus: Value =
-            serde_json::from_str(include_str!("../tests/data/reliability_tasks.json"))
-                .expect("corpus parses");
-        let context = context("task-corpus");
-        let fake = Fake::new();
-        let runs = Runs::with(fake);
-        for scenario in corpus["scenarios"].as_array().expect("scenarios") {
-            match scenario["id"].as_str().expect("id") {
-                "contract_creation_persists" => {
-                    let value = create_with(
-                        &runs,
-                        &context,
-                        &json!({
-                            "intent": "corpus contract",
-                            "retry_policy": "idempotent",
-                            "verification_contract": {"kind": "artifact", "path": "artifact.txt"}
-                        }),
-                    )
-                    .await
-                    .expect("created");
-                    let task = FileTasksStore
-                        .load(&context.workspace, value["task"].as_str().expect("id"))
-                        .expect("load")
-                        .expect("record");
-                    assert!(task.verification_contract.is_some());
-                    assert_eq!(task.verification.status, VerificationStatus::Pending);
-                }
-                "attempt_binding_isolated" => {
-                    let value = create_with(
-                        &runs,
-                        &context,
-                        &json!({
-                            "intent": "corpus binding",
-                            "retry_policy": "idempotent",
-                            "verification_contract": {"kind": "review"}
-                        }),
-                    )
-                    .await
-                    .expect("created");
-                    let task = FileTasksStore
-                        .load(&context.workspace, value["task"].as_str().expect("id"))
-                        .expect("load")
-                        .expect("record");
-                    let attempt = task.attempts.last().expect("attempt");
-                    assert_eq!(
-                        attempt.verification.attempt_id.as_deref(),
-                        Some(attempt.id.as_str())
-                    );
-                }
-                "sandbox_timeout_stops_command" => {
-                    let shell: VerificationShell = std::sync::Arc::new(|_| {
-                        Err("controlled runtime stopped the command".into())
-                    });
-                    let report = verify_contract(
-                        &VerificationContract::Command {
-                            command: "sleep 5".to_string(),
-                        },
-                        &context.workspace,
-                        Some(&shell),
-                    )
-                    .await;
-                    assert_ne!(report.status, VerificationStatus::Passed);
-                }
-                "artifact_symlink_escape_refused" => {
-                    #[cfg(unix)]
-                    {
-                        std::fs::write(context.workspace.join("artifact.txt"), "done")
-                            .expect("artifact");
-                        let link = context.workspace.join("escape.txt");
-                        let _ = std::fs::remove_file(&link);
-                        std::os::unix::fs::symlink("/etc/passwd", &link).expect("symlink");
-                        let report = verify_contract(
-                            &VerificationContract::Artifact {
-                                path: "escape.txt".to_string(),
-                                digest: None,
-                            },
-                            &context.workspace,
-                            None,
-                        )
-                        .await;
-                        assert_eq!(report.status, VerificationStatus::Failed);
-                    }
-                }
-                other => panic!("unhandled corpus scenario {other}"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&context.workspace);
-    }
-
-    /// Review/human approvals bind to one attempt, can be revoked/expired,
-    /// and never verify a later retry (issue #433).
-    #[tokio::test]
-    async fn approvals_verify_only_their_attempt() {
-        let context = context("approvals");
-        let fake = Fake::new();
-        let runs = Runs::with(fake.clone());
-        let value = create_with(
-            &runs,
-            &context,
-            &json!({
-                "intent": "Approve the release",
-                "retry_policy": "idempotent",
-                "verification_contract": {"kind": "human"}
-            }),
         )
         .await
         .expect("created");
@@ -4050,134 +4085,260 @@ mod tests {
         join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
             .await
             .expect("join");
-        let task = FileTasksStore
+        let settled = FileTasksStore
             .load(&context.workspace, &id)
             .expect("load")
             .expect("record");
-        assert_eq!(task.verification.status, VerificationStatus::Inconclusive);
+        assert_eq!(
+            settled
+                .side_effects
+                .values()
+                .next()
+                .map(|effect| effect.status),
+            Some(tasks::SideEffectStatus::Completed)
+        );
 
-        let error = approve_with(
+        let denied = retry_with(
+            &runs,
             &context,
-            &json!({"task": id, "approver": "model", "evidence": "x", "reference": "r"}),
+            &json!({"task": id.clone(), "confirm_side_effects": true}),
         )
-        .expect_err("model cannot self-approve");
-        assert!(format!("{error:?}").contains("cannot approve"));
+        .await
+        .expect_err("model confirmation refused");
+        assert!(
+            format!("{denied:?}").contains("host authorization"),
+            "{denied:?}"
+        );
 
-        let approved = approve_with(
+        retry_with_authorization(
+            &runs,
             &context,
-            &json!({
-                "task": id,
-                "approver": "alice",
-                "decision": "approved",
-                "scope": id,
-                "evidence": "reviewed the artifact",
-                "reference": "approval-1"
-            }),
+            &json!({"task": id.clone()}),
+            tasks::RetryAuthorization {
+                approved_by: "reader".to_string(),
+                reason: "verified the deploy never ran".to_string(),
+                side_effect_state: tasks::RetrySideEffectState::NoEffect,
+                compensation_command: None,
+                compensation_verification: None,
+                approved_ms: 1,
+            },
         )
-        .expect("approval recorded");
-        let attempt_one = approved["approvals"][0]["attempt_id"]
-            .as_str()
-            .expect("attempt")
-            .to_string();
-        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
-            .await
-            .expect("join");
-        let task = FileTasksStore
-            .load(&context.workspace, &id)
-            .expect("load")
-            .expect("record");
-        assert_eq!(task.verification.status, VerificationStatus::Passed);
-        assert!(task.verified_completion());
+        .await
+        .expect("authorized retry");
 
-        retry_with(&runs, &context, &json!({"task": id.clone()}))
-            .await
-            .expect("retry");
+        let value = create_with(
+            &runs,
+            &context,
+            &json!({"intent": "Deploy again", "retry_policy": "non-idempotent"}),
+        )
+        .await
+        .expect("created");
+        let second = value["task"].as_str().expect("id").to_string();
         {
             let mut runs = fake.runs.lock().expect("runs");
-            runs.get_mut("run-2").expect("second run").state = RunState::Succeeded;
+            runs.get_mut("run-3").expect("run").state = RunState::Succeeded;
         }
-        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+        join_with(&runs, &context, &json!({"tasks": [second.clone()]}))
             .await
             .expect("join");
-        let task = FileTasksStore
-            .load(&context.workspace, &id)
-            .expect("load")
-            .expect("record");
-        assert_eq!(
-            task.verification.status,
-            VerificationStatus::Inconclusive,
-            "attempt one's approval cannot verify attempt two"
-        );
-        let attempt_two = task.attempts.last().expect("attempt").id.clone();
-        approve_with(
+        let denied = retry_with_authorization(
+            &runs,
             &context,
-            &json!({
-                "task": id,
-                "attempt_id": attempt_two,
-                "approver": "alice",
-                "decision": "approved",
-                "evidence": "reviewed the retry",
-                "reference": "approval-2"
-            }),
+            &json!({"task": second}),
+            tasks::RetryAuthorization {
+                approved_by: "reader".to_string(),
+                reason: "try again".to_string(),
+                side_effect_state: tasks::RetrySideEffectState::Completed,
+                compensation_command: None,
+                compensation_verification: None,
+                approved_ms: 1,
+            },
         )
-        .expect("second approval");
-        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
-            .await
-            .expect("join");
-        let task = FileTasksStore
-            .load(&context.workspace, &id)
-            .expect("load")
-            .expect("record");
-        assert_eq!(task.verification.status, VerificationStatus::Passed);
-        assert_eq!(task.approvals.len(), 2, "audit history retained");
+        .await
+        .expect_err("completed effect denied");
+        assert!(format!("{denied:?}").contains("duplicate"), "{denied:?}");
 
-        approve_with(
-            &context,
-            &json!({"task": id, "revoke": true, "reference": "approval-2"}),
-        )
-        .expect("revoked");
-        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+        let unknown = create_with(&runs, &context, &json!({"intent": "Unknown effect"}))
+            .await
+            .expect("created");
+        let unknown_id = unknown["task"].as_str().expect("id").to_string();
+        {
+            let mut runs = fake.runs.lock().expect("runs");
+            runs.get_mut("run-4").expect("run").state = RunState::Failed;
+        }
+        join_with(&runs, &context, &json!({"tasks": [unknown_id.clone()]}))
             .await
             .expect("join");
-        let task = FileTasksStore
-            .load(&context.workspace, &id)
-            .expect("load")
-            .expect("record");
-        assert_eq!(task.verification.status, VerificationStatus::Inconclusive);
+        let authorization = |verification: &str| tasks::RetryAuthorization {
+            approved_by: "reader".to_string(),
+            reason: "partial effect investigated".to_string(),
+            side_effect_state: tasks::RetrySideEffectState::Partial,
+            compensation_command: Some("echo rolled-back > compensated.txt".to_string()),
+            compensation_verification: Some(verification.to_string()),
+            approved_ms: 1,
+        };
+        let denied = retry_with_authorization(
+            &runs,
+            &context,
+            &json!({"task": unknown_id.clone()}),
+            authorization("false"),
+        )
+        .await
+        .expect_err("failed verification refuses retry");
         assert!(
-            task.approvals
-                .iter()
-                .any(|approval| approval.revoked_ms.is_some()),
-            "revocation is audited"
+            format!("{denied:?}").contains("verification failed"),
+            "{denied:?}"
         );
+        let task = FileTasksStore
+            .load(&context.workspace, &unknown_id)
+            .expect("load")
+            .expect("record");
+        let effect = task.side_effects.values().next().expect("effect");
+        assert_eq!(effect.status, tasks::SideEffectStatus::Compensated);
+        assert!(!effect.compensation.as_ref().expect("compensation").verified);
+        assert_eq!(
+            task.attempts.len(),
+            1,
+            "a failed verification must not start a new attempt"
+        );
+        assert!(context.workspace.join("compensated.txt").exists());
 
-        approve_with(
+        retry_with_authorization(
+            &runs,
+            &context,
+            &json!({"task": unknown_id.clone()}),
+            authorization("test -f compensated.txt"),
+        )
+        .await
+        .expect("verified compensation allows retry");
+        let task = FileTasksStore
+            .load(&context.workspace, &unknown_id)
+            .expect("load")
+            .expect("record");
+        let effect = task.side_effects.values().next().expect("effect");
+        assert_eq!(effect.status, tasks::SideEffectStatus::Verified);
+        assert!(effect.compensation.as_ref().expect("compensation").verified);
+        assert_eq!(
+            task.attempts.len(),
+            2,
+            "the authorized retry started a second attempt"
+        );
+        assert_eq!(task.retry_authorizations.len(), 2);
+
+        let keyed = create_with(
+            &runs,
             &context,
             &json!({
-                "task": id,
-                "attempt_id": task.attempts.last().expect("attempt").id,
-                "approver": "alice",
-                "decision": "approved",
-                "evidence": "expired review",
-                "reference": "approval-3",
-                "expires_ms": 1
+                "intent": "Keyed work",
+                "retry_policy": "idempotent",
+                "idempotency_key": "order-42"
             }),
         )
-        .expect("expired approval recorded");
-        join_with(&runs, &context, &json!({"tasks": [id.clone()]}))
+        .await
+        .expect("created");
+        let keyed_id = keyed["task"].as_str().expect("id").to_string();
+        let keyed_task = FileTasksStore
+            .load(&context.workspace, &keyed_id)
+            .expect("load")
+            .expect("record");
+        let keyed_run = keyed_task.attempts[0].run.clone().expect("run");
+        {
+            let mut runs = fake.runs.lock().expect("runs");
+            let snapshot = runs.get_mut(&keyed_run).expect("run");
+            snapshot.state = RunState::Succeeded;
+            snapshot.result = Some("only once".to_string());
+        }
+        join_with(&runs, &context, &json!({"tasks": [keyed_id.clone()]}))
             .await
             .expect("join");
+        let value = retry_with(&runs, &context, &json!({"task": keyed_id}))
+            .await
+            .expect("deduplicated retry");
+        assert_eq!(value["deduplicated"], true);
+        assert_eq!(value["result"], "only once");
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// A crash between persisting an attempt and recording its run leaves a
+    /// Queued attempt that must not be re-executed automatically (#430).
+    #[tokio::test]
+    async fn a_runless_persisted_attempt_is_reconciled_not_rerun() {
+        let context = context("retry-crash");
+        let fake = Fake::new();
+        let runs = Runs::with(fake);
+        let value = create_with(
+            &runs,
+            &context,
+            &json!({"intent": "Crash", "retry_policy": "non-idempotent"}),
+        )
+        .await
+        .expect("created");
+        let id = value["task"].as_str().expect("id").to_string();
+        let mut record = FileTasksStore
+            .load(&context.workspace, &id)
+            .expect("load")
+            .expect("record");
+        record.attempts[0].status = AttemptStatus::Queued;
+        record.attempts[0].run = None;
+        record.attempts[0].started_ms = None;
+        record.status = TaskStatus::Running;
+        if let Some(effect) = record.side_effects.get_mut(&record.attempts[0].id) {
+            effect.status = tasks::SideEffectStatus::Unknown;
+        }
+        FileTasksStore
+            .save(&context.workspace, &record)
+            .expect("save");
+
+        let error = retry_with(&runs, &context, &json!({"task": id.clone()}))
+            .await
+            .expect_err("crash remnant needs host authorization");
+        assert!(
+            format!("{error:?}").contains("host authorization"),
+            "{error:?}"
+        );
         let task = FileTasksStore
             .load(&context.workspace, &id)
             .expect("load")
             .expect("record");
+        assert_eq!(task.attempts.len(), 1, "no blind re-execution");
+        assert_eq!(task.attempts[0].status, AttemptStatus::Interrupted);
         assert_eq!(
-            task.verification.status,
-            VerificationStatus::Inconclusive,
-            "an expired approval cannot verify"
+            task.side_effects
+                .values()
+                .next()
+                .map(|effect| effect.status),
+            Some(tasks::SideEffectStatus::Unknown)
         );
-        assert_eq!(task.approvals.len(), 3, "approval history survives restart");
-        let _ = attempt_one;
+        let _ = std::fs::remove_dir_all(&context.workspace);
+    }
+
+    /// The idempotency key reaches the executor for job commands, not only the
+    /// task record (#430).
+    #[tokio::test]
+    async fn the_idempotency_key_reaches_a_job_command() {
+        let context = context("idempotency-command");
+        let value = create_with(
+            &Runs::empty(),
+            &context,
+            &json!({
+                "intent": "Keyed job",
+                "tier": "job",
+                "trigger": {"at_ms": 4_000_000_000_000u64},
+                "command": "echo work",
+                "idempotency_key": "order-7"
+            }),
+        )
+        .await
+        .expect("created");
+        let task = FileTasksStore
+            .load(&context.workspace, value["task"].as_str().expect("id"))
+            .expect("load")
+            .expect("record");
+        let command = task.command.expect("command");
+        assert!(
+            command.contains("BSH_IDEMPOTENCY_KEY='order-7'"),
+            "{command}"
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 

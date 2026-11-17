@@ -127,10 +127,22 @@ new pending attempt without reusing the prior report.
 
 Each task carries an explicit retry policy (`idempotent`, `non-idempotent`,
 `unknown`; default unknown/fail-closed) and persisted per-attempt side-effect
-records. Non-idempotent retries require `confirm_side_effects=true`; unknown
-ones additionally require a `compensation` command, which is executed through
-the controlled shell and must succeed before the retry starts. A failed
-non-idempotent execution is treated as a possible partial effect. Idempotency keys are stored on
+records with states NotStarted/Started/Completed/Failed/Compensating/Compensated/
+Verified/Unknown. A failed execution is not treated as "no side effect" for a
+non-idempotent/unknown task. Non-idempotent and unknown retries require a
+host/UI `RetryAuthorization` (approver, reason, assessed state NoEffect/
+Completed/Partial/Unknown); the model-facing `task_retry` tool has no
+confirmation boolean and is refused for these tasks. Partial/Unknown states
+require a compensation command and an independent verification command: the
+compensation runs first, then verification; only a passing verification marks
+the effect Verified. A compensation exit of 0 without verification records
+Compensated and the retry is still refused. Authorizations and compensation
+records are persisted for audit. Attempts are saved as Queued before the run
+starts; a crash between save and run leaves a run-less Queued attempt that is
+reconciled to Interrupted and never silently re-executed. Idempotency keys are
+persisted, passed to job commands as `BSH_IDEMPOTENCY_KEY`, recorded with their
+result, and a repeated completed key returns the recorded result without
+executing again. Idempotency keys are stored on
 the task.
 
 Review/human contracts are executable through a HOST-ONLY approval API
