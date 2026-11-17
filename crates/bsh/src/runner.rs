@@ -1070,6 +1070,47 @@ mod tests {
         dir
     }
 
+    /// Records the tool names the provider request actually carried.
+    struct AdmissionCapturingLlm(Arc<std::sync::Mutex<Vec<Vec<String>>>>);
+
+    #[async_trait::async_trait]
+    impl agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContext>
+        for AdmissionCapturingLlm
+    {
+        async fn complete(
+            &self,
+            _persona: Option<String>,
+            _req: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> react::llm::LlmResponseResult {
+            Ok(summary_response("ok"))
+        }
+
+        async fn stream_complete(
+            &self,
+            _persona: Option<String>,
+            request: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> Result<react::llm::TokenStream, react::llm::LlmError> {
+            let names = request
+                .provider_request
+                .as_ref()
+                .map(|request| request.tools.iter().map(|tool| tool.name.clone()).collect())
+                .unwrap_or_default();
+            self.0.lock().unwrap().push(names);
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(react::llm::StreamToken::Text("ok".to_string())),
+                Ok(react::llm::StreamToken::Done),
+            ])))
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "admission-capturing-mock"
+        }
+    }
+
     fn capturing_agent(seen: CapturedRows) -> Arc<agent::Agent> {
         let mut provider = agent::agent::agentic::LlmProvider::new();
         provider.register_vendor("mock".to_string(), Box::new(ContextCapturingLlm(seen)));
@@ -1194,6 +1235,139 @@ mod tests {
             "the workspace source is named in the manifest"
         );
         assert_eq!(rows[3], "go", "the reader's line is last and unframed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The captured shape of issue #435: a plain greeting must not advertise
+    /// the workspace roster. Discovery (and the skill loader) is all it gets.
+    #[test]
+    fn a_plain_chat_request_carries_only_the_discovery_surface() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut provider = agent::agent::agentic::LlmProvider::new();
+        provider.register_vendor(
+            "mock".to_string(),
+            Box::new(AdmissionCapturingLlm(seen.clone())),
+        );
+        let mut agent = agent::Agent::new(
+            agent::AgentConfig {
+                model: "mock-model".to_string(),
+                ..Default::default()
+            },
+            Arc::new(provider),
+        );
+        agent.add_tool(Arc::new(agent::tools::FunctionTool::new(
+            "read_file",
+            "read a file",
+            serde_json::json!({"type": "object"}),
+            |_args| Ok(serde_json::json!({"ok": true})),
+        )));
+        agent.set_initial_tool_scope(react::tool::admission::InitialToolScope::new(
+            ["read_file"],
+            Vec::<String>::new(),
+        ));
+        let root = workspace("admission-chat");
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        let mut runner = Runner::new();
+        let receiver = runner.spawn(
+            "admission-chat-turn",
+            Arc::new(agent),
+            react::llm::Content::Text("hello 8888".to_string()),
+            Vec::new(),
+            facts,
+            None,
+            1_000,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
+            None,
+        );
+        drain(receiver);
+        let requests = seen.lock().unwrap();
+        let names = requests.last().expect("the provider request was captured");
+        assert!(
+            names.iter().any(|name| name == "find_tool"),
+            "discovery is advertised: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "read_file"),
+            "the workspace reader is not advertised for a greeting: {names:?}"
+        );
+        assert!(names.len() <= 2, "only discovery surfaces: {names:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A work request carries the workspace core initially; a specialist is
+    /// withheld until discovery (issue #435).
+    #[test]
+    fn a_work_request_carries_the_core_and_withholds_a_specialist() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut provider = agent::agent::agentic::LlmProvider::new();
+        provider.register_vendor(
+            "mock".to_string(),
+            Box::new(AdmissionCapturingLlm(seen.clone())),
+        );
+        let mut agent = agent::Agent::new(
+            agent::AgentConfig {
+                model: "mock-model".to_string(),
+                ..Default::default()
+            },
+            Arc::new(provider),
+        );
+        for name in ["read_file", "federation_search"] {
+            agent.add_tool(Arc::new(agent::tools::FunctionTool::new(
+                name,
+                "a tool",
+                serde_json::json!({"type": "object"}),
+                |_args| Ok(serde_json::json!({"ok": true})),
+            )));
+        }
+        agent.set_initial_tool_scope(react::tool::admission::InitialToolScope::new(
+            ["read_file"],
+            Vec::<String>::new(),
+        ));
+        let root = workspace("admission-work");
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        let mut runner = Runner::new();
+        let receiver = runner.spawn(
+            "admission-work-turn",
+            Arc::new(agent),
+            react::llm::Content::Text("fix the retry logic".to_string()),
+            Vec::new(),
+            facts,
+            None,
+            1_000,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
+            None,
+        );
+        drain(receiver);
+        let requests = seen.lock().unwrap();
+        let names = requests.last().expect("the provider request was captured");
+        assert!(
+            names.iter().any(|name| name == "read_file"),
+            "the core reader is initial: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "find_tool"),
+            "discovery is advertised next to the core: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "federation_search"),
+            "the specialist stays out of the initial array: {names:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

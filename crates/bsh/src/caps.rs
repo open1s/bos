@@ -1848,6 +1848,13 @@ fn build_agent_for_session_inner(
     // disagree.
     crate::prompts::append_tool_guidance(&mut agent);
 
+    // The initial tool array is scoped by the turn's intent (issue #435):
+    // a conversation carries only find_tool, a work turn carries the workspace
+    // core, and specialist tools (Federation, scheduling, goals, surface,
+    // memory, extensions, extra MCP servers) stay one find_tool call away. The
+    // byte budget below then applies to the smaller array.
+    agent.set_initial_tool_scope(workspace_tool_scope());
+
     // The meter's tools bucket follows the request's own tool array, so it is
     // priced from exactly that array - the build registry AND the live overlay
     // the extension platform installs into - and from the one admission
@@ -2372,6 +2379,40 @@ fn compose_registry(agent: &mut Agent, session: &str, preset: &str) -> Result<us
 /// The argument is that array rather than a registry because the registry is no
 /// longer the whole answer - a package applies after the build - and a meter
 /// that priced only the registry under-reported every extension's schema.
+/// The definitions a WORK turn carries initially (issue #435).
+///
+/// These are the harness's own workspace primitives: the reader's files, the
+/// shell and its jobs, the plan, the clarification tool, and the three tools
+/// whose guidance the standing prompt already carries (web search, the MCP
+/// gateway, subagent). Everything else - Federation, scheduling, goals, the
+/// surface, memory tools, browser and extension packages - is specialist and
+/// reachable through `find_tool`; a conversation carries none of them.
+pub(crate) fn workspace_tool_scope() -> react::tool::admission::InitialToolScope {
+    react::tool::admission::InitialToolScope::new(
+        [
+            "ask_user",
+            "bash",
+            "edit_file",
+            "glob",
+            "grep",
+            "job_kill",
+            "job_list",
+            "job_output",
+            "list_dir",
+            "mcp",
+            "read_file",
+            "read_files",
+            "sed",
+            "apply_patch",
+            "subagent",
+            "update_plan",
+            "web_search",
+            "write_file",
+        ],
+        ["job_"],
+    )
+}
+
 pub(crate) fn tools_schema_chars(tools: &[react::llm::LlmTool]) -> usize {
     serde_json::to_string(tools)
         .map(|json| json.chars().count())
@@ -6570,9 +6611,9 @@ mod tests {
         agent_messages, allows_writes, build_agent, check_spawn, compactable_span,
         egress_allowlist_path, is_confined, offers_local_web_search, plugin_provider_node,
         read_egress_rules, refresh_plugin_providers, sandbox_spec_for, surfaced_capabilities,
-        tool_gates_for, web_search_config, with_bridge_pool, write_file_tool, BuiltAgent,
-        WorkspaceEgress, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, MAX_BATCH_READ_BYTES, READ_ONLY,
-        WORKSPACE_WRITE,
+        tool_gates_for, web_search_config, with_bridge_pool, workspace_tool_scope, write_file_tool,
+        BuiltAgent, WorkspaceEgress, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, MAX_BATCH_READ_BYTES,
+        READ_ONLY, WORKSPACE_WRITE,
     };
     use crate::settings::global::{ModelEntry, Preset};
     use crate::settings::resolve::SessionChoice;
@@ -8183,6 +8224,163 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A classified conversation advertises only the discovery surface: the
+    /// captured 39-tool greeting request is the failure this closes (issue #435).
+    #[test]
+    fn a_conversation_carries_only_the_discovery_surface() {
+        let built = build(&bare());
+        built
+            .agent
+            .set_action_intent(react::llm::ActionIntent::Unknown);
+        let names: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["find_tool".to_string()],
+            "ordinary conversation carries no execution tools: {names:?}"
+        );
+        let withheld = built.agent.tool_admission().withheld_names();
+        assert!(
+            withheld.iter().any(|name| name == "bash"),
+            "the shell left the array and is discoverable: {withheld:?}"
+        );
+        assert!(
+            withheld.iter().any(|name| name == "read_file"),
+            "the file reader left the array too: {withheld:?}"
+        );
+        assert!(
+            built
+                .agent
+                .registry()
+                .expect("registry")
+                .get("bash")
+                .is_some(),
+            "withholding a definition is not revoking the tool"
+        );
+    }
+
+    /// A work turn carries the BSH core and withholds everything outside it;
+    /// every omitted definition is named in the one admission decision.
+    #[test]
+    fn a_work_turn_carries_the_workspace_core_and_withholds_specialists() {
+        let built = build(&bare());
+        built
+            .agent
+            .set_action_intent(react::llm::ActionIntent::Action);
+        let names: Vec<String> = built
+            .agent
+            .model_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        for core in [
+            "bash",
+            "read_file",
+            "glob",
+            "grep",
+            "update_plan",
+            "find_tool",
+        ] {
+            assert!(
+                names.iter().any(|name| name == core),
+                "{core} is workspace core: {names:?}"
+            );
+        }
+        let scope = workspace_tool_scope();
+        let admission = built.agent.tool_admission();
+        let withheld: std::collections::BTreeSet<&str> = admission
+            .withheld
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        for tool in built.agent.all_tools() {
+            if scope.admits(&tool.name) {
+                assert!(
+                    names.contains(&tool.name),
+                    "core definition {} is initial: {names:?}",
+                    tool.name
+                );
+                continue;
+            }
+            assert!(
+                !names.contains(&tool.name),
+                "specialist {} stays out of the initial array: {names:?}",
+                tool.name
+            );
+        }
+        // The intent path names its own omissions; a tool that already carried
+        // a deferred mark (browser, MCP, extra packages) travels through the
+        // existing discovery policy. Both are reachable because the search is.
+        assert!(
+            withheld.contains("federation_status"),
+            "the Federation tool is withheld by intent: {withheld:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "find_tool"),
+            "the way back is advertised: {names:?}"
+        );
+    }
+
+    /// The measured saving is the request, not a tool count: tools bytes and
+    /// the complete composition are priced before and after the intent scope.
+    #[test]
+    fn intent_scope_reports_its_request_saving() {
+        let built = build(&bare());
+        let input = react::llm::Content::text("hello 8888");
+        let system = Some(built.agent.config().system_prompt.as_str());
+        // The historical request: an unclassified build admits its broad array
+        // (policy-withheld tools out, find_tool in).
+        let before_tools = built.agent.model_tools();
+        let before = react::telemetry::RequestComposition::measure(
+            system,
+            &before_tools,
+            None,
+            None,
+            &input,
+        );
+
+        built
+            .agent
+            .set_action_intent(react::llm::ActionIntent::Unknown);
+        let chat_tools = built.agent.model_tools();
+        let chat =
+            react::telemetry::RequestComposition::measure(system, &chat_tools, None, None, &input);
+
+        built
+            .agent
+            .set_action_intent(react::llm::ActionIntent::Action);
+        let work_tools = built.agent.model_tools();
+        let work =
+            react::telemetry::RequestComposition::measure(system, &work_tools, None, None, &input);
+
+        assert!(
+            chat.total_bytes < work.total_bytes && work.total_bytes < before.total_bytes,
+            "scope narrows the request: chat {} < work {} < broad {}",
+            chat.total_bytes,
+            work.total_bytes,
+            before.total_bytes
+        );
+        eprintln!(
+            "issue #435 benchmark: tools {} -> {} (chat) / {} (work) definitions; schema {} -> {} / {} bytes; request {} -> {} / {} bytes; ~tokens {} -> {} / {}",
+            before_tools.len(),
+            chat_tools.len(),
+            work_tools.len(),
+            before.tools_bytes,
+            chat.tools_bytes,
+            work.tools_bytes,
+            before.total_bytes,
+            chat.total_bytes,
+            work.total_bytes,
+            before.total_bytes / 4,
+            chat.total_bytes / 4,
+            work.total_bytes / 4
+        );
     }
 
     /// An EMPTY persona is "the framework's default", not "no persona": a

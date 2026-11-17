@@ -342,8 +342,16 @@ pub struct Agent {
     /// `Arc` and classifies the reader's message at send time, after the
     /// build. The engine reads it through `LlmRequest::intent` and applies the
     /// action contract; `Unknown` leaves the behaviour unchanged.
+    ///
+    /// None means no turn has been classified yet (a build-time read), so the
+    /// initial tool array stays on the broad, safe fallback; Some(Unknown)
+    /// means the host classified THIS turn as ordinary conversation.
     #[rkyv(with = qserde::rkyv::with::Skip)]
-    action_intent: std::sync::Mutex<ActionIntent>,
+    action_intent: std::sync::Mutex<Option<ActionIntent>>,
+    /// The definitions a work turn carries initially. A host that never sets
+    /// one keeps the historical broad array (issue #435).
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    initial_tool_scope: Option<react::tool::admission::InitialToolScope>,
     /// The immutable typed request the host assembled for this turn
     /// (issue #421). The same snapshot feeds diagnostics and the request.
     #[rkyv(with = qserde::rkyv::with::Skip)]
@@ -492,7 +500,8 @@ impl Agent {
         Self {
             config,
             context_budget: 0,
-            action_intent: std::sync::Mutex::new(ActionIntent::Unknown),
+            action_intent: std::sync::Mutex::new(None),
+            initial_tool_scope: None,
             provider_request: std::sync::Mutex::new(None),
             auxiliary_usage: std::sync::Mutex::new(react::telemetry::TokenUsage::default()),
             llm,
@@ -589,16 +598,31 @@ impl Agent {
     /// The classification is never serialized to the provider.
     pub fn set_action_intent(&self, intent: ActionIntent) {
         if let Ok(mut slot) = self.action_intent.lock() {
-            *slot = intent;
+            *slot = Some(intent);
         }
+    }
+
+    /// Restrict the initial tool array to a host-declared core scope for work
+    /// turns (issue #435).
+    ///
+    /// A conversation then advertises only the discovery surface, and a work
+    /// turn advertises the core definitions; every other registered tool stays
+    /// callable through find_tool. Call this once, when the tool set is built.
+    /// An agent that never sets a scope keeps the historical broad array.
+    pub fn set_initial_tool_scope(&mut self, scope: react::tool::admission::InitialToolScope) {
+        self.initial_tool_scope = Some(scope);
+        self.engine_cache.lock().unwrap().take();
+        self.context_cache.lock().unwrap().take();
+    }
+
+    /// The intent this turn was classified as, when the host classified it.
+    fn classified_action_intent(&self) -> Option<ActionIntent> {
+        self.action_intent.lock().ok().and_then(|intent| *intent)
     }
 
     /// The intent currently applied to a turn; `Unknown` applies no policy.
     pub fn action_intent(&self) -> ActionIntent {
-        self.action_intent
-            .lock()
-            .map(|intent| *intent)
-            .unwrap_or_default()
+        self.classified_action_intent().unwrap_or_default()
     }
 
     /// Attach the immutable typed request for this turn (issue #421).
@@ -1408,7 +1432,12 @@ impl Agent {
     /// either: two tools that can only answer "none" are prompt bytes for no
     /// capability.
     pub fn has_deferred_tools(&self) -> bool {
-        self.has_policy_withheld_tools() || self.tool_admission().has_withheld()
+        // A host-declared scope can withhold tools on any future turn, so the
+        // search must be registered even when THIS turn needs none: the engine
+        // outlives a single turn (issue #435).
+        self.initial_tool_scope.is_some()
+            || self.has_policy_withheld_tools()
+            || self.tool_admission().has_withheld()
     }
 
     /// The admission policy the initial array is derived under.
@@ -1431,35 +1460,66 @@ impl Agent {
         policy
     }
 
-    /// The definitions the request could carry, before the byte budget.
-    fn budget_candidates(&self, search: bool) -> Vec<react::llm::LlmTool> {
+    /// The definitions this turn could carry before the byte budget.
+    ///
+    /// Policy-withheld names (deferred, MCP, host-deferred) are removed first.
+    /// The remaining set is then scoped by the classified intent (issue #435):
+    /// a work turn keeps the host's core; a conversation keeps only
+    /// provider-owned definitions, and every local execution tool becomes
+    /// discoverable. An UNCLASSIFIED agent keeps the broad array, which is the
+    /// safe fallback for a host that has not classified the turn.
+    fn scope_candidates(
+        &self,
+    ) -> (
+        Vec<react::llm::LlmTool>,
+        Vec<react::tool::admission::WithheldTool>,
+    ) {
         let withheld = self.policy_withheld_names();
-        let mut tools: Vec<react::llm::LlmTool> = self
+        let tools: Vec<react::llm::LlmTool> = self
             .all_tools()
             .into_iter()
             .filter(|tool| !withheld.contains(&tool.name))
             .collect();
-        if search {
-            tools.push(discovery::find_tool_definition());
+        match (
+            self.classified_action_intent(),
+            self.initial_tool_scope.as_ref(),
+        ) {
+            (Some(intent), Some(scope)) => {
+                react::tool::admission::split_for_intent(intent, tools, scope)
+            }
+            _ => (tools, Vec::new()),
         }
-        tools
     }
 
     /// Admit the initial array under this agent's schema budget.
     ///
     /// Two passes in the one case that needs them: when the budget withholds a
-    /// definition and the policy withheld nothing, the search joins the array
-    /// and is priced WITH the definitions it makes reachable. The second pass
-    /// can withhold one more definition behind the search's own bytes, which is
-    /// the same trade the first pass made.
+    /// definition and neither policy nor intent scoped anything, the search
+    /// joins the array and is priced WITH the definitions it makes reachable.
+    /// The second pass can withhold one more definition behind the search's own
+    /// bytes, which is the same trade the first pass made.
+    ///
+    /// Definitions withheld by intent are appended to the same admission
+    /// report, so one decision still names every definition the request omits
+    /// and find_tool can reach it.
     fn admit_model_tools(&self) -> react::tool::admission::Admission {
-        let search = self.has_policy_withheld_tools();
+        let (mut candidates, mut intent_withheld) = self.scope_candidates();
+        let search = self.has_policy_withheld_tools() || !intent_withheld.is_empty();
         let mut policy = self.admission_policy(search);
-        let mut admission = react::tool::admission::admit(self.budget_candidates(search), &policy);
+        if search {
+            candidates.push(discovery::find_tool_definition());
+        }
+        let mut admission = react::tool::admission::admit(candidates, &policy);
         if !search && admission.has_withheld() {
             policy.required.insert(discovery::FIND_TOOL.to_string());
-            admission = react::tool::admission::admit(self.budget_candidates(true), &policy);
+            let (mut candidates, _) = self.scope_candidates();
+            candidates.push(discovery::find_tool_definition());
+            admission = react::tool::admission::admit(candidates, &policy);
         }
+        admission.withheld.append(&mut intent_withheld);
+        admission
+            .withheld
+            .sort_by(|left, right| left.name.cmp(&right.name));
         admission
     }
 
@@ -1467,7 +1527,9 @@ impl Agent {
     ///
     /// A host prices and logs the array from this one decision, so a definition
     /// it reports as withheld is exactly one `find_tool` can offer. The
-    /// decision is also published where the search's catalogue reads it.
+    /// decision is also published where the search's catalogue reads it. The
+    /// result depends on the current intent and scope: the three withhold paths
+    /// (policy, intent, byte budget) are one report, one catalogue.
     pub fn tool_admission(&self) -> react::tool::admission::Admission {
         let admission = self.admit_model_tools();
         if let Ok(mut set) = self.schema_withheld.write() {
@@ -1540,10 +1602,11 @@ impl Agent {
     ///
     /// This is [`Agent::all_tools`] minus everything withheld: a tool marked
     /// [`react::tool::Tool::deferred`], an MCP tool (withheld by default), any
-    /// name this agent was told to defer, and every definition the byte budget
-    /// could not admit. The model reaches a withheld tool through `find_tool`;
-    /// the tools that search reports join the next request, so the provider
-    /// sees only the definitions the model asked for.
+    /// name this agent was told to defer, a definition the turn's intent scope
+    /// leaves out (issue #435), and every definition the byte budget could not
+    /// admit. The model reaches a withheld tool through `find_tool`; the tools
+    /// that search reports join the next request, so the provider sees only the
+    /// definitions the model asked for.
     ///
     /// The array is the ONE derivation a request, a capability pane and the
     /// host's own metering read ([`Agent::tool_admission`] carries the
@@ -2398,7 +2461,8 @@ impl Clone for Agent {
         Self {
             config: self.config.clone(),
             context_budget: self.context_budget,
-            action_intent: std::sync::Mutex::new(self.action_intent()),
+            action_intent: std::sync::Mutex::new(self.classified_action_intent()),
+            initial_tool_scope: self.initial_tool_scope.clone(),
             provider_request: std::sync::Mutex::new(self.provider_request()),
             auxiliary_usage: std::sync::Mutex::new(react::telemetry::TokenUsage::default()),
             llm: self.llm.clone(),

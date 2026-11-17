@@ -1367,6 +1367,317 @@ fn the_admitted_array_is_stable_across_registration_order() {
 }
 
 // =========================================================================
+// Intent-aware initial tool admission (issue #435)
+// =========================================================================
+
+/// An agent carrying a core/specialist mix, scoped the way BSH scopes one.
+fn scoped_agent(names: &[&'static str]) -> Agent {
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    for name in names {
+        agent.add_tool(Arc::new(FunctionTool::new(
+            name,
+            "a tool",
+            serde_json::json!({"type": "object"}),
+            move |_args| Ok(serde_json::json!("ok")),
+        )));
+    }
+    agent.set_initial_tool_scope(react::tool::admission::InitialToolScope::new(
+        ["read_file", "bash", "update_plan"],
+        ["job_"],
+    ));
+    agent
+}
+
+fn tool_names(tools: Vec<react::llm::LlmTool>) -> Vec<String> {
+    tools.into_iter().map(|tool| tool.name).collect()
+}
+
+/// A classified conversation advertises discovery only. Every execution tool
+/// stays registered and callable, and the admission report names each one so
+/// find_tool can reach it.
+#[test]
+fn a_conversation_carries_only_the_discovery_surface() {
+    let agent = scoped_agent(&[
+        "read_file",
+        "bash",
+        "job_output",
+        "federation_search",
+        "schedule_create",
+    ]);
+    agent.set_action_intent(ActionIntent::Unknown);
+
+    let admission = agent.tool_admission();
+    assert_eq!(
+        tool_names(admission.tools.clone()),
+        vec!["find_tool"],
+        "ordinary conversation carries no execution tools"
+    );
+    let withheld: Vec<&str> = admission
+        .withheld
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(
+        withheld,
+        vec![
+            "bash",
+            "federation_search",
+            "job_output",
+            "read_file",
+            "schedule_create"
+        ],
+        "every withheld definition is reported, not dropped"
+    );
+    assert!(
+        admission
+            .withheld
+            .iter()
+            .all(|tool| tool.reason == react::tool::admission::WithheldReason::IntentScope),
+        "the reason is the turn's scope"
+    );
+    assert!(
+        agent
+            .registry()
+            .expect("registry")
+            .get("federation_search")
+            .is_some(),
+        "advertising is not registration: the tool is still registered"
+    );
+    // The search sees the definitions the array omitted.
+    let search = super::discovery::find_tool(
+        agent.registry().cloned(),
+        Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
+        Arc::new(std::sync::RwLock::new(None)),
+        super::discovery::Withheld::new(Vec::new(), Vec::new())
+            .with_budget(Arc::clone(&agent.schema_withheld)),
+    );
+    let reported = search
+        .run(&serde_json::json!({"name": "federation_search"}))
+        .expect("the search answers");
+    assert_eq!(
+        reported.get("name").and_then(|name| name.as_str()),
+        Some("federation_search"),
+        "a conversation's withheld tool is discoverable: {reported}"
+    );
+    // Advertising is not authorization in either direction: the withheld tool
+    // still runs when the model calls it by name.
+    let direct = agent
+        .registry()
+        .expect("registry")
+        .get("federation_search")
+        .expect("registered")
+        .run(&serde_json::json!({}))
+        .expect("the withheld tool is callable");
+    assert_eq!(direct, serde_json::json!("ok"));
+}
+
+/// A work turn carries the host's core and the discovery surface; a specialist
+/// stays out of the array and is found on demand.
+#[test]
+fn a_work_turn_keeps_the_core_and_discovers_a_specialist() {
+    let agent = scoped_agent(&[
+        "read_file",
+        "bash",
+        "job_output",
+        "update_plan",
+        "federation_search",
+        "schedule_create",
+    ]);
+    agent.set_action_intent(ActionIntent::Action);
+
+    let names = tool_names(agent.model_tools());
+    for core in [
+        "bash",
+        "job_output",
+        "read_file",
+        "update_plan",
+        "find_tool",
+    ] {
+        assert!(
+            names.iter().any(|name| name == core),
+            "{core} is core: {names:?}"
+        );
+    }
+    for specialist in ["federation_search", "schedule_create"] {
+        assert!(
+            !names.iter().any(|name| name == specialist),
+            "{specialist} is specialist, not initial: {names:?}"
+        );
+    }
+
+    let admission = agent.tool_admission();
+    let withheld = admission.withheld_names();
+    assert!(withheld.contains(&"federation_search".to_string()));
+    assert!(withheld.contains(&"schedule_create".to_string()));
+
+    // Both specialist classes are reachable through one discovery call.
+    let search = super::discovery::find_tool(
+        agent.registry().cloned(),
+        Arc::new(std::sync::RwLock::new(ToolRegistry::new())),
+        Arc::new(std::sync::RwLock::new(None)),
+        super::discovery::Withheld::new(Vec::new(), Vec::new())
+            .with_budget(Arc::clone(&agent.schema_withheld)),
+    );
+    for specialist in ["federation_search", "schedule_create"] {
+        let reported = search
+            .run(&serde_json::json!({"name": specialist}))
+            .expect("the search answers");
+        assert_eq!(
+            reported.get("name").and_then(|name| name.as_str()),
+            Some(specialist),
+            "{specialist} is discoverable: {reported}"
+        );
+    }
+}
+
+/// A scoped work turn still completes: the model sees the core definition,
+/// calls it, and the turn ends on the verified result.
+#[tokio::test]
+async fn a_scoped_work_turn_completes_its_tool_call() {
+    let (mut agent, _seen, _requests) = action_agent(
+        vec![
+            Step::Tool("read_file", "{}"),
+            Step::Text("Final Answer: read the file and verified it."),
+        ],
+        true,
+    );
+    agent.set_initial_tool_scope(react::tool::admission::InitialToolScope::new(
+        ["read_file"],
+        Vec::<String>::new(),
+    ));
+    agent.set_action_intent(ActionIntent::Action);
+
+    let answer = agent.react("fix the retry logic").await.expect("the turn");
+    assert!(answer.contains("verified it"), "{answer}");
+}
+
+/// The provider-run web search is an execution tool too: a conversation does
+/// not carry it, and the next work turn offers it again (issue #435).
+#[test]
+fn a_conversation_does_not_carry_the_hosted_web_search() {
+    let config = AgentConfig {
+        web_search: true,
+        api_mode: "responses".to_string(),
+        ..Default::default()
+    };
+    let mut agent = Agent::new(config, Arc::new(make_llm_provider()));
+    agent.add_tool(Arc::new(FunctionTool::new(
+        "read_file",
+        "a tool",
+        serde_json::json!({"type": "object"}),
+        |_args| Ok(serde_json::json!("ok")),
+    )));
+    agent.set_initial_tool_scope(react::tool::admission::InitialToolScope::new(
+        ["read_file"],
+        Vec::<String>::new(),
+    ));
+
+    agent.set_action_intent(ActionIntent::Unknown);
+    let chat: Vec<String> = agent
+        .prepare_context()
+        .tools
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert!(
+        !chat.iter().any(|name| name == "web_search"),
+        "a conversation carries no hosted execution tool: {chat:?}"
+    );
+
+    agent.set_action_intent(ActionIntent::Action);
+    let work: Vec<String> = agent
+        .prepare_context()
+        .tools
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert!(
+        work.iter().any(|name| name == "web_search"),
+        "a work turn offers the hosted search again: {work:?}"
+    );
+}
+
+/// A host that has not classified the turn keeps the broad historical array:
+/// an unclassified turn must not silently lose a capability.
+#[test]
+fn an_unclassified_agent_keeps_the_broad_safe_fallback() {
+    let agent = scoped_agent(&["read_file", "federation_search"]);
+    // No set_action_intent call: this is a build-time read.
+    let names = tool_names(agent.model_tools());
+    assert_eq!(
+        names,
+        vec!["federation_search", "read_file"],
+        "the safe fallback keeps every definition"
+    );
+    assert!(!agent.tool_admission().has_withheld());
+}
+
+/// Intent scoping changes the serialized request, not only the tool count: the
+/// tool array and the whole composition are priced before and after.
+#[test]
+fn intent_scope_cuts_the_serialized_request_bytes() {
+    use react::telemetry::RequestComposition;
+    let mut agent = Agent::new(AgentConfig::default(), Arc::new(make_llm_provider()));
+    for index in 0..30 {
+        let name: &'static str = Box::leak(format!("federation_task_{index:02}").into_boxed_str());
+        agent.add_tool(Arc::new(FunctionTool::new(
+            name,
+            Box::leak(format!("specialist {index} {}", "d".repeat(900)).into_boxed_str()),
+            serde_json::json!({"type": "object"}),
+            move |_args| Ok(serde_json::json!("ok")),
+        )));
+    }
+    for name in ["read_file", "bash", "grep", "edit_file"] {
+        agent.add_tool(Arc::new(FunctionTool::new(
+            name,
+            "a workspace core tool",
+            serde_json::json!({"type": "object"}),
+            move |_args| Ok(serde_json::json!("ok")),
+        )));
+    }
+    let mut agent = agent;
+    agent.set_initial_tool_scope(react::tool::admission::InitialToolScope::new(
+        ["read_file", "bash", "grep", "edit_file"],
+        Vec::<String>::new(),
+    ));
+    agent.set_action_intent(ActionIntent::Unknown);
+
+    let all = agent.all_tools();
+    let scoped = agent.model_tools();
+    let before = all
+        .iter()
+        .map(react::llm::LlmTool::schema_bytes)
+        .sum::<usize>();
+    let after = scoped
+        .iter()
+        .map(react::llm::LlmTool::schema_bytes)
+        .sum::<usize>();
+    assert!(
+        after * 10 < before,
+        "a conversation must not carry the specialist roster: {after} vs {before}"
+    );
+
+    let input = react::llm::Content::text("hello 8888");
+    let before_request =
+        RequestComposition::measure(Some("system prompt"), &all, None, None, &input);
+    let after_request =
+        RequestComposition::measure(Some("system prompt"), &scoped, None, None, &input);
+    assert!(
+        after_request.total_bytes < before_request.total_bytes,
+        "the complete request shrinks: {} vs {}",
+        after_request.total_bytes,
+        before_request.total_bytes
+    );
+    eprintln!(
+        "intent scope: tools {before} -> {after} bytes; request {} -> {} bytes (schema {} -> {})",
+        before_request.total_bytes,
+        after_request.total_bytes,
+        before_request.tools_bytes,
+        after_request.tools_bytes
+    );
+}
+
+// =========================================================================
 // Action-first turns (issue #293)
 // =========================================================================
 

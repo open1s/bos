@@ -21,6 +21,19 @@
   into its one leading system message; Anthropic and Responses fold them into
   their system/instructions sections, so no provider sees a mid-conversation
   system turn.
+- **Initial tools are scoped by the turn's intent (#435).** The assembled
+  request no longer advertises the whole registry on every turn. A classified
+  conversation carries only `find_tool`; a work turn carries the BSH workspace
+  core (file, search, shell/job, plan, clarification, web search, MCP gateway,
+  subagent) plus `find_tool`; Federation, scheduling, goals, surface, memory,
+  browser, extra MCP servers and extension tools are withheld but stay
+  registered, callable, and discoverable. An unclassified turn (a build-time
+  read, or a host that does not classify) keeps the previous broad array.
+  Measured on the default test build, against its own historical request:
+  25 definitions -> 1 (chat) / 17 (work); schema 16,655 -> 737 / 13,627 bytes;
+  complete request 26,099 -> 10,181 / 23,071 bytes (~6,524 -> 2,545 / 5,767
+  tokens). The #292 byte budget and the #284 discovery catalogue remain the only
+  enforcement points.
 - **Intent routing no longer treats an open workspace as a request.**
   The classifier now recognizes explicit file reads, and a verb with no object
   ("fix it", "修复它") is `Unknown` rather than `Action`; an `Unknown` or

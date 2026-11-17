@@ -23,7 +23,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::llm::LlmTool;
+use crate::llm::{ActionIntent, LlmTool, LlmToolKind};
 
 /// Bytes the initial advertisement leaves for a later `find_tool` reveal.
 ///
@@ -40,6 +40,9 @@ pub enum WithheldReason {
     TooLarge,
     /// The cumulative initial budget has no room left.
     OverBudget,
+    /// The tool is outside this turn's initial scope. It stays registered and
+    /// callable, and `find_tool` reports it on demand (issue #435).
+    IntentScope,
 }
 
 /// One definition the initial request does not carry.
@@ -105,6 +108,80 @@ impl Default for AdmissionPolicy {
     fn default() -> Self {
         Self::new(0, 0)
     }
+}
+
+/// Which definitions a host considers core to a work turn.
+///
+/// The initial array is scoped by intent (issue #435): a conversation carries
+/// only the discovery surface, a work turn carries the host's core workspace
+/// tools, and every specialist stays one `find_tool` call away. The core set is
+/// declared by the host because only it knows which of its tools are the
+/// workspace primitives; the byte budget from issue #292 then applies to the
+/// smaller array.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InitialToolScope {
+    /// Names admitted initially for a work turn.
+    pub core: BTreeSet<String>,
+    /// Prefixes admitted initially for a work turn, e.g. `job_`.
+    pub core_prefixes: Vec<String>,
+}
+
+impl InitialToolScope {
+    /// Build a scope from exact names and name prefixes.
+    pub fn new(
+        names: impl IntoIterator<Item = impl Into<String>>,
+        prefixes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            core: names.into_iter().map(Into::into).collect(),
+            core_prefixes: prefixes.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Whether a definition is part of the work-turn core.
+    pub fn admits(&self, name: &str) -> bool {
+        self.core.contains(name)
+            || self
+                .core_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_str()))
+    }
+}
+
+/// Split the candidate definitions by the turn's intent.
+///
+/// - `Action`: the host's core scope (and every provider-owned definition).
+/// - `Explanation` / `Unknown`: no execution tools; discovery is the only
+///   surface. The caller adds `find_tool`, so every withheld definition stays
+///   reachable.
+///
+/// A provider-owned tool (a hosted `web_search` / `file_search` /
+/// `computer_use`) is always kept: it is not in the local registry, so the
+/// discovery search could not restore it. Withholding one would silently remove
+/// a capability the provider itself runs.
+///
+/// The output keeps the input order; admission sorts the array afterwards, so
+/// the request prefix remains a function of the set.
+pub fn split_for_intent(
+    intent: ActionIntent,
+    tools: Vec<LlmTool>,
+    scope: &InitialToolScope,
+) -> (Vec<LlmTool>, Vec<WithheldTool>) {
+    let work = intent == ActionIntent::Action;
+    let mut kept: Vec<LlmTool> = Vec::with_capacity(tools.len());
+    let mut withheld: Vec<WithheldTool> = Vec::new();
+    for tool in tools {
+        if tool.kind != LlmToolKind::Function || (work && scope.admits(&tool.name)) {
+            kept.push(tool);
+        } else {
+            withheld.push(WithheldTool {
+                name: tool.name.clone(),
+                bytes: tool.schema_bytes(),
+                reason: WithheldReason::IntentScope,
+            });
+        }
+    }
+    (kept, withheld)
 }
 
 /// What one admission did to the array.
@@ -383,6 +460,59 @@ mod tests {
                 .collect::<Vec<_>>(),
             "the cached prefix cannot depend on registration order"
         );
+    }
+
+    #[test]
+    fn a_conversation_keeps_no_execution_tools_and_work_keeps_the_core() {
+        let tools = vec![
+            tool("read_file", 100),
+            tool("bash", 100),
+            tool("federation_search", 100),
+            LlmTool::web_search(None),
+        ];
+        let scope = InitialToolScope::new(["read_file", "bash"], ["job_"]);
+
+        let (kept, withheld) = split_for_intent(ActionIntent::Unknown, tools.clone(), &scope);
+        let kept_names: Vec<&str> = kept.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(
+            kept_names,
+            vec!["web_search"],
+            "conversation keeps only provider-owned definitions"
+        );
+        assert_eq!(
+            withheld
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "bash", "federation_search"]
+        );
+        assert!(withheld
+            .iter()
+            .all(|tool| tool.reason == WithheldReason::IntentScope));
+
+        let (kept, withheld) = split_for_intent(ActionIntent::Action, tools, &scope);
+        let kept_names: Vec<&str> = kept.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(
+            kept_names,
+            vec!["read_file", "bash", "web_search"],
+            "work keeps the core plus provider-owned definitions"
+        );
+        assert_eq!(
+            withheld
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["federation_search"],
+            "a specialist stays discoverable"
+        );
+    }
+
+    #[test]
+    fn the_core_scope_accepts_name_prefixes() {
+        let scope = InitialToolScope::new(["bash"], ["job_"]);
+        assert!(scope.admits("bash"));
+        assert!(scope.admits("job_output"));
+        assert!(!scope.admits("schedule_create"));
     }
 
     #[test]

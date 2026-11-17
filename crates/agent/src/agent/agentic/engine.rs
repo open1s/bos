@@ -192,40 +192,50 @@ impl Agent {
     /// never called, because nothing told the model it exists.
     pub(super) fn prepare_context(&self) -> AgentReactContext {
         let mut context = AgentReactContext::new(self.config.name.clone());
-
-        // One derivation of the model-facing array, so the request and every
-        // surface that prices or lists it cannot drift: see Agent::model_tools.
-        context.tools = self.model_tools();
-
-        // The hosted web-search tool is not in the registry, because nothing
-        // here runs it: the provider does, and returns the results in its own
-        // stream.
-        if offers_web_search(self.config.web_search, &self.config.api_mode) {
-            context.tools.push(react::llm::LlmTool::web_search(None));
-        }
-
-        // The array is part of the provider's cached prefix, so its order must
-        // be a function of the set, not of what was appended last. The
-        // discovery search is already part of `model_tools` when anything is
-        // withheld; nothing is added here.
-        context.tools.sort_by(|a, b| a.name.cmp(&b.name));
+        self.fill_model_tools(&mut context);
 
         // Skills follow the tool rule: the request carries no catalogue, and
-        // the model asks for what it needs with `find_skill`. The catalogue
+        // the model asks for what it needs with find_skill. The catalogue
         // stays available for a host that wants the model to see every skill up
-        // front (see `Agent::with_skill_catalogue`); a skill whose manifest says
-        // `disable-model-invocation: true` is out of both, because the reader's
-        // `/name` gesture still loads it.
-        if self.skill_search() {
-            context
-                .tools
-                .push(super::discovery::find_skill_definition());
-            context.tools.sort_by(|a, b| a.name.cmp(&b.name));
-        } else {
+        // front (see Agent::with_skill_catalogue); a skill whose manifest says
+        // disable-model-invocation: true is out of both, because the reader's
+        // /name gesture still loads it.
+        if !self.skill_search() {
             context.skills = self.model_skills();
         }
 
         context
+    }
+
+    /// Set the model-facing tool array for the CURRENT turn.
+    ///
+    /// One derivation of the array, so the request and every surface that
+    /// prices or lists it cannot drift (see Agent::model_tools). The cached
+    /// context is refreshed from here on every turn: an agent can serve a
+    /// conversation and then a work turn, and each carries its own intent scope
+    /// (issue #435). The array is name-sorted because it is part of the
+    /// provider's cached prefix.
+    pub(super) fn fill_model_tools(&self, context: &mut AgentReactContext) {
+        context.tools = self.model_tools();
+
+        // The hosted web-search tool is not in the registry, because nothing
+        // here runs it: the provider does, and returns the results in its own
+        // stream. It is still an execution tool, so a classified conversation
+        // does not carry it; the next work turn offers it again.
+        let conversation = self.classified_action_intent() == Some(ActionIntent::Unknown);
+        if !conversation && offers_web_search(self.config.web_search, &self.config.api_mode) {
+            context.tools.push(react::llm::LlmTool::web_search(None));
+        }
+
+        // The discovery search is already part of model_tools when anything is
+        // withheld; only the skill search is added here.
+        if self.skill_search() {
+            context
+                .tools
+                .push(super::discovery::find_skill_definition());
+        }
+
+        context.tools.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
     /// Build a ReActEngine with the standard adapter stack (LLM, tools, skills).
@@ -624,6 +634,13 @@ impl Agent {
                 )
             }
         };
+
+        // The tool array is intent-scoped per turn (issue #435): a session that
+        // serves a conversation and then a work turn must not keep the first
+        // turn's array in the cached context.
+        if let Some(context) = context.as_mut() {
+            self.fill_model_tools(context);
+        }
 
         // A cached engine's counters span its whole lifetime; snapshot them
         // before the run so metrics record only what this run added.
@@ -1082,10 +1099,13 @@ impl Agent {
             let mut cache = self.context_cache.lock().unwrap();
             cache.take()
         };
-        let context = match cached_context {
+        let mut context = match cached_context {
             Some(c) => c,
             None => self.prepare_context(),
         };
+        // Refresh the array for THIS turn's intent: the cached context may come
+        // from a turn with a different scope (issue #435).
+        self.fill_model_tools(&mut context);
 
         // Snapshot engine counters before the run so the values stored for
         // this stream describe this run, not the engine's whole lifetime.

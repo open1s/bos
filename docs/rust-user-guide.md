@@ -428,6 +428,40 @@ once `find_tool` reports it, the direct call carries the real name.
 Defer a tool only when the prompt does not name it. An instruction that says
 `update_plan` is a promise that `update_plan` is advertised.
 
+### Intent-Scoped Initial Tools
+
+A host that knows what the turn is asking for can scope the initial array
+further (issue #435). Declare the definitions a work turn must carry, then set
+the turn's intent:
+
+```rust
+use react::llm::ActionIntent;
+use react::tool::admission::InitialToolScope;
+
+let mut agent = Agent::from_config(config);
+agent.set_initial_tool_scope(InitialToolScope::new(
+    ["read_file", "write_file", "bash", "update_plan"],
+    ["job_"],
+));
+agent.set_action_intent(ActionIntent::Action); // or Explanation / Unknown
+```
+
+- **Action** advertises the core scope plus `find_tool`; every specialist tool
+  (Federation, scheduling, goals, surface, memory, browser, MCP servers,
+  extension packages) stays registered, callable and discoverable.
+- **Explanation / Unknown** advertises no execution tool at all - just
+  `find_tool` (and the engine's `load_skill`). A greeting costs one schema, not
+  the roster.
+- **No classification yet** keeps the broad historical array. This is the safe
+  fallback for a build-time read and for a host that does not classify turns.
+
+The scope is one more reason in the same admission report (`IntentScope`), so
+`find_tool` reaches a scoped-out definition by the same path as a deferred or
+budget-withheld one. It is not an authorization boundary: the tool is still
+registered, and policy still decides whether the call runs. The byte budget
+from `with_tool_schema_budget` applies after the scope, and the array stays
+name-sorted for a stable provider prefix.
+
 ### Remote Agent Tools
 
 Create tools that call other agents via RPC:

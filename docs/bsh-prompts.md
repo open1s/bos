@@ -284,8 +284,30 @@ The prompt is only one bucket of a request. The tool definitions are the other
 large per-step payload, and they used to have no bound at all: every registered,
 non-deferred tool rode every step, so an extension platform, an MCP gateway that
 did not defer, or a preset with every bundle on made the request grow with the
-registry. Two numbers now govern the array, and they are the same number for a
-turn.
+registry. The array is scoped by the turn's intent first (issue #435), then
+bounded by two numbers that are the same number for a turn.
+
+**Intent scope.** Agent::set_initial_tool_scope declares the host's core
+definitions (BSH: files, search, shell and jobs, the plan, clarification, web
+search, the MCP gateway and subagent). Agent::set_action_intent then selects
+one of three arrays:
+
+- Action: the core plus find_tool; Federation, scheduling, goals, surface,
+  memory, browser, extra MCP servers and extension tools stay registered and
+  discoverable.
+- Explanation / Unknown: no execution tools at all - only find_tool. The
+  captured 39-tool greeting request becomes one definition.
+- unclassified (no set_action_intent yet): the historical broad array. This
+  is the safe fallback for a build-time read and for a host that does not
+  classify turns.
+
+An intent-withheld definition is reported with reason IntentScope in the same
+admission decision, so find_tool reaches it exactly like a deferred or
+budget-withheld one. Advertising, discovery and invocation stay separate: the
+tool remains registered and callable, and policy still authorizes or denies the
+call at invocation time. Measured on the default test build: 25 definitions ->
+1 (chat) / 17 (work); the complete composition 26,099 -> 10,181 / 23,071 bytes
+(~6,524 -> 2,545 / 5,767 tokens).
 
 | Writer | Limit | Owner |
 |---|---|---|
@@ -302,21 +324,22 @@ ordinary "schema budget reached" note instead of silently arriving.
 
 The rules that make the bound safe:
 
-- **Nothing is dropped silently.** `Agent::tool_admission` reports each
-  withheld definition with its bytes and reason (`TooLarge` or
-  `OverBudget`); the build logs the names and total. A withheld tool is still
-  registered and callable.
+- **Nothing is dropped silently.** Agent::tool_admission reports each withheld
+  definition with its bytes and reason (TooLarge, OverBudget or IntentScope);
+  the build logs the names and total. A withheld tool is still registered and
+  callable.
 - **The way back is in the same request.** Withholding anything admits
   `find_tool` in its place, and the admissions decision is written into the
   catalogue `find_tool` reads, so a withheld definition is offered with its
   full schema exactly like a deferred one. The search's own bytes are priced
   with the definitions it makes reachable.
-- **Required definitions are never withheld.** `Agent::require_tool` names
-  them. BSH marks every tool whose paragraph `append_tool_guidance` appended,
-  so a rule and a definition are written or omitted together rather than the
-  prompt naming a tool the request does not carry. A required definition is
-  admitted even when it overdraws the ceiling; the overdraft is logged, not paid
-  for by dropping the tool.
+- **Required definitions are never withheld by the byte budget.**
+  Agent::require_tool names them, and BSH marks every tool whose paragraph
+  append_tool_guidance appended. A required definition is admitted even when it
+  overdraws the ceiling; the overdraft is logged, not paid for by dropping the
+  tool. The intent scope is the one decision that can omit a required
+  definition, and it does so only for a conversation, where find_tool is the way
+  back; a work turn carries every core definition the prompt names.
 - **The cached prefix stays stable.** Admission visits candidates in name order
   and the array is name-sorted, so an unchanged registry yields a byte-identical
   array whatever order tools were registered in.

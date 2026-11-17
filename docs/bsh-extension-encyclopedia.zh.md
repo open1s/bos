@@ -341,7 +341,7 @@ description = "Echo the input"
 | 模型可读 | prompt / context / skill | 系统提示或技能目录 |
 | 读者可见 | command / panel / theme / workflow | 宿主插件注册表与清单 |
 
-工具延迟是刻意设计：一次安装贡献一族工具，而每个 schema 每一步都重发。构建只广告 `find_tool`；被选中的定义下一步才加入请求。要模型一开始就看到某个工具，就在 prompt 里点名它。
+工具延迟是刻意设计：一次安装贡献一族工具，而每个 schema 每一步都重发。构建只广告 `find_tool`；被选中的定义下一步才加入请求。初始数组还按意图收窄（#435）：普通对话只带 `find_tool`，工作回合带工作区核心工具；扩展工具和其他专项能力始终通过 `find_tool` 发现。
 
 命令永不提升为工具；模型操作 reader shell 是另一种授权。若同一效果要两种入口，声明 `tool` 与 `command` 两个贡献、共享 handler。
 
