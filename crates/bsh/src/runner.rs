@@ -1728,6 +1728,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The reported regression: an admitted extension tool must not inject
+    /// its workflow on an unrelated research turn (issue #436 review).
+    #[test]
+    fn a_research_turn_does_not_inject_an_admitted_extension() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut provider = agent::agent::agentic::LlmProvider::new();
+        provider.register_vendor(
+            "mock".to_string(),
+            Box::new(RequestCapturingLlm(seen.clone())),
+        );
+        let mut agent = agent::Agent::new(
+            agent::AgentConfig {
+                model: "mock-model".to_string(),
+                ..Default::default()
+            },
+            Arc::new(provider),
+        );
+        agent.add_tool(Arc::new(agent::tools::FunctionTool::new(
+            "devkit__scaffold",
+            "scaffold a package",
+            serde_json::json!({"type": "object"}),
+            |_args| Ok(serde_json::json!({"ok": true})),
+        )));
+        agent.set_initial_tool_scope(react::tool::admission::InitialToolScope::new(
+            ["read_file"],
+            Vec::<String>::new(),
+        ));
+        agent.add_conditional_prompt(devkit_prompt());
+        let root = workspace("extension-research");
+        let mut runner = Runner::new();
+        let receiver = spawn_turn(
+            &mut runner,
+            "extension-research",
+            Arc::new(agent),
+            "research the latest llm papers",
+            &root,
+        );
+        drain(receiver);
+
+        let requests = seen.lock().unwrap();
+        let request = requests.last().expect("a request");
+        let messages = format!("{:?}", request.messages);
+        assert!(
+            !messages.contains("DEVKIT-BODY"),
+            "the extension guide is not injected: {messages}"
+        );
+        assert!(
+            request
+                .manifest
+                .contains("not relevant to this contribution"),
+            "the omission is reported: {}",
+            request.manifest
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Explicit extension work injects the body once, with the extension's id
     /// and version in the manifest (issue #436).
     #[test]
