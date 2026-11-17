@@ -770,18 +770,22 @@ fn result_change(name: &str, output: Option<&str>) -> Option<StepChange> {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(output?).ok()?;
-    if value
-        .get("dry_run")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
+    // The current result uses words (mode/outcome); the boolean fallback
+    // keeps a replayed session written before the result contract readable.
+    let dry_run = value.get("mode").and_then(serde_json::Value::as_str) == Some("dry-run")
+        || value
+            .get("dry_run")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    if dry_run {
         return None;
     }
-    if !value
-        .get("changed")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
+    let changed = value.get("outcome").and_then(serde_json::Value::as_str) == Some("changed")
+        || value
+            .get("changed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    if !changed {
         return None;
     }
     let added = value
@@ -5965,7 +5969,7 @@ mod tests {
         let mut tool = step("sed");
         tool.args = r#"{"path":"a.txt","script":"s/a/b/"}"#.to_string();
         tool.output = Some(
-            r#"{"path":"a.txt","changed":true,"dry_run":false,"added":1,"deleted":1,"diff":[{"sign":"-","line":"a"},{"sign":"+","line":"b"}]}"#
+            r#"{"path":"a.txt","outcome":"changed","mode":"applied","added":1,"deleted":1,"diff":[{"sign":"-","line":"a"},{"sign":"+","line":"b"}]}"#
                 .to_string(),
         );
         let files = turn_changes(&[tool.clone()]);
@@ -5980,7 +5984,7 @@ mod tests {
 
         // A dry run writes nothing, and a byte-level change with no line diff
         // is not shown as a line change.
-        tool.output = Some(r#"{"path":"a.txt","changed":true,"dry_run":true}"#.to_string());
+        tool.output = Some(r#"{"path":"a.txt","outcome":"changed","mode":"dry-run"}"#.to_string());
         assert!(turn_changes(&[tool]).is_empty());
     }
 

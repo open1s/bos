@@ -6,7 +6,6 @@
 //!
 //! - `tool`: the tool that produced the result;
 //! - `status`: `ok`, `empty`, `partial` or `error`;
-//! - `truncated`: whether a line/row/entry budget or the batch cap cut the result;
 //! - `next`: the exact arguments for the continuation call, absent when none;
 //! - `hint`: a one-sentence recovery note, absent when the result speaks for
 //!   itself.
@@ -45,19 +44,12 @@ pub(crate) fn status(empty: bool, truncated: bool) -> &'static str {
 /// `next` is omitted when it is `None`, which is the common case: a result
 /// that is complete should not spend tokens saying "no continuation". A tool
 /// keeps its own `hint` when it has one; this function does not touch it.
-pub(crate) fn finish(
-    value: &mut Value,
-    tool: &str,
-    status: &str,
-    truncated: bool,
-    next: Option<Value>,
-) {
+pub(crate) fn finish(value: &mut Value, tool: &str, status: &str, next: Option<Value>) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
     object.insert("tool".to_string(), Value::String(tool.to_string()));
     object.insert("status".to_string(), Value::String(status.to_string()));
-    object.insert("truncated".to_string(), Value::Bool(truncated));
     if let Some(next) = next {
         object.insert("next".to_string(), next);
     }
@@ -79,10 +71,10 @@ mod tests {
     #[test]
     fn finish_adds_the_shared_fields_and_omits_an_absent_continuation() {
         let mut value = json!({ "content": "line" });
-        finish(&mut value, "read_file", OK, false, None);
+        finish(&mut value, "read_file", OK, None);
         assert_eq!(value["tool"], "read_file");
         assert_eq!(value["status"], "ok");
-        assert_eq!(value["truncated"], false);
+        assert!(value.get("truncated").is_none());
         assert!(value.get("next").is_none());
         assert_eq!(value["content"], "line");
     }
@@ -94,18 +86,17 @@ mod tests {
             &mut value,
             "read_file",
             PARTIAL,
-            true,
             Some(json!({ "offset": 13 })),
         );
         assert_eq!(value["status"], "partial");
-        assert_eq!(value["truncated"], true);
+        assert!(value.get("truncated").is_none());
         assert_eq!(value["next"]["offset"], 13);
     }
 
     #[test]
     fn finish_keeps_a_tool_specific_hint() {
         let mut value = json!({ "hint": "the file is empty" });
-        finish(&mut value, "read_file", EMPTY, false, None);
+        finish(&mut value, "read_file", EMPTY, None);
         assert_eq!(value["hint"], "the file is empty");
     }
 }

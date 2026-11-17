@@ -524,7 +524,7 @@ fn read_bounded(target: &Path) -> Result<Vec<u8>, Error> {
 /// A binary pair has no line diff; the counts stay zero and the transcript omits
 /// the card's preview rather than pretending bytes are lines. Context lines are
 /// left out because the existing card previews only the lines a step changed.
-fn line_diff(before: &[u8], after: &[u8]) -> (Vec<(char, String)>, usize, usize, bool) {
+pub(crate) fn line_diff(before: &[u8], after: &[u8]) -> (Vec<(char, String)>, usize, usize, bool) {
     let (Ok(before), Ok(after)) = (std::str::from_utf8(before), std::str::from_utf8(after)) else {
         return (Vec::new(), 0, 0, false);
     };

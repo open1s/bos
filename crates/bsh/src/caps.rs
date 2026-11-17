@@ -4156,6 +4156,8 @@ struct Listing {
 struct WriteOutcome {
     bytes: usize,
     unchanged: bool,
+    /// Whether the target existed before this write.
+    existed: bool,
 }
 
 /// Why one edit could not be applied.
@@ -4358,6 +4360,18 @@ fn read_editable(target: &Path) -> Result<String, ToolError> {
     utf8_text(target, bytes, 0)
 }
 
+/// One changed line's JSON row, shared by every mutating file tool.
+fn diff_rows(diff: &[(char, String)]) -> Vec<serde_json::Value> {
+    diff.iter()
+        .map(|(sign, line)| {
+            serde_json::json!({
+                "sign": sign.to_string(),
+                "line": line,
+            })
+        })
+        .collect()
+}
+
 /// The one temp path a write uses beside its target.
 fn temp_beside(target: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -4390,6 +4404,7 @@ fn write_bytes(target: &Path, bytes: &[u8]) -> Result<WriteOutcome, ToolError> {
                         return Ok(WriteOutcome {
                             bytes: bytes.len(),
                             unchanged: true,
+                            existed: true,
                         });
                     }
                 }
@@ -4437,6 +4452,7 @@ fn write_bytes(target: &Path, bytes: &[u8]) -> Result<WriteOutcome, ToolError> {
     Ok(WriteOutcome {
         bytes: bytes.len(),
         unchanged: false,
+        existed: existing.is_some(),
     })
 }
 
@@ -4698,7 +4714,6 @@ pub(crate) fn glob_tool(
                 "pattern": pattern,
                 "count": count,
                 "matches": matches,
-                "truncated": found.truncated,
             });
             if empty {
                 result["hint"] =
@@ -4712,7 +4727,6 @@ pub(crate) fn glob_tool(
                 &mut result,
                 "glob",
                 crate::file_result::status(empty, found.truncated),
-                found.truncated,
                 next,
             );
             Ok(result)
@@ -4866,7 +4880,6 @@ pub(crate) fn grep_tool(
                 "pattern": pattern,
                 "count": count,
                 "matches": matches,
-                "truncated": found.truncated,
             });
             if !found.binary.is_empty() {
                 result["binary"] = serde_json::json!(
@@ -4907,7 +4920,6 @@ pub(crate) fn grep_tool(
                 &mut result,
                 "grep",
                 crate::file_result::status(empty, found.truncated),
-                found.truncated,
                 next,
             );
             Ok(result)
@@ -4982,7 +4994,6 @@ pub(crate) fn read_file_tool(
                 "end_line": end_line,
                 "total_lines": total_lines,
                 "bytes": bytes,
-                "past_end": past_end,
             });
             if let Some(next) = next_offset {
                 let of = total_lines
@@ -5006,7 +5017,6 @@ pub(crate) fn read_file_tool(
                 &mut result,
                 "read_file",
                 crate::file_result::status(empty, truncated),
-                truncated,
                 next,
             );
             Ok(result)
@@ -5110,7 +5120,6 @@ pub(crate) fn read_files_tool(
                         results.push(serde_json::json!({
                             "path": raw,
                             "status": crate::file_result::ERROR,
-                            "truncated": false,
                             "error": error.to_string()
                         }));
                         continue;
@@ -5138,9 +5147,7 @@ pub(crate) fn read_files_tool(
                             "end_line": 0,
                             "total_lines": null,
                             "bytes": 0,
-                            "truncated": true,
                             "next": { "offset": offset.unwrap_or(1) },
-                            "past_end": false,
                             "reason": "combined batch output budget reached"
                         }));
                     }
@@ -5201,11 +5208,14 @@ pub(crate) fn read_files_tool(
                         "end_line": end_line,
                         "total_lines": total_lines,
                         "bytes": bytes,
-                        "truncated": was_truncated,
-                        "past_end": past_end
                     });
                     if was_truncated {
                         file_result["next"] = serde_json::json!({ "offset": next_offset });
+                    }
+                    if past_end {
+                        file_result["hint"] = serde_json::json!(format!(
+                            "offset {start_line} is past the last line"
+                        ));
                     }
                     Ok(file_result)
                 })();
@@ -5214,6 +5224,7 @@ pub(crate) fn read_files_tool(
                     Ok(value) => results.push(value),
                     Err(error) => results.push(serde_json::json!({
                         "path": raw,
+                        "status": crate::file_result::ERROR,
                         "error": error.to_string()
                     })),
                 }
@@ -5242,10 +5253,9 @@ pub(crate) fn read_files_tool(
                 "returned": returned,
                 "failed": failed,
                 "bytes": total_bytes,
-                "truncated": truncated,
                 "max_bytes": MAX_BATCH_READ_BYTES
             });
-            crate::file_result::finish(&mut result, "read_files", status, truncated, None);
+            crate::file_result::finish(&mut result, "read_files", status, None);
             Ok(result)
         },
     )
@@ -5480,13 +5490,21 @@ fn apply_patch_tool(
                         }
                         changed_files += 1;
                     }
+                    let (diff, added, deleted, diff_truncated) = if unchanged {
+                        (Vec::new(), 0, 0, false)
+                    } else {
+                        crate::sed::line_diff(original.as_bytes(), content.as_bytes())
+                    };
                     Ok(serde_json::json!({
                         "path": target.display().to_string(),
                         "status": crate::file_result::OK,
-                        "truncated": false,
+                        "outcome": if unchanged { "unchanged" } else { "patched" },
                         "replacements": replacements,
                         "bytes": content.len(),
-                        "unchanged": unchanged
+                        "added": added,
+                        "deleted": deleted,
+                        "diff_status": if diff_truncated { "truncated" } else { "complete" },
+                        "diff": diff_rows(&diff)
                     }))
                 })();
 
@@ -5495,7 +5513,6 @@ fn apply_patch_tool(
                     Err(error) => results.push(serde_json::json!({
                         "path": raw,
                         "status": crate::file_result::ERROR,
-                        "truncated": false,
                         "error": error.to_string()
                     })),
                 }
@@ -5505,6 +5522,9 @@ fn apply_patch_tool(
                 .iter()
                 .filter(|file| file["status"].as_str() == Some(crate::file_result::ERROR))
                 .count();
+            let diff_truncated = results
+                .iter()
+                .any(|file| file["diff_status"].as_str() == Some("truncated"));
             let status = if failed == results.len() {
                 crate::file_result::ERROR
             } else if failed > 0 {
@@ -5516,9 +5536,10 @@ fn apply_patch_tool(
                 "files": results,
                 "count": changes.len(),
                 "failed": failed,
-                "changed_files": changed_files
+                "changed_files": changed_files,
+                "diff_status": if diff_truncated { "truncated" } else { "complete" }
             });
-            crate::file_result::finish(&mut result, "apply_patch", status, false, None);
+            crate::file_result::finish(&mut result, "apply_patch", status, None);
             Ok(result)
         },
     )
@@ -5584,15 +5605,19 @@ fn write_file_tool(
             }
             let mut result = serde_json::json!({
                 "path": target.display().to_string(),
-                "operation": if existed { "update" } else { "create" },
+                "outcome": if outcome.unchanged {
+                    "unchanged"
+                } else if outcome.existed {
+                    "updated"
+                } else {
+                    "created"
+                },
                 "bytes": outcome.bytes,
-                "unchanged": outcome.unchanged,
             });
             crate::file_result::finish(
                 &mut result,
                 "write_file",
                 crate::file_result::OK,
-                false,
                 None,
             );
             Ok(result)
@@ -5689,16 +5714,33 @@ fn edit_file_tool(
                     runtime.record(&target, ChangeOperation::Edit, before, "edit_file");
                 }
             }
+            let (diff, added, deleted, diff_truncated) = match &outcome.updated {
+                Some(updated) => crate::sed::line_diff(content.as_bytes(), updated.as_bytes()),
+                None => (Vec::new(), 0, 0, false),
+            };
+            let bytes = outcome
+                .updated
+                .as_ref()
+                .map_or(content.len(), |updated| updated.len());
             let mut result = serde_json::json!({
                 "path": target.display().to_string(),
                 "replacements": outcome.replacements,
-                "unchanged": unchanged,
+                "bytes": bytes,
+                "outcome": if unchanged { "unchanged" } else { "updated" },
+                "added": added,
+                "deleted": deleted,
+                "diff_status": if diff_truncated { "truncated" } else { "complete" },
+                "diff": diff_rows(&diff),
             });
+            if diff_truncated {
+                result["hint"] = serde_json::json!(
+                    "the diff was truncated; read the file with read_file for the rest"
+                );
+            }
             crate::file_result::finish(
                 &mut result,
                 "edit_file",
                 crate::file_result::OK,
-                false,
                 None,
             );
             Ok(result)
@@ -5850,8 +5892,8 @@ fn sed_tool(
             };
             let mut result = serde_json::json!({
                 "path": target.display().to_string(),
-                "changed": outcome.changed,
-                "dry_run": dry_run,
+                "outcome": if outcome.changed { "changed" } else { "unchanged" },
+                "mode": if dry_run { "dry-run" } else { "applied" },
                 "before_bytes": outcome.before_bytes,
                 "bytes": outcome.after_bytes,
                 "exit_code": outcome.exit_code,
@@ -5861,23 +5903,26 @@ fn sed_tool(
                     Some(content) => serde_json::Value::String(content),
                     None => serde_json::Value::Null,
                 };
-                result["truncated"] = serde_json::json!(outcome.truncated);
-                result["binary"] = serde_json::json!(outcome.binary);
+                result["content_kind"] = serde_json::json!(if outcome.binary {
+                    "binary"
+                } else {
+                    "text"
+                });
+                result["content_status"] = serde_json::json!(if outcome.truncated {
+                    "truncated"
+                } else {
+                    "complete"
+                });
             }
             if !dry_run {
-                result["diff"] = serde_json::json!(
-                    outcome
-                        .diff
-                        .iter()
-                        .map(|(sign, line)| serde_json::json!({
-                            "sign": sign.to_string(),
-                            "line": line,
-                        }))
-                        .collect::<Vec<_>>()
-                );
+                result["diff"] = serde_json::json!(diff_rows(&outcome.diff));
                 result["added"] = serde_json::json!(outcome.added);
                 result["deleted"] = serde_json::json!(outcome.deleted);
-                result["diff_truncated"] = serde_json::json!(outcome.diff_truncated);
+                result["diff_status"] = serde_json::json!(if outcome.diff_truncated {
+                    "truncated"
+                } else {
+                    "complete"
+                });
             }
             if let Some(backup) = &backup {
                 result["backup"] = serde_json::json!(backup.display().to_string());
@@ -5892,8 +5937,7 @@ fn sed_tool(
             crate::file_result::finish(
                 &mut result,
                 "sed",
-                crate::file_result::status(empty, truncated),
-                truncated,
+                crate::file_result::status(empty, false),
                 None,
             );
             Ok(result)
@@ -5938,7 +5982,6 @@ fn list_dir_tool(
                 "path": target.display().to_string(),
                 "count": count,
                 "entries": listing.entries,
-                "truncated": listing.truncated,
             });
             if listing.truncated {
                 result["hint"] = serde_json::json!(
@@ -5949,7 +5992,6 @@ fn list_dir_tool(
                 &mut result,
                 "list_dir",
                 crate::file_result::status(count == 0, listing.truncated),
-                listing.truncated,
                 None,
             );
             Ok(result)
@@ -11103,7 +11145,6 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("a small file reads whole");
         assert_eq!(whole["content"], body);
-        assert_eq!(whole["truncated"], false);
         assert_eq!(whole["start_line"], 1);
         assert_eq!(whole["end_line"], 100);
         assert_eq!(whole["total_lines"], 100);
@@ -11122,8 +11163,6 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("a window reads");
         assert_eq!(window["content"], "line 10\nline 11\nline 12\n");
-        assert_eq!(window["truncated"], true);
-        assert_eq!(window["past_end"], false);
         assert_eq!(window["start_line"], 10);
         assert_eq!(window["end_line"], 12);
         assert_eq!(window["total_lines"], 100);
@@ -11157,11 +11196,6 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("an offset past the end is empty, not an error");
         assert_eq!(past["content"], "");
-        assert_eq!(past["truncated"], false);
-        assert_eq!(
-            past["past_end"], true,
-            "an empty window past the last line says so, so it cannot be read as an empty file"
-        );
         assert_eq!(past["status"], "empty");
         assert_eq!(past["total_lines"], 100);
         assert!(
@@ -11220,7 +11254,6 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(result["files"][2]["status"], "error");
         assert!(result["files"][2]["error"].as_str().is_some());
         assert!(!result.to_string().contains("outside-secret"));
-        assert_eq!(result["truncated"], false);
     }
 
     #[test]
@@ -11257,13 +11290,11 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("bounded batch read");
         assert_eq!(result["bytes"], MAX_BATCH_READ_BYTES);
-        assert_eq!(result["truncated"], true);
         assert_eq!(
             result["files"][0]["bytes"].as_u64().unwrap()
                 + result["files"][1]["bytes"].as_u64().unwrap(),
             MAX_BATCH_READ_BYTES as u64
         );
-        assert!(result["files"][1]["truncated"].as_bool().unwrap());
         assert_eq!(result["status"], "partial");
         // The batch cut b.txt in the middle of its one long line. The
         // continuation must re-read that line, not skip to the next one.
@@ -11487,8 +11518,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 }),
             )
             .expect("the dry run runs");
-        assert_eq!(dry["changed"], true);
-        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["outcome"], "changed");
+        assert_eq!(dry["mode"], "dry-run");
         assert_eq!(dry["content"], "1 two 1\n");
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).expect("the original"),
@@ -11502,8 +11533,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 &serde_json::json!({ "path": "a.txt", "script": "s/one/1/g" }),
             )
             .expect("the edit runs");
-        assert_eq!(edited["changed"], true);
-        assert_eq!(edited["dry_run"], false);
+        assert_eq!(edited["outcome"], "changed");
+        assert_eq!(edited["mode"], "applied");
         assert_eq!(edited["added"], 1, "{edited}");
         assert_eq!(edited["deleted"], 1, "{edited}");
         assert_eq!(edited["diff"][0]["sign"], "-", "{edited}");
@@ -11518,7 +11549,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 &serde_json::json!({ "path": "a.txt", "script": "s/one/1/g" }),
             )
             .expect("a second run is a no-op");
-        assert_eq!(again["changed"], false);
+        assert_eq!(again["outcome"], "unchanged");
 
         // GNU sed -i -n '/two/p' is the filter idiom: the explicit print goes
         // to the edited file, and quiet suppresses the automatic one. The file
@@ -11530,7 +11561,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 &serde_json::json!({ "path": "a.txt", "script": "/two/p", "quiet": true }),
             )
             .expect("the filter runs");
-        assert_eq!(filtered["changed"], true, "{filtered}");
+        assert_eq!(filtered["outcome"], "changed", "{filtered}");
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).expect("the filter"),
             "two\n"
@@ -11613,7 +11644,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 }),
             )
             .expect("an identical write succeeds");
-        assert_eq!(repeated["unchanged"], true);
+        assert_eq!(repeated["outcome"], "unchanged");
         let after = std::fs::metadata(&file)
             .expect("metadata")
             .modified()
@@ -11629,8 +11660,20 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 }),
             )
             .expect("a real write succeeds");
-        assert_eq!(changed["unchanged"], false);
+        assert_eq!(changed["outcome"], "updated");
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "different");
+
+        let created = registry
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": root.join("new.txt").to_string_lossy(),
+                    "content": "new",
+                }),
+            )
+            .expect("a create succeeds");
+        assert_eq!(created["outcome"], "created");
+        assert_eq!(created["status"], "ok");
     }
 
     /// An overwrite keeps the file's mode, which a temp-and-rename write would
@@ -11701,6 +11744,43 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect_err("an identical edit is refused");
         assert!(identical.to_string().contains("identical"), "{identical}");
+    }
+
+    /// A large edit still returns local context, but the diff is bounded and
+    /// says so instead of silently dropping the rest.
+    #[test]
+    fn an_edit_diff_is_bounded_and_says_so() {
+        let root = scratch("edit-diff-budget");
+        let file = root.join("many.txt");
+        std::fs::write(&file, "x\n".repeat(40)).expect("many");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let result = registry
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "old_string": "x",
+                    "new_string": "y",
+                    "replace_all": true,
+                }),
+            )
+            .expect("the edit applies");
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["diff_status"], "truncated");
+        assert_eq!(
+            result["diff"].as_array().map(Vec::len),
+            Some(crate::sed::MAX_DIFF_LINES),
+            "the changed-line preview is capped"
+        );
+        assert!(
+            result["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("diff was truncated"),
+            "{result}"
+        );
     }
 
     /// Two edits to one path cannot both start from the original bytes: the
@@ -11777,7 +11857,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 ("link", "dir"),
             ]
         );
-        assert_eq!(result["truncated"], false);
+        assert_eq!(result["status"], "ok");
     }
 
     /// The ignore file is created on the first file-tool call, with the common
@@ -12102,7 +12182,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             vec!["root.rs", "src/deep/two.rs", "src/one.rs"],
             "a pattern without a separator matches the basename at any depth"
         );
-        assert_eq!(all["truncated"], false);
+        assert_eq!(all["status"], "ok");
 
         let narrowed = registry
             .execute(
@@ -12142,7 +12222,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("a limited glob runs");
         assert_eq!(matches(&limited).len(), 1);
-        assert_eq!(limited["truncated"], true);
+        assert_eq!(limited["status"], "partial");
+        assert_eq!(limited["next"]["limit"], 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -12448,7 +12529,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 .any(|row| row["line"] == 40 && row["text"] == "function target(){"),
             "the match itself is in the window: {found}"
         );
-        assert_eq!(found["truncated"], false);
+        assert_eq!(found["status"], "ok");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -12486,7 +12567,6 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 .any(|row| row["line"] == 50 && row["text"] == "TARGET"),
             "the match survives its own before-context: {found}"
         );
-        assert_eq!(found["truncated"], true);
         assert_eq!(found["status"], "partial");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -15917,9 +15997,47 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
                 .unwrap_or_else(|error| panic!("{tool} failed: {error}"));
             assert_eq!(value["tool"], tool, "self-describing result: {value}");
             assert_eq!(value["status"], "ok", "{tool}: {value}");
-            assert_eq!(value["truncated"], false, "{tool}: {value}");
+            assert!(
+                value.get("truncated").is_none(),
+                "a boolean does not stand in for a status: {value}"
+            );
             if let Some(next) = value.get("next") {
                 assert!(next.is_object(), "{tool} next is arguments: {value}");
+            }
+            match tool {
+                "write_file" => assert_eq!(value["outcome"], "created", "{value}"),
+                "edit_file" => {
+                    assert_eq!(value["outcome"], "updated", "{value}");
+                    assert_eq!(value["diff_status"], "complete", "{value}");
+                    assert_eq!(value["added"], 1, "{value}");
+                    assert_eq!(value["deleted"], 1, "{value}");
+                    assert!(
+                        value["diff"].as_array().is_some_and(|diff| diff.len() == 2),
+                        "the edit result carries its changed lines: {value}"
+                    );
+                }
+                "apply_patch" => {
+                    assert_eq!(value["files"][0]["outcome"], "patched", "{value}");
+                    assert_eq!(value["files"][0]["diff_status"], "complete", "{value}");
+                    assert!(
+                        value["files"][0]["diff"]
+                            .as_array()
+                            .is_some_and(|diff| diff.len() == 2),
+                        "the patch result carries each file's changed lines: {value}"
+                    );
+                }
+                "sed" => {
+                    assert_eq!(value["outcome"], "changed", "{value}");
+                    assert_eq!(value["mode"], "applied", "{value}");
+                    assert_eq!(value["diff_status"], "complete", "{value}");
+                    assert!(
+                        value["diff"]
+                            .as_array()
+                            .is_some_and(|diff| !diff.is_empty()),
+                        "the sed result carries its changed lines: {value}"
+                    );
+                }
+                _ => {}
             }
         }
         let _ = std::fs::remove_dir_all(&root);

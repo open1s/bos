@@ -8438,7 +8438,7 @@ mod tests {
             "a running sed step has no result to preview"
         );
         tool.output = Some(
-            r#"{"path":"a.txt","changed":true,"dry_run":false,"added":1,"deleted":1,"diff":[{"sign":"-","line":"a"},{"sign":"+","line":"b"}]}"#
+            r#"{"path":"a.txt","outcome":"changed","mode":"applied","added":1,"deleted":1,"diff":[{"sign":"-","line":"a"},{"sign":"+","line":"b"}]}"#
                 .to_string(),
         );
         assert_eq!(
