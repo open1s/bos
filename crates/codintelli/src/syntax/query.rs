@@ -70,8 +70,8 @@ pub const MAX_RETAINED_MATCHES: usize = 1_000_000;
 /// batch indexing may raise the limit up to this documented ceiling.
 pub const MAX_RETAINED_CAPTURES: usize = 5_000_000;
 
-/// Absolute maximum accepted value of
-/// [`QueryRegistryLimits::max_query_source_bytes`].
+/// Absolute maximum accepted value of the query registry's per-query source
+/// limit.
 ///
 /// Bounds the query source accepted for compilation before Tree-sitter sees
 /// it. The default (64 KiB) is far lower; this ceiling exists so a registry
@@ -79,12 +79,10 @@ pub const MAX_RETAINED_CAPTURES: usize = 5_000_000;
 /// unbounded definition.
 pub const MAX_QUERY_SOURCE_BYTES: usize = 1 << 20;
 
-/// Absolute maximum accepted value of
-/// [`QueryRegistryLimits::max_queries`].
+/// Absolute maximum accepted value of the query registry's query-count limit.
 pub const MAX_REGISTRY_QUERIES: usize = 4_096;
 
-/// Absolute maximum accepted value of
-/// [`QueryRegistryLimits::max_total_source_bytes`].
+/// Absolute maximum accepted value of the query registry's total-source limit.
 pub const MAX_REGISTRY_TOTAL_SOURCE_BYTES: usize = 8 << 20;
 
 /// Validate a query identifier or version.
