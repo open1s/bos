@@ -15,10 +15,13 @@
   message. `ThinkingSnapshot` persists beside the messages in `AgentSession`
   (session schema 6, snapshot schema 3). Effective polarity resolves negation
   around a claim's predicate, so "does not fail" is positive and "does not
-  pass" is negative. Resume-versus-new-task is decided from a bounded request
-  signature, not the phase alone: a different request after an interruption
-  clears stale pending state, while a continuation or the same task preserves
-  the in-flight call as interrupted/unknown instead of success. Reasoning is
+  pass" is negative. Output polarity is scored over predicate occurrences with
+  their negation context: "did not fail" and "no failures" are positive,
+  "failed to pass" is negative, "not present" is an absence, and absence
+  reports cannot confirm a failure claim. Resume-versus-new-task is decided from
+  a bounded request signature, not the phase alone: a different request after an
+  interruption clears stale pending state, while a continuation or the same
+  task preserves the in-flight call as interrupted/unknown instead of success. Reasoning is
   folded in batches and at every recoverable stream termination (provider error,
   stop, dropped stream after a batch) without ever marking a stopped turn
   complete. See `docs/thinking-summary.md`.

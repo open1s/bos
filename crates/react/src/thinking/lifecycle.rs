@@ -529,12 +529,35 @@ struct ClaimPolarity {
 
 /// Predicates that assert failure or absence.
 const NEGATIVE_PREDICATES: &[&str] = &[
-    "fail", "error", "broken", "missing", "crash", "panic", "失败", "错误", "缺失", "崩溃",
+    "fail",
+    "error",
+    "broken",
+    "missing",
+    "absent",
+    "crash",
+    "panic",
+    "unsuccess",
+    "失败",
+    "错误",
+    "缺失",
+    "崩溃",
 ];
 
 /// Predicates that assert success or a fix.
+const SUCCESS_PREDICATES: &[&str] = &[
+    "pass", "work", "fix", "success", "succeed", "correct", "resolve", "通过", "成功", "修复",
+    "正确",
+];
+
+/// Predicates that assert presence or evidence.
+const PRESENCE_PREDICATES: &[&str] = &[
+    "find", "found", "contain", "present", "confirm", "verif", "match",
+];
+
+/// All predicates that can carry a positive claim.
 const POSITIVE_PREDICATES: &[&str] = &[
-    "pass", "work", "fix", "success", "correct", "resolve", "通过", "成功", "修复", "正确",
+    "pass", "work", "fix", "success", "succeed", "correct", "resolve", "find", "found", "contain",
+    "present", "confirm", "verif", "match", "通过", "成功", "修复", "正确",
 ];
 
 /// The first line of `output`, when it actually supports `statement`.
@@ -567,9 +590,18 @@ fn confirming_excerpt(output: &str, statement: &str) -> Option<String> {
     // A test/build marker is itself evidence about the named test; otherwise
     // require two shared significant tokens so a generic word cannot verify a
     // claim on its own.
+    let test_evidence = statement_lower.contains("test")
+        && (negated_negative_predicate(&output_lower)
+            || SUCCESS_PREDICATES
+                .iter()
+                .any(|root| contains_predicate(&output_lower, root))
+            || NEGATIVE_PREDICATES
+                .iter()
+                .any(|root| contains_predicate(&output_lower, root)));
     let explicit_test_marker = output_lower.contains("test result:")
         || output_lower.contains("tests passed")
-        || output_lower.contains("0 failed");
+        || output_lower.contains("0 failed")
+        || test_evidence;
     let needed = if explicit_test_marker { 1 } else { 2 };
     if overlaps < needed {
         return None;
@@ -582,12 +614,17 @@ fn confirming_excerpt(output: &str, statement: &str) -> Option<String> {
 /// A bare substring search would see `work` inside `network` and `error`
 /// inside `terror`; those are not predicates of the sentence.
 fn find_predicate(text: &str, root: &str) -> Option<usize> {
+    predicate_occurrences(text, root).last().copied()
+}
+
+/// Every predicate occurrence, in reading order.
+fn predicate_occurrences(text: &str, root: &str) -> Vec<usize> {
     if root.chars().any(is_cjk) {
-        return text.rfind(root);
+        return text.match_indices(root).map(|(index, _)| index).collect();
     }
     text.match_indices(root)
         .filter_map(|(index, _)| predicate_bounds(text, index, root).then_some(index))
-        .last()
+        .collect()
 }
 
 /// Whether `root` at `index` is a whole predicate word.
@@ -599,12 +636,14 @@ fn predicate_bounds(text: &str, index: usize, root: &str) -> bool {
     let rest = &text[index + root.len()..];
     let after_ok = rest.is_empty()
         || rest.chars().next().is_none_or(|ch| !ch.is_alphanumeric())
-        || ["s", "es", "ed", "ing", "ure", "ures", "ful", "fully"]
-            .iter()
-            .any(|suffix| {
-                rest.strip_prefix(suffix)
-                    .is_some_and(|tail| tail.chars().next().is_none_or(|ch| !ch.is_alphanumeric()))
-            });
+        || [
+            "s", "es", "ed", "d", "ing", "ked", "king", "ure", "ures", "ful", "fully", "ied", "ies",
+        ]
+        .iter()
+        .any(|suffix| {
+            rest.strip_prefix(suffix)
+                .is_some_and(|tail| tail.chars().next().is_none_or(|ch| !ch.is_alphanumeric()))
+        });
     before_ok && after_ok
 }
 
@@ -684,7 +723,7 @@ fn negated_before(text: &str, index: usize) -> bool {
     let tail: String = prefix
         .chars()
         .rev()
-        .take(24)
+        .take(48)
         .collect::<String>()
         .chars()
         .rev()
@@ -693,9 +732,11 @@ fn negated_before(text: &str, index: usize) -> bool {
         || tail.contains("fails to ")
         || tail.contains("failed to ")
         || tail.contains("unable to ")
-        || ["not", "never", "no", "cannot", "without"]
-            .iter()
-            .any(|marker| contains_token(&tail, marker))
+        || [
+            "not", "never", "no", "none", "neither", "zero", "cannot", "without",
+        ]
+        .iter()
+        .any(|marker| contains_token(&tail, marker))
     {
         return true;
     }
@@ -707,9 +748,11 @@ fn negated_before(text: &str, index: usize) -> bool {
 /// Whether the statement contains an explicit negation at all.
 fn has_negation(text: &str) -> bool {
     if text.contains("n't")
-        || ["not", "never", "no", "cannot", "without"]
-            .iter()
-            .any(|marker| contains_token(text, marker))
+        || [
+            "not", "never", "no", "none", "neither", "zero", "cannot", "without",
+        ]
+        .iter()
+        .any(|marker| contains_token(text, marker))
     {
         return true;
     }
@@ -725,15 +768,41 @@ fn predicate_supported(claim: &ClaimPolarity, statement: &str, output: &str) -> 
         // the decision.
         return true;
     };
-    if contains_predicate(output, root) {
+    if contains_predicate(output, root) || presence_synonym(root, output) {
         return true;
     }
-    let antonyms: &[&str] = match claim.polarity {
-        Polarity::Negative => NEGATIVE_PREDICATES,
-        Polarity::Positive => POSITIVE_PREDICATES,
-        Polarity::Neutral => &[],
+    // A negative presence claim ("not present") is confirmed by an absence
+    // report even when the report uses a different presence verb.
+    if claim.polarity == Polarity::Negative
+        && PRESENCE_PREDICATES.contains(&root)
+        && output_is_absence(output)
+    {
+        return true;
+    }
+    // An absence report ("no test named parser") is not failure evidence for a
+    // claim about a test failing; only the claim's own predicate may confirm it.
+    if output_is_absence(output) && !PRESENCE_PREDICATES.contains(&root) {
+        return false;
+    }
+    // "The test did not fail" confirms a passing-test claim: a negated failure
+    // predicate is positive evidence even though it is not the word "pass".
+    if claim.polarity == Polarity::Positive
+        && statement.contains("test")
+        && negated_negative_predicate(output)
+    {
+        return true;
+    }
+    let family: &[&str] = if claim.polarity == Polarity::Negative {
+        NEGATIVE_PREDICATES
+    } else if NEGATIVE_PREDICATES.contains(&root) {
+        // A negated negative predicate ("does not fail") is a positive claim.
+        SUCCESS_PREDICATES
+    } else if PRESENCE_PREDICATES.contains(&root) {
+        PRESENCE_PREDICATES
+    } else {
+        SUCCESS_PREDICATES
     };
-    if antonyms
+    if family
         .iter()
         .any(|marker| contains_predicate(output, marker))
     {
@@ -745,54 +814,96 @@ fn predicate_supported(claim: &ClaimPolarity, statement: &str, output: &str) -> 
     explicit_test_marker && statement.contains("test")
 }
 
-/// Classify what an output reports.
-fn output_polarity(output: &str) -> Polarity {
-    if output.contains("test result: ok")
-        || output.contains("all tests passed")
-        || output.contains("0 failed")
-        || output.contains("no errors")
-    {
-        return Polarity::Positive;
-    }
-    if output_is_negative(output) {
-        return Polarity::Negative;
-    }
-    if output_is_positive(output) {
-        return Polarity::Positive;
-    }
-    Polarity::Neutral
+/// Whether the output negates a failure predicate ("did not fail", "no errors").
+fn negated_negative_predicate(output: &str) -> bool {
+    NEGATIVE_PREDICATES.iter().any(|root| {
+        predicate_occurrences(output, root)
+            .iter()
+            .any(|index| negated_before(output, *index))
+    })
 }
 
-/// Whether `output` reports a failure or an absence.
-fn output_is_negative(output: &str) -> bool {
-    [
-        "failed", "failure", "error", "missing", "broken", "panic", "panicked", "absent",
-    ]
-    .iter()
-    .any(|marker| contains_token(output, marker))
-        || output.contains("not found")
+/// Whether a presence root has an equivalent form in the output.
+fn presence_synonym(root: &str, output: &str) -> bool {
+    match root {
+        "find" => contains_predicate(output, "found"),
+        "found" => contains_predicate(output, "find"),
+        _ => false,
+    }
+}
+
+/// Whether the output reports an absence rather than a failure.
+fn output_is_absence(output: &str) -> bool {
+    output.contains("not found")
         || output.contains("no test")
-        || output.contains("\"success\": false")
-        || output.contains("失败")
-        || output.contains("错误")
+        || ["absent", "missing", "none"]
+            .iter()
+            .any(|marker| contains_token(output, marker))
 }
 
-/// Whether `output` reports a positive observation.
-fn output_is_positive(output: &str) -> bool {
-    output.contains("test result: ok")
-        || output.contains("all tests passed")
-        || output.contains("0 failed")
-        || [
-            "passed",
-            "found",
-            "confirmed",
-            "matches",
-            "present",
-            "verified",
-            "contains",
-        ]
+/// Classify what an output reports, including the negation around its predicates.
+///
+/// A score is used rather than a single marker: an output can say "test result:
+/// ok. 4 passed; 0 failed" (positive) or "the test did not fail because no
+/// errors were found" (also positive), and a single substring cannot tell those
+/// from "the test did not pass" (negative). Negation immediately before a
+/// predicate flips its contribution.
+fn output_polarity(output: &str) -> Polarity {
+    let lower = output.to_lowercase().replace("not only", "only");
+    let mut score = 0i32;
+    let mut evidence = false;
+
+    if lower.contains("test result: ok") {
+        score += 4;
+        evidence = true;
+    }
+    if lower.contains("test result: failed") {
+        score -= 4;
+        evidence = true;
+    }
+    for marker in [
+        "0 failed",
+        "0 failures",
+        "0 errors",
+        "no errors",
+        "no failures",
+    ] {
+        if lower.contains(marker) {
+            score += 3;
+            evidence = true;
+        }
+    }
+    if lower.contains("\"success\": false") {
+        score -= 3;
+        evidence = true;
+    }
+    if lower.contains("no test") || lower.contains("not found") {
+        score -= 2;
+        evidence = true;
+    }
+
+    for (root, base) in NEGATIVE_PREDICATES
         .iter()
-        .any(|marker| contains_token(output, marker))
+        .map(|root| (*root, -2))
+        .chain(POSITIVE_PREDICATES.iter().map(|root| (*root, 2)))
+    {
+        for index in predicate_occurrences(&lower, root) {
+            let negated = negated_before(&lower, index);
+            score += if negated { -base } else { base };
+            evidence = true;
+        }
+    }
+
+    if !evidence {
+        return Polarity::Neutral;
+    }
+    if score > 0 {
+        Polarity::Positive
+    } else if score < 0 {
+        Polarity::Negative
+    } else {
+        Polarity::Neutral
+    }
 }
 
 /// A bounded signature of the request that opened a turn.
@@ -918,9 +1029,144 @@ fn history_contains(history: &[LlmMessage], text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_polarity, Polarity, ThinkingState};
+    use super::{claim_polarity, output_polarity, Polarity, ThinkingState};
     use crate::llm::LlmMessage;
     use crate::thinking::summary::ThinkingConfidence;
+
+    #[test]
+    fn complex_output_negation_is_classified() {
+        assert_eq!(output_polarity("the test did not fail"), Polarity::Positive);
+        assert_eq!(output_polarity("the test did not pass"), Polarity::Negative);
+        assert_eq!(
+            output_polarity("the test is not failing"),
+            Polarity::Positive
+        );
+        assert_eq!(
+            output_polarity("the test is not passing"),
+            Polarity::Negative
+        );
+        assert_eq!(
+            output_polarity("the test failed to pass"),
+            Polarity::Negative
+        );
+        assert_eq!(output_polarity("no bug was found"), Polarity::Negative);
+        assert_eq!(
+            output_polarity("the bug is not present"),
+            Polarity::Negative
+        );
+        assert_eq!(
+            output_polarity("no failures were found"),
+            Polarity::Positive
+        );
+        assert_eq!(output_polarity("0 failures"), Polarity::Positive);
+        assert_eq!(output_polarity("no errors"), Polarity::Positive);
+        assert_eq!(output_polarity("unsuccessful"), Polarity::Negative);
+        assert_eq!(output_polarity("the build succeeded"), Polarity::Positive);
+        assert_eq!(
+            output_polarity("the issue was resolved"),
+            Polarity::Positive
+        );
+        assert_eq!(
+            output_polarity("the parser found no failures"),
+            Polarity::Positive
+        );
+        assert_eq!(
+            output_polarity("none of the tests failed"),
+            Polarity::Positive
+        );
+        assert_eq!(output_polarity("zero failures"), Polarity::Positive);
+        assert_eq!(
+            output_polarity("none of the tests passed"),
+            Polarity::Negative
+        );
+        assert_eq!(
+            output_polarity("after the full rebuild and a clean install there were no failures"),
+            Polarity::Positive
+        );
+    }
+
+    #[test]
+    fn a_passing_test_is_confirmed_by_did_not_fail() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The issue is that the test passes because the fixture exists.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result("bash", "the test did not fail", true, 2);
+        assert_eq!(
+            state.summary().decisions[0].confidence,
+            ThinkingConfidence::Verified,
+            "a negated failure confirms a passing claim"
+        );
+    }
+
+    #[test]
+    fn a_passing_test_confirms_does_not_fail() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The issue is that the test does not fail because the fix is correct.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result("bash", "the test passed", true, 2);
+        assert_eq!(
+            state.summary().decisions[0].confidence,
+            ThinkingConfidence::Verified
+        );
+    }
+
+    #[test]
+    fn a_failing_test_confirms_does_not_pass() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The issue is that the test does not pass because the fixture is missing.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result("bash", "the test failed", true, 2);
+        assert_eq!(
+            state.summary().decisions[0].confidence,
+            ThinkingConfidence::Verified
+        );
+    }
+
+    #[test]
+    fn a_failing_test_is_not_confirmed_by_did_not_fail() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The issue is that the parser test fails because the fixture is missing.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result("bash", "the parser test did not fail", true, 2);
+        assert_eq!(
+            state.summary().decisions[0].confidence,
+            ThinkingConfidence::Inferred,
+            "a negated failure contradicts a failing claim"
+        );
+    }
+
+    #[test]
+    fn a_negative_presence_claim_is_confirmed_by_absence() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The bug is not present in the parser because the file was rebuilt.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result("bash", "the parser bug was not found", true, 2);
+        assert_eq!(
+            state.summary().decisions[0].confidence,
+            ThinkingConfidence::Verified,
+            "absence evidence confirms a negative presence claim"
+        );
+    }
 
     #[test]
     fn predicate_matching_ignores_words_that_merely_contain_it() {

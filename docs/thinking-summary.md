@@ -29,10 +29,14 @@ to be about the same subject. Effective polarity resolves negation around the
 predicate: "does not fail" is positive, "does not pass" is negative, and "is
 not in the parser" is an absence claim that positive evidence cannot confirm.
 A successful tool call is execution, not verification, so an `intent` is never
-promoted by its own success. A decision parsed from reasoning is never rendered
-as a fact, even when the model stated it confidently. The note itself opens with
-`[source: thinking-summary revision=N phase=...]` and tells the reader that
-inferred items are unverified.
+promoted by its own success. Output polarity is scored across predicate
+occurrences with their negation context: `did not fail` and `no failures` are
+positive evidence, `did not pass` and `failed to pass` are negative, `not
+present` is an absence, and an absence report (`no test named parser`) never
+confirms a claim that a test failed. A decision parsed from reasoning is never
+rendered as a fact, even when the model stated it confidently. The note itself
+opens with `[source: thinking-summary revision=N phase=...]` and tells the
+reader that inferred items are unverified.
 
 The full chain of thought is deliberately not stored: only the bounded set of
 items above, at most 12 decisions and 8 questions.
@@ -88,9 +92,10 @@ Rules:
   stale and are not carried forward.
 - The turn phase alone does not decide resume-versus-new-task. A completed
   turn is always a new task. An unfinished turn resumes only when the new
-  request is a continuation command, still shares significant words with the
-  stored request signature, or relates to a pending call; a different request is
-  a new task and clears stale pending state. A call that was in flight on a
+  request is a continuation command, still shares enough significant words with
+  the stored request signature, or relates to a pending call; a single subject
+  word can continue the work, while a shared generic verb (`fix`, `run`) cannot.
+  A different request is a new task and clears stale pending state. A call that was in flight on a
   resume is preserved with `interrupted = true`; it cannot be paired with a later
   result and its outcome is recorded as an open question ("outcome is unknown").
 - Streamed reasoning is folded into the summary when a tool call starts, when a
