@@ -63,10 +63,15 @@ The note is omitted when:
 
 - the summary has no live items (or the turn is `complete`);
 - the step already received the same revision (one note per step);
-- an item's text already appears in the last 40 history rows (duplicate guard);
+- an item's text, paraphrase or inflected token set already appears in the last
+  40 history rows (duplicate guard);
 - nothing survives that filtering (the function returns `None`).
 
 ## 3. Lifecycle (REQ-3)
+
+Conversational narration such as "let me first check..." is not a durable
+intent by default; explicit choices, factual claims, unresolved questions and
+concrete actions are extracted instead.
 
 `ThinkingState` is the owner. It ingests:
 
@@ -85,6 +90,10 @@ Rules:
   records the supporting excerpt with the tool and step. It also moves the phase
   to `verifying` when the output looks like a test or build result. A success
   with no confirming evidence leaves the claim `inferred`.
+- A success retires the live `intent` whose statement matches the action recorded
+  when the call was issued; an unrelated active intent stays live. The retired
+  intent is kept for audit but is never injected. A failure or interruption never
+  takes this completion path.
 - A failure retires the judgment that led to the call, adds an open question
   naming the failure, and sets the next action to diagnosis instead of a retry.
   If the decision had been `verified` by that same tool, the verification is

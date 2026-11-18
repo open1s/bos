@@ -268,7 +268,7 @@ pub struct ReActEngine<A: ReActApp> {
     parallel_tool_calls: bool,
     /// Whether the thinking-summary context is extracted, persisted and
     /// injected for this engine. Off means the loop pays none of that cost and
-    /// never adds a `thinking-summary` host-guidance note.
+    /// never adds a `thinking-summary` context block.
     thinking_context: bool,
     telemetry: Telemetry,
     llm_timeout_secs: u64,

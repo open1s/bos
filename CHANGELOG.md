@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Completed thinking intents are retired before injection (#441).**
+  Conversational "let me first..." narration is no longer extracted as a durable
+  intent. When a tool call succeeds, the live intent whose statement matches the
+  action stored with that call is superseded and never injected; an unrelated
+  intent stays live, and a failed or interrupted call never takes the completion
+  path. The injection duplicate guard now also recognizes paraphrases and simple
+  inflections already present in recent history, not only exact substrings.
+
 - **Harness instructions get a real developer role.** `LlmMessage::Developer`
   carries application-level instructions at `Precedence::High`, below system
   policy and distinct from the reader's request. Chat Completions and the

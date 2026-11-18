@@ -117,7 +117,7 @@ pub(crate) struct AgentSection {
     /// Enable the thinking-summary context in the ReAct loop.
     ///
     /// On by default. Off skips summary extraction, persistence and the
-    /// `thinking-summary` host guidance; a snapshot already stored in the
+    /// `thinking-summary` context block; a snapshot already stored in the
     /// session is left untouched.
     pub(crate) thinking_context: bool,
     /// Attach the file-backed memory store.

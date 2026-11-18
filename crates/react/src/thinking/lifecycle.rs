@@ -1041,6 +1041,15 @@ fn task_is_related(task: &str, item: &str) -> bool {
     task.trim().is_empty() || similarity(item, task) > 0.0
 }
 
+/// Whether two tokens name the same word across a simple inflection.
+fn token_matches(left: &str, right: &str) -> bool {
+    left == right
+        || (left.len() >= 4
+            && right.len() >= 4
+            && left.len().abs_diff(right.len()) <= 2
+            && (left.starts_with(right) || right.starts_with(left)))
+}
+
 /// Whether the history already carries `text`.
 ///
 /// Only the last 40 rows and a bounded prefix are compared: the check is a
@@ -1057,10 +1066,14 @@ fn history_contains(history: &[LlmMessage], text: &str) -> bool {
         .take(40)
         .filter_map(|message| match message {
             LlmMessage::System { content } | LlmMessage::Assistant { content } => {
-                Some(content.as_str())
+                Some((content.as_str(), true))
             }
-            LlmMessage::ToolResult { content, .. } => Some(content.as_str()),
-            LlmMessage::User { content } => content.as_text(),
+            // Tool output is evidence, not narration. Exact text still counts
+            // as a duplicate, but a paraphrase check against a large result
+            // would suppress a claim merely because its subject words appear
+            // in the output.
+            LlmMessage::ToolResult { content, .. } => Some((content.as_str(), false)),
+            LlmMessage::User { content } => content.as_text().map(|text| (text, true)),
             // Reasoning is the source the summary is distilled from, not a
             // history turn the reader or the assistant said. Counting it here
             // would make every summary item look duplicated.
@@ -1068,10 +1081,13 @@ fn history_contains(history: &[LlmMessage], text: &str) -> bool {
             | LlmMessage::AssistantReasoning { .. }
             | LlmMessage::AssistantToolCall { .. } => None,
         })
-        .any(|body| {
+        .any(|(body, narration)| {
             let normalized = normalize_text(body);
             if normalized.contains(&needle) || normalized.contains(&prefix) {
                 return true;
+            }
+            if !narration {
+                return false;
             }
             // A paraphrase of a carried item is already represented even when
             // the exact words differ. Compare the whole row and its first lines
@@ -1079,6 +1095,19 @@ fn history_contains(history: &[LlmMessage], text: &str) -> bool {
             // substring hit alone (issue #441).
             if similarity(&normalized, &needle) >= 0.8 {
                 return true;
+            }
+            // A paraphrase may use a plural or inflection (fixture/fixtures).
+            // If every significant item token is covered by the row, the item
+            // is already represented even when Jaccard is below the threshold.
+            let item_tokens = significant_tokens(&needle);
+            if !item_tokens.is_empty() {
+                let body_tokens = significant_tokens(&normalized);
+                if item_tokens
+                    .iter()
+                    .all(|token| body_tokens.iter().any(|body| token_matches(token, body)))
+                {
+                    return true;
+                }
             }
             body.lines().take(24).any(|line| {
                 let line = normalize_text(line);
@@ -1310,8 +1339,87 @@ mod tests {
             .expect("the intended action");
         assert_eq!(
             intent.confidence,
-            ThinkingConfidence::Inferred,
-            "an intent is not verified by its own execution"
+            ThinkingConfidence::Superseded,
+            "a completed intent is retired, not verified"
+        );
+        assert!(!intent.active, "a completed intent is not injected");
+    }
+
+    #[test]
+    fn a_successful_call_retires_the_intent_it_ran_and_keeps_another() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "I will update the README. I will search the parser fixture.",
+            1,
+        );
+        state.observe_tool_call("bash", 1);
+        state.observe_tool_result("bash", "", true, 2);
+
+        let search = state
+            .summary()
+            .decisions
+            .iter()
+            .find(|decision| decision.statement.to_lowercase().contains("search"))
+            .expect("the completed search intent");
+        assert!(
+            !search.is_live(),
+            "the action the call carried out is retired: {search:?}"
+        );
+        assert_eq!(search.confidence, ThinkingConfidence::Superseded);
+
+        let readme = state
+            .summary()
+            .decisions
+            .iter()
+            .find(|decision| decision.statement.contains("README"))
+            .expect("the unrelated intent");
+        assert!(
+            readme.is_live(),
+            "an unrelated successful call keeps the other intent live: {readme:?}"
+        );
+
+        let note = state
+            .prepare_injection(3, &[])
+            .expect("the still-pending intent is injected");
+        assert!(
+            note.content.contains("README"),
+            "the pending intent remains: {}",
+            note.content
+        );
+        assert!(
+            !note.content.to_lowercase().contains("search the parser"),
+            "the completed search is gone: {}",
+            note.content
+        );
+    }
+
+    #[test]
+    fn a_completed_search_is_not_injected_on_the_next_step() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning("I will search the workspace for relevant files.", 1);
+        state.observe_tool_call("bash", 1);
+        state.observe_tool_result("bash", "", true, 2);
+        assert!(
+            state.prepare_injection(3, &[]).is_none(),
+            "the completed search no longer contributes a note"
+        );
+    }
+
+    #[test]
+    fn a_paraphrased_item_already_in_history_is_not_injected() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning("I will search the parser fixture.", 1);
+        let history = vec![LlmMessage::assistant(
+            "I will search the parser fixtures before editing.",
+        )];
+        let note = state.prepare_injection(2, &history);
+        assert!(
+            note.as_ref()
+                .is_none_or(|note| !note.content.to_lowercase().contains("search the parser")),
+            "a paraphrase already in history is not repeated: {note:?}"
         );
     }
 

@@ -192,9 +192,11 @@ async fn a_confirming_result_verifies_the_claim_and_reaches_the_next_request() {
         note.content
     );
     assert!(
-        note.content
-            .contains("[inferred] I will run the parser test"),
-        "the intended action is not promoted by its own success: {}",
+        !note
+            .content
+            .to_lowercase()
+            .contains("i will run the parser test"),
+        "the completed intent is retired, not injected: {}",
         note.content
     );
     assert!(
@@ -223,11 +225,11 @@ async fn a_confirming_result_verifies_the_claim_and_reaches_the_next_request() {
     assert!(
         !second.messages.iter().any(|message| matches!(
             message,
-            LlmMessage::System { content } if content.contains("source: thinking-summary")
+            LlmMessage::System { content } | LlmMessage::Developer { content }
+                if content.contains("source: thinking-summary")
         )),
-        "no system message carries the note"
+        "no system or developer message carries the note"
     );
-
     let history = session.history().expect("the session keeps history");
     let reasoning = history.iter().find_map(|message| match message {
         LlmMessage::AssistantReasoning {
@@ -247,7 +249,8 @@ async fn a_confirming_result_verifies_the_claim_and_reaches_the_next_request() {
     }));
     assert!(snapshot.summary.decisions.iter().any(|decision| {
         decision.statement.contains("I will run the parser test")
-            && decision.confidence.as_str() == "inferred"
+            && decision.confidence.as_str() == "superseded"
+            && !decision.active
     }));
 }
 

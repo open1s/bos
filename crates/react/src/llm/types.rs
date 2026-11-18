@@ -2004,5 +2004,14 @@ mod tests {
             super::LlmMessage::tool_result("id", "output").precedence(),
             super::Precedence::Low
         );
+
+        let empty = super::ProviderRequest {
+            system_prompt: Some("POLICY".to_string()),
+            messages: vec![super::LlmMessage::user("current request")],
+            ..Default::default()
+        };
+        assert!(empty.context_blocks.is_empty());
+        assert_eq!(empty.wire_messages().len(), 1);
+        assert_eq!(empty.wire_system_prompt().as_deref(), Some("POLICY"));
     }
 }

@@ -116,8 +116,8 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
     /// Enable or disable the thinking-summary context.
     ///
     /// Enabled by default. When off, the engine neither extracts a summary
-    /// from reasoning nor persists or injects one, so `thinking-summary` host
-    /// guidance never appears in a request.
+    /// from reasoning nor persists or injects one, so no `thinking-summary`
+    /// context block ever appears in a request.
     pub fn thinking_context(mut self, enabled: bool) -> Self {
         self.thinking_context = enabled;
         self
