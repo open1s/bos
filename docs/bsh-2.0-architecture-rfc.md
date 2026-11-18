@@ -1,9 +1,9 @@
 # BSH 2.0 Architecture RFC
 ## AI-Native Composable Capability Container & Federated Runtime
 
-- **Status:** Proposed
-- **Version:** 0.2.0
-- **Date:** 2026-11-06
+- **Status:** Proposed — architecture convergence RFC added; implementation not implied
+- **Version:** 0.3.0
+- **Date:** 2026-11-19
 - **Target:** BOS / BSH
 - **Scope:** BSH local capability composition, workspace runtime, and multi-node federation
 - **Decision baseline:** ADR-001 through ADR-009 (ADR-008 and ADR-009 accepted 2026-11-06)
@@ -1535,3 +1535,364 @@ The review identifies the following implementation blockers beyond the domain-mo
 - First-class Knowledge Federation and higher-level collaboration orchestration.
 
 These are not claims that the existing primitives are defective in isolation. They are the missing end-to-end guarantees needed before the corresponding BSH 2.0 product capabilities can be described as complete.
+
+
+## 31. Unified Agent, Composition, and Federation Execution Model
+
+**Status:** Proposed  
+**Motivation:** GitHub Issue [#445](https://github.com/open1s/bos/issues/445)  
+**Scope:** Execution identity, lifecycle ownership, local/remote invocation semantics, cancellation, failure, retry, and recovery.
+
+This section refines the existing BSH 2.0 architecture. It does not replace the Capability, Workspace, Agent, or Federation designs above. It defines the contracts by which those subsystems cooperate. The source-level examples below are evidence of existing foundations, not a claim that the complete unified contract already exists.
+
+### 31.1 Decision summary
+
+BSH SHALL converge on a **Unified Execution Model**, not a single monolithic execution service or a universal state machine.
+
+The model has four cooperating responsibilities:
+
+1. **Agent Intelligence** decides what work is needed and proposes plans, compositions, and delegations. It owns conversation/turn reasoning, not execution authority.
+2. **Composition and Orchestration** resolves a task plan, validates dependencies and policy constraints, owns the parent task graph, and binds work to local or explicitly authorized remote targets.
+3. **Execution Runtime** admits and runs each invocation through a Workspace and provider boundary. It owns invocation lifecycle, budgets, cancellation propagation, result classification, and cleanup at that boundary.
+4. **Security and Governance** authenticates principals and peers, evaluates authorization, constrains delegation, enforces revocation and isolation, and records attributable decisions.
+
+These are logical responsibilities. They do not require four processes, four crates, a new workflow language, or a central coordinator. Existing subsystem state machines remain authoritative for their own resources. The convergence requirement is shared identity and correlation, compatible lifecycle semantics, and explicit ownership at subsystem boundaries.
+
+**Normative decisions**
+
+| ID | Decision |
+|---|---|
+| UEM-001 | Conversation, Turn, Task, Invocation, Delegation, Workspace, Composition Snapshot, and Resource Lease are distinct identities with distinct lifetimes. |
+| UEM-002 | The origin node owns the parent task/graph. A target node owns the execution state of a delegation it accepts. Each node remains authoritative for its own providers, resources, policy, and audit. |
+| UEM-003 | A Workspace is node-local. A remote capability is a binding/proxy to a provider on another node, never a transfer of remote provider ownership. |
+| UEM-004 | Every admitted invocation is authorized at the execution boundary. Discovery, model-visible schemas, composition approval, cached plans, and prior authorization are not invocation-time permission. |
+| UEM-005 | Local and remote invocation expose compatible outcomes, but remote uncertainty is explicit. A sent request without a definitive response is not silently converted to failure or success. |
+| UEM-006 | Cancellation is a request until the owning execution boundary confirms a terminal outcome. Timeout and transport loss do not prove that side effects stopped. |
+| UEM-007 | Automatic retry of a side-effecting operation requires a durable idempotency/deduplication contract. Exactly-once execution is not promised. |
+| UEM-008 | The model may propose and interpret; deterministic runtime code validates, authorizes, admits, executes, and records. |
+
+### 31.2 Layer responsibilities and dependency direction
+
+```text
+ User / Interface
+       |
+       v
+ Agent Intelligence  ---- model reasoning, planning, proposals
+       |
+       v
+ Composition & Orchestration ---- task graph, dependency resolution,
+       |                           composition approval, target binding
+       v
+ Unified Execution Runtime ---- invocation admission and lifecycle
+       |
+       +------ Local Provider (native / Ferris / MCP / WASM / process)
+       |
+       +------ Remote Provider Proxy ---- Federation protocol ---- Peer Node
+       |                                                        |
+       |                                                        v
+       |                                               Peer-local Runtime
+       |                                                        |
+       |                                               Peer-local Provider
+       |
+       +------ Result / Artifact / Audit correlation
+
+ Security & Governance cuts across every admission and provider boundary:
+ identity -> policy -> grants -> isolation -> revocation -> audit
+```
+
+The diagram is a responsibility map, not a synchronous call-stack requirement.
+
+Dependency rules:
+
+- Agent Intelligence may depend on public task and capability contracts; the execution runtime MUST NOT depend on a specific ReAct implementation or model vendor.
+- Composition may depend on capability descriptors, provider metadata, and policy decisions; it MUST NOT treat model output as an approved executable plan.
+- The Workspace runtime dispatches through resolved bindings. It MUST NOT infer remote authority from a capability name or transport address.
+- Federation transports authenticated protocol messages. It MUST NOT become a second capability policy engine or grant authority based on reachability.
+- Provider adapters implement invocation and lifecycle contracts. A provider cannot widen the principal's effective grants.
+- Audit correlation is shared; audit storage and the decision record remain local to the node that made the decision.
+
+### 31.3 Identity model and context contract
+
+The execution context is a **correlation and constraint envelope**, not a bearer credential. It carries references to authority and constraints; the receiving boundary must authenticate the sender and independently validate the requested operation.
+
+| Identity | Represents | Owner / lifetime | Must not be confused with |
+|---|---|---|---|
+| Conversation ID | User-facing dialogue/session | Conversation host | A task or execution |
+| Turn ID | One model interaction/agent loop | Agent session; normally turn-scoped | A task that spans multiple turns |
+| Task ID | A unit of work with an objective and outcome | Originating task owner | A single tool call |
+| Task Graph Node ID | One schedulable step in a parent graph | Graph owner | Federation delegation ID |
+| Invocation ID | One attempt to execute one capability operation | Invoking runtime; unique per attempt | Logical task or retry identity |
+| Delegation ID | One bounded request accepted/refused by a target node | Caller and target maintain correlated records; target owns target-side state | A local invocation or task graph node |
+| Workspace ID | One node-local composed runtime environment | Workspace host | A globally portable or federated workspace |
+| Composition ID + revision/snapshot digest | The desired composition and exact resolved version used | Composition owner | A mutable live registry |
+| Capability ID + version | The operation contract selected for invocation | Capability publisher/provider | A model-visible tool name |
+| Node ID | A federation identity | Each node's identity store | Process ID, endpoint, or display name |
+| Resource Lease ID | A bounded grant to access a remote resource | Granting node | A task or invocation |
+| Trace / Span ID | Observability correlation | Trace producer | Authorization evidence |
+
+A common context SHOULD carry the following fields (names are conceptual; existing Rust types should be reused where they already provide the same semantics):
+
+- `task_id`, optional `parent_task_id`, and optional graph-node/attempt reference.
+- `turn_id` when work originated in an Agent turn; absence is valid for non-Agent callers.
+- `invocation_id` and a separate logical idempotency key when retry semantics require one.
+- Originating and executing `node_id` values, with authenticated peer identity derived from the transport/session rather than trusted from an arbitrary payload field.
+- Local `workspace_id`, composition identity/revision or immutable snapshot digest, and capability identity/version/operation.
+- Local principal identity plus authorization-decision/grant provenance references. Never serialize local secrets or treat a claimed principal string as authentication.
+- Absolute deadline, resource budget, and cancellation correlation.
+- Trace/span and audit correlation identifiers.
+- Input/result/artifact references with explicit ownership and retention semantics; do not put unbounded payloads or secrets into the context envelope.
+
+**Propagation rules**
+
+1. Context is immutable across a single invocation attempt except for explicitly modeled lifecycle metadata and child correlation.
+2. A child task receives a new Task ID; a provider call receives a new Invocation ID; a retry receives a new attempt/Invocation ID.
+3. A delegated task receives a Delegation ID and a target-local execution context. The caller's Workspace ID is not interpreted as a target Workspace ID.
+4. The target maps the authenticated peer and attenuated delegation into its own local principal/policy model. It does not blindly trust the caller's authorization decision.
+5. A child may receive only a subset of the parent's capabilities/resources, the same permitted target scope, and a deadline no later than the parent. Sub-delegation remains denied unless explicitly allowed.
+6. Context propagation failure is a typed execution failure. It must not silently fall back to a broader global registry or ambient authority.
+
+### 31.4 State ownership and lifecycle boundaries
+
+Do not force all entities into one shared enum. The state owner validates transitions for its own entity and publishes correlated events to the parent coordinator.
+
+| Entity | Authoritative state owner | Lifecycle responsibility |
+|---|---|---|
+| Conversation / Turn | Agent session | Model interaction, turn-local reasoning, tool loop, turn completion |
+| Parent Task / Task Graph | Origin node's orchestrator | Dependencies, scheduling, attempts, acceptance, aggregate outcome |
+| Delegation | Target node for accepted target-side execution; caller keeps its request/observation record | Acceptance/rejection, target execution status, result, cancellation acknowledgement |
+| Workspace | Workspace host/runtime | Prepare, activate, admit, drain, suspend/stop, provider teardown |
+| Invocation | Node/provider boundary that executes it | Authorization, admission, execution, timeout/cancel, result and cleanup |
+| Resource Lease | Node that grants the lease | Grant, quota, expiry, stream lifecycle, revoke |
+| Composition Snapshot | Composition owner | Immutable resolved identity/version/policy reference for a Workspace instance |
+
+The parent task graph may mirror a delegated task's state, but the mirror is not a second authority. It records what the caller has observed and must preserve an explicit unknown state when the target outcome cannot be established.
+
+#### 31.4.1 Task lifecycle
+
+The parent task lifecycle is:
+
+`Created -> Planned -> Ready -> Running -> Verifying -> Succeeded`
+
+Terminal alternatives are `Failed` and `Cancelled`. A task may return to `Ready` only through an explicit retry transition that creates a new attempt. A task graph owns dependency readiness and aggregate completion; a Task ID is not a synonym for a Turn ID.
+
+- Planning and composition proposals are non-executing states.
+- A task becomes Running only when at least one execution attempt is admitted.
+- Verifying is distinct from provider success: the task's acceptance criteria may reject an otherwise successful invocation result.
+- A failed dependency cancels only dependent work, not unrelated graph branches.
+- Completion requires a recorded outcome and cleanup/retention disposition for owned resources.
+
+#### 31.4.2 Workspace lifecycle
+
+The existing Workspace state model (`Created`, `Prepared`, `Activating`, `Active`, `Draining`, `Suspended`, `Stopped`, `Failed`) remains Workspace-owned. Invocation admission is allowed only while the Workspace is Active and its relevant capability binding remains authorized.
+
+Stopping or suspending a Workspace closes admission first, then drains in-flight invocations, then deactivates providers in reverse dependency order. A drain timeout must report remaining in-flight work; it must not claim that those calls were stopped. Rollback/teardown failures remain observable terminal or recoverable failures rather than being swallowed.
+
+#### 31.4.3 Invocation lifecycle
+
+The common semantic lifecycle is:
+
+`Created -> Authorized -> Admitted -> Running -> (Succeeded | Failed | Cancelled | TimedOut | UnknownOutcome)`
+
+- `Authorized` records a policy decision for this invocation attempt; it is not a reusable grant for later attempts.
+- `Admitted` means the execution boundary accepted responsibility and accounted for concurrency/resources.
+- `Running` means the provider may have begun work.
+- `Cancelled` requires confirmation from the execution owner that work reached a cancelled terminal state.
+- `TimedOut` means the deadline expired. It does not imply that a remote provider or external side effect stopped.
+- `UnknownOutcome` is required when a request may have executed but the caller cannot establish the result.
+
+The local and remote adapters may use different internal states, but they must map to these externally meaningful outcome classes without erasing uncertainty.
+
+### 31.5 Composition-to-execution contract
+
+The composition result is a versioned, immutable input to execution, not a long-lived authorization token.
+
+1. Discovery returns candidate metadata only.
+2. Composition proposal generation may be model-driven.
+3. A deterministic validator checks descriptor/schema versions, dependencies, provider availability, conflicts, workspace boundary, risk ceiling, remote target policy, and resource budgets.
+4. Approval is recorded when policy or risk requires it. The approval token/result is bound to the exact proposal or digest and cannot be reused for a modified composition.
+5. Resolution produces a snapshot containing exact capability/provider versions and local/remote bindings.
+6. Workspace activation is transactional to the extent supported by providers: partial activation rolls back previously activated providers and reports rollback failures.
+7. The Agent receives only the Workspace-scoped capability view. A model-visible tool name is an adapter identifier, not a stable security principal.
+8. Every invocation revalidates current Workspace state, principal, capability version/binding, provider availability, and current policy/grant at the authoritative boundary.
+
+A remote binding remains a proxy. Its local descriptor and cached discovery result do not prove that the remote grant still exists. The target node authorizes the actual operation.
+
+### 31.6 Local and federated invocation semantics
+
+The common invocation request SHOULD contain:
+
+- Invocation ID and attempt number.
+- Task/parent/delegation correlation.
+- Capability ID, version, operation, and schema version.
+- Bounded input or an explicit artifact/resource reference.
+- Caller principal and Workspace context references.
+- Absolute deadline and cancellation correlation.
+- Logical idempotency key and canonical request digest when supported.
+- Trace/audit correlation.
+
+**Local path**
+
+`Agent -> Task/Workspace admission -> Policy -> Provider -> Result validation -> Audit -> Agent`
+
+The local runtime owns admission and provider execution. Provider adapters must observe deadline/cancellation where supported, enforce declared limits, and return typed outcomes. A timeout wrapper that merely stops waiting while a future/process continues is not cancellation.
+
+**Remote path**
+
+`Caller Agent -> Caller Workspace/Policy -> Remote Proxy -> Authenticated Federation Request -> Target Peer/Policy -> Target Runtime/Provider -> Target Result/Audit -> Caller Result/Audit`
+
+- Caller-side policy decides whether this Workspace/principal may contact the peer and request the capability.
+- The target authenticates the peer and independently authorizes the requested capability, operation, resources, and delegated scope.
+- The target owns provider execution, local process/resource lifecycle, and its authoritative result.
+- Both nodes record their own decision/outcome with the shared correlation identifiers. Neither node writes on behalf of the other.
+- A successful transport send is not a successful invocation. The result is successful only after the target's authoritative completion response is validated.
+- Peer unavailability before send is a transport failure. Loss after send without a definitive response is `UnknownOutcome`, unless the protocol can prove the request was not admitted.
+- No implicit local fallback is permitted for a failed remote binding. A fallback would change the execution target and possibly the trust/data boundary.
+
+### 31.7 Cancellation, timeout, and revocation
+
+Cancellation is a distributed protocol, not a boolean flag.
+
+1. The owner records a cancellation request and closes further admission for the affected task/invocation scope.
+2. Local child invocations receive cancellation; process-backed providers terminate their owned process tree according to the provider contract.
+3. For a remote delegation, the caller sends a cancellation request correlated to the Delegation ID and waits for an authoritative acknowledgement or a deadline.
+4. The target checks ownership and current state, requests cancellation of its local execution, and acknowledges only after it knows the resulting terminal state.
+5. If acknowledgement is lost, the caller records `UnknownOutcome`/cancellation-unconfirmed and may query status. It must not report successful termination.
+6. The parent task becomes Cancelled only when all required children are terminal or their unresolved outcomes are explicitly represented and the task policy permits terminalization with uncertainty.
+
+**Timeout rules**
+
+- A deadline is absolute and propagated downward; child deadlines cannot exceed the parent's.
+- Each node converts the remaining wall-clock budget into a local monotonic deadline to avoid relying on wall-clock changes during execution.
+- A local timeout closes admission and requests provider cancellation, but the final outcome depends on provider confirmation.
+- A remote timeout may leave the target executing. The caller records an unknown outcome and reconciles through status; it does not infer cancellation from elapsed time.
+
+**Revocation rules**
+
+- Revocation immediately prevents new invocations using the revoked grant/peer/capability at the authoritative node.
+- Active invocations are handled according to the provider's declared side-effect and safety contract: request cooperative cancellation where supported; otherwise allow a documented bounded drain or mark the outcome uncertain. Revocation must never be represented as proof that an already-running external side effect was undone.
+- The target node is authoritative for revoking its own provider grants and stopping its own executions. A caller cannot directly kill a peer's process.
+- Revocation events and active invocation dispositions are auditable and correlated.
+
+### 31.8 Idempotency, retries, and recovery
+
+BSH must not promise exactly-once execution across an unreliable network. It can provide deduplicated admission and safe retry for operations whose contract supports it.
+
+- An idempotency key identifies a **logical operation**, scoped by authenticated caller, target node, capability, operation, and request digest. It is distinct from Invocation ID.
+- The target persists the key and admission/result record for the documented retention window before acknowledging durable acceptance.
+- Reuse of the same key with a different request digest is rejected as a conflict.
+- A duplicate with the same key returns the recorded state/result; it does not start a second side effect.
+- If an operation is not declared idempotent and no durable deduplication exists, an unknown outcome must not be automatically retried.
+- Each retry is a new attempt/Invocation ID. The parent task graph owns retry policy and attempt ceilings; the target owns deduplication of the logical operation.
+- Compensation is not rollback. It is a separate operation with its own identity, authorization, outcome, and audit record.
+
+**Checkpoint/recovery**
+
+A checkpoint may be persisted only at a boundary where state and side effects are understood. It records task/graph state, attempt, composition snapshot digest, capability/provider versions, artifact references, delegation references, and the last committed transition.
+
+On restart:
+
+- Resume only work whose owner can establish a safe continuation point.
+- Revalidate identity, grants, policy, capability/provider versions, artifact availability, and deadlines.
+- Never revive an expired lease or assume a previously active external process is still safely owned.
+- Mark interrupted work with an indeterminate/unknown outcome when the side effect may have occurred.
+- Do not replay a non-idempotent operation solely because its completion record is absent.
+- A recovered task may be rescheduled only under the explicit retry/idempotency policy.
+
+### 31.9 Result, artifact, and audit contract
+
+A provider result is not automatically a successful task outcome.
+
+- Invocation result validation checks the declared output schema, size limits, stream completion, and provider-specific status.
+- Task acceptance is a separate deterministic or attributable evaluation step. A task can fail verification after a provider invocation succeeds.
+- Large outputs are represented by bounded artifact references with owner node, content digest, media type, size, access policy, and retention/expiry metadata.
+- A remote artifact remains owned by its provider node. Access requires a grant/lease; a reference does not imply a copy or permanent access.
+- Audit records identify the decision maker and outcome at each boundary. Caller and target records share correlation IDs but preserve local authority.
+- Audit SHOULD capture identity references, capability/version, decision, timing, outcome class, and provenance. It SHOULD NOT store secrets, raw prompts, or full arguments/results by default.
+
+Minimum correlation chain:
+
+`Task -> Graph Node/Attempt -> Turn (if any) -> Invocation -> Provider Decision -> Result/Artifact -> Task Acceptance -> Cleanup`
+
+For remote work, include:
+
+`Caller Task -> Delegation -> Target Task/Invocation -> Target Decision/Result -> Caller Observation/Acceptance`
+
+### 31.10 Mapping to current implementation and known gaps
+
+This mapping is intentionally conservative. It identifies current code foundations and the additional integration contract; it is not a full line-by-line audit or a claim that all end-to-end guarantees are already implemented.
+
+| Area | Existing foundation observed in source/docs | Convergence work still required |
+|---|---|---|
+| Workspace lifecycle | `crates/capability/src/workspace.rs`: explicit Workspace states, provider activation/deactivation, admission slots, in-flight drain | Ensure every Agent-eligible execution uses this governed path or a documented compatibility path; bind principal/task/deadline/cancel/audit context to every dispatch and reject cross-Workspace context reuse |
+| Composition | Capability composition, proposal approval gate, resolved local/remote bindings and snapshots | Make the snapshot/digest and approval provenance the stable input to Workspace activation and invocation; close optional/legacy bypasses for governed execution |
+| Agent turn/reasoning | `docs/reasoning-messages.md`: reasoning is turn-local and provider state is replayed only inside the producing turn | Keep Turn/Reasoning lifecycle separate from Task lifecycle; attach task correlation without persisting/replaying provider reasoning across turns |
+| Federation delegation | `crates/federation/src/delegation.rs`: durable delegation record, target ownership, state transitions, attenuation, trace correlation | Align target-side delegation state and caller-side observation with the shared Task/Invocation outcome model, including cancellation acknowledgement and unknown outcome |
+| Collaboration graph | `crates/federation/src/collaboration.rs`: durable task graph, dependency readiness, bounded execution, attempts, acceptance and recovery | Make graph ownership explicit at the origin; connect graph nodes to delegation/attempt/invocation IDs; ensure retries consult idempotency and preserve unknown outcomes |
+| Remote invocation | Federation envelope/service, remote provider proxy, dual authorization and caller/target audit | Propagate the complete bounded context; standardize admission/result/unknown-outcome mapping and status reconciliation |
+| Security/audit | Node identity, grants, policy checks, local audit and provenance primitives | Correlate all lifecycle transitions and active-invocation revocation; test that no alternate execution path bypasses authorization or cancellation semantics |
+| Providers/extensions | Native, Ferris, MCP and process/WASM adapter foundations | Declare and test per-provider cancellation, deadline, streaming, idempotency, side-effect and cleanup guarantees; do not claim unsupported semantics |
+
+**Important correction to architecture status language:** the existence of a durable task graph and durable delegation primitives is not evidence that cross-node Agent orchestration is complete. Likewise, a Workspace drain API or a cancellation message is not proof that every provider or remote side effect has terminated. Feature status must be based on end-to-end tests at the relevant boundary.
+
+### 31.11 Incremental implementation plan
+
+The implementation order is contract-first and reuses existing modules. Each work item should remain independently reviewable and, where practical, fit within three working days.
+
+| Phase | Deliverable | Exit evidence |
+|---|---|---|
+| 0. Source and contract map | Map Agent turn, TaskGraph, Delegation, Workspace, Invocation, Lease, provider and audit types; record authoritative owner and existing bypasses | Reviewed source map and lifecycle/identity table; no speculative replacement types |
+| 1. Local governed path | Route eligible Agent calls through Workspace/capability admission; bind principal, Workspace, task, invocation, deadline and cancellation | Tests prove policy denial, cross-Workspace rejection, deadline propagation, provider failure, drain and cleanup |
+| 2. Shared outcome semantics | Normalize invocation terminal classes and correlate task/turn/invocation/audit IDs | Tests distinguish provider success from task acceptance, timeout from cancellation, and unknown outcome from failure |
+| 3. Federation convergence | Map parent graph steps to Delegation IDs and target-local task/invocation state; preserve dual authorization and independent ownership | Two-node tests for acceptance, denial, cancellation acknowledgement/loss, peer loss, revocation and result correlation |
+| 4. Safe retry and recovery | Durable idempotency records, attempt identity, checkpoint boundaries and restart reconciliation | Duplicate delivery never repeats a protected side effect; non-idempotent unknown outcomes are not auto-replayed |
+| 5. Provider conformance | Publish per-provider support for cancellation, deadlines, streaming, idempotency and cleanup | Conformance suite across supported platforms/providers; unsupported behavior is explicit |
+
+Do not start by creating a new universal task engine. First map and connect the existing `WorkspaceRuntime`, Federation delegation store, collaboration graph, Agent turn loop, and provider contracts. Introduce a new shared type only where the source audit proves that an existing type cannot represent the required semantics without conflating lifetimes.
+
+### 31.12 Required verification matrix
+
+| Scenario | Required assertion |
+|---|---|
+| Unauthorized local capability | Rejected before provider execution; denial is attributable and audited |
+| Stale Workspace/composition snapshot | Invocation rejected or explicitly re-resolved; stale approval does not authorize changed inputs |
+| Cross-Workspace context reuse | Rejected; no ambient/global fallback |
+| Provider timeout | Caller does not report cancellation unless provider termination is confirmed |
+| Workspace drain | New admission stops; in-flight calls are counted; timeout reports remaining work |
+| Remote request lost before admission | Typed transport/not-admitted result where provable |
+| Remote reply lost after admission | Unknown outcome; status reconciliation; no unsafe automatic retry |
+| Duplicate request, same key and digest | Existing operation/result returned; provider side effect occurs once within deduplication retention |
+| Duplicate key, different digest | Conflict; second operation is not admitted |
+| Cancellation acknowledgement lost | Caller records unconfirmed/unknown state rather than Cancelled |
+| Grant/peer revocation during execution | New calls denied; active call disposition follows target-side provider policy and is audited |
+| Parent task with independent branches | Failure/cancellation is scoped to dependents; unrelated branch continues |
+| Result fails acceptance | Invocation may be Succeeded while parent Task is Failed/retried according to policy |
+| Restart during local/remote work | Interrupted side effects are not blindly replayed; unknown outcomes are reconciled |
+| Remote artifact access after lease expiry/revocation | Access denied; reference does not bypass lease ownership |
+
+### 31.13 Acceptance criteria for Issue #445
+
+- [ ] This RFC defines layer boundaries and dependency direction without mandating a monolithic service or new framework.
+- [ ] Identity lifetimes and authoritative state owners are explicit.
+- [ ] Shared execution context is defined as correlation/constraint metadata, not an authorization credential.
+- [ ] Local and remote invocation have compatible, typed outcome semantics.
+- [ ] Cancellation, timeout, peer loss, and revocation distinguish request, acknowledgement, termination, and uncertainty.
+- [ ] Retry and recovery rules prevent unsafe replay of non-idempotent side effects.
+- [ ] Composition snapshots, Workspace activation, provider dispatch, and invocation-time authorization are connected by explicit contracts.
+- [ ] Parent task graph and target-owned delegation state are correlated without competing authorities.
+- [ ] Artifacts, leases, provenance, and audit records have explicit ownership.
+- [ ] Existing implementations are mapped and reused; implementation gaps are separated from implemented foundations.
+- [ ] A phased implementation plan and verification matrix are available for follow-up implementation issues.
+
+### 31.14 Out of scope
+
+- Replacing the Agent/ReAct engine or provider abstraction.
+- Replacing the existing Workspace runtime, Federation delegation store, or collaboration graph with a new framework.
+- Guaranteeing exactly-once execution across nodes.
+- Making every provider forcibly cancellable when its underlying operation cannot be interrupted.
+- Creating a global Workspace, global identity authority, or mandatory central scheduler.
+- Adding new UI before the execution contracts and lifecycle behavior are implemented and tested.
+- Treating a successful model response, tool schema exposure, transport send, or cancellation request as proof of task completion or execution termination.
+
+### 31.15 Relationship to existing sections
+
+This section is normative for execution identity and lifecycle semantics. Where earlier sections describe a generic Execution Context or task/delegation lifecycle, Section 31 adds the ownership, uncertainty, and retry detail required to implement those contracts. Existing ADRs remain in force; this section does not silently supersede ADR-001 through ADR-009. Any future change to composition ownership, execution authority, or Federation trust topology requires a separate ADR.
