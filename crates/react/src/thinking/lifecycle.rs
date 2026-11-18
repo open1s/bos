@@ -13,7 +13,7 @@ use super::{
     contains_token, is_cjk, normalize_text, significant_tokens, similarity, ThinkingOrigin,
     THINKING_SOURCE,
 };
-use crate::llm::{ContextBlock, LlmMessage, ReactSession};
+use crate::llm::{ContextBlock, ContextRole, LlmMessage, ReactSession};
 
 /// The live lifecycle owner for one agent.
 ///
@@ -450,7 +450,10 @@ impl ThinkingState {
         }
         let content = summary.render()?;
         self.injected = Some((revision, step));
-        Some(ContextBlock::non_authoritative(THINKING_SOURCE, content))
+        Some(
+            ContextBlock::non_authoritative(THINKING_SOURCE, content)
+                .with_role(ContextRole::Assistant),
+        )
     }
 
     /// The snapshot to persist, if it has changed since the last save.

@@ -1044,6 +1044,9 @@ pub enum ContextRole {
     User,
 }
 
+/// The source id of the BSH continuation summary.
+const THINKING_SUMMARY_SOURCE: &str = "thinking-summary";
+
 /// One block of non-message context attached to a provider call.
 ///
 /// It is not a new `LlmMessage` role: adapters serialize it as the mapped
@@ -1208,7 +1211,8 @@ impl ProviderRequest {
     }
 
     /// The conversation exactly as an adapter serializes it: context blocks
-    /// become one framed user-role turn immediately before the final input.
+    /// become framed turns immediately before the final input. The thinking
+    /// summary is always an `assistant` turn; retrieved memory is a `user` turn.
     pub fn wire_messages(&self) -> Vec<LlmMessage> {
         if self.context_blocks.is_empty() {
             return self.messages.clone();
@@ -1222,9 +1226,19 @@ impl ProviderRequest {
         let context: Vec<LlmMessage> = self
             .context_blocks
             .iter()
-            .map(|block| match block.role {
-                ContextRole::Assistant => LlmMessage::assistant(block.wire_text()),
-                ContextRole::User => LlmMessage::user(block.wire_text()),
+            .map(|block| {
+                // The continuation summary is assistant-authored task state by
+                // definition. Force its role here so a stale or malformed
+                // producer cannot serialize it as user/developer/system.
+                let role = if block.source == THINKING_SUMMARY_SOURCE {
+                    ContextRole::Assistant
+                } else {
+                    block.role
+                };
+                match role {
+                    ContextRole::Assistant => LlmMessage::assistant(block.wire_text()),
+                    ContextRole::User => LlmMessage::user(block.wire_text()),
+                }
             })
             .collect();
         messages.splice(at..at, context);
@@ -2003,6 +2017,23 @@ mod tests {
         assert_eq!(
             super::LlmMessage::tool_result("id", "output").precedence(),
             super::Precedence::Low
+        );
+
+        let forced = super::ProviderRequest {
+            messages: vec![super::LlmMessage::user("current")],
+            context_blocks: vec![super::ContextBlock::non_authoritative(
+                "thinking-summary",
+                "summary",
+            )
+            .with_role(super::ContextRole::User)],
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                forced.wire_messages().first(),
+                Some(super::LlmMessage::Assistant { .. })
+            ),
+            "a thinking summary is assistant even if a producer set another role"
         );
 
         let empty = super::ProviderRequest {
