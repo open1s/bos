@@ -211,6 +211,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             tool_time_nanos: AtomicU64::new(0),
             stop_flag: Arc::new(AtomicBool::new(false)),
             run_manager,
+            thinking: ThinkingState::new(),
         })
     }
 }

@@ -25,6 +25,15 @@ pub trait ReactSession {
     fn compact_mechanical(&mut self, _keep_recent: usize, _max_summary_chars: usize) -> bool {
         false
     }
+    /// The persisted thinking summary, when the session keeps one.
+    ///
+    /// It is separate from the message history: the summary is model-derived
+    /// state, not a turn the reader or the assistant said.
+    fn thinking_snapshot(&self) -> Option<crate::thinking::ThinkingSnapshot> {
+        None
+    }
+    /// Replace the persisted thinking summary.
+    fn set_thinking_snapshot(&mut self, _snapshot: Option<crate::thinking::ThinkingSnapshot>) {}
 }
 
 // =============================================================================
@@ -1209,6 +1218,11 @@ pub struct LlmSession {
     /// Vendors append to this and/or read it to build requests.
     /// Arc enables O(1) clone for sharing across async boundaries.
     pub history: Arc<Vec<LlmMessage>>,
+    /// The persisted thinking summary, when the engine recorded one.
+    ///
+    /// Kept out of `history` on purpose: it is host guidance derived from the
+    /// model's reasoning, not a reader or assistant turn.
+    pub thinking: Option<crate::thinking::ThinkingSnapshot>,
 }
 
 impl LlmSession {
@@ -1216,6 +1230,7 @@ impl LlmSession {
     pub fn new() -> Self {
         Self {
             history: Arc::new(Vec::new()),
+            thinking: None,
         }
     }
 
@@ -1247,6 +1262,14 @@ impl ReactSession for LlmSession {
 
     fn history(&self) -> Option<&[LlmMessage]> {
         Some(&*self.history)
+    }
+
+    fn thinking_snapshot(&self) -> Option<crate::thinking::ThinkingSnapshot> {
+        self.thinking.clone()
+    }
+
+    fn set_thinking_snapshot(&mut self, snapshot: Option<crate::thinking::ThinkingSnapshot>) {
+        self.thinking = snapshot;
     }
 }
 

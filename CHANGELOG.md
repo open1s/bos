@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Thinking summaries feed later steps without rewriting history.** A reasoning
+  step's decisions, rationale, open questions and next action are extracted into
+  a typed, bounded summary (`react::thinking`). A tool result corroborates a
+  related judgment or retires it and replaces the next action with diagnosis;
+  superseded and completed items are never injected. The note rides
+  `HostGuidance` with an explicit `thinking-summary` source, composes into the
+  system prompt of one call, is filtered against the history, and is never
+  appended as a user or assistant message. `ThinkingSnapshot` persists beside
+  the messages in `AgentSession` (session schema 6) so an interrupted run
+  resumes its still-valid summary; a new turn carries only verified items that
+  overlap the new request. See `docs/thinking-summary.md`.
+
 ## v4.1.18 (2026-11-17)
 
 - **Release-gate fixes.** Federation capability tests now pass the required

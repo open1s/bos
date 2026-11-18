@@ -30,8 +30,10 @@ struct SessionRestore<'a> {
 
 impl<'a> SessionRestore<'a> {
     fn new(agent: &'a Agent, messages: Vec<LlmMessage>) -> Self {
+        let thinking = agent.session.lock().unwrap().thinking_snapshot();
         let mut session = AgentSession::new();
         session.restore_messages(messages);
+        session.set_thinking_snapshot(thinking);
         Self {
             agent,
             session: Some(session),
@@ -51,9 +53,11 @@ impl<'a> SessionRestore<'a> {
     /// Move the current messages back into the agent's session.
     fn restore(&mut self) {
         if let Some(mut session) = self.session.take() {
+            let thinking = session.thinking_snapshot();
             let messages = session.take_messages();
             let mut target = self.agent.session.lock().unwrap();
             target.restore_messages(messages);
+            target.set_thinking_snapshot(thinking);
         }
     }
 }

@@ -8,6 +8,7 @@ use crate::llm::{
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::runtime::{HookDecision, ReActApp};
 use crate::telemetry::{Telemetry, TelemetryEvent, TokenBudgetReport, TokenCounter, TokenUsage};
+use crate::thinking::{push_reasoning_tail, ThinkingState, THINKING_SOURCE};
 use crate::tool::registry::{FnTool, ToolVariant};
 use crate::tool::{Tool, ToolRegistry};
 use async_stream::stream;
@@ -285,6 +286,10 @@ pub struct ReActEngine<A: ReActApp> {
     tool_time_nanos: AtomicU64,
     stop_flag: Arc<AtomicBool>,
     run_manager: Arc<ToolRunManager>,
+    /// The live thinking lifecycle. It is loaded from the session snapshot at
+    /// the start of every run and persisted back after every change, so an
+    /// interrupted run resumes from the still-valid part of the summary.
+    thinking: ThinkingState,
 }
 
 /// Builder for [`ReActEngine`].
@@ -710,6 +715,7 @@ impl<A: ReActApp> ReActEngine<A> {
                 HookDecision::Error(msg) => return Err(ReactError::HookAbort(msg)),
             }
 
+            self.inject_thinking(&mut request, session, steps);
             self.ensure_context_fits(session, persona.as_deref());
             emit_request_composition(
                 &self.telemetry,
@@ -750,6 +756,16 @@ impl<A: ReActApp> ReActEngine<A> {
 
                     for choice in rsp.choices {
                         let message = &choice.message;
+
+                        // The model's reasoning is not history, but the
+                        // decisions it states are. Record them before any
+                        // tool call of this response runs, so a result can
+                        // corroborate or retire the judgment that led to it.
+                        if let Some(reasoning) = &message.reasoning_content {
+                            if self.thinking.observe_reasoning(reasoning, steps) {
+                                self.persist_thinking(session);
+                            }
+                        }
 
                         // The model's own words belong in the transcript even
                         // when the same message also carries tool calls: a
@@ -821,6 +837,8 @@ impl<A: ReActApp> ReActEngine<A> {
                                     Self::write_proxy_args(&mut args, hook_args);
                                 }
 
+                                self.thinking.observe_tool_call(&hook_name, steps);
+                                self.persist_thinking(session);
                                 hook_names.insert(call_id.clone(), hook_name);
                                 batch.push((name, call_id, args));
                             }
@@ -954,6 +972,13 @@ impl<A: ReActApp> ReActEngine<A> {
                                     self.tool_result_cap,
                                 );
                                 trace.note_tool_result(result.is_ok());
+                                self.thinking.observe_tool_result(
+                                    &observed,
+                                    &result_text,
+                                    result.is_ok(),
+                                    steps,
+                                );
+                                self.persist_thinking(session);
 
                                 if let Ok(ret) = &result {
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
@@ -1206,6 +1231,13 @@ impl<A: ReActApp> ReActEngine<A> {
                                     self.tool_result_cap,
                                 );
                                 trace.note_tool_result(result.is_ok());
+                                self.thinking.observe_tool_result(
+                                    &observed,
+                                    &result_text,
+                                    result.is_ok(),
+                                    steps,
+                                );
+                                self.persist_thinking(session);
 
                                 if let Ok(ret) = &result {
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
@@ -1333,11 +1365,19 @@ impl<A: ReActApp> ReActEngine<A> {
         // does, so the two cannot add up to an unbounded request.
         price_initial_tools(&mut self.schema_budget, &*context);
 
+        // The session is the authority on the summary: a run after an
+        // interruption or a restored session starts from what it kept.
+        let task = request.input.retrieval_text().unwrap_or_default();
+        self.begin_thinking(session, turn, &task);
+
         let result = self
             .react_loop(persona, request, session, context, turn)
-            .await?;
-
-        Ok(result)
+            .await;
+        if result.is_ok() {
+            self.thinking.finish();
+            self.persist_thinking(session);
+        }
+        result
     }
 
     /// Run the ReAct loop, streaming tokens as they arrive.
@@ -1357,6 +1397,10 @@ impl<A: ReActApp> ReActEngine<A> {
         self.schema_budget.reset();
         let turn = self.turn.fetch_add(1, Ordering::Relaxed) + 1;
 
+        // Load the persisted summary before the turn's first request: a run
+        // after a restore or an interruption resumes the valid part.
+        let task = request.input.retrieval_text().unwrap_or_default();
+        self.begin_thinking(session, turn, &task);
         session.push(LlmMessage::user(request.input.clone()));
 
         let stream = stream! {
@@ -1377,6 +1421,9 @@ impl<A: ReActApp> ReActEngine<A> {
             context.add_tool(load_skill_tool());
             price_initial_tools(&mut self.schema_budget, &*context);
             let mut trace = TurnTrace::new(request.intent, &*context);
+            // Reasoning chunks accumulate here and are parsed once per step,
+            // not once per token.
+            let mut step_reasoning = String::new();
 
             loop {
                 if self.stop_flag.load(Ordering::SeqCst) {
@@ -1416,6 +1463,7 @@ impl<A: ReActApp> ReActEngine<A> {
                     }
                 }
 
+                self.inject_thinking(&mut request, session, steps);
                 self.ensure_context_fits(session, persona.as_deref());
                 emit_request_composition(
                     &self.telemetry,
@@ -1456,6 +1504,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             yield Ok(StreamToken::Text(text));
                         }
                         Ok(StreamToken::ReasoningContent(text)) => {
+                            push_reasoning_tail(&mut step_reasoning, &text);
                             yield Ok(StreamToken::ReasoningContent(text));
                         }
                         Ok(StreamToken::ToolResult { name, output, ms }) => {
@@ -1490,6 +1539,14 @@ impl<A: ReActApp> ReActEngine<A> {
                             // instead of one more step.
                             if closing {
                                 continue;
+                            }
+                            // The reasoning that introduced this call belongs
+                            // to this step; parse it before the call runs so a
+                            // result can corroborate or retire the judgment.
+                            if !step_reasoning.trim().is_empty() {
+                                self.thinking.observe_reasoning(&step_reasoning, steps);
+                                self.persist_thinking(session);
+                                step_reasoning.clear();
                             }
                             saw_tool_call = true;
                             trace.note_tool_call(steps);
@@ -1531,6 +1588,8 @@ impl<A: ReActApp> ReActEngine<A> {
                             } else {
                                 Self::write_proxy_args(&mut args, hook_args);
                             }
+                            self.thinking.observe_tool_call(&observed, steps);
+                            self.persist_thinking(session);
 
                             let tool_started = Instant::now();
                             let mut result = if name == "load_skill" {
@@ -1625,6 +1684,13 @@ impl<A: ReActApp> ReActEngine<A> {
                             };
                             let result_text = cap_tool_result(&result_text, self.tool_result_cap);
                             trace.note_tool_result(result.is_ok());
+                            self.thinking.observe_tool_result(
+                                &observed,
+                                &result_text,
+                                result.is_ok(),
+                                steps,
+                            );
+                            self.persist_thinking(session);
 
                             // A failed call is the one line the log was
                             // missing: policy refusals, broken environments and
@@ -1663,6 +1729,14 @@ impl<A: ReActApp> ReActEngine<A> {
                             break;
                         }
                     }
+                }
+
+                // A step that reasoned but issued no call still leaves
+                // decisions worth carrying to the next request.
+                if !step_reasoning.trim().is_empty() {
+                    self.thinking.observe_reasoning(&step_reasoning, steps);
+                    self.persist_thinking(session);
+                    step_reasoning.clear();
                 }
 
                 self.react_app
@@ -1741,6 +1815,8 @@ impl<A: ReActApp> ReActEngine<A> {
                         answer: full_response.clone(),
                     });
                     emit_turn_outcome(&self.telemetry, turn, &trace, steps, &full_response);
+                    self.thinking.finish();
+                    self.persist_thinking(session);
                     yield Ok(StreamToken::Done);
                     break;
                 }
@@ -1821,6 +1897,44 @@ impl<A: ReActApp> ReActEngine<A> {
             if !session.compact_mechanical(MID_TURN_KEEP_RECENT, MID_TURN_SUMMARY_CHARS) {
                 return;
             }
+        }
+    }
+
+    /// Load the thinking summary the session persisted and open a new run.
+    fn begin_thinking<S: ReactSession>(&mut self, session: &mut S, turn: u64, task: &str) {
+        self.thinking = ThinkingState::from_snapshot(session.thinking_snapshot());
+        self.thinking.begin_run(turn, task);
+        self.thinking.persist(session);
+    }
+
+    /// Save the live summary so an interruption loses no valid decision.
+    fn persist_thinking<S: ReactSession>(&self, session: &mut S) {
+        self.thinking.persist(session);
+    }
+
+    /// Append this step's thinking note to the request's host guidance.
+    ///
+    /// Host guidance is the only channel: it rides the system prompt of exactly
+    /// one call and never enters the message list (issue #434). An identical
+    /// purpose already on the request is left alone.
+    fn inject_thinking<S: ReactSession>(
+        &mut self,
+        request: &mut LlmRequest,
+        session: &S,
+        step: usize,
+    ) {
+        if request
+            .host_guidance
+            .iter()
+            .any(|guidance| guidance.purpose == THINKING_SOURCE)
+        {
+            return;
+        }
+        if let Some(note) = self
+            .thinking
+            .prepare_injection(step, session.history().unwrap_or_default())
+        {
+            request.host_guidance.push(note);
         }
     }
 

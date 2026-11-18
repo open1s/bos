@@ -1469,6 +1469,11 @@ pub struct AgentSession {
     /// The per-checkpoint source-span byte budget.
     #[serde(default = "checkpoint_span_budget_default")]
     checkpoint_span_budget: usize,
+    /// The persisted thinking summary (REQ-3). It is model-derived state, not
+    /// conversation history, so it is stored beside the messages rather than
+    /// in them; a restored session resumes the still-valid part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<react::thinking::ThinkingSnapshot>,
 }
 
 /// The current archive payload schema.
@@ -1500,7 +1505,10 @@ fn checkpoint_span_budget_default() -> usize {
 }
 
 /// The current serialized session schema (issue #419).
-pub const SESSION_SCHEMA_VERSION: u32 = 5;
+///
+/// Generation 6 added the persisted thinking summary; older files load with
+/// `thinking: None` and keep working.
+pub const SESSION_SCHEMA_VERSION: u32 = 6;
 
 /// Timestamps and counters stored with an [`AgentSession`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1532,6 +1540,7 @@ impl AgentSession {
             archive_entries: std::collections::BTreeMap::new(),
             checkpoint_archive_budget: DEFAULT_CHECKPOINT_ARCHIVE_BYTES,
             checkpoint_span_budget: DEFAULT_CHECKPOINT_SPAN_BYTES,
+            thinking: None,
         }
     }
 
@@ -1624,6 +1633,16 @@ impl AgentSession {
         self.context = JsonValue::Null;
     }
 
+    /// The persisted thinking summary, when one was recorded.
+    pub fn thinking_snapshot(&self) -> Option<react::thinking::ThinkingSnapshot> {
+        self.thinking.clone()
+    }
+
+    /// Replace the persisted thinking summary.
+    pub fn set_thinking_snapshot(&mut self, snapshot: Option<react::thinking::ThinkingSnapshot>) {
+        self.thinking = snapshot;
+    }
+
     /// Write the session to `path` as pretty JSON.
     pub fn save(&self, path: &str) -> Result<(), std::io::Error> {
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
@@ -1702,6 +1721,7 @@ impl AgentSession {
         self.archive_entries = restored.archive_entries;
         self.checkpoint_archive_budget = restored.checkpoint_archive_budget;
         self.checkpoint_span_budget = restored.checkpoint_span_budget;
+        self.thinking = restored.thinking;
         Ok(())
     }
 
@@ -1715,6 +1735,7 @@ impl AgentSession {
         self.messages
             .retain(|msg| matches!(msg, Message::System { .. }));
         self.context = JsonValue::Null;
+        self.thinking = None;
         self.metadata.updated_at = current_timestamp();
     }
 
@@ -2508,6 +2529,14 @@ impl ReactSession for AgentSession {
         let before = self.estimate_tokens().unwrap_or(0);
         self.compact(keep_recent, max_summary_chars);
         self.estimate_tokens().is_some_and(|after| after < before)
+    }
+
+    fn thinking_snapshot(&self) -> Option<react::thinking::ThinkingSnapshot> {
+        self.thinking.clone()
+    }
+
+    fn set_thinking_snapshot(&mut self, snapshot: Option<react::thinking::ThinkingSnapshot>) {
+        self.thinking = snapshot;
     }
 }
 
@@ -3987,5 +4016,45 @@ mod budget_tests {
             })
             .expect("summary system message");
         assert!(summary.contains("compacted"));
+    }
+
+    #[test]
+    fn a_thinking_snapshot_survives_save_and_restore() {
+        use react::thinking::{ThinkingConfidence, ThinkingDecision, ThinkingOrigin};
+
+        let mut session = AgentSession::new();
+        let mut snapshot = react::thinking::ThinkingSnapshot::new(1);
+        snapshot.summary.phase = react::thinking::ThinkingPhase::Implementing;
+        snapshot.summary.decisions.push(ThinkingDecision {
+            statement: "reuse the coordinated store".to_string(),
+            rationale: Some("it already serializes writers".to_string()),
+            confidence: ThinkingConfidence::Verified,
+            origin: ThinkingOrigin::ToolResult,
+            evidence: vec!["memory tests succeeded at step 2".to_string()],
+            step: 2,
+            active: true,
+            superseded_by: None,
+        });
+        session.set_thinking_snapshot(Some(snapshot.clone()));
+
+        let json = session.to_json_string().expect("serializes");
+        let mut restored = AgentSession::new();
+        restored.restore_from_json(&json).expect("restores");
+        assert_eq!(restored.thinking_snapshot(), Some(snapshot));
+    }
+
+    #[test]
+    fn a_session_without_a_thinking_field_still_loads() {
+        let mut session = AgentSession::new();
+        session.add_user("hello".to_string());
+        let mut value: serde_json::Value =
+            serde_json::from_str(&session.to_json_string().expect("serializes"))
+                .expect("valid json");
+        value.as_object_mut().expect("object").remove("thinking");
+        let mut restored = AgentSession::new();
+        restored
+            .restore_from_json(&value.to_string())
+            .expect("the older file loads");
+        assert!(restored.thinking_snapshot().is_none());
     }
 }
