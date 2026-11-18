@@ -114,6 +114,8 @@ pub enum StreamTokenWrapper {
     Text(String),
     /// Reasoning text emitted alongside the answer.
     ReasoningContent(String),
+    /// Opaque provider state that belongs to the reasoning emitted so far.
+    ReasoningState(react::llm::ReasoningState),
     /// A tool call request.
     ToolCall {
         /// Tool name.
@@ -156,6 +158,9 @@ impl StreamTokenWrapper {
                 StreamTokenWrapper::ToolResult { name, output, ms }
             }
             react::llm::StreamToken::ReasoningContent(s) => StreamTokenWrapper::ReasoningContent(s),
+            react::llm::StreamToken::ReasoningState(state) => {
+                StreamTokenWrapper::ReasoningState(state)
+            }
             react::llm::StreamToken::Usage(u) => StreamTokenWrapper::Usage(u),
             react::llm::StreamToken::Done => StreamTokenWrapper::Done,
             react::llm::StreamToken::Stopped => StreamTokenWrapper::Stopped,
@@ -181,6 +186,9 @@ impl StreamTokenWrapper {
             react::llm::StreamToken::ReasoningContent(s) => {
                 StreamTokenWrapper::ReasoningContent(s.clone())
             }
+            react::llm::StreamToken::ReasoningState(state) => {
+                StreamTokenWrapper::ReasoningState(state.clone())
+            }
             react::llm::StreamToken::Usage(u) => StreamTokenWrapper::Usage(u.clone()),
             react::llm::StreamToken::Done => StreamTokenWrapper::Done,
             react::llm::StreamToken::Stopped => StreamTokenWrapper::Stopped,
@@ -198,6 +206,9 @@ impl StreamTokenWrapper {
                 react::llm::StreamToken::ToolResult { name, output, ms }
             }
             StreamTokenWrapper::ReasoningContent(s) => react::llm::StreamToken::ReasoningContent(s),
+            StreamTokenWrapper::ReasoningState(state) => {
+                react::llm::StreamToken::ReasoningState(state)
+            }
             StreamTokenWrapper::Usage(u) => react::llm::StreamToken::Usage(u),
             StreamTokenWrapper::Done => react::llm::StreamToken::Done,
             StreamTokenWrapper::Stopped => react::llm::StreamToken::Stopped,

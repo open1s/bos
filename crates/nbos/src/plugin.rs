@@ -401,6 +401,16 @@ impl From<&InnerStreamToken> for PyStreamTokenWrapper {
                 ms: None,
                 usage: None,
             },
+            InnerStreamToken::ReasoningState(state) => Self {
+                token_type: "ReasoningState".to_string(),
+                text: serde_json::to_string(state).ok(),
+                name: None,
+                args: None,
+                id: None,
+                output: None,
+                ms: None,
+                usage: None,
+            },
             InnerStreamToken::ToolCall { name, args, id } => Self {
                 token_type: "ToolCall".to_string(),
                 text: None,
@@ -462,6 +472,11 @@ impl From<PyStreamTokenWrapper> for InnerStreamToken {
             "ReasoningContent" => {
                 InnerStreamToken::ReasoningContent(token.text.unwrap_or_default())
             }
+            "ReasoningState" => token
+                .text
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .map(InnerStreamToken::ReasoningState)
+                .unwrap_or(InnerStreamToken::Done),
             "ToolCall" => InnerStreamToken::ToolCall {
                 name: token.name.unwrap_or_default(),
                 args: token

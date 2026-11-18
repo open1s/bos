@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Reasoning is preserved as its own message (#438).** `LlmMessage` gained
+  `AssistantReasoning { content, provider_state }`, kept separate from
+  `Assistant` so the model's semantic boundary survives. The engine records
+  non-streamed and streamed reasoning once per step, before the visible text
+  and tool calls. Chat Completions never replays it; Anthropic replays signed
+  `thinking`/`redacted_thinking` blocks and merges them with their `tool_use`
+  blocks; the Responses API replays a reasoning item only when its own opaque
+  state (`id`/`encrypted_content`) is present. A provider switch therefore
+  cannot replay another protocol's state. BSH persists the opaque states in
+  `MessageMeta.reasoning_states` and `Runner::seed_session` pairs each timeline
+  thinking block with its own state, ahead of the text. Thinking summaries remain a separate, opt-in
+  context channel. See `docs/reasoning-messages.md`.
+
 - **Thinking summaries feed later steps without rewriting history (#438).** A
   reasoning step's claims, intents, rationale, open questions and next action are
   extracted into a typed, bounded summary (`react::thinking`). A tool result

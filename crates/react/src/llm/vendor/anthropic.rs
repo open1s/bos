@@ -26,7 +26,7 @@ use super::openaicompatible::{ChatCompletionResponse, Usage};
 use crate::llm::types::{BinarySource, LlmMessage};
 use crate::llm::{
     Content, ContentPart, LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult,
-    ReactContext, ReactSession, StreamToken, TokenStream, VendorBuilderError,
+    ReactContext, ReactSession, ReasoningState, StreamToken, TokenStream, VendorBuilderError,
 };
 
 /// The Anthropic API version this client speaks.
@@ -229,6 +229,30 @@ impl AnthropicVendor {
         }
     }
 
+    /// Append blocks to the last message when the role repeats.
+    ///
+    /// Anthropic expects one assistant message carrying the thinking block
+    /// together with its tool_use blocks; splitting them into consecutive
+    /// messages breaks the reasoning/tool continuity the protocol requires.
+    fn push_blocks(messages: &mut Vec<AnthropicMessage>, role: &str, content: Value) {
+        let blocks = match content {
+            Value::Array(blocks) => blocks,
+            other => vec![other],
+        };
+        if let Some(last) = messages.last_mut() {
+            if last.role == role {
+                if let Some(existing) = last.content.as_array_mut() {
+                    existing.extend(blocks);
+                    return;
+                }
+            }
+        }
+        messages.push(AnthropicMessage {
+            role: role.to_string(),
+            content: Value::Array(blocks),
+        });
+    }
+
     /// Map the library message content onto Anthropic content blocks.
     fn content_blocks(content: &Content) -> Value {
         match content {
@@ -297,38 +321,77 @@ impl AnthropicVendor {
             for message in &history {
                 match message {
                     LlmMessage::System { content } => system_parts.push(content.clone()),
-                    LlmMessage::User { content } => messages.push(AnthropicMessage {
-                        role: "user".to_string(),
-                        content: Self::content_blocks(content),
-                    }),
-                    LlmMessage::Assistant { content } => messages.push(AnthropicMessage {
-                        role: "assistant".to_string(),
-                        content: json!([{ "type": "text", "text": content }]),
-                    }),
+                    LlmMessage::User { content } => {
+                        Self::push_blocks(&mut messages, "user", Self::content_blocks(content))
+                    }
+                    LlmMessage::Assistant { content } => Self::push_blocks(
+                        &mut messages,
+                        "assistant",
+                        json!([{ "type": "text", "text": content }]),
+                    ),
+                    LlmMessage::AssistantReasoning {
+                        content,
+                        provider_state: Some(state),
+                    } if state.provider == "anthropic" => {
+                        match state.payload.get("type").and_then(Value::as_str) {
+                            Some("thinking") => {
+                                if let Some(signature) =
+                                    state.payload.get("signature").and_then(Value::as_str)
+                                {
+                                    Self::push_blocks(
+                                        &mut messages,
+                                        "assistant",
+                                        json!([{
+                                            "type": "thinking",
+                                            "thinking": content,
+                                            "signature": signature,
+                                        }]),
+                                    );
+                                }
+                            }
+                            Some("redacted_thinking") => {
+                                if let Some(data) =
+                                    state.payload.get("data").and_then(Value::as_str)
+                                {
+                                    Self::push_blocks(
+                                        &mut messages,
+                                        "assistant",
+                                        json!([{ "type": "redacted_thinking", "data": data }]),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Reasoning without a signed Anthropic block stays out of
+                    // the wire: inventing a signature is not possible.
+                    LlmMessage::AssistantReasoning { .. } => {}
                     LlmMessage::AssistantToolCall {
                         tool_call_id,
                         name,
                         args,
-                    } => messages.push(AnthropicMessage {
-                        role: "assistant".to_string(),
-                        content: json!([{
+                    } => Self::push_blocks(
+                        &mut messages,
+                        "assistant",
+                        json!([{
                             "type": "tool_use",
                             "id": tool_call_id,
                             "name": name,
                             "input": args,
                         }]),
-                    }),
+                    ),
                     LlmMessage::ToolResult {
                         tool_call_id,
                         content,
-                    } => messages.push(AnthropicMessage {
-                        role: "user".to_string(),
-                        content: json!([{
+                    } => Self::push_blocks(
+                        &mut messages,
+                        "user",
+                        json!([{
                             "type": "tool_result",
                             "tool_use_id": tool_call_id,
                             "content": content,
                         }]),
-                    }),
+                    ),
                 }
             }
         }
@@ -560,6 +623,19 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                         }
                         "content_block_start" => {
                             if frame.pointer("/content_block/type").and_then(Value::as_str)
+                                == Some("redacted_thinking")
+                            {
+                                if let Some(data) =
+                                    frame.pointer("/content_block/data").and_then(Value::as_str)
+                                {
+                                    let state = ReasoningState::new(
+                                        "anthropic",
+                                        json!({ "type": "redacted_thinking", "data": data }),
+                                    );
+                                    let _ = tx.send(Ok(StreamToken::ReasoningState(state))).await;
+                                }
+                            }
+                            if frame.pointer("/content_block/type").and_then(Value::as_str)
                                 == Some("tool_use")
                             {
                                 let index = frame.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -605,6 +681,18 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                                 )))
                                                 .await;
                                         }
+                                    }
+                                }
+                                "signature_delta" => {
+                                    if let Some(signature) =
+                                        frame.pointer("/delta/signature").and_then(Value::as_str)
+                                    {
+                                        let state = ReasoningState::new(
+                                            "anthropic",
+                                            json!({ "type": "thinking", "signature": signature }),
+                                        );
+                                        let _ =
+                                            tx.send(Ok(StreamToken::ReasoningState(state))).await;
                                     }
                                 }
                                 "input_json_delta" => {
@@ -869,6 +957,71 @@ mod tests {
             !outside.contains("DATA"),
             "data is only inside the envelope: {system}"
         );
+    }
+
+    #[test]
+    fn signed_thinking_replays_and_unsigned_reasoning_is_skipped() {
+        use crate::llm::{Content, LlmMessage, LlmRequest, ReasoningState};
+        let vendor = super::tests::vendor();
+        let request = |provider_state: Option<ReasoningState>| LlmRequest {
+            model: "claude-3-5-sonnet-latest".to_string(),
+            input: Content::text("next"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                messages: vec![
+                    LlmMessage::user("think"),
+                    LlmMessage::AssistantReasoning {
+                        content: "private chain".to_string(),
+                        provider_state,
+                    },
+                    LlmMessage::assistant("answer"),
+                    LlmMessage::user("next"),
+                ],
+                input: Content::text("next"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let signed = vendor.build_request(
+            &None,
+            &request(Some(ReasoningState::new(
+                "anthropic",
+                json!({ "type": "thinking", "signature": "sig-1" }),
+            ))),
+            &(),
+            &(),
+        );
+        let assistant = signed
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("the assistant turn");
+        let blocks = assistant.content.as_array().expect("blocks");
+        assert!(blocks.iter().any(|block| {
+            block["type"] == "thinking"
+                && block["thinking"] == "private chain"
+                && block["signature"] == "sig-1"
+        }));
+        assert!(blocks.iter().any(|block| block["type"] == "text"));
+
+        let unsigned = vendor.build_request(&None, &request(None), &(), &());
+        let serialized = serde_json::to_string(&unsigned.messages).expect("serializes");
+        assert!(
+            !serialized.contains("private chain") && !serialized.contains("thinking"),
+            "unsigned reasoning is not invented on the wire: {serialized}"
+        );
+
+        // A provider switch must not replay another protocol's opaque state.
+        let foreign = vendor.build_request(
+            &None,
+            &request(Some(ReasoningState::new(
+                "openai-responses",
+                json!({ "id": "rs_1" }),
+            ))),
+            &(),
+            &(),
+        );
+        let serialized = serde_json::to_string(&foreign.messages).expect("serializes");
+        assert!(!serialized.contains("thinking"), "{serialized}");
     }
 
     #[test]

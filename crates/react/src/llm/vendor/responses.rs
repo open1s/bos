@@ -89,6 +89,19 @@ pub enum ResponsesInputItem {
         /// Message content parts.
         content: Vec<ResponsesContentPart>,
     },
+    /// A reasoning item returned by the model.
+    ///
+    /// Only sent when the history carries the Responses provider state for it;
+    /// a reasoning message without that state is ordinary output and is not
+    /// replayed as input.
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        /// Provider reasoning item id.
+        id: String,
+        /// Opaque encrypted reasoning payload, when the provider returned one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
     /// A function call made by the model.
     #[serde(rename = "function_call")]
     FunctionCall {
@@ -248,6 +261,12 @@ pub enum ResponsesItem {
     /// Reasoning output.
     #[serde(rename = "reasoning")]
     Reasoning {
+        /// Provider reasoning item id, when present.
+        #[serde(default)]
+        id: String,
+        /// Opaque encrypted reasoning payload, when the provider returned one.
+        #[serde(default)]
+        encrypted_content: Option<String>,
         /// Reasoning summary parts.
         #[serde(default)]
         summary: Vec<ResponsesReasoningSummary>,
@@ -387,6 +406,25 @@ fn serialize_input_content(content: &Content) -> Vec<ResponsesContentPart> {
     }
 }
 
+/// The opaque state of one streamed Responses reasoning item.
+fn reasoning_state_from_item(item: &Value) -> Option<crate::llm::ReasoningState> {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return None;
+    }
+    let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+    let encrypted = item.get("encrypted_content").and_then(Value::as_str);
+    if id.is_empty() && encrypted.is_none() {
+        return None;
+    }
+    Some(crate::llm::ReasoningState::new(
+        "openai-responses",
+        serde_json::json!({
+            "id": id,
+            "encrypted_content": encrypted,
+        }),
+    ))
+}
+
 fn build_input(history: Option<&[LlmMessage]>, input: &Content) -> Vec<ResponsesInputItem> {
     let mut items = Vec::new();
     if let Some(history) = history {
@@ -407,6 +445,24 @@ fn build_input(history: Option<&[LlmMessage]>, input: &Content) -> Vec<Responses
                         }],
                     });
                 }
+                LlmMessage::AssistantReasoning {
+                    provider_state: Some(state),
+                    ..
+                } if state.provider == "openai-responses" => {
+                    if let Some(id) = state.payload.get("id").and_then(Value::as_str) {
+                        items.push(ResponsesInputItem::Reasoning {
+                            id: id.to_string(),
+                            encrypted_content: state
+                                .payload
+                                .get("encrypted_content")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        });
+                    }
+                }
+                // The visible reasoning text alone is not valid Responses
+                // input; without provider state it stays history-only.
+                LlmMessage::AssistantReasoning { .. } => {}
                 LlmMessage::AssistantToolCall {
                     tool_call_id,
                     name,
@@ -1084,6 +1140,9 @@ impl ResponsesTransport {
                             }
                             ResponsesStreamEvent::OutputItemAdded { item, .. }
                             | ResponsesStreamEvent::OutputItemDone { item, .. } => {
+                                if let Some(state) = reasoning_state_from_item(&item) {
+                                    let _ = tx.send(Ok(StreamToken::ReasoningState(state))).await;
+                                }
                                 func_calls.add_item(&item);
                             }
                             ResponsesStreamEvent::FunctionCallArgumentsDelta {
@@ -1265,6 +1324,60 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_input_requires_responses_provider_state() {
+        use crate::llm::{Content, LlmMessage, ReasoningState};
+        let history = vec![
+            LlmMessage::user("think"),
+            LlmMessage::AssistantReasoning {
+                content: "summary".to_string(),
+                provider_state: Some(ReasoningState::new(
+                    "openai-responses",
+                    serde_json::json!({"id": "rs_1", "encrypted_content": "opaque"}),
+                )),
+            },
+            LlmMessage::assistant("answer"),
+        ];
+        let items = build_input(Some(&history), &Content::text("next"));
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                ResponsesInputItem::Reasoning {
+                    id,
+                    encrypted_content: Some(content),
+                } if id == "rs_1" && content == "opaque"
+            )),
+            "the provider state replays: {items:?}"
+        );
+
+        let unsigned = vec![LlmMessage::AssistantReasoning {
+            content: "summary".to_string(),
+            provider_state: None,
+        }];
+        let items = build_input(Some(&unsigned), &Content::text("next"));
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, ResponsesInputItem::Reasoning { .. })),
+            "visible reasoning alone is not a Responses input item"
+        );
+
+        let foreign = vec![LlmMessage::AssistantReasoning {
+            content: "summary".to_string(),
+            provider_state: Some(ReasoningState::new(
+                "anthropic",
+                serde_json::json!({"type": "thinking", "signature": "sig"}),
+            )),
+        }];
+        let items = build_input(Some(&foreign), &Content::text("next"));
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, ResponsesInputItem::Reasoning { .. })),
+            "another provider's state is not replayed"
+        );
+    }
+
+    #[test]
     fn build_request_maps_history_and_hosted_tools() {
         let session = session_with_history();
         let context = context_with_tools();
@@ -1320,6 +1433,7 @@ mod tests {
             .iter()
             .map(|i| match i {
                 ResponsesInputItem::Message { .. } => "message",
+                ResponsesInputItem::Reasoning { .. } => "reasoning",
                 ResponsesInputItem::FunctionCall { .. } => "function_call",
                 ResponsesInputItem::FunctionCallOutput { .. } => "function_call_output",
             })

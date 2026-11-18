@@ -3,11 +3,12 @@
 Status: implemented in `react::thinking` and persisted by `agent::AgentSession`.
 
 The raw reasoning stream is model-private output. It is shown to the reader and
-streamed as `StreamToken::ReasoningContent`, but it is not conversation history:
-replaying it as a user or assistant turn would invent a message nobody sent.
-This feature keeps the useful part of that stream - the decisions, the questions
-it left open, and the next action - and feeds it back as a small, explicitly
-labelled note on the NEXT provider request.
+streamed as `StreamToken::ReasoningContent`, and it is preserved as its own
+`LlmMessage::AssistantReasoning` message; it is not ordinary assistant text.
+See [reasoning-messages.md](reasoning-messages.md) for the provider replay
+contract. This feature keeps the useful part of that stream - the decisions, the
+questions it left open, and the next action - and feeds it back as a small,
+explicitly labelled note on the NEXT provider request.
 
 ## 1. Extraction (REQ-1)
 

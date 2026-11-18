@@ -3102,6 +3102,8 @@ pub(crate) fn child_transcript(child: &Agent) -> Vec<crate::subagent::SubagentMe
             react::llm::LlmMessage::Assistant { content } => {
                 Some(("assistant", content.clone(), None))
             }
+            // Reasoning is preserved in the session but is not a child turn row.
+            react::llm::LlmMessage::AssistantReasoning { .. } => None,
             react::llm::LlmMessage::AssistantToolCall { name, args, .. } => {
                 Some(("tool", format!("{name} {args}"), Some(name.clone())))
             }
@@ -3152,6 +3154,7 @@ pub(crate) async fn stream_child(
                 registry.append_text(id, &chunk);
             }
             Ok(react::llm::StreamToken::ReasoningContent(_)) => {}
+            Ok(react::llm::StreamToken::ReasoningState(_)) => {}
             Ok(react::llm::StreamToken::ToolCall { name, args, .. }) => {
                 registry.append_tool_call(id, &name, &args.to_string());
             }

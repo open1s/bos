@@ -105,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "\n[ Usage ] prompt={} completion={} total={}",
                     u.prompt_tokens, u.completion_tokens, u.total_tokens
                 ),
+                agent::StreamToken::ReasoningState(_) => {}
                 agent::StreamToken::Stopped => println!("\n[ Stopped ]"),
             },
             Err(e) => println!("Error: {}", e),

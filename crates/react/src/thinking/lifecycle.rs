@@ -1019,7 +1019,10 @@ fn history_contains(history: &[LlmMessage], text: &str) -> bool {
             }
             LlmMessage::ToolResult { content, .. } => Some(content.as_str()),
             LlmMessage::User { content } => content.as_text(),
-            LlmMessage::AssistantToolCall { .. } => None,
+            // Reasoning is the source the summary is distilled from, not a
+            // history turn the reader or the assistant said. Counting it here
+            // would make every summary item look duplicated.
+            LlmMessage::AssistantReasoning { .. } | LlmMessage::AssistantToolCall { .. } => None,
         })
         .any(|body| {
             let body = normalize_text(body);

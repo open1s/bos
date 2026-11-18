@@ -324,6 +324,9 @@ fn stream_token_to_json(token: &StreamTokenWrapper) -> serde_json::Value {
     StreamTokenWrapper::ReasoningContent(text) => {
       serde_json::json!({"type": "ReasoningContent", "text": text})
     }
+    StreamTokenWrapper::ReasoningState(state) => {
+      serde_json::json!({"type": "ReasoningState", "state": state})
+    }
     StreamTokenWrapper::ToolCall { name, args, id } => serde_json::json!({
         "type": "ToolCall",
         "name": name,
@@ -364,6 +367,9 @@ fn stream_token_from_json(value: &serde_json::Value) -> Option<StreamTokenWrappe
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string(),
+    ),
+    "ReasoningState" => StreamTokenWrapper::ReasoningState(
+      serde_json::from_value(value.get("state").cloned().unwrap_or_default()).ok()?,
     ),
     "ToolCall" => StreamTokenWrapper::ToolCall {
       name: value

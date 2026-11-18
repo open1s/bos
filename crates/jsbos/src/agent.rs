@@ -1554,6 +1554,9 @@ impl Agent {
               agent::StreamToken::ReasoningContent(text) => {
                 serde_json::json!({ "type": "ReasoningContent", "text": text })
               }
+              agent::StreamToken::ReasoningState(state) => {
+                serde_json::json!({ "type": "ReasoningState", "state": state })
+              }
               agent::StreamToken::ToolCall { name, args, id } => {
                 serde_json::json!({
                     "type": "ToolCall",

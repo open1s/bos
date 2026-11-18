@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::pin::Pin;
 
-use super::types::LlmError;
+use super::types::{LlmError, ReasoningState};
 use super::vendor::responses::{ResponsesContentPart, ResponsesItem};
 
 /// Result of an LLM call.
@@ -75,6 +75,12 @@ pub enum StreamToken {
     Text(String),
     /// A chunk of reasoning text.
     ReasoningContent(String),
+    /// Opaque provider state that belongs to the reasoning emitted so far.
+    ///
+    /// Providers that sign or encrypt reasoning send this after the text (or
+    /// instead of it); the engine stores it with the reasoning message so a
+    /// later request can replay the block without reconstructing it.
+    ReasoningState(ReasoningState),
     /// A complete tool call.
     ToolCall {
         /// Tool name.

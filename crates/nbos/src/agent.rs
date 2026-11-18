@@ -231,6 +231,19 @@ impl PyLlmMessage {
                 dict.set_item("content", content)?;
                 Ok(dict.into_any())
             }
+            LlmMessage::AssistantReasoning {
+                content,
+                provider_state,
+            } => {
+                let dict = PyDict::new(py);
+                dict.set_item("role", "assistant_reasoning")?;
+                dict.set_item("content", content)?;
+                if let Some(state) = provider_state {
+                    let value = serde_json::to_value(state).unwrap_or_default();
+                    dict.set_item("provider_state", json_to_py(py, &value)?)?;
+                }
+                Ok(dict.into_any())
+            }
             LlmMessage::AssistantToolCall {
                 tool_call_id,
                 name,
@@ -1349,6 +1362,11 @@ impl PyAgent {
                         Ok(StreamToken::ReasoningContent(text)) => Ok(serde_json::json!({
                             "type": "thinking",
                             "text": text
+                        })
+                        .to_string()),
+                        Ok(StreamToken::ReasoningState(state)) => Ok(serde_json::json!({
+                            "type": "reasoning_state",
+                            "state": state,
                         })
                         .to_string()),
                         Ok(StreamToken::ToolCall { name, args, id }) => Ok(serde_json::json!({

@@ -3,7 +3,8 @@
 use crate::llm::types::{load_skill_tool, HostGuidance, ReactContext, ReactSession};
 use crate::llm::vendor::responses::{ResponsesContentPart, ResponsesItem};
 use crate::llm::{
-    ActionIntent, LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, StreamToken,
+    ActionIntent, LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, ReasoningState,
+    StreamToken,
 };
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::runtime::{HookDecision, ReActApp};
@@ -767,6 +768,9 @@ impl<A: ReActApp> ReActEngine<A> {
                         // tool call of this response runs, so a result can
                         // corroborate or retire the judgment that led to it.
                         if let Some(reasoning) = &message.reasoning_content {
+                            if !reasoning.trim().is_empty() {
+                                session.push(LlmMessage::assistant_reasoning(reasoning.clone()));
+                            }
                             self.observe_thinking(session, reasoning, steps);
                         }
 
@@ -1114,6 +1118,34 @@ impl<A: ReActApp> ReActEngine<A> {
 
                     for item in &rsp.output {
                         match item {
+                            ResponsesItem::Reasoning {
+                                id,
+                                encrypted_content,
+                                summary,
+                            } => {
+                                let content = summary
+                                    .iter()
+                                    .map(|part| part.text.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if content.is_empty()
+                                    && id.is_empty()
+                                    && encrypted_content.is_none()
+                                {
+                                    continue;
+                                }
+                                let state = ReasoningState::new(
+                                    "openai-responses",
+                                    serde_json::json!({
+                                        "id": id,
+                                        "encrypted_content": encrypted_content,
+                                    }),
+                                );
+                                session.push(LlmMessage::AssistantReasoning {
+                                    content,
+                                    provider_state: Some(state),
+                                });
+                            }
                             ResponsesItem::FunctionCall {
                                 call_id,
                                 name,
@@ -1423,8 +1455,11 @@ impl<A: ReActApp> ReActEngine<A> {
             price_initial_tools(&mut self.schema_budget, &*context);
             let mut trace = TurnTrace::new(request.intent, &*context);
             // Reasoning chunks accumulate here and are parsed once per step,
-            // not once per token.
+            // not once per token. The raw buffer is preserved verbatim as its
+            // own message; the summary buffer is the bounded parse input.
             let mut step_reasoning = String::new();
+            let mut step_reasoning_raw = String::new();
+            let mut step_reasoning_state: Option<ReasoningState> = None;
 
             loop {
                 if self.stop_flag.load(Ordering::SeqCst) {
@@ -1505,6 +1540,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             yield Ok(StreamToken::Text(text));
                         }
                         Ok(StreamToken::ReasoningContent(text)) => {
+                            step_reasoning_raw.push_str(&text);
                             push_reasoning_tail(&mut step_reasoning, &text);
                             // Persist in bounded batches so a stream dropped
                             // before the step boundary keeps what arrived.
@@ -1516,6 +1552,10 @@ impl<A: ReActApp> ReActEngine<A> {
                                 );
                             }
                             yield Ok(StreamToken::ReasoningContent(text));
+                        }
+                        Ok(StreamToken::ReasoningState(state)) => {
+                            step_reasoning_state = Some(state.clone());
+                            yield Ok(StreamToken::ReasoningState(state));
                         }
                         Ok(StreamToken::ToolResult { name, output, ms }) => {
                             // Providers never emit this; pass through for
@@ -1553,7 +1593,13 @@ impl<A: ReActApp> ReActEngine<A> {
                             // The reasoning that introduced this call belongs
                             // to this step; parse it before the call runs so a
                             // result can corroborate or retire the judgment.
-                            self.observe_step_reasoning(session, &mut step_reasoning, steps);
+                            self.flush_step_reasoning(
+                                session,
+                                &mut step_reasoning_raw,
+                                &mut step_reasoning,
+                                &mut step_reasoning_state,
+                                steps,
+                            );
                             saw_tool_call = true;
                             trace.note_tool_call(steps);
                             // Keep the words that introduced the call: the
@@ -1729,23 +1775,41 @@ impl<A: ReActApp> ReActEngine<A> {
                             // The provider failed after some reasoning arrived:
                             // keep the bounded summary before handing the error
                             // to the consumer.
-                            self.observe_step_reasoning(session, &mut step_reasoning, steps);
+                            self.flush_step_reasoning(
+                                session,
+                                &mut step_reasoning_raw,
+                                &mut step_reasoning,
+                                &mut step_reasoning_state,
+                                steps,
+                            );
                             yield Err(ReactError::Llm(e));
                             break;
                         }
                         Ok(StreamToken::Stopped) => {
                             // A stopped turn is not complete. Fold what arrived
                             // and leave the phase in progress for a resume.
-                            self.observe_step_reasoning(session, &mut step_reasoning, steps);
+                            self.flush_step_reasoning(
+                                session,
+                                &mut step_reasoning_raw,
+                                &mut step_reasoning,
+                                &mut step_reasoning_state,
+                                steps,
+                            );
                             yield Ok(StreamToken::Stopped);
                             break;
                         }
                     }
                 }
 
-                // A step that reasoned but issued no call still leaves
-                // decisions worth carrying to the next request.
-                self.observe_step_reasoning(session, &mut step_reasoning, steps);
+                // A step that reasoned but issued no call still leaves the raw
+                // block and decisions worth carrying to the next request.
+                self.flush_step_reasoning(
+                    session,
+                    &mut step_reasoning_raw,
+                    &mut step_reasoning,
+                    &mut step_reasoning_state,
+                    steps,
+                );
 
                 self.react_app
                     .after_llm_response_step(
@@ -1977,6 +2041,42 @@ impl<A: ReActApp> ReActEngine<A> {
         }
         self.thinking.finish();
         self.persist_thinking(session);
+    }
+
+    /// Preserve the raw reasoning of one step as its own message.
+    ///
+    /// It is not an assistant text message: keeping the two apart preserves
+    /// the model's semantic boundary. Adapters decide whether the provider
+    /// needs the block replayed; the Chat Completions path deliberately does
+    /// not.
+    fn record_step_reasoning<S: ReactSession>(
+        &self,
+        session: &mut S,
+        raw: &mut String,
+        state: &mut Option<ReasoningState>,
+    ) {
+        if raw.is_empty() && state.is_none() {
+            return;
+        }
+        let content = std::mem::take(raw);
+        let provider_state = state.take();
+        session.push(LlmMessage::AssistantReasoning {
+            content,
+            provider_state,
+        });
+    }
+
+    /// Record one step's raw reasoning and fold the summary buffer.
+    fn flush_step_reasoning<S: ReactSession>(
+        &mut self,
+        session: &mut S,
+        raw: &mut String,
+        summary: &mut String,
+        state: &mut Option<ReasoningState>,
+        step: usize,
+    ) {
+        self.record_step_reasoning(session, raw, state);
+        self.observe_step_reasoning(session, summary, step);
     }
 
     /// Fold the reasoning received so far into the summary and persist it.

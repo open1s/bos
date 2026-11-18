@@ -176,7 +176,7 @@ fn message_text(message: &LlmMessage) -> Option<&str> {
         LlmMessage::System { content } | LlmMessage::Assistant { content } => Some(content),
         LlmMessage::User { content } => content.as_text(),
         LlmMessage::ToolResult { content, .. } => Some(content),
-        LlmMessage::AssistantToolCall { .. } => None,
+        LlmMessage::AssistantReasoning { .. } | LlmMessage::AssistantToolCall { .. } => None,
     }
 }
 
@@ -218,6 +218,18 @@ async fn a_confirming_result_verifies_the_claim_and_reaches_the_next_request() {
             .any(|text| text.contains("source: thinking-summary")),
         "the note is not a synthetic message"
     );
+
+    let history = session.history().expect("the session keeps history");
+    let reasoning = history.iter().find_map(|message| match message {
+        LlmMessage::AssistantReasoning {
+            content,
+            provider_state,
+        } => Some((content.clone(), provider_state.clone())),
+        _ => None,
+    });
+    let (content, state) = reasoning.expect("reasoning is preserved as its own message");
+    assert!(content.contains("The bug is in the parser file"));
+    assert!(state.is_none(), "Chat Completions carries no opaque state");
 
     let snapshot = session.thinking_snapshot().expect("the summary persists");
     assert_eq!(snapshot.summary.phase, ThinkingPhase::Complete);

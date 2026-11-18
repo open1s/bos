@@ -247,6 +247,9 @@ impl AgentRpcClient {
                 crate::StreamToken::ReasoningContent(_t) => {
                     //SKIP
                 }
+                crate::StreamToken::ReasoningState(_) => {
+                    //SKIP
+                }
                 crate::StreamToken::Usage(_) => {
                     //SKIP
                 }

@@ -330,6 +330,15 @@ pub(crate) struct MessageMeta {
     /// thing the model said.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) cancelled: bool,
+    /// Opaque provider states that belong to this turn's reasoning blocks.
+    ///
+    /// Anthropic signs thinking blocks and the Responses API can return an
+    /// encrypted reasoning item. The states ride in the message meta so the
+    /// existing history schema does not gain a new column; they are replayed
+    /// only by the adapter that recognizes their provider, in thinking-segment
+    /// order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) reasoning_states: Vec<react::llm::ReasoningState>,
 }
 
 /// One skill a prompt invoked, with the instructions the model received.
@@ -571,6 +580,16 @@ impl ChatMessage {
         let mut tokens = ROLE_OVERHEAD;
         if !self.text.is_empty() {
             tokens += price_block(self.text.chars().count());
+        }
+        // Reasoning is normally history-only; when a provider state is present,
+        // that provider may replay the block, so it contributes to the request.
+        if self
+            .meta
+            .as_ref()
+            .is_some_and(|meta| !meta.reasoning_states.is_empty())
+            && !self.reasoning.is_empty()
+        {
+            tokens += price_block(self.reasoning.chars().count());
         }
         tokens += IMAGE_TOKENS * self.images.len() as u64;
         for tool in &self.tools {

@@ -493,6 +493,30 @@ impl From<reqwest::Error> for LlmError {
 // Message Types
 // =============================================================================
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Opaque provider state that must travel with a reasoning block.
+///
+/// Some protocols require more than the visible reasoning text to replay a
+/// block: Anthropic signs a thinking block, and the Responses API can carry an
+/// encrypted reasoning item. `provider` names the protocol that owns `payload`;
+/// an adapter sends the block only when it recognizes its own provider.
+pub struct ReasoningState {
+    /// Provider protocol, e.g. `"anthropic"` or `"openai-responses"`.
+    pub provider: String,
+    /// The provider's opaque payload, preserved verbatim.
+    pub payload: Value,
+}
+
+impl ReasoningState {
+    /// Create a provider state from its opaque payload.
+    pub fn new(provider: impl Into<String>, payload: Value) -> Self {
+        Self {
+            provider: provider.into(),
+            payload,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 /// A message in an LLM conversation.
 pub enum LlmMessage {
@@ -510,6 +534,19 @@ pub enum LlmMessage {
     Assistant {
         /// The assistant text.
         content: String,
+    },
+    /// The model's reasoning for the turn.
+    ///
+    /// It is preserved verbatim and kept separate from [`Self::Assistant`], so
+    /// the semantic boundary between thinking and the answer survives. Adapters
+    /// do not send it by default; a protocol that needs a signed or encrypted
+    /// block reads `provider_state` and replays it.
+    AssistantReasoning {
+        /// The raw reasoning text, as the provider emitted it.
+        content: String,
+        /// Opaque provider state required to replay the block, when one exists.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_state: Option<ReasoningState>,
     },
     /// An assistant request to call a tool.
     AssistantToolCall {
@@ -558,6 +595,23 @@ impl LlmMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::Assistant {
             content: content.into(),
+        }
+    }
+    /// Create an assistant reasoning message without provider state.
+    pub fn assistant_reasoning(content: impl Into<String>) -> Self {
+        Self::AssistantReasoning {
+            content: content.into(),
+            provider_state: None,
+        }
+    }
+    /// Create an assistant reasoning message with its opaque provider state.
+    pub fn assistant_reasoning_with_state(
+        content: impl Into<String>,
+        state: ReasoningState,
+    ) -> Self {
+        Self::AssistantReasoning {
+            content: content.into(),
+            provider_state: Some(state),
         }
     }
     /// Create an assistant tool-call message.
@@ -946,6 +1000,9 @@ impl ProviderRequest {
                         ("user", content.as_text().map(|text| text.chars().count()).unwrap_or(0))
                     }
                     LlmMessage::Assistant { content } => ("assistant", content.chars().count()),
+                    LlmMessage::AssistantReasoning { content, .. } => {
+                        ("reasoning", content.chars().count())
+                    }
                     LlmMessage::AssistantToolCall { .. } => ("tool_call", 0),
                     LlmMessage::ToolResult { content, .. } => ("tool_result", content.chars().count()),
                 })

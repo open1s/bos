@@ -328,6 +328,11 @@ impl OpenAiVendor {
                         tool_call_id: None,
                         tool_calls: None,
                     },
+                    // Reasoning is model output, not an ordinary assistant
+                    // message. The Chat Completions wire has no replay field for
+                    // it, so it is deliberately omitted unless a vendor adapter
+                    // handles its own protocol state.
+                    crate::llm::LlmMessage::AssistantReasoning { .. } => continue,
                     crate::llm::LlmMessage::Assistant { content } => OpenAiMessageJson {
                         role: "assistant",
                         content: Some(serde_json::Value::String(content.clone())),
@@ -1685,6 +1690,43 @@ mod tests {
             );
             assert!(body["messages"].is_array());
         }
+    }
+
+    #[test]
+    fn chat_completions_does_not_replay_reasoning_by_default() {
+        use crate::llm::{Content, LlmContext, LlmMessage, LlmRequest, LlmSession};
+        let vendor = OpenAiVendor::new(
+            "https://api.example.com".to_string(),
+            "gpt-test".to_string(),
+            "k".to_string(),
+        );
+        let request = LlmRequest {
+            model: "gpt-test".to_string(),
+            input: Content::text("next"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                messages: vec![
+                    LlmMessage::user("think"),
+                    LlmMessage::assistant_reasoning("private chain"),
+                    LlmMessage::assistant("answer"),
+                    LlmMessage::user("next"),
+                ],
+                input: Content::text("next"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let built =
+            vendor.convert_request(None, &request, &LlmSession::new(), &LlmContext::default());
+        let serialized = serde_json::to_string(&built.messages).expect("serializes");
+        assert!(
+            !serialized.contains("private chain"),
+            "reasoning must not be replayed on the chat wire: {serialized}"
+        );
+        assert_eq!(
+            built.messages.len(),
+            4,
+            "system plus the three non-reasoning rows"
+        );
     }
 
     #[test]

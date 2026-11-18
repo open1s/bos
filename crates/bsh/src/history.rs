@@ -5302,6 +5302,10 @@ mod tests {
                     ms: Some(9),
                 }),
                 cancelled: true,
+                reasoning_states: vec![react::llm::ReasoningState::new(
+                    "test",
+                    serde_json::json!({ "signature": "sig" }),
+                )],
             }),
             skills: vec![SkillInvocation {
                 name: "skill".to_string(),

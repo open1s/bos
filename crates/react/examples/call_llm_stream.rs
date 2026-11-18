@@ -165,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     u.prompt_tokens, u.completion_tokens, u.total_tokens
                 ),
                 react::llm::StreamToken::Stopped => println!("\n[Stopped]"),
+                react::llm::StreamToken::ReasoningState(_) => {}
             },
             Err(e) => println!("Error: {:?}", e),
         }

@@ -280,6 +280,12 @@ pub fn estimate_message_tokens(message: &Message) -> usize {
     match message {
         Message::System { content } | Message::Assistant { content } => estimate_tokens(content),
         Message::User { content } => estimate_tokens(&content_to_summary_string(content)),
+        Message::AssistantReasoning {
+            content,
+            provider_state,
+        } => provider_state.as_ref().map_or(0, |state| {
+            estimate_tokens(content) + estimate_tokens(&state.payload.to_string())
+        }),
         Message::AssistantToolCall { name, args, .. } => {
             estimate_tokens(name) + estimate_tokens(&args.to_string())
         }
@@ -366,6 +372,10 @@ pub fn render_for_summary(message: &Message) -> String {
             format!("[user] {}", content_to_summary_string(content))
         }
         Message::Assistant { content } => format!("[assistant] {content}"),
+        // Raw reasoning is not replayed to a provider by default, so it is not
+        // fed to the compaction summarizer either; the thinking summary is the
+        // separate, opt-in channel.
+        Message::AssistantReasoning { .. } => String::new(),
         Message::AssistantToolCall { name, args, .. } => {
             format!("[assistant tool call] {name}: {args}")
         }
@@ -710,6 +720,7 @@ fn message_text_and_trust(message: &Message) -> (String, &'static str) {
             (text, "user")
         }
         Message::Assistant { content } => (content.clone(), "assistant"),
+        Message::AssistantReasoning { .. } => (String::new(), "reasoning"),
         Message::ToolResult { content, .. } => (content.clone(), "tool"),
         Message::AssistantToolCall { .. } => (String::new(), "assistant"),
     }
@@ -1355,7 +1366,9 @@ fn explicit_constraints(source: &[Message]) -> Vec<String> {
                 Content::Parts(_) => "",
             },
             Message::Assistant { content } => content.as_str(),
-            Message::AssistantToolCall { .. } | Message::ToolResult { .. } => "",
+            Message::AssistantReasoning { .. }
+            | Message::AssistantToolCall { .. }
+            | Message::ToolResult { .. } => "",
         };
         let text = text.replace("</compacted-summary>", "");
         for line in text.lines() {
@@ -2272,6 +2285,8 @@ impl AgentSession {
                 Message::System { content } => content.clone(),
                 Message::User { content } => content_to_summary_string(content),
                 Message::Assistant { content } => content.clone(),
+                // Raw reasoning stays out of the mechanical prompt too.
+                Message::AssistantReasoning { .. } => String::new(),
                 Message::AssistantToolCall { name, args, .. } => {
                     format!("Tool call {}: {}", name, args)
                 }
@@ -2458,6 +2473,12 @@ impl ContextBudget {
                     Message::System { content } => estimate_tokens(content),
                     Message::User { content } => estimate_content_tokens(content),
                     Message::Assistant { content } => estimate_tokens(content),
+                    Message::AssistantReasoning {
+                        content,
+                        provider_state,
+                    } => provider_state.as_ref().map_or(0, |state| {
+                        estimate_tokens(content) + estimate_tokens(&state.payload.to_string())
+                    }),
                     Message::AssistantToolCall { name, args, .. } => {
                         let mut counts = CharCounts::default();
                         let _ =
@@ -2848,6 +2869,7 @@ fn message_traces(session: &AgentSession) -> String {
                 Message::System { content } => ("system", content.clone()),
                 Message::User { content } => ("user", content_text(content)),
                 Message::Assistant { content } => ("assistant", content.clone()),
+                Message::AssistantReasoning { content, .. } => ("reasoning", content.clone()),
                 Message::AssistantToolCall { name, args, .. } => {
                     ("tool_call", format!("{name} {args}"))
                 }

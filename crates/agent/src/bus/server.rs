@@ -45,6 +45,9 @@ pub(crate) async fn handle_rpc_request(
                     Some(Ok(crate::StreamToken::ReasoningContent(_t))) => {
                         //SKIP
                     }
+                    Some(Ok(crate::StreamToken::ReasoningState(_))) => {
+                        //SKIP
+                    }
                     Some(Ok(crate::StreamToken::Usage(_))) => {
                         //SKIP
                     }
@@ -254,6 +257,9 @@ pub(crate) async fn handle_incoming_query(
                     .await?;
                 }
                 Ok(crate::StreamToken::ReasoningContent(_t)) => {
+                    //SKIP
+                }
+                Ok(crate::StreamToken::ReasoningState(_)) => {
                     //SKIP
                 }
                 Ok(crate::StreamToken::Usage(_)) => {
@@ -726,6 +732,7 @@ mod tests {
                 crate::StreamToken::ToolCall { .. } => {}
                 crate::StreamToken::ToolResult { .. } => {}
                 crate::StreamToken::ReasoningContent(_) => {}
+                crate::StreamToken::ReasoningState(_) => {}
                 crate::StreamToken::Usage(_) => {}
                 crate::StreamToken::Stopped => break,
             }

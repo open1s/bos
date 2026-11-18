@@ -4048,6 +4048,17 @@ impl AppState {
                         note_first_output(message, at);
                     }
                 }
+                AgentEvent::ReasoningState(state) => {
+                    if let Some(message) = session.messages.last_mut() {
+                        let states = &mut message
+                            .meta
+                            .get_or_insert_with(MessageMeta::default)
+                            .reasoning_states;
+                        if !states.contains(&state) {
+                            states.push(state);
+                        }
+                    }
+                }
                 AgentEvent::ToolCall { name, args } => {
                     if let Some(message) = session.messages.last_mut() {
                         message.tools.push(ToolEvent {
@@ -7256,9 +7267,30 @@ mod tests {
             id = state.active_id.clone().expect("a session");
             state.begin_turn_in(&id, "hello").expect("a turn opens");
             state.apply_event(&id, crate::runner::AgentEvent::Reasoning("weigh it".into()));
+            let kept = react::llm::ReasoningState::new(
+                "anthropic",
+                serde_json::json!({ "type": "thinking", "signature": "sig-1" }),
+            );
+            state.apply_event(&id, crate::runner::AgentEvent::ReasoningState(kept.clone()));
+            // A retried state event must not duplicate the block.
+            state.apply_event(&id, crate::runner::AgentEvent::ReasoningState(kept.clone()));
             state.apply_event(&id, crate::runner::AgentEvent::Text("the answer".into()));
             state.stop(&id);
             let session = state.store.session(&id).expect("the session");
+            let reasoning = session
+                .messages
+                .iter()
+                .find(|message| !message.reasoning.is_empty())
+                .expect("the reasoning row");
+            assert_eq!(
+                reasoning
+                    .meta
+                    .as_ref()
+                    .map(|meta| meta.reasoning_states.as_slice())
+                    .unwrap_or_default(),
+                std::slice::from_ref(&kept),
+                "the provider state is kept once"
+            );
             assert!(
                 session
                     .messages
