@@ -8,7 +8,7 @@ use crate::llm::{
 use crate::resilience::{ReActResilience, ResilienceError};
 use crate::runtime::{HookDecision, ReActApp};
 use crate::telemetry::{Telemetry, TelemetryEvent, TokenBudgetReport, TokenCounter, TokenUsage};
-use crate::thinking::{push_reasoning_tail, ThinkingState, THINKING_SOURCE};
+use crate::thinking::{push_reasoning_tail, ThinkingState, REASONING_FLUSH_CHARS, THINKING_SOURCE};
 use crate::tool::registry::{FnTool, ToolVariant};
 use crate::tool::{Tool, ToolRegistry};
 use async_stream::stream;
@@ -1505,6 +1505,15 @@ impl<A: ReActApp> ReActEngine<A> {
                         }
                         Ok(StreamToken::ReasoningContent(text)) => {
                             push_reasoning_tail(&mut step_reasoning, &text);
+                            // Persist in bounded batches so a stream dropped
+                            // before the step boundary keeps what arrived.
+                            if step_reasoning.chars().count() >= REASONING_FLUSH_CHARS {
+                                self.observe_step_reasoning(
+                                    session,
+                                    &mut step_reasoning,
+                                    steps,
+                                );
+                            }
                             yield Ok(StreamToken::ReasoningContent(text));
                         }
                         Ok(StreamToken::ToolResult { name, output, ms }) => {
@@ -1543,11 +1552,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             // The reasoning that introduced this call belongs
                             // to this step; parse it before the call runs so a
                             // result can corroborate or retire the judgment.
-                            if !step_reasoning.trim().is_empty() {
-                                self.thinking.observe_reasoning(&step_reasoning, steps);
-                                self.persist_thinking(session);
-                                step_reasoning.clear();
-                            }
+                            self.observe_step_reasoning(session, &mut step_reasoning, steps);
                             saw_tool_call = true;
                             trace.note_tool_call(steps);
                             // Keep the words that introduced the call: the
@@ -1721,10 +1726,17 @@ impl<A: ReActApp> ReActEngine<A> {
                             }
                         }
                         Err(e) => {
+                            // The provider failed after some reasoning arrived:
+                            // keep the bounded summary before handing the error
+                            // to the consumer.
+                            self.observe_step_reasoning(session, &mut step_reasoning, steps);
                             yield Err(ReactError::Llm(e));
                             break;
                         }
                         Ok(StreamToken::Stopped) => {
+                            // A stopped turn is not complete. Fold what arrived
+                            // and leave the phase in progress for a resume.
+                            self.observe_step_reasoning(session, &mut step_reasoning, steps);
                             yield Ok(StreamToken::Stopped);
                             break;
                         }
@@ -1733,11 +1745,7 @@ impl<A: ReActApp> ReActEngine<A> {
 
                 // A step that reasoned but issued no call still leaves
                 // decisions worth carrying to the next request.
-                if !step_reasoning.trim().is_empty() {
-                    self.thinking.observe_reasoning(&step_reasoning, steps);
-                    self.persist_thinking(session);
-                    step_reasoning.clear();
-                }
+                self.observe_step_reasoning(session, &mut step_reasoning, steps);
 
                 self.react_app
                     .after_llm_response_step(
@@ -1910,6 +1918,25 @@ impl<A: ReActApp> ReActEngine<A> {
     /// Save the live summary so an interruption loses no valid decision.
     fn persist_thinking<S: ReactSession>(&self, session: &mut S) {
         self.thinking.persist(session);
+    }
+
+    /// Fold the reasoning received so far into the summary and persist it.
+    ///
+    /// Called at every recoverable step boundary (tool call, step end, provider
+    /// error, stop) and once the streaming buffer reaches its batch limit, so a
+    /// stream that never reaches normal completion still keeps what arrived.
+    fn observe_step_reasoning<S: ReactSession>(
+        &mut self,
+        session: &mut S,
+        reasoning: &mut String,
+        step: usize,
+    ) {
+        if reasoning.trim().is_empty() {
+            return;
+        }
+        self.thinking.observe_reasoning(reasoning, step);
+        self.persist_thinking(session);
+        reasoning.clear();
     }
 
     /// Append this step's thinking note to the request's host guidance.

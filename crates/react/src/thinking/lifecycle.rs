@@ -9,7 +9,9 @@ use super::summary::{
     PendingTool, ThinkingConfidence, ThinkingDecision, ThinkingOpenQuestion, ThinkingPhase,
     ThinkingSnapshot, ThinkingSummary,
 };
-use super::{normalize_text, similarity, ThinkingOrigin, THINKING_SOURCE};
+use super::{
+    contains_token, normalize_text, significant_tokens, similarity, ThinkingOrigin, THINKING_SOURCE,
+};
 use crate::llm::{HostGuidance, LlmMessage, ReactSession};
 
 /// The live lifecycle owner for one agent.
@@ -61,8 +63,12 @@ impl ThinkingState {
     /// interrupted turn (anything not `Complete`) resumes exactly where it
     /// stopped, because it is the same task.
     pub fn begin_run(&mut self, turn: u64, task: &str) {
+        let resuming =
+            self.snapshot.summary.turn != 0 && !self.snapshot.summary.phase.is_terminal();
         if self.snapshot.summary.turn == 0 {
             self.snapshot = ThinkingSnapshot::new(turn);
+            self.snapshot.pending.clear();
+            self.snapshot.consecutive_failures = 0;
         } else if self.snapshot.summary.phase.is_terminal() {
             let prior = &self.snapshot.summary;
             let decisions: Vec<ThinkingDecision> = prior
@@ -91,12 +97,69 @@ impl ThinkingState {
                 next_action: None,
                 last_step: 0,
             };
+            // A genuinely new task must not inherit an in-flight call from the
+            // turn that closed.
+            self.snapshot.pending.clear();
+            self.snapshot.consecutive_failures = 0;
         } else {
             self.snapshot.summary.turn = turn;
+            if resuming {
+                self.mark_interrupted_pending();
+            }
         }
-        self.snapshot.pending.clear();
-        self.snapshot.consecutive_failures = 0;
         self.injected = None;
+    }
+
+    /// Represent calls that were in flight when the run stopped.
+    ///
+    /// The process cannot know whether an interrupted call took effect, so the
+    /// call stays in the snapshot as `interrupted` and its outcome is recorded
+    /// as an open question. It is never treated as completed, and it cannot be
+    /// paired with a later result of the same tool name.
+    fn mark_interrupted_pending(&mut self) {
+        if self.snapshot.pending.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for pending in &mut self.snapshot.pending {
+            if pending.interrupted {
+                continue;
+            }
+            pending.interrupted = true;
+            let planned = pending
+                .action
+                .as_deref()
+                .map(|action| format!(" (planned: {action})"))
+                .unwrap_or_default();
+            let question = format!(
+                "The {} call at step {} was interrupted before its result; its outcome is unknown{planned}.",
+                pending.name, pending.step
+            );
+            let duplicate = self.snapshot.summary.open_questions.iter().any(|existing| {
+                !existing.resolved && similarity(&existing.question, &question) >= 0.8
+            });
+            if !duplicate {
+                self.snapshot
+                    .summary
+                    .open_questions
+                    .push(ThinkingOpenQuestion {
+                        question,
+                        step: pending.step,
+                        resolved: false,
+                    });
+            }
+            changed = true;
+        }
+        if changed {
+            if let Some(pending) = self.snapshot.pending.first() {
+                self.snapshot.summary.next_action = Some(format!(
+                    "Determine whether the interrupted {} call took effect before retrying",
+                    pending.name
+                ));
+            }
+            self.prune();
+            self.bump();
+        }
     }
 
     /// Ingest one reasoning step.
@@ -147,6 +210,7 @@ impl ThinkingState {
             name: name.to_string(),
             step,
             action: self.snapshot.summary.next_action.clone(),
+            interrupted: false,
         });
         if self.snapshot.summary.phase != ThinkingPhase::Blocked {
             self.snapshot.summary.phase = ThinkingPhase::Implementing;
@@ -158,9 +222,10 @@ impl ThinkingState {
 
     /// Record one tool result and correct the judgments it bears on.
     ///
-    /// A success corroborates a related inferred decision. A failure retires
-    /// the judgment that led to the call, adds the open question the failure
-    /// raises, and sets the next action to diagnosis instead of a retry.
+    /// A success verifies only a claim the output actually supports. A failure
+    /// retires the judgment that led to the call, withdraws a verification the
+    /// same tool had supported, adds the open question the failure raises, and
+    /// sets the next action to diagnosis instead of a retry.
     pub fn observe_tool_result(&mut self, name: &str, output: &str, success: bool, step: usize) {
         let pending = self.take_pending(name);
         let action = pending.and_then(|pending| pending.action);
@@ -169,7 +234,8 @@ impl ThinkingState {
         if failed {
             self.snapshot.consecutive_failures =
                 self.snapshot.consecutive_failures.saturating_add(1);
-            let evidence = format!("{name} failed at step {step}: {}", first_line(output));
+            let excerpt = first_line(output);
+            let output_norm = normalize_text(output);
             for decision in &mut self.snapshot.summary.decisions {
                 if !decision.is_live() {
                     continue;
@@ -177,10 +243,34 @@ impl ThinkingState {
                 let related = action
                     .as_deref()
                     .is_some_and(|action| similarity(&decision.statement, action) >= 0.3);
-                if related {
+                // A failure of the same tool is only about this claim when the
+                // failure text names the claim's subject. An unrelated `bash`
+                // failure must not erase a verification from another command.
+                let failure_about_claim = significant_tokens(&decision.statement)
+                    .iter()
+                    .any(|token| contains_token(&output_norm, token));
+                let evidenced_by_tool = decision
+                    .evidence
+                    .iter()
+                    .any(|line| line.to_lowercase().contains(&name.to_lowercase()));
+                if !related && !(evidenced_by_tool && failure_about_claim) {
+                    continue;
+                }
+                if decision.confidence == ThinkingConfidence::Verified {
+                    // The verification rested on this tool. A failure means the
+                    // support is gone; the claim returns to unverified rather
+                    // than staying a fact.
+                    decision.confidence = ThinkingConfidence::Inferred;
+                    decision.origin = ThinkingOrigin::Reasoning;
+                    decision.evidence.push(format!(
+                        "{name} at step {step} failed; verification withdrawn: {excerpt}"
+                    ));
+                } else {
                     decision.active = false;
                     decision.confidence = ThinkingConfidence::Superseded;
-                    decision.evidence.push(evidence.clone());
+                    decision
+                        .evidence
+                        .push(format!("{name} failed at step {step}: {excerpt}"));
                     decision.superseded_by = Some(format!("{name} failed at step {step}"));
                 }
             }
@@ -207,18 +297,22 @@ impl ThinkingState {
             };
         } else {
             self.snapshot.consecutive_failures = 0;
-            let evidence = format!("{name} succeeded at step {step}");
             for decision in &mut self.snapshot.summary.decisions {
-                if !decision.is_live() || decision.confidence != ThinkingConfidence::Inferred {
+                if !decision.is_live()
+                    || decision.confidence != ThinkingConfidence::Inferred
+                    || !decision.kind.is_verifiable()
+                {
                     continue;
                 }
-                let related = action
-                    .as_deref()
-                    .is_some_and(|action| similarity(&decision.statement, action) >= 0.5);
-                if related {
+                // Success alone is not evidence for the decision: the output
+                // must actually support this statement, with matching
+                // polarity and content. An intent is never promoted.
+                if let Some(excerpt) = confirming_excerpt(output, &decision.statement) {
                     decision.confidence = ThinkingConfidence::Verified;
                     decision.origin = ThinkingOrigin::ToolResult;
-                    decision.evidence.push(evidence.clone());
+                    decision
+                        .evidence
+                        .push(format!("{name} at step {step} confirmed: {excerpt}"));
                 }
             }
             self.snapshot.summary.next_action = None;
@@ -366,17 +460,139 @@ impl ThinkingState {
     }
 
     fn take_pending(&mut self, name: &str) -> Option<PendingTool> {
+        // An interrupted call has no result to pair with it. Only a live call
+        // may be resolved by a later result of the same tool name.
         let index = self
             .snapshot
             .pending
             .iter()
-            .position(|pending| pending.name == name)?;
+            .position(|pending| pending.name == name && !pending.interrupted)?;
         Some(self.snapshot.pending.remove(index))
     }
 
     fn bump(&mut self) {
         self.snapshot.summary.revision = self.snapshot.summary.revision.saturating_add(1);
     }
+}
+
+/// The first line of `output`, when it actually supports `statement`.
+///
+/// Success is not evidence. The output must match the claim's polarity (a
+/// failing test cannot confirm "the test passes"), carry a predicate of the
+/// claim when the claim is directional, and share enough significant tokens to
+/// be about the same subject. `Intent` decisions never reach this function.
+fn confirming_excerpt(output: &str, statement: &str) -> Option<String> {
+    let statement_lower = statement.to_lowercase();
+    let output_lower = output.to_lowercase();
+    let negative_claim = is_negative_claim(&statement_lower);
+    let positive_claim = is_positive_claim(&statement_lower);
+    let output_negative = output_is_negative(&output_lower);
+    let output_positive = output_is_positive(&output_lower);
+
+    let polarity_ok = if negative_claim {
+        output_negative && predicate_supported(&statement_lower, &output_lower, true)
+    } else if positive_claim {
+        output_positive && predicate_supported(&statement_lower, &output_lower, false)
+    } else {
+        output_positive && !output_negative
+    };
+    if !polarity_ok {
+        return None;
+    }
+
+    let normalized_output = normalize_text(output);
+    let overlaps = significant_tokens(statement)
+        .iter()
+        .filter(|token| contains_token(&normalized_output, token))
+        .count();
+    // A test/build marker is itself evidence about the named test; otherwise
+    // require two shared significant tokens so a generic word cannot verify a
+    // claim on its own.
+    let explicit_test_marker = output_lower.contains("test result:")
+        || output_lower.contains("tests passed")
+        || output_lower.contains("0 failed");
+    let needed = if explicit_test_marker { 1 } else { 2 };
+    if overlaps < needed {
+        return None;
+    }
+    Some(first_line(output))
+}
+
+/// Whether a directional claim's own predicate appears in the output.
+fn predicate_supported(statement: &str, output: &str, negative: bool) -> bool {
+    let markers: &[&str] = if negative {
+        &["fail", "broken", "missing", "error", "失败", "错误", "缺失"]
+    } else {
+        &[
+            "pass", "works", "fixed", "success", "correct", "通过", "成功", "修复",
+        ]
+    };
+    markers
+        .iter()
+        .any(|marker| statement.contains(marker) && output.contains(marker))
+}
+
+/// Whether the statement predicts failure or absence.
+fn is_negative_claim(statement: &str) -> bool {
+    let lower = format!(" {statement} ");
+    lower.contains(" fail")
+        || lower.contains(" broken")
+        || lower.contains(" missing")
+        || lower.contains(" error")
+        || lower.contains(" not ")
+        || lower.contains(" cannot")
+        || lower.contains(" never")
+        || statement.contains('不')
+        || statement.contains("失败")
+        || statement.contains("错误")
+        || statement.contains("缺失")
+}
+
+/// Whether the statement predicts success or correctness.
+fn is_positive_claim(statement: &str) -> bool {
+    let lower = format!(" {statement} ");
+    lower.contains(" pass")
+        || lower.contains(" works")
+        || lower.contains(" fixed")
+        || lower.contains(" success")
+        || lower.contains(" correct")
+        || statement.contains("通过")
+        || statement.contains("成功")
+        || statement.contains("修复")
+}
+
+/// Whether `output` reports a failure.
+fn output_is_negative(output: &str) -> bool {
+    if output.contains("0 failed")
+        || output.contains("test result: ok")
+        || output.contains("no errors")
+    {
+        return false;
+    }
+    output.contains("failed")
+        || output.contains("failure")
+        || output.contains("error")
+        || output.contains("not found")
+        || output.contains("missing")
+        || output.contains("panicked")
+        || output.contains("\"success\": false")
+        || output.contains("失败")
+        || output.contains("错误")
+}
+
+/// Whether `output` reports a positive observation.
+fn output_is_positive(output: &str) -> bool {
+    output.contains("test result: ok")
+        || output.contains("all tests passed")
+        || output.contains("0 failed")
+        || output.contains("passed")
+        || output.contains("confirmed")
+        || output.contains("matches")
+        || output.contains("as expected")
+        || output.contains("found")
+        || output.contains("verified")
+        || output.contains("contains")
+        || output.contains("present")
 }
 
 /// Whether a carried item still bears on the next task.
@@ -424,31 +640,7 @@ mod tests {
     use crate::thinking::summary::ThinkingConfidence;
 
     #[test]
-    fn a_successful_tool_verifies_the_related_decision() {
-        let mut state = ThinkingState::new();
-        state.begin_run(1, "");
-        assert!(state.observe_reasoning(
-            "I will run the parser test because it reproduces the failure.",
-            1
-        ));
-        state.observe_tool_call("bash", 2);
-        state.observe_tool_result("bash", "test result: ok. 4 passed; 0 failed", true, 2);
-        let decision = state
-            .summary()
-            .decisions
-            .iter()
-            .find(|decision| decision.statement.contains("parser test"))
-            .expect("the decision survives");
-        assert_eq!(decision.confidence, ThinkingConfidence::Verified);
-        assert!(decision
-            .evidence
-            .iter()
-            .any(|line| line.contains("succeeded")));
-        assert_eq!(state.summary().phase.as_str(), "verifying");
-    }
-
-    #[test]
-    fn an_unrelated_judgment_is_not_promoted_by_a_success() {
+    fn a_success_without_confirming_evidence_leaves_the_claim_inferred() {
         let mut state = ThinkingState::new();
         state.begin_run(1, "");
         state.observe_reasoning("The cause is the cache because reads are stale.", 1);
@@ -463,8 +655,156 @@ mod tests {
         assert_eq!(
             decision.confidence,
             ThinkingConfidence::Inferred,
-            "a success elsewhere does not turn an unverified claim into a fact"
+            "tool success alone does not turn a claim into a fact"
         );
+        assert!(
+            decision.evidence.is_empty(),
+            "execution success is not recorded as evidence for the claim"
+        );
+    }
+
+    #[test]
+    fn confirming_evidence_promotes_only_the_supported_claim() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The bug is in the parser file because the failure starts there. The cause is the cache because reads are stale. I will run the parser test.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result(
+            "bash",
+            "grep found the bug in parser.rs; test result: ok. 4 passed; 0 failed",
+            true,
+            2,
+        );
+
+        let bug = state
+            .summary()
+            .decisions
+            .iter()
+            .find(|decision| decision.statement.contains("bug"))
+            .expect("the supported claim");
+        assert_eq!(bug.confidence, ThinkingConfidence::Verified);
+        assert!(
+            bug.evidence.iter().any(|line| line.contains("confirmed")),
+            "verification records the supporting evidence: {:?}",
+            bug.evidence
+        );
+
+        let cache = state
+            .summary()
+            .decisions
+            .iter()
+            .find(|decision| decision.statement.contains("cache"))
+            .expect("the other claim");
+        assert_eq!(cache.confidence, ThinkingConfidence::Inferred);
+
+        let intent = state
+            .summary()
+            .decisions
+            .iter()
+            .find(|decision| decision.statement.contains("I will run"))
+            .expect("the intended action");
+        assert_eq!(
+            intent.confidence,
+            ThinkingConfidence::Inferred,
+            "an intent is not verified by its own execution"
+        );
+    }
+
+    #[test]
+    fn a_failed_result_withdraws_a_verification_that_rested_on_the_same_tool() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The bug is in the parser file because the failure starts there.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result("bash", "grep found the bug in parser.rs", true, 2);
+        assert_eq!(
+            state.summary().decisions[0].confidence,
+            ThinkingConfidence::Verified
+        );
+
+        state.observe_tool_call("bash", 3);
+        state.observe_tool_result("bash", "Error: parser.rs is missing", false, 3);
+        assert_eq!(
+            state.summary().decisions[0].confidence,
+            ThinkingConfidence::Inferred,
+            "a failed call withdraws the verification it had supported"
+        );
+        assert!(state.summary().decisions[0]
+            .evidence
+            .iter()
+            .any(|line| line.contains("withdrawn")));
+    }
+
+    #[test]
+    fn an_unrelated_failure_does_not_erase_a_verification() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The bug is in the parser file because the failure starts there.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result("bash", "grep found the bug in parser.rs", true, 2);
+        state.observe_tool_call("bash", 3);
+        state.observe_tool_result("bash", "Permission denied writing output", false, 3);
+        assert_eq!(
+            state.summary().decisions[0].confidence,
+            ThinkingConfidence::Verified,
+            "a failure about a different subject does not erase support"
+        );
+    }
+
+    #[test]
+    fn a_resumed_pending_call_is_preserved_as_unknown() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "I will run the parser test because it reproduces the failure.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        let snapshot = state.snapshot_cloned();
+
+        let mut resumed = ThinkingState::from_snapshot(Some(snapshot));
+        resumed.begin_run(2, "continue the parser work");
+        assert_eq!(resumed.snapshot.pending.len(), 1, "the call is preserved");
+        assert!(resumed.snapshot.pending[0].interrupted);
+        assert!(resumed.snapshot.pending[0].action.is_some());
+        assert!(resumed
+            .summary()
+            .open_questions
+            .iter()
+            .any(|question| question.question.contains("interrupted")
+                && question.question.contains("outcome is unknown")));
+        assert!(
+            !resumed
+                .summary()
+                .decisions
+                .iter()
+                .any(|decision| decision.confidence == ThinkingConfidence::Verified),
+            "an interrupted call must not be read as success"
+        );
+    }
+
+    #[test]
+    fn a_new_task_clears_stale_pending_calls() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_tool_call("bash", 2);
+        state.snapshot.summary.phase = crate::thinking::ThinkingPhase::Complete;
+        state.begin_run(2, "deploy the release notes");
+        assert!(state.snapshot.pending.is_empty());
+        assert!(!state
+            .summary()
+            .open_questions
+            .iter()
+            .any(|question| question.question.contains("interrupted")));
     }
 
     #[test]
@@ -536,9 +876,12 @@ mod tests {
     fn a_new_turn_keeps_verified_decisions_but_drops_inference() {
         let mut state = ThinkingState::new();
         state.begin_run(1, "");
-        state.observe_reasoning("I will run the parser test because it fails.", 1);
+        state.observe_reasoning(
+            "The bug is in the parser file because the failure starts there. I will run the parser test.",
+            1,
+        );
         state.observe_tool_call("bash", 2);
-        state.observe_tool_result("bash", "test result: ok. 4 passed; 0 failed", true, 2);
+        state.observe_tool_result("bash", "grep found the bug in parser.rs", true, 2);
         state.observe_reasoning("The cache is the cause because reads are stale.", 3);
         state.finish();
         state.begin_run(2, "");
@@ -547,7 +890,7 @@ mod tests {
             .active_decisions()
             .map(|decision| decision.statement.as_str())
             .collect();
-        assert!(live.iter().any(|line| line.contains("parser test")));
+        assert!(live.iter().any(|line| line.contains("bug")));
         assert!(!live.iter().any(|line| line.contains("cache")));
         assert_eq!(state.summary().phase.as_str(), "exploring");
 
@@ -573,6 +916,14 @@ mod tests {
             .summary()
             .active_decisions()
             .any(|decision| decision.statement.contains("parser test")));
+        assert!(
+            resumed
+                .summary()
+                .next_action
+                .as_deref()
+                .is_some_and(|action| action.contains("parser")),
+            "an interruption before the tool call keeps the planned action"
+        );
         assert!(resumed
             .prepare_injection(1, &[])
             .is_some_and(|note| note.content.contains("[source: thinking-summary")));

@@ -64,7 +64,7 @@ impl AsyncTool for FakeBash {
         } else {
             Ok(serde_json::json!({
                 "success": true,
-                "output": "test result: ok. 4 passed; 0 failed"
+                "output": "grep found the bug in parser.rs; test result: ok. 4 passed; 0 failed"
             }))
         }
     }
@@ -110,7 +110,8 @@ impl LlmClient<LlmSession, LlmContext> for ReasoningThenAnswer {
         let tokens: Vec<Result<StreamToken, LlmError>> = if first {
             vec![
                 Ok(StreamToken::ReasoningContent(
-                    "I will run the parser test because it reproduces the failure.".to_string(),
+                    "The bug is in the parser file because the failure starts there. I will run the parser test."
+                        .to_string(),
                 )),
                 Ok(StreamToken::ToolCall {
                     name: "bash".to_string(),
@@ -179,7 +180,7 @@ fn message_text(message: &LlmMessage) -> Option<&str> {
 }
 
 #[tokio::test]
-async fn a_verified_decision_is_injected_into_the_next_request_as_host_guidance() {
+async fn a_confirming_result_verifies_the_claim_and_reaches_the_next_request() {
     let (session, seen) = run(false).await;
     assert_eq!(seen.len(), 2, "one reasoning step and one answer step");
 
@@ -191,8 +192,14 @@ async fn a_verified_decision_is_injected_into_the_next_request_as_host_guidance(
         note.content
     );
     assert!(
-        note.content.contains("[verified]") && note.content.contains("parser test"),
-        "the corroborated decision survives: {}",
+        note.content.contains("[verified]") && note.content.contains("bug"),
+        "the claim the output confirms is verified: {}",
+        note.content
+    );
+    assert!(
+        note.content
+            .contains("[inferred] I will run the parser test"),
+        "the intended action is not promoted by its own success: {}",
         note.content
     );
     assert!(
@@ -214,7 +221,11 @@ async fn a_verified_decision_is_injected_into_the_next_request_as_host_guidance(
     let snapshot = session.thinking_snapshot().expect("the summary persists");
     assert_eq!(snapshot.summary.phase, ThinkingPhase::Complete);
     assert!(snapshot.summary.decisions.iter().any(|decision| {
-        decision.statement.contains("parser test") && decision.confidence.as_str() == "verified"
+        decision.statement.contains("bug") && decision.confidence.as_str() == "verified"
+    }));
+    assert!(snapshot.summary.decisions.iter().any(|decision| {
+        decision.statement.contains("I will run the parser test")
+            && decision.confidence.as_str() == "inferred"
     }));
 }
 
@@ -273,6 +284,7 @@ async fn a_restored_session_resumes_its_live_summary() {
     snapshot.summary.decisions.push(ThinkingDecision {
         statement: "I will run the parser test".to_string(),
         rationale: Some("it reproduces the failure".to_string()),
+        kind: react::thinking::ThinkingDecisionKind::Intent,
         confidence: ThinkingConfidence::Inferred,
         origin: ThinkingOrigin::Reasoning,
         evidence: Vec::new(),

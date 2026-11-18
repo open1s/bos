@@ -89,6 +89,34 @@ impl ThinkingOrigin {
     }
 }
 
+/// What kind of judgment a decision records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDecisionKind {
+    /// A factual claim about the world ("the bug is in the parser"). Only this
+    /// kind can be corroborated by tool evidence.
+    #[default]
+    Claim,
+    /// An intended action or chosen plan ("I will run the test"). A successful
+    /// call proves it ran, not that the plan was right.
+    Intent,
+}
+
+impl ThinkingDecisionKind {
+    /// The wire name of this kind.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Claim => "claim",
+            Self::Intent => "intent",
+        }
+    }
+
+    /// Whether tool evidence can make this decision verified.
+    pub fn is_verifiable(&self) -> bool {
+        *self == Self::Claim
+    }
+}
+
 /// One judgment the model made, with the reason it gave.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThinkingDecision {
@@ -96,6 +124,9 @@ pub struct ThinkingDecision {
     pub statement: String,
     /// Why the model chose it, when the reasoning gave a reason.
     pub rationale: Option<String>,
+    /// Whether this is a factual claim or an intended action.
+    #[serde(default)]
+    pub kind: ThinkingDecisionKind,
     /// How strongly the judgment is supported.
     pub confidence: ThinkingConfidence,
     /// What produced the judgment.
@@ -138,6 +169,11 @@ pub struct PendingTool {
     pub step: usize,
     /// The next action the reasoning stated before the call, when it did.
     pub action: Option<String>,
+    /// Whether the run was interrupted after the call was issued. An
+    /// interrupted call has no result to pair with it; its outcome is unknown
+    /// and it must never be read as a success.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// The compact summary injected into later provider calls.
@@ -322,14 +358,15 @@ impl ThinkingSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        ThinkingConfidence, ThinkingDecision, ThinkingOpenQuestion, ThinkingOrigin, ThinkingPhase,
-        ThinkingSnapshot, ThinkingSummary,
+        ThinkingConfidence, ThinkingDecision, ThinkingDecisionKind, ThinkingOpenQuestion,
+        ThinkingOrigin, ThinkingPhase, ThinkingSnapshot, ThinkingSummary,
     };
 
     fn decision(statement: &str, confidence: ThinkingConfidence) -> ThinkingDecision {
         ThinkingDecision {
             statement: statement.to_string(),
             rationale: Some("the failure starts there".to_string()),
+            kind: ThinkingDecisionKind::Claim,
             confidence,
             origin: ThinkingOrigin::Reasoning,
             evidence: Vec::new(),

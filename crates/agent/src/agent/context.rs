@@ -4028,6 +4028,7 @@ mod budget_tests {
         snapshot.summary.decisions.push(ThinkingDecision {
             statement: "reuse the coordinated store".to_string(),
             rationale: Some("it already serializes writers".to_string()),
+            kind: react::thinking::ThinkingDecisionKind::Claim,
             confidence: ThinkingConfidence::Verified,
             origin: ThinkingOrigin::ToolResult,
             evidence: vec!["memory tests succeeded at step 2".to_string()],

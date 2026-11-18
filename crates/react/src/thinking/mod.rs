@@ -32,8 +32,8 @@ mod summary;
 
 pub use lifecycle::ThinkingState;
 pub use summary::{
-    PendingTool, ThinkingConfidence, ThinkingDecision, ThinkingOpenQuestion, ThinkingOrigin,
-    ThinkingPhase, ThinkingSnapshot, ThinkingSummary,
+    PendingTool, ThinkingConfidence, ThinkingDecision, ThinkingDecisionKind, ThinkingOpenQuestion,
+    ThinkingOrigin, ThinkingPhase, ThinkingSnapshot, ThinkingSummary,
 };
 
 /// The stable source label for the injected note.
@@ -44,7 +44,10 @@ pub use summary::{
 pub const THINKING_SOURCE: &str = "thinking-summary";
 
 /// The snapshot schema this build writes and can read.
-pub const THINKING_SCHEMA_VERSION: u32 = 1;
+///
+/// Generation 2 added `ThinkingDecisionKind` and the interrupted-pending flag;
+/// generation-1 snapshots load with their defaults.
+pub const THINKING_SCHEMA_VERSION: u32 = 2;
 
 /// The longest single item kept in a summary (statement, rationale or action).
 pub(crate) const ITEM_CHARS: usize = 320;
@@ -58,6 +61,14 @@ pub(crate) const QUESTION_CHARS: usize = 240;
 /// only the tail bounds the parse cost and keeps the summary about the work in
 /// front of the model rather than its opening thoughts.
 pub(crate) const REASONING_TAIL_CHARS: usize = 16_000;
+
+/// Fold streamed reasoning into the summary at this many characters.
+///
+/// A dropped or cancelled stream cannot run generator cleanup, so reasoning is
+/// persisted in bounded batches as it arrives instead of only at step end. The
+/// batch is deliberately larger than a sentence and much smaller than the parse
+/// tail, so interruption loses at most this much unprocessed text.
+pub(crate) const REASONING_FLUSH_CHARS: usize = 2_048;
 
 /// Append streamed reasoning while keeping only a bounded tail.
 ///
@@ -124,15 +135,16 @@ pub(crate) fn is_cjk(ch: char) -> bool {
 
 /// Words too common to identify what a statement is about.
 pub(crate) const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "that", "this", "from", "into", "your", "when", "use", "using",
-    "are", "was", "were", "will", "would", "should", "can", "could", "have", "has", "had", "not",
-    "but", "you", "our", "its", "their", "them", "they", "than", "then", "there", "here", "also",
-    "any", "all", "some", "such", "each", "every", "work", "works", "working", "task", "tasks",
-    "thing", "things", "need", "needs", "want", "wants", "make", "makes", "making", "get", "gets",
-    "one", "two", "new", "add", "adds", "adding", "create", "creates", "creating", "file", "files",
-    "because", "since", "now", "just", "like", "about", "after", "before", "more", "most", "very",
-    "still", "only", "even", "well", "what", "which", "how", "why", "where", "who", "been",
-    "being", "does", "did",
+    "the", "and", "for", "with", "that", "this", "from", "into", "your", "when", "use", "in", "on",
+    "at", "to", "of", "is", "be", "as", "by", "it", "or", "if", "do", "so", "we", "me", "my",
+    "our", "us", "using", "are", "was", "were", "will", "would", "should", "can", "could", "have",
+    "has", "had", "not", "but", "you", "our", "its", "their", "them", "they", "than", "then",
+    "there", "here", "also", "any", "all", "some", "such", "each", "every", "work", "works",
+    "working", "task", "tasks", "thing", "things", "need", "needs", "want", "wants", "make",
+    "makes", "making", "get", "gets", "one", "two", "new", "add", "adds", "adding", "create",
+    "creates", "creating", "file", "files", "because", "since", "now", "just", "like", "about",
+    "after", "before", "more", "most", "very", "still", "only", "even", "well", "what", "which",
+    "how", "why", "where", "who", "been", "being", "does", "did",
 ];
 
 /// The significant tokens of `text`, used for similarity.
@@ -158,6 +170,20 @@ pub(crate) fn significant_tokens(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether `haystack` contains `token` as a whole token.
+///
+/// Latin tokens match a whitespace/punctuation-delimited word, so `in` does not
+/// match the inside of `writing`. CJK bigrams are matched as substrings because
+/// Chinese text has no word delimiters.
+pub(crate) fn contains_token(haystack: &str, token: &str) -> bool {
+    if token.chars().any(is_cjk) {
+        return haystack.contains(token);
+    }
+    haystack
+        .split(|ch: char| !ch.is_alphanumeric())
+        .any(|word| word == token)
 }
 
 /// Jaccard similarity of two token sets, in `0.0..=1.0`.

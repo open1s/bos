@@ -2,17 +2,22 @@
 
 ## Unreleased
 
-- **Thinking summaries feed later steps without rewriting history.** A reasoning
-  step's decisions, rationale, open questions and next action are extracted into
-  a typed, bounded summary (`react::thinking`). A tool result corroborates a
-  related judgment or retires it and replaces the next action with diagnosis;
-  superseded and completed items are never injected. The note rides
-  `HostGuidance` with an explicit `thinking-summary` source, composes into the
-  system prompt of one call, is filtered against the history, and is never
-  appended as a user or assistant message. `ThinkingSnapshot` persists beside
-  the messages in `AgentSession` (session schema 6) so an interrupted run
-  resumes its still-valid summary; a new turn carries only verified items that
-  overlap the new request. See `docs/thinking-summary.md`.
+- **Thinking summaries feed later steps without rewriting history (#438).** A
+  reasoning step's claims, intents, rationale, open questions and next action are
+  extracted into a typed, bounded summary (`react::thinking`). A tool result
+  verifies a claim only when its output actually supports that claim; execution
+  success alone never promotes a decision, and an intent is never verified by
+  its own success. A failure retires the judgment it contradicts and withdraws a
+  verification that rested on the failed tool. Superseded and completed items
+  are never injected. The note rides `HostGuidance` with an explicit
+  `thinking-summary` source, composes into the system prompt of one call, is
+  filtered against the history, and is never appended as a user or assistant
+  message. `ThinkingSnapshot` persists beside the messages in `AgentSession`
+  (session schema 6, snapshot schema 2). An interrupted run preserves in-flight
+  calls as interrupted/unknown instead of success, and a new task clears them;
+  reasoning is folded in batches and at every recoverable stream termination
+  (provider error, stop, dropped stream after a batch) without ever marking a
+  stopped turn complete. See `docs/thinking-summary.md`.
 
 ## v4.1.18 (2026-11-17)
 

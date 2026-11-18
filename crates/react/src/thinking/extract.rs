@@ -8,14 +8,14 @@
 //! produces [`super::ThinkingConfidence::Inferred`] items: corroboration is the
 //! tool-result path's job.
 
-use super::summary::{ThinkingConfidence, ThinkingDecision, ThinkingOpenQuestion, ThinkingOrigin};
+use super::summary::{
+    ThinkingConfidence, ThinkingDecision, ThinkingDecisionKind, ThinkingOpenQuestion,
+    ThinkingOrigin,
+};
 use super::{clip_chars, one_line, QUESTION_CHARS, REASONING_TAIL_CHARS};
 
-/// Markers that introduce a judgment or a chosen direction.
-const JUDGMENT_CUES: &[&str] = &[
-    "the fix is",
-    "the approach is",
-    "the plan is",
+/// Markers that introduce a factual claim a tool result could support.
+const CLAIM_CUES: &[&str] = &[
     "the cause is",
     "is the cause",
     "the root cause",
@@ -24,6 +24,23 @@ const JUDGMENT_CUES: &[&str] = &[
     "the issue is",
     "is the issue",
     "the problem is",
+    "the failure is",
+    "the error is",
+    "原因是",
+    "根因",
+    "问题在于",
+    "失败原因是",
+    "错误原因是",
+];
+
+/// Markers that introduce a chosen direction or intended action.
+///
+/// These are `Intent`: a successful call proves the action ran, not that the
+/// choice was right, so evidence must not promote them to `Verified`.
+const PLAN_CUES: &[&str] = &[
+    "the fix is",
+    "the approach is",
+    "the plan is",
     "i will use",
     "we will use",
     "i'll use",
@@ -34,9 +51,6 @@ const JUDGMENT_CUES: &[&str] = &[
     "决定",
     "方案是",
     "采用",
-    "根因",
-    "原因是",
-    "问题在于",
     "应该使用",
 ];
 
@@ -238,9 +252,19 @@ pub(crate) fn extract_decisions(text: &str, step: usize) -> Vec<ThinkingDecision
             continue;
         }
         let lower = sentence.to_lowercase();
-        if !has_cue(&lower, JUDGMENT_CUES) && !has_cue(&lower, INTENT_CUES) {
+        let claim = has_cue(&lower, CLAIM_CUES);
+        let plan = has_cue(&lower, PLAN_CUES);
+        let intent = has_cue(&lower, INTENT_CUES);
+        if !claim && !plan && !intent {
             continue;
         }
+        // A sentence that states a cause or a defect is a claim even when it
+        // also names an action; the claim is the part evidence can test.
+        let kind = if claim {
+            ThinkingDecisionKind::Claim
+        } else {
+            ThinkingDecisionKind::Intent
+        };
         let (statement, rationale) = split_rationale(&sentence);
         let statement = clip_chars(&one_line(&statement), super::ITEM_CHARS);
         if statement.chars().count() < 6 {
@@ -249,6 +273,7 @@ pub(crate) fn extract_decisions(text: &str, step: usize) -> Vec<ThinkingDecision
         out.push(ThinkingDecision {
             statement,
             rationale: rationale.map(|text| clip_chars(&one_line(&text), super::ITEM_CHARS)),
+            kind,
             confidence: ThinkingConfidence::Inferred,
             origin: ThinkingOrigin::Reasoning,
             evidence: Vec::new(),
@@ -400,7 +425,7 @@ mod tests {
         bounded_tail, extract_decisions, extract_next_action, extract_questions, is_negated,
         looks_failed, looks_verifying, split_rationale, split_sentences,
     };
-    use crate::thinking::ThinkingConfidence;
+    use crate::thinking::{ThinkingConfidence, ThinkingDecisionKind};
 
     #[test]
     fn sentences_split_on_english_and_chinese_punctuation() {
@@ -425,6 +450,11 @@ mod tests {
         );
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].confidence, ThinkingConfidence::Inferred);
+        assert_eq!(
+            decisions[0].kind,
+            ThinkingDecisionKind::Intent,
+            "a chosen fix is an intent, not a verifiable claim"
+        );
         assert_eq!(decisions[0].step, 2);
         assert!(decisions[0]
             .rationale
@@ -446,10 +476,22 @@ mod tests {
     }
 
     #[test]
+    fn a_cause_statement_is_a_verifiable_claim() {
+        let decisions = extract_decisions(
+            "The bug is in the parser because the failure starts there.",
+            1,
+        );
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].kind, ThinkingDecisionKind::Claim);
+        assert_eq!(decisions[0].confidence, ThinkingConfidence::Inferred);
+    }
+
+    #[test]
     fn chinese_reasoning_yields_decisions_questions_and_actions() {
         let decisions = extract_decisions("我决定采用现有锁，因为已经有协调机制。", 1);
         assert_eq!(decisions.len(), 1);
         assert!(decisions[0].statement.contains("采用现有锁"));
+        assert_eq!(decisions[0].kind, ThinkingDecisionKind::Intent);
         assert!(decisions[0]
             .rationale
             .as_deref()
