@@ -234,6 +234,7 @@ permission = "workspace-write" # read-only | workspace-write | danger-full-acces
 bash_enabled = true
 file_tools_enabled = true
 parallel_tool_calls = false
+thinking_context = true         # false: no summary extraction, persistence or injection
 memory_enabled = true
 max_tokens = 4096              # absent leaves it to the engine
 context_budget = 32768

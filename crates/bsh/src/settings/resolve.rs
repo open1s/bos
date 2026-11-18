@@ -478,6 +478,8 @@ pub(crate) struct Resolution {
     pub(crate) max_tokens: Option<u32>,
     /// Run one turn's tool calls concurrently.
     pub(crate) parallel_tool_calls: bool,
+    /// Extract, persist and inject the thinking summary.
+    pub(crate) thinking_context: bool,
     /// The session's permission and the preset ceiling folded into the mode in
     /// force. The one resolution every consumer reads.
     pub(crate) permission: PermissionResolution,
@@ -722,6 +724,7 @@ pub(crate) fn resolve_with_catalogue(
         temperature: workspace.agent.temperature,
         max_tokens: workspace.agent.max_tokens,
         parallel_tool_calls: workspace.agent.parallel_tool_calls,
+        thinking_context: workspace.agent.thinking_context,
         permission,
         sandbox,
         bash_enabled: workspace.agent.bash_enabled,

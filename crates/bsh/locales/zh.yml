@@ -561,6 +561,8 @@
 "settings.presetDefault": "默认（不使用预设）"
 "settings.parallelToolCalls": "并行工具调用"
 "settings.parallelToolCallsHint": "同一轮助手的多个工具调用会同时执行，而不是依次执行。关闭时保持原有顺序。"
+"settings.thinkingContext": "思考上下文"
+"settings.thinkingContextHint": "把模型判断、未解决问题和下一步行动的简明摘要注入后续请求。摘要来自推理和工具结果，不会写入对话历史。"
 "settings.modelCatalog": "Customized model catalog"
 "settings.modelCatalogHint": "Each model ID may appear once."
 "settings.addModel": "Add model"

@@ -8154,6 +8154,55 @@ fn parallel_tool_calls_switch_flips_the_setting(cx: &mut TestAppContext) {
     assert!(!off, "pressing the switch again must turn it back off");
 }
 
+/// The Thinking Context switch writes the workspace draft in both directions.
+#[gpui::test]
+fn thinking_context_switch_flips_the_setting(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("thinking-context-switch", 2);
+        state.settings.workspace.agent.thinking_context = false;
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+
+    scroll_settings_row_into_view(cx, "thinking-context");
+    let row = cx
+        .debug_bounds("thinking-context")
+        .expect("the thinking-context switch row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .thinking_context),
+        "the switch must turn the thinking context on"
+    );
+
+    scroll_settings_row_into_view(cx, "thinking-context");
+    let row = cx
+        .debug_bounds("thinking-context")
+        .expect("the thinking-context switch row again");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(|_, cx| shell
+            .read(cx)
+            .state
+            .draft()
+            .workspace
+            .agent
+            .thinking_context),
+        "pressing the switch again must turn it back off"
+    );
+}
+
 /// Capture is the write half of memory, and the pane says so.
 ///
 /// With Memory on, the switch writes the workspace opt-in. With Memory off the

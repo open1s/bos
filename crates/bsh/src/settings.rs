@@ -158,6 +158,8 @@ impl TranscriptPolicy {
 pub(crate) struct Effective {
     /// Run one turn tool calls concurrently when the model asks for several.
     pub(crate) parallel_tool_calls: bool,
+    /// Extract, persist and inject the thinking summary.
+    pub(crate) thinking_context: bool,
     /// API protocol, or empty to follow the model.
     pub(crate) api_mode: String,
     /// Workspace root.
@@ -996,6 +998,7 @@ impl Settings {
             model_ref: resolution.model.reference().cloned(),
             model_name,
             parallel_tool_calls: resolution.parallel_tool_calls,
+            thinking_context: resolution.thinking_context,
             api_mode: connection
                 .and_then(|c| c.api_mode.clone())
                 .unwrap_or_default(),

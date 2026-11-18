@@ -27,8 +27,9 @@
   complete. The feature is on by default and can be disabled for an Agent
   (`AgentConfig::thinking_context(false)` or `thinking_context = false` in
   TOML), Python (`with_thinking_context(False)`), JavaScript
-  (`thinkingContext(false)`), or a direct engine
-  (`ReActEngineBuilder::thinking_context(false)`); disabled means no extraction,
+  (`thinkingContext(false)`), BSH's **Settings → Agent loop → Thinking context**
+  row, or a direct engine (`ReActEngineBuilder::thinking_context(false)`);
+  disabled means no extraction,
   no snapshot write and no `thinking-summary` guidance, while a previously
   stored snapshot is left intact. See
   `docs/thinking-summary.md`.

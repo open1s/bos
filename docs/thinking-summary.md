@@ -137,7 +137,9 @@ let engine = ReActEngineBuilder::<MyApp>::new()
 In TOML the same switch is `thinking_context = false`; an absent key keeps the
 default (on), so existing files are unchanged. The bindings expose it as
 `AgentBuilder.with_thinking_context(False)` in Python and
-`AgentBuilder.thinkingContext(false)` in JavaScript. Disabling it makes the loop
+`AgentBuilder.thinkingContext(false)` in JavaScript. BSH exposes the same
+switch in **Settings → Agent loop → Thinking context**; the workspace value is
+`[agent] thinking_context`. Disabling it makes the loop
 skip extraction, snapshot persistence and `thinking-summary` host guidance; a
 snapshot already stored in the session is left untouched and can be restored if
 the switch is re-enabled.

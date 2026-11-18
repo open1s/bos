@@ -5159,6 +5159,11 @@ impl AppState {
         self.draft_mut().workspace.agent.parallel_tool_calls = parallel;
     }
 
+    /// Turn the thinking-summary context on or off for the next build.
+    pub(crate) fn set_thinking_context(&mut self, enabled: bool) {
+        self.draft_mut().workspace.agent.thinking_context = enabled;
+    }
+
     /// Make one preset the default a session takes when it names none.
     /// Trust (or untrust) one preset's policy contribution.
     ///
