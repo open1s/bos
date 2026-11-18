@@ -885,12 +885,11 @@ fn build_agent_for_session_inner(
         persona_complete,
         temperature: eff.temperature,
         // The composer's "Off" level is stored as the literal `off` so it can
-        // beat the model's declared effort; on the wire it means NO effort field
-        // rather than a string a provider would reject.
-        reasoning_effort: eff
-            .reasoning_effort
-            .clone()
-            .filter(|level| !level.eq_ignore_ascii_case("off")),
+        // beat the model's declared effort. The adapters translate it to the
+        // provider's own disable switch (DeepSeek `thinking.type=disabled`,
+        // Anthropic `thinking.type=disabled`, OpenRouter `reasoning.enabled=false`,
+        // Responses `effort=none`) instead of silently omitting it.
+        reasoning_effort: eff.reasoning_effort.clone(),
         max_tokens: eff.max_tokens,
         // The summarizer's request is bounded against the same window the
         // session is configured to send into, less the checkpoint's own output

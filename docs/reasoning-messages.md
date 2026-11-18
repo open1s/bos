@@ -53,6 +53,12 @@ Anthropic extended thinking is requested from the reader's effort level:
 raised above it. The Responses request asks for `reasoning.summary = "auto"`
 and `include: ["reasoning.encrypted_content"]` so the item is replayable.
 
+`Off` is explicit rather than an omitted field: DeepSeek and Anthropic get
+`thinking: {"type": "disabled"}`, OpenRouter gets
+`reasoning: {"enabled": false}`, and a Responses endpoint that accepts an off
+value gets `effort: "none"` (OpenAI's own Responses API omits the block, which
+has no portable off value).
+
 A provider switch cannot replay one vendor's state into another: the engine
 clears prior turns before every request, so only the current turn's blocks are
 ever serialized, and it was produced by the provider this turn is talking to.

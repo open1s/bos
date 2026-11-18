@@ -163,6 +163,12 @@ struct OpenAiRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<crate::llm::ReasoningEffort>,
+    /// DeepSeek: `thinking: {"type": "disabled"}` for the reader's Off level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
+    /// OpenRouter: `reasoning: {"enabled": false}` for the reader's Off level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     /// Ask a streaming provider to end the stream with a usage-only chunk.
@@ -658,6 +664,17 @@ impl OpenAiVendor {
             .max_tokens
             .unwrap_or(crate::llm::vendor::DEFAULT_COMPLETION_CAP);
         let parallel_tool_calls = tools.as_ref().map(|_| self.parallel_tool_calls);
+        // "Off" reaches the engine as `ReasoningEffort::None`. Each vendor
+        // disables it with its own field; an adapter with no off switch omits
+        // the effort instead of sending a value the endpoint would reject.
+        let explicit_off = req.reasoning_effort == Some(crate::llm::ReasoningEffort::None);
+        let reasoning_effort = req
+            .reasoning_effort
+            .filter(|effort| *effort != crate::llm::ReasoningEffort::None);
+        let thinking = (explicit_off && self.reasoning_replay == ReasoningReplay::Content)
+            .then(|| serde_json::json!({ "type": "disabled" }));
+        let reasoning = (explicit_off && self.reasoning_replay == ReasoningReplay::Details)
+            .then(|| serde_json::json!({ "enabled": false }));
 
         OpenAiRequest {
             model: req.model.clone(),
@@ -667,7 +684,9 @@ impl OpenAiVendor {
             top_p: req.top_p,
             top_k: req.top_k,
             max_tokens: Some(max_tokens),
-            reasoning_effort: req.reasoning_effort,
+            reasoning_effort,
+            thinking,
+            reasoning,
             stream: Some(false),
             stream_options: None,
             parallel_tool_calls,
@@ -1444,6 +1463,8 @@ mod tests {
             top_k: None,
             max_tokens: None,
             reasoning_effort: None,
+            thinking: None,
+            reasoning: None,
             stream: Some(true),
             stream_options: Some(super::OpenAiStreamOptions {
                 include_usage: true,
@@ -1465,6 +1486,8 @@ mod tests {
             top_k: None,
             max_tokens: None,
             reasoning_effort: None,
+            thinking: None,
+            reasoning: None,
             stream: Some(false),
             stream_options: None,
             parallel_tool_calls: None,
@@ -2057,6 +2080,54 @@ mod tests {
         assert_eq!(
             assistant.reasoning_details.as_ref(),
             Some(&serde_json::json!([{ "type": "reasoning.text", "text": "chain" }]))
+        );
+    }
+
+    #[test]
+    fn deepseek_off_disables_thinking_on_the_chat_wire() {
+        use crate::llm::{Content, LlmContext, LlmRequest, LlmSession, ReasoningEffort};
+        let vendor = OpenAiVendor::new(
+            "https://api.deepseek.com".to_string(),
+            "deepseek-chat".to_string(),
+            "k".to_string(),
+        )
+        .with_reasoning_replay(super::ReasoningReplay::Content);
+        let request = LlmRequest {
+            model: "deepseek-chat".to_string(),
+            input: Content::text("next"),
+            reasoning_effort: Some(ReasoningEffort::None),
+            ..Default::default()
+        };
+        let built =
+            vendor.convert_request(None, &request, &LlmSession::new(), &LlmContext::default());
+        assert_eq!(built.reasoning_effort, None);
+        assert_eq!(
+            built.thinking,
+            Some(serde_json::json!({ "type": "disabled" }))
+        );
+    }
+
+    #[test]
+    fn openrouter_off_disables_reasoning_on_the_chat_wire() {
+        use crate::llm::{Content, LlmContext, LlmRequest, LlmSession, ReasoningEffort};
+        let vendor = OpenAiVendor::new(
+            "https://openrouter.ai/api/v1".to_string(),
+            "anthropic/claude".to_string(),
+            "k".to_string(),
+        )
+        .with_reasoning_replay(super::ReasoningReplay::Details);
+        let request = LlmRequest {
+            model: "anthropic/claude".to_string(),
+            input: Content::text("next"),
+            reasoning_effort: Some(ReasoningEffort::None),
+            ..Default::default()
+        };
+        let built =
+            vendor.convert_request(None, &request, &LlmSession::new(), &LlmContext::default());
+        assert_eq!(built.reasoning_effort, None);
+        assert_eq!(
+            built.reasoning,
+            Some(serde_json::json!({ "enabled": false }))
         );
     }
 

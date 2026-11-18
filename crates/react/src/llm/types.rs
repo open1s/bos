@@ -1463,6 +1463,9 @@ impl ApiMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    /// Explicitly disable reasoning. The provider adapter maps it to its own
+    /// off switch; an adapter without one omits the field instead of guessing.
+    None,
     /// Low reasoning effort.
     Low,
     /// Medium reasoning effort.
@@ -1475,6 +1478,7 @@ impl ReasoningEffort {
     /// The wire name of this effort.
     pub fn as_str(&self) -> &'static str {
         match self {
+            ReasoningEffort::None => "none",
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
@@ -1484,6 +1488,7 @@ impl ReasoningEffort {
     /// Parse `s`, defaulting to medium.
     pub fn from_name(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
+            "off" | "none" => ReasoningEffort::None,
             "low" => ReasoningEffort::Low,
             "high" => ReasoningEffort::High,
             _ => ReasoningEffort::Medium,
@@ -2007,6 +2012,23 @@ mod tests {
         assert!(empty.context_blocks.is_empty());
         assert_eq!(empty.wire_messages().len(), 1);
         assert_eq!(empty.wire_system_prompt().as_deref(), Some("POLICY"));
+    }
+
+    #[test]
+    fn off_and_none_map_to_the_explicit_off_level() {
+        assert_eq!(
+            super::ReasoningEffort::from_name("off"),
+            super::ReasoningEffort::None
+        );
+        assert_eq!(
+            super::ReasoningEffort::from_name("none"),
+            super::ReasoningEffort::None
+        );
+        assert_eq!(super::ReasoningEffort::None.as_str(), "none");
+        assert_eq!(
+            super::ReasoningEffort::from_name("high"),
+            super::ReasoningEffort::High
+        );
     }
 
     /// A tool-loop request ends on a tool result, not a user message; the

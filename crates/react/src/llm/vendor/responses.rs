@@ -694,12 +694,20 @@ pub fn build_request(
         temperature: req.temperature,
         top_p: req.top_p,
         max_output_tokens: req.max_tokens,
-        reasoning: req.reasoning_effort.map(|effort| ResponsesReasoning {
-            effort: Some(effort),
-            // Only providers that implement OpenAI's summary/encrypted-item
-            // extensions receive these fields; a strict compatible endpoint
-            // that does not is left with the effort alone.
-            summary: allow_reasoning_state.then(|| "auto".to_string()),
+        reasoning: req.reasoning_effort.and_then(|effort| {
+            // OpenAI's Responses effort has no portable "off" value; omit the
+            // block there. DeepSeek accepts `none` and uses it to disable
+            // thinking, so a strict endpoint still receives the explicit off.
+            if effort == crate::llm::ReasoningEffort::None && allow_reasoning_state {
+                return None;
+            }
+            Some(ResponsesReasoning {
+                effort: Some(effort),
+                // Only providers that implement OpenAI's summary/encrypted-item
+                // extensions receive these fields; a strict compatible endpoint
+                // that does not is left with the effort alone.
+                summary: allow_reasoning_state.then(|| "auto".to_string()),
+            })
         }),
         include: allow_reasoning_state.then(|| vec!["reasoning.encrypted_content".to_string()]),
         stream: Some(stream),

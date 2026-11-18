@@ -94,12 +94,13 @@ pub struct AnthropicRequest {
 /// Anthropic's extended-thinking switch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicThinking {
-    /// `enabled`.
+    /// `enabled` or `disabled`.
     #[serde(rename = "type")]
     pub kind: String,
     /// Token budget reserved for thinking; the Messages API requires at least
-    /// 1024 and a `max_tokens` above it.
-    pub budget_tokens: u32,
+    /// 1024 and a `max_tokens` above it. Absent when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
 }
 
 /// Splits an Anthropic SSE byte stream into complete data frames.
@@ -438,23 +439,35 @@ impl AnthropicVendor {
         // Extended thinking is opt-in on this wire. The reader's effort level
         // selects a budget; the completion cap must stay above it, so a small
         // configured cap is raised rather than sending a body Anthropic rejects.
-        let thinking = request.reasoning_effort.map(|effort| {
-            let budget_tokens = match effort {
-                ReasoningEffort::Low => 1024,
-                ReasoningEffort::Medium => 2048,
-                ReasoningEffort::High => 4096,
-            };
-            AnthropicThinking {
-                kind: "enabled".to_string(),
-                budget_tokens,
+        let thinking = request.reasoning_effort.map(|effort| match effort {
+            ReasoningEffort::None => AnthropicThinking {
+                kind: "disabled".to_string(),
+                budget_tokens: None,
+            },
+            ReasoningEffort::Low | ReasoningEffort::Medium | ReasoningEffort::High => {
+                let budget_tokens = match effort {
+                    ReasoningEffort::Low => 1024,
+                    ReasoningEffort::Medium => 2048,
+                    ReasoningEffort::High => 4096,
+                    ReasoningEffort::None => unreachable!("handled above"),
+                };
+                AnthropicThinking {
+                    kind: "enabled".to_string(),
+                    budget_tokens: Some(budget_tokens),
+                }
             }
         });
         let mut max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        if let Some(thinking) = &thinking {
-            max_tokens = max_tokens.max(thinking.budget_tokens.saturating_add(1024));
+        if let Some(budget_tokens) = thinking
+            .as_ref()
+            .and_then(|thinking| thinking.budget_tokens)
+        {
+            max_tokens = max_tokens.max(budget_tokens.saturating_add(1024));
         }
 
-        let thinking_on = thinking.is_some();
+        let thinking_on = thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.kind == "enabled");
         AnthropicRequest {
             model,
             max_tokens,
@@ -1001,13 +1014,30 @@ mod tests {
         with_effort.top_p = Some(0.5);
         let body = vendor.build_request(&None, &with_effort, &(), &());
         let thinking = body.thinking.expect("thinking is enabled");
-        assert_eq!(thinking.budget_tokens, 4096);
+        assert_eq!(thinking.budget_tokens, Some(4096));
         assert!(
-            body.max_tokens > thinking.budget_tokens,
+            body.max_tokens > thinking.budget_tokens.unwrap(),
             "the completion cap stays above the thinking budget"
         );
         assert_eq!(body.temperature, None, "thinking requires the default");
         assert_eq!(body.top_p, None, "thinking requires the default");
+    }
+
+    #[test]
+    fn off_disables_thinking_on_the_messages_wire() {
+        let vendor = vendor();
+        let mut with_off = request(Some(2048));
+        with_off.reasoning_effort = Some(crate::llm::ReasoningEffort::None);
+        with_off.temperature = Some(0.2);
+        let body = vendor.build_request(&None, &with_off, &(), &());
+        let thinking = body.thinking.expect("thinking is explicitly disabled");
+        assert_eq!(thinking.kind, "disabled");
+        assert_eq!(thinking.budget_tokens, None);
+        assert_eq!(
+            body.temperature,
+            Some(0.2),
+            "disabled thinking keeps ordinary sampling"
+        );
     }
 
     /// Untrusted context keeps its explicit envelope inside Anthropic's one

@@ -15,6 +15,13 @@
   thinking from the reader's effort level, and Responses asks for the summary
   and encrypted reasoning item where the endpoint implements those extensions.
 
+- **"Off" is an explicit provider switch.** DeepSeek and Anthropic receive
+  `thinking: {"type": "disabled"}`, OpenRouter receives
+  `reasoning: {"enabled": false}`, and a Responses endpoint that accepts an off
+  value receives `effort: "none"`; OpenAI's own Responses API omits the block
+  because it has no portable off value. Previously the composer's Off level was
+  filtered to "no effort field", which left DeepSeek thinking on.
+
 ## v4.1.19 (2026-11-18)
 
 - **An ask_user answer steers the running turn instead of queueing.** Clicking
@@ -97,8 +104,8 @@
   row, or a direct engine (`ReActEngineBuilder::thinking_context(false)`);
   disabled means no extraction,
   no snapshot write and no `thinking-summary` guidance, while a previously
-  stored snapshot is left intact. See
-  `docs/thinking-summary.md`.
+  stored snapshot is left intact. (The feature was removed in Unreleased; see
+  the entry above.)
 
 ## v4.1.18 (2026-11-17)
 

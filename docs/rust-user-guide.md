@@ -229,9 +229,9 @@ let mut stream = Arc::new(stream);
 
 while let Some(token) = stream.next().await {
     match token {
-        StreamToken::Text { text } => print!("{}", text),
-        StreamToken::Reasoning { text } => eprint!("[thinking] {}", text),
-        StreamToken::ToolCall { name, args } => println!("Tool: {} - {:?}", name, args),
+        StreamToken::Text(text) => print!("{text}"),
+        StreamToken::ReasoningContent(text) => eprint!("[thinking] {text}"),
+        StreamToken::ToolCall { name, args, .. } => println!("Tool: {name} - {args:?}"),
         StreamToken::Done => println!("\n[Stream complete]"),
         _ => {}
     }

@@ -18769,9 +18769,9 @@ fn the_effort_level_reaches_the_request() {
 
     state.set_reasoning_effort(Some("off"));
     assert_eq!(
-        effort(&state),
-        None,
-        "Off sends no effort field at all, rather than a string a provider would reject"
+        effort(&state).as_deref(),
+        Some("off"),
+        "Off reaches the adapter, which maps it to the provider's own disable switch"
     );
 
     state.set_reasoning_effort(None);
