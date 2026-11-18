@@ -13,11 +13,15 @@
   `thinking-summary` source, composes into the system prompt of one call, is
   filtered against the history, and is never appended as a user or assistant
   message. `ThinkingSnapshot` persists beside the messages in `AgentSession`
-  (session schema 6, snapshot schema 2). An interrupted run preserves in-flight
-  calls as interrupted/unknown instead of success, and a new task clears them;
-  reasoning is folded in batches and at every recoverable stream termination
-  (provider error, stop, dropped stream after a batch) without ever marking a
-  stopped turn complete. See `docs/thinking-summary.md`.
+  (session schema 6, snapshot schema 3). Effective polarity resolves negation
+  around a claim's predicate, so "does not fail" is positive and "does not
+  pass" is negative. Resume-versus-new-task is decided from a bounded request
+  signature, not the phase alone: a different request after an interruption
+  clears stale pending state, while a continuation or the same task preserves
+  the in-flight call as interrupted/unknown instead of success. Reasoning is
+  folded in batches and at every recoverable stream termination (provider error,
+  stop, dropped stream after a batch) without ever marking a stopped turn
+  complete. See `docs/thinking-summary.md`.
 
 ## v4.1.18 (2026-11-17)
 

@@ -10,7 +10,8 @@ use super::summary::{
     ThinkingSnapshot, ThinkingSummary,
 };
 use super::{
-    contains_token, normalize_text, significant_tokens, similarity, ThinkingOrigin, THINKING_SOURCE,
+    contains_token, is_cjk, normalize_text, significant_tokens, similarity, ThinkingOrigin,
+    THINKING_SOURCE,
 };
 use crate::llm::{HostGuidance, LlmMessage, ReactSession};
 
@@ -57,57 +58,90 @@ impl ThinkingState {
 
     /// Start one engine run.
     ///
-    /// A completed previous turn keeps only the corroborated decisions and
-    /// unresolved questions that still overlap `task`; inferred judgments from
-    /// that turn were never verified and are not injected into a new task. An
-    /// interrupted turn (anything not `Complete`) resumes exactly where it
-    /// stopped, because it is the same task.
+    /// A completed previous turn is always a new task: it keeps only the
+    /// corroborated decisions and unresolved questions that still overlap
+    /// `task`. An unfinished turn is a resume only when the new request still
+    /// names the same task (or is a continuation command, or relates to a
+    /// pending call); otherwise the host moved on, so the stale pending state
+    /// is cleared as well. The turn phase alone cannot make that decision.
     pub fn begin_run(&mut self, turn: u64, task: &str) {
-        let resuming =
-            self.snapshot.summary.turn != 0 && !self.snapshot.summary.phase.is_terminal();
         if self.snapshot.summary.turn == 0 {
             self.snapshot = ThinkingSnapshot::new(turn);
-            self.snapshot.pending.clear();
-            self.snapshot.consecutive_failures = 0;
-        } else if self.snapshot.summary.phase.is_terminal() {
-            let prior = &self.snapshot.summary;
-            let decisions: Vec<ThinkingDecision> = prior
-                .decisions
-                .iter()
-                .filter(|decision| {
-                    decision.is_live()
-                        && decision.confidence == ThinkingConfidence::Verified
-                        && task_is_related(task, &decision.statement)
-                })
-                .cloned()
-                .collect();
-            let questions: Vec<ThinkingOpenQuestion> = prior
-                .open_questions
-                .iter()
-                .filter(|question| !question.resolved && task_is_related(task, &question.question))
-                .cloned()
-                .collect();
-            let revision = prior.revision.saturating_add(1);
-            self.snapshot.summary = ThinkingSummary {
-                turn,
-                revision,
-                phase: ThinkingPhase::Exploring,
-                decisions,
-                open_questions: questions,
-                next_action: None,
-                last_step: 0,
-            };
-            // A genuinely new task must not inherit an in-flight call from the
-            // turn that closed.
-            self.snapshot.pending.clear();
-            self.snapshot.consecutive_failures = 0;
+            self.snapshot.task_signature = task_signature(task);
+        } else if self.snapshot.summary.phase.is_terminal() || !self.is_same_task(task) {
+            self.begin_new_task(turn, task);
         } else {
             self.snapshot.summary.turn = turn;
-            if resuming {
-                self.mark_interrupted_pending();
+            if self.snapshot.task_signature.is_none() {
+                self.snapshot.task_signature = task_signature(task);
             }
+            self.mark_interrupted_pending();
         }
         self.injected = None;
+    }
+
+    /// Start a genuinely new task, keeping only the prior state that still
+    /// bears on it.
+    fn begin_new_task(&mut self, turn: u64, task: &str) {
+        let prior = &self.snapshot.summary;
+        let decisions: Vec<ThinkingDecision> = prior
+            .decisions
+            .iter()
+            .filter(|decision| {
+                decision.is_live()
+                    && decision.confidence == ThinkingConfidence::Verified
+                    && task_is_related(task, &decision.statement)
+            })
+            .cloned()
+            .collect();
+        let questions: Vec<ThinkingOpenQuestion> = prior
+            .open_questions
+            .iter()
+            .filter(|question| !question.resolved && task_is_related(task, &question.question))
+            .cloned()
+            .collect();
+        let revision = prior.revision.saturating_add(1);
+        self.snapshot.summary = ThinkingSummary {
+            turn,
+            revision,
+            phase: ThinkingPhase::Exploring,
+            decisions,
+            open_questions: questions,
+            next_action: None,
+            last_step: 0,
+        };
+        self.snapshot.pending.clear();
+        self.snapshot.consecutive_failures = 0;
+        self.snapshot.task_signature = task_signature(task);
+    }
+
+    /// Whether the new request belongs to the unfinished task.
+    ///
+    /// An empty request or a generic continuation cannot prove the opposite, so
+    /// it resumes. A different `task` with no word in common with the stored
+    /// signature and no relation to a pending call is a new task.
+    fn is_same_task(&self, task: &str) -> bool {
+        let task = task.trim();
+        if task.is_empty() || is_continuation_command(task) {
+            return true;
+        }
+        match &self.snapshot.task_signature {
+            Some(signature) if !signature.is_empty() => {
+                if tasks_overlap(signature, task) {
+                    return true;
+                }
+            }
+            // An older snapshot has no signature; it cannot distinguish, so
+            // the historical resume behaviour is preserved.
+            _ => return true,
+        }
+        self.snapshot.pending.iter().any(|pending| {
+            pending
+                .action
+                .as_deref()
+                .is_some_and(|action| tasks_overlap(action, task))
+                || tasks_overlap(&pending.name, task)
+        })
     }
 
     /// Represent calls that were in flight when the run stopped.
@@ -475,28 +509,53 @@ impl ThinkingState {
     }
 }
 
+/// The orientation of a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Polarity {
+    /// Asserts that something holds.
+    Positive,
+    /// Asserts that something fails, is absent, or does not hold.
+    Negative,
+    /// Makes no directional assertion.
+    Neutral,
+}
+
+/// A claim's effective polarity and the predicate root that carries it.
+#[derive(Debug, Clone, Copy)]
+struct ClaimPolarity {
+    polarity: Polarity,
+    predicate: Option<&'static str>,
+}
+
+/// Predicates that assert failure or absence.
+const NEGATIVE_PREDICATES: &[&str] = &[
+    "fail", "error", "broken", "missing", "crash", "panic", "失败", "错误", "缺失", "崩溃",
+];
+
+/// Predicates that assert success or a fix.
+const POSITIVE_PREDICATES: &[&str] = &[
+    "pass", "work", "fix", "success", "correct", "resolve", "通过", "成功", "修复", "正确",
+];
+
 /// The first line of `output`, when it actually supports `statement`.
 ///
-/// Success is not evidence. The output must match the claim's polarity (a
-/// failing test cannot confirm "the test passes"), carry a predicate of the
-/// claim when the claim is directional, and share enough significant tokens to
-/// be about the same subject. `Intent` decisions never reach this function.
+/// Success is not evidence. The output must match the claim's effective
+/// polarity (a passing result cannot confirm "the test does not pass"), carry
+/// the claim's predicate or a direct antonym, and share enough significant
+/// tokens to be about the same subject. `Intent` decisions never reach this
+/// function.
 fn confirming_excerpt(output: &str, statement: &str) -> Option<String> {
     let statement_lower = statement.to_lowercase();
     let output_lower = output.to_lowercase();
-    let negative_claim = is_negative_claim(&statement_lower);
-    let positive_claim = is_positive_claim(&statement_lower);
-    let output_negative = output_is_negative(&output_lower);
-    let output_positive = output_is_positive(&output_lower);
+    let claim = claim_polarity(&statement_lower);
+    let output_polarity = output_polarity(&output_lower);
 
-    let polarity_ok = if negative_claim {
-        output_negative && predicate_supported(&statement_lower, &output_lower, true)
-    } else if positive_claim {
-        output_positive && predicate_supported(&statement_lower, &output_lower, false)
-    } else {
-        output_positive && !output_negative
+    let polarity_ok = match claim.polarity {
+        Polarity::Positive => output_polarity == Polarity::Positive,
+        Polarity::Negative => output_polarity == Polarity::Negative,
+        Polarity::Neutral => output_polarity == Polarity::Positive,
     };
-    if !polarity_ok {
+    if !polarity_ok || !predicate_supported(&claim, &statement_lower, &output_lower) {
         return None;
     }
 
@@ -518,63 +577,201 @@ fn confirming_excerpt(output: &str, statement: &str) -> Option<String> {
     Some(first_line(output))
 }
 
-/// Whether a directional claim's own predicate appears in the output.
-fn predicate_supported(statement: &str, output: &str, negative: bool) -> bool {
-    let markers: &[&str] = if negative {
-        &["fail", "broken", "missing", "error", "失败", "错误", "缺失"]
-    } else {
-        &[
-            "pass", "works", "fixed", "success", "correct", "通过", "成功", "修复",
-        ]
-    };
-    markers
+/// Find a predicate root at a word boundary, accepting common inflections.
+///
+/// A bare substring search would see `work` inside `network` and `error`
+/// inside `terror`; those are not predicates of the sentence.
+fn find_predicate(text: &str, root: &str) -> Option<usize> {
+    if root.chars().any(is_cjk) {
+        return text.rfind(root);
+    }
+    text.match_indices(root)
+        .filter_map(|(index, _)| predicate_bounds(text, index, root).then_some(index))
+        .last()
+}
+
+/// Whether `root` at `index` is a whole predicate word.
+fn predicate_bounds(text: &str, index: usize, root: &str) -> bool {
+    let before_ok = text[..index]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !ch.is_alphanumeric());
+    let rest = &text[index + root.len()..];
+    let after_ok = rest.is_empty()
+        || rest.chars().next().is_none_or(|ch| !ch.is_alphanumeric())
+        || ["s", "es", "ed", "ing", "ure", "ures", "ful", "fully"]
+            .iter()
+            .any(|suffix| {
+                rest.strip_prefix(suffix)
+                    .is_some_and(|tail| tail.chars().next().is_none_or(|ch| !ch.is_alphanumeric()))
+            });
+    before_ok && after_ok
+}
+
+/// Whether a predicate root appears at a word boundary.
+fn contains_predicate(text: &str, root: &str) -> bool {
+    find_predicate(text, root).is_some()
+}
+
+/// Resolve a claim's effective polarity.
+///
+/// The predicate decides, and a negation immediately before it inverts the
+/// result: "does not fail" is a positive claim, "does not pass" is a negative
+/// one. A sentence with no predicate but a negation ("is not the cause") is an
+/// absence claim, not a positive one. Positive predicates win over a failure
+/// noun in the object ("the failure is fixed").
+fn claim_polarity(statement: &str) -> ClaimPolarity {
+    let lower = statement.replace("not only", "only");
+    let mut negated: Option<(&'static str, usize)> = None;
+    let mut positive: Option<(&'static str, usize)> = None;
+    let mut negative: Option<(&'static str, usize)> = None;
+    for (root, is_negative) in NEGATIVE_PREDICATES
         .iter()
-        .any(|marker| statement.contains(marker) && output.contains(marker))
+        .map(|root| (*root, true))
+        .chain(POSITIVE_PREDICATES.iter().map(|root| (*root, false)))
+    {
+        let Some(index) = find_predicate(&lower, root) else {
+            continue;
+        };
+        if negated_before(&lower, index) {
+            if negated.is_none_or(|(_, at)| index > at) {
+                negated = Some((root, index));
+            }
+        } else if is_negative {
+            if negative.is_none_or(|(_, at)| index > at) {
+                negative = Some((root, index));
+            }
+        } else if positive.is_none_or(|(_, at)| index > at) {
+            positive = Some((root, index));
+        }
+    }
+    if let Some((root, _)) = negated {
+        let base_negative = NEGATIVE_PREDICATES.contains(&root);
+        return ClaimPolarity {
+            polarity: if base_negative {
+                Polarity::Positive
+            } else {
+                Polarity::Negative
+            },
+            predicate: Some(root),
+        };
+    }
+    if let Some((root, _)) = positive {
+        return ClaimPolarity {
+            polarity: Polarity::Positive,
+            predicate: Some(root),
+        };
+    }
+    if let Some((root, _)) = negative {
+        return ClaimPolarity {
+            polarity: Polarity::Negative,
+            predicate: Some(root),
+        };
+    }
+    ClaimPolarity {
+        polarity: if has_negation(&lower) {
+            Polarity::Negative
+        } else {
+            Polarity::Neutral
+        },
+        predicate: None,
+    }
 }
 
-/// Whether the statement predicts failure or absence.
-fn is_negative_claim(statement: &str) -> bool {
-    let lower = format!(" {statement} ");
-    lower.contains(" fail")
-        || lower.contains(" broken")
-        || lower.contains(" missing")
-        || lower.contains(" error")
-        || lower.contains(" not ")
-        || lower.contains(" cannot")
-        || lower.contains(" never")
-        || statement.contains('不')
-        || statement.contains("失败")
-        || statement.contains("错误")
-        || statement.contains("缺失")
+/// Whether a negation appears in the short window before `index`.
+fn negated_before(text: &str, index: usize) -> bool {
+    let prefix = &text[..index];
+    let tail: String = prefix
+        .chars()
+        .rev()
+        .take(24)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if tail.contains("n't")
+        || tail.contains("fails to ")
+        || tail.contains("failed to ")
+        || tail.contains("unable to ")
+        || ["not", "never", "no", "cannot", "without"]
+            .iter()
+            .any(|marker| contains_token(&tail, marker))
+    {
+        return true;
+    }
+    ["不", "没有", "未", "并非", "无"]
+        .iter()
+        .any(|marker| tail.contains(marker))
 }
 
-/// Whether the statement predicts success or correctness.
-fn is_positive_claim(statement: &str) -> bool {
-    let lower = format!(" {statement} ");
-    lower.contains(" pass")
-        || lower.contains(" works")
-        || lower.contains(" fixed")
-        || lower.contains(" success")
-        || lower.contains(" correct")
-        || statement.contains("通过")
-        || statement.contains("成功")
-        || statement.contains("修复")
+/// Whether the statement contains an explicit negation at all.
+fn has_negation(text: &str) -> bool {
+    if text.contains("n't")
+        || ["not", "never", "no", "cannot", "without"]
+            .iter()
+            .any(|marker| contains_token(text, marker))
+    {
+        return true;
+    }
+    ["不", "没有", "未", "并非", "无"]
+        .iter()
+        .any(|marker| text.contains(marker))
 }
 
-/// Whether `output` reports a failure.
-fn output_is_negative(output: &str) -> bool {
-    if output.contains("0 failed")
-        || output.contains("test result: ok")
+/// Whether the claim's predicate (or its antonym) is present in the output.
+fn predicate_supported(claim: &ClaimPolarity, statement: &str, output: &str) -> bool {
+    let Some(root) = claim.predicate else {
+        // An absence claim has no predicate; polarity and shared tokens carry
+        // the decision.
+        return true;
+    };
+    if contains_predicate(output, root) {
+        return true;
+    }
+    let antonyms: &[&str] = match claim.polarity {
+        Polarity::Negative => NEGATIVE_PREDICATES,
+        Polarity::Positive => POSITIVE_PREDICATES,
+        Polarity::Neutral => &[],
+    };
+    if antonyms
+        .iter()
+        .any(|marker| contains_predicate(output, marker))
+    {
+        return true;
+    }
+    let explicit_test_marker = output.contains("test result:")
+        || output.contains("tests passed")
+        || output.contains("0 failed");
+    explicit_test_marker && statement.contains("test")
+}
+
+/// Classify what an output reports.
+fn output_polarity(output: &str) -> Polarity {
+    if output.contains("test result: ok")
+        || output.contains("all tests passed")
+        || output.contains("0 failed")
         || output.contains("no errors")
     {
-        return false;
+        return Polarity::Positive;
     }
-    output.contains("failed")
-        || output.contains("failure")
-        || output.contains("error")
+    if output_is_negative(output) {
+        return Polarity::Negative;
+    }
+    if output_is_positive(output) {
+        return Polarity::Positive;
+    }
+    Polarity::Neutral
+}
+
+/// Whether `output` reports a failure or an absence.
+fn output_is_negative(output: &str) -> bool {
+    [
+        "failed", "failure", "error", "missing", "broken", "panic", "panicked", "absent",
+    ]
+    .iter()
+    .any(|marker| contains_token(output, marker))
         || output.contains("not found")
-        || output.contains("missing")
-        || output.contains("panicked")
+        || output.contains("no test")
         || output.contains("\"success\": false")
         || output.contains("失败")
         || output.contains("错误")
@@ -585,14 +782,100 @@ fn output_is_positive(output: &str) -> bool {
     output.contains("test result: ok")
         || output.contains("all tests passed")
         || output.contains("0 failed")
-        || output.contains("passed")
-        || output.contains("confirmed")
-        || output.contains("matches")
-        || output.contains("as expected")
-        || output.contains("found")
-        || output.contains("verified")
-        || output.contains("contains")
-        || output.contains("present")
+        || [
+            "passed",
+            "found",
+            "confirmed",
+            "matches",
+            "present",
+            "verified",
+            "contains",
+        ]
+        .iter()
+        .any(|marker| contains_token(output, marker))
+}
+
+/// A bounded signature of the request that opened a turn.
+///
+/// Only significant words are kept, deduplicated and capped at 24 tokens. The
+/// signature is a lifecycle key for resume-versus-new-task decisions; the raw
+/// request body is not stored.
+fn task_signature(task: &str) -> Option<String> {
+    let tokens = significant_tokens(task);
+    let mut seen = std::collections::BTreeSet::new();
+    let signature: Vec<&str> = tokens
+        .iter()
+        .filter(|token| seen.insert(token.as_str()))
+        .take(24)
+        .map(String::as_str)
+        .collect();
+    (!signature.is_empty()).then(|| signature.join(" "))
+}
+
+/// Whether the request is a generic instruction to continue the prior work.
+fn is_continuation_command(task: &str) -> bool {
+    let lower = normalize_text(task);
+    if lower.is_empty() {
+        return true;
+    }
+    [
+        "continue",
+        "resume",
+        "go on",
+        "keep going",
+        "carry on",
+        "proceed",
+    ]
+    .iter()
+    .any(|cue| {
+        lower
+            .strip_prefix(cue)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    }) || ["继续", "接着", "往下"]
+        .iter()
+        .any(|cue| lower.starts_with(cue))
+}
+
+/// Verbs that say what to do but not what the work is about.
+const GENERIC_TASK_WORDS: &[&str] = &[
+    "fix", "run", "test", "check", "add", "update", "use", "make", "get", "try", "work", "need",
+    "should", "build", "write", "read", "change", "remove",
+];
+
+/// Whether two requests are about the same work.
+///
+/// One shared word is not enough: "fix the parser" and "fix the deployment"
+/// share only the generic verb. A resume needs either two shared significant
+/// words with meaningful overlap, or a single shared word when both requests
+/// are very short.
+fn tasks_overlap(left: &str, right: &str) -> bool {
+    let left_tokens = significant_tokens(left);
+    let right_tokens = significant_tokens(right);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return false;
+    }
+    let left_set: std::collections::BTreeSet<&str> =
+        left_tokens.iter().map(String::as_str).collect();
+    let right_set: std::collections::BTreeSet<&str> =
+        right_tokens.iter().map(String::as_str).collect();
+    if left_set == right_set {
+        return true;
+    }
+    let shared_tokens: Vec<&str> = left_set.intersection(&right_set).copied().collect();
+    let shared = shared_tokens.len();
+    if shared == 0 {
+        return false;
+    }
+    if shared >= 2 {
+        let union = left_set.union(&right_set).count();
+        return shared as f32 / union as f32 >= 0.25;
+    }
+    // A single-word request can continue the work when its word is the
+    // subject, not a generic verb such as "fix" or "run".
+    right_set.len() <= 1
+        && !shared_tokens
+            .first()
+            .is_some_and(|token| GENERIC_TASK_WORDS.contains(token))
 }
 
 /// Whether a carried item still bears on the next task.
@@ -635,9 +918,21 @@ fn history_contains(history: &[LlmMessage], text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ThinkingState;
+    use super::{claim_polarity, Polarity, ThinkingState};
     use crate::llm::LlmMessage;
     use crate::thinking::summary::ThinkingConfidence;
+
+    #[test]
+    fn predicate_matching_ignores_words_that_merely_contain_it() {
+        assert_eq!(
+            claim_polarity("the network works").polarity,
+            Polarity::Positive
+        );
+        assert_eq!(
+            claim_polarity("the network fails").polarity,
+            Polarity::Negative
+        );
+    }
 
     #[test]
     fn a_success_without_confirming_evidence_leaves_the_claim_inferred() {
@@ -710,6 +1005,127 @@ mod tests {
             intent.confidence,
             ThinkingConfidence::Inferred,
             "an intent is not verified by its own execution"
+        );
+    }
+
+    #[test]
+    fn a_negated_claim_is_not_confirmed_by_positive_evidence() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The bug is not in the parser because the failure starts elsewhere.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result("bash", "grep found the bug in parser.rs", true, 2);
+        let decision = state
+            .summary()
+            .decisions
+            .iter()
+            .find(|decision| decision.statement.contains("bug"))
+            .expect("the negated claim");
+        assert_eq!(
+            decision.confidence,
+            ThinkingConfidence::Inferred,
+            "positive evidence cannot confirm an absence claim"
+        );
+    }
+
+    #[test]
+    fn a_negated_claim_is_confirmed_by_absence_evidence() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The bug is not in the parser because the failure starts elsewhere.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result("bash", "bug not found in parser", true, 2);
+        let decision = state
+            .summary()
+            .decisions
+            .iter()
+            .find(|decision| decision.statement.contains("bug"))
+            .expect("the negated claim");
+        assert_eq!(decision.confidence, ThinkingConfidence::Verified);
+    }
+
+    #[test]
+    fn a_negated_positive_predicate_requires_failure_evidence() {
+        let mut passing = ThinkingState::new();
+        passing.begin_run(1, "");
+        passing.observe_reasoning(
+            "The issue is that the parser test does not pass because the fixture is missing.",
+            1,
+        );
+        passing.observe_tool_call("bash", 2);
+        passing.observe_tool_result("bash", "test result: ok. parser test passed", true, 2);
+        assert_eq!(
+            passing.summary().decisions[0].confidence,
+            ThinkingConfidence::Inferred,
+            "a passing result contradicts 'does not pass'"
+        );
+
+        let mut failing = ThinkingState::new();
+        failing.begin_run(1, "");
+        failing.observe_reasoning(
+            "The issue is that the parser test does not pass because the fixture is missing.",
+            1,
+        );
+        failing.observe_tool_call("bash", 2);
+        failing.observe_tool_result("bash", "the parser test failed", true, 2);
+        assert_eq!(
+            failing.summary().decisions[0].confidence,
+            ThinkingConfidence::Verified,
+            "failure evidence confirms 'does not pass'"
+        );
+    }
+
+    #[test]
+    fn fails_to_pass_reads_as_a_negative_claim() {
+        let mut passing = ThinkingState::new();
+        passing.begin_run(1, "");
+        passing.observe_reasoning(
+            "The issue is that the parser test fails to pass because the fixture is missing.",
+            1,
+        );
+        passing.observe_tool_call("bash", 2);
+        passing.observe_tool_result("bash", "test result: ok. parser test passed", true, 2);
+        assert_eq!(
+            passing.summary().decisions[0].confidence,
+            ThinkingConfidence::Inferred,
+            "a pass contradicts 'fails to pass'"
+        );
+
+        let mut failing = ThinkingState::new();
+        failing.begin_run(1, "");
+        failing.observe_reasoning(
+            "The issue is that the parser test fails to pass because the fixture is missing.",
+            1,
+        );
+        failing.observe_tool_call("bash", 2);
+        failing.observe_tool_result("bash", "the parser test failed", true, 2);
+        assert_eq!(
+            failing.summary().decisions[0].confidence,
+            ThinkingConfidence::Verified,
+            "failure evidence confirms 'fails to pass'"
+        );
+    }
+
+    #[test]
+    fn a_negated_negative_predicate_is_a_positive_claim() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "");
+        state.observe_reasoning(
+            "The issue is that the parser test does not fail because the fix is correct.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+        state.observe_tool_result("bash", "test result: ok. parser test passed", true, 2);
+        assert_eq!(
+            state.summary().decisions[0].confidence,
+            ThinkingConfidence::Verified,
+            "'does not fail' is a positive claim confirmed by a pass"
         );
     }
 
@@ -790,6 +1206,113 @@ mod tests {
                 .any(|decision| decision.confidence == ThinkingConfidence::Verified),
             "an interrupted call must not be read as success"
         );
+    }
+
+    #[test]
+    fn a_different_task_after_an_interruption_starts_fresh() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "fix the parser failure");
+        state.observe_reasoning(
+            "I will run the parser test because it reproduces the failure.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+
+        state.begin_run(2, "deploy the release notes");
+        assert!(
+            state.snapshot.pending.is_empty(),
+            "stale pending is cleared"
+        );
+        assert!(!state
+            .summary()
+            .open_questions
+            .iter()
+            .any(|question| question.question.contains("interrupted")));
+        assert_eq!(
+            state.summary().phase,
+            crate::thinking::ThinkingPhase::Exploring
+        );
+        assert!(state
+            .snapshot
+            .task_signature
+            .as_deref()
+            .is_some_and(|signature| signature.contains("deploy")));
+        assert!(!state
+            .summary()
+            .active_decisions()
+            .any(|decision| decision.statement.contains("parser")));
+    }
+
+    #[test]
+    fn a_single_subject_word_resumes_but_a_generic_verb_does_not() {
+        let mut by_subject = ThinkingState::new();
+        by_subject.begin_run(1, "fix the parser failure");
+        by_subject.observe_tool_call("bash", 2);
+        by_subject.begin_run(2, "parser");
+        assert_eq!(by_subject.snapshot.pending.len(), 1);
+
+        let mut by_verb = ThinkingState::new();
+        by_verb.begin_run(1, "fix the parser failure");
+        by_verb.observe_tool_call("bash", 2);
+        by_verb.begin_run(2, "fix");
+        assert!(by_verb.snapshot.pending.is_empty());
+    }
+
+    #[test]
+    fn a_different_task_with_a_shared_verb_starts_fresh() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "fix the parser failure");
+        state.observe_reasoning(
+            "I will run the parser test because it reproduces the failure.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+
+        state.begin_run(2, "fix the deployment pipeline");
+        assert!(
+            state.snapshot.pending.is_empty(),
+            "a shared generic verb is not the same task"
+        );
+        assert!(!state
+            .summary()
+            .open_questions
+            .iter()
+            .any(|question| question.question.contains("interrupted")));
+    }
+
+    #[test]
+    fn a_matching_task_after_an_interruption_resumes_pending() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "fix the parser failure");
+        state.observe_reasoning(
+            "I will run the parser test because it reproduces the failure.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+
+        state.begin_run(2, "fix the parser failure again");
+        assert_eq!(state.snapshot.pending.len(), 1);
+        assert!(state.snapshot.pending[0].interrupted);
+        assert!(state
+            .summary()
+            .open_questions
+            .iter()
+            .any(|question| question.question.contains("interrupted")));
+    }
+
+    #[test]
+    fn a_continuation_command_resumes_pending() {
+        let mut state = ThinkingState::new();
+        state.begin_run(1, "fix the parser failure");
+        state.observe_reasoning(
+            "I will run the parser test because it reproduces the failure.",
+            1,
+        );
+        state.observe_tool_call("bash", 2);
+
+        state.begin_run(2, "continue");
+        assert_eq!(state.snapshot.pending.len(), 1);
+        assert!(state.snapshot.pending[0].interrupted);
     }
 
     #[test]

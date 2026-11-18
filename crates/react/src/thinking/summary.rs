@@ -325,6 +325,13 @@ pub struct ThinkingSnapshot {
     pub pending: Vec<PendingTool>,
     /// Consecutive failed tool results, used to detect a blocked turn.
     pub consecutive_failures: u32,
+    /// Significant words of the request that opened the turn.
+    ///
+    /// This is a lifecycle key, not model-facing text: a later run compares the
+    /// new request with it to tell a resume from an unrelated new task. It is
+    /// bounded and does not include the raw request body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_signature: Option<String>,
 }
 
 impl Default for ThinkingSnapshot {
@@ -334,6 +341,7 @@ impl Default for ThinkingSnapshot {
             summary: ThinkingSummary::default(),
             pending: Vec::new(),
             consecutive_failures: 0,
+            task_signature: None,
         }
     }
 }
@@ -346,6 +354,7 @@ impl ThinkingSnapshot {
             summary: ThinkingSummary::new(turn),
             pending: Vec::new(),
             consecutive_failures: 0,
+            task_signature: None,
         }
     }
 
@@ -415,6 +424,7 @@ mod tests {
             .summary
             .decisions
             .push(decision("fix the retry loop", ThinkingConfidence::Verified));
+        snapshot.task_signature = Some("fix retry loop".to_string());
         let json = serde_json::to_string(&snapshot).expect("serializes");
         let restored: ThinkingSnapshot = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(restored, snapshot);

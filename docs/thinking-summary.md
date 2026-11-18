@@ -23,13 +23,16 @@ step (the last 16,000 characters) and extracts the following items:
 | Next action | "next step:", "next I will", "接下来", "下一步", or a leading imperative ("run ", "check ", "运行", "检查") | tentative |
 
 Only a `claim` can become `verified`, and only when a tool result actually
-supports it: the output must match the claim's polarity, carry its predicate
-when it is directional, and share enough significant tokens to be about the
-same subject. A successful tool call is execution, not verification, so an
-`intent` is never promoted by its own success. A decision parsed from reasoning
-is never rendered as a fact, even when the model stated it confidently. The
-note itself opens with `[source: thinking-summary revision=N phase=...]` and
-tells the reader that inferred items are unverified.
+supports it: the output must match the claim's **effective** polarity, carry
+the claim's predicate or a direct antonym, and share enough significant tokens
+to be about the same subject. Effective polarity resolves negation around the
+predicate: "does not fail" is positive, "does not pass" is negative, and "is
+not in the parser" is an absence claim that positive evidence cannot confirm.
+A successful tool call is execution, not verification, so an `intent` is never
+promoted by its own success. A decision parsed from reasoning is never rendered
+as a fact, even when the model stated it confidently. The note itself opens with
+`[source: thinking-summary revision=N phase=...]` and tells the reader that
+inferred items are unverified.
 
 The full chain of thought is deliberately not stored: only the bounded set of
 items above, at most 12 decisions and 8 questions.
@@ -83,11 +86,13 @@ Rules:
 - A new turn keeps only verified decisions and unresolved questions that
   share a word with the new request; inferred judgments from a closed turn are
   stale and are not carried forward.
-- An interrupted run (phase not `complete`) resumes exactly where it stopped.
-  A call that was in flight is preserved with `interrupted = true`; it cannot be
-  paired with a later result and its outcome is recorded as an open question
-  ("outcome is unknown"). A genuinely new task clears pending calls, so stale
-  in-flight state never leaks into the next task.
+- The turn phase alone does not decide resume-versus-new-task. A completed
+  turn is always a new task. An unfinished turn resumes only when the new
+  request is a continuation command, still shares significant words with the
+  stored request signature, or relates to a pending call; a different request is
+  a new task and clears stale pending state. A call that was in flight on a
+  resume is preserved with `interrupted = true`; it cannot be paired with a later
+  result and its outcome is recorded as an open question ("outcome is unknown").
 - Streamed reasoning is folded into the summary when a tool call starts, when a
   step ends, on provider error, on stop, and in batches once 2,048 characters
   have arrived. A dropped stream therefore keeps the batched part; a drop before
@@ -96,7 +101,7 @@ Rules:
 
 ## 4. Persistence and resume
 
-`ThinkingSnapshot` (schema version 2) is serializable. `ReactSession` gained two
+`ThinkingSnapshot` (schema version 3) is serializable. `ReactSession` gained two
 default methods, `thinking_snapshot` / `set_thinking_snapshot`; both
 `LlmSession` and `AgentSession` implement them.
 
@@ -122,5 +127,8 @@ default methods, `thinking_snapshot` / `set_thinking_snapshot`; both
   the retired judgment with an open question.
 - `crates/react/tests/thinking_interruption_test.rs`: provider error, stop,
   stream drop (before and after the reasoning batch), and normal completion.
+- `crates/react/tests/thinking_tool_interruption_test.rs`: a tool interrupted
+  while executing is restored as `interrupted`/unknown and injected as such on
+  the next request; a different task after that interruption clears it.
 - `crates/agent/src/agent/context.rs`: session save/restore round-trips the
   snapshot and an older session file without the field still loads.

@@ -46,8 +46,9 @@ pub const THINKING_SOURCE: &str = "thinking-summary";
 /// The snapshot schema this build writes and can read.
 ///
 /// Generation 2 added `ThinkingDecisionKind` and the interrupted-pending flag;
-/// generation-1 snapshots load with their defaults.
-pub const THINKING_SCHEMA_VERSION: u32 = 2;
+/// generation 3 added the task signature that distinguishes a resume from a
+/// new task. Older snapshots load with their defaults.
+pub const THINKING_SCHEMA_VERSION: u32 = 3;
 
 /// The longest single item kept in a summary (statement, rationale or action).
 pub(crate) const ITEM_CHARS: usize = 320;
