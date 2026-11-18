@@ -271,6 +271,7 @@ impl Agent {
             .llm_timeout(llm_timeout)
             .max_retries(self.config.max_retries)
             .parallel_tool_calls(self.config.parallel_tool_calls)
+            .thinking_context(self.config.thinking_context)
             .context_budget(self.context_budget)
             // ONE per-turn ceiling for the definitions a request carries: the
             // array the host admitted and every later `find_tool` reveal are

@@ -111,6 +111,7 @@ new AgentBuilder(bus, options = {})
 | `compactionInputTokens(tokens)` | Cap one compaction request's input | `AgentBuilder` |
 | `toolOutputCap(bytes)` | Cap the text one tool result may add to the context | `AgentBuilder` |
 | `parallelToolCalls(enabled)` | Run one response's tool calls concurrently | `AgentBuilder` |
+| `thinkingContext(enabled)` | Enable or disable the thinking-summary context (on by default) | `AgentBuilder` |
 | `webSearch(enabled)` | Offer the provider's hosted web-search tool | `AgentBuilder` |
 | `contextBudget(tokens)` / `setContextBudget(tokens)` | Set (or with no argument read) the send-side context budget | `AgentBuilder` |
 | `skillCatalogue(enabled)` / `setSkillCatalogue(enabled)` | Read or choose catalogue vs on-demand search | `AgentBuilder` |

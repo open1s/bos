@@ -223,6 +223,8 @@ class AgentBuilder:
             self._config.tool_output_cap = opts["tool_output_cap"]
         if opts.get("parallel_tool_calls") is not None:
             self._config.parallel_tool_calls = bool(opts["parallel_tool_calls"])
+        if opts.get("thinking_context") is not None:
+            self._config.thinking_context = bool(opts["thinking_context"])
         if opts.get("web_search") is not None:
             self._config.web_search = bool(opts["web_search"])
         if opts.get("context_budget") is not None:
@@ -319,6 +321,11 @@ class AgentBuilder:
     def with_parallel_tool_calls(self, enabled: bool = True) -> "AgentBuilder":
         """Run one response's tool calls concurrently instead of one at a time."""
         self._config.parallel_tool_calls = enabled
+        return self
+
+    def with_thinking_context(self, enabled: bool = True) -> "AgentBuilder":
+        """Enable or disable the thinking-summary context (on by default)."""
+        self._config.thinking_context = enabled
         return self
 
     def with_web_search(self, enabled: bool = True) -> "AgentBuilder":
@@ -449,6 +456,8 @@ class AgentBuilder:
             self._config.tool_output_cap = config["tool_output_cap"]
         if config.get("parallel_tool_calls") is not None:
             self._config.parallel_tool_calls = bool(config["parallel_tool_calls"])
+        if config.get("thinking_context") is not None:
+            self._config.thinking_context = bool(config["thinking_context"])
         if config.get("web_search") is not None:
             self._config.web_search = bool(config["web_search"])
         if config.get("context_budget") is not None:

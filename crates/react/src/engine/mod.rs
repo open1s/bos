@@ -265,6 +265,10 @@ pub struct ReActEngine<A: ReActApp> {
     /// embedders that need a runaway guard, not as the exit rule.
     max_steps: Option<usize>,
     parallel_tool_calls: bool,
+    /// Whether the thinking-summary context is extracted, persisted and
+    /// injected for this engine. Off means the loop pays none of that cost and
+    /// never adds a `thinking-summary` host-guidance note.
+    thinking_context: bool,
     telemetry: Telemetry,
     llm_timeout_secs: u64,
     /// Retries after the first attempt when a provider failure is transient.
@@ -300,6 +304,7 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     context_budget: usize,
     tool_result_cap: usize,
     parallel_tool_calls: bool,
+    thinking_context: bool,
     telemetry: Telemetry,
     resilience: Option<ReActResilience>,
     llm_timeout_secs: u64,
@@ -762,9 +767,7 @@ impl<A: ReActApp> ReActEngine<A> {
                         // tool call of this response runs, so a result can
                         // corroborate or retire the judgment that led to it.
                         if let Some(reasoning) = &message.reasoning_content {
-                            if self.thinking.observe_reasoning(reasoning, steps) {
-                                self.persist_thinking(session);
-                            }
+                            self.observe_thinking(session, reasoning, steps);
                         }
 
                         // The model's own words belong in the transcript even
@@ -837,8 +840,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                     Self::write_proxy_args(&mut args, hook_args);
                                 }
 
-                                self.thinking.observe_tool_call(&hook_name, steps);
-                                self.persist_thinking(session);
+                                self.observe_thinking_tool_call(session, &hook_name, steps);
                                 hook_names.insert(call_id.clone(), hook_name);
                                 batch.push((name, call_id, args));
                             }
@@ -972,13 +974,13 @@ impl<A: ReActApp> ReActEngine<A> {
                                     self.tool_result_cap,
                                 );
                                 trace.note_tool_result(result.is_ok());
-                                self.thinking.observe_tool_result(
+                                self.observe_thinking_tool_result(
+                                    session,
                                     &observed,
                                     &result_text,
                                     result.is_ok(),
                                     steps,
                                 );
-                                self.persist_thinking(session);
 
                                 if let Ok(ret) = &result {
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
@@ -1231,13 +1233,13 @@ impl<A: ReActApp> ReActEngine<A> {
                                     self.tool_result_cap,
                                 );
                                 trace.note_tool_result(result.is_ok());
-                                self.thinking.observe_tool_result(
+                                self.observe_thinking_tool_result(
+                                    session,
                                     &observed,
                                     &result_text,
                                     result.is_ok(),
                                     steps,
                                 );
-                                self.persist_thinking(session);
 
                                 if let Ok(ret) = &result {
                                     self.telemetry.emit(&TelemetryEvent::ToolInvocation {
@@ -1374,8 +1376,7 @@ impl<A: ReActApp> ReActEngine<A> {
             .react_loop(persona, request, session, context, turn)
             .await;
         if result.is_ok() {
-            self.thinking.finish();
-            self.persist_thinking(session);
+            self.finish_thinking(session);
         }
         result
     }
@@ -1593,8 +1594,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             } else {
                                 Self::write_proxy_args(&mut args, hook_args);
                             }
-                            self.thinking.observe_tool_call(&observed, steps);
-                            self.persist_thinking(session);
+                            self.observe_thinking_tool_call(session, &observed, steps);
 
                             let tool_started = Instant::now();
                             let mut result = if name == "load_skill" {
@@ -1689,13 +1689,13 @@ impl<A: ReActApp> ReActEngine<A> {
                             };
                             let result_text = cap_tool_result(&result_text, self.tool_result_cap);
                             trace.note_tool_result(result.is_ok());
-                            self.thinking.observe_tool_result(
+                            self.observe_thinking_tool_result(
+                                session,
                                 &observed,
                                 &result_text,
                                 result.is_ok(),
                                 steps,
                             );
-                            self.persist_thinking(session);
 
                             // A failed call is the one line the log was
                             // missing: policy refusals, broken environments and
@@ -1823,8 +1823,7 @@ impl<A: ReActApp> ReActEngine<A> {
                         answer: full_response.clone(),
                     });
                     emit_turn_outcome(&self.telemetry, turn, &trace, steps, &full_response);
-                    self.thinking.finish();
-                    self.persist_thinking(session);
+                    self.finish_thinking(session);
                     yield Ok(StreamToken::Done);
                     break;
                 }
@@ -1909,7 +1908,14 @@ impl<A: ReActApp> ReActEngine<A> {
     }
 
     /// Load the thinking summary the session persisted and open a new run.
+    ///
+    /// A disabled switch starts from empty state and leaves any persisted
+    /// summary untouched, so turning the feature back on can still restore it.
     fn begin_thinking<S: ReactSession>(&mut self, session: &mut S, turn: u64, task: &str) {
+        if !self.thinking_context {
+            self.thinking = ThinkingState::new();
+            return;
+        }
         self.thinking = ThinkingState::from_snapshot(session.thinking_snapshot());
         self.thinking.begin_run(turn, task);
         self.thinking.persist(session);
@@ -1917,7 +1923,60 @@ impl<A: ReActApp> ReActEngine<A> {
 
     /// Save the live summary so an interruption loses no valid decision.
     fn persist_thinking<S: ReactSession>(&self, session: &mut S) {
+        if !self.thinking_context {
+            return;
+        }
         self.thinking.persist(session);
+    }
+
+    /// Record one non-streamed reasoning block for the summary.
+    fn observe_thinking<S: ReactSession>(&mut self, session: &mut S, text: &str, step: usize) {
+        if !self.thinking_context {
+            return;
+        }
+        if self.thinking.observe_reasoning(text, step) {
+            self.persist_thinking(session);
+        }
+    }
+
+    /// Record a tool call for the summary.
+    fn observe_thinking_tool_call<S: ReactSession>(
+        &mut self,
+        session: &mut S,
+        name: &str,
+        step: usize,
+    ) {
+        if !self.thinking_context {
+            return;
+        }
+        self.thinking.observe_tool_call(name, step);
+        self.persist_thinking(session);
+    }
+
+    /// Record a tool result for the summary.
+    fn observe_thinking_tool_result<S: ReactSession>(
+        &mut self,
+        session: &mut S,
+        name: &str,
+        output: &str,
+        success: bool,
+        step: usize,
+    ) {
+        if !self.thinking_context {
+            return;
+        }
+        self.thinking
+            .observe_tool_result(name, output, success, step);
+        self.persist_thinking(session);
+    }
+
+    /// Close the thinking turn when the turn itself closes.
+    fn finish_thinking<S: ReactSession>(&mut self, session: &mut S) {
+        if !self.thinking_context {
+            return;
+        }
+        self.thinking.finish();
+        self.persist_thinking(session);
     }
 
     /// Fold the reasoning received so far into the summary and persist it.
@@ -1931,6 +1990,10 @@ impl<A: ReActApp> ReActEngine<A> {
         reasoning: &mut String,
         step: usize,
     ) {
+        if !self.thinking_context {
+            reasoning.clear();
+            return;
+        }
         if reasoning.trim().is_empty() {
             return;
         }
@@ -1950,6 +2013,9 @@ impl<A: ReActApp> ReActEngine<A> {
         session: &S,
         step: usize,
     ) {
+        if !self.thinking_context {
+            return;
+        }
         if request
             .host_guidance
             .iter()

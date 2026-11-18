@@ -121,7 +121,28 @@ default methods, `thinking_snapshot` / `set_thinking_snapshot`; both
 - `Agent::save_session` / `restore_session` therefore persist the summary
   without changing the message history.
 
-## 5. Tests
+## 5. Configuration
+
+The switch is part of the Agent loop configuration and is **on by default**:
+
+```rust
+let agent = AgentConfig::default().thinking_context(false);
+// or, for an engine embedded directly:
+let engine = ReActEngineBuilder::<MyApp>::new()
+    .llm(client)
+    .thinking_context(false)
+    .build()?;
+```
+
+In TOML the same switch is `thinking_context = false`; an absent key keeps the
+default (on), so existing files are unchanged. The bindings expose it as
+`AgentBuilder.with_thinking_context(False)` in Python and
+`AgentBuilder.thinkingContext(false)` in JavaScript. Disabling it makes the loop
+skip extraction, snapshot persistence and `thinking-summary` host guidance; a
+snapshot already stored in the session is left untouched and can be restored if
+the switch is re-enabled.
+
+## 6. Tests
 
 - `crates/react/src/thinking/*`: extraction, rendering, supersession,
   corroboration, correction, duplicate suppression, completion, new-turn
@@ -135,5 +156,8 @@ default methods, `thinking_snapshot` / `set_thinking_snapshot`; both
 - `crates/react/tests/thinking_tool_interruption_test.rs`: a tool interrupted
   while executing is restored as `interrupted`/unknown and injected as such on
   the next request; a different task after that interruption clears it.
+- `crates/react/tests/thinking_injection_test.rs` also runs the same turn with
+  `thinking_context(false)` and proves no snapshot, guidance or system-prompt
+  note is produced.
 - `crates/agent/src/agent/context.rs`: session save/restore round-trips the
   snapshot and an older session file without the field still loads.

@@ -13,6 +13,9 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             // The engine default applies until a host passes its own cap.
             tool_result_cap: TOOL_RESULT_CAP,
             parallel_tool_calls: false,
+            // Preserve the shipped behaviour: a host that never mentions the
+            // switch keeps the thinking-context feature it had before.
+            thinking_context: true,
             telemetry: Telemetry::new(),
             resilience: None,
             llm_timeout_secs: 120,
@@ -110,6 +113,16 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
         self
     }
 
+    /// Enable or disable the thinking-summary context.
+    ///
+    /// Enabled by default. When off, the engine neither extracts a summary
+    /// from reasoning nor persists or injects one, so `thinking-summary` host
+    /// guidance never appears in a request.
+    pub fn thinking_context(mut self, enabled: bool) -> Self {
+        self.thinking_context = enabled;
+        self
+    }
+
     /// Set the telemetry sink.
     pub fn telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
@@ -198,6 +211,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             context_budget: self.context_budget,
             tool_result_cap: self.tool_result_cap,
             parallel_tool_calls: self.parallel_tool_calls,
+            thinking_context: self.thinking_context,
             telemetry: self.telemetry,
             llm_timeout_secs: self.llm_timeout_secs,
             max_retries: self.max_retries,

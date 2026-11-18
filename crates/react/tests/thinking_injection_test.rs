@@ -138,7 +138,7 @@ impl LlmClient<LlmSession, LlmContext> for ReasoningThenAnswer {
     }
 }
 
-async fn run(fail: bool) -> (LlmSession, Vec<Observed>) {
+async fn run(fail: bool, thinking_context: bool) -> (LlmSession, Vec<Observed>) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut engine = ReActEngineBuilder::<TestApp>::new()
         .llm(Box::new(ReasoningThenAnswer {
@@ -146,6 +146,7 @@ async fn run(fail: bool) -> (LlmSession, Vec<Observed>) {
         }))
         .with_tool(ToolVariant::Async(Box::new(FakeBash { fail })))
         .max_steps(4)
+        .thinking_context(thinking_context)
         .build()
         .expect("the engine builds");
     let mut session = LlmSession::default();
@@ -181,7 +182,7 @@ fn message_text(message: &LlmMessage) -> Option<&str> {
 
 #[tokio::test]
 async fn a_confirming_result_verifies_the_claim_and_reaches_the_next_request() {
-    let (session, seen) = run(false).await;
+    let (session, seen) = run(false, true).await;
     assert_eq!(seen.len(), 2, "one reasoning step and one answer step");
 
     let second = &seen[1];
@@ -227,6 +228,36 @@ async fn a_confirming_result_verifies_the_claim_and_reaches_the_next_request() {
         decision.statement.contains("I will run the parser test")
             && decision.confidence.as_str() == "inferred"
     }));
+}
+
+#[tokio::test]
+async fn the_switch_disables_extraction_persistence_and_injection() {
+    let (session, seen) = run(false, false).await;
+    assert_eq!(
+        seen.len(),
+        2,
+        "the turn still runs its tool and answer steps"
+    );
+    assert!(
+        session.thinking_snapshot().is_none(),
+        "a disabled switch persists no thinking snapshot"
+    );
+    for observed in &seen {
+        assert!(
+            !observed
+                .guidance
+                .iter()
+                .any(|guidance| guidance.purpose == THINKING_SOURCE),
+            "a disabled switch adds no thinking guidance"
+        );
+    }
+    assert!(
+        !seen[1]
+            .system_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("source: thinking-summary")),
+        "no thinking note reaches the system prompt"
+    );
 }
 
 #[tokio::test]
@@ -320,7 +351,7 @@ async fn a_restored_session_resumes_its_live_summary() {
 
 #[tokio::test]
 async fn a_failed_result_retires_the_judgment_and_injects_the_open_question() {
-    let (session, seen) = run(true).await;
+    let (session, seen) = run(true, true).await;
     let second = &seen[1];
     let note = summary_guidance(second).expect("the next request carries a thinking note");
     assert!(

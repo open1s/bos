@@ -24,7 +24,14 @@
   task preserves the in-flight call as interrupted/unknown instead of success. Reasoning is
   folded in batches and at every recoverable stream termination (provider error,
   stop, dropped stream after a batch) without ever marking a stopped turn
-  complete. See `docs/thinking-summary.md`.
+  complete. The feature is on by default and can be disabled for an Agent
+  (`AgentConfig::thinking_context(false)` or `thinking_context = false` in
+  TOML), Python (`with_thinking_context(False)`), JavaScript
+  (`thinkingContext(false)`), or a direct engine
+  (`ReActEngineBuilder::thinking_context(false)`); disabled means no extraction,
+  no snapshot write and no `thinking-summary` guidance, while a previously
+  stored snapshot is left intact. See
+  `docs/thinking-summary.md`.
 
 ## v4.1.18 (2026-11-17)
 
