@@ -67,7 +67,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = AgentConfig {
         parallel_tool_calls: false,
-        thinking_context: true,
         web_search: false,
         name: "resilient-agent".to_string(),
         model,

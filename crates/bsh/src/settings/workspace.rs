@@ -114,12 +114,11 @@ pub(crate) struct AgentSection {
     pub(crate) web_tools_enabled: bool,
     /// Run one assistant turn's tool calls concurrently.
     pub(crate) parallel_tool_calls: bool,
-    /// Enable the thinking-summary context in the ReAct loop.
-    ///
-    /// On by default. Off skips summary extraction, persistence and the
-    /// `thinking-summary` context block; a snapshot already stored in the
-    /// session is left untouched.
-    pub(crate) thinking_context: bool,
+    /// Removed switch from the thinking-summary feature. Accepted so an
+    /// existing workspace file still loads, ignored, and never written back.
+    #[serde(default, rename = "thinking_context", skip_serializing)]
+    #[allow(dead_code)]
+    pub(crate) legacy_thinking_context: Option<bool>,
     /// Attach the file-backed memory store.
     pub(crate) memory_enabled: bool,
     /// Run governed knowledge capture at completed turns (issue #343).
@@ -186,7 +185,7 @@ impl Default for AgentSection {
             // the batching rule buy nothing: measured, every call of a batch ran
             // one after another.
             parallel_tool_calls: true,
-            thinking_context: true,
+            legacy_thinking_context: None,
             memory_enabled: true,
             memory_capture: false,
             max_tokens: None,
@@ -317,10 +316,6 @@ extensions = ["plan"]
             agent.parallel_tool_calls,
             "a batch the prompt asks for must run concurrently"
         );
-        assert!(
-            agent.thinking_context,
-            "the thinking summary is on unless the reader turns it off"
-        );
         let reserve = agent.max_tokens.unwrap_or(12_800) as usize;
         assert!(
             agent.context_budget > reserve * 2,
@@ -360,23 +355,17 @@ extensions = ["plan"]
     }
 
     #[test]
-    fn the_thinking_context_switch_parses_defaults_on_and_round_trips() {
-        let older = WorkspaceSettings::from_toml(WORKED).expect("an older file parses");
-        assert!(
-            older.agent.thinking_context,
-            "an absent switch keeps the shipped default"
-        );
-
-        let off_text = WORKED.replace(
+    fn an_old_thinking_context_key_still_loads_and_is_not_written_back() {
+        let old = WORKED.replace(
             "permission = \"read-only\"",
             "permission = \"read-only\"\nthinking_context = false",
         );
-        let off = WorkspaceSettings::from_toml(&off_text).expect("the switch parses");
-        assert!(!off.agent.thinking_context);
-        let rendered = off.to_toml().expect("renders");
+        let parsed = WorkspaceSettings::from_toml(&old).expect("the removed key still loads");
+        assert_eq!(parsed.agent.legacy_thinking_context, Some(false));
+        let rendered = parsed.to_toml().expect("renders");
         assert!(
-            rendered.contains("thinking_context = false"),
-            "Save keeps the switch: {rendered}"
+            !rendered.contains("thinking_context"),
+            "a removed key is not written back: {rendered}"
         );
     }
 

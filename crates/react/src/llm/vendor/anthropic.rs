@@ -26,7 +26,8 @@ use super::openaicompatible::{ChatCompletionResponse, Usage};
 use crate::llm::types::{BinarySource, LlmMessage};
 use crate::llm::{
     Content, ContentPart, LlmClient, LlmError, LlmRequest, LlmResponse, LlmResponseResult,
-    ReactContext, ReactSession, ReasoningState, StreamToken, TokenStream, VendorBuilderError,
+    ReactContext, ReactSession, ReasoningEffort, ReasoningState, StreamToken, TokenStream,
+    VendorBuilderError,
 };
 
 /// The Anthropic API version this client speaks.
@@ -83,8 +84,22 @@ pub struct AnthropicRequest {
     /// Tools offered to the model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<AnthropicTool>>,
+    /// Extended thinking. Omitted unless the reader chose an effort level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<AnthropicThinking>,
     /// Whether the response is streamed.
     pub stream: bool,
+}
+
+/// Anthropic's extended-thinking switch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnthropicThinking {
+    /// `enabled`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Token budget reserved for thinking; the Messages API requires at least
+    /// 1024 and a `max_tokens` above it.
+    pub budget_tokens: u32,
 }
 
 /// Splits an Anthropic SSE byte stream into complete data frames.
@@ -420,18 +435,43 @@ impl AnthropicVendor {
             })
             .unwrap_or_default();
 
+        // Extended thinking is opt-in on this wire. The reader's effort level
+        // selects a budget; the completion cap must stay above it, so a small
+        // configured cap is raised rather than sending a body Anthropic rejects.
+        let thinking = request.reasoning_effort.map(|effort| {
+            let budget_tokens = match effort {
+                ReasoningEffort::Low => 1024,
+                ReasoningEffort::Medium => 2048,
+                ReasoningEffort::High => 4096,
+            };
+            AnthropicThinking {
+                kind: "enabled".to_string(),
+                budget_tokens,
+            }
+        });
+        let mut max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        if let Some(thinking) = &thinking {
+            max_tokens = max_tokens.max(thinking.budget_tokens.saturating_add(1024));
+        }
+
+        let thinking_on = thinking.is_some();
         AnthropicRequest {
             model,
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            max_tokens,
             system: if system_parts.is_empty() {
                 None
             } else {
                 Some(system_parts.join("\n"))
             },
             messages,
-            temperature: request.temperature,
-            top_p: request.top_p,
+            temperature: if thinking_on {
+                None
+            } else {
+                request.temperature
+            },
+            top_p: if thinking_on { None } else { request.top_p },
             tools: if tools.is_empty() { None } else { Some(tools) },
+            thinking,
             stream: true,
         }
     }
@@ -459,12 +499,19 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             .await?;
 
         let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut reasoning_state: Option<ReasoningState> = None;
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut usage_in = 0u32;
         let mut usage_out = 0u32;
         while let Some(item) = stream.next().await {
             match item? {
                 StreamToken::Text(chunk) => text.push_str(&chunk),
+                // The blocking path must not throw away what the streamed path
+                // preserves: the turn's reasoning and its signature are what a
+                // tool loop replays to Anthropic.
+                StreamToken::ReasoningContent(chunk) => reasoning.push_str(&chunk),
+                StreamToken::ReasoningState(state) => reasoning_state = Some(state),
                 StreamToken::ToolCall { name, args, id } => tool_calls.push(json!({
                     "id": id.unwrap_or_default(),
                     "type": "function",
@@ -489,9 +536,18 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             "tool_calls"
         };
         let message = if tool_calls.is_empty() {
-            json!({ "role": "assistant", "content": content })
+            let mut message = json!({ "role": "assistant", "content": content });
+            if !reasoning.is_empty() {
+                message["reasoning_content"] = Value::String(reasoning.clone());
+            }
+            message
         } else {
-            json!({ "role": "assistant", "content": content, "tool_calls": tool_calls })
+            let mut message =
+                json!({ "role": "assistant", "content": content, "tool_calls": tool_calls });
+            if !reasoning.is_empty() {
+                message["reasoning_content"] = Value::String(reasoning.clone());
+            }
+            message
         };
         let created = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -513,8 +569,15 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 "total_tokens": usage_in.saturating_add(usage_out),
             },
         });
-        let parsed: ChatCompletionResponse =
+        let mut parsed: ChatCompletionResponse =
             serde_json::from_value(body).map_err(|e| LlmError::Parse(e.to_string()))?;
+        // The Chat wire has no field for the signature; hand it to the engine
+        // through the message extension so it can attach a ReasoningState.
+        if let Some(state) = reasoning_state {
+            if let Some(choice) = parsed.choices.first_mut() {
+                choice.message.extra = json!({ "_bos_reasoning_state": state.payload });
+            }
+        }
         let response = LlmResponse::OpenAI(parsed);
         context.notify_response(&response);
         Ok(response)
@@ -927,6 +990,24 @@ mod tests {
         let capped = vendor.build_request(&None, &request(Some(64)), &(), &());
         assert_eq!(capped.max_tokens, 64);
         assert!(capped.system.is_none());
+    }
+
+    #[test]
+    fn effort_enables_thinking_and_drops_custom_sampling() {
+        let vendor = vendor();
+        let mut with_effort = request(Some(2048));
+        with_effort.reasoning_effort = Some(crate::llm::ReasoningEffort::High);
+        with_effort.temperature = Some(0.2);
+        with_effort.top_p = Some(0.5);
+        let body = vendor.build_request(&None, &with_effort, &(), &());
+        let thinking = body.thinking.expect("thinking is enabled");
+        assert_eq!(thinking.budget_tokens, 4096);
+        assert!(
+            body.max_tokens > thinking.budget_tokens,
+            "the completion cap stays above the thinking budget"
+        );
+        assert_eq!(body.temperature, None, "thinking requires the default");
+        assert_eq!(body.top_p, None, "thinking requires the default");
     }
 
     /// Untrusted context keeps its explicit envelope inside Anthropic's one

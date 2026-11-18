@@ -921,7 +921,6 @@ fn build_agent_for_session_inner(
         parallel_tool_calls: eff
             .preset_parallel_tool_calls
             .unwrap_or(eff.parallel_tool_calls),
-        thinking_context: eff.thinking_context,
         ..AgentConfig::default()
     };
     // BSH does not read the ambient BOS config: the settings files are the
@@ -9295,17 +9294,6 @@ mod tests {
         let mut on = bare();
         on.workspace.agent.parallel_tool_calls = true;
         assert!(build(&on).agent.config().parallel_tool_calls);
-    }
-
-    /// The thinking-context switch reaches the agent config, not just the file.
-    #[test]
-    fn the_thinking_context_switch_reaches_the_agent_config() {
-        let mut off = bare();
-        off.workspace.agent.thinking_context = false;
-        assert!(!build(&off).agent.config().thinking_context);
-        let mut on = bare();
-        on.workspace.agent.thinking_context = true;
-        assert!(build(&on).agent.config().thinking_context);
     }
 
     /// The API protocol the user picks reaches the agent config, not just the

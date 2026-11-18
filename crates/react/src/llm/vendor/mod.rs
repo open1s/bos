@@ -12,7 +12,7 @@ mod tap;
 pub use anthropic::{AnthropicVendor, AnthropicVendorBuilder};
 pub use deepseek::{DeepSeekVendor, DeepSeekVendorBuilder};
 pub use nvidia::NvidiaVendor;
-pub use openai::{OpenAiClient, OpenAiVendor, OpenAiVendorBuilder};
+pub use openai::{OpenAiClient, OpenAiVendor, OpenAiVendorBuilder, ReasoningReplay};
 pub use openaicompatible::{
     sse_has_done_signal, ChatCompletionChunk, ChatCompletionResponse, ChatMessage, Choice,
     ChunkChoice, Delta, FunctionCall, FunctionCallDelta, LogProbContent, LogProbs, OpenAIExtractor,

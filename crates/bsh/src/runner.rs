@@ -52,8 +52,6 @@ pub(crate) enum AgentEvent {
     Text(String),
     /// More reasoning text.
     Reasoning(String),
-    /// Opaque provider state for the reasoning received so far.
-    ReasoningState(react::llm::ReasoningState),
     /// The model called a tool.
     ToolCall {
         /// Tool name.
@@ -134,61 +132,6 @@ pub(crate) enum AgentEvent {
     Done,
     /// The turn failed.
     Error(String),
-}
-
-/// Replay a stored assistant row's reasoning blocks into the session.
-///
-/// One row carries the concatenated reasoning text plus the timeline's Thinking
-/// lengths. Those lengths split the text back into the blocks the provider
-/// produced, so each block keeps its own opaque state.
-fn replay_reasoning(session: &mut agent::agent::context::AgentSession, message: &ChatMessage) {
-    let states = message
-        .meta
-        .as_ref()
-        .map(|meta| meta.reasoning_states.as_slice())
-        .unwrap_or_default();
-    if message.reasoning.is_empty() {
-        // Redacted thinking can arrive as state only; keep one empty reasoning
-        // block per state so each opaque payload survives.
-        for state in states {
-            session.push(react::llm::LlmMessage::AssistantReasoning {
-                content: String::new(),
-                provider_state: Some(state.clone()),
-            });
-        }
-        return;
-    }
-    let mut start = 0usize;
-    let mut block = 0usize;
-    let mut pushed = false;
-    for part in &message.parts {
-        let crate::model::TurnPart::Thinking(len) = part else {
-            continue;
-        };
-        let end = start.saturating_add(*len).min(message.reasoning.len());
-        if end < start || !message.reasoning.is_char_boundary(end) {
-            break;
-        }
-        let provider_state = states.get(block).cloned();
-        let content = message.reasoning[start..end].to_string();
-        if !content.is_empty() || provider_state.is_some() {
-            session.push(react::llm::LlmMessage::AssistantReasoning {
-                content,
-                provider_state,
-            });
-            pushed = true;
-        }
-        start = end;
-        block += 1;
-    }
-    let tail = message.reasoning[start..].to_string();
-    let provider_state = states.get(block).cloned();
-    if !pushed || !tail.is_empty() || provider_state.is_some() {
-        session.push(react::llm::LlmMessage::AssistantReasoning {
-            content: tail,
-            provider_state,
-        });
-    }
 }
 
 /// Owns the Tokio runtime and the in-flight turns.
@@ -276,12 +219,10 @@ impl Runner {
                     }
                 }
                 Role::Assistant => {
-                    // Reasoning is its own message, ahead of the visible text.
-                    // It is not sent by default; the adapter reads the provider
-                    // state when it recognizes its own protocol. A turn can
-                    // contain several thinking blocks, so the timeline's
-                    // Thinking lengths pair each block with its own state.
-                    replay_reasoning(&mut session, message);
+                    // Reasoning stays in the transcript for the reader, but it
+                    // is NOT replayed: a model must never receive a previous
+                    // turn's chain of thought or its opaque provider state.
+                    // Only the current turn's engine session carries those.
                     if !message.text.is_empty() {
                         session.add_assistant(message.text.clone());
                     }
@@ -827,9 +768,9 @@ impl Runner {
                             AgentEvent::Text(text)
                         }
                         Ok(StreamToken::ReasoningContent(text)) => AgentEvent::Reasoning(text),
-                        Ok(StreamToken::ReasoningState(state)) => {
-                            AgentEvent::ReasoningState(state)
-                        }
+                        // The engine keeps the state in its own turn-local
+                        // session; the transcript does not persist or replay it.
+                        Ok(StreamToken::ReasoningState(_)) => continue,
                         Ok(StreamToken::ToolCall { name, args, .. }) => {
                             tool_calls += 1;
                             AgentEvent::ToolCall {
@@ -2069,66 +2010,18 @@ mod tests {
         );
     }
 
-    /// Stored reasoning replays as its own message, with provider state.
+    /// Reasoning stays in the transcript but never reaches a later turn.
+    ///
+    /// A model must not receive a previous turn's chain of thought or its
+    /// opaque provider state; only the engine's live session for the current
+    /// turn carries those.
     #[test]
-    fn seeding_replays_reasoning_with_provider_state() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let agent = capturing_agent(seen);
+    fn seeding_never_replays_a_previous_turns_reasoning() {
+        let agent = capturing_agent(Arc::new(std::sync::Mutex::new(Vec::new())));
         let mut assistant = crate::model::ChatMessage::assistant();
         assistant.reasoning = "private thought".to_string();
-        assistant.meta = Some(crate::model::MessageMeta {
-            reasoning_states: vec![react::llm::ReasoningState::new(
-                "anthropic",
-                serde_json::json!({ "type": "thinking", "signature": "sig" }),
-            )],
-            ..Default::default()
-        });
-        let transcript = vec![
-            crate::model::ChatMessage::user("solve it".to_string()),
-            assistant,
-        ];
-        Runner::seed_session(&agent, &transcript);
-        let session = agent.session();
-        let messages = session.messages();
-        let reasoning = messages.iter().find_map(|message| match message {
-            react::llm::LlmMessage::AssistantReasoning {
-                content,
-                provider_state,
-            } => Some((content.clone(), provider_state.clone())),
-            _ => None,
-        });
-        let (content, state) = reasoning.expect("the reasoning row replays");
-        assert_eq!(content, "private thought");
-        let state = state.expect("the provider state replays with it");
-        assert_eq!(state.provider, "anthropic");
-        assert_eq!(state.payload["signature"], "sig");
-    }
-
-    /// Several thinking blocks replay as several messages, each with its own state.
-    #[test]
-    fn seeding_pairs_each_reasoning_block_with_its_state() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let agent = capturing_agent(seen);
-        let mut assistant = crate::model::ChatMessage::assistant();
-        assistant.reasoning = "firstsecond".to_string();
-        assistant.parts = vec![
-            crate::model::TurnPart::Thinking(5),
-            crate::model::TurnPart::Content(0),
-            crate::model::TurnPart::Thinking(6),
-        ];
-        assistant.meta = Some(crate::model::MessageMeta {
-            reasoning_states: vec![
-                react::llm::ReasoningState::new(
-                    "anthropic",
-                    serde_json::json!({ "type": "thinking", "signature": "sig-1" }),
-                ),
-                react::llm::ReasoningState::new(
-                    "anthropic",
-                    serde_json::json!({ "type": "thinking", "signature": "sig-2" }),
-                ),
-            ],
-            ..Default::default()
-        });
+        assistant.parts = vec![crate::model::TurnPart::Thinking(15)];
+        assistant.text = "answer".to_string();
         Runner::seed_session(
             &agent,
             &[
@@ -2137,29 +2030,19 @@ mod tests {
             ],
         );
         let session = agent.session();
-        let blocks: Vec<(String, String)> = session
-            .messages()
-            .iter()
-            .filter_map(|message| match message {
-                react::llm::LlmMessage::AssistantReasoning {
-                    content,
-                    provider_state: Some(state),
-                } => Some((
-                    content.clone(),
-                    state.payload["signature"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                )),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            blocks,
-            vec![
-                ("first".to_string(), "sig-1".to_string()),
-                ("second".to_string(), "sig-2".to_string()),
-            ]
+        assert!(
+            !session.messages().iter().any(|message| matches!(
+                message,
+                react::llm::LlmMessage::AssistantReasoning { .. }
+            )),
+            "a later turn seeds no reasoning"
+        );
+        assert!(
+            session.messages().iter().any(|message| matches!(
+                message,
+                react::llm::LlmMessage::Assistant { content } if content == "answer"
+            )),
+            "the visible answer still replays"
         );
     }
 

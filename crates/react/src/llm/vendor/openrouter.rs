@@ -7,6 +7,7 @@ use crate::llm::{
     VendorBuilderError,
 };
 
+use super::openai::ReasoningReplay;
 use super::OpenAiVendor;
 
 /// OpenRouter vendor.
@@ -30,7 +31,10 @@ impl OpenRouterVendor {
     /// Create a OpenRouter vendor with an explicit endpoint, model, and key.
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
         Self {
-            inner: OpenAiVendor::new(endpoint, model, api_key),
+            // OpenRouter preserves structured reasoning across a tool loop;
+            // replay it only inside the turn that produced it.
+            inner: OpenAiVendor::new(endpoint, model, api_key)
+                .with_reasoning_replay(ReasoningReplay::Details),
         }
     }
 

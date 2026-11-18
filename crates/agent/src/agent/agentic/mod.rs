@@ -183,14 +183,6 @@ pub struct AgentConfig {
     /// Off by default: a sequential batch keeps the hook and session order a
     /// caller may depend on.
     pub parallel_tool_calls: bool,
-    /// Enable the thinking-summary context in the ReAct loop.
-    ///
-    /// On by default, preserving the shipped behaviour. When off, the engine
-    /// does not extract decisions from reasoning, persist a thinking snapshot,
-    /// or inject a `thinking-summary` note into a request. The session's
-    /// existing snapshot is left untouched, so re-enabling the switch can still
-    /// restore the last valid summary.
-    pub thinking_context: bool,
     /// API protocol selection: `"chat"` (default, `/chat/completions`) or
     /// `"responses"` (`/v1/responses`). Kept as a string so it archives cleanly
     /// under qserde/rkyv.
@@ -231,7 +223,6 @@ impl Default for AgentConfig {
             tool_output_cap: 0,
             web_search: false,
             parallel_tool_calls: false,
-            thinking_context: true,
             api_mode: "chat".to_string(),
             reasoning_effort: None,
             circuit_breaker: None,
@@ -304,11 +295,6 @@ impl AgentConfig {
     /// Run one response's tool calls concurrently instead of one at a time.
     pub fn parallel_tool_calls(mut self, parallel: bool) -> Self {
         self.parallel_tool_calls = parallel;
-        self
-    }
-    /// Enable or disable the thinking-summary context in the ReAct loop.
-    pub fn thinking_context(mut self, enabled: bool) -> Self {
-        self.thinking_context = enabled;
         self
     }
     /// `"chat"` (default) or `"responses"`.
@@ -763,8 +749,7 @@ impl Agent {
         request.tools = tools.to_vec();
         request.input = input.clone();
         // Retrieved memory is context, never system policy. Replace any stale
-        // retrieval block; other context blocks (for example a thinking summary)
-        // are added per call by the engine.
+        // retrieval block; other context blocks are added per call by the engine.
         request
             .context_blocks
             .retain(|block| block.source != "retrieved-memory");

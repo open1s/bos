@@ -32,6 +32,24 @@ use thiserror::Error;
 /// keeps the window consistent.
 pub fn cut_is_balanced(messages: &[Message], cut: usize) -> bool {
     let cut = cut.min(messages.len());
+    // A cut must not split one assistant response's reasoning from the text and
+    // tool calls it introduced. Anthropic signs a thinking block for the
+    // tool_use that follows it; dropping the block while keeping the call
+    // produces an invalid replay of that turn.
+    let mut group_start = cut;
+    while group_start > 0 {
+        match &messages[group_start - 1] {
+            Message::Assistant { .. } | Message::AssistantReasoning { .. } => group_start -= 1,
+            _ => break,
+        }
+    }
+    if cut > group_start
+        && messages[group_start..cut]
+            .iter()
+            .any(|message| matches!(message, Message::AssistantReasoning { .. }))
+    {
+        return false;
+    }
     let mut open: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for message in &messages[..cut] {
         match message {
@@ -282,12 +300,19 @@ pub fn estimate_message_tokens(message: &Message) -> usize {
         | Message::Developer { content }
         | Message::Assistant { content } => estimate_tokens(content),
         Message::User { content } => estimate_tokens(&content_to_summary_string(content)),
+        // Reasoning is replayed inside its turn by DeepSeek, OpenRouter,
+        // Anthropic and Responses, so it spends the same context as any other
+        // message that turn sends. Pricing only signed blocks undercounted a
+        // DeepSeek tool loop.
         Message::AssistantReasoning {
             content,
             provider_state,
-        } => provider_state.as_ref().map_or(0, |state| {
-            estimate_tokens(content) + estimate_tokens(&state.payload.to_string())
-        }),
+        } => {
+            estimate_tokens(content)
+                + provider_state
+                    .as_ref()
+                    .map_or(0, |state| estimate_tokens(&state.payload.to_string()))
+        }
         Message::AssistantToolCall { name, args, .. } => {
             estimate_tokens(name) + estimate_tokens(&args.to_string())
         }
@@ -375,9 +400,8 @@ pub fn render_for_summary(message: &Message) -> String {
             format!("[user] {}", content_to_summary_string(content))
         }
         Message::Assistant { content } => format!("[assistant] {content}"),
-        // Raw reasoning is not replayed to a provider by default, so it is not
-        // fed to the compaction summarizer either; the thinking summary is the
-        // separate, opt-in channel.
+        // Raw reasoning is turn-local and never replayed across turns, so it is
+        // not fed to the compaction summarizer either.
         Message::AssistantReasoning { .. } => String::new(),
         Message::AssistantToolCall { name, args, .. } => {
             format!("[assistant tool call] {name}: {args}")
@@ -1486,11 +1510,6 @@ pub struct AgentSession {
     /// The per-checkpoint source-span byte budget.
     #[serde(default = "checkpoint_span_budget_default")]
     checkpoint_span_budget: usize,
-    /// The persisted thinking summary (REQ-3). It is model-derived state, not
-    /// conversation history, so it is stored beside the messages rather than
-    /// in them; a restored session resumes the still-valid part.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    thinking: Option<react::thinking::ThinkingSnapshot>,
 }
 
 /// The current archive payload schema.
@@ -1523,9 +1542,11 @@ fn checkpoint_span_budget_default() -> usize {
 
 /// The current serialized session schema (issue #419).
 ///
-/// Generation 6 added the persisted thinking summary; older files load with
-/// `thinking: None` and keep working.
-pub const SESSION_SCHEMA_VERSION: u32 = 6;
+/// Generation 7 removed the persisted thinking summary: reasoning is
+/// turn-local, so the session no longer stores a summary beside the messages.
+/// Older files that still carry a `thinking` field load because unknown
+/// fields are ignored.
+pub const SESSION_SCHEMA_VERSION: u32 = 7;
 
 /// Timestamps and counters stored with an [`AgentSession`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1557,7 +1578,6 @@ impl AgentSession {
             archive_entries: std::collections::BTreeMap::new(),
             checkpoint_archive_budget: DEFAULT_CHECKPOINT_ARCHIVE_BYTES,
             checkpoint_span_budget: DEFAULT_CHECKPOINT_SPAN_BYTES,
-            thinking: None,
         }
     }
 
@@ -1650,16 +1670,6 @@ impl AgentSession {
         self.context = JsonValue::Null;
     }
 
-    /// The persisted thinking summary, when one was recorded.
-    pub fn thinking_snapshot(&self) -> Option<react::thinking::ThinkingSnapshot> {
-        self.thinking.clone()
-    }
-
-    /// Replace the persisted thinking summary.
-    pub fn set_thinking_snapshot(&mut self, snapshot: Option<react::thinking::ThinkingSnapshot>) {
-        self.thinking = snapshot;
-    }
-
     /// Write the session to `path` as pretty JSON.
     pub fn save(&self, path: &str) -> Result<(), std::io::Error> {
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
@@ -1738,7 +1748,6 @@ impl AgentSession {
         self.archive_entries = restored.archive_entries;
         self.checkpoint_archive_budget = restored.checkpoint_archive_budget;
         self.checkpoint_span_budget = restored.checkpoint_span_budget;
-        self.thinking = restored.thinking;
         Ok(())
     }
 
@@ -1752,7 +1761,6 @@ impl AgentSession {
         self.messages
             .retain(|msg| matches!(msg, Message::System { .. }));
         self.context = JsonValue::Null;
-        self.thinking = None;
         self.metadata.updated_at = current_timestamp();
     }
 
@@ -2483,9 +2491,12 @@ impl ContextBudget {
                     Message::AssistantReasoning {
                         content,
                         provider_state,
-                    } => provider_state.as_ref().map_or(0, |state| {
-                        estimate_tokens(content) + estimate_tokens(&state.payload.to_string())
-                    }),
+                    } => {
+                        estimate_tokens(content)
+                            + provider_state
+                                .as_ref()
+                                .map_or(0, |state| estimate_tokens(&state.payload.to_string()))
+                    }
                     Message::AssistantToolCall { name, args, .. } => {
                         let mut counts = CharCounts::default();
                         let _ =
@@ -2559,12 +2570,13 @@ impl ReactSession for AgentSession {
         self.estimate_tokens().is_some_and(|after| after < before)
     }
 
-    fn thinking_snapshot(&self) -> Option<react::thinking::ThinkingSnapshot> {
-        self.thinking.clone()
-    }
-
-    fn set_thinking_snapshot(&mut self, snapshot: Option<react::thinking::ThinkingSnapshot>) {
-        self.thinking = snapshot;
+    fn clear_reasoning(&mut self) {
+        // Reasoning is turn-local: a tool loop replays it inside the turn,
+        // never to a later turn. Keeping the transcript's display rows is the
+        // host's job; the session the engine reads must not carry them.
+        self.messages
+            .retain(|message| !matches!(message, Message::AssistantReasoning { .. }));
+        self.update_metadata();
     }
 }
 
@@ -3350,6 +3362,43 @@ mod budget_tests {
         }
     }
 
+    /// A cut that would keep a tool call but fold away the reasoning that
+    /// signed it is refused; the whole assistant group stays on one side.
+    #[test]
+    fn a_cut_never_splits_reasoning_from_the_tool_call_it_signed() {
+        let messages = vec![
+            Message::user("u1"),
+            Message::AssistantReasoning {
+                content: "the parser is the cause".to_string(),
+                provider_state: Some(react::llm::ReasoningState::new(
+                    "anthropic",
+                    serde_json::json!({ "type": "thinking", "signature": "sig" }),
+                )),
+            },
+            Message::AssistantToolCall {
+                tool_call_id: "call-1".to_string(),
+                name: "bash".to_string(),
+                args: serde_json::json!({}),
+            },
+            Message::ToolResult {
+                tool_call_id: "call-1".to_string(),
+                content: "ok".to_string(),
+            },
+        ];
+        assert!(
+            !cut_is_balanced(&messages, 2),
+            "a cut before the tool call may not drop its reasoning"
+        );
+        assert!(
+            cut_is_balanced(&messages, 1),
+            "a cut before the reasoning is balanced"
+        );
+        assert!(
+            cut_is_balanced(&messages, 4),
+            "a cut after the tool result is balanced"
+        );
+    }
+
     /// The selection keeps a priced tail: a larger budget keeps more, and the
     /// boundary never reaches into the retained tail.
     #[test]
@@ -4049,43 +4098,21 @@ mod budget_tests {
     }
 
     #[test]
-    fn a_thinking_snapshot_survives_save_and_restore() {
-        use react::thinking::{ThinkingConfidence, ThinkingDecision, ThinkingOrigin};
-
-        let mut session = AgentSession::new();
-        let mut snapshot = react::thinking::ThinkingSnapshot::new(1);
-        snapshot.summary.phase = react::thinking::ThinkingPhase::Implementing;
-        snapshot.summary.decisions.push(ThinkingDecision {
-            statement: "reuse the coordinated store".to_string(),
-            rationale: Some("it already serializes writers".to_string()),
-            kind: react::thinking::ThinkingDecisionKind::Claim,
-            confidence: ThinkingConfidence::Verified,
-            origin: ThinkingOrigin::ToolResult,
-            evidence: vec!["memory tests succeeded at step 2".to_string()],
-            step: 2,
-            active: true,
-            superseded_by: None,
-        });
-        session.set_thinking_snapshot(Some(snapshot.clone()));
-
-        let json = session.to_json_string().expect("serializes");
-        let mut restored = AgentSession::new();
-        restored.restore_from_json(&json).expect("restores");
-        assert_eq!(restored.thinking_snapshot(), Some(snapshot));
-    }
-
-    #[test]
-    fn a_session_without_a_thinking_field_still_loads() {
+    fn an_older_session_with_a_thinking_field_still_loads() {
         let mut session = AgentSession::new();
         session.add_user("hello".to_string());
         let mut value: serde_json::Value =
             serde_json::from_str(&session.to_json_string().expect("serializes"))
                 .expect("valid json");
-        value.as_object_mut().expect("object").remove("thinking");
+        value.as_object_mut().expect("object").insert(
+            "thinking".to_string(),
+            serde_json::json!({ "schema": 3, "summary": { "turn": 1 } }),
+        );
         let mut restored = AgentSession::new();
         restored
             .restore_from_json(&value.to_string())
-            .expect("the older file loads");
-        assert!(restored.thinking_snapshot().is_none());
+            .expect("an older file with the removed field loads");
+        assert_eq!(restored.messages().len(), 1);
+        assert_eq!(restored.schema_version, SESSION_SCHEMA_VERSION);
     }
 }

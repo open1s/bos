@@ -358,9 +358,6 @@ pub struct AgentConfig {
   /// Run one response's tool calls concurrently.
   #[napi(js_name = "parallelToolCalls")]
   pub parallel_tool_calls: Option<bool>,
-  /// Enable the thinking-summary context in the ReAct loop.
-  #[napi(js_name = "thinkingContext")]
-  pub thinking_context: Option<bool>,
   /// Offer the model the provider's hosted web-search tool.
   #[napi(js_name = "webSearch")]
   pub web_search: Option<bool>,
@@ -401,7 +398,6 @@ impl Default for AgentConfig {
       compaction_input_tokens: None,
       tool_output_cap: None,
       parallel_tool_calls: None,
-      thinking_context: None,
       web_search: None,
       fallbacks: None,
       context_budget: None,
@@ -518,7 +514,6 @@ impl From<AgentConfig> for agent::AgentConfig {
         .unwrap_or_else(|| agent::AgentConfig::default().compaction_input_tokens),
       tool_output_cap: value.tool_output_cap.map(|v| v as usize).unwrap_or(0),
       parallel_tool_calls: value.parallel_tool_calls.unwrap_or(false),
-      thinking_context: value.thinking_context.unwrap_or(true),
       web_search: value.web_search.unwrap_or(false),
       api_mode: value.api_mode.unwrap_or_else(|| "chat".to_string()),
       reasoning_effort: value.reasoning_effort,
@@ -726,7 +721,6 @@ impl Agent {
         "compaction_input_tokens": cfg.compaction_input_tokens,
         "tool_output_cap": cfg.tool_output_cap,
         "parallel_tool_calls": cfg.parallel_tool_calls,
-        "thinking_context": cfg.thinking_context,
         "web_search": cfg.web_search,
         "api_mode": cfg.api_mode,
         "reasoning_effort": cfg.reasoning_effort,

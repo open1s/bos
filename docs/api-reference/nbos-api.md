@@ -123,7 +123,6 @@ AgentBuilder(bus, options=None)
 | `with_compaction_input_tokens(tokens)` | Cap one compaction request's input | `AgentBuilder` |
 | `with_tool_output_cap(bytes_cap)` | Cap the text one tool result may add to the context | `AgentBuilder` |
 | `with_parallel_tool_calls(enabled=True)` | Run one response's tool calls concurrently | `AgentBuilder` |
-| `with_thinking_context(enabled=True)` | Enable or disable the thinking-summary context (on by default) | `AgentBuilder` |
 | `with_web_search(enabled=True)` | Offer the provider's hosted web-search tool | `AgentBuilder` |
 | `with_context_budget(tokens)` | Set the send-side history ceiling for mid-turn compaction | `AgentBuilder` |
 | `with_skill_catalogue(enabled=True)` | Advertise skills as a catalogue instead of searching | `AgentBuilder` |
@@ -402,7 +401,6 @@ config.max_retries = 3
 | `compaction_input_tokens` | 24000 | Token ceiling for one compaction request |
 | `tool_output_cap` | 0 | Bytes one tool result may add (0 keeps the engine default) |
 | `parallel_tool_calls` | `False` | Run one response's tool calls concurrently |
-| `thinking_context` | `True` | Extract, persist and inject the thinking summary |
 | `web_search` | `False` | Offer the provider's hosted web-search tool (Responses only) |
 | `context_budget` | `None` | Send-side history ceiling for mid-turn compaction |
 | `skill_catalogue` | `None` | Advertise skills as a catalogue instead of searching |

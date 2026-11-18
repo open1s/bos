@@ -104,6 +104,14 @@ pub struct Delta {
     pub function_call: Option<FunctionCallDelta>,
     /// A fragment of reasoning text.
     pub reasoning_content: Option<String>,
+    /// Reasoning text under OpenRouter's field name (input alias is
+    /// `reasoning_content`, the response field is `reasoning`).
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    /// OpenRouter's opaque reasoning blocks. Preserved verbatim so the same
+    /// turn's tool loop can replay the provider state it produced.
+    #[serde(default)]
+    pub reasoning_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,6 +168,32 @@ pub struct ChatMessage {
     /// Any additional provider fields.
     #[serde(flatten)]
     pub extra: serde_json::Value,
+}
+
+impl ChatMessage {
+    /// The reasoning text this response carried, under either field name.
+    pub fn reasoning_text(&self) -> Option<&str> {
+        self.reasoning_content.as_deref().or_else(|| {
+            self.extra
+                .get("reasoning")
+                .and_then(serde_json::Value::as_str)
+        })
+    }
+
+    /// OpenRouter's structured reasoning blocks, when the response carried them.
+    pub fn reasoning_details(&self) -> Option<&serde_json::Value> {
+        self.extra
+            .get("reasoning_details")
+            .filter(|value| !value.is_null())
+    }
+
+    /// Opaque state a non-OpenAI adapter attached to this message after
+    /// decoding (Anthropic's thinking signature).
+    pub fn attached_reasoning_state(&self) -> Option<crate::llm::ReasoningState> {
+        self.extra
+            .get("_bos_reasoning_state")
+            .map(|payload| crate::llm::ReasoningState::new("anthropic", payload.clone()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

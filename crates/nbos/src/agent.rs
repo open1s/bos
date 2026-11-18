@@ -652,9 +652,6 @@ pub struct PyAgentConfig {
     /// Run one response's tool calls concurrently.
     #[pyo3(get, set)]
     pub parallel_tool_calls: bool,
-    /// Enable the thinking-summary context in the ReAct loop.
-    #[pyo3(get, set)]
-    pub thinking_context: bool,
     /// Offer the model the provider's hosted web-search tool.
     #[pyo3(get, set)]
     pub web_search: bool,
@@ -695,7 +692,6 @@ impl Default for PyAgentConfig {
             compaction_input_tokens: c.compaction_input_tokens,
             tool_output_cap: c.tool_output_cap,
             parallel_tool_calls: c.parallel_tool_calls,
-            thinking_context: c.thinking_context,
             web_search: c.web_search,
             fallbacks: Vec::new(),
             context_budget: None,
@@ -751,7 +747,6 @@ impl From<PyAgentConfig> for AgentConfig {
             compaction_input_tokens: value.compaction_input_tokens,
             tool_output_cap: value.tool_output_cap,
             parallel_tool_calls: value.parallel_tool_calls,
-            thinking_context: value.thinking_context,
             web_search: value.web_search,
             api_mode: value.api_mode,
             reasoning_effort: value.reasoning_effort,
@@ -785,7 +780,6 @@ impl PyAgentConfig {
         timeout_secs = None,
         api_mode = None,
         reasoning_effort = None,
-        thinking_context = None,
     ))]
     fn new(
         name: Option<String>,
@@ -798,7 +792,6 @@ impl PyAgentConfig {
         timeout_secs: Option<u64>,
         api_mode: Option<String>,
         reasoning_effort: Option<String>,
-        thinking_context: Option<bool>,
     ) -> Self {
         let mut cfg = Self::default();
         if let Some(v) = name {
@@ -830,9 +823,6 @@ impl PyAgentConfig {
         }
         if let Some(v) = reasoning_effort {
             cfg.reasoning_effort = Some(v);
-        }
-        if let Some(v) = thinking_context {
-            cfg.thinking_context = v;
         }
         cfg
     }
@@ -1499,10 +1489,6 @@ impl PyAgent {
         map.insert(
             "parallel_tool_calls".to_string(),
             serde_json::Value::Bool(cfg.parallel_tool_calls),
-        );
-        map.insert(
-            "thinking_context".to_string(),
-            serde_json::Value::Bool(cfg.thinking_context),
         );
         map.insert(
             "web_search".to_string(),

@@ -566,8 +566,6 @@
 "settings.presetDefault": "Default (no preset)"
 "settings.parallelToolCalls": "Parallel tool calls"
 "settings.parallelToolCallsHint": "One assistant turn's tool calls run at the same time instead of one after another. Off keeps the order a sequential batch always had."
-"settings.thinkingContext": "Thinking context"
-"settings.thinkingContextHint": "Inject a compact summary of the model's decisions, open questions and next action into later requests. It is derived from reasoning and tool results and is never added to the conversation history."
 "settings.modelCatalog": "Customized model catalog"
 "settings.modelCatalogHint": "Each model ID may appear once."
 "settings.addModel": "Add model"

@@ -60,6 +60,10 @@ pub struct ResponsesRequest {
     /// Reasoning configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponsesReasoning>,
+    /// Opt-in output items. `reasoning.encrypted_content` is what makes a
+    /// reasoning item replayable when the provider does not store it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
     /// Whether to stream the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
@@ -75,6 +79,10 @@ pub struct ResponsesReasoning {
     /// Requested reasoning effort.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<crate::llm::ReasoningEffort>,
+    /// Ask for a generated summary (`auto`), otherwise the wire returns no
+    /// readable reasoning text at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -101,6 +109,15 @@ pub enum ResponsesInputItem {
         /// Opaque encrypted reasoning payload, when the provider returned one.
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
+        /// Reasoning text parts, preserved verbatim.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<Vec<Value>>,
+        /// Reasoning summary parts, preserved verbatim.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<Vec<Value>>,
+        /// Reasoning signature (Anthropic-style providers behind OpenRouter).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     /// A function call made by the model.
     #[serde(rename = "function_call")]
@@ -270,6 +287,12 @@ pub enum ResponsesItem {
         /// Reasoning summary parts.
         #[serde(default)]
         summary: Vec<ResponsesReasoningSummary>,
+        /// Reasoning text parts (DeepSeek / OpenRouter).
+        #[serde(default)]
+        content: Vec<ResponsesReasoningContent>,
+        /// Reasoning signature (Anthropic-style providers behind OpenRouter).
+        #[serde(default)]
+        signature: Option<String>,
     },
     /// A hosted web-search call.
     #[serde(rename = "web_search_call")]
@@ -301,6 +324,14 @@ pub enum ResponsesItem {
 /// A summary of a reasoning item.
 pub struct ResponsesReasoningSummary {
     /// Summary text.
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A reasoning-text part of a reasoning item.
+pub struct ResponsesReasoningContent {
+    /// Text of the part.
     #[serde(default)]
     pub text: String,
 }
@@ -416,12 +447,12 @@ fn reasoning_state_from_item(item: &Value) -> Option<crate::llm::ReasoningState>
     if id.is_empty() && encrypted.is_none() {
         return None;
     }
+    // Preserve the whole item: id, encrypted_content, content, summary and
+    // signature are all part of the state a later turn of this same tool loop
+    // may need to replay verbatim.
     Some(crate::llm::ReasoningState::new(
         "openai-responses",
-        serde_json::json!({
-            "id": id,
-            "encrypted_content": encrypted,
-        }),
+        item.clone(),
     ))
 }
 
@@ -457,12 +488,22 @@ fn build_input(history: Option<&[LlmMessage]>, input: &Content) -> Vec<Responses
                     provider_state: Some(state),
                     ..
                 } if state.provider == "openai-responses" => {
-                    if let Some(id) = state.payload.get("id").and_then(Value::as_str) {
+                    let payload = &state.payload;
+                    if let Some(id) = payload
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    {
                         items.push(ResponsesInputItem::Reasoning {
                             id: id.to_string(),
-                            encrypted_content: state
-                                .payload
+                            encrypted_content: payload
                                 .get("encrypted_content")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            content: payload.get("content").and_then(Value::as_array).cloned(),
+                            summary: payload.get("summary").and_then(Value::as_array).cloned(),
+                            signature: payload
+                                .get("signature")
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
                         });
@@ -603,6 +644,7 @@ pub fn build_request(
     context: &impl ReactContext,
     stream: bool,
     parallel_tool_calls: bool,
+    allow_reasoning_state: bool,
 ) -> ResponsesRequest {
     let tools = serialize_tools(
         req.provider_request
@@ -654,7 +696,12 @@ pub fn build_request(
         max_output_tokens: req.max_tokens,
         reasoning: req.reasoning_effort.map(|effort| ResponsesReasoning {
             effort: Some(effort),
+            // Only providers that implement OpenAI's summary/encrypted-item
+            // extensions receive these fields; a strict compatible endpoint
+            // that does not is left with the effort alone.
+            summary: allow_reasoning_state.then(|| "auto".to_string()),
         }),
+        include: allow_reasoning_state.then(|| vec!["reasoning.encrypted_content".to_string()]),
         stream: Some(stream),
         parallel_tool_calls: parallel,
     }
@@ -960,6 +1007,14 @@ impl ResponsesTransport {
         }
     }
 
+    /// Whether this endpoint implements OpenAI's summary / encrypted-item
+    /// extensions. A strict compatible endpoint only gets the effort field.
+    fn allows_reasoning_state(&self) -> bool {
+        self.endpoint.contains("api.openai.com")
+            || self.endpoint.contains("openai.azure.com")
+            || self.endpoint.contains("openrouter.ai")
+    }
+
     /// Allow (or forbid) several tool calls in one provider response.
     pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
         self.parallel_tool_calls = parallel;
@@ -987,6 +1042,7 @@ impl ResponsesTransport {
             context,
             false,
             self.parallel_tool_calls,
+            self.allows_reasoning_state(),
         );
 
         let url = format!("{}/responses", self.endpoint);
@@ -1070,6 +1126,7 @@ impl ResponsesTransport {
             context,
             true,
             self.parallel_tool_calls,
+            self.allows_reasoning_state(),
         );
 
         let url = format!("{}/responses", self.endpoint);
@@ -1146,8 +1203,13 @@ impl ResponsesTransport {
                                     let _ = tx.send(Ok(StreamToken::ReasoningContent(delta))).await;
                                 }
                             }
-                            ResponsesStreamEvent::OutputItemAdded { item, .. }
-                            | ResponsesStreamEvent::OutputItemDone { item, .. } => {
+                            ResponsesStreamEvent::OutputItemAdded { item, .. } => {
+                                // The added event has the id but not the text
+                                // yet; emitting its state here would close an
+                                // empty block before the summary deltas arrive.
+                                func_calls.add_item(&item);
+                            }
+                            ResponsesStreamEvent::OutputItemDone { item, .. } => {
                                 if let Some(state) = reasoning_state_from_item(&item) {
                                     let _ = tx.send(Ok(StreamToken::ReasoningState(state))).await;
                                 }
@@ -1322,12 +1384,12 @@ mod tests {
         };
         let session = LlmSession::new();
         let req = LlmRequest::new("m");
-        let built = build_request(None, &req, &session, &context, false, true);
+        let built = build_request(None, &req, &session, &context, false, true, true);
         assert_eq!(built.parallel_tool_calls, Some(true));
-        let built = build_request(None, &req, &session, &context, false, false);
+        let built = build_request(None, &req, &session, &context, false, false, true);
         assert_eq!(built.parallel_tool_calls, Some(false));
         let bare = LlmContext::default();
-        let built = build_request(None, &req, &session, &bare, false, true);
+        let built = build_request(None, &req, &session, &bare, false, true, true);
         assert_eq!(built.parallel_tool_calls, None);
     }
 
@@ -1371,6 +1433,7 @@ mod tests {
                 ResponsesInputItem::Reasoning {
                     id,
                     encrypted_content: Some(content),
+                    ..
                 } if id == "rs_1" && content == "opaque"
             )),
             "the provider state replays: {items:?}"
@@ -1405,6 +1468,39 @@ mod tests {
     }
 
     #[test]
+    fn responses_replays_content_summary_and_signature_verbatim() {
+        use crate::llm::{Content, LlmMessage, ReasoningState};
+        let content = vec![serde_json::json!({ "type": "reasoning_text", "text": "chain" })];
+        let summary = vec![serde_json::json!({ "type": "summary_text", "text": "short" })];
+        let history = vec![LlmMessage::AssistantReasoning {
+            content: "chain".to_string(),
+            provider_state: Some(ReasoningState::new(
+                "openai-responses",
+                serde_json::json!({
+                    "id": "rs_1",
+                    "content": content.clone(),
+                    "summary": summary.clone(),
+                    "signature": "sig",
+                }),
+            )),
+        }];
+        let items = build_input(Some(&history), &Content::text("next"));
+        match &items[0] {
+            ResponsesInputItem::Reasoning {
+                content: replayed_content,
+                summary: replayed_summary,
+                signature,
+                ..
+            } => {
+                assert_eq!(replayed_content.as_ref(), Some(&content));
+                assert_eq!(replayed_summary.as_ref(), Some(&summary));
+                assert_eq!(signature.as_deref(), Some("sig"));
+            }
+            other => panic!("expected a reasoning item, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_request_maps_history_and_hosted_tools() {
         let session = session_with_history();
         let context = context_with_tools();
@@ -1424,7 +1520,7 @@ mod tests {
             context_blocks: Vec::new(),
         };
 
-        let built = build_request(None, &req, &session, &context, false, true);
+        let built = build_request(None, &req, &session, &context, false, true, true);
 
         assert_eq!(built.model, "gpt-5");
         assert_eq!(built.max_output_tokens, Some(100));
@@ -1436,8 +1532,12 @@ mod tests {
         );
         let wire = serde_json::to_string(&built).unwrap();
         assert!(
-            wire.contains("\"reasoning\":{\"effort\":\"high\"}"),
-            "wire format must nest effort under reasoning: {wire}"
+            wire.contains("\"reasoning\":{\"effort\":\"high\",\"summary\":\"auto\"}"),
+            "wire format must nest effort and the summary request: {wire}"
+        );
+        assert!(
+            wire.contains("\"include\":[\"reasoning.encrypted_content\"]"),
+            "the request must ask for replayable reasoning state: {wire}"
         );
         assert!(
             built
@@ -1513,7 +1613,7 @@ mod tests {
         let mut req = LlmRequest::new("gpt-5");
         req.input = Content::text("hi");
 
-        let built = build_request(None, &req, &session, &context, false, true);
+        let built = build_request(None, &req, &session, &context, false, true, true);
 
         assert_eq!(built.input.len(), 1);
         match &built.input[0] {
@@ -1711,6 +1811,7 @@ mod tests {
             &LlmContext::default(),
             false,
             true,
+            true,
         );
         let instructions = built.instructions.expect("instructions");
         let host = instructions.find("HOST POLICY").expect("host policy");
@@ -1762,6 +1863,7 @@ mod tests {
             &LlmSession::new(),
             &LlmContext::default(),
             false,
+            true,
             true,
         );
         let instructions = built.instructions.as_deref().expect("instructions");

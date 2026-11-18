@@ -1,7 +1,5 @@
 //! Provider-agnostic responses and streamed tokens.
 
-//! Provider-agnostic responses and streamed tokens.
-
 use crate::telemetry::TokenUsage;
 use futures::Stream;
 use serde::Serialize;

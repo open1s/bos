@@ -56,12 +56,6 @@ pub struct TomlAgentConfig {
     /// Optional reasoning effort for reasoning models.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-    /// Enable the thinking-summary context in the ReAct loop.
-    ///
-    /// Absent keeps the engine default (on), so an older TOML file is
-    /// unchanged until it opts out.
-    #[serde(default = "default_thinking_context")]
-    pub thinking_context: bool,
     /// Optional tool declarations.
     #[serde(default)]
     pub tools: Option<Vec<TomlToolRef>>,
@@ -77,10 +71,6 @@ fn default_temperature() -> f32 {
 
 fn default_timeout() -> u64 {
     60
-}
-
-fn default_thinking_context() -> bool {
-    true
 }
 
 impl From<TomlAgentConfig> for AgentConfig {
@@ -109,7 +99,6 @@ impl From<TomlAgentConfig> for AgentConfig {
             // the fields on the AgentConfig it builds directly.
             web_search: false,
             parallel_tool_calls: false,
-            thinking_context: t.thinking_context,
             api_mode: t.api_mode.unwrap_or_default(),
             reasoning_effort: t.reasoning_effort,
             circuit_breaker: None,
@@ -250,34 +239,6 @@ pub fn apply_model_defaults(config: &mut AgentConfig) {
 mod tests {
     use super::*;
     use crate::agent::AgentConfig;
-
-    #[test]
-    fn thinking_context_defaults_on_and_can_be_disabled_in_toml() {
-        assert!(AgentConfig::default().thinking_context);
-        assert!(
-            !AgentConfig::default()
-                .thinking_context(false)
-                .thinking_context
-        );
-
-        let base = r#"
-name = "a"
-model = "m"
-base_url = "u"
-api_key = "k"
-"#;
-        let legacy: TomlAgentConfig = toml::from_str(base).expect("legacy TOML loads");
-        assert!(
-            legacy.thinking_context,
-            "an absent switch keeps the default"
-        );
-
-        let disabled: TomlAgentConfig =
-            toml::from_str(&format!("{base}\nthinking_context = false\n"))
-                .expect("the switch parses");
-        let config: AgentConfig = disabled.into();
-        assert!(!config.thinking_context);
-    }
 
     #[test]
     fn applies_model_defaults_by_exact_model_match() {

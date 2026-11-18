@@ -18,10 +18,6 @@ pub use crate::telemetry::{
 pub use crate::template::{
     render_template, with_memory, PromptTemplate, TemplateError, MEMORY_PLACEHOLDER,
 };
-pub use crate::thinking::{
-    ThinkingConfidence, ThinkingDecision, ThinkingPhase, ThinkingSnapshot, ThinkingState,
-    ThinkingSummary,
-};
 pub use crate::tool::{Tool, ToolError, ToolRegistry};
 pub use crate::utils::Arena as StreamArena;
 pub use crate::utils::Span as StreamSpan;

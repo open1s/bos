@@ -4050,17 +4050,6 @@ impl AppState {
                         note_first_output(message, at);
                     }
                 }
-                AgentEvent::ReasoningState(state) => {
-                    if let Some(message) = session.messages.last_mut() {
-                        let states = &mut message
-                            .meta
-                            .get_or_insert_with(MessageMeta::default)
-                            .reasoning_states;
-                        if !states.contains(&state) {
-                            states.push(state);
-                        }
-                    }
-                }
                 AgentEvent::ToolCall { name, args } => {
                     if let Some(message) = session.messages.last_mut() {
                         message.tools.push(ToolEvent {
@@ -5170,11 +5159,6 @@ impl AppState {
     /// Turn concurrent tool dispatch for one assistant turn on or off.
     pub(crate) fn set_parallel_tool_calls(&mut self, parallel: bool) {
         self.draft_mut().workspace.agent.parallel_tool_calls = parallel;
-    }
-
-    /// Turn the thinking-summary context on or off for the next build.
-    pub(crate) fn set_thinking_context(&mut self, enabled: bool) {
-        self.draft_mut().workspace.agent.thinking_context = enabled;
     }
 
     /// Make one preset the default a session takes when it names none.
@@ -7269,13 +7253,6 @@ mod tests {
             id = state.active_id.clone().expect("a session");
             state.begin_turn_in(&id, "hello").expect("a turn opens");
             state.apply_event(&id, crate::runner::AgentEvent::Reasoning("weigh it".into()));
-            let kept = react::llm::ReasoningState::new(
-                "anthropic",
-                serde_json::json!({ "type": "thinking", "signature": "sig-1" }),
-            );
-            state.apply_event(&id, crate::runner::AgentEvent::ReasoningState(kept.clone()));
-            // A retried state event must not duplicate the block.
-            state.apply_event(&id, crate::runner::AgentEvent::ReasoningState(kept.clone()));
             state.apply_event(&id, crate::runner::AgentEvent::Text("the answer".into()));
             state.stop(&id);
             let session = state.store.session(&id).expect("the session");
@@ -7285,13 +7262,8 @@ mod tests {
                 .find(|message| !message.reasoning.is_empty())
                 .expect("the reasoning row");
             assert_eq!(
-                reasoning
-                    .meta
-                    .as_ref()
-                    .map(|meta| meta.reasoning_states.as_slice())
-                    .unwrap_or_default(),
-                std::slice::from_ref(&kept),
-                "the provider state is kept once"
+                reasoning.reasoning, "weigh it",
+                "the reasoning text is kept for the transcript"
             );
             assert!(
                 session

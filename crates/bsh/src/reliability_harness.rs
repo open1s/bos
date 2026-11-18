@@ -826,6 +826,7 @@ fn scenario_provider_request_consistency() -> Result<ScenarioEvidence, HarnessFa
         &LlmContext::default(),
         false,
         true,
+        true,
     );
     let responses =
         serde_json::to_value(responses).map_err(|error| functional(error.to_string()))?;

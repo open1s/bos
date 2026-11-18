@@ -5,6 +5,17 @@ react session keeps it as a separate `LlmMessage::AssistantReasoning` variant so
 the semantic boundary between thinking and the answer survives, and so provider
 adapters can decide what (if anything) to put back on the wire.
 
+## Turn-local rule
+
+Reasoning belongs to the turn that produced it. A tool loop inside that turn
+must replay the reasoning blocks the same provider emitted (Anthropic's signed
+thinking, a Responses reasoning item, DeepSeek's `reasoning_content`); a later
+turn must never receive them. The engine drops every prior-turn
+`AssistantReasoning` before a turn's first request
+(`ReactSession::clear_reasoning`), and BSH does not seed reasoning from the
+transcript at all. There is no persisted thinking summary: the old
+`thinking_context` feature and its `ThinkingSnapshot` are gone.
+
 ## Message contract
 
 ~~~rust
@@ -17,98 +28,45 @@ pub enum LlmMessage {
 }
 
 pub struct ReasoningState {
-    pub provider: String,   // "anthropic", "openai-responses", ...
+    pub provider: String,   // "anthropic", "openai-responses", "openai-chat"
     pub payload: Value,     // opaque provider payload, preserved verbatim
 }
 ~~~
 
 `content` is the raw reasoning text. `provider_state` is optional: a protocol
-that signs or encrypts reasoning state (Anthropic thinking signatures, Responses
-reasoning items) puts its opaque payload there. The engine stores both; it never
-rewrites either.
+that signs or encrypts reasoning state puts its opaque payload there. One
+message carries one provider block; the engine accumulates a block at a time so
+several signed / redacted / encrypted blocks keep their own state.
 
-## Replay policy
+## Replay policy (inside the turn only)
 
-| Item | Sent to the next LLM? |
-|---|---|
-| Normal `Assistant` text | Yes, according to the conversation-history policy |
-| Model-returned `AssistantReasoning` | Not by default |
-| Provider-required reasoning state | Only by the adapter that recognizes its own `provider` |
-| Thinking summary | `Assistant`-role context on demand; never a system message |
+| Provider wire | What is replayed | Field / item |
+|---|---|---|
+| OpenAI Chat Completions | nothing | none |
+| DeepSeek Chat Completions | the turn's reasoning text | `reasoning_content` on the assistant row |
+| OpenRouter Chat Completions | text + structured details | `reasoning` + `reasoning_details` |
+| Anthropic Messages | signed thinking and redacted thinking | `thinking` / `redacted_thinking` blocks |
+| OpenAI / DeepSeek Responses | the reasoning item, verbatim | `reasoning` input item (id, encrypted_content, content, summary, signature) |
 
-| Context source | Wire role | Precedence | Trust | Framing |
-|---|---|---|---|---|
-| Thinking summary | `assistant` | Medium | non-authoritative | `<execution_context source="thinking-summary" trust="non-authoritative" precedence="medium">` |
-| Retrieved memory | `user` | Medium | untrusted-data | `<untrusted_context source="retrieved-memory" trust="untrusted-data" precedence="medium">` |
-| Quoted/untrusted content | `user` | Low | untrusted-data | `<untrusted_context ... precedence="low">` |
+Anthropic extended thinking is requested from the reader's effort level:
+`low` / `medium` / `high` map to a `budget_tokens` and the completion cap is
+raised above it. The Responses request asks for `reasoning.summary = "auto"`
+and `include: ["reasoning.encrypted_content"]` so the item is replayable.
 
-The four priorities are `Highest`, `High`, `Medium`, `Low`. Role says who
-the message belongs to, precedence says which side wins a conflict, and trust says
-how far the content can be believed; the three are independent. `System` is
-Highest; the current user request is High; normal assistant history, the
-thinking summary and retrieved memory are Medium; raw reasoning and tool traffic
-are Low.
-
-The summary is assistant-side task-continuation state, not raw reasoning and not
-policy. Retrieved memory is historical reader-side data, not a new request. Both
-are framed immediately before the current input and never enter the system
-prompt. A summary does not use `AssistantReasoning`; that type remains reserved
-for provider-native reasoning blocks.
-
-The default is deliberate: the Chat Completions adapter skips
-`AssistantReasoning` entirely. A provider switch therefore cannot replay an
-Anthropic signature into an OpenAI-compatible endpoint or vice versa.
-
-## Adapter mapping
-
-- **Chat Completions / DeepSeek / OpenAI-compatible**
-  - Reasoning is history-only. No `reasoning_content` is written back.
-- **Anthropic Messages**
-  - A message with `provider: "anthropic"` and
-    `payload.type == "thinking"` replays as a `thinking` block with its
-    signature.
-  - `payload.type == "redacted_thinking"` replays as a `redacted_thinking`
-    block.
-  - Consecutive assistant blocks are merged into one assistant message, so a
-    thinking block and its `tool_use` blocks stay in the same turn.
-  - Reasoning without a signature is not sent; a signature cannot be invented.
-- **OpenAI Responses**
-  - A message with `provider: "openai-responses"` and a payload `id` replays as
-    a `reasoning` input item, carrying `encrypted_content` when present.
-  - Visible reasoning without Responses state is history-only.
+A provider switch cannot replay one vendor's state into another: the engine
+clears prior turns before every request, so only the current turn's blocks are
+ever serialized, and it was produced by the provider this turn is talking to.
 
 ## Where it is captured
 
-- **Non-streaming**: `message.reasoning_content` is pushed as
-  `AssistantReasoning` before the assistant text.
-- **Streaming**: reasoning chunks accumulate per step; a
-  `StreamToken::ReasoningState` carries the provider's opaque state. At the step
-  boundary the engine pushes one `AssistantReasoning` message, before the
-  visible text and tool calls, then clears both buffers.
-- **Anthropic SSE**: `signature_delta` and `redacted_thinking` blocks emit
-  `ReasoningState`.
-- **Responses SSE**: reasoning `output_item.added`/`done` events emit
-  `ReasoningState` when they carry an item id or encrypted content.
-- **BSH transcript**: `AgentEvent::ReasoningState` persists the states in
-  `MessageMeta.reasoning_states`. `Runner::seed_session` splits the reasoning
-  text by its `TurnPart::Thinking` lengths and replays one `AssistantReasoning`
-  per block, each with its own state, before the assistant text.
-
-## Existing behaviour preserved
-
-- Reasoning is still streamed to the reader as `StreamToken::ReasoningContent`.
-- Thinking summaries remain a separate, optional context channel.
-- The engine's token estimate counts reasoning only when provider state is
-  present, because that is the only case an adapter may send it.
-- Compaction does not feed raw reasoning to the summarizer; deriving a compact
-  summary is the thinking-summary feature's job, not a license to replay the
-  chain of thought.
-
-## Timeline pairing
-
-The BSH transcript stores the reasoning text once and its provider states in
-`MessageMeta.reasoning_states`. The `TurnPart::Thinking` lengths split the text
-back into blocks, so a turn with several signed thinking blocks replays each
-block with its own signature. An older row with no timeline replays its whole
-reasoning text with the first state; the transcript never invents a block the
-provider did not produce.
+- **Non-streaming**: `message.reasoning_content` / `reasoning` is pushed as
+  `AssistantReasoning` before the assistant text; an Anthropic signature arrives
+  in the message extension and is attached as `ReasoningState`.
+- **Streaming**: reasoning chunks accumulate per block. A
+  `StreamToken::ReasoningState` closes the block (Anthropic's
+  `signature_delta`, a Responses `output_item.done`); a state with no text is
+  its own block (redacted thinking). The engine pushes one
+  `AssistantReasoning` per block, before the visible text and tool calls.
+- **BSH transcript**: reasoning text and its display timeline (`TurnPart`) are
+  stored for the reader. No provider state is persisted or replayed: the next
+  turn seeds only the user/assistant text and the tool traffic.

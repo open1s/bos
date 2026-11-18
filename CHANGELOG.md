@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **Reasoning is turn-local; the thinking-summary channel is removed.**
+  `AssistantReasoning` blocks may be replayed only inside the turn that
+  produced them: a tool loop sends them back (DeepSeek `reasoning_content`,
+  OpenRouter `reasoning`/`reasoning_details`, Anthropic signed
+  thinking/redacted thinking, Responses reasoning items with content,
+  summary, signature and encrypted content). Every turn starts by clearing the
+  previous turn's reasoning and provider state, and BSH no longer seeds
+  reasoning from the transcript, so no chain of thought crosses a turn. The
+  `thinking_context` setting, `ThinkingSnapshot`, summary extraction and the
+  `thinking-summary` context block are gone. Anthropic now requests extended
+  thinking from the reader's effort level, and Responses asks for the summary
+  and encrypted reasoning item where the endpoint implements those extensions.
+
 ## v4.1.19 (2026-11-18)
 
 - **An ask_user answer steers the running turn instead of queueing.** Clicking

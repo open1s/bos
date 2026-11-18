@@ -642,7 +642,6 @@ class AgentBuilder {
       compactionInputTokens: options.compactionInputTokens,
       toolOutputCap: options.toolOutputCap,
       parallelToolCalls: options.parallelToolCalls,
-      thinkingContext: options.thinkingContext,
       webSearch: options.webSearch,
       contextBudget: options.contextBudget,
       skillCatalogue: options.skillCatalogue,
@@ -675,9 +674,6 @@ class AgentBuilder {
     if (config.toolOutputCap !== undefined) this._config.toolOutputCap = config.toolOutputCap;
     if (config.parallelToolCalls !== undefined) {
       this._config.parallelToolCalls = config.parallelToolCalls;
-    }
-    if (config.thinkingContext !== undefined) {
-      this._config.thinkingContext = config.thinkingContext;
     }
     if (config.webSearch !== undefined) this._config.webSearch = config.webSearch;
     if (config.contextBudget !== undefined) this._config.contextBudget = config.contextBudget;
@@ -771,11 +767,6 @@ class AgentBuilder {
 
   parallelToolCalls(enabled = true) {
     this._config.parallelToolCalls = enabled;
-    return this;
-  }
-
-  thinkingContext(enabled = true) {
-    this._config.thinkingContext = enabled;
     return this;
   }
 

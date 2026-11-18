@@ -7,6 +7,7 @@ use crate::llm::{
     VendorBuilderError,
 };
 
+use super::openai::ReasoningReplay;
 use super::OpenAiVendor;
 
 /// DeepSeek vendor. DeepSeek's API is OpenAI-compatible on both protocols:
@@ -30,7 +31,11 @@ impl DeepSeekVendor {
     /// Create a DeepSeek vendor with an explicit endpoint, model, and key.
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
         Self {
-            inner: OpenAiVendor::new(endpoint, model, api_key),
+            // DeepSeek's thinking mode requires the turn's reasoning_content
+            // back once tools are in play; the engine only keeps the current
+            // turn's blocks, so this never crosses a turn.
+            inner: OpenAiVendor::new(endpoint, model, api_key)
+                .with_reasoning_replay(ReasoningReplay::Content),
         }
     }
 

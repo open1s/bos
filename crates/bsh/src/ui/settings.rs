@@ -7928,23 +7928,6 @@ impl Shell {
                     ),
                 )
             },
-            {
-                let on = self.state.draft().workspace.agent.thinking_context;
-                self.preference_row(
-                    "settings.thinkingContext",
-                    Some("settings.thinkingContextHint"),
-                    self.switch(
-                        "thinking-context",
-                        on,
-                        true,
-                        |shell, next, cx| {
-                            shell.state.set_thinking_context(next);
-                            cx.notify();
-                        },
-                        cx,
-                    ),
-                )
-            },
         ];
         // The persona contract shapes the request, so it sits with the numbers
         // above it and the switches follow. It also keeps the primary behaviour
