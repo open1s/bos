@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v4.1.19 (2026-11-18)
 
 - **An ask_user answer steers the running turn instead of queueing.** Clicking
   a question option, or typing the answer, now pushes the choice into the live
