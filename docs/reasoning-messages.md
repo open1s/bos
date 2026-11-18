@@ -36,14 +36,14 @@ rewrites either.
 | Provider-required reasoning state | Only by the adapter that recognizes its own `provider` |
 | Thinking summary | `Assistant`-role context on demand; never a system message |
 
-| Context source | Wire role | Priority | Trust | Framing |
+| Context source | Wire role | Precedence | Trust | Framing |
 |---|---|---|---|---|
-| Thinking summary | `assistant` | Medium | non-authoritative | `<execution_context source="thinking-summary" trust="non-authoritative" priority="medium">` |
-| Retrieved memory | `user` | Medium | untrusted-data | `<untrusted_context source="retrieved-memory" trust="untrusted-data" priority="medium">` |
-| Quoted/untrusted content | `user` | Low | untrusted-data | `<untrusted_context ... priority="low">` |
+| Thinking summary | `assistant` | Medium | non-authoritative | `<execution_context source="thinking-summary" trust="non-authoritative" precedence="medium">` |
+| Retrieved memory | `user` | Medium | untrusted-data | `<untrusted_context source="retrieved-memory" trust="untrusted-data" precedence="medium">` |
+| Quoted/untrusted content | `user` | Low | untrusted-data | `<untrusted_context ... precedence="low">` |
 
 The four priorities are `Highest`, `High`, `Medium`, `Low`. Role says who
-the message belongs to, priority says which side wins a conflict, and trust says
+the message belongs to, precedence says which side wins a conflict, and trust says
 how far the content can be believed; the three are independent. `System` is
 Highest; the current user request is High; normal assistant history, the
 thinking summary and retrieved memory are Medium; raw reasoning and tool traffic

@@ -232,6 +232,15 @@ impl OpenAiVendor {
         }
     }
 
+    /// Whether this endpoint's protocol accepts the `developer` role.
+    ///
+    /// OpenAI's own APIs do; many OpenAI-compatible gateways only accept the
+    /// legacy `system` role, so the adapter degrades to a marked system row
+    /// rather than sending a role those endpoints reject.
+    fn supports_developer_role(&self) -> bool {
+        self.endpoint.contains("api.openai.com") || self.endpoint.contains("openai.azure.com")
+    }
+
     /// Allow (or forbid) several tool calls in one provider response.
     pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
         self.parallel_tool_calls = parallel;
@@ -320,6 +329,29 @@ impl OpenAiVendor {
                             }
                             history_system.push_str(content);
                             continue;
+                        }
+                    }
+                    crate::llm::LlmMessage::Developer { content } => {
+                        // The developer role is an OpenAI-family capability.
+                        // Compatible gateways that only accept `system` keep
+                        // the instruction and its [developer] marker instead of
+                        // failing the whole turn.
+                        if self.supports_developer_role() {
+                            OpenAiMessageJson {
+                                role: "developer",
+                                content: Some(serde_json::Value::String(content.clone())),
+                                tool_call_id: None,
+                                tool_calls: None,
+                            }
+                        } else {
+                            OpenAiMessageJson {
+                                role: "system",
+                                content: Some(serde_json::Value::String(format!(
+                                    "[developer]\n{content}"
+                                ))),
+                                tool_call_id: None,
+                                tool_calls: None,
+                            }
                         }
                     }
                     crate::llm::LlmMessage::User { content } => OpenAiMessageJson {
@@ -1727,6 +1759,56 @@ mod tests {
             built.messages.len(),
             4,
             "system plus the three non-reasoning rows"
+        );
+    }
+
+    #[test]
+    fn developer_role_is_used_where_supported_and_marked_otherwise() {
+        use crate::llm::{
+            Content, LlmContext, LlmMessage, LlmRequest, LlmSession, ProviderRequest,
+        };
+        let vendor = OpenAiVendor::new(
+            "https://api.openai.com/v1".to_string(),
+            "gpt-test".to_string(),
+            "k".to_string(),
+        );
+        let request = LlmRequest {
+            model: "gpt-test".to_string(),
+            input: Content::text("question"),
+            provider_request: Some(ProviderRequest {
+                system_prompt: Some("POLICY".to_string()),
+                messages: vec![
+                    LlmMessage::developer("HARNESS RULE"),
+                    LlmMessage::user("question"),
+                ],
+                input: Content::text("question"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let built =
+            vendor.convert_request(None, &request, &LlmSession::new(), &LlmContext::default());
+        assert_eq!(built.messages[0].role, "system");
+        assert_eq!(built.messages[1].role, "developer");
+        assert_eq!(
+            built.messages[1].content.as_ref().and_then(|v| v.as_str()),
+            Some("HARNESS RULE")
+        );
+        assert_eq!(built.messages[2].role, "user");
+
+        // A compatible gateway that only accepts `system` keeps the instruction
+        // with an explicit marker instead of failing the turn.
+        let compatible = OpenAiVendor::new(
+            "https://api.deepseek.com".to_string(),
+            "deepseek-chat".to_string(),
+            "k".to_string(),
+        );
+        let built =
+            compatible.convert_request(None, &request, &LlmSession::new(), &LlmContext::default());
+        assert_eq!(built.messages[1].role, "system");
+        assert_eq!(
+            built.messages[1].content.as_ref().and_then(|v| v.as_str()),
+            Some("[developer]\nHARNESS RULE")
         );
     }
 

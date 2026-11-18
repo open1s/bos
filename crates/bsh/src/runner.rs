@@ -1134,11 +1134,11 @@ mod tests {
         assert!(
             messages[..checkpoint].iter().all(|message| matches!(
                 message,
-                react::LlmMessage::System { content }
+                react::LlmMessage::Developer { content }
                     if content.starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE)
                         || content.starts_with(crate::context::TIME_CONTEXT_PREAMBLE)
             )),
-            "only the injected system frame precedes the checkpoint: {messages:?}"
+            "only the injected developer frame precedes the checkpoint: {messages:?}"
         );
         assert!(
             matches!(
@@ -1201,6 +1201,9 @@ mod tests {
                 .iter()
                 .filter_map(|message| match message {
                     react::LlmMessage::System { content } => Some(("system", content.clone())),
+                    react::LlmMessage::Developer { content } => {
+                        Some(("developer", content.clone()))
+                    }
                     react::LlmMessage::User { content } => {
                         content.as_text().map(|text| ("user", text.to_string()))
                     }
@@ -1378,8 +1381,8 @@ mod tests {
         );
         assert_eq!(
             captured_roles(&seen),
-            vec!["system", "system", "system", "user"],
-            "context is system policy; only the reader's line is a user row"
+            vec!["developer", "developer", "developer", "user"],
+            "context is developer instruction; only the reader's line is a user row"
         );
         assert!(
             rows[0].starts_with(crate::context::RUNTIME_CONTEXT_PREAMBLE),

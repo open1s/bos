@@ -321,6 +321,12 @@ impl AnthropicVendor {
             for message in &history {
                 match message {
                     LlmMessage::System { content } => system_parts.push(content.clone()),
+                    // Anthropic has no developer role. Keep the instruction in
+                    // the system channel but name its weaker origin so it is
+                    // not mistaken for the authored policy.
+                    LlmMessage::Developer { content } => {
+                        system_parts.push(format!("[developer]\n{content}"))
+                    }
                     LlmMessage::User { content } => {
                         Self::push_blocks(&mut messages, "user", Self::content_blocks(content))
                     }
@@ -958,6 +964,32 @@ mod tests {
             !outside.contains("DATA"),
             "data is only inside the envelope: {system}"
         );
+    }
+
+    #[test]
+    fn developer_falls_back_to_the_system_channel() {
+        use crate::llm::{Content, LlmMessage, LlmRequest};
+        let vendor = super::tests::vendor();
+        let request = LlmRequest {
+            model: "claude-3-5-sonnet-latest".to_string(),
+            input: Content::text("question"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                system_prompt: Some("POLICY".to_string()),
+                messages: vec![
+                    LlmMessage::developer("HARNESS RULE"),
+                    LlmMessage::user("question"),
+                ],
+                input: Content::text("question"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let built = vendor.build_request(&None, &request, &(), &());
+        let system = built.system.expect("system channel");
+        assert!(system.contains("POLICY"));
+        assert!(system.contains("[developer]\nHARNESS RULE"));
+        assert_eq!(built.messages.len(), 1);
+        assert_eq!(built.messages[0].role, "user");
     }
 
     #[test]

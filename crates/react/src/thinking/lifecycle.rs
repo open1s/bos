@@ -6,8 +6,8 @@ use super::extract::{
     is_negated, looks_failed, looks_verifying,
 };
 use super::summary::{
-    PendingTool, ThinkingConfidence, ThinkingDecision, ThinkingOpenQuestion, ThinkingPhase,
-    ThinkingSnapshot, ThinkingSummary,
+    PendingTool, ThinkingConfidence, ThinkingDecision, ThinkingDecisionKind, ThinkingOpenQuestion,
+    ThinkingPhase, ThinkingSnapshot, ThinkingSummary,
 };
 use super::{
     contains_token, is_cjk, normalize_text, significant_tokens, similarity, ThinkingOrigin,
@@ -240,10 +240,27 @@ impl ThinkingState {
     /// Record a tool call before it runs, keeping the action it was meant to
     /// carry out so a result can corroborate or retire the matching judgment.
     pub fn observe_tool_call(&mut self, name: &str, step: usize) {
+        // The pending action is what this call is meant to carry out. Prefer the
+        // explicit next action; otherwise use the most recent live intent from
+        // this step, so a concrete "I will search" is retired when that search
+        // returns instead of surviving as stale narration.
+        let action = self.snapshot.summary.next_action.clone().or_else(|| {
+            self.snapshot
+                .summary
+                .decisions
+                .iter()
+                .rev()
+                .find(|decision| {
+                    decision.is_live()
+                        && decision.kind == ThinkingDecisionKind::Intent
+                        && decision.step == step
+                })
+                .map(|decision| decision.statement.clone())
+        });
         self.snapshot.pending.push(PendingTool {
             name: name.to_string(),
             step,
-            action: self.snapshot.summary.next_action.clone(),
+            action,
             interrupted: false,
         });
         if self.snapshot.summary.phase != ThinkingPhase::Blocked {
@@ -349,6 +366,9 @@ impl ThinkingState {
                         .push(format!("{name} at step {step} confirmed: {excerpt}"));
                 }
             }
+            if let Some(action) = action.as_deref() {
+                self.retire_intent(action, name, step);
+            }
             self.snapshot.summary.next_action = None;
             self.snapshot.summary.phase = if looks_verifying(output) {
                 ThinkingPhase::Verifying
@@ -359,6 +379,28 @@ impl ThinkingState {
         self.snapshot.summary.last_step = step;
         self.prune();
         self.bump();
+    }
+
+    /// Retire the live intent a successful call actually carried out.
+    ///
+    /// Only an intent whose statement matches the action stored when the call
+    /// was issued is retired; another active intent is unrelated and stays
+    /// live. A failure never reaches this path.
+    fn retire_intent(&mut self, action: &str, name: &str, step: usize) {
+        for decision in &mut self.snapshot.summary.decisions {
+            if !decision.is_live() || decision.kind != ThinkingDecisionKind::Intent {
+                continue;
+            }
+            if similarity(&decision.statement, action) < 0.5 {
+                continue;
+            }
+            decision.active = false;
+            decision.confidence = ThinkingConfidence::Superseded;
+            decision.superseded_by = Some(format!("{name} completed at step {step}"));
+            decision.evidence.push(format!(
+                "{name} succeeded at step {step}; the planned action was carried out"
+            ));
+        }
     }
 
     /// Close the turn.
@@ -1022,11 +1064,27 @@ fn history_contains(history: &[LlmMessage], text: &str) -> bool {
             // Reasoning is the source the summary is distilled from, not a
             // history turn the reader or the assistant said. Counting it here
             // would make every summary item look duplicated.
-            LlmMessage::AssistantReasoning { .. } | LlmMessage::AssistantToolCall { .. } => None,
+            LlmMessage::Developer { .. }
+            | LlmMessage::AssistantReasoning { .. }
+            | LlmMessage::AssistantToolCall { .. } => None,
         })
         .any(|body| {
-            let body = normalize_text(body);
-            body.contains(&needle) || body.contains(&prefix)
+            let normalized = normalize_text(body);
+            if normalized.contains(&needle) || normalized.contains(&prefix) {
+                return true;
+            }
+            // A paraphrase of a carried item is already represented even when
+            // the exact words differ. Compare the whole row and its first lines
+            // with bounded work, so the duplicate guard does not depend on a
+            // substring hit alone (issue #441).
+            if similarity(&normalized, &needle) >= 0.8 {
+                return true;
+            }
+            body.lines().take(24).any(|line| {
+                let line = normalize_text(line);
+                line.chars().count() >= 12
+                    && (line.contains(&prefix) || similarity(&line, &needle) >= 0.7)
+            })
         })
 }
 

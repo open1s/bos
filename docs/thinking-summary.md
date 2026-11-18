@@ -46,7 +46,7 @@ items above, at most 12 decisions and 8 questions.
 
 `ThinkingState::prepare_injection` returns a
 `ContextBlock { source: "thinking-summary", trust: NonAuthoritative, role:
-Assistant, priority: Medium, content }`. It is explicitly execution context, not
+Assistant, precedence: Medium, content }`. It is explicitly execution context, not
 policy:
 
 - `ProviderRequest::wire_messages` serializes it as an `assistant`-role turn

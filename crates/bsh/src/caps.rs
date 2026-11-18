@@ -3083,7 +3083,9 @@ pub(crate) fn child_transcript(child: &Agent) -> Vec<crate::subagent::SubagentMe
     let mut rows: Vec<crate::subagent::SubagentMessage> = Vec::new();
     for message in session.messages() {
         let row = match message {
-            react::llm::LlmMessage::System { .. } => None,
+            react::llm::LlmMessage::System { .. } | react::llm::LlmMessage::Developer { .. } => {
+                None
+            }
             react::llm::LlmMessage::User { content } => {
                 let raw = content.as_text().unwrap_or("");
                 // The child's row is the model-facing request, so an extension

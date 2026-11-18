@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Harness instructions get a real developer role.** `LlmMessage::Developer`
+  carries application-level instructions at `Precedence::High`, below system
+  policy and distinct from the reader's request. Chat Completions and the
+  Responses API serialize the `developer` role; Anthropic has no such role, so
+  its adapter folds the text into the system channel with a `[developer]`
+  marker. BSH now injects its runtime snapshot, time context, workspace
+  instructions and extension instructions as developer rows instead of system
+  rows.
+
 - **Thinking summaries and retrieved memory leave the system prompt (#439,
   #440).** They now ride a typed `ProviderRequest::context_blocks` channel that
   adapters serialize as existing roles immediately before the current input:
@@ -11,7 +20,7 @@
   envelope and audit; a memory block cannot close its own envelope even when it
   contains instruction-like text. `ProviderRequest::wire_messages` is the one
   placement path for Chat Completions, Anthropic and Responses. Context now
-  carries the shared four-level `Priority` (`Highest`/`High`/`Medium`/`Low`)
+  carries the shared four-level `Precedence` (`Highest`/`High`/`Medium`/`Low`)
   independently of role and trust: the summary and retrieved memory are Medium,
   quoted/untrusted content can be Low, and provider-native reasoning/tool
   traffic stays Low.

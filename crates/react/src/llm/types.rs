@@ -525,6 +525,15 @@ pub enum LlmMessage {
         /// The system prompt.
         content: String,
     },
+    /// Application/harness instructions, below system policy.
+    ///
+    /// These are real instructions, but they are not the system prompt: the
+    /// provider role is `developer` where the protocol supports it, and the
+    /// conflict precedence is `High`, never `Highest`.
+    Developer {
+        /// The application-level instruction text.
+        content: String,
+    },
     /// A user message.
     User {
         /// The user content.
@@ -567,24 +576,31 @@ pub enum LlmMessage {
 }
 
 impl LlmMessage {
-    /// The message's conflict-resolution priority.
+    /// The message's conflict-resolution precedence.
     ///
-    /// This is metadata about authority, separate from its wire role and from
+    /// This is the ordered authority rank, separate from its wire role and from
     /// any trust class a context envelope carries.
-    pub fn priority(&self) -> Priority {
+    pub fn precedence(&self) -> Precedence {
         match self {
-            LlmMessage::System { .. } => Priority::Highest,
-            LlmMessage::User { .. } => Priority::High,
-            LlmMessage::Assistant { .. } => Priority::Medium,
+            LlmMessage::System { .. } => Precedence::Highest,
+            LlmMessage::Developer { .. } => Precedence::High,
+            LlmMessage::User { .. } => Precedence::High,
+            LlmMessage::Assistant { .. } => Precedence::Medium,
             LlmMessage::AssistantReasoning { .. }
             | LlmMessage::AssistantToolCall { .. }
-            | LlmMessage::ToolResult { .. } => Priority::Low,
+            | LlmMessage::ToolResult { .. } => Precedence::Low,
         }
     }
 
     /// Create a system message.
     pub fn system(content: impl Into<String>) -> Self {
         Self::System {
+            content: content.into(),
+        }
+    }
+    /// Create an application/harness instruction.
+    pub fn developer(content: impl Into<String>) -> Self {
+        Self::Developer {
             content: content.into(),
         }
     }
@@ -984,32 +1000,32 @@ impl ContextTrust {
     }
 }
 
-/// Conflict-resolution priority, independent of role and trust.
+/// Conflict-resolution precedence, independent of role and trust.
 ///
 /// Role says who a message belongs to, trust says how much its content can be
-/// believed, and priority says which side wins when two pieces of context
+/// believed, and precedence says which side wins when two pieces of context
 /// disagree. The order is significant: `Highest` outranks `Low`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Priority {
-    /// System policy.
-    Highest,
-    /// Developer instructions and the current user request.
-    High,
-    /// Historical assistant output, a thinking summary, or retrieved memory.
-    Medium,
+pub enum Precedence {
     /// Raw reasoning, tool traffic, or quoted/untrusted content.
     Low,
+    /// Historical assistant output, a thinking summary, or retrieved memory.
+    Medium,
+    /// Developer instructions and the current user request.
+    High,
+    /// System policy.
+    Highest,
 }
 
-impl Priority {
+impl Precedence {
     /// The wire/diagnostic label.
     pub fn label(self) -> &'static str {
         match self {
-            Priority::Highest => "highest",
-            Priority::High => "high",
-            Priority::Medium => "medium",
-            Priority::Low => "low",
+            Precedence::Highest => "highest",
+            Precedence::High => "high",
+            Precedence::Medium => "medium",
+            Precedence::Low => "low",
         }
     }
 }
@@ -1032,7 +1048,7 @@ pub enum ContextRole {
 ///
 /// It is not a new `LlmMessage` role: adapters serialize it as the mapped
 /// existing role immediately before the current input, never as a system
-/// message. The source, trust class, role and priority all survive into the
+/// message. The source, trust class, role and precedence all survive into the
 /// envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBlock {
@@ -1042,8 +1058,8 @@ pub struct ContextBlock {
     pub trust: ContextTrust,
     /// The existing wire role that carries the block.
     pub role: ContextRole,
-    /// Conflict-resolution priority, independent of the role.
-    pub priority: Priority,
+    /// Conflict-resolution precedence, independent of the role.
+    pub precedence: Precedence,
     /// The block's text, preserved as data.
     pub content: String,
     /// Optional provenance detail.
@@ -1062,7 +1078,7 @@ impl ContextBlock {
             source: source.into(),
             trust,
             role,
-            priority: Priority::Medium,
+            precedence: Precedence::Medium,
             content: content.into(),
             provenance: None,
         }
@@ -1085,16 +1101,16 @@ impl ContextBlock {
         self
     }
 
-    /// Override the conflict-resolution priority.
+    /// Override the conflict-resolution precedence.
     #[must_use]
-    pub fn with_priority(mut self, priority: Priority) -> Self {
-        self.priority = priority;
+    pub fn with_precedence(mut self, precedence: Precedence) -> Self {
+        self.precedence = precedence;
         self
     }
 
     /// Create quoted/untrusted content that can never outrank the request.
     pub fn quoted_untrusted(source: impl Into<String>, content: impl Into<String>) -> Self {
-        Self::untrusted(source, content).with_priority(Priority::Low)
+        Self::untrusted(source, content).with_precedence(Precedence::Low)
     }
 
     /// Attach provenance to the envelope.
@@ -1118,9 +1134,9 @@ impl ContextBlock {
             .unwrap_or_default();
         let content = neutralize_envelope(&self.content, tag);
         format!(
-            "<{tag} source=\"{source}\" trust=\"{}\" priority=\"{}\"{provenance}>\n{}\n{content}\n</{tag}>",
+            "<{tag} source=\"{source}\" trust=\"{}\" precedence=\"{}\"{provenance}>\n{}\n{content}\n</{tag}>",
             self.trust.label(),
-            self.priority.label(),
+            self.precedence.label(),
             self.trust.notice()
         )
     }
@@ -1234,6 +1250,9 @@ impl ProviderRequest {
                 .iter()
                 .map(|message| match message {
                     LlmMessage::System { content } => ("system", content.chars().count()),
+                    LlmMessage::Developer { content } => {
+                        ("developer", content.chars().count())
+                    }
                     LlmMessage::User { content } => {
                         ("user", content.as_text().map(|text| text.chars().count()).unwrap_or(0))
                     }
@@ -1268,7 +1287,7 @@ impl ProviderRequest {
                             ContextRole::Assistant => "assistant",
                             ContextRole::User => "user",
                         },
-                        "priority": block.priority.label(),
+                        "precedence": block.precedence.label(),
                         "provenance": block.provenance,
                         "chars": block.content.chars().count(),
                     })
@@ -1916,7 +1935,7 @@ mod tests {
         assert_eq!(messages.len(), 3, "summary, memory, and the current input");
         assert!(
             matches!(&messages[0], super::LlmMessage::Assistant { content }
-                if content.contains("<execution_context source=\"thinking-summary\" trust=\"non-authoritative\" priority=\"medium\">")),
+                if content.contains("<execution_context source=\"thinking-summary\" trust=\"non-authoritative\" precedence=\"medium\">")),
             "the summary is assistant-side context: {messages:?}"
         );
         assert!(
@@ -1924,9 +1943,12 @@ mod tests {
             "retrieved memory is user-side data: {messages:?}"
         );
         // The message role default is High; the block itself carries Medium
-        // explicitly, so role and priority remain independent.
-        assert_eq!(messages[1].priority(), super::Priority::High);
-        assert_eq!(request.context_blocks[1].priority, super::Priority::Medium);
+        // explicitly, so role and precedence remain independent.
+        assert_eq!(messages[1].precedence(), super::Precedence::High);
+        assert_eq!(
+            request.context_blocks[1].precedence,
+            super::Precedence::Medium
+        );
         assert!(
             matches!(&messages[2], super::LlmMessage::User { .. }),
             "the current input stays last"
@@ -1936,7 +1958,7 @@ mod tests {
             _ => "",
         };
         assert!(memory.starts_with("<untrusted_context source=\"retrieved-memory\""));
-        assert!(memory.contains("priority=\"medium\""));
+        assert!(memory.contains("precedence=\"medium\""));
         assert!(
             memory.contains("&lt;/untrusted_context"),
             "the closing tag is neutralized: {memory}"
@@ -1946,34 +1968,41 @@ mod tests {
         assert!(!request.audit().to_string().contains("a bounded summary"));
         let audit = request.audit();
         assert_eq!(audit["context_blocks"][0]["role"], "assistant");
-        assert_eq!(audit["context_blocks"][0]["priority"], "medium");
+        assert_eq!(audit["context_blocks"][0]["precedence"], "medium");
         assert_eq!(audit["context_blocks"][1]["trust"], "untrusted-data");
         assert_eq!(audit["context_blocks"][1]["role"], "user");
-        assert_eq!(audit["context_blocks"][1]["priority"], "medium");
+        assert_eq!(audit["context_blocks"][1]["precedence"], "medium");
         assert_eq!(
-            super::ContextBlock::quoted_untrusted("quote", "text").priority,
-            super::Priority::Low
+            super::ContextBlock::quoted_untrusted("quote", "text").precedence,
+            super::Precedence::Low
         );
 
         assert_eq!(
-            super::LlmMessage::system("policy").priority(),
-            super::Priority::Highest
+            super::LlmMessage::system("policy").precedence(),
+            super::Precedence::Highest
         );
         assert_eq!(
-            super::LlmMessage::user("request").priority(),
-            super::Priority::High
+            super::LlmMessage::developer("harness").precedence(),
+            super::Precedence::High
+        );
+        assert!(super::Precedence::Highest > super::Precedence::High);
+        assert!(super::Precedence::High > super::Precedence::Medium);
+        assert!(super::Precedence::Medium > super::Precedence::Low);
+        assert_eq!(
+            super::LlmMessage::user("request").precedence(),
+            super::Precedence::High
         );
         assert_eq!(
-            super::LlmMessage::assistant("answer").priority(),
-            super::Priority::Medium
+            super::LlmMessage::assistant("answer").precedence(),
+            super::Precedence::Medium
         );
         assert_eq!(
-            super::LlmMessage::assistant_reasoning("thought").priority(),
-            super::Priority::Low
+            super::LlmMessage::assistant_reasoning("thought").precedence(),
+            super::Precedence::Low
         );
         assert_eq!(
-            super::LlmMessage::tool_result("id", "output").priority(),
-            super::Priority::Low
+            super::LlmMessage::tool_result("id", "output").precedence(),
+            super::Precedence::Low
         );
     }
 }

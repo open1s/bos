@@ -432,6 +432,14 @@ fn build_input(history: Option<&[LlmMessage]>, input: &Content) -> Vec<Responses
             match message {
                 // System prompts are folded into `instructions`, not `input`.
                 LlmMessage::System { .. } => {}
+                LlmMessage::Developer { content } => {
+                    items.push(ResponsesInputItem::Message {
+                        role: "developer".to_string(),
+                        content: vec![ResponsesContentPart::InputText {
+                            text: content.clone(),
+                        }],
+                    });
+                }
                 LlmMessage::User { content } => items.push(ResponsesInputItem::Message {
                     role: "user".to_string(),
                     content: serialize_input_content(content),
@@ -1321,6 +1329,25 @@ mod tests {
         let bare = LlmContext::default();
         let built = build_request(None, &req, &session, &bare, false, true);
         assert_eq!(built.parallel_tool_calls, None);
+    }
+
+    #[test]
+    fn developer_input_keeps_its_role() {
+        use crate::llm::{Content, LlmMessage};
+        let items = build_input(
+            Some(&[LlmMessage::developer("HARNESS RULE")]),
+            &Content::text("question"),
+        );
+        match &items[0] {
+            ResponsesInputItem::Message { role, content } => {
+                assert_eq!(role, "developer");
+                assert!(matches!(
+                    &content[0],
+                    ResponsesContentPart::InputText { text } if text == "HARNESS RULE"
+                ));
+            }
+            other => panic!("expected a developer message, got {other:?}"),
+        }
     }
 
     #[test]

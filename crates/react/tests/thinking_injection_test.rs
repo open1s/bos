@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use react::llm::{
     Content, ContextBlock, ContextTrust, LlmClient, LlmContext, LlmError, LlmMessage, LlmRequest,
-    LlmResponseResult, LlmSession, Priority, ReactSession, StreamToken, TokenStream,
+    LlmResponseResult, LlmSession, Precedence, ReactSession, StreamToken, TokenStream,
 };
 use react::runtime::ReActApp;
 use react::thinking::{
@@ -185,7 +185,7 @@ async fn a_confirming_result_verifies_the_claim_and_reaches_the_next_request() {
         note.content
     );
     assert_eq!(note.trust, ContextTrust::NonAuthoritative);
-    assert_eq!(note.priority, Priority::Medium);
+    assert_eq!(note.precedence, Precedence::Medium);
     assert!(
         note.content.contains("[verified]") && note.content.contains("bug"),
         "the claim the output confirms is verified: {}",

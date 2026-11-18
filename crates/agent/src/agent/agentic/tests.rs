@@ -247,7 +247,7 @@ async fn recalled_memory_is_a_context_block_not_system_prompt() {
         .find(|block| block.source == "retrieved-memory")
         .expect("memory is a context block");
     assert_eq!(memory.trust, react::llm::ContextTrust::UntrustedData);
-    assert_eq!(memory.priority, react::llm::Priority::Medium);
+    assert_eq!(memory.precedence, react::llm::Precedence::Medium);
     let wire = request.wire_messages();
     let memory_text = wire
         .iter()

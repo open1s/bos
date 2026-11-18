@@ -219,6 +219,12 @@ impl PyLlmMessage {
                 dict.set_item("content", content)?;
                 Ok(dict.into_any())
             }
+            LlmMessage::Developer { content } => {
+                let dict = PyDict::new(py);
+                dict.set_item("role", "developer")?;
+                dict.set_item("content", content)?;
+                Ok(dict.into_any())
+            }
             LlmMessage::User { content } => {
                 let dict = PyDict::new(py);
                 dict.set_item("role", "user")?;

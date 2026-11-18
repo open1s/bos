@@ -207,10 +207,10 @@ impl TurnContext {
             if present.contains(&text) {
                 continue;
             }
-            // Host context is not something the reader said. It rides as a
-            // system row: a user row is reserved for the reader's own input
-            // (issue #434).
-            injected.push(react::llm::LlmMessage::system(text.to_string()));
+            // Host context is application-level instruction, below system
+            // policy. It rides as a developer row; a user row is reserved for
+            // the reader's own input (issue #434).
+            injected.push(react::llm::LlmMessage::developer(text.to_string()));
         }
         if injected.is_empty() {
             return;
@@ -225,7 +225,8 @@ impl TurnContext {
                     .as_text()
                     .map(|text| !is_instructions_user_text(text) || text == want)
                     .unwrap_or(true),
-                react::llm::LlmMessage::System { content } => {
+                react::llm::LlmMessage::System { content }
+                | react::llm::LlmMessage::Developer { content } => {
                     !is_instructions_user_text(content) || content == want
                 }
                 _ => true,
@@ -293,9 +294,10 @@ pub(crate) fn inject_snapshot(agent: &Agent, snapshot: &crate::context_assembly:
         if present.contains(&text.as_str()) {
             continue;
         }
-        // Every request block is host-supplied context, so it is a system row.
-        // The reader's own input is the only user row in a turn (issue #434).
-        injected.push(react::llm::LlmMessage::system(text.clone()));
+        // Every request block is application/harness instruction: it is below
+        // system policy, so it is a developer row, not a system row. The
+        // reader's own input is the only user row in a turn.
+        injected.push(react::llm::LlmMessage::developer(text.clone()));
     }
     // No early return: even when no NEW block landed, a stale extension row
     // from the previous turn must still be dropped (issue #436).
@@ -321,7 +323,10 @@ pub(crate) fn inject_snapshot(agent: &Agent, snapshot: &crate::context_assembly:
                     .as_text()
                     .map(|text| !is_extension_context_text(text))
                     .unwrap_or(true),
-                react::llm::LlmMessage::System { content } => !is_extension_context_text(content),
+                react::llm::LlmMessage::System { content }
+                | react::llm::LlmMessage::Developer { content } => {
+                    !is_extension_context_text(content)
+                }
                 _ => true,
             };
         };
@@ -334,7 +339,8 @@ pub(crate) fn inject_snapshot(agent: &Agent, snapshot: &crate::context_assembly:
                         || active_extensions.contains(text)
                 })
                 .unwrap_or(true),
-            react::llm::LlmMessage::System { content } => {
+            react::llm::LlmMessage::System { content }
+            | react::llm::LlmMessage::Developer { content } => {
                 (!is_instructions_user_text(content) && !is_extension_context_text(content))
                     || content == want
                     || active_extensions.contains(content.as_str())
@@ -349,11 +355,13 @@ pub(crate) fn inject_snapshot(agent: &Agent, snapshot: &crate::context_assembly:
 /// The text of a conversation row that carries reader or host prose.
 ///
 /// Both roles are read because injected context used to be a `user` row and is
-/// a `system` row now (issue #434); dedup and replay must work across both.
+/// now a `system` or `developer` row; dedup and replay must work across all
+/// three.
 fn message_text(message: &react::llm::LlmMessage) -> Option<&str> {
     match message {
         react::llm::LlmMessage::User { content } => content.as_text(),
-        react::llm::LlmMessage::System { content } => Some(content.as_str()),
+        react::llm::LlmMessage::System { content }
+        | react::llm::LlmMessage::Developer { content } => Some(content.as_str()),
         _ => None,
     }
 }
@@ -911,7 +919,7 @@ mod tests {
             .messages()
             .iter()
             .filter_map(|message| match message {
-                react::llm::LlmMessage::System { content } => Some(content.as_str()),
+                react::llm::LlmMessage::Developer { content } => Some(content.as_str()),
                 _ => None,
             })
             .collect();
@@ -980,10 +988,10 @@ mod tests {
         );
     }
 
-    /// Injected context is harness policy, so it rides as system rows; the
-    /// reader's own message is the only user row in the request (issue #434).
+    /// Injected context is harness instruction, so it rides as developer rows;
+    /// the reader's own message is the only user row in the request.
     #[test]
-    fn context_injection_uses_the_system_role_and_never_the_user_role() {
+    fn context_injection_uses_the_developer_role_and_never_the_user_role() {
         let root = scratch("roles");
         std::fs::write(root.join("AGENTS.md"), "workspace rule").expect("the file");
         let context = TurnContext::from_facts(&facts(&rooted(&root)), false);
@@ -1000,14 +1008,15 @@ mod tests {
             .iter()
             .map(|message| match message {
                 react::llm::LlmMessage::System { .. } => "system",
+                react::llm::LlmMessage::Developer { .. } => "developer",
                 react::llm::LlmMessage::User { .. } => "user",
                 _ => "other",
             })
             .collect();
         assert_eq!(
             roles,
-            vec!["system", "system", "system", "user"],
-            "snapshot, time and instructions are system; only the reader is user"
+            vec!["developer", "developer", "developer", "user"],
+            "snapshot, time and instructions are developer; only the reader is user"
         );
         assert_eq!(
             session.messages().last().and_then(message_text),

@@ -278,7 +278,9 @@ fn token_suffix_start(text: &str, max_tokens: usize) -> usize {
 /// [`ContextBudget`].
 pub fn estimate_message_tokens(message: &Message) -> usize {
     match message {
-        Message::System { content } | Message::Assistant { content } => estimate_tokens(content),
+        Message::System { content }
+        | Message::Developer { content }
+        | Message::Assistant { content } => estimate_tokens(content),
         Message::User { content } => estimate_tokens(&content_to_summary_string(content)),
         Message::AssistantReasoning {
             content,
@@ -368,6 +370,7 @@ pub fn render_checkpoint(summary: &str) -> String {
 pub fn render_for_summary(message: &Message) -> String {
     match message {
         Message::System { content } => format!("[system] {content}"),
+        Message::Developer { content } => format!("[developer] {content}"),
         Message::User { content } => {
             format!("[user] {}", content_to_summary_string(content))
         }
@@ -705,6 +708,7 @@ pub fn validate_checkpoint(summary: &str, source: &[Message]) -> Result<(), Stri
 fn message_text_and_trust(message: &Message) -> (String, &'static str) {
     match message {
         Message::System { content } => (content.clone(), "system"),
+        Message::Developer { content } => (content.clone(), "developer"),
         Message::User { content } => {
             let text = match content {
                 Content::Text(text) => text.clone(),
@@ -1360,7 +1364,7 @@ fn explicit_constraints(source: &[Message]) -> Vec<String> {
     let mut constraints = Vec::new();
     for message in source {
         let text = match message {
-            Message::System { content } => content.as_str(),
+            Message::System { content } | Message::Developer { content } => content.as_str(),
             Message::User { content } => match content {
                 Content::Text(text) => text.as_str(),
                 Content::Parts(_) => "",
@@ -2283,6 +2287,7 @@ impl AgentSession {
             .iter()
             .map(|msg| match msg {
                 Message::System { content } => content.clone(),
+                Message::Developer { content } => format!("[developer] {content}"),
                 Message::User { content } => content_to_summary_string(content),
                 Message::Assistant { content } => content.clone(),
                 // Raw reasoning stays out of the mechanical prompt too.
@@ -2470,7 +2475,9 @@ impl ContextBudget {
                 // history full of tool results must not be copied just to be
                 // measured.
                 let body = match msg {
-                    Message::System { content } => estimate_tokens(content),
+                    Message::System { content } | Message::Developer { content } => {
+                        estimate_tokens(content)
+                    }
                     Message::User { content } => estimate_content_tokens(content),
                     Message::Assistant { content } => estimate_tokens(content),
                     Message::AssistantReasoning {
@@ -2867,6 +2874,7 @@ fn message_traces(session: &AgentSession) -> String {
         for message in history.iter().rev().take(48).rev() {
             let (role, body) = match message {
                 Message::System { content } => ("system", content.clone()),
+                Message::Developer { content } => ("developer", content.clone()),
                 Message::User { content } => ("user", content_text(content)),
                 Message::Assistant { content } => ("assistant", content.clone()),
                 Message::AssistantReasoning { content, .. } => ("reasoning", content.clone()),

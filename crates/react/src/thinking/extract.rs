@@ -62,8 +62,6 @@ const INTENT_CUES: &[&str] = &[
     "i'm going to ",
     "we will ",
     "we'll ",
-    "let's ",
-    "let me ",
     "i should ",
     "we should ",
     "i need to ",
@@ -472,6 +470,25 @@ mod tests {
         assert_eq!(
             extract_next_action(text).as_deref(),
             Some("run the memory tests.")
+        );
+    }
+
+    #[test]
+    fn conversational_let_me_narration_is_not_a_durable_intent() {
+        assert!(
+            extract_decisions("Let me first check if there is anything relevant here.", 1)
+                .is_empty(),
+            "conversational narration is not a decision"
+        );
+        assert!(
+            extract_decisions("Let's first search for any relevant files.", 1).is_empty(),
+            "a first-person suggestion is not a durable action"
+        );
+        assert!(
+            extract_decisions("I will search for the parser fixture.", 1)
+                .iter()
+                .any(|decision| decision.kind == ThinkingDecisionKind::Intent),
+            "a concrete intent is still extracted"
         );
     }
 
