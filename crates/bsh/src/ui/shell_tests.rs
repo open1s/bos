@@ -1571,6 +1571,64 @@ fn a_question_option_click_answers_and_sends(cx: &mut TestAppContext) {
     );
 }
 
+/// Answering a question while its turn still streams steers the answer into
+/// that turn; it does not wait in the queue behind it.
+#[gpui::test]
+fn a_question_answer_steers_into_the_running_turn(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    cx.dispatcher.allow_parking();
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("question-steer", 1);
+        let id = state.active_id.clone().expect("a session");
+        if let Some(session) = state.store.session_mut(&id) {
+            if let Some(last) = session.messages.last_mut() {
+                last.question = Some(crate::model::QuestionBlock {
+                    questions: vec![crate::model::QuestionItem {
+                        question: "Which approach?".to_string(),
+                        options: vec!["Fix the cause".to_string(), "Work around it".to_string()],
+                        multi_select: false,
+                    }],
+                    answered: None,
+                });
+            }
+        }
+        state.streams.insert(id.clone(), 0);
+        state.attach_steers(&id, std::sync::Arc::new(agent::agent::SteerMailbox::new()));
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let chip = cx
+        .debug_bounds("question-option-1-0")
+        .expect("the option chip draws");
+    cx.simulate_click(chip.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (queued, pending, answered) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let id = shell.state.active_id.clone().expect("a session");
+        let queued = shell.state.has_queued(&id);
+        let pending: Vec<String> = shell
+            .state
+            .pending_steers(&id)
+            .iter()
+            .map(|row| row.text.clone())
+            .collect();
+        let answered = shell
+            .state
+            .store
+            .session(&id)
+            .and_then(|session| session.messages.iter().find_map(|m| m.question.as_ref()))
+            .and_then(|question| question.answered.clone());
+        (queued, pending, answered)
+    });
+    assert_eq!(answered.as_deref(), Some("Which approach?: Fix the cause"));
+    assert!(!queued, "the answer is not left in the queue dock");
+    assert_eq!(pending, vec!["Which approach?: Fix the cause".to_string()]);
+}
+
 /// A multi-step card: a single-select click advances without sending; the
 /// multi-select step toggles several picks and its Send button delivers every
 /// answer as one message.

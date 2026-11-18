@@ -3578,6 +3578,21 @@ impl Shell {
                 }
             }
         }
+        // An answer to a question the running turn asked is input for that
+        // turn, not a new reader message waiting behind it. Steer it into the
+        // live step so the model receives it at once; only an idle session (or
+        // a turn that cannot accept a steer) falls back to an ordinary send.
+        if let Some(id) = self.state.active_id.clone() {
+            if self.state.is_streaming(&id)
+                && self.state.steers(&id).is_some()
+                && !self.state.steer_blocked(&id)
+            {
+                let seq = self.state.enqueue(&id, option, Vec::new());
+                self.steer_now(&id, seq, cx);
+                cx.notify();
+                return;
+            }
+        }
         self.composer
             .update(cx, |input, cx| input.set_value(option, window, cx));
         self.send(window, cx);
@@ -3771,10 +3786,13 @@ impl Shell {
         self.warn_unresolved_skill(&text);
         self.warn_unresolved_command(&text);
         // A typed answer settles the open question card just like a click.
-        if let Some(id) = self.state.active_id.clone() {
-            self.state.answer_last_question(&id, &text);
+        let answered_question = if let Some(id) = self.state.active_id.clone() {
+            let answered = self.state.answer_last_question(&id, &text);
             self.question_progress.retain(|(s, _), _| s != &id);
-        }
+            answered
+        } else {
+            false
+        };
         // Measured: the reference queues a submission while its session is
         // already running instead of opening a second turn over the same
         // transcript, which is what its queue dock lists.
@@ -3784,6 +3802,19 @@ impl Shell {
             // after it finishes", so a submission made while the summarizer
             // works must wait rather than open a turn under it.
             if self.state.is_streaming(&id) || self.state.is_compacting(&id) {
+                // A typed answer to the question the running turn asked is
+                // input for that turn, not a row behind it. Steer it into the
+                // live step exactly like a clicked option; other submissions
+                // keep the normal queue behaviour.
+                if answered_question
+                    && self.state.is_streaming(&id)
+                    && self.state.steers(&id).is_some()
+                    && !self.state.steer_blocked(&id)
+                {
+                    let seq = self.state.enqueue(&id, text, attachments);
+                    self.steer_now(&id, seq, cx);
+                    return Submit::Accepted;
+                }
                 self.state.enqueue(&id, text, attachments);
                 return Submit::Accepted;
             }

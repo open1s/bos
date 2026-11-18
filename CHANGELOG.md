@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **An ask_user answer steers the running turn instead of queueing.** Clicking
+  a question option, or typing the answer, now pushes the choice into the live
+  turn's steer mailbox when the turn is still streaming. It reaches the next
+  step immediately and the queue dock no longer holds it behind the turn. A
+  session with no live mailbox (or a turn whose settings changed too far to
+  steer) keeps the ordinary queue/send fallback.
+
 - **Completed thinking intents are retired before injection (#441).**
   Conversational "let me first..." narration is no longer extracted as a durable
   intent. When a tool call succeeds, the live intent whose statement matches the

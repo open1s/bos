@@ -3859,7 +3859,7 @@ impl AppState {
     /// Fold one runner event into the transcript.
     /// The reader answered by typing: settle the newest unanswered question
     /// card with their words, the same as a clicked option settles it.
-    pub(crate) fn answer_last_question(&mut self, id: &str, text: &str) {
+    pub(crate) fn answer_last_question(&mut self, id: &str, text: &str) -> bool {
         if let Some(session) = self.store.session_mut(id) {
             if let Some(message) = session.messages.iter_mut().rev().find(|message| {
                 message
@@ -3869,9 +3869,11 @@ impl AppState {
             }) {
                 if let Some(question) = &mut message.question {
                     question.answered = Some(text.to_string());
+                    return true;
                 }
             }
         }
+        false
     }
 
     pub(crate) fn apply_event(&mut self, id: &str, event: AgentEvent) {
