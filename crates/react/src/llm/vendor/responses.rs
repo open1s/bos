@@ -623,7 +623,7 @@ pub fn build_request(
             }
             (
                 (!instructions.is_empty()).then_some(instructions),
-                build_input(Some(&provider.messages), &provider.input),
+                build_input(Some(&provider.wire_messages()), &provider.input),
             )
         }
         None => (
@@ -1394,6 +1394,7 @@ mod tests {
             intent: Default::default(),
             provider_request: None,
             host_guidance: Vec::new(),
+            context_blocks: Vec::new(),
         };
 
         let built = build_request(None, &req, &session, &context, false, true);

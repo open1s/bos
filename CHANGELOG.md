@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Thinking summaries and retrieved memory leave the system prompt (#439,
+  #440).** They now ride a typed `ProviderRequest::context_blocks` channel that
+  adapters serialize as existing roles immediately before the current input:
+  the bounded thinking summary as a framed non-authoritative `assistant` turn,
+  retrieved memory as a framed untrusted-data `user` turn. Neither is part of
+  the system prompt. Source, trust class and provenance survive into the
+  envelope and audit; a memory block cannot close its own envelope even when it
+  contains instruction-like text. `ProviderRequest::wire_messages` is the one
+  placement path for Chat Completions, Anthropic and Responses. Context now
+  carries the shared four-level `Priority` (`Highest`/`High`/`Medium`/`Low`)
+  independently of role and trust: the summary and retrieved memory are Medium,
+  quoted/untrusted content can be Low, and provider-native reasoning/tool
+  traffic stays Low.
+
 - **Reasoning is preserved as its own message (#438).** `LlmMessage` gained
   `AssistantReasoning { content, provider_state }`, kept separate from
   `Assistant` so the model's semantic boundary survives. The engine records

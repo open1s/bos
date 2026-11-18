@@ -10,7 +10,7 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use react::llm::{
-    Content, HostGuidance, LlmClient, LlmContext, LlmError, LlmRequest, LlmResponseResult,
+    Content, ContextBlock, LlmClient, LlmContext, LlmError, LlmRequest, LlmResponseResult,
     LlmSession, ReactSession, StreamToken, TokenStream,
 };
 use react::runtime::ReActApp;
@@ -91,7 +91,7 @@ impl LlmClient<LlmSession, LlmContext> for AskForTool {
 }
 
 struct Observed {
-    guidance: Vec<HostGuidance>,
+    context_blocks: Vec<ContextBlock>,
     system_prompt: Option<String>,
     pending_interrupted: Vec<bool>,
 }
@@ -121,7 +121,7 @@ impl LlmClient<LlmSession, LlmContext> for RecoveryLlm {
         _context: &mut LlmContext,
     ) -> Result<TokenStream, LlmError> {
         self.calls.lock().unwrap().push(Observed {
-            guidance: req.host_guidance.clone(),
+            context_blocks: req.context_blocks.clone(),
             system_prompt: req
                 .provider_request
                 .as_ref()
@@ -192,11 +192,11 @@ async fn interrupt_during_tool() -> LlmSession {
     session
 }
 
-fn note_for(observed: &Observed) -> &HostGuidance {
+fn note_for(observed: &Observed) -> &ContextBlock {
     observed
-        .guidance
+        .context_blocks
         .iter()
-        .find(|guidance| guidance.purpose == THINKING_SOURCE)
+        .find(|block| block.source == THINKING_SOURCE)
         .expect("the recovery request carries a thinking note")
 }
 
@@ -254,11 +254,11 @@ async fn a_tool_interrupted_mid_execution_is_recovered_as_unknown() {
         note.content
     );
     assert!(
-        seen[0]
+        !seen[0]
             .system_prompt
             .as_deref()
             .is_some_and(|prompt| prompt.contains("outcome is unknown")),
-        "the note reaches the system prompt"
+        "the note must not reach the system prompt"
     );
     assert_eq!(
         seen[0].pending_interrupted,

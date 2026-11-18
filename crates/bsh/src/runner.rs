@@ -440,7 +440,9 @@ impl Runner {
                 // the recall account it was built from. Diagnostics read the
                 // account, never search the rendered text.
                 let assembly = agent.assemble_prompt(&input).await;
-                let persona = assembly.system_prompt.clone();
+                // Retrieved memory is not part of the system prompt: it rides
+                // the provider request's untrusted context channel.
+                let persona = assembly.base_prompt.clone();
                 let recall =
                     crate::context_assembly::MemoryRecallInfo::from_agent(&assembly.memory);
 

@@ -508,11 +508,7 @@ impl Agent {
     ///
     /// Non-text input (images/audio only) has no query to match against, so
     /// it uses the composed prompt unchanged.
-    async fn system_prompt_for(&self, task: &Content, tools: &[react::llm::LlmTool]) -> String {
-        self.assemble_for(task, tools).await.system_prompt
-    }
-
-    /// The typed assembly behind [`Self::system_prompt_for`] (issue #346):
+    /// The typed assembly behind [`Self::assemble_prompt`] (issue #346):
     /// the prompt AND the recall account it was built from, so diagnostics
     /// never re-derive inclusion from rendered strings.
     async fn assemble_for(&self, task: &Content, tools: &[react::llm::LlmTool]) -> PromptAssembly {
@@ -567,15 +563,12 @@ impl Agent {
                 }
             }
         };
-        // Recalled memory is untrusted data, not host policy. It stays in the
-        // system channel, but inside an explicit envelope so the role cannot
-        // promote it (issue #434 review).
-        let wrapped_memory = memory.block.as_deref().map(|block| {
-            format!(
-                "<untrusted_context source=\"retrieved-memory\" trust=\"untrusted-data\">\n{block}\n</untrusted_context>"
-            )
-        });
-        let result = react::template::with_memory(&base, wrapped_memory.as_deref());
+        // Recalled memory is untrusted data, not host policy. It does not ride
+        // the system prompt at all: the typed request carries it as a context
+        // block, and adapters serialize that as a framed user-role data turn
+        // (issues #439/#440). The system prompt still drops a `{{memory}}`
+        // placeholder so an authored template cannot leave a dangling slot.
+        let result = react::template::with_memory(&base, None);
         let assembly = PromptAssembly {
             system_prompt: result,
             base_prompt: base,
@@ -587,11 +580,11 @@ impl Agent {
         assembly
     }
 
-    /// The full system prompt a turn for `task` will carry: the discovery
-    /// block, the configured persona, any live prompt sections and the recalled
-    /// memory - the exact assembly [`Self::assemble_prompt`] sends to the
-    /// provider. A host surfacing the injection shows the whole of it, so no key
-    /// info the model receives is missing from the inject event.
+    /// The stable system prompt a turn for `task` will carry: the discovery
+    /// block, the configured persona and any live prompt sections. Retrieved
+    /// memory is deliberately absent; [`Self::assemble_prompt`] returns it in
+    /// `memory.block` for the separate untrusted context channel (issues
+    /// #439/#440).
     pub async fn injected_system_prompt(&self, task: &Content) -> String {
         self.assemble_prompt(task).await.system_prompt
     }
@@ -677,7 +670,8 @@ impl Agent {
             .expect("a prepared context for this run")
             .tools
             .clone();
-        let system_prompt = self.system_prompt_for(&task_content, &tools).await;
+        let assembled = self.assemble_for(&task_content, &tools).await;
+        let system_prompt = assembled.system_prompt.clone();
         // system_prompt_for can add a discovery tool (load_skill); snapshot the
         // FINAL array so the typed request and adapter see the same set (#427).
         let tools = context
@@ -694,6 +688,7 @@ impl Agent {
             &tools,
             session_restore.session().messages(),
             &task_content,
+            Some(&assembled.memory),
         );
         let request = match &provider_request {
             Some(typed) => LlmRequest {
@@ -705,6 +700,7 @@ impl Agent {
                 api_mode: typed.api_mode,
                 intent: self.action_intent(),
                 provider_request: Some(typed.clone()),
+                context_blocks: typed.context_blocks.clone(),
                 ..Default::default()
             },
             None => LlmRequest {
@@ -1152,15 +1148,17 @@ impl Agent {
                 *tt = std::time::Duration::ZERO;
             }
 
-            let system_prompt = self
-                .system_prompt_for(&task_content, context.tools.as_slice())
+            let assembled = self
+                .assemble_for(&task_content, context.tools.as_slice())
                 .await;
+            let system_prompt = assembled.system_prompt.clone();
             let prompt_text = task_content.as_text().unwrap_or_default().to_string();
             let provider_request = self.describe_provider_request(
                 &system_prompt,
                 context.tools.as_slice(),
                 session_restore.session().messages(),
                 &task_content,
+                Some(&assembled.memory),
             );
             if let Some(typed) = &provider_request {
                 context.tools = typed.tools.clone();
@@ -1175,6 +1173,7 @@ impl Agent {
                     api_mode: typed.api_mode,
                     intent: self.action_intent(),
                     provider_request: Some(typed.clone()),
+                    context_blocks: typed.context_blocks.clone(),
                     ..Default::default()
                 },
                 None => LlmRequest {

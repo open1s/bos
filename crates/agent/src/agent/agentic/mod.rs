@@ -69,14 +69,14 @@ pub struct MemoryRecallReport {
 /// One immutable prompt assembly: the serialized prompt plus the typed recall
 /// account it was built from (issue #346).
 ///
-/// `base_prompt` is the prompt BEFORE memory injection, so token accounting
-/// can check the memory estimate against the final serialized request within
-/// the estimator's documented rounding limits.
+/// `system_prompt` is the stable policy only; retrieved memory is NOT appended
+/// to it (issues #439/#440). The memory text rides `memory.block` and is
+/// serialized as a framed untrusted context turn in front of the input.
 #[derive(Debug, Clone)]
 pub struct PromptAssembly {
-    /// The full system prompt the request carries.
+    /// The stable system prompt the request carries, without retrieved memory.
     pub system_prompt: String,
-    /// The prompt before the memory block was injected.
+    /// The authored prompt before any placeholder cleanup.
     pub base_prompt: String,
     /// The typed memory recall account.
     pub memory: MemoryRecallReport,
@@ -745,6 +745,7 @@ impl Agent {
         tools: &[react::llm::LlmTool],
         history: &[react::llm::LlmMessage],
         input: &react::llm::Content,
+        memory: Option<&MemoryRecallReport>,
     ) -> Option<react::llm::ProviderRequest> {
         // Every model call has a typed snapshot, even when the host did not
         // pre-populate identities: adapters never need to fall back to reading
@@ -761,6 +762,21 @@ impl Agent {
         request.tool_names = tools.iter().map(|tool| tool.name.clone()).collect();
         request.tools = tools.to_vec();
         request.input = input.clone();
+        // Retrieved memory is context, never system policy. Replace any stale
+        // retrieval block; other context blocks (for example a thinking summary)
+        // are added per call by the engine.
+        request
+            .context_blocks
+            .retain(|block| block.source != "retrieved-memory");
+        if let Some(block) = memory.and_then(|report| report.block.as_deref()) {
+            let provenance = memory
+                .map(|report| format!("hits={}", report.hits.len()))
+                .unwrap_or_default();
+            request.context_blocks.push(
+                react::llm::ContextBlock::untrusted("retrieved-memory", block)
+                    .with_provenance(provenance),
+            );
+        }
         request.temperature = Some(self.config.temperature);
         request.max_tokens = self.config.max_tokens;
         request.reasoning_effort = self

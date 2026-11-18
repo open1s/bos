@@ -13,7 +13,7 @@ use super::{
     contains_token, is_cjk, normalize_text, significant_tokens, similarity, ThinkingOrigin,
     THINKING_SOURCE,
 };
-use crate::llm::{HostGuidance, LlmMessage, ReactSession};
+use crate::llm::{ContextBlock, LlmMessage, ReactSession};
 
 /// The live lifecycle owner for one agent.
 ///
@@ -384,7 +384,7 @@ impl ThinkingState {
         &mut self,
         step: usize,
         history: &[LlmMessage],
-    ) -> Option<HostGuidance> {
+    ) -> Option<ContextBlock> {
         if self.snapshot.summary.phase.is_terminal() || !self.snapshot.summary.has_injectable() {
             return None;
         }
@@ -408,7 +408,7 @@ impl ThinkingState {
         }
         let content = summary.render()?;
         self.injected = Some((revision, step));
-        Some(HostGuidance::new(THINKING_SOURCE, content))
+        Some(ContextBlock::non_authoritative(THINKING_SOURCE, content))
     }
 
     /// The snapshot to persist, if it has changed since the last save.

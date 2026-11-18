@@ -32,6 +32,12 @@ fn refresh_provider_snapshot<S: ReactSession, C: ReactContext>(
     // outside the message list and are dropped once the call is made, so no
     // reader turn is ever followed by a synthetic reader instruction.
     provider.host_guidance = request.host_guidance.clone();
+    // Context blocks ride the same one-call window as guidance, but are a
+    // non-message channel: adapters frame them as user-role data before the
+    // input, never as system policy (#439/#440).
+    if !request.context_blocks.is_empty() {
+        provider.context_blocks = request.context_blocks.clone();
+    }
     request.provider_request = Some(provider);
 }
 

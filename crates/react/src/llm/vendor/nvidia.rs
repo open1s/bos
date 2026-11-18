@@ -224,6 +224,7 @@ mod tests {
             intent: Default::default(),
             provider_request: None,
             host_guidance: Vec::new(),
+            context_blocks: Vec::new(),
         };
         let result = match vendor
             .complete(None, request, &mut LlmSession::new(), &mut ())

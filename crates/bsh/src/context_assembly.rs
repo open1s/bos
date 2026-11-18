@@ -654,9 +654,9 @@ impl AssemblySnapshot {
     /// The blocks that ride as request messages rather than in the system
     /// prompt: the host runtime, the time context and workspace instructions.
     ///
-    /// Persona and retrieved memory are composed into the system prompt today;
-    /// they remain in the snapshot for diagnostics, and are deliberately not
-    /// duplicated as messages (issue #411's documented flattening).
+    /// Persona is the system prompt; retrieved memory rides the provider
+    /// request's untrusted context channel. Both remain in the snapshot for
+    /// diagnostics and are deliberately not duplicated as system messages.
     pub(crate) fn injected_blocks(&self) -> impl Iterator<Item = &ContextBlock> {
         self.blocks.iter().filter(|block| {
             matches!(

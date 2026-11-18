@@ -745,7 +745,12 @@ impl<A: ReActApp> ReActEngine<A> {
             };
             // Guidance is scoped to the call that just ran: the next step starts
             // from the authored prompt unless it earns a note of its own (#434).
+            // Persistent context (retrieved memory) stays; this call's summary
+            // does not.
             request.host_guidance.clear();
+            request
+                .context_blocks
+                .retain(|block| block.source != THINKING_SOURCE);
 
             self.react_app
                 .after_llm_response(
@@ -1520,8 +1525,11 @@ impl<A: ReActApp> ReActEngine<A> {
                 };
                 // Guidance is scoped to the call that just ran: the next step
                 // starts from the authored prompt unless it earns its own note
-                // (issue #434).
+                // (issue #434). Persistent context stays; the summary does not.
                 request.host_guidance.clear();
+                request
+                    .context_blocks
+                    .retain(|block| block.source != THINKING_SOURCE);
 
                 futures::pin_mut!(llm_stream);
                 let mut full_response = String::new();
@@ -2117,9 +2125,9 @@ impl<A: ReActApp> ReActEngine<A> {
             return;
         }
         if request
-            .host_guidance
+            .context_blocks
             .iter()
-            .any(|guidance| guidance.purpose == THINKING_SOURCE)
+            .any(|block| block.source == THINKING_SOURCE)
         {
             return;
         }
@@ -2127,7 +2135,7 @@ impl<A: ReActApp> ReActEngine<A> {
             .thinking
             .prepare_injection(step, session.history().unwrap_or_default())
         {
-            request.host_guidance.push(note);
+            request.context_blocks.push(note);
         }
     }
 

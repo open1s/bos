@@ -45,15 +45,19 @@ items above, at most 12 decisions and 8 questions.
 ## 2. Injection (REQ-2)
 
 `ThinkingState::prepare_injection` returns a
-`HostGuidance { purpose: "thinking-summary", content }`. Host guidance is the
-existing seam for exactly this shape of data:
+`ContextBlock { source: "thinking-summary", trust: NonAuthoritative, role:
+Assistant, priority: Medium, content }`. It is explicitly execution context, not
+policy:
 
-- it is composed into the system prompt of one call by
-  `ProviderRequest::wire_system_prompt`;
-- it is never appended to `messages`, so no user or assistant turn is forged;
-- it is cleared after the call, so it cannot leak into later history;
-- it carries a stable purpose and source marker, visible in request diagnostics
-  and in the wire prompt.
+- `ProviderRequest::wire_messages` serializes it as an `assistant`-role turn
+  wrapped in `<execution_context source="thinking-summary"
+  trust="non-authoritative">`, immediately before the current input;
+- it is never composed into `ProviderRequest::wire_system_prompt`, so it cannot
+  gain instruction authority;
+- it is not stored in the session's message history; the request snapshot is
+  cleared after the call, so it cannot leak into a later turn;
+- it carries a stable source marker and appears in request diagnostics with its
+  trust class and role.
 
 The note is omitted when:
 

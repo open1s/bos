@@ -1,9 +1,10 @@
-//! Thinking summaries reach the next request as host guidance, not as history.
+//! Thinking summaries reach the next request as explicit context, not system policy.
 //!
 //! REQ-2 and REQ-3 are end-to-end here: a reasoning step states a decision and
 //! calls a tool, the tool result either corroborates or retires that decision,
 //! and the following provider request carries a compact note with an explicit
-//! source marker. The note never appears in the message list.
+//! source marker. The note is a framed assistant-role context turn, never a
+//! system message.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,8 +13,8 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use react::llm::{
-    Content, HostGuidance, LlmClient, LlmContext, LlmError, LlmMessage, LlmRequest,
-    LlmResponseResult, LlmSession, ReactSession, StreamToken, TokenStream,
+    Content, ContextBlock, ContextTrust, LlmClient, LlmContext, LlmError, LlmMessage, LlmRequest,
+    LlmResponseResult, LlmSession, Priority, ReactSession, StreamToken, TokenStream,
 };
 use react::runtime::ReActApp;
 use react::thinking::{
@@ -35,7 +36,7 @@ impl ReActApp for TestApp {
 /// What one provider call saw.
 #[derive(Clone)]
 struct Observed {
-    guidance: Vec<HostGuidance>,
+    context_blocks: Vec<ContextBlock>,
     system_prompt: Option<String>,
     messages: Vec<LlmMessage>,
 }
@@ -95,7 +96,7 @@ impl LlmClient<LlmSession, LlmContext> for ReasoningThenAnswer {
         _context: &mut LlmContext,
     ) -> Result<TokenStream, LlmError> {
         self.calls.lock().unwrap().push(Observed {
-            guidance: req.host_guidance.clone(),
+            context_blocks: req.context_blocks.clone(),
             system_prompt: req
                 .provider_request
                 .as_ref()
@@ -103,7 +104,7 @@ impl LlmClient<LlmSession, LlmContext> for ReasoningThenAnswer {
             messages: req
                 .provider_request
                 .as_ref()
-                .map(|provider| provider.messages.clone())
+                .map(|provider| provider.wire_messages())
                 .unwrap_or_default(),
         });
         let first = self.calls.lock().unwrap().len() == 1;
@@ -164,20 +165,11 @@ async fn run(fail: bool, thinking_context: bool) -> (LlmSession, Vec<Observed>) 
     (session, seen)
 }
 
-fn summary_guidance(observed: &Observed) -> Option<&HostGuidance> {
+fn summary_block(observed: &Observed) -> Option<&ContextBlock> {
     observed
-        .guidance
+        .context_blocks
         .iter()
-        .find(|guidance| guidance.purpose == THINKING_SOURCE)
-}
-
-fn message_text(message: &LlmMessage) -> Option<&str> {
-    match message {
-        LlmMessage::System { content } | LlmMessage::Assistant { content } => Some(content),
-        LlmMessage::User { content } => content.as_text(),
-        LlmMessage::ToolResult { content, .. } => Some(content),
-        LlmMessage::AssistantReasoning { .. } | LlmMessage::AssistantToolCall { .. } => None,
-    }
+        .find(|block| block.source == THINKING_SOURCE)
 }
 
 #[tokio::test]
@@ -186,12 +178,14 @@ async fn a_confirming_result_verifies_the_claim_and_reaches_the_next_request() {
     assert_eq!(seen.len(), 2, "one reasoning step and one answer step");
 
     let second = &seen[1];
-    let note = summary_guidance(second).expect("the next request carries a thinking note");
+    let note = summary_block(second).expect("the next request carries a thinking note");
     assert!(
         note.content.contains("[source: thinking-summary"),
         "the note names its source: {}",
         note.content
     );
+    assert_eq!(note.trust, ContextTrust::NonAuthoritative);
+    assert_eq!(note.priority, Priority::Medium);
     assert!(
         note.content.contains("[verified]") && note.content.contains("bug"),
         "the claim the output confirms is verified: {}",
@@ -204,19 +198,34 @@ async fn a_confirming_result_verifies_the_claim_and_reaches_the_next_request() {
         note.content
     );
     assert!(
-        second
+        !second
             .system_prompt
             .as_deref()
             .is_some_and(|prompt| prompt.contains("[source: thinking-summary")),
-        "the note reaches the system prompt, not the message list"
+        "the note must not gain system authority"
+    );
+    let context = second
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            LlmMessage::Assistant { content }
+                if content.contains("<execution_context source=\"thinking-summary\"") =>
+            {
+                Some(content)
+            }
+            _ => None,
+        })
+        .expect("the note rides an assistant context turn");
+    assert!(
+        context.contains("[source: thinking-summary"),
+        "the context turn carries the note: {context}"
     );
     assert!(
-        !second
-            .messages
-            .iter()
-            .filter_map(message_text)
-            .any(|text| text.contains("source: thinking-summary")),
-        "the note is not a synthetic message"
+        !second.messages.iter().any(|message| matches!(
+            message,
+            LlmMessage::System { content } if content.contains("source: thinking-summary")
+        )),
+        "no system message carries the note"
     );
 
     let history = session.history().expect("the session keeps history");
@@ -256,11 +265,8 @@ async fn the_switch_disables_extraction_persistence_and_injection() {
     );
     for observed in &seen {
         assert!(
-            !observed
-                .guidance
-                .iter()
-                .any(|guidance| guidance.purpose == THINKING_SOURCE),
-            "a disabled switch adds no thinking guidance"
+            summary_block(observed).is_none(),
+            "a disabled switch adds no thinking context"
         );
     }
     assert!(
@@ -298,7 +304,7 @@ async fn a_restored_session_resumes_its_live_summary() {
             _context: &mut LlmContext,
         ) -> Result<TokenStream, LlmError> {
             self.calls.lock().unwrap().push(Observed {
-                guidance: req.host_guidance.clone(),
+                context_blocks: req.context_blocks.clone(),
                 system_prompt: req
                     .provider_request
                     .as_ref()
@@ -352,7 +358,7 @@ async fn a_restored_session_resumes_its_live_summary() {
     }
 
     let seen = calls.lock().unwrap();
-    let note = summary_guidance(&seen[0]).expect("the resumed summary is injected");
+    let note = summary_block(&seen[0]).expect("the resumed summary is injected");
     assert!(
         note.content
             .contains("[inferred] I will run the parser test"),
@@ -365,7 +371,7 @@ async fn a_restored_session_resumes_its_live_summary() {
 async fn a_failed_result_retires_the_judgment_and_injects_the_open_question() {
     let (session, seen) = run(true, true).await;
     let second = &seen[1];
-    let note = summary_guidance(second).expect("the next request carries a thinking note");
+    let note = summary_block(second).expect("the next request carries a thinking note");
     assert!(
         !note
             .content

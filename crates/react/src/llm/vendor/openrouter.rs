@@ -203,6 +203,7 @@ mod tests {
             intent: Default::default(),
             provider_request: None,
             host_guidance: Vec::new(),
+            context_blocks: Vec::new(),
         };
         let outcome = vendor
             .complete(

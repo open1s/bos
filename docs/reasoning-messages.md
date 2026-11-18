@@ -34,7 +34,26 @@ rewrites either.
 | Normal `Assistant` text | Yes, according to the conversation-history policy |
 | Model-returned `AssistantReasoning` | Not by default |
 | Provider-required reasoning state | Only by the adapter that recognizes its own `provider` |
-| Thinking summary | Separate `HostGuidance`, injected on demand when enabled |
+| Thinking summary | `Assistant`-role context on demand; never a system message |
+
+| Context source | Wire role | Priority | Trust | Framing |
+|---|---|---|---|---|
+| Thinking summary | `assistant` | Medium | non-authoritative | `<execution_context source="thinking-summary" trust="non-authoritative" priority="medium">` |
+| Retrieved memory | `user` | Medium | untrusted-data | `<untrusted_context source="retrieved-memory" trust="untrusted-data" priority="medium">` |
+| Quoted/untrusted content | `user` | Low | untrusted-data | `<untrusted_context ... priority="low">` |
+
+The four priorities are `Highest`, `High`, `Medium`, `Low`. Role says who
+the message belongs to, priority says which side wins a conflict, and trust says
+how far the content can be believed; the three are independent. `System` is
+Highest; the current user request is High; normal assistant history, the
+thinking summary and retrieved memory are Medium; raw reasoning and tool traffic
+are Low.
+
+The summary is assistant-side task-continuation state, not raw reasoning and not
+policy. Retrieved memory is historical reader-side data, not a new request. Both
+are framed immediately before the current input and never enter the system
+prompt. A summary does not use `AssistantReasoning`; that type remains reserved
+for provider-native reasoning blocks.
 
 The default is deliberate: the Chat Completions adapter skips
 `AssistantReasoning` entirely. A provider switch therefore cannot replay an

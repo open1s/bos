@@ -18,8 +18,10 @@
 //! - Superseded or completed state is never injected: the injection path sees
 //!   only active decisions, unresolved questions and a live next action.
 //! - The note is not stored in the message list. It rides on
-//!   [`crate::llm::HostGuidance`] for one call and is filtered against the
-//!   history, so it neither duplicates a turn nor changes the history.
+//!   [`crate::llm::ContextBlock`] as explicitly non-authoritative execution
+//!   context for one call, is serialized as a framed context turn before the
+//!   input, and is filtered against the history so it neither duplicates a turn
+//!   nor changes the history.
 //!
 //! [`ThinkingState`] is the lifecycle owner: it ingests reasoning and tool
 //! outcomes, updates or retires decisions, and emits the injection note. A

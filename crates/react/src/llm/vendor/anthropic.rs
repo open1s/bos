@@ -310,7 +310,7 @@ impl AnthropicVendor {
         }
         let mut messages: Vec<AnthropicMessage> = Vec::new();
         let history: Vec<crate::llm::LlmMessage> = if let Some(provider) = typed {
-            provider.messages.clone()
+            provider.wire_messages()
         } else {
             session
                 .history()
@@ -845,6 +845,7 @@ mod tests {
             intent: Default::default(),
             provider_request: None,
             host_guidance: Vec::new(),
+            context_blocks: Vec::new(),
         }
     }
 
