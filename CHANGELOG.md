@@ -1,5 +1,9 @@
 # Changelog
 
+## v4.1.21 (2026-11-19)
+
+- Release v4.1.21.
+
 ## v4.1.20 (2026-11-19)
 
 - **One result envelope for every tool call (#447).** The engine now records
