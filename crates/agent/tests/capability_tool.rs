@@ -396,3 +396,78 @@ async fn a_shim_preserves_a_dispatchers_proxy_target() {
     assert_eq!(target.0, "echo_add");
     assert_eq!(target.1, json!({ "a": 1, "b": 2 }));
 }
+
+/// The capability boundary keeps the class a tool reported, so a caller's
+/// recovery decision does not depend on parsing the message.
+#[test]
+fn a_capability_failure_keeps_its_class() {
+    use agent::capabilities::to_tool_error;
+    use capability::{CapabilityError, DeliveryState};
+    use react::tool::ToolErrorCode;
+
+    let denied = to_tool_error(CapabilityError::Denied {
+        reason: "the policy refused the write".to_string(),
+        policy: None,
+    });
+    assert_eq!(denied.code(), ToolErrorCode::PermissionDenied);
+    assert!(!denied.retryable());
+    assert!(!denied.indeterminate());
+
+    let cancelled = to_tool_error(CapabilityError::Cancelled);
+    assert_eq!(cancelled.code(), ToolErrorCode::Cancelled);
+    assert!(cancelled.indeterminate(), "cancellation is not rollback");
+
+    let timed_out = to_tool_error(CapabilityError::Timeout {
+        elapsed_ms: 30,
+        partial: Some(json!({ "stdout": "half" })),
+    });
+    assert_eq!(timed_out.code(), ToolErrorCode::Timeout);
+    assert!(timed_out.to_string().contains("stdout"), "{timed_out}");
+
+    let unavailable = to_tool_error(CapabilityError::Unavailable {
+        reason: "the browser engine is not running".to_string(),
+    });
+    assert_eq!(unavailable.code(), ToolErrorCode::Unavailable);
+    assert!(unavailable.retryable());
+
+    let not_sent = to_tool_error(CapabilityError::Transport {
+        message: "dial failed".to_string(),
+        delivered: DeliveryState::NotSent,
+    });
+    assert_eq!(not_sent.code(), ToolErrorCode::Unavailable);
+    assert!(not_sent.retryable(), "nothing left this node");
+
+    let sent = to_tool_error(CapabilityError::Transport {
+        message: "no answer".to_string(),
+        delivered: DeliveryState::Sent,
+    });
+    assert_eq!(sent.code(), ToolErrorCode::Internal);
+    assert!(sent.indeterminate(), "a sent call may have run at the peer");
+
+    let conflict = to_tool_error(CapabilityError::Duplicate {
+        message: "already accepted".to_string(),
+    });
+    assert_eq!(conflict.code(), ToolErrorCode::Conflict);
+}
+
+/// A missing argument keeps its name across the capability boundary, because
+/// the shim validates against the descriptor the model was shown.
+#[tokio::test]
+async fn a_missing_argument_keeps_its_field_through_the_shim() {
+    let registry = registry();
+    let runtime = runtime_over(&registry);
+    let shim = CapabilityTool::new(runtime, &capability("echo_add"), principal())
+        .expect("the capability exists");
+
+    let error = shim
+        .run(&json!({ "a": 1 }))
+        .await
+        .expect_err("b is required");
+    match error {
+        ToolError::InvalidField { field, missing, .. } => {
+            assert_eq!(field, "b");
+            assert!(missing);
+        }
+        other => panic!("expected a field error, got {other:?}"),
+    }
+}

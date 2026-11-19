@@ -916,7 +916,13 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                     .any(|(start, end)| *start <= at && at < *end)
             });
             let outcome = match tool.output.as_deref().map(str::trim) {
-                Some(output) if !output.is_empty() => clip(first_line(output).as_str(), 72),
+                Some(output) if !output.is_empty() => {
+                    // The envelope's summary is the outcome in one line; an
+                    // older row has none, so its payload's first line is used.
+                    let line =
+                        crate::tool_output::summary(output).unwrap_or_else(|| first_line(output));
+                    clip(line.as_str(), 72)
+                }
                 _ => lang.tr("traj.noOutput"),
             };
             out.push(Event {

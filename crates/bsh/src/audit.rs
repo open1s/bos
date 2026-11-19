@@ -975,8 +975,7 @@ fn confinement_of(
     Option<String>,
     Option<String>,
 ) {
-    let Some(value) = output.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-    else {
+    let Some(value) = output.and_then(crate::tool_output::payload) else {
         return (None, None, None, None);
     };
     let field = |key: &str| {
@@ -995,12 +994,16 @@ fn confinement_of(
     )
 }
 
-/// How a stored output reads: the engine prefixes a tool failure with "Error: ",
-/// and an absent output is a call still running.
+/// How a stored output reads: a failure is the envelope's `status` (or, for a
+/// row written before the envelope, its legacy "Error: " prefix), and an absent
+/// output is a call still running.
 fn outcome_of(output: Option<&str>) -> AuditOutcome {
     match output {
         None => AuditOutcome::Pending,
-        Some(output) if output.starts_with("Error:") || output.starts_with("Error\u{ff1a}") => {
+        Some(output)
+            if react::tool::ToolResult::text_is_error(output)
+                || output.starts_with("Error\u{ff1a}") =>
+        {
             AuditOutcome::Failed
         }
         Some(_) => AuditOutcome::Ok,

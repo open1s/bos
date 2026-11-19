@@ -31,9 +31,7 @@ fn validate_object(schema: &serde_json::Value, args: &serde_json::Value) -> Resu
                 })?;
 
             if !args_obj.contains_key(field_name) {
-                return Err(ToolError::SchemaMismatch {
-                    message: format!("missing required field: {}", field_name),
-                });
+                return Err(ToolError::missing(field_name));
             }
         }
     }
@@ -42,9 +40,7 @@ fn validate_object(schema: &serde_json::Value, args: &serde_json::Value) -> Resu
     if schema.get("additionalProperties") == Some(&serde_json::Value::Bool(false)) {
         for field_name in args_obj.keys() {
             if !properties.is_some_and(|props| props.contains_key(field_name)) {
-                return Err(ToolError::SchemaMismatch {
-                    message: format!("unknown field: {field_name}"),
-                });
+                return Err(ToolError::invalid_field(field_name, "is not declared"));
             }
         }
     }
@@ -80,21 +76,18 @@ fn validate_field(
     };
 
     if !matches {
-        return Err(ToolError::SchemaMismatch {
-            message: format!(
-                "field '{}' expected type {}, got {}",
-                name,
-                expected_type,
-                value_type(value)
-            ),
-        });
+        return Err(ToolError::invalid_field(
+            name,
+            format!("expected type {}, got {}", expected_type, value_type(value)),
+        ));
     }
 
     if let Some(values) = schema.get("enum").and_then(|v| v.as_array()) {
         if !values.contains(value) {
-            return Err(ToolError::SchemaMismatch {
-                message: format!("field '{name}' must be one of the declared enum values"),
-            });
+            return Err(ToolError::invalid_field(
+                name,
+                "must be one of the declared enum values",
+            ));
         }
     }
 
@@ -102,16 +95,18 @@ fn validate_field(
         let length = text.chars().count();
         if let Some(minimum) = schema.get("minLength").and_then(|v| v.as_u64()) {
             if length < minimum as usize {
-                return Err(ToolError::SchemaMismatch {
-                    message: format!("field '{name}' must contain at least {minimum} characters"),
-                });
+                return Err(ToolError::invalid_field(
+                    name,
+                    format!("must contain at least {minimum} characters"),
+                ));
             }
         }
         if let Some(maximum) = schema.get("maxLength").and_then(|v| v.as_u64()) {
             if length > maximum as usize {
-                return Err(ToolError::SchemaMismatch {
-                    message: format!("field '{name}' must contain at most {maximum} characters"),
-                });
+                return Err(ToolError::invalid_field(
+                    name,
+                    format!("must contain at most {maximum} characters"),
+                ));
             }
         }
     }
@@ -119,16 +114,18 @@ fn validate_field(
     if let Some(number) = numeric_value(value) {
         if let Some(minimum) = schema.get("minimum").and_then(|v| v.as_f64()) {
             if number < minimum {
-                return Err(ToolError::SchemaMismatch {
-                    message: format!("field '{name}' must be at least {minimum}"),
-                });
+                return Err(ToolError::invalid_field(
+                    name,
+                    format!("must be at least {minimum}"),
+                ));
             }
         }
         if let Some(maximum) = schema.get("maximum").and_then(|v| v.as_f64()) {
             if number > maximum {
-                return Err(ToolError::SchemaMismatch {
-                    message: format!("field '{name}' must be at most {maximum}"),
-                });
+                return Err(ToolError::invalid_field(
+                    name,
+                    format!("must be at most {maximum}"),
+                ));
             }
         }
     }
@@ -136,16 +133,18 @@ fn validate_field(
     if let Some(array) = value.as_array() {
         if let Some(minimum) = schema.get("minItems").and_then(|v| v.as_u64()) {
             if array.len() < minimum as usize {
-                return Err(ToolError::SchemaMismatch {
-                    message: format!("field '{name}' must contain at least {minimum} items"),
-                });
+                return Err(ToolError::invalid_field(
+                    name,
+                    format!("must contain at least {minimum} items"),
+                ));
             }
         }
         if let Some(maximum) = schema.get("maxItems").and_then(|v| v.as_u64()) {
             if array.len() > maximum as usize {
-                return Err(ToolError::SchemaMismatch {
-                    message: format!("field '{name}' must contain at most {maximum} items"),
-                });
+                return Err(ToolError::invalid_field(
+                    name,
+                    format!("must contain at most {maximum} items"),
+                ));
             }
         }
         if let Some(items_schema) = schema.get("items") {
@@ -207,10 +206,11 @@ mod tests {
         });
         let args = json!({});
         let result = validate_args(&schema, &args);
-        assert!(matches!(result, Err(ToolError::SchemaMismatch { .. })));
-        if let Err(ToolError::SchemaMismatch { message }) = result {
-            assert!(message.contains("missing required field: name"));
-        }
+        let error = result.expect_err("a required field is missing");
+        assert_eq!(error.field(), Some("name"), "{error:?}");
+        assert!(error.missing_field(), "{error:?}");
+        assert_eq!(error.code(), react::tool::ToolErrorCode::InvalidInput);
+        assert!(error.to_string().contains("name"), "{error}");
     }
 
     #[test]
@@ -224,10 +224,14 @@ mod tests {
         });
         let args = json!({"count": "not a number"});
         let result = validate_args(&schema, &args);
-        assert!(matches!(result, Err(ToolError::SchemaMismatch { .. })));
-        if let Err(ToolError::SchemaMismatch { message }) = result {
-            assert!(message.contains("expected type number"));
-        }
+        let error = result.expect_err("the type is wrong");
+        assert_eq!(error.field(), Some("count"), "{error:?}");
+        assert!(!error.missing_field(), "present but malformed");
+        assert!(
+            error.to_string().contains("expected type number"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("count"), "{error}");
     }
 
     #[test]
@@ -346,6 +350,23 @@ mod tests {
         });
         let args = json!({"items": ["a", 123, "c"]});
         let result = validate_args(&schema, &args);
-        assert!(matches!(result, Err(ToolError::SchemaMismatch { .. })));
+        let error = result.expect_err("the third item is not a string");
+        assert_eq!(error.field(), Some("items[1]"), "{error:?}");
+    }
+
+    /// A field-level rejection names the argument, so the model can repair
+    /// exactly that one instead of re-reading the whole schema.
+    #[test]
+    fn an_undeclared_field_is_rejected_by_name() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "path": {"type": "string"} },
+            "additionalProperties": false
+        });
+        let error = validate_args(&schema, &json!({"path": "a", "extra": true}))
+            .expect_err("an undeclared field is refused");
+        assert_eq!(error.field(), Some("extra"), "{error:?}");
+        assert!(!error.missing_field());
+        assert!(error.to_string().contains("extra"), "{error}");
     }
 }

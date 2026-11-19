@@ -300,6 +300,14 @@ impl AsyncTool for CapabilityTool {
     }
 
     async fn run_with_call_id(&self, input: &Value, call_id: &str) -> Result<Value, ToolError> {
+        // Validate against the descriptor the model was shown before the call
+        // crosses the capability boundary. The provider validates too, but its
+        // refusal travels back as one message; doing it here keeps the
+        // offending field structured, which is what lets the model repair that
+        // argument instead of re-reading the schema.
+        if self.descriptor.input_schema.is_object() {
+            crate::tools::validate_args(&self.descriptor.input_schema, input)?;
+        }
         let mut context = self.context(call_id);
         let token = CancelToken::new();
         context.cancel = token.clone();
@@ -345,10 +353,47 @@ pub fn to_tool_error(error: CapabilityError) -> ToolError {
     match error {
         CapabilityError::Invalid { message } => ToolError::InvalidInput(message),
         CapabilityError::NotFound { capability } => ToolError::NotFound(capability.to_string()),
-        CapabilityError::Timeout { elapsed_ms, .. } => ToolError::Timeout(format!(
-            "capability exceeded its deadline after {elapsed_ms} ms"
-        )),
-        CapabilityError::Denied { reason, .. } => ToolError::Failed(format!("denied: {reason}")),
-        other => ToolError::Failed(other.to_string()),
+        CapabilityError::DelegationNotFound { delegation } => ToolError::NotFound(delegation),
+        CapabilityError::Timeout {
+            elapsed_ms,
+            partial,
+        } => {
+            let captured = partial
+                .map(|partial| format!("; partial output: {partial}"))
+                .unwrap_or_default();
+            ToolError::Timeout(format!(
+                "capability exceeded its deadline after {elapsed_ms} ms{captured}"
+            ))
+        }
+        // A refusal is its own class, not a generic failure: retrying it is
+        // never the recovery, and the model must be able to tell.
+        CapabilityError::Denied { reason, .. } => ToolError::denied(reason),
+        CapabilityError::Cancelled => ToolError::cancelled("the capability call was cancelled"),
+        CapabilityError::Unavailable { reason } | CapabilityError::StaleDiscovery { reason } => {
+            ToolError::Unavailable { message: reason }
+        }
+        CapabilityError::RateLimited { retry_after_ms } => ToolError::Unavailable {
+            message: match retry_after_ms {
+                Some(ms) => format!("the capability is rate limited; retry after {ms} ms"),
+                None => "the capability is rate limited".to_string(),
+            },
+        },
+        CapabilityError::Duplicate { message } => ToolError::Conflict { message },
+        CapabilityError::ProviderFailed { message } => ToolError::Failed(message),
+        // A message that never left may be retried; one that left and was not
+        // answered has an unknown outcome and must be inspected first.
+        CapabilityError::Transport {
+            message,
+            delivered: ::capability::DeliveryState::NotSent,
+        } => ToolError::Unavailable {
+            message: format!("the capability transport failed before sending: {message}"),
+        },
+        CapabilityError::Transport {
+            message,
+            delivered: ::capability::DeliveryState::Sent,
+        }
+        | CapabilityError::UnknownOutcome { message } => {
+            ToolError::Failed(format!("the outcome is unknown after sending: {message}"))
+        }
     }
 }

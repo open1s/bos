@@ -361,9 +361,14 @@ existing shape; the shared fields add meaning without moving data:
   says whether the returned context was cut, so a complete edit is never
   mislabeled as a partial edit.
 - `next` is present only when a continuation exists, and its value is the
-  exact argument object for the next call: `read_file`/`read_files` use
-  `{"offset": N}`, `glob`/`grep` use `{"limit": N}`. A result with no
-  `next` is complete; a result with `next` says exactly how to continue.
+  exact argument object for the next call; `glob`/`grep` use
+  `{"limit": N}`. A result with no `next` is complete.
+- `next_offset` (file reads only) is ALWAYS present: the 1-based line to
+  pass as `offset` next, or null when that file is fully read. A
+  `read_files` result carries one per entry; a failed entry carries null.
+  It is the ONLY continuation a read result carries: no duplicate `next`
+  object and no envelope `continuation` repeating the same offset. The
+  `hint` says to pass it as `offset`.
 - `count` is the number of returned items (`lines`, `matches`, `entries`,
   `files`). `read_files` and `apply_patch` also report `failed`/`returned`,
   and every per-file entry carries its own `status`.
@@ -371,24 +376,27 @@ existing shape; the shared fields add meaning without moving data:
   mislead: an empty glob, an offset past EOF, or a spent context row budget.
 
 There are no `truncated`/`unchanged`/`changed` booleans. Completeness is a word
-(`status`), continuation is an argument object (`next`), and a change is an
+(`status`), continuation is one field (`next` for searches, `next_offset` for
+reads) that the engine turns into the next call's arguments, and a change is an
 outcome word (`created`, `updated`, `patched`, `unchanged`, `changed`).
 
 `read_file` treats `offset` as optional and defaults it to 1: a path-only call
 starts at the first line, and after a partial window the same path-only call
-continues from the previous `next` instead of returning the same lines. Pass
-`offset: 1` explicitly to re-read from the start. Every line number is 1-based:
-`start_line`/`end_line`/`total_lines` use the same base, and `next.offset` is
-`end_line + 1`. Offset 0 is refused rather than silently meaning the first
+continues from the previous `next_offset` (while the file is unchanged)
+instead of returning the same lines. Pass `offset: 1` explicitly to re-read
+from the start. Every line number is 1-based: `start_line`/`end_line`/
+`total_lines` use the same base, and `next_offset` is `end_line + 1`. Offset 0 is refused rather than silently meaning the first
 line. It returns raw `content` plus `start_line`, `end_line`
 and `total_lines` for a file inside the read ceiling; a window in a larger file
 reports `total_lines: null` rather than scanning the rest. An empty file and
 an offset past EOF are distinguished by `status` and `hint`, because empty
 `content` alone reads as "the file is empty". A batch cut in the middle of a
-line points `next.offset` at that same line, so the continuation re-reads the
-partial line instead of skipping it. A first line larger than the read-window
-ceiling is refused rather than returned as an empty page whose `next` would
-point at the same line forever.
+line points `next_offset` at that same line, so the continuation re-reads the
+partial line instead of skipping it. `read_files` applies `offset`/`limit` to
+every file, so continuing one cut entry means calling `read_file` (or
+`read_files`) with only that path and the entry's `next_offset`. A first line larger than the read-window
+ceiling is refused rather than returned as an empty page whose `next_offset`
+would point at the same line forever.
 
 `grep` accepts up to 2000 context rows per side. A call without `limit` gets at
 least one full context window (2 x context + 1 rows, capped at the row

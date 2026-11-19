@@ -9,7 +9,7 @@ use crate::skills::SkillError;
 use thiserror::Error;
 
 pub use react::llm::LlmError;
-pub use react::tool::ToolError;
+pub use react::tool::{ToolError, ToolErrorCode};
 
 /// Top-level agent errors.
 #[derive(Error, Debug, Clone)]

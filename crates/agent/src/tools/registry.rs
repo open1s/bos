@@ -459,9 +459,10 @@ mod mcp_projection_tests {
             .execute("strict_exec", &serde_json::json!({}))
             .expect_err("missing required argument");
         assert!(
-            matches!(error, ToolError::SchemaMismatch { .. }),
+            matches!(error, ToolError::InvalidField { missing: true, .. }),
             "{error:?}"
         );
+        assert_eq!(error.field(), Some("value"), "{error:?}");
 
         let value = registry
             .execute("strict_exec", &serde_json::json!({"value": "x"}))

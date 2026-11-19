@@ -1,5 +1,8 @@
 # Tool Complexity and Confusion Risk Analysis with Input/Output Patterns
 
+> The code-backed audit, the implemented result envelope and the remaining gap
+> list live in [`docs/rfc/tools-2.0.md`](rfc/tools-2.0.md).
+
 ## Tool Complexity Matrix
 
 | Tool Category | Tool Names | Input Complexity | Output Complexity | Main Confusion Points |

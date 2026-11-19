@@ -2,6 +2,26 @@
 
 ## v4.1.20 (2026-11-19)
 
+- **One result envelope for every tool call (#447).** The engine now records
+  each tool result as `{status, summary, data, error, continuation, truncated}`
+  instead of stringifying the payload and prefixing failures with "Error: ".
+  `status` is one of `success`, `partial`, `pending`, `error`; `error` carries a
+  stable class (`invalid_input`, `permission_denied`, `timeout`, `cancelled`,
+  `unavailable`, …) with `retryable` and `indeterminate` advice. The tool's own
+  payload stays unmodified under `data`, so existing payload consumers keep
+  reading the same keys. `ToolError` gained field-level validation errors and
+  permission/cancellation/conflict/unavailable classes, and the capability
+  boundary now preserves the class instead of flattening it into a message.
+  Truncated results stay valid JSON and say so. `read_file` and `read_files`
+  now return an explicit `next_offset` (per file for a batch) as their single
+  continuation (no duplicate `next` object and no envelope `continuation`
+  repeating it): the line to pass as `offset` next, or `null` when
+  the file is fully read (every per-file entry carries the field, a failed
+  entry as null), so the model never has to infer completion from an absent
+  field. The hint says to pass `next_offset` as `offset`; the input
+  schema keeps the simple `offset`/`limit` pair. See
+  `docs/rfc/tools-2.0.md`.
+
 - **Reasoning is turn-local; the thinking-summary channel is removed.**
   `AssistantReasoning` blocks may be replayed only inside the turn that
   produced them: a tool loop sends them back (DeepSeek `reasoning_content`,

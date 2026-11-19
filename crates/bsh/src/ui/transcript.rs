@@ -765,7 +765,9 @@ fn result_change(name: &str, output: Option<&str>) -> Option<StepChange> {
     if name != "sed" {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_str(output?).ok()?;
+    // The result is read through the engine's envelope, so a legacy row (the
+    // payload at the top level) and a current one read alike.
+    let value: serde_json::Value = crate::tool_output::payload(output?)?;
     // The current result uses words (mode/outcome); the boolean fallback
     // keeps a replayed session written before the result contract readable.
     let dry_run = value.get("mode").and_then(serde_json::Value::as_str) == Some("dry-run")

@@ -31,17 +31,34 @@ impl<A: ReActApp> ReActEngine<A> {
         if Self::TRANSIENT_TOOL_RETRIES == 0 {
             return false;
         }
-        let text = error.to_string().to_lowercase();
-        if !Self::TRANSIENT_FAILURES
-            .iter()
-            .any(|needle| text.contains(needle))
-        {
+        // A classified failure answers directly; a message-only failure keeps
+        // the older text rule. A timeout is not retryable in general (the
+        // operation may have started), but this path only runs for tools whose
+        // declared side effects are all "read", so repeating one cannot
+        // duplicate a change.
+        let transient = match error {
+            ReactError::ToolFailure(failure) => {
+                failure.retryable()
+                    || matches!(failure, crate::tool::ToolError::Timeout(_))
+                    || Self::transient_text(&failure.to_string())
+            }
+            other => Self::transient_text(&other.to_string()),
+        };
+        if !transient {
             return false;
         }
         self.tools.metadata(name).is_some_and(|metadata| {
             !metadata.side_effects.is_empty()
                 && metadata.side_effects.iter().all(|effect| effect == "read")
         })
+    }
+
+    /// Whether a failure message names something a retry can plausibly clear.
+    fn transient_text(text: &str) -> bool {
+        let text = text.to_lowercase();
+        Self::TRANSIENT_FAILURES
+            .iter()
+            .any(|needle| text.contains(needle))
     }
 
     /// Run a tool, retrying a declared read-only tool once after a transient
@@ -89,7 +106,11 @@ impl<A: ReActApp> ReActEngine<A> {
             // If cancel was requested between register and tool execution,
             // skip running the tool entirely.
             if !self.run_manager.is_running(&cid) {
+                // The tool name makes this payload a result-contract record,
+                // so the envelope reads the cancellation instead of treating a
+                // skipped call as a success.
                 return Ok(serde_json::json!({
+                    "tool": name,
                     "status": "cancelled",
                     "call_id": cid,
                     "elapsed_ms": 0,
@@ -101,12 +122,12 @@ impl<A: ReActApp> ReActEngine<A> {
             } else {
                 self.run_manager.fail(&cid);
             }
-            result.map_err(|e| ReactError::ToolError(format!("{:?}", e)))
+            result.map_err(ReactError::ToolFailure)
         } else {
             self.tools
                 .call(name, input)
                 .await
-                .map_err(|e| ReactError::ToolError(format!("{:?}", e)))
+                .map_err(ReactError::ToolFailure)
         }
     }
 

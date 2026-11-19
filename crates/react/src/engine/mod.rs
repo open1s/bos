@@ -10,6 +10,7 @@ use crate::resilience::{ReActResilience, ResilienceError};
 use crate::runtime::{HookDecision, ReActApp};
 use crate::telemetry::{Telemetry, TelemetryEvent, TokenBudgetReport, TokenCounter, TokenUsage};
 use crate::tool::registry::{FnTool, ToolVariant};
+use crate::tool::result::ToolResult;
 use crate::tool::{Tool, ToolRegistry};
 use async_stream::stream;
 use bus::Bus;
@@ -149,65 +150,34 @@ impl RepeatedFailure {
 /// the next request. The head and tail are kept because the failure and the
 /// summary usually sit at opposite ends; the middle is the part a model can
 /// ask for again with a narrower call.
-const TOOL_RESULT_CAP: usize = 48 * 1024;
+const TOOL_RESULT_CAP: usize = crate::tool::result::DEFAULT_RESULT_CAP;
 
-/// Cap one tool result, preserving both ends and naming what was dropped.
-fn cap_tool_result(text: &str, cap: usize) -> String {
-    let cap = if cap == 0 { TOOL_RESULT_CAP } else { cap };
-    if text.len() <= cap {
-        return text.to_string();
-    }
-
-    const SHORT_MARKER: &str = "\n[truncated]\n";
-    if cap <= SHORT_MARKER.len() {
-        return SHORT_MARKER[..cap].to_string();
-    }
-
-    // Keep both ends, but include the omission marker INSIDE the byte budget.
-    // Very small caps use a short marker; larger caps also report the byte gap.
-    let marker_budget = if cap < 128 { SHORT_MARKER.len() } else { 64 };
-    let mut head_budget = (cap - marker_budget) / 2;
-    let mut tail_budget = cap - marker_budget - head_budget;
-    loop {
-        let mut head_end = head_budget.min(text.len());
-        while head_end > 0 && !text.is_char_boundary(head_end) {
-            head_end -= 1;
-        }
-        let mut tail_start = text.len().saturating_sub(tail_budget);
-        while tail_start < text.len() && !text.is_char_boundary(tail_start) {
-            tail_start += 1;
-        }
-
-        let omitted = tail_start.saturating_sub(head_end);
-        let marker = if cap < 128 {
-            SHORT_MARKER.to_string()
-        } else {
-            format!("\n\n[... {omitted} bytes omitted; ask for a narrower read or grep ...]\n\n")
-        };
-        let tail_len = text.len().saturating_sub(tail_start);
-        if head_end + marker.len() + tail_len <= cap {
-            return format!("{}{marker}{}", &text[..head_end], &text[tail_start..]);
-        }
-
-        if head_budget >= tail_budget && head_budget > 0 {
-            head_budget -= 1;
-        } else if tail_budget > 0 {
-            tail_budget -= 1;
-        } else {
-            return SHORT_MARKER[..cap.min(SHORT_MARKER.len())].to_string();
-        }
+/// Render one tool result as the shared envelope, capped for the model.
+///
+/// Every result the engine hands the model goes through here: a success keeps
+/// its payload under `data`, a failure becomes a classified `error`, and a
+/// result the tool itself called partial or pending keeps its continuation.
+/// The envelope is what makes the next iteration's verdict independent of
+/// whether a message happens to contain the words "Error:".
+fn render_tool_result(tool: &str, result: &Result<Value, ReactError>, cap: usize) -> String {
+    match result {
+        Ok(value) => ToolResult::from_value(tool, value.clone()).to_text(cap),
+        Err(error) => ToolResult::from_error(tool, &error.as_tool_error()).to_text(cap),
     }
 }
 
 /// A normalized signature for a failed tool result, or none for a success.
+///
+/// The verdict comes from the result envelope, so a payload that merely
+/// mentions a failure is not mistaken for one and a failure whose message
+/// contains no digits is still recognized.
 ///
 /// Digits are dropped (they carry PIDs, timings and line numbers, which differ
 /// between two attempts at the same broken command) and the rest is lowercased
 /// and collapsed to one line. The prefix is bounded so two megabyte failures
 /// still compare cheaply.
 fn failure_signature(tool: &str, result: &str) -> Option<String> {
-    let failed = result.starts_with("Error:") || result.contains("\"success\":false");
-    if !failed {
+    if !ToolResult::text_is_error(result) {
         return None;
     }
     let mut signature = String::with_capacity(96);
@@ -987,16 +957,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                     }
                                 }
 
-                                // One cap for the whole result: the same
-                                // ceiling the streaming loop applies, applied
-                                // before anything reaches the session.
-                                let result_text = cap_tool_result(
-                                    &match &result {
-                                        Ok(ret) => ret.to_string(),
-                                        Err(error) => format!("Error: {error}"),
-                                    },
-                                    self.tool_result_cap,
-                                );
+                                // One envelope for the whole result, capped
+                                // with the same ceiling the streaming loop
+                                // applies, before anything reaches the session.
+                                let result_text =
+                                    render_tool_result(&observed, &result, self.tool_result_cap);
                                 trace.note_tool_result(result.is_ok());
 
                                 if let Ok(ret) = &result {
@@ -1278,16 +1243,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                     }
                                 }
 
-                                // One cap for the whole result: the same
-                                // ceiling the streaming loop applies, applied
-                                // before anything reaches the session.
-                                let result_text = cap_tool_result(
-                                    &match &result {
-                                        Ok(ret) => ret.to_string(),
-                                        Err(error) => format!("Error: {error}"),
-                                    },
-                                    self.tool_result_cap,
-                                );
+                                // One envelope for the whole result, capped
+                                // with the same ceiling the streaming loop
+                                // applies, before anything reaches the session.
+                                let result_text =
+                                    render_tool_result(&observed, &result, self.tool_result_cap);
                                 trace.note_tool_result(result.is_ok());
 
                                 if let Ok(ret) = &result {
@@ -1707,37 +1667,36 @@ impl<A: ReActApp> ReActEngine<A> {
                                 }
                             }
 
-                            let result_text = match result {
-                                Ok(ref ret) => {
-                                    if name == "load_skill" {
-                                        let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                        let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
-                                        let skill_dir = ret.get("skill_dir").and_then(|v| v.as_str()).unwrap_or("");
-                                        if !instructions.is_empty() && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                            loaded_skills.insert(skill_name.to_string(), (instructions.to_string(), skill_dir.to_string()));
-                                        }
+                            if let Ok(ref ret) = result {
+                                if name == "load_skill" {
+                                    let skill_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let instructions = ret.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
+                                    let skill_dir = ret.get("skill_dir").and_then(|v| v.as_str()).unwrap_or("");
+                                    if !instructions.is_empty() && !ret.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                        loaded_skills.insert(skill_name.to_string(), (instructions.to_string(), skill_dir.to_string()));
                                     }
-                                    self.telemetry.emit(&TelemetryEvent::ToolInvocation {
-                                        tool: observed.clone(),
-                                        input: args.clone(),
-                                        output: ret.clone(),
-                                    });
-                                    self.telemetry.emit(&TelemetryEvent::ToolSelection {
-                                        turn,
-                                        tool: observed.clone(),
-                                        discovered: self.schema_budget.was_revealed(&observed),
-                                    });
-                                    ret.to_string()
                                 }
-                                Err(ref e) => format!("Error: {}", e),
-                            };
-                            let result_text = cap_tool_result(&result_text, self.tool_result_cap);
+                                self.telemetry.emit(&TelemetryEvent::ToolInvocation {
+                                    tool: observed.clone(),
+                                    input: args.clone(),
+                                    output: ret.clone(),
+                                });
+                                self.telemetry.emit(&TelemetryEvent::ToolSelection {
+                                    turn,
+                                    tool: observed.clone(),
+                                    discovered: self.schema_budget.was_revealed(&observed),
+                                });
+                            }
+                            // The same envelope the batch paths use, so a
+                            // streamed turn and a collected one read alike.
+                            let result_text =
+                                render_tool_result(&observed, &result, self.tool_result_cap);
                             trace.note_tool_result(result.is_ok());
 
                             // A failed call is the one line the log was
                             // missing: policy refusals, broken environments and
                             // timeouts used to be visible only to the model.
-                            if result.is_err() || result_text.contains("\"success\":false") {
+                            if ToolResult::text_is_error(&result_text) {
                                 let head: String = result_text.chars().take(240).collect();
                                 log::warn!("tool {name} failed: {head}");
                             }
@@ -2004,8 +1963,9 @@ impl<A: ReActApp> ReActEngine<A> {
 mod repeat_guard_tests {
     use super::{
         MID_TURN_FIXED_RESERVE, REPEAT_FAILURE_LIMIT, RepeatedFailure, TOOL_RESULT_CAP,
-        cap_tool_result, failure_signature, mid_turn_ceiling,
+        failure_signature, mid_turn_ceiling,
     };
+    use crate::tool::result::cap_text as cap_tool_result;
 
     #[test]
     fn a_successful_result_has_no_failure_signature() {

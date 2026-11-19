@@ -7,8 +7,14 @@ pub enum ReactError {
     #[error("LLM error: {0}")]
     Llm(#[from] LlmError),
     /// A tool failed.
+    ///
+    /// Kept for callers that only have a rendered message; the engine itself
+    /// reports a classified failure through [`ReactError::ToolFailure`].
     #[error("Tool error: {0}")]
     ToolError(String),
+    /// A tool failed with its class, retry advice and field intact.
+    #[error("Tool error: {0}")]
+    ToolFailure(crate::tool::ToolError),
     /// The model returned a malformed response.
     #[error("Malformed response: {0}")]
     Malformed(String),
@@ -21,6 +27,21 @@ pub enum ReactError {
     /// A hook aborted the run.
     #[error("Hook abort: {0}")]
     HookAbort(String),
+}
+
+impl ReactError {
+    /// The classified tool failure behind this error, for the result envelope.
+    ///
+    /// A failure that arrived as a rendered message loses its class; it is
+    /// reported as an internal failure rather than being guessed from prose.
+    /// An engine timeout is a timeout: the tool did not finish in the bound.
+    pub fn as_tool_error(&self) -> crate::tool::ToolError {
+        match self {
+            Self::ToolFailure(error) => error.clone(),
+            Self::Timeout(message) => crate::tool::ToolError::Timeout(message.clone()),
+            other => crate::tool::ToolError::Failed(other.to_string()),
+        }
+    }
 }
 
 // Explicit impl to route Inner(LlmError) -> Llm variant for better error handling

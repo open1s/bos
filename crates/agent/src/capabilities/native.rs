@@ -209,28 +209,38 @@ impl CapabilityProvider for NativeToolProvider {
 }
 
 fn invalid(error: &ToolError) -> CapabilityError {
-    match error {
-        ToolError::SchemaMismatch { message } => CapabilityError::Invalid {
-            message: message.clone(),
-        },
-        other => CapabilityError::Invalid {
-            message: other.to_string(),
-        },
+    // The message keeps the offending field (the tool error's Display names
+    // it), so a caller that only has the capability error still knows which
+    // argument to repair.
+    CapabilityError::Invalid {
+        message: error.to_string(),
     }
 }
 
 fn classify(capability: &CapabilityId, error: ToolError, started: Instant) -> CapabilityError {
+    let described = error.to_string();
     match error {
         ToolError::NotFound(_) => CapabilityError::NotFound {
             capability: capability.clone(),
         },
-        ToolError::InvalidInput(message) | ToolError::SchemaMismatch { message } => {
-            CapabilityError::Invalid { message }
-        }
+        ToolError::InvalidInput(_)
+        | ToolError::SchemaMismatch { .. }
+        | ToolError::InvalidField { .. } => CapabilityError::Invalid { message: described },
         ToolError::Timeout(message) => CapabilityError::Timeout {
             elapsed_ms: started.elapsed().as_millis() as u64,
             partial: Some(Value::String(message)),
         },
+        ToolError::Cancelled(_) => CapabilityError::Cancelled,
+        // A refusal keeps its class across the boundary; it must never be
+        // flattened into a provider fault, or the retry rule stops working.
+        ToolError::PermissionDenied { message } => CapabilityError::Denied {
+            reason: message,
+            policy: None,
+        },
+        ToolError::Unavailable { message } => CapabilityError::Unavailable { reason: message },
+        ToolError::Conflict { message } | ToolError::Unsupported { message } => {
+            CapabilityError::ProviderFailed { message }
+        }
         ToolError::Failed(message) => CapabilityError::ProviderFailed { message },
         ToolError::Ambiguous { name, candidates } => CapabilityError::Invalid {
             message: format!("tool {name} is ambiguous: {candidates:?}"),

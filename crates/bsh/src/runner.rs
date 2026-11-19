@@ -19,11 +19,11 @@ use crate::model::{ChatMessage, Role};
 
 /// Whether one streamed tool result reports a failure.
 ///
-/// The engine's own failure guard uses this shape: a tool that returns a value
-/// starting with "Error:" or a payload carrying "success": false did not do the
-/// work, whatever its prose says.
+/// The engine renders every result as the shared envelope, whose `status` is
+/// the verdict; a transcript written before the envelope is still recognized
+/// by its legacy `Error: ` prefix or a payload-level `"success":false`.
 fn tool_result_failed(output: &str) -> bool {
-    output.starts_with("Error:") || output.contains("\"success\":false")
+    react::tool::ToolResult::text_is_error(output)
 }
 
 /// Cap the transcript-facing tool result by UTF-8 bytes, not Unicode scalar count.

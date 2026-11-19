@@ -4979,13 +4979,13 @@ pub(crate) fn read_file_tool(
     let cursor: ReadCursor = Arc::new(Mutex::new(HashMap::new()));
     FunctionTool::new(
         "read_file",
-        "Read a UTF-8 text file. With only path it starts at line 1; after a partial read the same call continues from next, so pass offset=1 to restart. limit bounds the window. Paths are workspace-relative or absolute inside the workspace; ignored paths are refused. Returns start_line, end_line, total_lines and next={offset} while more lines remain.",
+        "Read a UTF-8 text file. With only path it starts at line 1; after a partial read, a path-only call continues from the previous next_offset while the file is unchanged, so pass offset=1 to re-read from the start. limit bounds the window. Paths are workspace-relative or absolute inside the workspace; ignored paths are refused. The result returns start_line, end_line, total_lines and next_offset: the 1-based line to read next, or null when the file is fully read. To continue a cut read, pass next_offset as offset.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path of the UTF-8 text file to read, relative to the workspace or absolute inside the allowed workspace." },
-                "offset": { "type": "integer", "minimum": 1, "description": "Optional 1-based starting line; defaults to 1 (the first line is 1, not 0). Pass the next offset to continue." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Optional maximum lines from offset; next continues when more remain." }
+                "offset": { "type": "integer", "minimum": 1, "description": "Optional 1-based starting line; defaults to 1 (the first line is 1, not 0). Pass the previous result's next_offset to continue." },
+                "limit": { "type": "integer", "minimum": 1, "description": "Optional maximum lines to return from offset. A window that stops before the end returns next_offset for the next call." }
             },
             "required": ["path"],
             "additionalProperties": false
@@ -5064,7 +5064,6 @@ pub(crate) fn read_file_tool(
                     }
                 }
             }
-            let next = next_offset.map(|offset| serde_json::json!({ "offset": offset }));
             let mut result = serde_json::json!({
                 "path": target.display().to_string(),
                 "content": content,
@@ -5077,6 +5076,10 @@ pub(crate) fn read_file_tool(
             if continued {
                 result["continued"] = serde_json::json!(true);
             }
+            // Always name the next line to read: the number while more lines
+            // remain, an explicit null once the file is fully consumed. The
+            // model must not have to infer "done" from an absent field.
+            result["next_offset"] = serde_json::json!(next_offset);
             if let Some(next) = next_offset {
                 let of = total_lines
                     .map(|total| format!(" of {total}"))
@@ -5089,7 +5092,7 @@ pub(crate) fn read_file_tool(
                     String::new()
                 };
                 result["hint"] = serde_json::json!(format!(
-                    "{resumed}showing lines {start_line}-{end_line}{of}; continue with offset {next}"
+                    "{resumed}showing lines {start_line}-{end_line}{of}; to continue, pass next_offset={next} as offset"
                 ));
             } else if past_end {
                 let total = match total_lines {
@@ -5102,11 +5105,14 @@ pub(crate) fn read_file_tool(
             } else if empty {
                 result["hint"] = serde_json::json!("the file is empty");
             }
+            // `next_offset` is the one continuation representation; the
+            // envelope adds neither a duplicate `next` object nor a
+            // `continuation` that repeats the same offset.
             crate::file_result::finish(
                 &mut result,
                 "read_file",
                 crate::file_result::status(empty, truncated),
-                next,
+                None,
             );
             Ok(result)
         },
@@ -5123,7 +5129,7 @@ pub(crate) fn read_files_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "read_files",
-        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next. Combined content is capped at 1 MiB; inspect each entry's truncated or error field.",
+        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next_offset (the 1-based line to read next in that file, or null when it is fully read). offset and limit apply to every file. To continue one cut file, call read_file with that file's path and its next_offset as offset. Combined content is capped at 1 MiB; inspect each entry's truncated or error field.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -5142,12 +5148,12 @@ pub(crate) fn read_files_tool(
                 "offset": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional 1-based starting line applied to every file."
+                    "description": "Optional 1-based starting line, applied to EVERY file in this call; defaults to 1. To continue one cut file, call read_file with only that path and its next_offset."
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional maximum number of lines per file, applied to every file."
+                    "description": "Optional maximum number of lines per file, applied to every file. A file that stops early returns its next_offset."
                 }
             },
             "required": ["paths"],
@@ -5212,7 +5218,10 @@ pub(crate) fn read_files_tool(
                         results.push(serde_json::json!({
                             "path": raw,
                             "status": crate::file_result::ERROR,
-                            "error": error.to_string()
+                            "error": error.to_string(),
+                            // Every read entry names its next line; a failed
+                            // read has none, so the field is explicit null.
+                            "next_offset": null
                         }));
                         continue;
                     }
@@ -5239,8 +5248,12 @@ pub(crate) fn read_files_tool(
                             "end_line": 0,
                             "total_lines": null,
                             "bytes": 0,
-                            "next": { "offset": offset.unwrap_or(1) },
-                            "reason": "combined batch output budget reached"
+                            "next_offset": offset.unwrap_or(1),
+                            "reason": "combined batch output budget reached",
+                            "hint": format!(
+                                "the batch byte budget is spent; to read this file, call read_file with offset={}",
+                                offset.unwrap_or(1)
+                            )
                         }));
                     }
 
@@ -5297,8 +5310,16 @@ pub(crate) fn read_files_tool(
                         "total_lines": total_lines,
                         "bytes": bytes,
                     });
+                    // Always name this file's next line: the number while more
+                    // remains, an explicit null when the entry is complete.
+                    file_result["next_offset"] =
+                        serde_json::json!(was_truncated.then_some(next_offset));
                     if was_truncated {
-                        file_result["next"] = serde_json::json!({ "offset": next_offset });
+                        // One continuation field: the hint names `next_offset`
+                        // and the number to pass as `offset`.
+                        file_result["hint"] = serde_json::json!(format!(
+                            "more lines remain; to continue this file, call read_file with offset={next_offset} (its next_offset)"
+                        ));
                     }
                     if past_end {
                         file_result["hint"] =
@@ -5312,7 +5333,10 @@ pub(crate) fn read_files_tool(
                     Err(error) => results.push(serde_json::json!({
                         "path": raw,
                         "status": crate::file_result::ERROR,
-                        "error": error.to_string()
+                        "error": error.to_string(),
+                        // Every read entry names its next line; a failed read
+                        // has none, so the field is explicit null.
+                        "next_offset": null
                     })),
                 }
             }
@@ -7807,15 +7831,19 @@ mod tests {
 
         // The peer leaves: the attached tool fails instead of falling back to
         // anything local, and no local tool of that name exists to fall back to.
+        // The failure is a dependency that is gone, which is its own class: a
+        // caller may retry it once the peer returns, unlike a provider fault.
         network.leave(&provider_id);
         let error = tool
             .run(&serde_json::json!({ "v": 6 }))
             .await
             .expect_err("the peer is gone");
-        assert!(
-            matches!(error, agent::tools::ToolError::Failed(_)),
+        assert_eq!(
+            error.code(),
+            react::tool::ToolErrorCode::Unavailable,
             "{error:?}"
         );
+        assert!(error.retryable(), "{error:?}");
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -7886,18 +7914,18 @@ mod tests {
             "both paths return the same value"
         );
 
-        // Schema rejection happens before the body on both paths.
+        // Schema rejection happens before the body on both paths, and both
+        // name the same missing field, because both run the same validator.
         let left = raw
             .execute("update_plan", &serde_json::json!({}))
             .unwrap_err();
         let right = shims
             .execute("update_plan", &serde_json::json!({}))
             .unwrap_err();
-        assert!(matches!(left, ToolError::SchemaMismatch { .. }), "{left:?}");
-        assert!(
-            matches!(right, ToolError::SchemaMismatch { .. }),
-            "{right:?}"
-        );
+        assert!(matches!(left, ToolError::InvalidField { .. }), "{left:?}");
+        assert!(matches!(right, ToolError::InvalidField { .. }), "{right:?}");
+        assert_eq!(left.field(), right.field(), "{left:?} / {right:?}");
+        assert_eq!(left.field(), Some("items"), "{left:?}");
 
         // A body failure stays a tool failure on both paths. The message text
         // differs (the shim reports the provider's classification), which is
@@ -11403,6 +11431,14 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(whole["tool"], "read_file");
         assert_eq!(whole["status"], "ok");
         assert!(whole.get("next").is_none());
+        assert!(
+            whole.get("next_offset").is_some(),
+            "the field is always present so a complete read is explicit"
+        );
+        assert!(
+            whole["next_offset"].is_null(),
+            "a complete read says there is no next line"
+        );
 
         let window = registry
             .execute(
@@ -11419,7 +11455,14 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(window["end_line"], 12);
         assert_eq!(window["total_lines"], 100);
         assert_eq!(window["status"], "partial");
-        assert_eq!(window["next"]["offset"], 13);
+        assert!(
+            window.get("next").is_none(),
+            "next_offset is the one continuation field on a read"
+        );
+        assert_eq!(
+            window["next_offset"], 13,
+            "the explicit number to pass as offset"
+        );
 
         // The last page reaches EOF, so it can report the exact file length and
         // does not offer a continuation past the end.
@@ -11437,6 +11480,10 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(tail["total_lines"], 100);
         assert_eq!(tail["status"], "ok");
         assert!(tail.get("next").is_none());
+        assert!(
+            tail["next_offset"].is_null(),
+            "the tail consumed the file, so there is no next line"
+        );
 
         let past = registry
             .execute(
@@ -11505,7 +11552,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("the first window");
         assert_eq!(first["content"], "one\n");
-        assert_eq!(first["next"]["offset"], 2);
+        assert_eq!(first["next_offset"], 2);
+        assert!(first.get("next").is_none(), "no duplicate next object");
 
         let continued = registry
             .execute("read_file", &serde_json::json!({ "path": "a.txt" }))
@@ -11551,7 +11599,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .expect("offset 1 reads the first line");
         assert_eq!(first["content"], "first\n");
         assert_eq!(first["start_line"], 1);
-        assert_eq!(first["next"]["offset"], 2);
+        assert_eq!(first["next_offset"], 2);
+        assert!(first.get("next").is_none(), "no duplicate next object");
 
         let zero = registry
             .execute(
@@ -11592,10 +11641,24 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(result["files"][0]["end_line"], 1);
         assert_eq!(result["files"][0]["total_lines"], 1);
         assert!(result["files"][0].get("next").is_none());
+        assert!(
+            result["files"][0].get("next_offset").is_some(),
+            "every read entry names its next line"
+        );
+        assert!(result["files"][0]["next_offset"].is_null());
         assert_eq!(result["files"][1]["content"], "fn b() {}");
         assert_eq!(result["files"][2]["status"], "error");
         assert!(result["files"][2]["error"].as_str().is_some());
         assert!(!result.to_string().contains("outside-secret"));
+        // Every entry names its next line, including a failed read: the field
+        // is always present and null when there is nothing to continue.
+        for file in result["files"].as_array().expect("per-file entries") {
+            assert!(
+                file.get("next_offset").is_some(),
+                "a read entry is missing next_offset: {file}"
+            );
+        }
+        assert!(result["files"][2]["next_offset"].is_null());
     }
 
     #[test]
@@ -11623,6 +11686,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let body = "x".repeat(MAX_BATCH_READ_BYTES / 2 + 128);
         std::fs::write(root.join("a.txt"), &body).expect("a");
         std::fs::write(root.join("b.txt"), &body).expect("b");
+        std::fs::write(root.join("c.txt"), "c\n").expect("c");
         let built = build(&confined(&root));
         let result = built
             .agent
@@ -11630,7 +11694,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .expect("registry")
             .execute(
                 "read_files",
-                &serde_json::json!({"paths": ["a.txt", "b.txt"]}),
+                &serde_json::json!({"paths": ["a.txt", "b.txt", "c.txt"]}),
             )
             .expect("bounded batch read");
         assert_eq!(result["bytes"], MAX_BATCH_READ_BYTES);
@@ -11645,7 +11709,121 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(result["files"][1]["start_line"], 1);
         assert_eq!(result["files"][1]["end_line"], 1);
         assert_eq!(result["files"][1]["status"], "partial");
-        assert_eq!(result["files"][1]["next"]["offset"], 1);
+        assert_eq!(
+            result["files"][1]["next_offset"], 1,
+            "the cut entry names the offset to resume from"
+        );
+        assert!(
+            result["files"][1].get("next").is_none(),
+            "no duplicate next object"
+        );
+        // The budget is spent before c.txt is reached: its entry still names
+        // the offset and says what to call next.
+        assert_eq!(result["files"][2]["status"], "partial");
+        assert_eq!(result["files"][2]["content"], "");
+        assert_eq!(result["files"][2]["next_offset"], 1);
+        let hint = result["files"][2]["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("budget") && hint.contains("read_file") && hint.contains("offset=1"),
+            "the spent-budget entry is actionable: {result}"
+        );
+    }
+
+    /// A per-file window says where to continue in the explicit field the
+    /// model passes back, not only in the opaque continuation object.
+    #[test]
+    fn read_files_reports_next_offset_for_each_cut_file() {
+        let root = scratch("read-files-next-offset");
+        let body: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("a.txt"), &body).expect("a");
+        // b.txt fits its window exactly, so it has nothing to continue.
+        std::fs::write(root.join("b.txt"), "one\ntwo\nthree\nfour\n").expect("b");
+        let built = build(&confined(&root));
+        let result = built
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "read_files",
+                &serde_json::json!({"paths": ["a.txt", "b.txt"], "offset": 2, "limit": 3}),
+            )
+            .expect("the batch reads");
+        assert_eq!(result["files"][0]["status"], "partial");
+        assert_eq!(result["files"][0]["start_line"], 2);
+        assert_eq!(result["files"][0]["end_line"], 4);
+        assert_eq!(result["files"][0]["next_offset"], 5);
+        assert!(result["files"][0].get("next").is_none());
+        let hint = result["files"][0]["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("read_file") && hint.contains("offset=5"),
+            "the cut entry says which file tool and line to continue with: {result}"
+        );
+        assert!(
+            hint.contains("next_offset"),
+            "the cut entry names the result field: {result}"
+        );
+        assert_eq!(result["files"][1]["status"], "ok");
+        assert!(
+            result["files"][1]["next_offset"].is_null(),
+            "the complete file has no next line"
+        );
+    }
+
+    /// The returned `next_offset` is the line to pass back as `offset`; the
+    /// input schema stays the simple `offset`/`limit` pair.
+    #[test]
+    fn next_offset_names_the_line_to_continue_from() {
+        let root = scratch("read-next-offset");
+        let body: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("a.txt"), &body).expect("a");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let first = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({"path": "a.txt", "offset": 1, "limit": 3}),
+            )
+            .expect("the first window");
+        assert_eq!(first["next_offset"], 4);
+        assert!(
+            first["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("next_offset=4"),
+            "the hint names the field and the line: {first}"
+        );
+        assert!(
+            registry
+                .execute(
+                    "read_file",
+                    &serde_json::json!({"path": "a.txt", "next_offset": 4})
+                )
+                .is_err(),
+            "next_offset is a result field, not an input parameter"
+        );
+
+        let continued = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({
+                    "path": "a.txt", "offset": first["next_offset"], "limit": 3
+                }),
+            )
+            .expect("the returned number continues the read as offset");
+        assert_eq!(continued["start_line"], 4);
+        assert_eq!(continued["end_line"], 6);
+        assert_eq!(continued["next_offset"], 7);
+
+        let batch = registry
+            .execute(
+                "read_files",
+                &serde_json::json!({"paths": ["a.txt"], "offset": 7, "limit": 3}),
+            )
+            .expect("the batch continues at the same line");
+        assert_eq!(batch["files"][0]["start_line"], 7);
+        assert_eq!(batch["files"][0]["end_line"], 9);
+        assert_eq!(batch["files"][0]["next_offset"], 10);
     }
 
     /// A binary file and a directory are refused by name instead of being
