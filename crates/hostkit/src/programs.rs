@@ -66,10 +66,8 @@ fn override_variable(name: &str) -> String {
 /// [`executable`] with the environment lookup injected for tests.
 fn executable_with(name: &str, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
     let names = executable_names(name);
-    if let Some(explicit) = env(&override_variable(name)) {
-        if explicit.is_file() {
-            return Some(explicit);
-        }
+    if let Some(explicit) = env(&override_variable(name)).filter(|path| path.is_file()) {
+        return Some(explicit);
     }
     if let Some(venv) = env("VIRTUAL_ENV") {
         #[cfg(windows)]
