@@ -5,6 +5,7 @@ use crate::agent::context::{
 };
 use crate::agent::hooks::{AgentHook, HookContext, HookDecision, HookEvent, HookRegistry};
 use crate::agent::plugin::{AgentPlugin, PluginRegistry, StreamTokenWrapper};
+use crate::capabilities::CapabilityCorrelation;
 use crate::memory::{MemoryItem, MemoryStore, MetadataFilter};
 use crate::session::AgentState;
 use crate::tools::{FunctionTool, PlanItem, PlanStore};
@@ -394,6 +395,12 @@ pub struct Agent {
     /// means the host classified THIS turn as ordinary conversation.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     action_intent: std::sync::Mutex<Option<ActionIntent>>,
+    /// Turn/task/policy correlation the host changes at turn boundaries.
+    ///
+    /// Capability shims read a snapshot per call, so the tool set built once
+    /// for this agent does not freeze the first turn's identity.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    capability_correlation: Arc<std::sync::Mutex<CapabilityCorrelation>>,
     /// The definitions a work turn carries initially. A host that never sets
     /// one keeps the historical broad array (issue #435).
     #[rkyv(with = qserde::rkyv::with::Skip)]
@@ -551,6 +558,9 @@ impl Agent {
             config,
             context_budget: 0,
             action_intent: std::sync::Mutex::new(None),
+            capability_correlation: Arc::new(std::sync::Mutex::new(
+                CapabilityCorrelation::default(),
+            )),
             initial_tool_scope: None,
             provider_request: std::sync::Mutex::new(None),
             auxiliary_usage: std::sync::Mutex::new(react::telemetry::TokenUsage::default()),
@@ -651,6 +661,44 @@ impl Agent {
         if let Ok(mut slot) = self.action_intent.lock() {
             *slot = Some(intent);
         }
+    }
+
+    /// The shared turn/task/policy state capability shims read per call.
+    ///
+    /// The host holds the same handle when it builds shims, so changing the
+    /// turn here reaches tools that were composed for an earlier turn.
+    pub fn capability_correlation(&self) -> Arc<std::sync::Mutex<CapabilityCorrelation>> {
+        Arc::clone(&self.capability_correlation)
+    }
+
+    /// Update the capability-call correlation under its lock.
+    pub fn update_capability_correlation(&self, update: impl FnOnce(&mut CapabilityCorrelation)) {
+        if let Ok(mut correlation) = self.capability_correlation.lock() {
+            update(&mut correlation);
+        }
+    }
+
+    /// Name the Agent turn that owns subsequent capability calls.
+    pub fn set_capability_turn(&self, turn: impl Into<String>) {
+        let turn = turn.into();
+        self.update_capability_correlation(|correlation| {
+            correlation.turn = Some(capability::TurnId::new(turn));
+        });
+    }
+
+    /// Attach the task subsequent capability calls belong to.
+    pub fn set_capability_task(&self, task: impl Into<String>) {
+        let task = task.into();
+        self.update_capability_correlation(|correlation| {
+            correlation.task = Some(capability::TaskId::new(task));
+        });
+    }
+
+    /// Attach the policy decision that admitted subsequent capability calls.
+    pub fn set_capability_policy(&self, policy: capability::PolicyDecisionRef) {
+        self.update_capability_correlation(|correlation| {
+            correlation.policy = Some(policy);
+        });
     }
 
     /// Restrict the initial tool array to a host-declared core scope for work
@@ -2590,6 +2638,7 @@ impl Clone for Agent {
             config: self.config.clone(),
             context_budget: self.context_budget,
             action_intent: std::sync::Mutex::new(self.classified_action_intent()),
+            capability_correlation: Arc::clone(&self.capability_correlation),
             initial_tool_scope: self.initial_tool_scope.clone(),
             provider_request: std::sync::Mutex::new(self.provider_request()),
             auxiliary_usage: std::sync::Mutex::new(react::telemetry::TokenUsage::default()),

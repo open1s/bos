@@ -1612,16 +1612,18 @@ mod tests {
     /// The opt-in is explicit and off by default.
     #[test]
     fn no_sandbox_requires_an_explicit_opt_in() {
+        // SAFETY: this test is the only writer of this process-global variable
+        // in the test binary; it restores the previous value before returning.
         let previous = std::env::var_os("BSH_BROWSER_NO_SANDBOX");
-        std::env::remove_var("BSH_BROWSER_NO_SANDBOX");
+        unsafe { std::env::remove_var("BSH_BROWSER_NO_SANDBOX") };
         assert!(!no_sandbox_opt_in());
-        std::env::set_var("BSH_BROWSER_NO_SANDBOX", "1");
+        unsafe { std::env::set_var("BSH_BROWSER_NO_SANDBOX", "1") };
         assert!(no_sandbox_opt_in());
-        std::env::set_var("BSH_BROWSER_NO_SANDBOX", "0");
+        unsafe { std::env::set_var("BSH_BROWSER_NO_SANDBOX", "0") };
         assert!(!no_sandbox_opt_in());
         match previous {
-            Some(value) => std::env::set_var("BSH_BROWSER_NO_SANDBOX", value),
-            None => std::env::remove_var("BSH_BROWSER_NO_SANDBOX"),
+            Some(value) => unsafe { std::env::set_var("BSH_BROWSER_NO_SANDBOX", value) },
+            None => unsafe { std::env::remove_var("BSH_BROWSER_NO_SANDBOX") },
         }
     }
 }

@@ -4,6 +4,7 @@
 //! instant and a cancellation token is an in-process flag, so this type is
 //! deliberately not serializable.
 
+use crate::composition::CompositionId;
 use crate::id::{NodeId, WorkspaceId};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,32 @@ impl InvocationId {
 }
 
 impl std::fmt::Display for InvocationId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// One Agent turn.
+///
+/// A turn is not a task: a turn is one model interaction/agent loop, while a
+/// task can span turns and delegations. Keep them separate so a task that
+/// survives a turn does not inherit the turn's reasoning or lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TurnId(String);
+
+impl TurnId {
+    /// Build a turn id.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TurnId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
@@ -60,6 +87,32 @@ impl PolicyDecisionRef {
     /// The reference as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// The composition instance an invocation belongs to.
+///
+/// This is a reference, not the plan body: an invocation must be able to name
+/// the resolved composition and its snapshot without carrying a mutable plan or
+/// a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositionRef {
+    /// The composition id.
+    pub id: CompositionId,
+    /// The exact resolved version.
+    pub version: String,
+    /// The snapshot digest or reference, when one was recorded.
+    pub snapshot: Option<String>,
+}
+
+impl CompositionRef {
+    /// Build a composition reference.
+    pub fn new(id: CompositionId, version: impl Into<String>, snapshot: Option<String>) -> Self {
+        Self {
+            id,
+            version: version.into(),
+            snapshot,
+        }
     }
 }
 
@@ -144,6 +197,16 @@ pub struct InvocationContext {
     pub workspace: WorkspaceId,
     /// The delegated task, when the call belongs to one.
     pub task: Option<TaskId>,
+    /// The parent task, when this call is a child or delegated step.
+    pub parent_task: Option<TaskId>,
+    /// The Agent turn that originated the call, when any.
+    pub turn: Option<TurnId>,
+    /// The attempt number for this logical task, starting at one.
+    pub attempt: u32,
+    /// The composition instance this call belongs to.
+    pub composition: Option<CompositionRef>,
+    /// Logical idempotency key for a retry-safe operation.
+    pub idempotency_key: Option<String>,
     /// Absolute deadline. A duration restarted at each hop is how a federated
     /// call outlives its budget.
     pub deadline: Option<Instant>,
@@ -165,12 +228,53 @@ impl InvocationContext {
             principal,
             workspace,
             task: None,
+            parent_task: None,
+            turn: None,
+            attempt: 1,
+            composition: None,
+            idempotency_key: None,
             deadline: None,
             cancel: CancelToken::new(),
             trace: TraceContext::default(),
             delegation: Vec::new(),
             policy: None,
         }
+    }
+
+    /// Attach the delegated task id.
+    pub fn with_task(mut self, task: impl Into<String>) -> Self {
+        self.task = Some(TaskId::new(task));
+        self
+    }
+
+    /// Attach the parent task id.
+    pub fn with_parent_task(mut self, task: impl Into<String>) -> Self {
+        self.parent_task = Some(TaskId::new(task));
+        self
+    }
+
+    /// Attach the Agent turn id.
+    pub fn with_turn(mut self, turn: impl Into<String>) -> Self {
+        self.turn = Some(TurnId::new(turn));
+        self
+    }
+
+    /// Set the attempt number for this logical task.
+    pub fn with_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = attempt.max(1);
+        self
+    }
+
+    /// Attach the composition instance.
+    pub fn with_composition(mut self, composition: CompositionRef) -> Self {
+        self.composition = Some(composition);
+        self
+    }
+
+    /// Attach a logical idempotency key.
+    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
     }
 
     /// Whether the deadline has already passed.

@@ -2163,14 +2163,6 @@ struct CachedComposition {
     key: u64,
     plan: Arc<agent::capability::composition::ResolvedComposition>,
     snapshot: Arc<agent::capability::CompositionSnapshot>,
-    /// The shim registry built for this surface and principal, when a build
-    /// asked for it. Reusing it keeps the capability-registry mode cheap on a
-    /// warm cache.
-    composed: Option<Arc<ToolRegistry>>,
-    /// The surface fingerprint mixed with the principal the shims were built
-    /// for: a shim carries the session and preset it reports, so a different
-    /// turn principal must not reuse it.
-    composed_key: u64,
 }
 
 thread_local! {
@@ -2210,35 +2202,6 @@ fn hash_metadata(metadata: Option<&ToolMetadata>, hasher: &mut impl Hasher) {
         metadata.timeout_ms.hash(hasher);
         metadata.max_output_bytes.hash(hasher);
     }
-}
-
-/// Remember the shim registry a build made for this surface.
-fn cache_composed(key: u64, composed_key: u64, composed: Arc<ToolRegistry>) {
-    COMPOSITION_CACHE.with(|cache| {
-        let mut slot = cache.borrow_mut();
-        let Some(entry) = slot.as_ref() else {
-            return;
-        };
-        if entry.key != key {
-            return;
-        }
-        let plan = Arc::clone(&entry.plan);
-        let snapshot = Arc::clone(&entry.snapshot);
-        *slot = Some(Arc::new(CachedComposition {
-            key,
-            plan,
-            snapshot,
-            composed: Some(composed),
-            composed_key,
-        }));
-    });
-}
-
-fn principal_salt(session: &str, preset: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    session.hash(&mut hasher);
-    preset.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// The turn's whole tool surface: the base registry plus the live overlay.
@@ -2285,8 +2248,6 @@ fn composition_for(agent: &Agent) -> Option<(Arc<CachedComposition>, bool)> {
         key,
         plan: Arc::new(plan),
         snapshot: Arc::new(snapshot),
-        composed: None,
-        composed_key: 0,
     });
     COMPOSITION_CACHE.with(|cache| {
         *cache.borrow_mut() = Some(Arc::clone(&entry));
@@ -2300,24 +2261,9 @@ fn composition_for(agent: &Agent) -> Option<(Arc<CachedComposition>, bool)> {
 /// and dispatched through the same path a remote capability would take.
 fn compose_registry(agent: &mut Agent, session: &str, preset: &str) -> Result<usize, String> {
     let registry = merged_registry(agent).ok_or("the agent has no tool registry")?;
-    let live_names: HashSet<String> = agent
-        .live_tools()
-        .read()
-        .map(|live| live.list().into_iter().collect())
-        .unwrap_or_default();
     let entry = composition_for(agent)
         .ok_or("the composition could not be resolved")?
         .0;
-    let wanted = entry.key ^ principal_salt(session, preset);
-    if let Some(composed) = entry
-        .composed
-        .as_ref()
-        .filter(|_| entry.composed_key == wanted)
-    {
-        let count = composed.list().len();
-        agent.set_registry((**composed).clone());
-        return Ok(count);
-    }
     let plan = (*entry.plan).clone();
     let provider: Arc<dyn CapabilityProvider> =
         Arc::new(NativeToolProvider::new(Arc::new(registry.clone())));
@@ -2332,11 +2278,6 @@ fn compose_registry(agent: &mut Agent, session: &str, preset: &str) -> Result<us
     for descriptor in runtime.describe() {
         let id = descriptor.id.clone();
         let name = descriptor.surface.to_string();
-        // A live tool keeps its own advertisement and cancellation path; the
-        // shim registry covers the base tools only.
-        if live_names.contains(&name) {
-            continue;
-        }
         let Some(mut tool) = CapabilityTool::new(Arc::clone(&runtime), &id, principal.clone())
         else {
             continue;
@@ -2361,12 +2302,12 @@ fn compose_registry(agent: &mut Agent, session: &str, preset: &str) -> Result<us
                 })
                 .with_proxy(ProxySource::Async(raw));
         }
+        tool = tool.with_correlation(agent.capability_correlation());
         composed
             .register_async(Arc::new(tool))
             .map_err(|error| error.to_string())?;
     }
     let count = composed.list().len();
-    cache_composed(entry.key, wanted, Arc::new(composed.clone()));
     agent.set_registry(composed);
     Ok(count)
 }
@@ -7072,6 +7013,7 @@ mod tests {
     #[tokio::test]
     async fn an_installed_extension_reaches_the_turn() {
         let mut settings = bare();
+        settings.global.general.capability_registry = true;
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../agent/tests/fixtures/extensions/dsh-echo");
         settings
@@ -7088,11 +7030,12 @@ mod tests {
             .agent
             .registry()
             .expect("tool registry")
-            .get("dsh_echo")
-            .expect("the extension tool");
+            .get_async("dsh_echo")
+            .expect("the governed extension tool");
         let output = tool
             .run(&serde_json::json!({ "value": "hi" }))
-            .expect("the tool runs");
+            .await
+            .expect("the governed extension tool runs");
         assert_eq!(output["value"], "hi");
         assert!(
             built
@@ -7450,7 +7393,7 @@ mod tests {
     /// under test.
     #[cfg(unix)]
     fn process_alive(pid: u32) -> bool {
-        extern "C" {
+        unsafe extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
         // SAFETY: `kill` with signal 0 performs the permission and existence
@@ -7830,7 +7773,9 @@ mod tests {
     /// and a shim still runs the real tool.
     #[test]
     fn the_capability_registry_switch_rebuilds_the_turn_registry() {
-        let plain = build(&with_tools("workspace-write", None));
+        let mut settings = with_tools("workspace-write", None);
+        settings.global.general.capability_registry = false;
+        let plain = build(&settings);
         let raw = plain.agent.registry().expect("a registry");
         assert!(raw.get("update_plan").is_some(), "the raw tool is sync");
         assert!(raw.get_async("update_plan").is_none());
@@ -7860,7 +7805,9 @@ mod tests {
     #[test]
     fn the_two_registries_answer_the_same_call_table() {
         use agent::ToolError;
-        let plain = build(&with_tools("workspace-write", None));
+        let mut raw_settings = with_tools("workspace-write", None);
+        raw_settings.global.general.capability_registry = false;
+        let plain = build(&raw_settings);
         let mut settings = with_tools("workspace-write", None);
         settings.global.general.capability_registry = true;
         let composed = build(&settings);

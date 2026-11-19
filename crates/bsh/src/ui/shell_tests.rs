@@ -15139,6 +15139,65 @@ fn the_stat_pills_take_the_measured_chrome(cx: &mut TestAppContext) {
     );
 }
 
+/// Probe: a long notice with a retry control must not squeeze the pills into
+/// each other.
+#[gpui::test]
+fn probe_status_notice_overlap(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("probe-stat-notice", 2);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            if let Some(message) = session.messages.last_mut() {
+                message.tools.push(ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{}".to_string(),
+                    output: None,
+                    ms: None,
+                    at: None,
+                });
+                message.meta = Some(MessageMeta {
+                    usage: Some(MessageUsage {
+                        prompt_tokens: 200,
+                        completion_tokens: 50,
+                        cached_tokens: 199,
+                        model: "probe".to_string(),
+                    }),
+                    ..Default::default()
+                });
+            }
+        }
+        state.notice = Some("本轮操作请求没有成功的工具调用（共 0 次，失败 0 次），请先核对对话记录再采信答复。".to_string());
+        state.notice_retry = Some("fix the parser".to_string());
+        tests_pin_reference_defaults(&mut state);
+        // The screenshot's window: the chat column at its 680px floor, where a
+        // 560px notice and the pills no longer fit on one line.
+        state.settings.global.general.content_width = Some(680.0);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for key in [
+        "status-pills",
+        "status-time-pill",
+        "status-usage-pill",
+        "status-notice",
+        "status-retry",
+    ] {
+        let b = cx.debug_bounds(key);
+        match b {
+            Some(b) => println!(
+                "{key}: x={} y={} w={} h={}",
+                b.origin.x.as_f32(),
+                b.origin.y.as_f32(),
+                b.size.width.as_f32(),
+                b.size.height.as_f32()
+            ),
+            None => println!("{key}: none"),
+        }
+    }
+}
+
 /// The usage pill is a live trigger, not a label: pressing it opens the measured
 /// token dialog 8px above the pill with the reference's own detail rows, and a
 /// second press closes it.

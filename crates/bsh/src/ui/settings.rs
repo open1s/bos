@@ -1303,7 +1303,7 @@ impl Shell {
         view_width: f32,
         view_height: f32,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let lang = self.state.lang;
         let section = self.state.settings_section;
         let generation = self.state.policy_generation;

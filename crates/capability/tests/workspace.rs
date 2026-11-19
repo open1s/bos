@@ -13,8 +13,8 @@ use capability::provider::{
     CapabilityCall, CapabilityOutput, CapabilityProvider, ProviderHealth, ProviderKind,
 };
 use capability::{
-    CapabilityError, GrantRef, InvocationContext, InvocationId, Principal, WorkspaceError,
-    WorkspaceRuntime,
+    CapabilityError, CompositionRef, GrantRef, InvocationContext, InvocationId, Principal,
+    WorkspaceError, WorkspaceRuntime,
 };
 use semver::Version;
 use serde_json::json;
@@ -89,6 +89,66 @@ fn context() -> InvocationContext {
     )
 }
 
+#[test]
+fn an_execution_context_keeps_turn_parent_attempt_composition_and_idempotency() {
+    let context = context()
+        .with_turn("turn-7")
+        .with_parent_task("task-parent")
+        .with_attempt(3)
+        .with_composition(CompositionRef::new(
+            "compose:test".into(),
+            "1.0.0",
+            Some("sha256:snapshot".to_string()),
+        ))
+        .with_idempotency_key("idem-7");
+    assert_eq!(
+        context.turn.as_ref().map(|turn| turn.as_str()),
+        Some("turn-7")
+    );
+    assert_eq!(
+        context.parent_task.as_ref().map(|task| task.as_str()),
+        Some("task-parent")
+    );
+    assert_eq!(context.attempt, 3);
+    assert_eq!(
+        context
+            .composition
+            .as_ref()
+            .map(|composition| composition.id.as_str()),
+        Some("compose:test")
+    );
+    assert_eq!(
+        context
+            .composition
+            .as_ref()
+            .and_then(|composition| composition.snapshot.as_deref()),
+        Some("sha256:snapshot")
+    );
+    assert_eq!(context.idempotency_key.as_deref(), Some("idem-7"));
+}
+
+#[test]
+fn the_workspace_runtime_exposes_its_composition_identity() {
+    let provider: Arc<dyn CapabilityProvider> = Arc::new(Fake {
+        provider: ProviderId::builtin(),
+        kind: ProviderKind::Builtin,
+        label: "local",
+    });
+    let runtime = WorkspaceRuntime::instantiate(
+        plan(
+            Binding::Local {
+                provider: ProviderId::builtin(),
+            },
+            "builtin/read_file",
+        ),
+        &[provider],
+    )
+    .expect("a runtime");
+    let composition = runtime.composition();
+    assert_eq!(composition.id.as_str(), "compose:test");
+    assert_eq!(composition.version, "1.0.0");
+    assert!(composition.snapshot.is_none());
+}
 #[tokio::test]
 async fn a_local_binding_dispatches_to_its_provider() {
     let provider: Arc<dyn CapabilityProvider> = Arc::new(Fake {
@@ -555,4 +615,61 @@ async fn a_cancelled_context_is_refused_before_dispatch() {
 
     assert!(matches!(error, CapabilityError::Cancelled));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+struct ErrorProvider {
+    provider: ProviderId,
+    descriptor: CapabilityDescriptor,
+    error: CapabilityError,
+}
+
+#[async_trait]
+impl CapabilityProvider for ErrorProvider {
+    fn id(&self) -> &ProviderId {
+        &self.provider
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Builtin
+    }
+
+    async fn describe(&self) -> Result<Vec<CapabilityDescriptor>, CapabilityError> {
+        Ok(vec![self.descriptor.clone()])
+    }
+
+    async fn invoke(&self, _call: CapabilityCall<'_>) -> Result<CapabilityOutput, CapabilityError> {
+        Err(self.error.clone())
+    }
+
+    async fn health(&self) -> ProviderHealth {
+        ProviderHealth::Available
+    }
+}
+
+/// A provider's classified outcome reaches the caller unchanged: the runtime
+/// must not turn an unknown side effect into a plain failure, or a retry could
+/// repeat work that already ran.
+#[tokio::test]
+async fn a_provider_outcome_is_not_reclassified() {
+    for error in [
+        CapabilityError::UnknownOutcome {
+            message: "the peer may have executed the call".to_string(),
+        },
+        CapabilityError::Cancelled,
+    ] {
+        let provider: Arc<dyn CapabilityProvider> = Arc::new(ErrorProvider {
+            provider: ProviderId::builtin(),
+            descriptor: descriptor("builtin/read_file"),
+            error: error.clone(),
+        });
+        let runtime =
+            WorkspaceRuntime::instantiate(plan_with_budgets(Budgets::default()), &[provider])
+                .expect("a runtime");
+        let id = "builtin/read_file".parse().expect("a valid id");
+        let got = runtime
+            .invoke(&id, json!({}), &context())
+            .await
+            .expect_err("the provider refuses");
+        assert_eq!(got, error, "the runtime preserves the provided class");
+    }
 }

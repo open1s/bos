@@ -294,6 +294,9 @@ impl Runner {
             .insert(session_id.to_string(), prepared_at)
             .map(|previous| prepared_at.saturating_sub(previous));
         let time = crate::context::TimeFacts { turn, elapsed };
+        // The agent may outlive a turn, and its capability shims are built
+        // once; stamp every call this turn makes with the current turn id.
+        agent.set_capability_turn(format!("turn-{turn}"));
 
         // Owned copies for the spawned task: the capture evidence outlives
         // the method body (issue #343).

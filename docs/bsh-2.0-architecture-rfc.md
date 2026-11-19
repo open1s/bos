@@ -1,8 +1,8 @@
 # BSH 2.0 Architecture RFC
 ## AI-Native Composable Capability Container & Federated Runtime
 
-- **Status:** Proposed — architecture convergence RFC added; implementation not implied
-- **Version:** 0.3.0
+- **Status:** Accepted design baseline — archived 2026-11-19; context and turn correlation implemented, governed-path default remains opt-in
+- **Version:** 0.3.3
 - **Date:** 2026-11-19
 - **Target:** BOS / BSH
 - **Scope:** BSH local capability composition, workspace runtime, and multi-node federation
@@ -1539,7 +1539,7 @@ These are not claims that the existing primitives are defective in isolation. Th
 
 ## 31. Unified Agent, Composition, and Federation Execution Model
 
-**Status:** Proposed  
+**Status:** Accepted design baseline — archived 2026-11-19; context and turn correlation implemented, governed-path default remains opt-in (see §31.16)  
 **Motivation:** GitHub Issue [#445](https://github.com/open1s/bos/issues/445)  
 **Scope:** Execution identity, lifecycle ownership, local/remote invocation semantics, cancellation, failure, retry, and recovery.
 
@@ -1896,3 +1896,33 @@ Do not start by creating a new universal task engine. First map and connect the 
 ### 31.15 Relationship to existing sections
 
 This section is normative for execution identity and lifecycle semantics. Where earlier sections describe a generic Execution Context or task/delegation lifecycle, Section 31 adds the ownership, uncertainty, and retry detail required to implement those contracts. Existing ADRs remain in force; this section does not silently supersede ADR-001 through ADR-009. Any future change to composition ownership, execution authority, or Federation trust topology requires a separate ADR.
+
+### 31.16 Review and archive decision (2026-11-19)
+
+**Verdict:** the requirement is valuable, but most of what remains is implementation rather than
+architecture. This section is therefore archived as the accepted design baseline: it should guide
+follow-up work, not be read as authorization for a broad rewrite.
+
+Source review against the latest tree:
+
+| Contract area | State | Evidence |
+|---|---|---|
+| Shared correlation context | implemented | `capability::InvocationContext` carries invocation, principal, workspace, task, parent task, turn, attempt, composition reference, idempotency key, absolute deadline, cancellation, trace, delegation hops, and policy-decision reference (`crates/capability/src/context.rs`) |
+| Provider invocation boundary | implemented foundation | `CapabilityCall` carries capability, operation, input, and context (`crates/capability/src/provider.rs`); `WorkspaceRuntime` records the resolved composition and `invoke_operation` rejects foreign workspaces and enforces deadline and cancellation (`crates/capability/src/workspace.rs`) |
+| Outcome taxonomy | implemented | `CapabilityError` keeps denial, unavailable, timeout, cancelled, provider failure, transport with `DeliveryState`, and `UnknownOutcome` distinct (`crates/capability/src/error.rs`) |
+| Agent turn -> capability path | implemented for turn; task/policy are host-supplied | `CapabilityTool` builds an `InvocationContext` per call, attaches the workspace composition, and reads a shared `CapabilityCorrelation` so a long-lived shim follows the current turn; BSH stamps the turn before every run (`crates/agent/src/capabilities/shim.rs`, `crates/bsh/src/runner.rs`). The shim exposes task/parent/attempt/policy builders, but BSH has no per-turn task/policy identity to supply yet |
+| Federation invocation | implemented foundation | The invoke payload carries task, parent task, turn, attempt, composition reference, idempotency key, trace, delegation, deadline, principal, and workspace; the receiver rebuilds the context; caller-side and provider-side authorization remain separate (`crates/federation/src/service.rs`) |
+| Durable delegation/task state | implemented foundation | Durable delegation and collaboration stores, including restart recovery (`crates/federation/src/delegation.rs`, `crates/federation/src/collaboration.rs`) |
+| Retry/idempotency | implemented | `FederationMessage::idempotency_key` plus the sender-scoped replay cache; a context idempotency key now travels in the invoke payload and becomes the envelope key, so a retry is refused without repeating the provider side effect |
+| Remaining gaps | implementation / product decision | The governed registry is still opt-in: live extension tools are now included as shims, but the whole surface becomes async, so a host that inspects the registry synchronously sees a different shape. The raw registry is the bounded compatibility path; its fallback on a composition error is logged. Task and policy correlation are host-supplied fields, but BSH has no per-turn task/policy identity yet. Provider conformance is covered at the capability, Agent and federation boundaries; per-provider parity is not claimed |
+
+**Archived decision:** do not build a new universal task engine. The context-and-turn slice is
+implemented: turn, parent task, attempt, composition reference, and idempotency key are on
+`InvocationContext`; the workspace records its composition; the Agent shim follows a shared
+correlation handle; BSH stamps the current turn; and federation propagates the fields with a
+replay-safe context key. The governed registry remains opt-in because its compatibility gaps are
+real (the composed surface is async-only and hosts inspect it synchronously), not cosmetic. Live
+tools are now included as shims. Follow-up implementation should supply task/policy identity from
+the turn host and decide the default once the async surface is accepted. These are implementation
+tasks, not reasons to reopen the architecture.
+

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use ::capability::{
     Binding, CancelToken, CapabilityDescriptor, CapabilityError, CapabilityId, InvocationContext,
-    InvocationId, Principal, WorkspaceRuntime,
+    InvocationId, PolicyDecisionRef, Principal, TaskId, TurnId, WorkspaceRuntime,
 };
 use async_trait::async_trait;
 use react::tool::registry::AsyncTool;
@@ -49,7 +49,46 @@ impl ProxySource {
             Self::Async(tool) => tool.proxy_target(args),
         }
     }
+
+    /// Forward a cancellation to the real tool, which owns its process/job.
+    pub fn cancel(&self, call_id: &str) {
+        match self {
+            Self::Sync(tool) => tool.cancel(call_id),
+            Self::Async(tool) => tool.cancel(call_id),
+        }
+    }
 }
+/// Turn/task/policy correlation a host attaches to capability calls.
+///
+/// The shim is built once per agent and serves every turn, so the values must
+/// be updatable between turns. A host holds the shared handle and changes it at
+/// the turn boundary; the tool reads a snapshot per call.
+#[derive(Debug, Clone)]
+pub struct CapabilityCorrelation {
+    /// The Agent turn that owns the call.
+    pub turn: Option<TurnId>,
+    /// The task the call belongs to.
+    pub task: Option<TaskId>,
+    /// The parent task, for a delegated or retried step.
+    pub parent_task: Option<TaskId>,
+    /// The attempt number for the logical task.
+    pub attempt: u32,
+    /// The policy decision that admitted the call.
+    pub policy: Option<PolicyDecisionRef>,
+}
+
+impl Default for CapabilityCorrelation {
+    fn default() -> Self {
+        Self {
+            turn: None,
+            task: None,
+            parent_task: None,
+            attempt: 1,
+            policy: None,
+        }
+    }
+}
+
 /// One capability from a workspace, callable by the engine.
 pub struct CapabilityTool {
     runtime: Arc<WorkspaceRuntime>,
@@ -60,6 +99,8 @@ pub struct CapabilityTool {
     calls: Mutex<HashMap<String, CancelToken>>,
     facts: ToolFacts,
     proxy: Option<ProxySource>,
+    correlation: CapabilityCorrelation,
+    shared_correlation: Option<Arc<Mutex<CapabilityCorrelation>>>,
     /// Discovery metadata derived from the descriptor and the binding, so the
     /// model-facing surface name reports the authoritative capability identity.
     metadata: ToolMetadata,
@@ -107,6 +148,8 @@ impl CapabilityTool {
             calls: Mutex::new(HashMap::new()),
             facts: ToolFacts::default(),
             proxy: None,
+            correlation: CapabilityCorrelation::default(),
+            shared_correlation: None,
             metadata,
         })
     }
@@ -129,6 +172,42 @@ impl CapabilityTool {
         self
     }
 
+    /// Attach the shared turn/task/policy state a host updates per turn.
+    pub fn with_correlation(mut self, correlation: Arc<Mutex<CapabilityCorrelation>>) -> Self {
+        self.shared_correlation = Some(correlation);
+        self
+    }
+
+    /// Attach the Agent turn that owns this call.
+    pub fn with_turn(mut self, turn: impl Into<String>) -> Self {
+        self.correlation.turn = Some(TurnId::new(turn));
+        self
+    }
+
+    /// Attach the task this call belongs to.
+    pub fn with_task(mut self, task: impl Into<String>) -> Self {
+        self.correlation.task = Some(TaskId::new(task));
+        self
+    }
+
+    /// Attach the parent task and attempt for a delegated/retried call.
+    pub fn with_parent_task(mut self, task: impl Into<String>) -> Self {
+        self.correlation.parent_task = Some(TaskId::new(task));
+        self
+    }
+
+    /// Set the attempt number for this logical task.
+    pub fn with_attempt(mut self, attempt: u32) -> Self {
+        self.correlation.attempt = attempt.max(1);
+        self
+    }
+
+    /// Attach the policy decision that admitted this call.
+    pub fn with_policy(mut self, policy: PolicyDecisionRef) -> Self {
+        self.correlation.policy = Some(policy);
+        self
+    }
+
     fn context(&self, call_id: &str) -> InvocationContext {
         let mut context = InvocationContext::local(
             InvocationId::new(call_id),
@@ -136,6 +215,22 @@ impl CapabilityTool {
             self.runtime.workspace().clone(),
         );
         context.deadline = self.timeout.map(|timeout| Instant::now() + timeout);
+        context.composition = Some(self.runtime.composition().clone());
+        let correlation = self
+            .shared_correlation
+            .as_ref()
+            .map(|shared| {
+                shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
+            .unwrap_or_else(|| self.correlation.clone());
+        context.turn = correlation.turn;
+        context.task = correlation.task;
+        context.parent_task = correlation.parent_task;
+        context.attempt = correlation.attempt;
+        context.policy = correlation.policy;
         context
     }
 
@@ -193,6 +288,9 @@ impl AsyncTool for CapabilityTool {
             .get(call_id)
         {
             token.cancel();
+        }
+        if let Some(proxy) = &self.proxy {
+            proxy.cancel(call_id);
         }
     }
 

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use crate::composition::{Binding, Budgets, ResolvedComposition};
+use crate::context::CompositionRef;
 use crate::descriptor::CapabilityDescriptor;
 use crate::error::CapabilityError;
 use crate::id::{CapabilityId, NodeId, ProviderId, WorkspaceId};
@@ -120,6 +121,8 @@ struct Dispatch {
 /// One instantiated workspace.
 pub struct WorkspaceRuntime {
     workspace: WorkspaceId,
+    /// The resolved composition this workspace instantiated.
+    composition: CompositionRef,
     capabilities: BTreeMap<CapabilityId, Dispatch>,
     budgets: Budgets,
     /// Dependency-first activation order.
@@ -133,6 +136,7 @@ impl std::fmt::Debug for WorkspaceRuntime {
         formatter
             .debug_struct("WorkspaceRuntime")
             .field("workspace", &self.workspace)
+            .field("composition", &self.composition)
             .field(
                 "capabilities",
                 &self.capabilities.keys().collect::<Vec<_>>(),
@@ -170,6 +174,7 @@ impl WorkspaceRuntime {
         providers: &[Arc<dyn CapabilityProvider>],
         activation_order: &[CapabilityId],
     ) -> Result<Self, WorkspaceError> {
+        let composition = CompositionRef::new(plan.id.clone(), plan.version.to_string(), None);
         let mut capabilities = BTreeMap::new();
         for resolved in plan.capabilities {
             let id = resolved.descriptor.id.clone();
@@ -206,6 +211,7 @@ impl WorkspaceRuntime {
         let budgets = plan.budgets.clone();
         Ok(Self {
             workspace: plan.workspace,
+            composition,
             capabilities,
             activation_order: activation_order.to_vec(),
             slots: tokio::sync::Semaphore::new(usize::from(budgets.max_concurrent_invocations)),
@@ -221,6 +227,11 @@ impl WorkspaceRuntime {
     /// The workspace this runtime instantiates.
     pub fn workspace(&self) -> &WorkspaceId {
         &self.workspace
+    }
+
+    /// The resolved composition that produced this workspace.
+    pub fn composition(&self) -> &CompositionRef {
+        &self.composition
     }
 
     /// The effective execution budgets this runtime enforces.

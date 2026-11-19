@@ -2454,7 +2454,7 @@ impl Shell {
         row: &crate::history::ToolRow,
         chrome: &RowChrome<'_>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let tool = ToolEvent {
             name: row.name.clone(),
             args: row.args.clone(),
@@ -5207,7 +5207,7 @@ impl Shell {
         folded: bool,
         chrome: &RowChrome<'_>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         // `liveProcessDetail` governs the RUNNING turn: its steps stay open while
         // it works. A settled turn folds its process the way the reference's
         // `stepGrouping: collapsed` does - one summary line per step, opened on a

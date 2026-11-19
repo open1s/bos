@@ -39,8 +39,8 @@ pub use composition::{
     resolve_host,
 };
 pub use context::{
-    CancelToken, DelegationHop, InvocationContext, InvocationId, PolicyDecisionRef, Principal,
-    TaskId, TraceContext,
+    CancelToken, CompositionRef, DelegationHop, InvocationContext, InvocationId, PolicyDecisionRef,
+    Principal, TaskId, TraceContext, TurnId,
 };
 pub use descriptor::{
     CapabilityDescriptor, FeatureSet, InvocationLimits, OutputContract, Permission, Risk,

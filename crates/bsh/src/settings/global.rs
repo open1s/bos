@@ -927,9 +927,11 @@ pub(crate) struct General {
     pub(crate) developer_tools: bool,
     /// Register the turn's tools through the capability model.
     ///
-    /// Off by default: the composed registry validates, classifies, and
-    /// dispatches through a provider, which is one hop more than the raw tool
-    /// registry. The switch exists so a build can opt in without a fork.
+    /// Opt-in: the composed registry validates, classifies, and dispatches
+    /// through a provider. Live extension tools are included as shims, but the
+    /// whole surface becomes async, so a host that inspects the registry
+    /// synchronously sees a different shape. A build opts in without a fork;
+    /// the raw registry remains the bounded compatibility path.
     #[serde(default)]
     pub(crate) capability_registry: bool,
     /// Whether presets apply at all: the master switch over the whole system.
@@ -3423,6 +3425,18 @@ search_depth = "advanced"
         let message = editor.to_string();
         assert!(message.contains("sandbox"), "{message}");
         assert!(message.contains("seatbelt"), "{message}");
+    }
+
+    /// The governed capability path is opt-in until live extension tools and
+    /// sync-tool compatibility are folded into it; an explicit true enables it.
+    #[test]
+    fn the_governed_capability_registry_is_opt_in() {
+        assert!(!GlobalSettings::default().general.capability_registry);
+        let empty = GlobalSettings::from_toml("").expect("an empty global file");
+        assert!(!empty.general.capability_registry);
+        let opted_in = GlobalSettings::from_toml("[general]\ncapability_registry = true\n")
+            .expect("an explicit opt-in");
+        assert!(opted_in.general.capability_registry);
     }
 
     #[test]

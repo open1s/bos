@@ -134,7 +134,7 @@ fn find_token(text: &str, raw: &str) -> Option<usize> {
 /// inside the text run, so the glyph and label are a single horizontal run and
 /// the glyph is dropped by the measured `-0.125em` to sit on the optical
 /// baseline.
-pub(crate) fn chip(context: &InlineTokenContext) -> impl IntoElement {
+pub(crate) fn chip(context: &InlineTokenContext) -> impl IntoElement + use<> {
     let size = chip_size(f32::from(context.line_height()));
     let directory = context.token().id().ends_with('/');
     let glyph = if directory {

@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent::capabilities::{
-    CapabilityTool, NativeToolProvider, ProxySource, ToolFacts, catalogue_from_registry,
+    CapabilityCorrelation, CapabilityTool, NativeToolProvider, ProxySource, ToolFacts,
+    catalogue_from_registry,
 };
 use agent::tools::{AsyncTool, FunctionTool, Tool, ToolError, ToolRegistry};
 use capability::composition::{
@@ -155,6 +156,165 @@ async fn the_shim_context_carries_the_workspace() {
     let context = InvocationContext::local(InvocationId::new("call-3"), principal(), workspace());
 
     assert_eq!(context.workspace, *runtime.workspace());
+}
+
+struct ContextProbe {
+    seen: Arc<std::sync::Mutex<Option<InvocationContext>>>,
+    provider: capability::ProviderId,
+    descriptor: capability::CapabilityDescriptor,
+}
+
+#[async_trait::async_trait]
+impl capability::CapabilityProvider for ContextProbe {
+    fn id(&self) -> &capability::ProviderId {
+        &self.provider
+    }
+
+    fn kind(&self) -> capability::ProviderKind {
+        capability::ProviderKind::Builtin
+    }
+
+    async fn describe(
+        &self,
+    ) -> Result<Vec<capability::CapabilityDescriptor>, capability::CapabilityError> {
+        Ok(vec![self.descriptor.clone()])
+    }
+
+    async fn invoke(
+        &self,
+        call: capability::CapabilityCall<'_>,
+    ) -> Result<capability::CapabilityOutput, capability::CapabilityError> {
+        *self.seen.lock().expect("seen") = Some(call.context.clone());
+        Ok(capability::CapabilityOutput::text("probe"))
+    }
+
+    async fn health(&self) -> capability::ProviderHealth {
+        capability::ProviderHealth::Available
+    }
+}
+
+fn probe_runtime() -> (
+    Arc<WorkspaceRuntime>,
+    Arc<std::sync::Mutex<Option<InvocationContext>>>,
+) {
+    use capability::composition::{Budgets, ResolvedCapability, ResolvedComposition};
+    use capability::descriptor::CapabilityDescriptor;
+    use capability::id::{CapabilityKind, VersionSource};
+
+    let descriptor = CapabilityDescriptor::new(
+        capability("probe"),
+        CapabilityKind::Tool,
+        Version::new(1, 0, 0),
+        VersionSource::Declared,
+    );
+    let provider = capability::ProviderId::builtin();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let plan = ResolvedComposition {
+        id: "compose:test".into(),
+        version: Version::new(1, 0, 0),
+        workspace: workspace(),
+        capabilities: vec![ResolvedCapability {
+            descriptor: descriptor.clone(),
+            binding: capability::composition::Binding::Local {
+                provider: provider.clone(),
+            },
+            decision: None,
+        }],
+        skipped: Vec::new(),
+        budgets: Budgets::default(),
+    };
+    let runtime = WorkspaceRuntime::instantiate(
+        plan,
+        &[Arc::new(ContextProbe {
+            seen: Arc::clone(&seen),
+            provider,
+            descriptor,
+        }) as Arc<dyn capability::CapabilityProvider>],
+    )
+    .expect("a runtime");
+    (Arc::new(runtime), seen)
+}
+
+#[tokio::test]
+async fn the_shim_context_carries_turn_task_and_policy() {
+    let (runtime, seen) = probe_runtime();
+    let tool = CapabilityTool::new(runtime, &capability("probe"), principal())
+        .expect("the capability exists")
+        .with_turn("turn-7")
+        .with_task("task-7")
+        .with_parent_task("task-parent")
+        .with_attempt(2)
+        .with_policy(capability::PolicyDecisionRef::new("policy-7"));
+
+    tool.run_with_call_id(&json!({}), "call-7")
+        .await
+        .expect("the probe answers");
+
+    let context = seen
+        .lock()
+        .expect("seen")
+        .clone()
+        .expect("the provider saw a context");
+    assert_eq!(
+        context.turn.as_ref().map(|turn| turn.as_str()),
+        Some("turn-7")
+    );
+    assert_eq!(
+        context.task.as_ref().map(|task| task.as_str()),
+        Some("task-7")
+    );
+    assert_eq!(
+        context.parent_task.as_ref().map(|task| task.as_str()),
+        Some("task-parent")
+    );
+    assert_eq!(context.attempt, 2);
+    assert_eq!(
+        context.policy.as_ref().map(|policy| policy.as_str()),
+        Some("policy-7")
+    );
+    assert_eq!(
+        context
+            .composition
+            .as_ref()
+            .map(|composition| composition.id.as_str()),
+        Some("compose:test")
+    );
+}
+
+#[tokio::test]
+async fn the_shim_reads_the_shared_correlation_per_call() {
+    let (runtime, seen) = probe_runtime();
+    let shared = Arc::new(std::sync::Mutex::new(CapabilityCorrelation::default()));
+    let tool = CapabilityTool::new(runtime, &capability("probe"), principal())
+        .expect("the capability exists")
+        .with_correlation(Arc::clone(&shared));
+
+    shared.lock().expect("shared").turn = Some(capability::TurnId::new("turn-1"));
+    tool.run_with_call_id(&json!({}), "call-1")
+        .await
+        .expect("the probe answers");
+    assert_eq!(
+        seen.lock()
+            .expect("seen")
+            .as_ref()
+            .and_then(|context| context.turn.as_ref())
+            .map(|turn| turn.as_str()),
+        Some("turn-1")
+    );
+
+    shared.lock().expect("shared").turn = Some(capability::TurnId::new("turn-2"));
+    tool.run_with_call_id(&json!({}), "call-2")
+        .await
+        .expect("the probe answers");
+    assert_eq!(
+        seen.lock()
+            .expect("seen")
+            .as_ref()
+            .and_then(|context| context.turn.as_ref())
+            .map(|turn| turn.as_str()),
+        Some("turn-2"),
+        "the same tool reads the next turn without being rebuilt"
+    );
 }
 
 fn runtime_over(registry: &ToolRegistry) -> Arc<WorkspaceRuntime> {

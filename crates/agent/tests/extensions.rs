@@ -718,7 +718,7 @@ fn copy_tree(from: &Path, to: &Path) {
 /// with the one under test.
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
-    extern "C" {
+    unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     // SAFETY: `kill` with signal 0 performs the permission and existence

@@ -187,13 +187,15 @@ mod tests {
     fn a_missing_override_is_actionable() {
         // Serialized through a mutex-free env guard: the override is read
         // once; set, resolve, restore.
+        // SAFETY: this test is the only writer of this process-global variable
+        // in the test binary; it restores the previous value before returning.
         let previous = std::env::var_os("BSH_BASH_BIN");
-        std::env::set_var("BSH_BASH_BIN", "/nonexistent/bash-xyz");
+        unsafe { std::env::set_var("BSH_BASH_BIN", "/nonexistent/bash-xyz") };
         let error = resolve().unwrap_err();
         assert!(error.contains("BSH_BASH_BIN"), "{error}");
         match previous {
-            Some(value) => std::env::set_var("BSH_BASH_BIN", value),
-            None => std::env::remove_var("BSH_BASH_BIN"),
+            Some(value) => unsafe { std::env::set_var("BSH_BASH_BIN", value) },
+            None => unsafe { std::env::remove_var("BSH_BASH_BIN") },
         }
     }
 

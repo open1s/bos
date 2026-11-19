@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use capability::transport::{FederationMessage, FederationTransport, unix_ms};
 use capability::{
     CancelToken, CapabilityDescriptor, CapabilityError, CapabilityId, CapabilityOutput,
-    DelegationHop, DeliveryState, InvocationContext, InvocationId, NodeId, Principal, TaskId,
-    TraceContext, WorkspaceRuntime,
+    CompositionId, CompositionRef, DelegationHop, DeliveryState, InvocationContext, InvocationId,
+    NodeId, Principal, TaskId, TraceContext, TurnId, WorkspaceRuntime,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -2072,6 +2072,15 @@ impl FederationNode {
             "input": input,
             "deadline_ms": deadline_ms,
             "task": context.task.as_ref().map(TaskId::as_str),
+            "parent_task": context.parent_task.as_ref().map(TaskId::as_str),
+            "turn": context.turn.as_ref().map(TurnId::as_str),
+            "attempt": context.attempt,
+            "composition": context.composition.as_ref().map(|composition| json!({
+                "id": composition.id.as_str(),
+                "version": composition.version,
+                "snapshot": composition.snapshot,
+            })),
+            "idempotency_key": context.idempotency_key,
             "trace": {
                 "trace_id": context.trace.trace_id,
                 "span_id": context.trace.span_id,
@@ -2696,6 +2705,11 @@ impl FederationNode {
             unix_ms(),
             self.next_correlation.fetch_add(1, Ordering::Relaxed)
         );
+        let idempotency = payload
+            .get("idempotency_key")
+            .and_then(Value::as_str)
+            .unwrap_or(&correlation)
+            .to_string();
         let message = FederationMessage::new(
             kind,
             serde_json::to_vec(&payload).map_err(|error| CapabilityError::Invalid {
@@ -2703,7 +2717,7 @@ impl FederationNode {
             })?,
         )
         .with_correlation(&correlation)
-        .with_idempotency_key(&correlation);
+        .with_idempotency_key(idempotency);
         let envelope = Envelope::seal(&message, &self.identity, peer).map_err(|error| {
             CapabilityError::Invalid {
                 message: error.to_string(),
@@ -2875,6 +2889,36 @@ async fn serve(
     );
     if let Some(task) = payload.get("task").and_then(Value::as_str) {
         context.task = Some(TaskId::new(task));
+    }
+    if let Some(task) = payload.get("parent_task").and_then(Value::as_str) {
+        context.parent_task = Some(TaskId::new(task));
+    }
+    if let Some(turn) = payload.get("turn").and_then(Value::as_str) {
+        context.turn = Some(TurnId::new(turn));
+    }
+    if let Some(attempt) = payload.get("attempt").and_then(Value::as_u64) {
+        context.attempt = u32::try_from(attempt).unwrap_or(u32::MAX).max(1);
+    }
+    if let Some(composition) = payload.get("composition") {
+        if let Some(id) = composition.get("id").and_then(Value::as_str) {
+            let version = composition
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let snapshot = composition
+                .get("snapshot")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            context.composition = Some(CompositionRef::new(
+                CompositionId::new(id),
+                version,
+                snapshot,
+            ));
+        }
+    }
+    if let Some(key) = payload.get("idempotency_key").and_then(Value::as_str) {
+        context.idempotency_key = Some(key.to_string());
     }
     if let Some(trace) = payload.get("trace") {
         let trace_id = trace

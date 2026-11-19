@@ -252,6 +252,42 @@ async fn an_invocation_correlates_both_sides() {
     assert_eq!(event.peer, pair.caller_id.to_string());
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_context_idempotency_key_refuses_a_retry() {
+    let pair = pair().await;
+    let mut context = context();
+    context.idempotency_key = Some("op-context-1".to_string());
+
+    pair.caller
+        .invoke(
+            &pair.provider_id,
+            &capability("echo"),
+            json!({ "value": 7 }),
+            &context,
+        )
+        .await
+        .expect("the first logical operation runs");
+
+    let retry = pair
+        .caller
+        .invoke(
+            &pair.provider_id,
+            &capability("echo"),
+            json!({ "value": 7 }),
+            &context,
+        )
+        .await;
+    assert!(
+        matches!(retry, Err(CapabilityError::Duplicate { .. })),
+        "the same context key is the same logical operation: {retry:?}"
+    );
+    assert_eq!(
+        pair.calls.load(Ordering::SeqCst),
+        1,
+        "the provider side effect runs once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_granted_call_crosses_both_kernels() {
     let pair = pair().await;
 
@@ -2407,6 +2443,11 @@ async fn the_resource_stream_budget_is_separate_and_configurable() {
 #[derive(Default)]
 struct SeenContext {
     task: Option<String>,
+    parent_task: Option<String>,
+    turn: Option<String>,
+    attempt: u32,
+    composition: Option<(String, String, Option<String>)>,
+    idempotency_key: Option<String>,
     trace: (String, String),
     delegation: Vec<(String, String)>,
     remote_principal: bool,
@@ -2438,6 +2479,25 @@ impl CapabilityProvider for ContextProbe {
             .task
             .as_ref()
             .map(|task| task.as_str().to_string());
+        seen.parent_task = call
+            .context
+            .parent_task
+            .as_ref()
+            .map(|task| task.as_str().to_string());
+        seen.turn = call
+            .context
+            .turn
+            .as_ref()
+            .map(|turn| turn.as_str().to_string());
+        seen.attempt = call.context.attempt;
+        seen.composition = call.context.composition.as_ref().map(|composition| {
+            (
+                composition.id.as_str().to_string(),
+                composition.version.clone(),
+                composition.snapshot.clone(),
+            )
+        });
+        seen.idempotency_key = call.context.idempotency_key.clone();
         seen.trace = (
             call.context.trace.trace_id.clone(),
             call.context.trace.span_id.clone(),
@@ -2504,6 +2564,15 @@ async fn task_trace_and_delegation_reach_the_remote_provider() {
 
     let mut context = context();
     context.task = Some(capability::TaskId::new("task-1"));
+    context.parent_task = Some(capability::TaskId::new("task-parent"));
+    context.turn = Some(capability::TurnId::new("turn-1"));
+    context.attempt = 2;
+    context.composition = Some(capability::CompositionRef::new(
+        capability::CompositionId::new("compose:test"),
+        "1.2.3",
+        Some("sha256:snapshot".to_string()),
+    ));
+    context.idempotency_key = Some("idem-1".to_string());
     context.trace = capability::TraceContext::new("trace-1", "span-1");
     context.delegation = vec![capability::DelegationHop {
         node: caller_id.clone(),
@@ -2516,6 +2585,18 @@ async fn task_trace_and_delegation_reach_the_remote_provider() {
 
     let seen = seen.lock().expect("seen");
     assert_eq!(seen.task.as_deref(), Some("task-1"));
+    assert_eq!(seen.parent_task.as_deref(), Some("task-parent"));
+    assert_eq!(seen.turn.as_deref(), Some("turn-1"));
+    assert_eq!(seen.attempt, 2);
+    assert_eq!(
+        seen.composition,
+        Some((
+            "compose:test".to_string(),
+            "1.2.3".to_string(),
+            Some("sha256:snapshot".to_string())
+        ))
+    );
+    assert_eq!(seen.idempotency_key.as_deref(), Some("idem-1"));
     assert_eq!(seen.trace, ("trace-1".to_string(), "span-1".to_string()));
     assert_eq!(
         seen.delegation,
