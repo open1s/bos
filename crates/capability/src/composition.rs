@@ -561,22 +561,22 @@ fn resolve_one(
     // workspace view widen itself through the federation. The one exception is
     // the other direction: a requirement that names a peer is executed there,
     // so a local implementation is not a substitute for it.
-    if !matches!(requirement.remote, RemotePolicy::Required(_)) {
-        if let Some(descriptor) = local.get(&requirement.id) {
-            if !scope.admits(&requirement.id) {
-                return Err(CompositionError::NotAdmitted {
-                    capability: requirement.id.clone(),
-                });
-            }
-            check_version(requirement, descriptor)?;
-            return Ok(Some(ResolvedCapability {
-                descriptor: descriptor.clone(),
-                binding: Binding::Local {
-                    provider: descriptor.id.provider.clone(),
-                },
-                decision: None,
-            }));
+    if !matches!(requirement.remote, RemotePolicy::Required(_))
+        && let Some(descriptor) = local.get(&requirement.id)
+    {
+        if !scope.admits(&requirement.id) {
+            return Err(CompositionError::NotAdmitted {
+                capability: requirement.id.clone(),
+            });
         }
+        check_version(requirement, descriptor)?;
+        return Ok(Some(ResolvedCapability {
+            descriptor: descriptor.clone(),
+            binding: Binding::Local {
+                provider: descriptor.id.provider.clone(),
+            },
+            decision: None,
+        }));
     }
 
     match &requirement.remote {

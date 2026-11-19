@@ -88,10 +88,11 @@ impl ResourceHandler for FolderResource {
                         Err(e) => return Err(ResourceError::Io(e)),
                     };
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(p) = &pattern {
-                        if p != "*" && !name.contains(p) {
-                            continue;
-                        }
+                    if let Some(p) = &pattern
+                        && p != "*"
+                        && !name.contains(p)
+                    {
+                        continue;
                     }
                     entries.push(name);
                 }

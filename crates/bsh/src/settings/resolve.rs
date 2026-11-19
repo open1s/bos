@@ -916,10 +916,10 @@ impl SkillCatalogueCache {
         workspace: &WorkspaceSettings,
     ) -> (Vec<ResolvedSource>, std::sync::Arc<Vec<DiscoveredSkill>>) {
         let fingerprint = catalogue_fingerprint(global, workspace);
-        if let Some(entry) = self.lock().as_ref() {
-            if entry.fingerprint == fingerprint {
-                return (entry.sources.clone(), entry.skills.clone());
-            }
+        if let Some(entry) = self.lock().as_ref()
+            && entry.fingerprint == fingerprint
+        {
+            return (entry.sources.clone(), entry.skills.clone());
         }
         let (sources, skills) = discover_skills(global, workspace, &workspace.disabled.skills);
         self.scans

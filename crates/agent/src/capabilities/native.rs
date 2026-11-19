@@ -195,10 +195,10 @@ impl CapabilityProvider for NativeToolProvider {
     }
 
     async fn cancel(&self, invocation: &InvocationId) -> Result<(), CapabilityError> {
-        if let Some(name) = self.in_flight_tool(invocation.as_str()) {
-            if let Some(tool) = self.registry.get_async(&name) {
-                tool.cancel(invocation.as_str());
-            }
+        if let Some(name) = self.in_flight_tool(invocation.as_str())
+            && let Some(tool) = self.registry.get_async(&name)
+        {
+            tool.cancel(invocation.as_str());
         }
         Ok(())
     }

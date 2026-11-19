@@ -619,11 +619,11 @@ impl Unlocked {
             push_record(&mut out, name, &entry.value, entry.created);
             count += 1;
         }
-        if let Pending::Put(added, replacement) = pending {
-            if !self.entries.contains_key(added) {
-                push_record(&mut out, added, &replacement.value, replacement.created);
-                count += 1;
-            }
+        if let Pending::Put(added, replacement) = pending
+            && !self.entries.contains_key(added)
+        {
+            push_record(&mut out, added, &replacement.value, replacement.created);
+            count += 1;
         }
         out[0..4].copy_from_slice(&count.to_be_bytes());
         out

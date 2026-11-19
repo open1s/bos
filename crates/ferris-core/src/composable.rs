@@ -585,18 +585,18 @@ impl ServiceRegistry {
         );
         let mut reported_generation = generation;
         let mut kind = ServiceChangeKind::Unavailable;
-        if let Ok(mut generations) = self.generations.write() {
-            if let Some(state) = generations.get_mut(&name_key) {
-                state.remove(&token.key.type_id);
-                if state.is_empty() {
-                    generations.remove(&name_key);
-                } else {
-                    // Another concrete type still provides this name: the name
-                    // remains available and its generation is the newest live
-                    // provider, not the one that was just revoked.
-                    kind = ServiceChangeKind::Replaced;
-                    reported_generation = state.values().copied().max().unwrap_or(generation);
-                }
+        if let Ok(mut generations) = self.generations.write()
+            && let Some(state) = generations.get_mut(&name_key)
+        {
+            state.remove(&token.key.type_id);
+            if state.is_empty() {
+                generations.remove(&name_key);
+            } else {
+                // Another concrete type still provides this name: the name
+                // remains available and its generation is the newest live
+                // provider, not the one that was just revoked.
+                kind = ServiceChangeKind::Replaced;
+                reported_generation = state.values().copied().max().unwrap_or(generation);
             }
         }
         owner.retire();

@@ -1202,27 +1202,27 @@ pub(crate) fn install_with_lease(
     }
     let mut skill_paths = Vec::new();
     let mut skills = Vec::new();
-    if let Some(dir) = &contributed.skills_dir {
-        if dir.is_dir() {
-            let before: std::collections::HashSet<PathBuf> =
-                agent.live_skill_paths().into_iter().collect();
-            if let Err(error) = agent.add_live_skills_from_dir(dir.clone()) {
-                log::warn!(
-                    target: "bsh::extension",
-                    "{}: skills were declared but could not be read: {error}",
-                    contributed.extension
-                );
-            } else {
-                // Record both the paths a suspend removes and the content a
-                // resume puts back; the overlay is the only place the parsed
-                // form lives.
-                for skill in agent.live_skills() {
-                    if before.contains(&skill.skill_dir) {
-                        continue;
-                    }
-                    skill_paths.push(skill.skill_dir.clone());
-                    skills.push(skill);
+    if let Some(dir) = &contributed.skills_dir
+        && dir.is_dir()
+    {
+        let before: std::collections::HashSet<PathBuf> =
+            agent.live_skill_paths().into_iter().collect();
+        if let Err(error) = agent.add_live_skills_from_dir(dir.clone()) {
+            log::warn!(
+                target: "bsh::extension",
+                "{}: skills were declared but could not be read: {error}",
+                contributed.extension
+            );
+        } else {
+            // Record both the paths a suspend removes and the content a
+            // resume puts back; the overlay is the only place the parsed
+            // form lives.
+            for skill in agent.live_skills() {
+                if before.contains(&skill.skill_dir) {
+                    continue;
                 }
+                skill_paths.push(skill.skill_dir.clone());
+                skills.push(skill);
             }
         }
     }

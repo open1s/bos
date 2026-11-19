@@ -772,11 +772,11 @@ impl<A: ReActApp> ReActEngine<A> {
                         // BEFORE the calls so the session keeps the model's own
                         // order.
                         let mut recorded = false;
-                        if let Some(content) = &message.content {
-                            if !content.trim().is_empty() {
-                                session.push(LlmMessage::assistant(content.clone()));
-                                recorded = true;
-                            }
+                        if let Some(content) = &message.content
+                            && !content.trim().is_empty()
+                        {
+                            session.push(LlmMessage::assistant(content.clone()));
+                            recorded = true;
                         }
 
                         // On the closing turn the model is asked for prose: a
@@ -907,28 +907,25 @@ impl<A: ReActApp> ReActEngine<A> {
                                 // A discovery adds the reported schemas to the
                                 // live context, so the next model step can call
                                 // those tools directly by name.
-                                if name == "find_tool" {
-                                    if let Ok(reported) = &mut result {
-                                        let reveal = Self::reveal_tools(
-                                            reported,
-                                            context,
-                                            &mut self.schema_budget,
-                                        );
-                                        self.telemetry.emit(&TelemetryEvent::ToolDiscovery {
-                                            turn,
-                                            candidates: reveal.candidates,
-                                            revealed: reveal.revealed,
-                                            rejected: reveal.rejected,
-                                            spent_bytes: self.schema_budget.spent(),
-                                        });
-                                        if let Some(note) = reveal.note {
-                                            if let Some(object) = reported.as_object_mut() {
-                                                object.insert(
-                                                    "budget".to_string(),
-                                                    Value::String(note),
-                                                );
-                                            }
-                                        }
+                                if name == "find_tool"
+                                    && let Ok(reported) = &mut result
+                                {
+                                    let reveal = Self::reveal_tools(
+                                        reported,
+                                        context,
+                                        &mut self.schema_budget,
+                                    );
+                                    self.telemetry.emit(&TelemetryEvent::ToolDiscovery {
+                                        turn,
+                                        candidates: reveal.candidates,
+                                        revealed: reveal.revealed,
+                                        rejected: reveal.rejected,
+                                        spent_bytes: self.schema_budget.spent(),
+                                    });
+                                    if let Some(note) = reveal.note
+                                        && let Some(object) = reported.as_object_mut()
+                                    {
+                                        object.insert("budget".to_string(), Value::String(note));
                                     }
                                 }
                                 // What the call actually was, when the tool that
@@ -1009,18 +1006,16 @@ impl<A: ReActApp> ReActEngine<A> {
 
                         // A response with no tool call is the answer: the text
                         // recorded above IS the final thought.
-                        if !found_tool_call {
-                            if let Some(content) = &message.content {
-                                if !content.is_empty() {
-                                    thought = content.clone();
-                                    if let Some(pos) = thought.find("Final Answer:") {
-                                        thought = thought[(pos + "Final Answer:".len())..]
-                                            .trim()
-                                            .to_string();
-                                    }
-                                    self.react_app.on_thought(&thought, session, context).await;
-                                }
+                        if !found_tool_call
+                            && let Some(content) = &message.content
+                            && !content.is_empty()
+                        {
+                            thought = content.clone();
+                            if let Some(pos) = thought.find("Final Answer:") {
+                                thought =
+                                    thought[(pos + "Final Answer:".len())..].trim().to_string();
                             }
+                            self.react_app.on_thought(&thought, session, context).await;
                         }
 
                         // A blank step ends the turn with nothing: give the model
@@ -1048,17 +1043,17 @@ impl<A: ReActApp> ReActEngine<A> {
                         // An ACTION turn answered with prose only has not done
                         // the work yet: spend one directed retry before the
                         // reply is accepted as the answer.
-                        if !found_tool_call {
-                            if let Some(note) = action_retry_note(
+                        if !found_tool_call
+                            && let Some(note) = action_retry_note(
                                 request.intent,
                                 &*context,
                                 closing,
                                 &mut trace,
                                 &thought,
-                            ) {
-                                request.host_guidance.push(note);
-                                continue 'turn;
-                            }
+                            )
+                        {
+                            request.host_guidance.push(note);
+                            continue 'turn;
                         }
                         if finish.is_some() && finish != Some("tool_calls") {
                             if !recorded {
@@ -1196,28 +1191,25 @@ impl<A: ReActApp> ReActEngine<A> {
                                 // A discovery reveals the reported schemas to
                                 // the next request so the model can call them
                                 // directly.
-                                if name == "find_tool" {
-                                    if let Ok(reported) = &mut result {
-                                        let reveal = Self::reveal_tools(
-                                            reported,
-                                            context,
-                                            &mut self.schema_budget,
-                                        );
-                                        self.telemetry.emit(&TelemetryEvent::ToolDiscovery {
-                                            turn,
-                                            candidates: reveal.candidates,
-                                            revealed: reveal.revealed,
-                                            rejected: reveal.rejected,
-                                            spent_bytes: self.schema_budget.spent(),
-                                        });
-                                        if let Some(note) = reveal.note {
-                                            if let Some(object) = reported.as_object_mut() {
-                                                object.insert(
-                                                    "budget".to_string(),
-                                                    Value::String(note),
-                                                );
-                                            }
-                                        }
+                                if name == "find_tool"
+                                    && let Ok(reported) = &mut result
+                                {
+                                    let reveal = Self::reveal_tools(
+                                        reported,
+                                        context,
+                                        &mut self.schema_budget,
+                                    );
+                                    self.telemetry.emit(&TelemetryEvent::ToolDiscovery {
+                                        turn,
+                                        candidates: reveal.candidates,
+                                        revealed: reveal.revealed,
+                                        rejected: reveal.rejected,
+                                        spent_bytes: self.schema_budget.spent(),
+                                    });
+                                    if let Some(note) = reveal.note
+                                        && let Some(object) = reported.as_object_mut()
+                                    {
+                                        object.insert("budget".to_string(), Value::String(note));
                                     }
                                 }
 
@@ -1315,17 +1307,17 @@ impl<A: ReActApp> ReActEngine<A> {
                         // The same action contract the OpenAI arm applies:
                         // one directed retry when an actionable turn came back
                         // as prose only.
-                        if !found_tool_call {
-                            if let Some(note) = action_retry_note(
+                        if !found_tool_call
+                            && let Some(note) = action_retry_note(
                                 request.intent,
                                 &*context,
                                 closing,
                                 &mut trace,
                                 &thought,
-                            ) {
-                                request.host_guidance.push(note);
-                                continue 'turn;
-                            }
+                            )
+                        {
+                            request.host_guidance.push(note);
+                            continue 'turn;
                         }
                         self.react_app
                             .on_final_answer(&thought, session, context)
@@ -1622,8 +1614,8 @@ impl<A: ReActApp> ReActEngine<A> {
 
                             // A discovery reveals the reported schemas to the
                             // next request so the model can call them directly.
-                            if name == "find_tool" {
-                                if let Ok(reported) = &mut result {
+                            if name == "find_tool"
+                                && let Ok(reported) = &mut result {
                                     let reveal = Self::reveal_tools(
                                         reported,
                                         context,
@@ -1636,13 +1628,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                         rejected: reveal.rejected,
                                         spent_bytes: self.schema_budget.spent(),
                                     });
-                                    if let Some(note) = reveal.note {
-                                        if let Some(object) = reported.as_object_mut() {
+                                    if let Some(note) = reveal.note
+                                        && let Some(object) = reported.as_object_mut() {
                                             object.insert("budget".to_string(), Value::String(note));
                                         }
-                                    }
                                 }
-                            }
 
                             match self.react_app
                                 .after_tool_result(

@@ -76,10 +76,10 @@ impl FrameSlot {
         }
         // Signalled AFTER the frame is readable, so a woken sync always finds
         // the frame that woke it - or a newer one.
-        if let Ok(guard) = self.wake.lock() {
-            if let Some(wake) = guard.as_ref() {
-                let _ = wake.try_send(());
-            }
+        if let Ok(guard) = self.wake.lock()
+            && let Some(wake) = guard.as_ref()
+        {
+            let _ = wake.try_send(());
         }
     }
 

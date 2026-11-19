@@ -148,10 +148,10 @@ impl TaskQueue {
         if objective.trim().is_empty() {
             return Err(TaskQueueError::EmptyObjective);
         }
-        if let TaskSchedule::Every { every_seconds } = schedule {
-            if every_seconds < 60 {
-                return Err(TaskQueueError::TooFrequent);
-            }
+        if let TaskSchedule::Every { every_seconds } = schedule
+            && every_seconds < 60
+        {
+            return Err(TaskQueueError::TooFrequent);
         }
         if self.tasks.contains_key(&id) {
             return Err(TaskQueueError::Duplicate(id));

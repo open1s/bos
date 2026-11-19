@@ -592,15 +592,15 @@ impl Settings {
         let previous_global = std::fs::read(&global_path).ok();
         atomic_write(&global_path, &global_text)
             .map_err(|e| std::io::Error::other(format!("global settings commit failed: {e}")))?;
-        if let Some(path) = workspace_path {
-            if let Err(error) = workspace.save(&path) {
-                if let Some(previous) = previous_global {
-                    let _ = atomic_write(&global_path, &String::from_utf8_lossy(&previous));
-                }
-                return Err(std::io::Error::other(format!(
-                    "workspace settings commit failed (global rolled back): {error}"
-                )));
+        if let Some(path) = workspace_path
+            && let Err(error) = workspace.save(&path)
+        {
+            if let Some(previous) = previous_global {
+                let _ = atomic_write(&global_path, &String::from_utf8_lossy(&previous));
             }
+            return Err(std::io::Error::other(format!(
+                "workspace settings commit failed (global rolled back): {error}"
+            )));
         }
         Ok(())
     }

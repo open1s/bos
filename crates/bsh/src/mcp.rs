@@ -230,11 +230,11 @@ impl McpPool {
         let mut failed = Vec::new();
         for launch in launches {
             let signature = launch.signature();
-            if let Some(connected) = previous.remove(&launch.name) {
-                if connected.signature == signature {
-                    self.servers.insert(launch.name.clone(), connected);
-                    continue;
-                }
+            if let Some(connected) = previous.remove(&launch.name)
+                && connected.signature == signature
+            {
+                self.servers.insert(launch.name.clone(), connected);
+                continue;
             }
             let name = launch.name.clone();
             match connect(rt, &launch, &self.egress) {

@@ -645,13 +645,12 @@ pub(crate) fn reconcile(
                 attempt.ended_ms = Some(now);
                 attempt.error = Some("process died before the run was recorded".to_string());
             }
-            if let Some(attempt) = task.attempts.last() {
-                if let Some(effect) = task.side_effects.get_mut(&attempt.id) {
-                    effect.status = tasks::SideEffectStatus::Unknown;
-                    effect.detail =
-                        "attempt was interrupted before its run was recorded".to_string();
-                    effect.recorded_ms = now;
-                }
+            if let Some(attempt) = task.attempts.last()
+                && let Some(effect) = task.side_effects.get_mut(&attempt.id)
+            {
+                effect.status = tasks::SideEffectStatus::Unknown;
+                effect.detail = "attempt was interrupted before its run was recorded".to_string();
+                effect.recorded_ms = now;
             }
             let _ = FileTasksStore.save(workspace, &task);
             changed += 1;
@@ -733,27 +732,27 @@ async fn retry_inner(
     // A Queued/Running attempt with no recorded run id is a crash remnant,
     // not a live run: mark it Interrupted and require a fresh authorization.
     let mut reconciled = false;
-    if let Some(attempt) = record.attempts.last() {
-        if matches!(
+    if let Some(attempt) = record.attempts.last()
+        && matches!(
             attempt.status,
             AttemptStatus::Queued | AttemptStatus::Running
-        ) && attempt.run.is_none()
-        {
-            let attempt_id = attempt.id.clone();
-            if let Some(attempt) = record.attempts.last_mut() {
-                attempt.status = AttemptStatus::Interrupted;
-                attempt.ended_ms = Some(now);
-                attempt.error = Some("process died before the run was recorded".to_string());
-            }
-            if let Some(effect) = record.side_effects.get_mut(&attempt_id) {
-                effect.status = tasks::SideEffectStatus::Unknown;
-                effect.detail = "attempt was interrupted before its run was recorded".to_string();
-                effect.recorded_ms = now;
-            }
-            record.status = TaskStatus::Interrupted;
-            record.updated_ms = now;
-            reconciled = true;
+        )
+        && attempt.run.is_none()
+    {
+        let attempt_id = attempt.id.clone();
+        if let Some(attempt) = record.attempts.last_mut() {
+            attempt.status = AttemptStatus::Interrupted;
+            attempt.ended_ms = Some(now);
+            attempt.error = Some("process died before the run was recorded".to_string());
         }
+        if let Some(effect) = record.side_effects.get_mut(&attempt_id) {
+            effect.status = tasks::SideEffectStatus::Unknown;
+            effect.detail = "attempt was interrupted before its run was recorded".to_string();
+            effect.recorded_ms = now;
+        }
+        record.status = TaskStatus::Interrupted;
+        record.updated_ms = now;
+        reconciled = true;
     }
     if reconciled {
         FileTasksStore
@@ -2208,42 +2207,41 @@ pub(crate) async fn join_with(
                     record.verification.status,
                     VerificationStatus::Passed | VerificationStatus::Failed
                 ))
+            && let Some(contract) = record.verification_contract.clone()
         {
-            if let Some(contract) = record.verification_contract.clone() {
-                let attempt_id = record.attempts.last().map(|attempt| attempt.id.clone());
-                let mut report = match &contract {
-                    VerificationContract::Review | VerificationContract::Human => approval_report(
-                        record,
-                        attempt_id.as_deref().unwrap_or(""),
-                        now,
-                        &context.workspace,
-                    ),
-                    _ => {
-                        verify_contract(&contract, &context.workspace, verification_shell.as_ref())
-                            .await
-                    }
-                };
-                // Bind the report to the attempt that produced this outcome:
-                // a previous attempt's report can never satisfy it (issue #417).
-                report.attempt_id = attempt_id;
-                record.verification = report.clone();
-                if let Some(attempt) = record.attempts.last_mut() {
-                    attempt.verification = report;
+            let attempt_id = record.attempts.last().map(|attempt| attempt.id.clone());
+            let mut report = match &contract {
+                VerificationContract::Review | VerificationContract::Human => approval_report(
+                    record,
+                    attempt_id.as_deref().unwrap_or(""),
+                    now,
+                    &context.workspace,
+                ),
+                _ => {
+                    verify_contract(&contract, &context.workspace, verification_shell.as_ref())
+                        .await
                 }
+            };
+            // Bind the report to the attempt that produced this outcome:
+            // a previous attempt's report can never satisfy it (issue #417).
+            report.attempt_id = attempt_id;
+            record.verification = report.clone();
+            if let Some(attempt) = record.attempts.last_mut() {
+                attempt.verification = report;
             }
         }
         // Record a completed idempotency key so a later retry can return the
         // same result without executing the external effect again (#430).
-        if record.status == TaskStatus::Succeeded {
-            if let (Some(key), Some(result)) = (
+        if record.status == TaskStatus::Succeeded
+            && let (Some(key), Some(result)) = (
                 record.idempotency_key.clone(),
                 record
                     .attempts
                     .last()
                     .and_then(|attempt| attempt.result.clone()),
-            ) {
-                record.idempotency_results.entry(key).or_insert(result);
-            }
+            )
+        {
+            record.idempotency_results.entry(key).or_insert(result);
         }
         let _ = FileTasksStore.save(&context.workspace, record);
     }

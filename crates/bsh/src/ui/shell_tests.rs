@@ -132,10 +132,10 @@ fn draw_until_row_is_stable(
             .map(|bounds| f32::from(bounds.origin.y));
         let now = (offset, row_y);
         history.push(now);
-        if let Some(row_y) = row_y {
-            if last == Some(now) {
-                return (offset, row_y);
-            }
+        if let Some(row_y) = row_y
+            && last == Some(now)
+        {
+            return (offset, row_y);
         }
         last = Some(now);
     }
@@ -1519,17 +1519,17 @@ fn a_question_option_click_answers_and_sends(cx: &mut TestAppContext) {
             .insert("p".to_string(), provider);
         state.select_model("local");
         let id = state.active_id.clone().expect("a session");
-        if let Some(session) = state.store.session_mut(&id) {
-            if let Some(last) = session.messages.last_mut() {
-                last.question = Some(crate::model::QuestionBlock {
-                    questions: vec![crate::model::QuestionItem {
-                        question: "Which approach?".to_string(),
-                        options: vec!["Fix the cause".to_string(), "Work around it".to_string()],
-                        multi_select: false,
-                    }],
-                    answered: None,
-                });
-            }
+        if let Some(session) = state.store.session_mut(&id)
+            && let Some(last) = session.messages.last_mut()
+        {
+            last.question = Some(crate::model::QuestionBlock {
+                questions: vec![crate::model::QuestionItem {
+                    question: "Which approach?".to_string(),
+                    options: vec!["Fix the cause".to_string(), "Work around it".to_string()],
+                    multi_select: false,
+                }],
+                answered: None,
+            });
         }
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -1580,17 +1580,17 @@ fn a_question_answer_steers_into_the_running_turn(cx: &mut TestAppContext) {
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("question-steer", 1);
         let id = state.active_id.clone().expect("a session");
-        if let Some(session) = state.store.session_mut(&id) {
-            if let Some(last) = session.messages.last_mut() {
-                last.question = Some(crate::model::QuestionBlock {
-                    questions: vec![crate::model::QuestionItem {
-                        question: "Which approach?".to_string(),
-                        options: vec!["Fix the cause".to_string(), "Work around it".to_string()],
-                        multi_select: false,
-                    }],
-                    answered: None,
-                });
-            }
+        if let Some(session) = state.store.session_mut(&id)
+            && let Some(last) = session.messages.last_mut()
+        {
+            last.question = Some(crate::model::QuestionBlock {
+                questions: vec![crate::model::QuestionItem {
+                    question: "Which approach?".to_string(),
+                    options: vec!["Fix the cause".to_string(), "Work around it".to_string()],
+                    multi_select: false,
+                }],
+                answered: None,
+            });
         }
         state.streams.insert(id.clone(), 0);
         state.attach_steers(&id, std::sync::Arc::new(agent::agent::SteerMailbox::new()));
@@ -1658,27 +1658,24 @@ fn a_question_card_steps_and_multi_selects(cx: &mut TestAppContext) {
             .insert("p".to_string(), provider);
         state.select_model("local");
         let id = state.active_id.clone().expect("a session");
-        if let Some(session) = state.store.session_mut(&id) {
-            if let Some(last) = session.messages.last_mut() {
-                last.question = Some(crate::model::QuestionBlock {
-                    questions: vec![
-                        crate::model::QuestionItem {
-                            question: "Which approach?".to_string(),
-                            options: vec![
-                                "Fix the cause".to_string(),
-                                "Work around it".to_string(),
-                            ],
-                            multi_select: false,
-                        },
-                        crate::model::QuestionItem {
-                            question: "Which extras?".to_string(),
-                            options: vec!["x".to_string(), "y".to_string(), "z".to_string()],
-                            multi_select: true,
-                        },
-                    ],
-                    answered: None,
-                });
-            }
+        if let Some(session) = state.store.session_mut(&id)
+            && let Some(last) = session.messages.last_mut()
+        {
+            last.question = Some(crate::model::QuestionBlock {
+                questions: vec![
+                    crate::model::QuestionItem {
+                        question: "Which approach?".to_string(),
+                        options: vec!["Fix the cause".to_string(), "Work around it".to_string()],
+                        multi_select: false,
+                    },
+                    crate::model::QuestionItem {
+                        question: "Which extras?".to_string(),
+                        options: vec!["x".to_string(), "y".to_string(), "z".to_string()],
+                        multi_select: true,
+                    },
+                ],
+                answered: None,
+            });
         }
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -1790,17 +1787,17 @@ fn a_question_card_multi_select_first_step_sends(cx: &mut TestAppContext) {
             .insert("p".to_string(), provider);
         state.select_model("local");
         let id = state.active_id.clone().expect("a session");
-        if let Some(session) = state.store.session_mut(&id) {
-            if let Some(last) = session.messages.last_mut() {
-                last.question = Some(crate::model::QuestionBlock {
-                    questions: vec![crate::model::QuestionItem {
-                        question: "Which extras?".to_string(),
-                        options: vec!["x".to_string(), "y".to_string(), "z".to_string()],
-                        multi_select: true,
-                    }],
-                    answered: None,
-                });
-            }
+        if let Some(session) = state.store.session_mut(&id)
+            && let Some(last) = session.messages.last_mut()
+        {
+            last.question = Some(crate::model::QuestionBlock {
+                questions: vec![crate::model::QuestionItem {
+                    question: "Which extras?".to_string(),
+                    options: vec!["x".to_string(), "y".to_string(), "z".to_string()],
+                    multi_select: true,
+                }],
+                answered: None,
+            });
         }
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -15084,25 +15081,25 @@ fn the_stat_pills_take_the_measured_chrome(cx: &mut TestAppContext) {
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("stat-chrome", 2);
         let id = state.active_id.clone().expect("an active session");
-        if let Some(session) = state.store.session_mut(&id) {
-            if let Some(message) = session.messages.last_mut() {
-                message.tools.push(ToolEvent {
-                    name: "bash".to_string(),
-                    args: "{}".to_string(),
-                    output: None,
-                    ms: None,
-                    at: None,
-                });
-                message.meta = Some(MessageMeta {
-                    usage: Some(MessageUsage {
-                        prompt_tokens: 200,
-                        completion_tokens: 50,
-                        cached_tokens: 199,
-                        model: "probe".to_string(),
-                    }),
-                    ..Default::default()
-                });
-            }
+        if let Some(session) = state.store.session_mut(&id)
+            && let Some(message) = session.messages.last_mut()
+        {
+            message.tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: "{}".to_string(),
+                output: None,
+                ms: None,
+                at: None,
+            });
+            message.meta = Some(MessageMeta {
+                usage: Some(MessageUsage {
+                    prompt_tokens: 200,
+                    completion_tokens: 50,
+                    cached_tokens: 199,
+                    model: "probe".to_string(),
+                }),
+                ..Default::default()
+            });
         }
         tests_pin_reference_defaults(&mut state);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -15153,25 +15150,25 @@ fn a_notice_takes_its_own_line_under_the_stat_pills(cx: &mut TestAppContext) {
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("stat-notice-row", 2);
         let id = state.active_id.clone().expect("an active session");
-        if let Some(session) = state.store.session_mut(&id) {
-            if let Some(message) = session.messages.last_mut() {
-                message.tools.push(ToolEvent {
-                    name: "bash".to_string(),
-                    args: "{}".to_string(),
-                    output: None,
-                    ms: None,
-                    at: None,
-                });
-                message.meta = Some(MessageMeta {
-                    usage: Some(MessageUsage {
-                        prompt_tokens: 200,
-                        completion_tokens: 50,
-                        cached_tokens: 199,
-                        model: "probe".to_string(),
-                    }),
-                    ..Default::default()
-                });
-            }
+        if let Some(session) = state.store.session_mut(&id)
+            && let Some(message) = session.messages.last_mut()
+        {
+            message.tools.push(ToolEvent {
+                name: "bash".to_string(),
+                args: "{}".to_string(),
+                output: None,
+                ms: None,
+                at: None,
+            });
+            message.meta = Some(MessageMeta {
+                usage: Some(MessageUsage {
+                    prompt_tokens: 200,
+                    completion_tokens: 50,
+                    cached_tokens: 199,
+                    model: "probe".to_string(),
+                }),
+                ..Default::default()
+            });
         }
         state.notice = Some(
             "本轮操作请求没有成功的工具调用（共 0 次，失败 0 次），请先核对对话记录再采信答复。"
@@ -15240,18 +15237,18 @@ fn the_usage_pill_opens_the_measured_token_dialog(cx: &mut TestAppContext) {
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let mut state = state_with_turns("stat-dialog", 1);
         let id = state.active_id.clone().expect("an active session");
-        if let Some(session) = state.store.session_mut(&id) {
-            if let Some(message) = session.messages.last_mut() {
-                message.meta = Some(MessageMeta {
-                    usage: Some(MessageUsage {
-                        prompt_tokens: 200,
-                        completion_tokens: 50,
-                        cached_tokens: 199,
-                        model: "probe".to_string(),
-                    }),
-                    ..Default::default()
-                });
-            }
+        if let Some(session) = state.store.session_mut(&id)
+            && let Some(message) = session.messages.last_mut()
+        {
+            message.meta = Some(MessageMeta {
+                usage: Some(MessageUsage {
+                    prompt_tokens: 200,
+                    completion_tokens: 50,
+                    cached_tokens: 199,
+                    model: "probe".to_string(),
+                }),
+                ..Default::default()
+            });
         }
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -15320,18 +15317,18 @@ fn the_context_meter_opens_the_measured_breakdown_panel(cx: &mut TestAppContext)
         // priced buckets are the transcript and this figure.
         state.set_tools_schema(2_000);
         let id = state.active_id.clone().expect("an active session");
-        if let Some(session) = state.store.session_mut(&id) {
-            if let Some(message) = session.messages.last_mut() {
-                message.meta = Some(MessageMeta {
-                    usage: Some(MessageUsage {
-                        prompt_tokens: 16_384,
-                        completion_tokens: 1_350,
-                        cached_tokens: 11_000,
-                        model: "probe".to_string(),
-                    }),
-                    ..Default::default()
-                });
-            }
+        if let Some(session) = state.store.session_mut(&id)
+            && let Some(message) = session.messages.last_mut()
+        {
+            message.meta = Some(MessageMeta {
+                usage: Some(MessageUsage {
+                    prompt_tokens: 16_384,
+                    completion_tokens: 1_350,
+                    cached_tokens: 11_000,
+                    model: "probe".to_string(),
+                }),
+                ..Default::default()
+            });
         }
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -17655,13 +17652,11 @@ fn a_picked_file_becomes_a_chip_that_opens_in_the_right_pane(cx: &mut TestAppCon
     // The chip's own path is what a press opens, and the token carries it.
     let opened = cx.update(|_, cx| {
         shell.update(cx, |this, cx| {
-            let token = this
-                .composer
+            this.composer
                 .read(cx)
                 .tokens()
                 .first()
-                .map(|span| span.token().id().to_string());
-            token
+                .map(|span| span.token().id().to_string())
         })
     });
     assert_eq!(
@@ -18891,10 +18886,10 @@ fn find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
         if path.file_name().map(|file| file == name).unwrap_or(false) {
             return Some(path);
         }
-        if path.is_dir() {
-            if let Some(found) = find_file(&path, name) {
-                return Some(found);
-            }
+        if path.is_dir()
+            && let Some(found) = find_file(&path, name)
+        {
+            return Some(found);
         }
     }
     None
@@ -30325,11 +30320,11 @@ fn the_goal_strip_follows_phase_and_activation(cx: &mut TestAppContext) {
     // A blocked goal is still drawn, with resume and its reason as the tooltip.
     cx.update(|_, cx| {
         shell.update(cx, |this, _cx| {
-            if let Some(session) = this.state.store.session_mut(&id) {
-                if let Some(goal) = session.goal.as_mut() {
-                    goal.arm();
-                    assert!(goal.block("round-limit", "the cap is spent"));
-                }
+            if let Some(session) = this.state.store.session_mut(&id)
+                && let Some(goal) = session.goal.as_mut()
+            {
+                goal.arm();
+                assert!(goal.block("round-limit", "the cap is spent"));
             }
         })
     });
@@ -30358,10 +30353,10 @@ fn the_goal_strip_follows_phase_and_activation(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         shell.update(cx, |this, _cx| {
             this.state.set_goal(&id, Some("ship it"));
-            if let Some(session) = this.state.store.session_mut(&id) {
-                if let Some(goal) = session.goal.as_mut() {
-                    assert!(goal.complete());
-                }
+            if let Some(session) = this.state.store.session_mut(&id)
+                && let Some(goal) = session.goal.as_mut()
+            {
+                assert!(goal.complete());
             }
         })
     });

@@ -622,10 +622,10 @@ fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
         "other_names": names_only,
         "hint": "Call the reported tools directly by name with args matching parameters. Call find_tool with {name: \"<tool>\"} for the full schema of any name in other_names.",
     });
-    if result.to_string().len() > FIND_BUDGET + FIND_BUDGET / 2 {
-        if let Some(object) = result.as_object_mut() {
-            object.remove("other_names");
-        }
+    if result.to_string().len() > FIND_BUDGET + FIND_BUDGET / 2
+        && let Some(object) = result.as_object_mut()
+    {
+        object.remove("other_names");
     }
     result
 }

@@ -367,29 +367,28 @@ pub fn load_contributions(
                 message: "panel title must be 1..=120 characters".to_string(),
             });
         }
-        if let Some(icon) = &file.icon {
-            if validate_relative_path(icon).is_err() {
-                return Err(ExtensionError::Manifest {
-                    path,
-                    message: "panel icon must be a package-relative path".to_string(),
-                });
-            }
+        if let Some(icon) = &file.icon
+            && validate_relative_path(icon).is_err()
+        {
+            return Err(ExtensionError::Manifest {
+                path,
+                message: "panel icon must be a package-relative path".to_string(),
+            });
         }
         for (field, id) in [("theme", &file.theme), ("theme_dark", &file.theme_dark)] {
-            if let Some(id) = id {
-                if !manifest
+            if let Some(id) = id
+                && !manifest
                     .contributes
                     .themes
                     .iter()
                     .any(|theme| theme.as_str() == id)
-                {
-                    return Err(ExtensionError::Manifest {
-                        path,
-                        message: format!(
-                            "panel {field} names theme {id}, which this package does not contribute"
-                        ),
-                    });
-                }
+            {
+                return Err(ExtensionError::Manifest {
+                    path,
+                    message: format!(
+                        "panel {field} names theme {id}, which this package does not contribute"
+                    ),
+                });
             }
         }
         let refresh_ms = match file.refresh_ms {

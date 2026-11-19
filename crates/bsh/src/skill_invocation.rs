@@ -79,15 +79,16 @@ pub(crate) fn invoked_skill_names(text: &str) -> Vec<String> {
     let mut index = 0;
     while index < bytes.len() {
         let boundary = index == 0 || bytes[index - 1].is_ascii_whitespace();
-        if boundary && bytes[index] == b'/' {
-            if let Some(end) = skill_name_end(bytes, index + 1) {
-                let name = &text[index + 1..end];
-                if !names.iter().any(|seen| seen == name) {
-                    names.push(name.to_string());
-                }
-                index = end;
-                continue;
+        if boundary
+            && bytes[index] == b'/'
+            && let Some(end) = skill_name_end(bytes, index + 1)
+        {
+            let name = &text[index + 1..end];
+            if !names.iter().any(|seen| seen == name) {
+                names.push(name.to_string());
             }
+            index = end;
+            continue;
         }
         index += 1;
     }

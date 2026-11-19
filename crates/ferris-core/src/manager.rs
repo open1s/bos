@@ -535,18 +535,18 @@ impl ExtensionManager {
                         details: serde_json::Value::Null,
                     });
                 }
-                if let Some(installed) = versions.get(dependency.as_str()) {
-                    if !requirement.matches(installed) {
-                        return Err(ExtError {
-                            code: ErrorCode::Package,
-                            message: format!(
-                                "{} requires {} {requirement}, but {installed} is installed",
-                                manifest.id(),
-                                dependency
-                            ),
-                            details: serde_json::Value::Null,
-                        });
-                    }
+                if let Some(installed) = versions.get(dependency.as_str())
+                    && !requirement.matches(installed)
+                {
+                    return Err(ExtError {
+                        code: ErrorCode::Package,
+                        message: format!(
+                            "{} requires {} {requirement}, but {installed} is installed",
+                            manifest.id(),
+                            dependency
+                        ),
+                        details: serde_json::Value::Null,
+                    });
                 }
             }
         }
@@ -617,10 +617,10 @@ impl Activation {
     pub async fn unload_leases(self, host: &mut dyn LeaseHost) -> Result<(), ExtError> {
         let mut first = None;
         for lease in self.leases.into_iter().rev() {
-            if let Err(error) = lease.revoke(host).await {
-                if first.is_none() {
-                    first = Some(error);
-                }
+            if let Err(error) = lease.revoke(host).await
+                && first.is_none()
+            {
+                first = Some(error);
             }
         }
         match first {
@@ -637,16 +637,16 @@ impl Activation {
     async fn shutdown(self, host: &mut dyn LeaseHost) -> Result<(), ExtError> {
         let mut first = None;
         for lease in self.leases.into_iter().rev() {
-            if let Err(error) = lease.revoke(host).await {
-                if first.is_none() {
-                    first = Some(error);
-                }
-            }
-        }
-        if let Err(error) = self.runtime.shutdown().await {
-            if first.is_none() {
+            if let Err(error) = lease.revoke(host).await
+                && first.is_none()
+            {
                 first = Some(error);
             }
+        }
+        if let Err(error) = self.runtime.shutdown().await
+            && first.is_none()
+        {
+            first = Some(error);
         }
         match first {
             Some(error) => Err(error),
@@ -703,10 +703,10 @@ impl ActivationSet {
     pub async fn unload(mut self, host: &mut dyn LeaseHost) -> Result<(), ExtError> {
         let mut first = None;
         while let Some(activation) = self.activations.pop() {
-            if let Err(error) = activation.shutdown(host).await {
-                if first.is_none() {
-                    first = Some(error);
-                }
+            if let Err(error) = activation.shutdown(host).await
+                && first.is_none()
+            {
+                first = Some(error);
             }
         }
         match first {

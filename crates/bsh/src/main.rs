@@ -67,13 +67,13 @@ fn split_profile_flag(args: &[String]) -> (Vec<String>, Option<String>) {
 
 fn main() {
     let (args, profile) = split_profile_flag(&std::env::args().skip(1).collect::<Vec<_>>());
-    if let Some(name) = profile {
-        if !bsh::set_federation_profile(&name) {
-            eprintln!(
-                "'{name}' is not a valid federation profile name (letters, digits, '-', '_', '.')"
-            );
-            std::process::exit(2);
-        }
+    if let Some(name) = profile
+        && !bsh::set_federation_profile(&name)
+    {
+        eprintln!(
+            "'{name}' is not a valid federation profile name (letters, digits, '-', '_', '.')"
+        );
+        std::process::exit(2);
     }
     // A GUI launch from Explorer should not leave a console window behind it.
     // A CLI invocation needs that console for its own output.

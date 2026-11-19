@@ -345,10 +345,10 @@ impl Shell {
             let snapshot_for_row = std::rc::Rc::clone(&snapshot);
             let mut tools: Vec<&str> = Vec::new();
             for revision in &change.revisions {
-                if let Some(tool) = &revision.tool {
-                    if !tools.contains(&tool.name.as_str()) {
-                        tools.push(tool.name.as_str());
-                    }
+                if let Some(tool) = &revision.tool
+                    && !tools.contains(&tool.name.as_str())
+                {
+                    tools.push(tool.name.as_str());
                 }
             }
             let tool_label = tools.first().map(|tool| {

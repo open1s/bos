@@ -531,10 +531,9 @@ impl WorkspaceLifecycle {
                             .capabilities
                             .get(&done)
                             .map(|dispatch| Arc::clone(&dispatch.provider))
+                            && let Err(rollback) = provider.deactivate().await
                         {
-                            if let Err(rollback) = provider.deactivate().await {
-                                rollback_failures.push(format!("{done}: {rollback}"));
-                            }
+                            rollback_failures.push(format!("{done}: {rollback}"));
                         }
                     }
                     *self
@@ -628,10 +627,9 @@ impl WorkspaceLifecycle {
                 .capabilities
                 .get(&id)
                 .map(|dispatch| Arc::clone(&dispatch.provider))
+                && let Err(error) = provider.deactivate().await
             {
-                if let Err(error) = provider.deactivate().await {
-                    failures.push(format!("{id}: {error}"));
-                }
+                failures.push(format!("{id}: {error}"));
             }
         }
         // Resource ownership is released exactly once, after providers stop.

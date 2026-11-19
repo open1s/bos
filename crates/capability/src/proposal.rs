@@ -136,10 +136,10 @@ fn proposed_descriptor<'a>(
     catalogue: &'a Catalogue,
     peers: &'a [PeerCatalogue],
 ) -> Result<Option<&'a crate::descriptor::CapabilityDescriptor>, ProposalError> {
-    if !matches!(requirement.remote, RemotePolicy::Required(_)) {
-        if let Some(descriptor) = catalogue.get(&requirement.id) {
-            return Ok(Some(descriptor));
-        }
+    if !matches!(requirement.remote, RemotePolicy::Required(_))
+        && let Some(descriptor) = catalogue.get(&requirement.id)
+    {
+        return Ok(Some(descriptor));
     }
     let mut saw_version_match = false;
     for peer in &spec.peers {

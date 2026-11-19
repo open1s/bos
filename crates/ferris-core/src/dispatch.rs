@@ -141,12 +141,12 @@ impl EventDispatcher {
         let scope = EffectScope::new();
         let cleanup_name = name.clone();
         scope.push_sync("event.unsubscribe", move || {
-            if let Ok(mut listeners) = inner.listeners.write() {
-                if let Some(entry) = listeners.get_mut(&cleanup_name) {
-                    entry.retain(|listener| listener.id != id);
-                    if entry.is_empty() {
-                        listeners.remove(&cleanup_name);
-                    }
+            if let Ok(mut listeners) = inner.listeners.write()
+                && let Some(entry) = listeners.get_mut(&cleanup_name)
+            {
+                entry.retain(|listener| listener.id != id);
+                if entry.is_empty() {
+                    listeners.remove(&cleanup_name);
                 }
             }
         });
@@ -242,10 +242,10 @@ impl EventDispatcher {
     fn first_value(&self, name: &str, mode: DispatchMode, payload: Value) -> Option<Value> {
         for listener in self.snapshot(name, mode) {
             let chain = self.chain_for(&listener, 1);
-            if let Some(value) = (listener.handler)(payload.clone(), chain) {
-                if is_bail_value(&value) {
-                    return Some(value);
-                }
+            if let Some(value) = (listener.handler)(payload.clone(), chain)
+                && is_bail_value(&value)
+            {
+                return Some(value);
             }
         }
         None

@@ -203,10 +203,10 @@ impl KnowledgeItem {
         {
             return false;
         }
-        if let Some(retention) = self.retention_ms {
-            if self.provenance.issued_at_ms.saturating_add(retention) <= now_ms {
-                return false;
-            }
+        if let Some(retention) = self.retention_ms
+            && self.provenance.issued_at_ms.saturating_add(retention) <= now_ms
+        {
+            return false;
         }
         true
     }

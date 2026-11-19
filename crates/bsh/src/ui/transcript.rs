@@ -87,10 +87,10 @@ impl TranscriptImageCache {
             return hit.clone();
         }
         let decoded = decode_stored_image(url);
-        if self.entries.len() >= IMAGE_CACHE_LIMIT {
-            if let Some(evicted) = self.order.pop_front() {
-                self.entries.remove(&evicted);
-            }
+        if self.entries.len() >= IMAGE_CACHE_LIMIT
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.entries.remove(&evicted);
         }
         self.order.push_back(key);
         self.entries.insert(key, decoded.clone());
@@ -1225,10 +1225,10 @@ impl TranscriptLayout {
     pub(crate) fn observe(&mut self, scroll: &ScrollHandle) {
         let built = std::mem::take(&mut self.built);
         for &(row, child) in &built {
-            if let Some(bounds) = scroll.bounds_for_item(child) {
-                if let Some(height) = self.heights.get_mut(row) {
-                    *height = Some(bounds.size.height.as_f32());
-                }
+            if let Some(bounds) = scroll.bounds_for_item(child)
+                && let Some(height) = self.heights.get_mut(row)
+            {
+                *height = Some(bounds.size.height.as_f32());
             }
         }
         self.built = built;
@@ -2830,10 +2830,10 @@ impl Shell {
         // The turn's changed files, as the reference's closing card. It sits after
         // the steps because it SUMMARISES them, and it is the only place a reader
         // can hover a file and see what changed in it.
-        if let Some(files) = self.changed_files(index) {
-            if let Some(card) = self.changes_card(index, &files, cx) {
-                column = column.child(card);
-            }
+        if let Some(files) = self.changed_files(index)
+            && let Some(card) = self.changes_card(index, &files, cx)
+        {
+            column = column.child(card);
         }
 
         if let Some(error) = &message.error {
@@ -3448,11 +3448,12 @@ impl Shell {
         at: (f32, f32),
         cx: &mut Context<Self>,
     ) {
-        if let Some(current) = self.changes_hover {
-            if current.message == message && current.file == file {
-                self.changes_hover = Some(ChangesHover { message, file, at });
-                return;
-            }
+        if let Some(current) = self.changes_hover
+            && current.message == message
+            && current.file == file
+        {
+            self.changes_hover = Some(ChangesHover { message, file, at });
+            return;
         }
         self.changes_hover = Some(ChangesHover { message, file, at });
         self.changes_preview = None;

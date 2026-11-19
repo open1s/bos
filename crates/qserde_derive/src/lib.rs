@@ -25,13 +25,13 @@ impl Parse for ArchiveArgs {
         }
 
         let fork = input.fork();
-        if let Ok(_path) = fork.parse::<Path>() {
-            if fork.is_empty() {
-                return Ok(Self {
-                    crate_path: Some(input.parse()?),
-                    rkyv_path: None,
-                });
-            }
+        if let Ok(_path) = fork.parse::<Path>()
+            && fork.is_empty()
+        {
+            return Ok(Self {
+                crate_path: Some(input.parse()?),
+                rkyv_path: None,
+            });
         }
 
         let mut crate_path = None;

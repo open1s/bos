@@ -385,10 +385,10 @@ impl Drop for PendingGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.correlation);
-        if self.armed {
-            if let Some(notice) = self.cancel.take() {
-                request_cancel(notice);
-            }
+        if self.armed
+            && let Some(notice) = self.cancel.take()
+        {
+            request_cancel(notice);
         }
     }
 }
@@ -889,10 +889,10 @@ impl FederationNode {
         if let Some(subject) = subject {
             event = event.with_subject(subject);
         }
-        if let Err(error) = result {
-            if let Some(reason) = error_reason(error) {
-                event = event.with_reason(reason);
-            }
+        if let Err(error) = result
+            && let Some(reason) = error_reason(error)
+        {
+            event = event.with_reason(reason);
         }
         self.audit(event);
     }
@@ -1389,10 +1389,10 @@ impl FederationNode {
             .tasks
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(path) = &self.task_path {
-            if let Err(error) = queue.save(path) {
-                tracing::warn!("federation: task queue was not written: {error}");
-            }
+        if let Some(path) = &self.task_path
+            && let Err(error) = queue.save(path)
+        {
+            tracing::warn!("federation: task queue was not written: {error}");
         }
     }
 
@@ -1403,12 +1403,11 @@ impl FederationNode {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let due = queue.claim_due(now_ms);
-        if !due.is_empty() {
-            if let Some(path) = &self.task_path {
-                if let Err(error) = queue.save(path) {
-                    tracing::warn!("federation: task queue was not written: {error}");
-                }
-            }
+        if !due.is_empty()
+            && let Some(path) = &self.task_path
+            && let Err(error) = queue.save(path)
+        {
+            tracing::warn!("federation: task queue was not written: {error}");
         }
         due
     }
@@ -1427,10 +1426,10 @@ impl FederationNode {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         queue.settle(id, ok, result, error, now)?;
-        if let Some(path) = &self.task_path {
-            if let Err(error) = queue.save(path) {
-                tracing::warn!("federation: task queue was not written: {error}");
-            }
+        if let Some(path) = &self.task_path
+            && let Err(error) = queue.save(path)
+        {
+            tracing::warn!("federation: task queue was not written: {error}");
         }
         Ok(())
     }
@@ -2137,10 +2136,10 @@ impl FederationNode {
             },
         )
         .with_elapsed_ms(elapsed);
-        if let Err(error) = &decoded {
-            if let Some(reason) = error_reason(error) {
-                event = event.with_reason(reason);
-            }
+        if let Err(error) = &decoded
+            && let Some(reason) = error_reason(error)
+        {
+            event = event.with_reason(reason);
         }
         self.audit(correlate_context(event, context));
         decoded
@@ -2551,18 +2550,18 @@ impl FederationNode {
             }
             None => (offset, None),
         };
-        if let Some(store) = &transfers {
-            if let Ok(mut store) = store.lock() {
-                store.checkpoint(crate::resource::TransferRecord {
-                    lease: lease.as_str().to_string(),
-                    uri: uri.to_string(),
-                    peer: peer.to_string(),
-                    position: resume,
-                    updated_at_ms: now,
-                });
-                if let Some(path) = &self.transfer_path {
-                    let _ = store.save(path);
-                }
+        if let Some(store) = &transfers
+            && let Ok(mut store) = store.lock()
+        {
+            store.checkpoint(crate::resource::TransferRecord {
+                lease: lease.as_str().to_string(),
+                uri: uri.to_string(),
+                peer: peer.to_string(),
+                position: resume,
+                updated_at_ms: now,
+            });
+            if let Some(path) = &self.transfer_path {
+                let _ = store.save(path);
             }
         }
 
@@ -2899,23 +2898,23 @@ async fn serve(
     if let Some(attempt) = payload.get("attempt").and_then(Value::as_u64) {
         context.attempt = u32::try_from(attempt).unwrap_or(u32::MAX).max(1);
     }
-    if let Some(composition) = payload.get("composition") {
-        if let Some(id) = composition.get("id").and_then(Value::as_str) {
-            let version = composition
-                .get("version")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let snapshot = composition
-                .get("snapshot")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            context.composition = Some(CompositionRef::new(
-                CompositionId::new(id),
-                version,
-                snapshot,
-            ));
-        }
+    if let Some(composition) = payload.get("composition")
+        && let Some(id) = composition.get("id").and_then(Value::as_str)
+    {
+        let version = composition
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let snapshot = composition
+            .get("snapshot")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        context.composition = Some(CompositionRef::new(
+            CompositionId::new(id),
+            version,
+            snapshot,
+        ));
     }
     if let Some(key) = payload.get("idempotency_key").and_then(Value::as_str) {
         context.idempotency_key = Some(key.to_string());
@@ -3007,10 +3006,10 @@ async fn serve(
     )
     .with_elapsed_ms(elapsed);
     event = correlate_payload(event, payload);
-    if let Err(error) = &result {
-        if let Some(reason) = error_reason(error) {
-            event = event.with_reason(reason);
-        }
+    if let Err(error) = &result
+        && let Some(reason) = error_reason(error)
+    {
+        event = event.with_reason(reason);
     }
     record(audit, event);
     let payload = match result {
@@ -3137,13 +3136,13 @@ fn correlate_payload(mut event: FederationEvent, payload: &Value) -> FederationE
     } else {
         payload.get("request").unwrap_or(payload)
     };
-    if let Some(trace) = payload.get("trace") {
-        if let (Some(trace_id), Some(span_id)) = (
+    if let Some(trace) = payload.get("trace")
+        && let (Some(trace_id), Some(span_id)) = (
             trace.get("trace_id").and_then(Value::as_str),
             trace.get("span_id").and_then(Value::as_str),
-        ) {
-            event = event.with_trace(trace_id, span_id);
-        }
+        )
+    {
+        event = event.with_trace(trace_id, span_id);
     }
     if let Some(task) = payload.get("task").and_then(Value::as_str) {
         event = event.with_task(task);
@@ -3467,24 +3466,24 @@ async fn serve_rotation(
         new: record.new.clone(),
         at_ms: record.rotated_at_ms,
     });
-    if let Some(path) = peer_path {
-        if let Err(error) = rotated.save_with_gate(path, &hostkit::durable::NoFaults) {
-            let reason = format!("the rotated peer store was not durably committed: {error}");
-            drop(store);
-            record_federation_event(
-                audit,
-                envelope,
-                &record,
-                "storage_failed",
-                Some(reason.clone()),
-                started,
-            );
-            return seal_reply(
-                identity,
-                envelope,
-                error_payload(CapabilityError::Unavailable { reason }),
-            );
-        }
+    if let Some(path) = peer_path
+        && let Err(error) = rotated.save_with_gate(path, &hostkit::durable::NoFaults)
+    {
+        let reason = format!("the rotated peer store was not durably committed: {error}");
+        drop(store);
+        record_federation_event(
+            audit,
+            envelope,
+            &record,
+            "storage_failed",
+            Some(reason.clone()),
+            started,
+        );
+        return seal_reply(
+            identity,
+            envelope,
+            error_payload(CapabilityError::Unavailable { reason }),
+        );
     }
     *store = rotated;
     drop(store);
@@ -3874,10 +3873,10 @@ async fn serve_task_create_inner(
     );
     match outcome {
         Ok(task) => {
-            if let Some(path) = task_path {
-                if let Err(error) = queue.save(path) {
-                    tracing::warn!("federation: task queue was not written: {error}");
-                }
+            if let Some(path) = task_path
+                && let Err(error) = queue.save(path)
+            {
+                tracing::warn!("federation: task queue was not written: {error}");
             }
             seal_reply(identity, envelope, ok_task(&task))
         }
@@ -4020,10 +4019,10 @@ async fn serve_task_cancel_inner(
     }
     match queue.cancel(&request.id, now) {
         Ok(()) => {
-            if let Some(path) = task_path {
-                if let Err(error) = queue.save(path) {
-                    tracing::warn!("federation: task queue was not written: {error}");
-                }
+            if let Some(path) = task_path
+                && let Err(error) = queue.save(path)
+            {
+                tracing::warn!("federation: task queue was not written: {error}");
             }
             match queue.get(&request.id) {
                 Some(task) => seal_reply(identity, envelope, ok_task(task)),
@@ -4419,20 +4418,20 @@ async fn run_delegation(
     let started = Instant::now();
     // Re-check the bound before the transition: a request that expired after
     // acceptance must not start running.
-    if let Some(deadline) = deadline_ms {
-        if deadline <= unix_ms() {
-            let mut store = delegations
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _ = store.fail(
-                &id,
-                "the delegation deadline has expired".to_string(),
-                unix_ms(),
-            );
-            drop(store);
-            journal.persist(&delegations);
-            return;
-        }
+    if let Some(deadline) = deadline_ms
+        && deadline <= unix_ms()
+    {
+        let mut store = delegations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = store.fail(
+            &id,
+            "the delegation deadline has expired".to_string(),
+            unix_ms(),
+        );
+        drop(store);
+        journal.persist(&delegations);
+        return;
     }
     {
         let mut store = delegations
@@ -4501,10 +4500,10 @@ async fn run_delegation(
     )
     .with_subject(id.as_str())
     .with_elapsed_ms(started.elapsed().as_millis() as u64);
-    if let Err(error) = &result {
-        if let Some(reason) = error_reason(error) {
-            event = event.with_reason(reason);
-        }
+    if let Err(error) = &result
+        && let Some(reason) = error_reason(error)
+    {
+        event = event.with_reason(reason);
     }
     if let Err(reason) = outcome {
         event = event.with_reason(reason);
@@ -4763,14 +4762,14 @@ impl RemoteStream {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.lease);
-        if let Some(store) = &self.transfers {
-            if let Ok(mut store) = store.lock() {
-                if completed {
-                    store.remove(&self.lease, &self.uri);
-                }
-                if let Some(path) = &self.transfer_path {
-                    let _ = store.save(path);
-                }
+        if let Some(store) = &self.transfers
+            && let Ok(mut store) = store.lock()
+        {
+            if completed {
+                store.remove(&self.lease, &self.uri);
+            }
+            if let Some(path) = &self.transfer_path {
+                let _ = store.save(path);
             }
         }
     }
@@ -5069,32 +5068,32 @@ async fn route_resource(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&lease)
                 .cloned();
-            if let Some(session) = existing {
-                if session.peer != envelope.sender || session.open.load(Ordering::SeqCst) {
-                    record(
-                        audit,
-                        FederationEvent::new(
-                            Direction::Inbound,
-                            envelope.sender.as_str(),
-                            "resource",
-                            None,
-                            "rejected",
-                        )
-                        .with_stream_subject(&lease, attempt)
-                        .with_reason("a stream for this lease is already open"),
-                    );
-                    send_stream(
-                        &identity,
-                        &transport,
-                        &envelope.sender,
-                        ResourceStreamMessage::Error {
-                            lease,
-                            message: "a stream for this lease is already open".to_string(),
-                        },
+            if let Some(session) = existing
+                && (session.peer != envelope.sender || session.open.load(Ordering::SeqCst))
+            {
+                record(
+                    audit,
+                    FederationEvent::new(
+                        Direction::Inbound,
+                        envelope.sender.as_str(),
+                        "resource",
+                        None,
+                        "rejected",
                     )
-                    .await;
-                    return;
-                }
+                    .with_stream_subject(&lease, attempt)
+                    .with_reason("a stream for this lease is already open"),
+                );
+                send_stream(
+                    &identity,
+                    &transport,
+                    &envelope.sender,
+                    ResourceStreamMessage::Error {
+                        lease,
+                        message: "a stream for this lease is already open".to_string(),
+                    },
+                )
+                .await;
+                return;
             }
             let open_streams = sessions
                 .lock()
@@ -5558,12 +5557,12 @@ async fn serve_coordinator(
             match member {
                 Some(member) => match state.register(&envelope.sender, member) {
                     Ok(()) => {
-                        if let Some(path) = path {
-                            if let Err(error) = state.save(path) {
-                                tracing::warn!(
-                                    "federation: coordinator membership was not written: {error}"
-                                );
-                            }
+                        if let Some(path) = path
+                            && let Err(error) = state.save(path)
+                        {
+                            tracing::warn!(
+                                "federation: coordinator membership was not written: {error}"
+                            );
                         }
                         json!({ "ok": true, "topology": state.topology() })
                     }

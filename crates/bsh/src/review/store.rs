@@ -400,10 +400,9 @@ impl ReviewRuntime {
             before,
             after,
             Some(ToolRef::named(tool)),
-        ) {
-            if let Err(error) = self.store.save_changeset(&inner.set) {
-                log::warn!("review manifest could not be saved: {error}");
-            }
+        ) && let Err(error) = self.store.save_changeset(&inner.set)
+        {
+            log::warn!("review manifest could not be saved: {error}");
         }
     }
 

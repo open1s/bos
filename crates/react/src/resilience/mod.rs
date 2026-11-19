@@ -193,12 +193,12 @@ impl CircuitBreaker {
             }
             CircuitState::Open => {
                 let last_failure = self.lock_last_failure_time();
-                if let Some(last) = *last_failure {
-                    if now.duration_since(last) >= self.config.cooldown {
-                        *state = CircuitState::HalfOpen;
-                        log::info!("[CircuitBreaker] Cooldown elapsed, entering half-open state");
-                        return Ok(());
-                    }
+                if let Some(last) = *last_failure
+                    && now.duration_since(last) >= self.config.cooldown
+                {
+                    *state = CircuitState::HalfOpen;
+                    log::info!("[CircuitBreaker] Cooldown elapsed, entering half-open state");
+                    return Ok(());
                 }
                 Err(ResilienceError::CircuitOpen)
             }
@@ -619,10 +619,10 @@ impl ReActResilience {
 
     /// Record failure with circuit breaker.
     pub fn record_failure(&self) {
-        if let Some(breaker) = &self.circuit_breaker {
-            if breaker.record_failure() {
-                self.notify_circuit_trip();
-            }
+        if let Some(breaker) = &self.circuit_breaker
+            && breaker.record_failure()
+        {
+            self.notify_circuit_trip();
         }
     }
 

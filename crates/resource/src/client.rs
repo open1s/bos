@@ -105,10 +105,10 @@ impl ResourceClient {
     /// otherwise the default remote transport.
     fn route(&self, uri: &str) -> Option<Arc<dyn Transport>> {
         let host = uri_host(uri);
-        if !host.is_empty() {
-            if let Some(t) = self.remotes.lock().unwrap().get(host) {
-                return Some(t.clone());
-            }
+        if !host.is_empty()
+            && let Some(t) = self.remotes.lock().unwrap().get(host)
+        {
+            return Some(t.clone());
         }
         self.default_transport.clone()
     }
@@ -117,11 +117,11 @@ impl ResourceClient {
     /// local manager (if the URI is registered there) → host-specific remote →
     /// default remote → not found.
     pub async fn invoke(&self, uri: &str, action: ResourceAction) -> Result<ResourceOutput> {
-        if let Some(mgr) = &self.manager {
-            if mgr.contains(uri).await {
-                debug!("route {} -> local manager", uri);
-                return mgr.dispatch(&self.agent, uri, action).await;
-            }
+        if let Some(mgr) = &self.manager
+            && mgr.contains(uri).await
+        {
+            debug!("route {} -> local manager", uri);
+            return mgr.dispatch(&self.agent, uri, action).await;
         }
         if let Some(t) = self.route(uri) {
             debug!("route {} -> remote transport", uri);
@@ -137,11 +137,11 @@ impl ResourceClient {
         uri: &str,
         events: Vec<String>,
     ) -> Result<BoxStream<'static, ResourceEvent>> {
-        if let Some(mgr) = &self.manager {
-            if mgr.contains(uri).await {
-                debug!("subscribe {} -> local manager", uri);
-                return mgr.subscribe(&self.agent, uri, events).await;
-            }
+        if let Some(mgr) = &self.manager
+            && mgr.contains(uri).await
+        {
+            debug!("subscribe {} -> local manager", uri);
+            return mgr.subscribe(&self.agent, uri, events).await;
         }
         if let Some(t) = self.route(uri) {
             debug!("subscribe {} -> remote transport", uri);
@@ -181,10 +181,10 @@ impl ResourceClient {
 
     /// Resolve a single URI to its info (routed like [`Self::invoke`]).
     pub async fn resolve(&self, uri: &str) -> Result<Option<ResourceInfo>> {
-        if let Some(mgr) = &self.manager {
-            if let Some(i) = mgr.resolve(&self.agent, uri).await? {
-                return Ok(Some(i));
-            }
+        if let Some(mgr) = &self.manager
+            && let Some(i) = mgr.resolve(&self.agent, uri).await?
+        {
+            return Ok(Some(i));
         }
         if let Some(t) = self.route(uri) {
             return t.resolve(&self.agent, uri).await;
@@ -208,10 +208,10 @@ impl ResourceClient {
         offset: u64,
         len: Option<u64>,
     ) -> Result<crate::transport::ChunkStream> {
-        if let Some(mgr) = &self.manager {
-            if mgr.contains(uri).await {
-                return mgr.read_stream(&self.agent, uri, offset, len).await;
-            }
+        if let Some(mgr) = &self.manager
+            && mgr.contains(uri).await
+        {
+            return mgr.read_stream(&self.agent, uri, offset, len).await;
         }
         if let Some(t) = self.route(uri) {
             return t.read_stream(uri, offset, len).await;
@@ -226,10 +226,10 @@ impl ResourceClient {
         uri: &str,
         offset: u64,
     ) -> Result<Box<dyn crate::transport::ChunkWriter>> {
-        if let Some(mgr) = &self.manager {
-            if mgr.contains(uri).await {
-                return mgr.write_stream(&self.agent, uri, offset).await;
-            }
+        if let Some(mgr) = &self.manager
+            && mgr.contains(uri).await
+        {
+            return mgr.write_stream(&self.agent, uri, offset).await;
         }
         if let Some(t) = self.route(uri) {
             return t.write_stream(uri, offset).await;

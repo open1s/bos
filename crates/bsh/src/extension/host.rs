@@ -1057,10 +1057,9 @@ fn contributed_skills_dir(entry: &LoadedExtension) -> Option<PathBuf> {
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.skills_dir())
+        && holds_skills(&dir)
     {
-        if holds_skills(&dir) {
-            return Some(dir);
-        }
+        return Some(dir);
     }
     (!entry.package.manifest.contributes.skills.is_empty())
         .then(|| entry.package.root.join("skills"))
@@ -2121,13 +2120,13 @@ impl ExtensionHost {
                         }
                     }
                 }
-                if !ordered.is_empty() {
-                    if let Err(error) = write_atomic(
+                if !ordered.is_empty()
+                    && let Err(error) = write_atomic(
                         &self.store.lock_path(),
                         resolution.lock.to_toml()?.as_bytes(),
-                    ) {
-                        issues.push(format!("lockfile was not written: {error}"));
-                    }
+                    )
+                {
+                    issues.push(format!("lockfile was not written: {error}"));
                 }
             }
             Err(error) => {
@@ -2195,12 +2194,11 @@ impl ExtensionHost {
                 .loaded
                 .get(id.as_str())
                 .is_some_and(|entry| entry.applied);
-            if !still_applied {
-                if let Ok(event) =
+            if !still_applied
+                && let Ok(event) =
                     lifecycle_event(&id, topics::EXTENSION_UNLOADED, "unloaded", None)
-                {
-                    let _ = self.events.publish(&event);
-                }
+            {
+                let _ = self.events.publish(&event);
             }
         }
         // A rebuild replaces the package set, so the old entries are dropped.
@@ -2329,15 +2327,15 @@ impl ExtensionHost {
 
     /// Cancel and join the on-startup batch, bounded.
     fn stop_warm_startup(&mut self) {
-        if let Some(warm) = self.warm.take() {
-            if !warm.stop() {
-                log::warn!(
-                    target: "bsh::extension",
-                    "on-startup activation did not stop within 2s; it can no longer activate runtimes"
-                );
-                self.issues
-                    .push("on-startup activation cleanup pending".to_string());
-            }
+        if let Some(warm) = self.warm.take()
+            && !warm.stop()
+        {
+            log::warn!(
+                target: "bsh::extension",
+                "on-startup activation did not stop within 2s; it can no longer activate runtimes"
+            );
+            self.issues
+                .push("on-startup activation cleanup pending".to_string());
         }
     }
 
@@ -2469,15 +2467,15 @@ impl ExtensionHost {
 
     /// Stop the event pump, bounded; a stuck pump is reported as pending.
     fn stop_event_pump(&mut self) {
-        if let Some(pump) = self.pump.take() {
-            if !pump.stop() {
-                log::warn!(
-                    target: "bsh::extension",
-                    "event pump did not stop within 2s; a Runtime::pump is still running"
-                );
-                self.issues
-                    .push("extension event pump cleanup pending".to_string());
-            }
+        if let Some(pump) = self.pump.take()
+            && !pump.stop()
+        {
+            log::warn!(
+                target: "bsh::extension",
+                "event pump did not stop within 2s; a Runtime::pump is still running"
+            );
+            self.issues
+                .push("extension event pump cleanup pending".to_string());
         }
     }
 
@@ -2829,78 +2827,78 @@ impl ExtensionHost {
             .collect();
         let known: std::collections::BTreeSet<String> =
             statuses.iter().map(|status| status.id.clone()).collect();
-        if let Ok(manager) = self.framework_manager() {
-            if let Ok(installed) = manager.installed() {
-                // One row per id, not one per version: an extension with two
-                // installed versions is still one row, and its active version
-                // names the one the host would load.
-                let mut by_id: std::collections::BTreeMap<String, Vec<String>> =
-                    std::collections::BTreeMap::new();
-                for extension in installed {
-                    by_id
-                        .entry(extension.id)
-                        .or_default()
-                        .push(extension.version);
+        if let Ok(manager) = self.framework_manager()
+            && let Ok(installed) = manager.installed()
+        {
+            // One row per id, not one per version: an extension with two
+            // installed versions is still one row, and its active version
+            // names the one the host would load.
+            let mut by_id: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for extension in installed {
+                by_id
+                    .entry(extension.id)
+                    .or_default()
+                    .push(extension.version);
+            }
+            for (id, versions) in by_id {
+                if known.contains(&id) {
+                    continue;
                 }
-                for (id, versions) in by_id {
-                    if known.contains(&id) {
-                        continue;
-                    }
-                    let active = manager
-                        .active_version(&id)
-                        .ok()
-                        .flatten()
-                        .filter(|version| versions.iter().any(|candidate| candidate == version))
-                        .or_else(|| versions.last().cloned())
-                        .unwrap_or_default();
-                    let package_root = manager.package_root(&id, &active).ok();
-                    let manifest = package_root
-                        .as_deref()
-                        .and_then(|root| ferris_sdk::manifest_v2::load_package_manifest(root).ok());
-                    let error = package_root.as_deref().and_then(|root| {
-                        ferris_sdk::manifest_v2::load_package_manifest(root)
-                            .err()
-                            .map(|error| error.to_string())
-                    });
-                    let root = package_root
-                        .map(|root| root.display().to_string())
-                        .unwrap_or_default();
-                    statuses.push(ExtensionStatus {
-                        id: id.clone(),
-                        name: manifest
-                            .as_ref()
-                            .map(|manifest| manifest.extension.name.clone())
-                            .unwrap_or_else(|| id.clone()),
-                        version: active,
-                        versions,
-                        runtime: manifest
-                            .as_ref()
-                            .map(|manifest| manifest.runtime.kind.to_string())
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        program: None,
-                        trust: "unknown".to_string(),
-                        source: "installed".to_string(),
-                        root,
-                        hash: String::new(),
-                        state: LifecycleState::Installed,
-                        health: Health::Unknown,
-                        configured: true,
-                        applied: false,
-                        tools: Vec::new(),
-                        commands: Vec::new(),
-                        panels: Vec::new(),
-                        skills: Vec::new(),
-                        languages: Vec::new(),
-                        integrations: Vec::new(),
-                        capabilities: Vec::new(),
-                        error,
-                        startup_ms: 0,
-                        installed_at: 0,
-                        dependencies: Vec::new(),
-                        signature: "unsigned".to_string(),
-                        publisher: None,
-                    });
-                }
+                let active = manager
+                    .active_version(&id)
+                    .ok()
+                    .flatten()
+                    .filter(|version| versions.iter().any(|candidate| candidate == version))
+                    .or_else(|| versions.last().cloned())
+                    .unwrap_or_default();
+                let package_root = manager.package_root(&id, &active).ok();
+                let manifest = package_root
+                    .as_deref()
+                    .and_then(|root| ferris_sdk::manifest_v2::load_package_manifest(root).ok());
+                let error = package_root.as_deref().and_then(|root| {
+                    ferris_sdk::manifest_v2::load_package_manifest(root)
+                        .err()
+                        .map(|error| error.to_string())
+                });
+                let root = package_root
+                    .map(|root| root.display().to_string())
+                    .unwrap_or_default();
+                statuses.push(ExtensionStatus {
+                    id: id.clone(),
+                    name: manifest
+                        .as_ref()
+                        .map(|manifest| manifest.extension.name.clone())
+                        .unwrap_or_else(|| id.clone()),
+                    version: active,
+                    versions,
+                    runtime: manifest
+                        .as_ref()
+                        .map(|manifest| manifest.runtime.kind.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    program: None,
+                    trust: "unknown".to_string(),
+                    source: "installed".to_string(),
+                    root,
+                    hash: String::new(),
+                    state: LifecycleState::Installed,
+                    health: Health::Unknown,
+                    configured: true,
+                    applied: false,
+                    tools: Vec::new(),
+                    commands: Vec::new(),
+                    panels: Vec::new(),
+                    skills: Vec::new(),
+                    languages: Vec::new(),
+                    integrations: Vec::new(),
+                    capabilities: Vec::new(),
+                    error,
+                    startup_ms: 0,
+                    installed_at: 0,
+                    dependencies: Vec::new(),
+                    signature: "unsigned".to_string(),
+                    publisher: None,
+                });
             }
         }
         statuses
@@ -3911,51 +3909,50 @@ impl ExtensionHost {
         let mut tool_names: BTreeMap<String, String> = BTreeMap::new();
         for entry in self.loaded.values() {
             let id = entry.package.id().as_str();
-            if entry.package.source != ExtensionSource::Builtin {
-                if let Some(record) = registry.as_ref().and_then(|registry| {
+            if entry.package.source != ExtensionSource::Builtin
+                && let Some(record) = registry.as_ref().and_then(|registry| {
                     registry.record(id, &entry.package.manifest.extension.version.to_string())
-                }) {
-                    if !record.hash.is_empty()
-                        && !entry.package.hash.is_empty()
-                        && record.hash != entry.package.hash
-                    {
+                })
+            {
+                if !record.hash.is_empty()
+                    && !entry.package.hash.is_empty()
+                    && record.hash != entry.package.hash
+                {
+                    issues.push(DiagnosticIssue::new(
+                        "error",
+                        Some(id),
+                        "installed files no longer match the hash recorded at install time",
+                    ));
+                }
+                match &entry.package.verification {
+                    ferris_sdk::signing::SignatureVerification::Verified { publisher } => {
                         issues.push(DiagnosticIssue::new(
-                            "error",
+                            "info",
                             Some(id),
-                            "installed files no longer match the hash recorded at install time",
+                            format!("package signature verified for publisher {publisher}"),
                         ));
                     }
-                    match &entry.package.verification {
-                        ferris_sdk::signing::SignatureVerification::Verified { publisher } => {
-                            issues.push(DiagnosticIssue::new(
-                                "info",
-                                Some(id),
-                                format!("package signature verified for publisher {publisher}"),
-                            ));
-                        }
-                        ferris_sdk::signing::SignatureVerification::Untrusted {
-                            publisher,
-                            reason,
-                        } => issues.push(DiagnosticIssue::new(
+                    ferris_sdk::signing::SignatureVerification::Untrusted { publisher, reason } => {
+                        issues.push(DiagnosticIssue::new(
                             "warning",
                             Some(id),
                             format!("signature by {publisher} is untrusted: {reason}"),
-                        )),
-                        ferris_sdk::signing::SignatureVerification::Invalid { reason } => {
+                        ))
+                    }
+                    ferris_sdk::signing::SignatureVerification::Invalid { reason } => {
+                        issues.push(DiagnosticIssue::new(
+                            "error",
+                            Some(id),
+                            format!("package signature is invalid: {reason}"),
+                        ));
+                    }
+                    ferris_sdk::signing::SignatureVerification::Missing => {
+                        if entry.package.signature.is_some() {
                             issues.push(DiagnosticIssue::new(
-                                "error",
+                                "warning",
                                 Some(id),
-                                format!("package signature is invalid: {reason}"),
+                                "package ships signature metadata but has not been verified",
                             ));
-                        }
-                        ferris_sdk::signing::SignatureVerification::Missing => {
-                            if entry.package.signature.is_some() {
-                                issues.push(DiagnosticIssue::new(
-                                    "warning",
-                                    Some(id),
-                                    "package ships signature metadata but has not been verified",
-                                ));
-                            }
                         }
                     }
                 }
@@ -4031,14 +4028,13 @@ fn select_active_versions(packages: Vec<Package>, store: &ExtensionStore) -> Vec
         let active = ExtensionId::parse(id.clone())
             .ok()
             .and_then(|id| store.active_version(&id));
-        if let Some(active) = active {
-            if let Some(position) = versions
+        if let Some(active) = active
+            && let Some(position) = versions
                 .iter()
                 .position(|package| package.version() == active)
-            {
-                selected.push(versions.swap_remove(position));
-                continue;
-            }
+        {
+            selected.push(versions.swap_remove(position));
+            continue;
         }
         versions.sort_by(|left, right| {
             left.manifest
@@ -4118,10 +4114,10 @@ pub(crate) fn install_with_fibers(
                 return Vec::new();
             }
         }
-    } else if let Some(host) = guard.as_mut() {
-        if let Err(error) = host.ensure_fresh() {
-            log::warn!("extension host could not refresh: {error}");
-        }
+    } else if let Some(host) = guard.as_mut()
+        && let Err(error) = host.ensure_fresh()
+    {
+        log::warn!("extension host could not refresh: {error}");
     }
     let allowed: Option<BTreeSet<String>> =
         preset_allowed.map(|ids| ids.iter().cloned().collect::<BTreeSet<_>>());
@@ -4166,10 +4162,10 @@ pub(crate) fn publish(topic: &str, payload: serde_json::Value) {
     let Some(bus) = bus else {
         return;
     };
-    if let Ok(event) = ExtensionEvent::new("bsh", topic, payload) {
-        if let Err(error) = bus.publish(&event) {
-            log::debug!(target: "bsh::extension", "event publish failed: {error}");
-        }
+    if let Ok(event) = ExtensionEvent::new("bsh", topic, payload)
+        && let Err(error) = bus.publish(&event)
+    {
+        log::debug!(target: "bsh::extension", "event publish failed: {error}");
     }
 }
 
@@ -4262,10 +4258,10 @@ pub(crate) fn panels(
                 return Vec::new();
             }
         }
-    } else if let Some(host) = guard.as_mut() {
-        if let Err(error) = host.ensure_fresh() {
-            log::warn!("extension host could not refresh: {error}");
-        }
+    } else if let Some(host) = guard.as_mut()
+        && let Err(error) = host.ensure_fresh()
+    {
+        log::warn!("extension host could not refresh: {error}");
     }
     guard
         .as_mut()
@@ -4422,10 +4418,10 @@ pub(crate) fn themes(
                 return BTreeMap::new();
             }
         }
-    } else if let Some(host) = guard.as_mut() {
-        if let Err(error) = host.ensure_fresh() {
-            log::warn!("extension host could not refresh: {error}");
-        }
+    } else if let Some(host) = guard.as_mut()
+        && let Err(error) = host.ensure_fresh()
+    {
+        log::warn!("extension host could not refresh: {error}");
     }
     guard
         .as_ref()
@@ -4549,10 +4545,10 @@ fn with_host<R>(
                 return None;
             }
         }
-    } else if let Some(host) = guard.as_mut() {
-        if let Err(error) = host.ensure_fresh() {
-            log::warn!("extension host could not refresh: {error}");
-        }
+    } else if let Some(host) = guard.as_mut()
+        && let Err(error) = host.ensure_fresh()
+    {
+        log::warn!("extension host could not refresh: {error}");
     }
     guard.as_mut().map(f)
 }

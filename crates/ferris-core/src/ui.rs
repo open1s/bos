@@ -1045,10 +1045,10 @@ mod tests {
     #[test]
     fn a_bad_action_is_refused() {
         let mut document = document();
-        if let UiNode::Column { children } = &mut document.root {
-            if let UiNode::Button { action, .. } = &mut children[2] {
-                *action = "Refresh!".to_string();
-            }
+        if let UiNode::Column { children } = &mut document.root
+            && let UiNode::Button { action, .. } = &mut children[2]
+        {
+            *action = "Refresh!".to_string();
         }
         let report = document.validate(&id());
         assert!(!report.is_valid());

@@ -196,10 +196,10 @@ pub(crate) fn search(root: &Path, base: &Path, query: &Query) -> Result<Found, S
     }
     // The reader's own ignore file is checked before the search, so a named
     // path gets a refusal that says why instead of an empty match list.
-    if let Some(rules) = query.workspace_ignore {
-        if rules.is_ignored(root, !single) {
-            return Err(rules.refusal(root));
-        }
+    if let Some(rules) = query.workspace_ignore
+        && rules.is_ignored(root, !single)
+    {
+        return Err(rules.refusal(root));
     }
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(query.case_insensitive)

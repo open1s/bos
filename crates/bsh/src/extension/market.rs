@@ -401,10 +401,10 @@ impl GitMarket {
             });
         }
         let committed = package_hash_at_rev(&source, "HEAD")?;
-        if let Some(hash) = entry.hash.as_deref().filter(|hash| !hash.is_empty()) {
-            if committed != hash {
-                return Err(integrity_denial(&entry.id, hash, &committed));
-            }
+        if let Some(hash) = entry.hash.as_deref().filter(|hash| !hash.is_empty())
+            && committed != hash
+        {
+            return Err(integrity_denial(&entry.id, hash, &committed));
         }
         // The store installs the checkout's bytes, not the commit's blobs, so a
         // checkout that drifted from its commit is refused even when the index

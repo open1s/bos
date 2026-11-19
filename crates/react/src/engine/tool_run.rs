@@ -187,10 +187,10 @@ impl ToolRunManager {
                     .ok()
                     .and_then(|v| v.get("call_id").and_then(|s| s.as_str()).map(String::from))
                     .unwrap_or(msg);
-                if let Some(name) = run_mgr.cancel(&call_id) {
-                    if let Some(tool) = tools.get(&name) {
-                        tool.cancel(&call_id);
-                    }
+                if let Some(name) = run_mgr.cancel(&call_id)
+                    && let Some(tool) = tools.get(&name)
+                {
+                    tool.cancel(&call_id);
                 }
             }
         });

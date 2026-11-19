@@ -619,27 +619,27 @@ impl OpenAiVendor {
                 ));
             }
 
-            if let Some(rules) = context.rules() {
-                if !rules.is_empty() {
-                    let rule_texts = rules
-                        .iter()
-                        .map(|r| r.content.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    extra_system_prompt
-                        .push_str(&format!("You should follow below rules:\n{}\n", rule_texts));
-                }
+            if let Some(rules) = context.rules()
+                && !rules.is_empty()
+            {
+                let rule_texts = rules
+                    .iter()
+                    .map(|r| r.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                extra_system_prompt
+                    .push_str(&format!("You should follow below rules:\n{}\n", rule_texts));
             }
 
-            if let Some(instructions) = context.instructions() {
-                if !instructions.is_empty() {
-                    let inst_texts = instructions
-                        .iter()
-                        .map(|i| format!("- {}: {}", i.name, i.description))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    extra_system_prompt.push_str(&format!("Instructions:\n{}\n", inst_texts));
-                }
+            if let Some(instructions) = context.instructions()
+                && !instructions.is_empty()
+            {
+                let inst_texts = instructions
+                    .iter()
+                    .map(|i| format!("- {}: {}", i.name, i.description))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                extra_system_prompt.push_str(&format!("Instructions:\n{}\n", inst_texts));
             }
         }
 
@@ -1078,41 +1078,35 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                         .reasoning_content
                                         .as_deref()
                                         .or(choice.delta.reasoning.as_deref());
-                                    if let Some(content) = reasoning {
-                                        if !content.is_empty() {
-                                            let cleaned = special_reasoning.push(content);
-                                            if !cleaned.is_empty() {
-                                                first_token
-                                                    .get_or_insert_with(|| started.elapsed());
-                                                on_chunk.as_ref().inspect(|cb| cb(&cleaned));
-                                                let _ = tx
-                                                    .send(Ok(StreamToken::ReasoningContent(
-                                                        cleaned,
-                                                    )))
-                                                    .await;
-                                            }
+                                    if let Some(content) = reasoning
+                                        && !content.is_empty()
+                                    {
+                                        let cleaned = special_reasoning.push(content);
+                                        if !cleaned.is_empty() {
+                                            first_token.get_or_insert_with(|| started.elapsed());
+                                            on_chunk.as_ref().inspect(|cb| cb(&cleaned));
+                                            let _ = tx
+                                                .send(Ok(StreamToken::ReasoningContent(cleaned)))
+                                                .await;
                                         }
                                     }
-                                    if let Some(details) = &choice.delta.reasoning_details {
-                                        if !details.is_null() {
-                                            reasoning_details =
-                                                Some(match reasoning_details.take() {
-                                                    Some(mut existing)
-                                                        if existing.is_array()
-                                                            && details.is_array() =>
-                                                    {
-                                                        if let (Some(existing), Some(more)) = (
-                                                            existing.as_array_mut(),
-                                                            details.as_array(),
-                                                        ) {
-                                                            existing.extend(more.iter().cloned());
-                                                        }
-                                                        existing
-                                                    }
-                                                    _ => details.clone(),
-                                                });
-                                            reasoning_open = true;
-                                        }
+                                    if let Some(details) = &choice.delta.reasoning_details
+                                        && !details.is_null()
+                                    {
+                                        reasoning_details = Some(match reasoning_details.take() {
+                                            Some(mut existing)
+                                                if existing.is_array() && details.is_array() =>
+                                            {
+                                                if let (Some(existing), Some(more)) =
+                                                    (existing.as_array_mut(), details.as_array())
+                                                {
+                                                    existing.extend(more.iter().cloned());
+                                                }
+                                                existing
+                                            }
+                                            _ => details.clone(),
+                                        });
+                                        reasoning_open = true;
                                     }
                                     if choice
                                         .delta
@@ -1127,16 +1121,14 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                         )
                                         .await;
                                     }
-                                    if let Some(content) = &choice.delta.content {
-                                        if !content.is_empty() {
-                                            let cleaned = special.push(content);
-                                            if !cleaned.is_empty() {
-                                                first_token
-                                                    .get_or_insert_with(|| started.elapsed());
-                                                on_chunk.as_ref().inspect(|cb| cb(&cleaned));
-                                                let _ =
-                                                    tx.send(Ok(StreamToken::Text(cleaned))).await;
-                                            }
+                                    if let Some(content) = &choice.delta.content
+                                        && !content.is_empty()
+                                    {
+                                        let cleaned = special.push(content);
+                                        if !cleaned.is_empty() {
+                                            first_token.get_or_insert_with(|| started.elapsed());
+                                            on_chunk.as_ref().inspect(|cb| cb(&cleaned));
+                                            let _ = tx.send(Ok(StreamToken::Text(cleaned))).await;
                                         }
                                     }
                                     if let Some(calls) = &choice.delta.tool_calls {

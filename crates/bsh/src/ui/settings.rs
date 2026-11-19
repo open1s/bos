@@ -3862,10 +3862,10 @@ impl Shell {
         if self.state.draft().global.default_preset == id {
             self.state.draft_mut().global.default_preset.clear();
         }
-        if let Some(session) = self.state.active_id.clone() {
-            if self.state.active_session_preset().as_deref() == Some(id) {
-                self.state.select_session_preset(&session, "");
-            }
+        if let Some(session) = self.state.active_id.clone()
+            && self.state.active_session_preset().as_deref() == Some(id)
+        {
+            self.state.select_session_preset(&session, "");
         }
         self.preset_editor = None;
         self.preset_editor_error = None;
@@ -3881,12 +3881,10 @@ impl Shell {
     /// Nothing is written while the dialog is open: [`Self::set_presets_enabled`]
     /// runs on Confirm only, so Cancel leaves every preset enabled.
     pub(crate) fn request_presets_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
-        if !on {
-            if let Some(pending) = self.state.presets_off_pending() {
-                self.state.pending_preset = Some(pending);
-                cx.notify();
-                return;
-            }
+        if !on && let Some(pending) = self.state.presets_off_pending() {
+            self.state.pending_preset = Some(pending);
+            cx.notify();
+            return;
         }
         self.set_presets_enabled(on, cx);
     }
@@ -3912,10 +3910,10 @@ impl Shell {
                         );
                         // A turn that is already streaming was built with NO
                         // preset, so the restored one reaches only the next.
-                        if let Some(id) = self.state.active_id.clone() {
-                            if self.state.is_streaming(&id) {
-                                text = format!("{text} {}", tr(lang, "settings.presetsNextTurn"));
-                            }
+                        if let Some(id) = self.state.active_id.clone()
+                            && self.state.is_streaming(&id)
+                        {
+                            text = format!("{text} {}", tr(lang, "settings.presetsNextTurn"));
                         }
                         self.state.notice(text);
                     }
@@ -3940,12 +3938,10 @@ impl Shell {
     /// already released the shell - has no facts to confirm and flips at once,
     /// which is what keeps the gate about a real loss.
     pub(crate) fn request_sandbox_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
-        if !on {
-            if let Some(pending) = self.state.sandbox_off_pending() {
-                self.state.pending_preset = Some(pending);
-                cx.notify();
-                return;
-            }
+        if !on && let Some(pending) = self.state.sandbox_off_pending() {
+            self.state.pending_preset = Some(pending);
+            cx.notify();
+            return;
         }
         self.set_sandbox_enabled(on, cx);
     }
@@ -3969,10 +3965,10 @@ impl Shell {
                         "settings.sandboxOffApplied"
                     },
                 );
-                if let Some(id) = self.state.active_id.clone() {
-                    if self.state.is_streaming(&id) {
-                        text = format!("{text} {}", tr(lang, "settings.presetsNextTurn"));
-                    }
+                if let Some(id) = self.state.active_id.clone()
+                    && self.state.is_streaming(&id)
+                {
+                    text = format!("{text} {}", tr(lang, "settings.presetsNextTurn"));
                 }
                 self.state.notice(text);
             }

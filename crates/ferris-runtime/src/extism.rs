@@ -1015,10 +1015,10 @@ impl Runtime for ExtismRuntime {
                 }
             };
             let previous = self.call_state.swap(CALL_STOPPED, Ordering::SeqCst);
-            if matches!(previous, CALL_RUNNING | CALL_CANCELLED) {
-                if let Err(error) = self.interrupt_active_call() {
-                    errors.push(error.to_string());
-                }
+            if matches!(previous, CALL_RUNNING | CALL_CANCELLED)
+                && let Err(error) = self.interrupt_active_call()
+            {
+                errors.push(error.to_string());
             }
         }
         // Teardown is terminal: attempt it even when cancellation coordination

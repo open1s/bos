@@ -1014,12 +1014,11 @@ fn network_targets(command: &str) -> Vec<(String, u16)> {
             if matches!(token.as_str(), "|" | "||" | ";" | "&&" | "&") {
                 break;
             }
-            if wants_network {
-                if let Some(target) = endpoint_in(token) {
-                    if !targets.contains(&target) {
-                        targets.push(target);
-                    }
-                }
+            if wants_network
+                && let Some(target) = endpoint_in(token)
+                && !targets.contains(&target)
+            {
+                targets.push(target);
             }
             index += 1;
         }
@@ -1120,12 +1119,11 @@ fn shell_tokens(command: &str) -> Vec<String> {
                         tokens.push(std::mem::take(&mut current));
                     }
                     let mut op = String::from(ch);
-                    if ch == '>' || ch == '&' || ch == '|' {
-                        if let Some(next) = chars.peek() {
-                            if (*next == '>' && ch != '|') || (*next == '&' && ch == '&') {
-                                op.push(chars.next().unwrap_or(ch));
-                            }
-                        }
+                    if (ch == '>' || ch == '&' || ch == '|')
+                        && let Some(next) = chars.peek()
+                        && ((*next == '>' && ch != '|') || (*next == '&' && ch == '&'))
+                    {
+                        op.push(chars.next().unwrap_or(ch));
                     }
                     tokens.push(op);
                 }
@@ -1215,10 +1213,11 @@ fn write_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
             }
             continue;
         }
-        if let Some(word) = command_word {
-            if WRITE_COMMANDS.contains(&word) && !token.starts_with('-') {
-                path_args.push(token);
-            }
+        if let Some(word) = command_word
+            && WRITE_COMMANDS.contains(&word)
+            && !token.starts_with('-')
+        {
+            path_args.push(token);
         }
     }
 

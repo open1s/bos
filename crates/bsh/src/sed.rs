@@ -327,10 +327,10 @@ fn prints_filename(root: &Program) -> bool {
             if command.code == 'F' {
                 return true;
             }
-            if command.code == '{' {
-                if let CommandData::BranchTarget(Some(body)) = &command.data {
-                    pending.push(Some(Rc::clone(body)));
-                }
+            if command.code == '{'
+                && let CommandData::BranchTarget(Some(body)) = &command.data
+            {
+                pending.push(Some(Rc::clone(body)));
             }
             current = command.next.clone();
         }

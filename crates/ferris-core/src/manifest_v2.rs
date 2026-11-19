@@ -212,13 +212,13 @@ impl ManifestV2 {
         }
         let config = &self.runtime.config;
         for key in ["entry", "protocol"] {
-            if let Some(value) = config.get(key) {
-                if !value.is_str() {
-                    return Err(ExtensionError::Manifest {
-                        path,
-                        message: format!("runtime.config.{key} must be a string"),
-                    });
-                }
+            if let Some(value) = config.get(key)
+                && !value.is_str()
+            {
+                return Err(ExtensionError::Manifest {
+                    path,
+                    message: format!("runtime.config.{key} must be a string"),
+                });
             }
         }
         if let Some(args) = config.get("args") {

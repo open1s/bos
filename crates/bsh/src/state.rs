@@ -214,10 +214,11 @@ pub(crate) fn local_zone_name() -> String {
                 }
             }
         }
-        if let Ok(zone) = std::env::var("TZ") {
-            if !zone.is_empty() && !zone.starts_with(':') {
-                return zone;
-            }
+        if let Ok(zone) = std::env::var("TZ")
+            && !zone.is_empty()
+            && !zone.starts_with(':')
+        {
+            return zone;
         }
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         let stamp = now() as libc::time_t;
@@ -1438,19 +1439,18 @@ impl AppState {
             // the restore filter name the same project the transcript is running
             // in. A turn resolves the session's own workspace regardless - this
             // is what keeps the VIEW from pointing at another one.
-            if let Some(workspace) = self.store.session(id).map(|s| s.workspace.clone()) {
-                if !workspace.is_empty()
-                    && self.settings.global.general.active_workspace != workspace
-                    && self
-                        .settings
-                        .global
-                        .workspaces
-                        .iter()
-                        .any(|w| w.id == workspace)
-                {
-                    self.settings.global.general.active_workspace = workspace;
-                    self.refresh_egress_allowlist();
-                }
+            if let Some(workspace) = self.store.session(id).map(|s| s.workspace.clone())
+                && !workspace.is_empty()
+                && self.settings.global.general.active_workspace != workspace
+                && self
+                    .settings
+                    .global
+                    .workspaces
+                    .iter()
+                    .any(|w| w.id == workspace)
+            {
+                self.settings.global.general.active_workspace = workspace;
+                self.refresh_egress_allowlist();
             }
             let _ = self.settings.save_global();
         }
@@ -1489,10 +1489,10 @@ impl AppState {
 
     /// Forget one launcher row.
     pub(crate) fn remove_launcher_recent(&mut self, kind: crate::recent::RecentKind, id: &str) {
-        if self.launcher_recent.remove(kind, id) {
-            if let Some(path) = self.settings.launcher_recent_path() {
-                let _ = self.launcher_recent.save(&path);
-            }
+        if self.launcher_recent.remove(kind, id)
+            && let Some(path) = self.settings.launcher_recent_path()
+        {
+            let _ = self.launcher_recent.save(&path);
         }
     }
 
@@ -1948,29 +1948,28 @@ impl AppState {
             .into_iter()
             .find(|entry| entry.path == path)
         {
-            if entry.kind() == Some(crate::trash::Kind::Session) {
-                if let Ok(session) =
+            if entry.kind() == Some(crate::trash::Kind::Session)
+                && let Ok(session) =
                     serde_json::from_value::<crate::model::Session>(entry.envelope.payload.clone())
-                {
-                    // The log lives under the session's WORKSPACE directory, not
-                    // the store root. The old path named `root/history/<id>`, a
-                    // directory that never existed, so every purge left the
-                    // transcript and the trajectory behind on disk.
-                    let session_dir = self.store.dir_for_workspace(&session.workspace);
-                    let dir = crate::history::History::dir_for(&session_dir, &session.id);
-                    let _ = std::fs::remove_dir_all(dir);
-                }
+            {
+                // The log lives under the session's WORKSPACE directory, not
+                // the store root. The old path named `root/history/<id>`, a
+                // directory that never existed, so every purge left the
+                // transcript and the trajectory behind on disk.
+                let session_dir = self.store.dir_for_workspace(&session.workspace);
+                let dir = crate::history::History::dir_for(&session_dir, &session.id);
+                let _ = std::fs::remove_dir_all(dir);
             }
             // Removing a workspace also removes the state bsh wrote into it: its
             // `.bsh` folder carries the annotations, the terminal policy and the
             // trace index for that root. The folder itself is never touched - only
             // the one directory bsh owns inside it.
-            if entry.kind() == Some(crate::trash::Kind::Workspace) {
-                if let Ok(workspace) = serde_json::from_value::<crate::settings::global::WorkspaceRef>(
+            if entry.kind() == Some(crate::trash::Kind::Workspace)
+                && let Ok(workspace) = serde_json::from_value::<crate::settings::global::WorkspaceRef>(
                     entry.envelope.payload.clone(),
-                ) {
-                    Self::remove_workspace_state(std::path::Path::new(&workspace.root));
-                }
+                )
+            {
+                Self::remove_workspace_state(std::path::Path::new(&workspace.root));
             }
         }
         crate::trash::purge(path)
@@ -2294,15 +2293,15 @@ impl AppState {
         self.runner.stop(id);
         // A halted turn is still a turn the reader saw: say so in the log, with
         // what it had produced, so a halted request is not a dangling body.
-        if let Some(session) = self.store.session(id) {
-            if let Some(message) = session.messages.last() {
-                log::info!(
-                    "session {id}: turn halted by the reader after {} text chars, {} reasoning chars, {} tool calls",
-                    message.text.chars().count(),
-                    message.reasoning.chars().count(),
-                    message.tools.len()
-                );
-            }
+        if let Some(session) = self.store.session(id)
+            && let Some(message) = session.messages.last()
+        {
+            log::info!(
+                "session {id}: turn halted by the reader after {} text chars, {} reasoning chars, {} tool calls",
+                message.text.chars().count(),
+                message.reasoning.chars().count(),
+                message.tools.len()
+            );
         }
         self.streams.remove(id);
         // The task is aborted before it can report a withdrawal, so the rows
@@ -2782,12 +2781,11 @@ impl AppState {
     /// empty store; a store the model already wrote is left alone, so an
     /// explicit clear stays a clear.
     pub(crate) fn attach_plan(&mut self, id: &str, store: PlanStore) {
-        if store.items().is_empty() {
-            if let Some(saved) = self.store.session(id).map(|session| session.plan.clone()) {
-                if !saved.is_empty() {
-                    store.replace(saved);
-                }
-            }
+        if store.items().is_empty()
+            && let Some(saved) = self.store.session(id).map(|session| session.plan.clone())
+            && !saved.is_empty()
+        {
+            store.replace(saved);
         }
         self.plans.insert(id.to_string(), store);
     }
@@ -2962,10 +2960,10 @@ impl AppState {
             let Some(session) = self.store.session_mut(id) else {
                 return Err(GoalRefusal::Missing);
             };
-            if let Some(current) = session.goal.as_ref() {
-                if current.state != GoalState::Completed {
-                    return Err(GoalRefusal::AlreadyExists(current.state));
-                }
+            if let Some(current) = session.goal.as_ref()
+                && current.state != GoalState::Completed
+            {
+                return Err(GoalRefusal::AlreadyExists(current.state));
             }
             let replaced = session.goal.is_some();
             let Some(goal) = crate::model::Goal::new(objective, None) else {
@@ -3116,10 +3114,10 @@ impl AppState {
             let Some(goal) = session.goal.as_mut() else {
                 return false;
             };
-            if let Some(fence) = round_fence {
-                if !goal.is_current(&fence) {
-                    return false;
-                }
+            if let Some(fence) = round_fence
+                && !goal.is_current(&fence)
+            {
+                return false;
             }
             let was_armed = goal.activation.is_armed();
             goal.disarm();
@@ -3669,10 +3667,10 @@ impl AppState {
     /// Only the text changes, which is also the reference's rule: a row that
     /// carries an image is not editable in place.
     pub(crate) fn edit_queued(&mut self, id: &str, seq: u64, text: String) {
-        if let Some(queue) = self.inbox.get_mut(id) {
-            if let Some(queued) = queue.iter_mut().find(|queued| queued.seq == seq) {
-                queued.text = text;
-            }
+        if let Some(queue) = self.inbox.get_mut(id)
+            && let Some(queued) = queue.iter_mut().find(|queued| queued.seq == seq)
+        {
+            queued.text = text;
         }
     }
 
@@ -3822,10 +3820,10 @@ impl AppState {
             let Some(session) = self.store.session_mut(id) else {
                 return;
             };
-            if let Some(last) = session.messages.last_mut() {
-                if last.role == Role::Assistant {
-                    settle_ms(last, at);
-                }
+            if let Some(last) = session.messages.last_mut()
+                && last.role == Role::Assistant
+            {
+                settle_ms(last, at);
             }
             let mut user = ChatMessage::steer(steering.queued.text.clone());
             user.images = images;
@@ -3860,18 +3858,17 @@ impl AppState {
     /// The reader answered by typing: settle the newest unanswered question
     /// card with their words, the same as a clicked option settles it.
     pub(crate) fn answer_last_question(&mut self, id: &str, text: &str) -> bool {
-        if let Some(session) = self.store.session_mut(id) {
-            if let Some(message) = session.messages.iter_mut().rev().find(|message| {
+        if let Some(session) = self.store.session_mut(id)
+            && let Some(message) = session.messages.iter_mut().rev().find(|message| {
                 message
                     .question
                     .as_ref()
                     .is_some_and(|q| q.answered.is_none())
-            }) {
-                if let Some(question) = &mut message.question {
-                    question.answered = Some(text.to_string());
-                    return true;
-                }
-            }
+            })
+            && let Some(question) = &mut message.question
+        {
+            question.answered = Some(text.to_string());
+            return true;
         }
         false
     }
@@ -3899,71 +3896,67 @@ impl AppState {
         }
         // An ask_user call presents its question as buttons on the assistant
         // row: the call carries the shape, the result confirms it landed.
-        if let AgentEvent::ToolCall { name, args } = &event {
-            if name == "ask_user" {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
-                    let questions: Vec<crate::model::QuestionItem> = parsed
-                        .get("questions")
-                        .and_then(|v| v.as_array())
-                        .map(|list| {
-                            list.iter()
-                                .filter_map(|item| {
-                                    let question = item
-                                        .get("question")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default()
-                                        .trim()
-                                        .to_string();
-                                    let options: Vec<String> = item
-                                        .get("options")
-                                        .and_then(|v| v.as_array())
-                                        .map(|opts| {
-                                            opts.iter()
-                                                .filter_map(|v| v.as_str())
-                                                .map(|s| s.trim().to_string())
-                                                .filter(|s| !s.is_empty())
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    if question.is_empty() || options.len() < 2 {
-                                        return None;
-                                    }
-                                    Some(crate::model::QuestionItem {
-                                        question,
-                                        options,
-                                        multi_select: item
-                                            .get("multi_select")
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(false),
-                                    })
+        if let AgentEvent::ToolCall { name, args } = &event
+            && name == "ask_user"
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args)
+        {
+            let questions: Vec<crate::model::QuestionItem> = parsed
+                .get("questions")
+                .and_then(|v| v.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|item| {
+                            let question = item
+                                .get("question")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            let options: Vec<String> = item
+                                .get("options")
+                                .and_then(|v| v.as_array())
+                                .map(|opts| {
+                                    opts.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty())
+                                        .collect()
                                 })
-                                .collect()
+                                .unwrap_or_default();
+                            if question.is_empty() || options.len() < 2 {
+                                return None;
+                            }
+                            Some(crate::model::QuestionItem {
+                                question,
+                                options,
+                                multi_select: item
+                                    .get("multi_select")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false),
+                            })
                         })
-                        .unwrap_or_default();
-                    if !questions.is_empty() {
-                        self.pending_questions.insert(
-                            id.to_string(),
-                            crate::model::QuestionBlock {
-                                questions,
-                                answered: None,
-                            },
-                        );
-                    }
-                }
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !questions.is_empty() {
+                self.pending_questions.insert(
+                    id.to_string(),
+                    crate::model::QuestionBlock {
+                        questions,
+                        answered: None,
+                    },
+                );
             }
         }
-        if let AgentEvent::ToolResult { name, output, .. } = &event {
-            if name == "ask_user" && output.contains("presented") {
-                if let Some(block) = self.pending_questions.remove(id) {
-                    if let Some(session) = self.store.session_mut(id) {
-                        if let Some(last) = session.messages.last_mut() {
-                            if last.role == Role::Assistant {
-                                last.question = Some(block);
-                            }
-                        }
-                    }
-                }
-            }
+        if let AgentEvent::ToolResult { name, output, .. } = &event
+            && name == "ask_user"
+            && output.contains("presented")
+            && let Some(block) = self.pending_questions.remove(id)
+            && let Some(session) = self.store.session_mut(id)
+            && let Some(last) = session.messages.last_mut()
+            && last.role == Role::Assistant
+        {
+            last.question = Some(block);
         }
         // A steered message and a withdrawn one are transcript/queue events,
         // not stream deltas: they touch no message the turn is filling in, so
@@ -4064,16 +4057,15 @@ impl AppState {
                     }
                 }
                 AgentEvent::ToolResult { name, output, ms } => {
-                    if let Some(message) = session.messages.last_mut() {
-                        if let Some(tool) = message
+                    if let Some(message) = session.messages.last_mut()
+                        && let Some(tool) = message
                             .tools
                             .iter_mut()
                             .rev()
                             .find(|tool| tool.name == name && tool.output.is_none())
-                        {
-                            tool.output = Some(output);
-                            tool.ms = Some(ms);
-                        }
+                    {
+                        tool.output = Some(output);
+                        tool.ms = Some(ms);
                     }
                 }
                 AgentEvent::Usage {
@@ -4108,13 +4100,12 @@ impl AppState {
                 // nudges once, and when even that comes back blank the turn
                 // closes on silence that reads as a hung app.
                 AgentEvent::Done => {
-                    if let Some(message) = session.messages.last_mut() {
-                        if message.text.is_empty()
-                            && message.tools.is_empty()
-                            && message.error.is_none()
-                        {
-                            message.error = Some(crate::i18n::tr(self.lang, "turn.noAnswer"));
-                        }
+                    if let Some(message) = session.messages.last_mut()
+                        && message.text.is_empty()
+                        && message.tools.is_empty()
+                        && message.error.is_none()
+                    {
+                        message.error = Some(crate::i18n::tr(self.lang, "turn.noAnswer"));
                     }
                 }
             }
@@ -4256,17 +4247,16 @@ impl AppState {
             return;
         }
         let now = std::time::Instant::now();
-        if !force {
-            if let Some(last) = self.journaled_at.get(id) {
-                if now.duration_since(*last) < CHECKPOINT_EVERY {
-                    return;
-                }
-            }
+        if !force
+            && let Some(last) = self.journaled_at.get(id)
+            && now.duration_since(*last) < CHECKPOINT_EVERY
+        {
+            return;
         }
-        if let Some(session) = self.store.session(id) {
-            if let Err(error) = self.store.checkpoint(session, tail) {
-                log::warn!("session {id}: the in-flight turn could not be journaled: {error}");
-            }
+        if let Some(session) = self.store.session(id)
+            && let Err(error) = self.store.checkpoint(session, tail)
+        {
+            log::warn!("session {id}: the in-flight turn could not be journaled: {error}");
         }
         self.journaled_at.insert(id.to_string(), now);
     }
@@ -4320,15 +4310,15 @@ impl AppState {
 
     /// Record a good/bad verdict on one assistant message.
     pub(crate) fn set_feedback(&mut self, id: &str, index: usize, value: &str) {
-        if let Some(session) = self.store.session_mut(id) {
-            if let Some(message) = session.messages.get_mut(index) {
-                let meta = message.meta.get_or_insert_with(MessageMeta::default);
-                meta.feedback = if meta.feedback.as_deref() == Some(value) {
-                    None
-                } else {
-                    Some(value.to_string())
-                };
-            }
+        if let Some(session) = self.store.session_mut(id)
+            && let Some(message) = session.messages.get_mut(index)
+        {
+            let meta = message.meta.get_or_insert_with(MessageMeta::default);
+            meta.feedback = if meta.feedback.as_deref() == Some(value) {
+                None
+            } else {
+                Some(value.to_string())
+            };
         }
         self.save_session(id);
     }
@@ -5317,13 +5307,13 @@ impl AppState {
                         // imply the running turn was released.
                         let mut text =
                             crate::i18n::tr(self.lang, "settings.sandboxOffApplied").to_string();
-                        if let Some(id) = self.active_id.clone() {
-                            if self.is_streaming(&id) {
-                                text = format!(
-                                    "{text} {}",
-                                    crate::i18n::tr(self.lang, "settings.presetsNextTurn")
-                                );
-                            }
+                        if let Some(id) = self.active_id.clone()
+                            && self.is_streaming(&id)
+                        {
+                            text = format!(
+                                "{text} {}",
+                                crate::i18n::tr(self.lang, "settings.presetsNextTurn")
+                            );
                         }
                         self.notice(text);
                         false
@@ -5346,13 +5336,13 @@ impl AppState {
                         // of letting "off" imply the running turn changed.
                         let mut text =
                             crate::i18n::tr(self.lang, "settings.presetsOffApplied").to_string();
-                        if let Some(id) = self.active_id.clone() {
-                            if self.is_streaming(&id) {
-                                text = format!(
-                                    "{text} {}",
-                                    crate::i18n::tr(self.lang, "settings.presetsNextTurn")
-                                );
-                            }
+                        if let Some(id) = self.active_id.clone()
+                            && self.is_streaming(&id)
+                        {
+                            text = format!(
+                                "{text} {}",
+                                crate::i18n::tr(self.lang, "settings.presetsNextTurn")
+                            );
                         }
                         self.notice(text);
                         false
@@ -5492,10 +5482,10 @@ impl AppState {
             }
             Err(error) => {
                 self.settings.global.general.sandbox_enabled = previous;
-                if let Some(draft) = self.draft.as_mut() {
-                    if let Some(drafted) = drafted {
-                        draft.global.general.sandbox_enabled = drafted;
-                    }
+                if let Some(draft) = self.draft.as_mut()
+                    && let Some(drafted) = drafted
+                {
+                    draft.global.general.sandbox_enabled = drafted;
                 }
                 Err(error)
             }
@@ -5532,10 +5522,10 @@ impl AppState {
             }
             Err(error) => {
                 self.settings.global.general.presets_enabled = previous;
-                if let Some(draft) = self.draft.as_mut() {
-                    if let Some(drafted) = drafted {
-                        draft.global.general.presets_enabled = drafted;
-                    }
+                if let Some(draft) = self.draft.as_mut()
+                    && let Some(drafted) = drafted
+                {
+                    draft.global.general.presets_enabled = drafted;
                 }
                 Err(error)
             }
@@ -5958,11 +5948,11 @@ impl AppState {
             .disabled
             .extensions
             .retain(|disabled| disabled != id);
-        if record.managed {
-            if let Some(raw) = record.path {
-                let path = crate::caps::expand_path(&raw);
-                crate::market::remove_managed(managed_root, &path);
-            }
+        if record.managed
+            && let Some(raw) = record.path
+        {
+            let path = crate::caps::expand_path(&raw);
+            crate::market::remove_managed(managed_root, &path);
         }
         // The package's directories are gone; the cached catalogue still
         // describes them until this says otherwise.
@@ -6383,15 +6373,15 @@ fn parse_goal_request(rest: &str) -> GoalRequest {
         "edit" => return GoalRequest::InvalidEdit,
         _ => {}
     }
-    if let Some(end) = rest.find(char::is_whitespace) {
-        if rest[..end].eq_ignore_ascii_case("edit") {
-            let objective = rest[end..].trim();
-            return if objective.is_empty() {
-                GoalRequest::InvalidEdit
-            } else {
-                GoalRequest::Edit(objective.to_string())
-            };
-        }
+    if let Some(end) = rest.find(char::is_whitespace)
+        && rest[..end].eq_ignore_ascii_case("edit")
+    {
+        let objective = rest[end..].trim();
+        return if objective.is_empty() {
+            GoalRequest::InvalidEdit
+        } else {
+            GoalRequest::Edit(objective.to_string())
+        };
     }
     GoalRequest::Create(rest.to_string())
 }

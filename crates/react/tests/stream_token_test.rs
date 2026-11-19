@@ -63,10 +63,10 @@ fn nvidia_handler(response: &str, start_idx: usize) -> (usize, Option<Vec<Stream
 
             if let Ok(resp) = serde_json::from_str::<Response>(json_slice) {
                 for choice in &resp.choices {
-                    if let Some(content) = &choice.delta.content {
-                        if !content.is_empty() {
-                            all_tokens.push(StreamToken::Text(content.clone()));
-                        }
+                    if let Some(content) = &choice.delta.content
+                        && !content.is_empty()
+                    {
+                        all_tokens.push(StreamToken::Text(content.clone()));
                     }
                 }
                 new_idx = start_idx + json_end;

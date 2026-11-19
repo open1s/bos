@@ -687,12 +687,11 @@ pub fn call_scope(arguments: &Value, workspace: Option<&Path>) -> CallScope {
         // splitting disagrees with reqwest on backslashes, userinfo and IPv6,
         // so the policy could authorize a different host than the one the
         // request actually reached.
-        if let Ok(parsed) = reqwest::Url::parse(raw) {
-            if matches!(parsed.scheme(), "http" | "https") {
-                if let Some(host) = parsed.host_str() {
-                    scope.domain = Some(host.to_ascii_lowercase());
-                }
-            }
+        if let Ok(parsed) = reqwest::Url::parse(raw)
+            && matches!(parsed.scheme(), "http" | "https")
+            && let Some(host) = parsed.host_str()
+        {
+            scope.domain = Some(host.to_ascii_lowercase());
         }
     }
     if let Some(raw) = arguments.get("method").and_then(Value::as_str) {
@@ -930,17 +929,16 @@ impl PolicyEngine {
         if let Err(error) = self
             .audit
             .record(extension, capability.as_str(), &decision, trust)
+            && let Ok(mut failure) = self.audit_failure.lock()
         {
-            if let Ok(mut failure) = self.audit_failure.lock() {
-                failure.get_or_insert_with(|| error.to_string());
-            }
+            failure.get_or_insert_with(|| error.to_string());
         }
-        if self.mode == PolicyMode::Advisory {
-            if let Decision::Deny { .. } = decision {
-                return Decision::Allow {
-                    scope: GrantScope::Any,
-                };
-            }
+        if self.mode == PolicyMode::Advisory
+            && let Decision::Deny { .. } = decision
+        {
+            return Decision::Allow {
+                scope: GrantScope::Any,
+            };
         }
         decision
     }
@@ -1016,10 +1014,9 @@ impl PolicyEngine {
                     if let Err(error) =
                         self.audit
                             .record(extension, capability.as_str(), &denial, trust)
+                        && let Ok(mut failure) = self.audit_failure.lock()
                     {
-                        if let Ok(mut failure) = self.audit_failure.lock() {
-                            failure.get_or_insert_with(|| error.to_string());
-                        }
+                        failure.get_or_insert_with(|| error.to_string());
                     }
                     return Err(ExtensionError::Denied {
                         extension: extension.to_string(),

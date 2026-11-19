@@ -82,10 +82,9 @@ fn post_json(
         if let (Some(gate), Some((host, port))) = (
             egress.as_ref(),
             crate::policy::egress::host_and_port(base_url),
-        ) {
-            if let Some(denial) = gate.denial(&host, port) {
-                return gate.policy().refusal(&denial.decision);
-            }
+        ) && let Some(denial) = gate.denial(&host, port)
+        {
+            return gate.policy().refusal(&denial.decision);
         }
         format!("Request error: {error}")
     })?;

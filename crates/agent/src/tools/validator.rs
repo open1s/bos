@@ -82,70 +82,70 @@ fn validate_field(
         ));
     }
 
-    if let Some(values) = schema.get("enum").and_then(|v| v.as_array()) {
-        if !values.contains(value) {
-            return Err(ToolError::invalid_field(
-                name,
-                "must be one of the declared enum values",
-            ));
-        }
+    if let Some(values) = schema.get("enum").and_then(|v| v.as_array())
+        && !values.contains(value)
+    {
+        return Err(ToolError::invalid_field(
+            name,
+            "must be one of the declared enum values",
+        ));
     }
 
     if let Some(text) = value.as_str() {
         let length = text.chars().count();
-        if let Some(minimum) = schema.get("minLength").and_then(|v| v.as_u64()) {
-            if length < minimum as usize {
-                return Err(ToolError::invalid_field(
-                    name,
-                    format!("must contain at least {minimum} characters"),
-                ));
-            }
+        if let Some(minimum) = schema.get("minLength").and_then(|v| v.as_u64())
+            && length < minimum as usize
+        {
+            return Err(ToolError::invalid_field(
+                name,
+                format!("must contain at least {minimum} characters"),
+            ));
         }
-        if let Some(maximum) = schema.get("maxLength").and_then(|v| v.as_u64()) {
-            if length > maximum as usize {
-                return Err(ToolError::invalid_field(
-                    name,
-                    format!("must contain at most {maximum} characters"),
-                ));
-            }
+        if let Some(maximum) = schema.get("maxLength").and_then(|v| v.as_u64())
+            && length > maximum as usize
+        {
+            return Err(ToolError::invalid_field(
+                name,
+                format!("must contain at most {maximum} characters"),
+            ));
         }
     }
 
     if let Some(number) = numeric_value(value) {
-        if let Some(minimum) = schema.get("minimum").and_then(|v| v.as_f64()) {
-            if number < minimum {
-                return Err(ToolError::invalid_field(
-                    name,
-                    format!("must be at least {minimum}"),
-                ));
-            }
+        if let Some(minimum) = schema.get("minimum").and_then(|v| v.as_f64())
+            && number < minimum
+        {
+            return Err(ToolError::invalid_field(
+                name,
+                format!("must be at least {minimum}"),
+            ));
         }
-        if let Some(maximum) = schema.get("maximum").and_then(|v| v.as_f64()) {
-            if number > maximum {
-                return Err(ToolError::invalid_field(
-                    name,
-                    format!("must be at most {maximum}"),
-                ));
-            }
+        if let Some(maximum) = schema.get("maximum").and_then(|v| v.as_f64())
+            && number > maximum
+        {
+            return Err(ToolError::invalid_field(
+                name,
+                format!("must be at most {maximum}"),
+            ));
         }
     }
 
     if let Some(array) = value.as_array() {
-        if let Some(minimum) = schema.get("minItems").and_then(|v| v.as_u64()) {
-            if array.len() < minimum as usize {
-                return Err(ToolError::invalid_field(
-                    name,
-                    format!("must contain at least {minimum} items"),
-                ));
-            }
+        if let Some(minimum) = schema.get("minItems").and_then(|v| v.as_u64())
+            && array.len() < minimum as usize
+        {
+            return Err(ToolError::invalid_field(
+                name,
+                format!("must contain at least {minimum} items"),
+            ));
         }
-        if let Some(maximum) = schema.get("maxItems").and_then(|v| v.as_u64()) {
-            if array.len() > maximum as usize {
-                return Err(ToolError::invalid_field(
-                    name,
-                    format!("must contain at most {maximum} items"),
-                ));
-            }
+        if let Some(maximum) = schema.get("maxItems").and_then(|v| v.as_u64())
+            && array.len() > maximum as usize
+        {
+            return Err(ToolError::invalid_field(
+                name,
+                format!("must contain at most {maximum} items"),
+            ));
         }
         if let Some(items_schema) = schema.get("items") {
             for (i, item) in array.iter().enumerate() {

@@ -86,13 +86,12 @@ fn write_pretty_message(w: &mut dyn Write, args: &fmt::Arguments<'_>) -> std::io
             let _ = write!(buffer, "{}", args);
 
             let trimmed = buffer.trim_start();
-            if looks_like_json(trimmed) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    if let Ok(pretty) = serde_json::to_string_pretty(&value) {
-                        // flexi_logger appends the record's trailing newline.
-                        return write!(w, "📦 JSON:\n{}", pretty);
-                    }
-                }
+            if looks_like_json(trimmed)
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && let Ok(pretty) = serde_json::to_string_pretty(&value)
+            {
+                // flexi_logger appends the record's trailing newline.
+                return write!(w, "📦 JSON:\n{}", pretty);
             }
             write!(w, "{}", buffer)
         })
@@ -255,11 +254,11 @@ mod tests {
         let file = dir.join("test-basename.log");
         let mut content = String::new();
         for _ in 0..50 {
-            if let Ok(c) = std::fs::read_to_string(&file) {
-                if c.contains("DIRECT LOG TEST") {
-                    content = c;
-                    break;
-                }
+            if let Ok(c) = std::fs::read_to_string(&file)
+                && c.contains("DIRECT LOG TEST")
+            {
+                content = c;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }

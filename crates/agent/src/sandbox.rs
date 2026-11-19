@@ -1133,10 +1133,10 @@ fn write_spellings(path: &Path) -> Vec<PathBuf> {
     if let Ok(resolved) = path.canonicalize() {
         spellings.push(resolved);
     }
-    if let Some(parent) = lexical.parent() {
-        if let Ok(directory) = parent.canonicalize() {
-            spellings.push(directory.join(lexical.file_name().unwrap_or_default()));
-        }
+    if let Some(parent) = lexical.parent()
+        && let Ok(directory) = parent.canonicalize()
+    {
+        spellings.push(directory.join(lexical.file_name().unwrap_or_default()));
     }
     spellings
 }

@@ -241,11 +241,11 @@ impl QuicTransport {
 
     async fn connection(&self) -> Result<Connection> {
         let mut guard = self.conn.lock().await;
-        if let Some(c) = guard.as_ref() {
-            if c.close_reason().is_none() {
-                debug!("QUIC connection reused for {}", self.server_addr);
-                return Ok(c.clone());
-            }
+        if let Some(c) = guard.as_ref()
+            && c.close_reason().is_none()
+        {
+            debug!("QUIC connection reused for {}", self.server_addr);
+            return Ok(c.clone());
         }
         debug!(
             "QUIC establishing new connection to {} (server_name={})",
@@ -726,25 +726,21 @@ async fn handle_stream(
                 match out {
                     Ok(o) => {
                         // Stream large data bodies as raw bytes after a header frame.
-                        if let Some((kind, data)) = streaming_payload(&o) {
-                            if data.len() > STREAM_THRESHOLD {
-                                let header = ResourceOutput::Streaming {
-                                    kind,
-                                    total: Some(data.len() as u64),
-                                };
-                                write_frame(
-                                    &mut stream.0,
-                                    TAG_INVOKE_RESP,
-                                    &encode_output(&header)?,
-                                )
+                        if let Some((kind, data)) = streaming_payload(&o)
+                            && data.len() > STREAM_THRESHOLD
+                        {
+                            let header = ResourceOutput::Streaming {
+                                kind,
+                                total: Some(data.len() as u64),
+                            };
+                            write_frame(&mut stream.0, TAG_INVOKE_RESP, &encode_output(&header)?)
                                 .await?;
-                                stream
-                                    .0
-                                    .write_all(data)
-                                    .await
-                                    .map_err(|e| ResourceError::Transport(e.to_string()))?;
-                                return Ok(());
-                            }
+                            stream
+                                .0
+                                .write_all(data)
+                                .await
+                                .map_err(|e| ResourceError::Transport(e.to_string()))?;
+                            return Ok(());
                         }
                         let body = encode_output(&o)?;
                         write_frame(&mut stream.0, TAG_INVOKE_RESP, &body).await?;

@@ -306,30 +306,30 @@ fn walk_definitions(
     parent: Option<&str>,
     out: &mut BTreeMap<String, Definition>,
 ) {
-    if let Some(kind) = structural_kind(lang, node.kind()) {
-        if let Some(name) = definition_name(node, source) {
-            let key = format!("{kind}:{name}");
-            let line = node.start_position().row as u32 + 1;
-            let parent = parent.map(str::to_string);
-            out.entry(key.clone()).or_insert_with(|| {
-                let text = node
-                    .utf8_text(source)
-                    .map(|text| text.to_string())
-                    .unwrap_or_default();
-                Definition {
-                    kind,
-                    name,
-                    line,
-                    text,
-                    parent,
-                }
-            });
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                walk_definitions(child, source, lang, Some(&key), out);
+    if let Some(kind) = structural_kind(lang, node.kind())
+        && let Some(name) = definition_name(node, source)
+    {
+        let key = format!("{kind}:{name}");
+        let line = node.start_position().row as u32 + 1;
+        let parent = parent.map(str::to_string);
+        out.entry(key.clone()).or_insert_with(|| {
+            let text = node
+                .utf8_text(source)
+                .map(|text| text.to_string())
+                .unwrap_or_default();
+            Definition {
+                kind,
+                name,
+                line,
+                text,
+                parent,
             }
-            return;
+        });
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk_definitions(child, source, lang, Some(&key), out);
         }
+        return;
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -376,15 +376,15 @@ fn structural_kind(lang: Lang, kind: &str) -> Option<&'static str> {
 }
 
 fn definition_name(node: Node, source: &[u8]) -> Option<String> {
-    if let Some(name) = node.child_by_field_name("name") {
-        if let Ok(text) = name.utf8_text(source) {
-            return Some(text.to_string());
-        }
+    if let Some(name) = node.child_by_field_name("name")
+        && let Ok(text) = name.utf8_text(source)
+    {
+        return Some(text.to_string());
     }
-    if let Some(name) = node.child_by_field_name("type") {
-        if let Ok(text) = name.utf8_text(source) {
-            return Some(text.to_string());
-        }
+    if let Some(name) = node.child_by_field_name("type")
+        && let Ok(text) = name.utf8_text(source)
+    {
+        return Some(text.to_string());
     }
     None
 }

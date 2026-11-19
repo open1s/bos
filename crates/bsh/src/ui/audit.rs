@@ -309,10 +309,10 @@ impl Shell {
                 .iter()
                 .enumerate()
                 .filter(|(_, event)| {
-                    if let Some(category) = key.category {
-                        if !matches!(event.kind, FlatKind::Call(call) if call == category) {
-                            return false;
-                        }
+                    if let Some(category) = key.category
+                        && !matches!(event.kind, FlatKind::Call(call) if call == category)
+                    {
+                        return false;
                     }
                     match key.result {
                         1 if !event.ok => return false,
@@ -321,10 +321,10 @@ impl Shell {
                     }
                     if key.range == 1 {
                         let cutoff = key.minute.saturating_mul(60_000).saturating_sub(86_400_000);
-                        if let Some(at) = event.at {
-                            if at < cutoff {
-                                return false;
-                            }
+                        if let Some(at) = event.at
+                            && at < cutoff
+                        {
+                            return false;
                         }
                     }
                     if query.is_empty() {

@@ -135,10 +135,11 @@ fn read_cached(path: &Path) -> Result<String, String> {
     let len = stored.len();
     let modified = stored.modified().ok();
     let previous = cache().lock().unwrap().get(path).cloned();
-    if let Some(previous) = previous {
-        if previous.modified == modified && previous.len == len {
-            return Ok(previous.content);
-        }
+    if let Some(previous) = previous
+        && previous.modified == modified
+        && previous.len == len
+    {
+        return Ok(previous.content);
     }
     let content = if len > MAX_SOURCE_BYTES {
         Err(format!(

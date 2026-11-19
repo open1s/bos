@@ -501,13 +501,13 @@ impl ExtensionRegistry {
             .map(|registry| registry.list().into_iter().collect())
             .unwrap_or_default();
         for (owner, contribution) in self.contributions() {
-            if let Contribution::Tool(tool) = contribution {
-                if existing.contains(tool.name()) {
-                    return Err(ExtensionError::ToolConflict {
-                        name: tool.name().to_string(),
-                        extension: owner.to_string(),
-                    });
-                }
+            if let Contribution::Tool(tool) = contribution
+                && existing.contains(tool.name())
+            {
+                return Err(ExtensionError::ToolConflict {
+                    name: tool.name().to_string(),
+                    extension: owner.to_string(),
+                });
             }
         }
 

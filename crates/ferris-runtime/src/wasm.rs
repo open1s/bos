@@ -90,10 +90,10 @@ fn compiled(path: &Path) -> Result<Arc<Component>, wasmtime::Error> {
         .map(|elapsed| elapsed.as_nanos() as u64)
         .unwrap_or_default();
     let key = (path.to_path_buf(), modified, metadata.len());
-    if let Ok(cache) = components().lock() {
-        if let Some(component) = cache.get(&key) {
-            return Ok(Arc::clone(component));
-        }
+    if let Ok(cache) = components().lock()
+        && let Some(component) = cache.get(&key)
+    {
+        return Ok(Arc::clone(component));
     }
     let component = Arc::new(Component::from_file(engine(), path)?);
     if let Ok(mut cache) = components().lock() {
@@ -101,10 +101,10 @@ fn compiled(path: &Path) -> Result<Arc<Component>, wasmtime::Error> {
         // many versions should not hold every compiled body forever. Evict one
         // entry rather than clearing, so a busy suite does not drop every
         // warm component at once.
-        if cache.len() >= 32 {
-            if let Some(oldest) = cache.keys().next().cloned() {
-                cache.remove(&oldest);
-            }
+        if cache.len() >= 32
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
         }
         cache.insert(key, Arc::clone(&component));
     }
@@ -1457,14 +1457,13 @@ impl Runtime for WasmRuntime {
                 message: "wasm instance lock is poisoned".to_string(),
             })?;
             let mut hook_error = None;
-            if let Some(instance) = guard.as_mut() {
-                if let Err(error) = instance
+            if let Some(instance) = guard.as_mut()
+                && let Err(error) = instance
                     .bindings
                     .bsh_extension_extension()
                     .call_shutdown(&mut instance.store)
-                {
-                    hook_error = Some(error.to_string());
-                }
+            {
+                hook_error = Some(error.to_string());
             }
             *guard = None;
             match hook_error {

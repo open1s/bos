@@ -33,12 +33,12 @@ impl SkillCache {
         instructions: String,
         skill_dir: String,
     ) -> Arc<CachedSkill> {
-        if let Some(entry) = self.cache.get(skill_name) {
-            if entry.loaded_at.elapsed() < self.ttl {
-                // Cloning the Arc keeps a multi-kilobyte instruction body from
-                // being copied on every skill lookup.
-                return Arc::clone(entry.value());
-            }
+        if let Some(entry) = self.cache.get(skill_name)
+            && entry.loaded_at.elapsed() < self.ttl
+        {
+            // Cloning the Arc keeps a multi-kilobyte instruction body from
+            // being copied on every skill lookup.
+            return Arc::clone(entry.value());
         }
         let skill = Arc::new(CachedSkill {
             instructions,

@@ -90,18 +90,18 @@ impl ToolResult {
 
     /// Wrap a runtime's JSON value, recognizing MCP-shaped content.
     pub fn from_value(value: Value) -> Self {
-        if let Value::Object(object) = &value {
-            if let Some(items) = object.get("content").and_then(Value::as_array) {
-                let content = items.iter().map(content_from_value).collect();
-                return Self {
-                    content,
-                    structured: object.get("structuredContent").cloned(),
-                    is_error: object
-                        .get("isError")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                };
-            }
+        if let Value::Object(object) = &value
+            && let Some(items) = object.get("content").and_then(Value::as_array)
+        {
+            let content = items.iter().map(content_from_value).collect();
+            return Self {
+                content,
+                structured: object.get("structuredContent").cloned(),
+                is_error: object
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
         }
         if let Value::String(text) = &value {
             return Self::text(text.clone());

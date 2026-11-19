@@ -99,12 +99,12 @@ fn build_router(config: &serde_json::Value) -> LlmRouter<DummySession, DummyCont
         router.register_vendor("nvidia".into(), Box::new(v));
     }
 
-    if let Some(cfg) = VendorConfig::from_openai(config) {
-        if !cfg.model.contains('/') {
-            println!("Registering openai: {} @ {}", cfg.model, cfg.base_url);
-            let v = OpenAiClient::new(cfg.base_url.clone(), cfg.model.clone(), cfg.api_key.clone());
-            router.register_vendor("openai".into(), Box::new(v));
-        }
+    if let Some(cfg) = VendorConfig::from_openai(config)
+        && !cfg.model.contains('/')
+    {
+        println!("Registering openai: {} @ {}", cfg.model, cfg.base_url);
+        let v = OpenAiClient::new(cfg.base_url.clone(), cfg.model.clone(), cfg.api_key.clone());
+        router.register_vendor("openai".into(), Box::new(v));
     }
 
     if let Some(cfg) = VendorConfig::from_openrouter(config) {

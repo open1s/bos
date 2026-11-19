@@ -165,12 +165,11 @@ pub(crate) fn preview_markdown(event: &Event) -> String {
     {
         return format!("\u{60}\u{60}\u{60}diff\n{text}\n\u{60}\u{60}\u{60}");
     }
-    if matches!(event.kind, Kind::Tool) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Ok(pretty) = serde_json::to_string_pretty(&value) {
-                return format!("\u{60}\u{60}\u{60}json\n{pretty}\n\u{60}\u{60}\u{60}");
-            }
-        }
+    if matches!(event.kind, Kind::Tool)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Ok(pretty) = serde_json::to_string_pretty(&value)
+    {
+        return format!("\u{60}\u{60}\u{60}json\n{pretty}\n\u{60}\u{60}\u{60}");
     }
     text
 }
@@ -792,30 +791,30 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
         let turn_now = turn.max(1);
         // `compacted` is a GLOBAL transcript index; the trajectory walks the
         // loaded window, so compare through `loaded_from`.
-        if session.loaded_from + index == session.compacted {
-            if let Some(record) = markers.next() {
-                out.push(Event {
-                    kind: Kind::Compaction,
-                    turn: turn_now,
-                    title: crate::i18n::tr_args(
-                        lang,
-                        "msg.compaction.completed",
-                        &[
-                            ("items", record.items.to_string()),
-                            ("tokens", record.tokens.to_string()),
-                        ],
-                    ),
-                    outcome: String::new(),
-                    raw: record.summary.clone(),
-                    source: "Compaction".to_string(),
-                    ms: None,
-                    live: false,
-                    message: usize::MAX,
-                    tool: usize::MAX,
-                    at: None,
-                    target: String::new(),
-                });
-            }
+        if session.loaded_from + index == session.compacted
+            && let Some(record) = markers.next()
+        {
+            out.push(Event {
+                kind: Kind::Compaction,
+                turn: turn_now,
+                title: crate::i18n::tr_args(
+                    lang,
+                    "msg.compaction.completed",
+                    &[
+                        ("items", record.items.to_string()),
+                        ("tokens", record.tokens.to_string()),
+                    ],
+                ),
+                outcome: String::new(),
+                raw: record.summary.clone(),
+                source: "Compaction".to_string(),
+                ms: None,
+                live: false,
+                message: usize::MAX,
+                tool: usize::MAX,
+                at: None,
+                target: String::new(),
+            });
         }
         // Only the LAST message of a streaming turn can own a live row, and
         // inside it only the row still producing data: a call with no result
@@ -1154,16 +1153,16 @@ impl Shell {
         // wants; a path genuinely outside the root keeps its refusal, which is
         // the confinement policy rather than a bug.
         let mut rel = std::path::PathBuf::from(path.trim_matches(['"', '\'', '`']));
-        if rel.is_absolute() {
-            if let Some(root) = self.state.workspace_root() {
-                match rel.strip_prefix(&root) {
-                    Ok(inside) => rel = inside.to_path_buf(),
-                    Err(_) => {
-                        self.show_right_tab(crate::ui::right_panel::RightTab::Files, cx);
-                        self.files.error = Some(self.state.lang.tr("right.files.outside"));
-                        cx.notify();
-                        return;
-                    }
+        if rel.is_absolute()
+            && let Some(root) = self.state.workspace_root()
+        {
+            match rel.strip_prefix(&root) {
+                Ok(inside) => rel = inside.to_path_buf(),
+                Err(_) => {
+                    self.show_right_tab(crate::ui::right_panel::RightTab::Files, cx);
+                    self.files.error = Some(self.state.lang.tr("right.files.outside"));
+                    cx.notify();
+                    return;
                 }
             }
         }

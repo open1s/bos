@@ -842,10 +842,10 @@ impl Agent {
             self.config.model.hash(&mut hasher);
             hasher.finish()
         };
-        if let Ok(cache) = intent_cache().lock() {
-            if let Some(hit) = cache.get(&key) {
-                return Some(*hit);
-            }
+        if let Ok(cache) = intent_cache().lock()
+            && let Some(hit) = cache.get(&key)
+        {
+            return Some(*hit);
         }
         let bounded: String = text.chars().take(2_000).collect();
         let input = Content::text(format!("User message:\n{bounded}"));
@@ -896,15 +896,15 @@ impl Agent {
                 _ => return None,
             }
         };
-        if let Some(usage) = response.usage() {
-            if let Ok(mut slot) = self.auxiliary_usage.lock() {
-                slot.prompt_tokens = slot.prompt_tokens.saturating_add(usage.prompt_tokens);
-                slot.completion_tokens = slot
-                    .completion_tokens
-                    .saturating_add(usage.completion_tokens);
-                slot.total_tokens = slot.total_tokens.saturating_add(usage.total_tokens);
-                slot.cached_tokens = slot.cached_tokens.saturating_add(usage.cached_tokens);
-            }
+        if let Some(usage) = response.usage()
+            && let Ok(mut slot) = self.auxiliary_usage.lock()
+        {
+            slot.prompt_tokens = slot.prompt_tokens.saturating_add(usage.prompt_tokens);
+            slot.completion_tokens = slot
+                .completion_tokens
+                .saturating_add(usage.completion_tokens);
+            slot.total_tokens = slot.total_tokens.saturating_add(usage.total_tokens);
+            slot.cached_tokens = slot.cached_tokens.saturating_add(usage.cached_tokens);
         }
         let answer = response.text()?.to_lowercase();
         let intent = if answer.contains("conversation") {

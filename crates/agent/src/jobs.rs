@@ -405,10 +405,10 @@ impl JobRegistry {
         // is released, so the bound can never orphan a child.
         let mut displaced: Vec<u32> = Vec::new();
         while state.jobs.len() > self.job_cap {
-            if let Some(job) = state.jobs.pop_front() {
-                if job.status.is_running() {
-                    displaced.extend(job.pid);
-                }
+            if let Some(job) = state.jobs.pop_front()
+                && job.status.is_running()
+            {
+                displaced.extend(job.pid);
             }
         }
         drop(state);
@@ -435,11 +435,11 @@ impl JobRegistry {
     /// capture change afterwards.
     pub fn append_output(&self, id: &str, bytes: &[u8]) {
         let mut state = self.lock();
-        if let Some(job) = state.jobs.iter_mut().find(|job| job.id == id) {
-            if job.status.is_running() {
-                job.output.push(bytes);
-                state.version += 1;
-            }
+        if let Some(job) = state.jobs.iter_mut().find(|job| job.id == id)
+            && job.status.is_running()
+        {
+            job.output.push(bytes);
+            state.version += 1;
         }
     }
 

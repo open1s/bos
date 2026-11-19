@@ -283,14 +283,14 @@ impl Shell {
                 // permission (the sandbox spec and the tool set are baked at
                 // spawn). Say so where the chip was pressed, instead of
                 // letting the new label imply the running turn changed.
-                if let Some(id) = self.state.active_id.clone() {
-                    if self.state.is_streaming(&id) {
-                        let next = crate::i18n::tr(lang, "permission.nextTurn").to_string();
-                        message = Some(match message {
-                            Some(existing) => format!("{existing} {next}"),
-                            None => next,
-                        });
-                    }
+                if let Some(id) = self.state.active_id.clone()
+                    && self.state.is_streaming(&id)
+                {
+                    let next = crate::i18n::tr(lang, "permission.nextTurn").to_string();
+                    message = Some(match message {
+                        Some(existing) => format!("{existing} {next}"),
+                        None => next,
+                    });
                 }
                 if let Some(message) = message {
                     self.state.notice(message);

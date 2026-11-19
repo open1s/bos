@@ -897,10 +897,8 @@ impl Client {
         remove_file(&self.ready_file);
         // Crash-recovery metadata is removed only once the owned tree is gone
         // (issue #327); otherwise it stays for a later recovery pass.
-        if tree_confirmed {
-            if let Some(pidfile) = &self.pidfile {
-                let _ = std::fs::remove_file(pidfile);
-            }
+        if tree_confirmed && let Some(pidfile) = &self.pidfile {
+            let _ = std::fs::remove_file(pidfile);
         }
         let _ = std::fs::remove_dir_all(&self.storage_dir);
     }
@@ -1034,10 +1032,10 @@ fn handle_event(
             let Some(target) = params.get("targetId").and_then(Value::as_str) else {
                 return;
             };
-            if let Ok(mut slot) = shared.popup.lock() {
-                if slot.as_ref().is_some_and(|(id, _)| id == target) {
-                    slot.take();
-                }
+            if let Ok(mut slot) = shared.popup.lock()
+                && slot.as_ref().is_some_and(|(id, _)| id == target)
+            {
+                slot.take();
             }
         }
         "Page.loadEventFired" => {
@@ -1140,10 +1138,10 @@ fn http_get(port: u16, path: &str) -> Result<Value, String> {
         if line == "\r\n" || line == "\n" {
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse::<usize>().ok();
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse::<usize>().ok();
         }
     }
     let length = content_length
@@ -1402,15 +1400,14 @@ fn wait_for_port(
 ) -> Result<u16, EngineError> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Ok(text) = std::fs::read_to_string(ready_file) {
-            if let Some(port) = text
+        if let Ok(text) = std::fs::read_to_string(ready_file)
+            && let Some(port) = text
                 .lines()
                 .next()
                 .and_then(|line| line.parse::<u16>().ok())
                 .filter(|port| *port > 0)
-            {
-                return Ok(port);
-            }
+        {
+            return Ok(port);
         }
         if let Ok(Some(status)) = child.try_wait() {
             return Err(EngineError::Startup {

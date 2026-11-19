@@ -3578,28 +3578,26 @@ impl Shell {
     ) {
         if let Some(id) = self.state.active_id.clone() {
             self.question_progress.remove(&(id.clone(), index));
-            if let Some(session) = self.state.store.session_mut(&id) {
-                if let Some(message) = session.messages.get_mut(index) {
-                    if let Some(question) = &mut message.question {
-                        question.answered = Some(option.clone());
-                    }
-                }
+            if let Some(session) = self.state.store.session_mut(&id)
+                && let Some(message) = session.messages.get_mut(index)
+                && let Some(question) = &mut message.question
+            {
+                question.answered = Some(option.clone());
             }
         }
         // An answer to a question the running turn asked is input for that
         // turn, not a new reader message waiting behind it. Steer it into the
         // live step so the model receives it at once; only an idle session (or
         // a turn that cannot accept a steer) falls back to an ordinary send.
-        if let Some(id) = self.state.active_id.clone() {
-            if self.state.is_streaming(&id)
-                && self.state.steers(&id).is_some()
-                && !self.state.steer_blocked(&id)
-            {
-                let seq = self.state.enqueue(&id, option, Vec::new());
-                self.steer_now(&id, seq, cx);
-                cx.notify();
-                return;
-            }
+        if let Some(id) = self.state.active_id.clone()
+            && self.state.is_streaming(&id)
+            && self.state.steers(&id).is_some()
+            && !self.state.steer_blocked(&id)
+        {
+            let seq = self.state.enqueue(&id, option, Vec::new());
+            self.steer_now(&id, seq, cx);
+            cx.notify();
+            return;
         }
         self.composer
             .update(cx, |input, cx| input.set_value(option, window, cx));
@@ -4746,10 +4744,8 @@ impl Shell {
                 }
             }
         }
-        if changed {
-            if let Err(error) = self.state.settings.save_global() {
-                log::warn!("automation task changes could not be saved: {error}");
-            }
+        if changed && let Err(error) = self.state.settings.save_global() {
+            log::warn!("automation task changes could not be saved: {error}");
         }
         cx.notify();
     }
@@ -5492,15 +5488,15 @@ impl Shell {
             .collect();
         for session in expired {
             self.peer_task_deadlines.remove(&session);
-            if let Some(task) = self.peer_task_runs.remove(&session) {
-                if let Some(runtime) = crate::federation_node::running() {
-                    let _ = runtime.node().settle_task(
-                        &task,
-                        false,
-                        None,
-                        Some("the remote-work deadline was exceeded".to_string()),
-                    );
-                }
+            if let Some(task) = self.peer_task_runs.remove(&session)
+                && let Some(runtime) = crate::federation_node::running()
+            {
+                let _ = runtime.node().settle_task(
+                    &task,
+                    false,
+                    None,
+                    Some("the remote-work deadline was exceeded".to_string()),
+                );
             }
             self.state.stop(&session);
         }
@@ -5597,10 +5593,10 @@ impl Shell {
                     .observe(&run)
                     .or_else(|| self.state.subagents.run(&run).map(|run| run.snapshot()))
                     .or_else(|| crate::federation_tools::delegation_snapshot(&run));
-                if let Some(snapshot) = snapshot {
-                    if snapshot.state.is_settled() {
-                        settled.push((root.clone(), task.clone(), snapshot));
-                    }
+                if let Some(snapshot) = snapshot
+                    && snapshot.state.is_settled()
+                {
+                    settled.push((root.clone(), task.clone(), snapshot));
                 }
             }
             if settled.is_empty() {
@@ -5774,10 +5770,10 @@ impl Shell {
                             return None;
                         }
                         let painted = this.painted_elapsed_seconds();
-                        if let Some(seconds) = painted {
-                            if this.elapsed_painted != Some(seconds) {
-                                this.frame_notify("elapsed-clock", cx);
-                            }
+                        if let Some(seconds) = painted
+                            && this.elapsed_painted != Some(seconds)
+                        {
+                            this.frame_notify("elapsed-clock", cx);
                         }
                         Some(match painted {
                             Some(_) => {
@@ -6689,18 +6685,16 @@ impl Shell {
                         .jobs_output_cache
                         .get(&id)
                         .is_none_or(|(held, gone, _, _)| *held != bytes || *gone != dropped);
-                    if stale {
-                        if let Some(output) = self.state.jobs.output_for(&id) {
-                            self.jobs_output_cache.insert(
-                                id,
-                                (
-                                    output.bytes,
-                                    output.dropped,
-                                    output.text,
-                                    output.dropped > 0,
-                                ),
-                            );
-                        }
+                    if stale && let Some(output) = self.state.jobs.output_for(&id) {
+                        self.jobs_output_cache.insert(
+                            id,
+                            (
+                                output.bytes,
+                                output.dropped,
+                                output.text,
+                                output.dropped > 0,
+                            ),
+                        );
                     }
                 }
                 None => {
@@ -6984,12 +6978,11 @@ impl Shell {
                                     (record.state, record.result.clone(), record.error.clone())
                                 })
                             });
-                            if let Some((state, result, error)) = found {
-                                if let Some((run_state, result, error)) =
+                            if let Some((state, result, error)) = found
+                                && let Some((run_state, result, error)) =
                                     Self::delegation_outcome(state, result, error)
-                                {
-                                    finished.push((run, run_state, result, error));
-                                }
+                            {
+                                finished.push((run, run_state, result, error));
                             }
                         }
                     }
@@ -7509,11 +7502,10 @@ impl Shell {
             return;
         }
         self.rail_active = active;
-        if self.rail_hover.is_none() {
-            if let Some(index) = active.and_then(|turn| turns.iter().position(|item| *item == turn))
-            {
-                self.rail_scroll_to(index);
-            }
+        if self.rail_hover.is_none()
+            && let Some(index) = active.and_then(|turn| turns.iter().position(|item| *item == turn))
+        {
+            self.rail_scroll_to(index);
         }
     }
 
@@ -8027,11 +8019,11 @@ impl Render for Shell {
                 // press is down, the up went somewhere this window never heard
                 // about, so end the gesture now rather than leaving the page
                 // stuck in a drag.
-                if event.pressed_button.is_none() {
-                    if let Some(button) = this.browser_pressed {
-                        this.browser_release_outside(event.position, button);
-                        cx.notify();
-                    }
+                if event.pressed_button.is_none()
+                    && let Some(button) = this.browser_pressed
+                {
+                    this.browser_release_outside(event.position, button);
+                    cx.notify();
                 }
                 // A drag that started in the browser page keeps reaching the
                 // page after it leaves the pane: the frame's own handler stops

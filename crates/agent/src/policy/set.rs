@@ -826,15 +826,15 @@ impl PolicySet {
             // name: a user module must never be able to shadow the floor the
             // binary ships, because the pane, the audit and the reader all read
             // a built-in id as trusted.
-            if module.origin != PolicyOrigin::Builtin {
-                if let Some(builtin) = builtin_id_claimed(&module.id) {
-                    set.failure = Some(PolicyError::BuiltinIdClaimed {
-                        origin: module.origin.as_str(),
-                        claimed: module.id.clone(),
-                        builtin,
-                    });
-                    return set;
-                }
+            if module.origin != PolicyOrigin::Builtin
+                && let Some(builtin) = builtin_id_claimed(&module.id)
+            {
+                set.failure = Some(PolicyError::BuiltinIdClaimed {
+                    origin: module.origin.as_str(),
+                    claimed: module.id.clone(),
+                    builtin,
+                });
+                return set;
             }
             if let Some(previous) = modules.iter().find(|other| other.id == module.id) {
                 set.failure = Some(PolicyError::DuplicateId {

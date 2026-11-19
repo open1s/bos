@@ -186,15 +186,13 @@ impl Explorer {
         debug!("peek {} bytes={}", uri, len);
         let scheme = uri.split("://").next().unwrap_or("");
         // Cheap lifecycle: only bother opening when it's actually required.
-        if scheme == "file" {
-            if let Ok(ResourceOutput::Status { state }) =
+        if scheme == "file"
+            && let Ok(ResourceOutput::Status { state }) =
                 self.client.invoke(uri, ResourceAction::Status).await
-            {
-                if state != crate::meta::ResourceStateLabel::Open {
-                    debug!("peek: opening file {}", uri);
-                    self.client.invoke(uri, ResourceAction::Open).await?;
-                }
-            }
+            && state != crate::meta::ResourceStateLabel::Open
+        {
+            debug!("peek: opening file {}", uri);
+            self.client.invoke(uri, ResourceAction::Open).await?;
         }
         let out = match scheme {
             "file" => {

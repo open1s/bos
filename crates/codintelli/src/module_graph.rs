@@ -407,24 +407,24 @@ pub fn build_rust_module_graph(
                     }
                 };
                 let mut unique_target = None;
-                if candidate.status == RustModuleResolutionStatus::UniqueCandidate {
-                    if let Some(target) = candidate.existing_candidates.first() {
-                        if let Some(target_parse) = by_path.get(target) {
-                            if target_parse.language == LanguageId::Rust
-                                && target_parse.status != ParseStatus::Failed
-                            {
-                                if child_path.len() > limits.max_depth {
-                                    edge_status = RustModuleEdgeStatus::DepthLimit;
-                                } else {
-                                    edge_status = RustModuleEdgeStatus::UniqueCandidateParsed;
-                                    unique_target = Some(target.clone());
-                                }
-                            } else if graph.status == RustModuleGraphStatus::Complete {
-                                graph.status = RustModuleGraphStatus::Partial;
+                if candidate.status == RustModuleResolutionStatus::UniqueCandidate
+                    && let Some(target) = candidate.existing_candidates.first()
+                {
+                    if let Some(target_parse) = by_path.get(target) {
+                        if target_parse.language == LanguageId::Rust
+                            && target_parse.status != ParseStatus::Failed
+                        {
+                            if child_path.len() > limits.max_depth {
+                                edge_status = RustModuleEdgeStatus::DepthLimit;
+                            } else {
+                                edge_status = RustModuleEdgeStatus::UniqueCandidateParsed;
+                                unique_target = Some(target.clone());
                             }
                         } else if graph.status == RustModuleGraphStatus::Complete {
                             graph.status = RustModuleGraphStatus::Partial;
                         }
+                    } else if graph.status == RustModuleGraphStatus::Complete {
+                        graph.status = RustModuleGraphStatus::Partial;
                     }
                 }
 

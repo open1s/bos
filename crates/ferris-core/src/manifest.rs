@@ -500,23 +500,23 @@ impl Manifest {
                 ),
             );
         }
-        if let Some(ui) = &self.compatibility.ui_api {
-            if !ui.matches(&api) {
-                report.warn(
-                    "compatibility.ui_api",
-                    format!("declares UI API {ui}; this host validates UI documents at {api}"),
-                );
-            }
+        if let Some(ui) = &self.compatibility.ui_api
+            && !ui.matches(&api)
+        {
+            report.warn(
+                "compatibility.ui_api",
+                format!("declares UI API {ui}; this host validates UI documents at {api}"),
+            );
         }
     }
 
     fn validate_runtime(&self, report: &mut ValidationReport) {
         match self.runtime.kind {
             RuntimeKind::Builtin => {
-                if let Some(entry) = &self.runtime.entry {
-                    if let Err(reason) = validate_builtin_entry(entry) {
-                        report.error("runtime.entry", reason);
-                    }
+                if let Some(entry) = &self.runtime.entry
+                    && let Err(reason) = validate_builtin_entry(entry)
+                {
+                    report.error("runtime.entry", reason);
                 }
             }
             RuntimeKind::Declarative => {
@@ -825,45 +825,45 @@ impl Manifest {
 
     fn validate_resources(&self, report: &mut ValidationReport) {
         let resources = &self.resources;
-        if let Some(value) = resources.max_memory_mb {
-            if value == 0 || value > HARD_MAX_MEMORY_MB {
-                report.error(
-                    "resources.max_memory_mb",
-                    format!("must be 1..={HARD_MAX_MEMORY_MB}"),
-                );
-            }
+        if let Some(value) = resources.max_memory_mb
+            && (value == 0 || value > HARD_MAX_MEMORY_MB)
+        {
+            report.error(
+                "resources.max_memory_mb",
+                format!("must be 1..={HARD_MAX_MEMORY_MB}"),
+            );
         }
-        if let Some(value) = resources.max_execution_ms {
-            if value == 0 || value > HARD_MAX_EXECUTION_MS {
-                report.error(
-                    "resources.max_execution_ms",
-                    format!("must be 1..={HARD_MAX_EXECUTION_MS}"),
-                );
-            }
+        if let Some(value) = resources.max_execution_ms
+            && (value == 0 || value > HARD_MAX_EXECUTION_MS)
+        {
+            report.error(
+                "resources.max_execution_ms",
+                format!("must be 1..={HARD_MAX_EXECUTION_MS}"),
+            );
         }
-        if let Some(value) = resources.max_concurrent_calls {
-            if value == 0 || value > HARD_MAX_CONCURRENT_CALLS {
-                report.error(
-                    "resources.max_concurrent_calls",
-                    format!("must be 1..={HARD_MAX_CONCURRENT_CALLS}"),
-                );
-            }
+        if let Some(value) = resources.max_concurrent_calls
+            && (value == 0 || value > HARD_MAX_CONCURRENT_CALLS)
+        {
+            report.error(
+                "resources.max_concurrent_calls",
+                format!("must be 1..={HARD_MAX_CONCURRENT_CALLS}"),
+            );
         }
-        if let Some(value) = resources.max_output_bytes {
-            if value == 0 || value > HARD_MAX_OUTPUT_BYTES {
-                report.error(
-                    "resources.max_output_bytes",
-                    format!("must be 1..={HARD_MAX_OUTPUT_BYTES}"),
-                );
-            }
+        if let Some(value) = resources.max_output_bytes
+            && (value == 0 || value > HARD_MAX_OUTPUT_BYTES)
+        {
+            report.error(
+                "resources.max_output_bytes",
+                format!("must be 1..={HARD_MAX_OUTPUT_BYTES}"),
+            );
         }
-        if let Some(value) = resources.max_table_elements {
-            if value == 0 || value > HARD_MAX_TABLE_ELEMENTS {
-                report.error(
-                    "resources.max_table_elements",
-                    format!("must be 1..={HARD_MAX_TABLE_ELEMENTS}"),
-                );
-            }
+        if let Some(value) = resources.max_table_elements
+            && (value == 0 || value > HARD_MAX_TABLE_ELEMENTS)
+        {
+            report.error(
+                "resources.max_table_elements",
+                format!("must be 1..={HARD_MAX_TABLE_ELEMENTS}"),
+            );
         }
     }
 

@@ -201,10 +201,10 @@ fn shared_for(path: &Path, default_scope: &MemoryScope) -> Result<Arc<SharedStor
     let mut guard = registry()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(weak) = guard.get(&identity) {
-        if let Some(shared) = weak.upgrade() {
-            return Ok(shared);
-        }
+    if let Some(weak) = guard.get(&identity)
+        && let Some(shared) = weak.upgrade()
+    {
+        return Ok(shared);
     }
     let shared = Arc::new(SharedStore::load(identity.clone(), default_scope)?);
     // Prune dead identities while we hold the lock: the registry stays bounded

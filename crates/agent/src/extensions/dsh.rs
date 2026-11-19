@@ -298,28 +298,28 @@ fn load_inner(root: &Path, trust: Trust) -> Result<LoadedPackage, ExtensionError
         }
     }
 
-    if details.client.is_some() {
-        if let Some(entry) = export_path(root, object, "./client", &manifest_path)? {
-            details.client_entry = Some(entry.clone());
-            if !entry.is_file() {
-                return Err(manifest_error(
-                    STANDARD,
-                    &manifest_path,
-                    format!("the client entry '{}' does not exist", entry.display()),
-                ));
-            }
-            let source = read_prefix(&entry, ENTRY_SCAN_LIMIT)?;
-            let found = scan_markers(&source, CLIENT_MARKERS);
-            for capability in &found {
-                capabilities.insert(*capability);
-            }
-            refusals.push(Refusal::new(
-                &id,
-                RefusedFeature::ImperativeClientEntry,
-                Some(entry),
-                imperative_reason("client entry", &found),
+    if details.client.is_some()
+        && let Some(entry) = export_path(root, object, "./client", &manifest_path)?
+    {
+        details.client_entry = Some(entry.clone());
+        if !entry.is_file() {
+            return Err(manifest_error(
+                STANDARD,
+                &manifest_path,
+                format!("the client entry '{}' does not exist", entry.display()),
             ));
         }
+        let source = read_prefix(&entry, ENTRY_SCAN_LIMIT)?;
+        let found = scan_markers(&source, CLIENT_MARKERS);
+        for capability in &found {
+            capabilities.insert(*capability);
+        }
+        refusals.push(Refusal::new(
+            &id,
+            RefusedFeature::ImperativeClientEntry,
+            Some(entry),
+            imperative_reason("client entry", &found),
+        ));
     }
 
     refusals.extend(bundle_refusals);

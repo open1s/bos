@@ -537,10 +537,10 @@ fn render_snapshot(facts: &RuntimeFacts, child: bool) -> String {
     // The shape of the workspace, so the first step can read the file it needs
     // instead of spending a whole round trip on list_dir. A turn is one LLM
     // call per step and a step costs seconds, so a free listing is not free.
-    if !cwd.is_empty() {
-        if let Some(layout) = render_layout(Path::new(cwd)) {
-            sections.push(layout);
-        }
+    if !cwd.is_empty()
+        && let Some(layout) = render_layout(Path::new(cwd))
+    {
+        sections.push(layout);
     }
     sections.push(match (facts.confined, facts.sandbox_reason) {
         (true, _) => "Sandbox: confined to the workspace.".to_string(),

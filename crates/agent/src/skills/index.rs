@@ -329,26 +329,26 @@ impl SkillIndex {
                 name: dependency.name.clone(),
             });
         };
-        if let Some(constraint) = &dependency.version {
-            if !target.version.satisfies(constraint) {
-                if dependency.optional {
-                    omitted.push(OmittedDependency {
-                        owner: owner.to_string(),
-                        name: dependency.name.clone(),
-                        reason: format!(
-                            "version {} does not satisfy {constraint}",
-                            target.version.display()
-                        ),
-                    });
-                    return Ok(None);
-                }
-                return Err(SkillPlanError::Incompatible {
+        if let Some(constraint) = &dependency.version
+            && !target.version.satisfies(constraint)
+        {
+            if dependency.optional {
+                omitted.push(OmittedDependency {
                     owner: owner.to_string(),
                     name: dependency.name.clone(),
-                    constraint: constraint.clone(),
-                    actual: target.version.display(),
+                    reason: format!(
+                        "version {} does not satisfy {constraint}",
+                        target.version.display()
+                    ),
                 });
+                return Ok(None);
             }
+            return Err(SkillPlanError::Incompatible {
+                owner: owner.to_string(),
+                name: dependency.name.clone(),
+                constraint: constraint.clone(),
+                actual: target.version.display(),
+            });
         }
         Ok(Some(dependency.name.clone()))
     }

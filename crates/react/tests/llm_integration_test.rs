@@ -79,16 +79,16 @@ fn verify_text_response(response: &LlmResponse) -> Result<String, String> {
                 return Err("Response has no choices".to_string());
             }
             let choice = &resp.choices[0];
-            if let Some(content) = &choice.message.content {
-                if !content.is_empty() {
-                    return Ok(content.clone());
-                }
+            if let Some(content) = &choice.message.content
+                && !content.is_empty()
+            {
+                return Ok(content.clone());
             }
             // Check new reasoning_content field on ChatMessage
-            if let Some(reasoning) = &choice.message.reasoning_content {
-                if !reasoning.is_empty() {
-                    return Ok(format!("[reasoning] {}", reasoning));
-                }
+            if let Some(reasoning) = &choice.message.reasoning_content
+                && !reasoning.is_empty()
+            {
+                return Ok(format!("[reasoning] {}", reasoning));
             }
             // Fallback: check in extra field
             if let Some(reasoning) = choice
@@ -96,10 +96,9 @@ fn verify_text_response(response: &LlmResponse) -> Result<String, String> {
                 .extra
                 .get("reasoning_content")
                 .and_then(|v| v.as_str())
+                && !reasoning.is_empty()
             {
-                if !reasoning.is_empty() {
-                    return Ok(format!("[reasoning] {}", reasoning));
-                }
+                return Ok(format!("[reasoning] {}", reasoning));
             }
             Err("Response has no content".to_string())
         }

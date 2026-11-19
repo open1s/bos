@@ -1001,10 +1001,10 @@ impl ExtensionStore {
     pub fn record_crash(&self, id: &str, error: &str) {
         let path = self.crashes_path();
         let line = format!("{}\t{id}\t{error}\n", crate::capability::unix_now());
-        if let Ok(existing) = std::fs::read_to_string(&path) {
-            if existing.lines().last() == Some(line.trim_end()) {
-                return;
-            }
+        if let Ok(existing) = std::fs::read_to_string(&path)
+            && existing.lines().last() == Some(line.trim_end())
+        {
+            return;
         }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);

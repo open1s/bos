@@ -255,13 +255,12 @@ impl AnthropicVendor {
             Value::Array(blocks) => blocks,
             other => vec![other],
         };
-        if let Some(last) = messages.last_mut() {
-            if last.role == role {
-                if let Some(existing) = last.content.as_array_mut() {
-                    existing.extend(blocks);
-                    return;
-                }
-            }
+        if let Some(last) = messages.last_mut()
+            && last.role == role
+            && let Some(existing) = last.content.as_array_mut()
+        {
+            existing.extend(blocks);
+            return;
         }
         messages.push(AnthropicMessage {
             role: role.to_string(),
@@ -319,10 +318,10 @@ impl AnthropicVendor {
             // has a top-level system section, so guidance stays out of the
             // message list (issue #434).
             system_parts.extend(provider.wire_system_prompt());
-        } else if let Some(persona) = persona {
-            if !persona.is_empty() {
-                system_parts.push(persona.clone());
-            }
+        } else if let Some(persona) = persona
+            && !persona.is_empty()
+        {
+            system_parts.push(persona.clone());
         }
         let mut messages: Vec<AnthropicMessage> = Vec::new();
         let history: Vec<crate::llm::LlmMessage> = if let Some(provider) = typed {
@@ -719,16 +718,14 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                         "content_block_start" => {
                             if frame.pointer("/content_block/type").and_then(Value::as_str)
                                 == Some("redacted_thinking")
-                            {
-                                if let Some(data) =
+                                && let Some(data) =
                                     frame.pointer("/content_block/data").and_then(Value::as_str)
-                                {
-                                    let state = ReasoningState::new(
-                                        "anthropic",
-                                        json!({ "type": "redacted_thinking", "data": data }),
-                                    );
-                                    let _ = tx.send(Ok(StreamToken::ReasoningState(state))).await;
-                                }
+                            {
+                                let state = ReasoningState::new(
+                                    "anthropic",
+                                    json!({ "type": "redacted_thinking", "data": data }),
+                                );
+                                let _ = tx.send(Ok(StreamToken::ReasoningState(state))).await;
                             }
                             if frame.pointer("/content_block/type").and_then(Value::as_str)
                                 == Some("tool_use")
@@ -756,26 +753,23 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                                 "text_delta" => {
                                     if let Some(text) =
                                         frame.pointer("/delta/text").and_then(Value::as_str)
+                                        && !text.is_empty()
                                     {
-                                        if !text.is_empty() {
-                                            on_chunk.as_ref().inspect(|cb| cb(text));
-                                            let _ = tx
-                                                .send(Ok(StreamToken::Text(text.to_string())))
-                                                .await;
-                                        }
+                                        on_chunk.as_ref().inspect(|cb| cb(text));
+                                        let _ =
+                                            tx.send(Ok(StreamToken::Text(text.to_string()))).await;
                                     }
                                 }
                                 "thinking_delta" => {
                                     if let Some(text) =
                                         frame.pointer("/delta/thinking").and_then(Value::as_str)
+                                        && !text.is_empty()
                                     {
-                                        if !text.is_empty() {
-                                            let _ = tx
-                                                .send(Ok(StreamToken::ReasoningContent(
-                                                    text.to_string(),
-                                                )))
-                                                .await;
-                                        }
+                                        let _ = tx
+                                            .send(Ok(StreamToken::ReasoningContent(
+                                                text.to_string(),
+                                            )))
+                                            .await;
                                     }
                                 }
                                 "signature_delta" => {

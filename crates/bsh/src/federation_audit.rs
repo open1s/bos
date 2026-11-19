@@ -194,14 +194,14 @@ pub(crate) fn prune_stale(path: &Path, now: std::time::SystemTime) -> usize {
 /// one story even though each process owns one file.
 pub(crate) fn load(path: &Path, limit: usize) -> Vec<FederationEvent> {
     let mut files = vec![path.to_path_buf()];
-    if let Some(directory) = path.parent() {
-        if let Ok(entries) = fs::read_dir(directory) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("audit-") && name.ends_with(".jsonl") {
-                    files.push(entry.path());
-                }
+    if let Some(directory) = path.parent()
+        && let Ok(entries) = fs::read_dir(directory)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("audit-") && name.ends_with(".jsonl") {
+                files.push(entry.path());
             }
         }
     }

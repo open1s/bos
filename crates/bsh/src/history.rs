@@ -862,12 +862,10 @@ impl History {
         let lost = repair.lost && promised.is_some_and(|promised| readable_rows < promised);
         if lost || !skipped.is_empty() {
             let mut reason = repair.reason;
-            if lost {
-                if let Some(promised) = promised {
-                    reason.push_str(&format!(
-                        "; the manifest promised {promised} rows and only {readable_rows} are readable"
-                    ));
-                }
+            if lost && let Some(promised) = promised {
+                reason.push_str(&format!(
+                    "; the manifest promised {promised} rows and only {readable_rows} are readable"
+                ));
             }
             if !skipped.is_empty() {
                 reason.push_str(&format!(
@@ -2379,10 +2377,10 @@ fn check_list(
             return ListCheck::Rebuild(format!("the manifest lists {name} twice"));
         }
         let key = (stamp, name);
-        if let Some(previous) = previous {
-            if key <= previous {
-                return ListCheck::Rebuild(format!("the manifest lists {name} out of order"));
-            }
+        if let Some(previous) = previous
+            && key <= previous
+        {
+            return ListCheck::Rebuild(format!("the manifest lists {name} out of order"));
         }
         previous = Some(key);
         if entry.rows == 0
@@ -2650,10 +2648,10 @@ pub(crate) fn diagnose(dir: &Path) -> HistoryDiagnosis {
                     findings.push(format!("{prefix} lists a foreign name {:?}", entry.file));
                 }
                 let key = (stamp_of(&entry.file), entry.file.as_str());
-                if let Some(previous) = previous {
-                    if key <= previous {
-                        findings.push(format!("{prefix} lists {} out of order", entry.file));
-                    }
+                if let Some(previous) = previous
+                    && key <= previous
+                {
+                    findings.push(format!("{prefix} lists {} out of order", entry.file));
                 }
                 previous = Some(key);
                 let name = entry.file.clone();

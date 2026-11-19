@@ -372,10 +372,10 @@ impl ManifestBuilder {
         }
         let resources = toml::Value::try_from(self.resources)
             .map_err(|error| invalid_input(error.to_string()))?;
-        if let toml::Value::Table(resources) = resources {
-            if !resources.is_empty() {
-                root.insert("resources".to_string(), toml::Value::Table(resources));
-            }
+        if let toml::Value::Table(resources) = resources
+            && !resources.is_empty()
+        {
+            root.insert("resources".to_string(), toml::Value::Table(resources));
         }
         if let Some(configuration) = self.configuration {
             let configuration = toml::Value::try_from(configuration)

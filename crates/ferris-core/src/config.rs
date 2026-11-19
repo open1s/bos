@@ -329,10 +329,10 @@ pub fn validate(schema: &Value, value: &Value, path: &str, errors: &mut Vec<Stri
             return;
         }
     }
-    if let Some(allowed) = object.get("enum").and_then(Value::as_array) {
-        if !allowed.iter().any(|allowed| allowed == value) {
-            errors.push(format!("{path}: value is not one of the allowed values"));
-        }
+    if let Some(allowed) = object.get("enum").and_then(Value::as_array)
+        && !allowed.iter().any(|allowed| allowed == value)
+    {
+        errors.push(format!("{path}: value is not one of the allowed values"));
     }
     match value {
         Value::Object(map) => {
@@ -375,32 +375,32 @@ pub fn validate(schema: &Value, value: &Value, path: &str, errors: &mut Vec<Stri
             }
         }
         Value::String(text) => {
-            if let Some(min) = object.get("minLength").and_then(Value::as_u64) {
-                if text.chars().count() < min as usize {
-                    errors.push(format!("{path}: must be at least {min} characters"));
-                }
+            if let Some(min) = object.get("minLength").and_then(Value::as_u64)
+                && text.chars().count() < min as usize
+            {
+                errors.push(format!("{path}: must be at least {min} characters"));
             }
-            if let Some(max) = object.get("maxLength").and_then(Value::as_u64) {
-                if text.chars().count() > max as usize {
-                    errors.push(format!("{path}: must be at most {max} characters"));
-                }
+            if let Some(max) = object.get("maxLength").and_then(Value::as_u64)
+                && text.chars().count() > max as usize
+            {
+                errors.push(format!("{path}: must be at most {max} characters"));
             }
-            if let Some(pattern) = object.get("pattern").and_then(Value::as_str) {
-                if !text.contains(pattern) {
-                    errors.push(format!("{path}: must contain {pattern:?}"));
-                }
+            if let Some(pattern) = object.get("pattern").and_then(Value::as_str)
+                && !text.contains(pattern)
+            {
+                errors.push(format!("{path}: must contain {pattern:?}"));
             }
         }
         Value::Number(number) => {
-            if let Some(min) = object.get("minimum").and_then(Value::as_f64) {
-                if number.as_f64().is_some_and(|value| value < min) {
-                    errors.push(format!("{path}: must be at least {min}"));
-                }
+            if let Some(min) = object.get("minimum").and_then(Value::as_f64)
+                && number.as_f64().is_some_and(|value| value < min)
+            {
+                errors.push(format!("{path}: must be at least {min}"));
             }
-            if let Some(max) = object.get("maximum").and_then(Value::as_f64) {
-                if number.as_f64().is_some_and(|value| value > max) {
-                    errors.push(format!("{path}: must be at most {max}"));
-                }
+            if let Some(max) = object.get("maximum").and_then(Value::as_f64)
+                && number.as_f64().is_some_and(|value| value > max)
+            {
+                errors.push(format!("{path}: must be at most {max}"));
             }
         }
         _ => {}

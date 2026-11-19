@@ -1256,28 +1256,28 @@ pub(crate) fn load(
     // MCP transport ask, so the permission tier cannot be bypassed here.
     if let Ok((host, port)) = agent::policy::http_host(url) {
         let gate = handle.egress.lock().ok().and_then(|slot| slot.clone());
-        if let Some(gate) = gate {
-            if let Err(denial) = gate.authorize(&host, port) {
-                let failure = Failure {
-                    kind: "policy",
-                    message: gate.policy().refusal(&denial.decision),
-                    rule: denial.decision.rule.clone(),
-                    url: url.to_string(),
-                };
-                let applied = handle.mutate(|browser| browser.fail(seq, failure.clone()));
-                return if applied {
-                    Err(failure)
-                } else {
-                    Err(Failure {
-                        kind: "body",
-                        message: String::from(
-                            "A newer navigation replaced this one before it finished.",
-                        ),
-                        rule: None,
-                        url: String::new(),
-                    })
-                };
-            }
+        if let Some(gate) = gate
+            && let Err(denial) = gate.authorize(&host, port)
+        {
+            let failure = Failure {
+                kind: "policy",
+                message: gate.policy().refusal(&denial.decision),
+                rule: denial.decision.rule.clone(),
+                url: url.to_string(),
+            };
+            let applied = handle.mutate(|browser| browser.fail(seq, failure.clone()));
+            return if applied {
+                Err(failure)
+            } else {
+                Err(Failure {
+                    kind: "body",
+                    message: String::from(
+                        "A newer navigation replaced this one before it finished.",
+                    ),
+                    rule: None,
+                    url: String::new(),
+                })
+            };
         }
     }
     // The pane's own view is the page: navigate IT, so the reader and the
@@ -3237,10 +3237,10 @@ impl<'a> Parser<'a> {
 
     /// A closing tag.
     fn close_tag(&mut self, name: &str) {
-        if let Some(capture) = &self.capture {
-            if capture.tag == name {
-                self.capture = None;
-            }
+        if let Some(capture) = &self.capture
+            && capture.tag == name
+        {
+            self.capture = None;
         }
         match name {
             "title" => self.in_title = false,
@@ -3487,15 +3487,15 @@ impl<'a> Parser<'a> {
         } else if let Some(capture) = &self.capture {
             let index = capture.index;
             let tag = capture.tag.clone();
-            if tag != "select" {
-                if let Some(element) = self.doc.elements.get_mut(index) {
-                    if element.kind == Kind::Textarea {
-                        if let Some(value) = element.value.as_mut() {
-                            value.push_str(&decoded);
-                        }
-                    } else {
-                        element.label.push_str(&decoded);
+            if tag != "select"
+                && let Some(element) = self.doc.elements.get_mut(index)
+            {
+                if element.kind == Kind::Textarea {
+                    if let Some(value) = element.value.as_mut() {
+                        value.push_str(&decoded);
                     }
+                } else {
+                    element.label.push_str(&decoded);
                 }
             }
         }

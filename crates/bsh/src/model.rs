@@ -576,10 +576,10 @@ impl ChatMessage {
         for tool in &self.tools {
             tokens += price_block(tool.name.chars().count());
             tokens += price_block(tool.args.chars().count());
-            if let Some(output) = &tool.output {
-                if !output.is_empty() {
-                    tokens += price_block(output.chars().count());
-                }
+            if let Some(output) = &tool.output
+                && !output.is_empty()
+            {
+                tokens += price_block(output.chars().count());
             }
         }
         tokens

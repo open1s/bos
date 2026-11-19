@@ -1529,26 +1529,26 @@ impl Engine {
                     let Some(reply) = inflight.pop_front() else {
                         continue;
                     };
-                    if let Ok(Ok(answer)) = reply.recv_timeout(LOAD_TIMEOUT) {
-                        if let Some(text) = answer.get("data").and_then(Value::as_str) {
-                            if last.as_deref() == Some(text) {
-                                quiet = quiet.saturating_add(1);
-                            } else {
-                                quiet = 0;
-                                // Hand the text to the decoder and start the
-                                // next capture immediately: the decode must not
-                                // be paid in front of the round trip.
-                                //
-                                // `last` advances ONLY when the hand-off was
-                                // accepted. A full slot means the decoder is
-                                // behind and this frame is dropped in favour of
-                                // the next one - so it must not be remembered as
-                                // displayed, or the following probe would see
-                                // identical text, count it as unchanged, and let
-                                // the pane settle on an image it never received.
-                                if decoder.try_send(text.to_string()).is_ok() {
-                                    last = Some(text.to_string());
-                                }
+                    if let Ok(Ok(answer)) = reply.recv_timeout(LOAD_TIMEOUT)
+                        && let Some(text) = answer.get("data").and_then(Value::as_str)
+                    {
+                        if last.as_deref() == Some(text) {
+                            quiet = quiet.saturating_add(1);
+                        } else {
+                            quiet = 0;
+                            // Hand the text to the decoder and start the
+                            // next capture immediately: the decode must not
+                            // be paid in front of the round trip.
+                            //
+                            // `last` advances ONLY when the hand-off was
+                            // accepted. A full slot means the decoder is
+                            // behind and this frame is dropped in favour of
+                            // the next one - so it must not be remembered as
+                            // displayed, or the following probe would see
+                            // identical text, count it as unchanged, and let
+                            // the pane settle on an image it never received.
+                            if decoder.try_send(text.to_string()).is_ok() {
+                                last = Some(text.to_string());
                             }
                         }
                     }

@@ -348,25 +348,25 @@ impl StreamExtractor for XmlExtractor {
                         break;
                     };
                     let tag_end = terminator_from + gt_offset + 1;
-                    if let Some(name) = get_tag_name(buf, name_start, name_end) {
-                        if let Some(idx) = self.stack.iter().position(|(n, _)| n == &name) {
-                            let (_, open_pos) = self.stack[idx];
-                            self.stack.remove(idx);
-                            let level = self.stack.len() + 1;
-                            let parent_idx = self.stack.len();
+                    if let Some(name) = get_tag_name(buf, name_start, name_end)
+                        && let Some(idx) = self.stack.iter().position(|(n, _)| n == &name)
+                    {
+                        let (_, open_pos) = self.stack[idx];
+                        self.stack.remove(idx);
+                        let level = self.stack.len() + 1;
+                        let parent_idx = self.stack.len();
 
-                            spans.push(Span {
-                                start: self.arena.start + open_pos,
-                                end: self.arena.start + tag_end,
-                                level,
-                                parent_idx: None,
-                            });
+                        spans.push(Span {
+                            start: self.arena.start + open_pos,
+                            end: self.arena.start + tag_end,
+                            level,
+                            parent_idx: None,
+                        });
 
-                            if parent_idx > 0 {
-                                if let Some(last) = spans.last_mut() {
-                                    last.parent_idx = Some(parent_idx - 1);
-                                }
-                            }
+                        if parent_idx > 0
+                            && let Some(last) = spans.last_mut()
+                        {
+                            last.parent_idx = Some(parent_idx - 1);
                         }
                     }
                 } else if next == Some(b'!') || next == Some(b'?') {
@@ -393,10 +393,10 @@ impl StreamExtractor for XmlExtractor {
                                 parent_idx: None,
                             });
 
-                            if parent_idx > 0 {
-                                if let Some(last) = spans.last_mut() {
-                                    last.parent_idx = Some(parent_idx - 1);
-                                }
+                            if parent_idx > 0
+                                && let Some(last) = spans.last_mut()
+                            {
+                                last.parent_idx = Some(parent_idx - 1);
                             }
                         } else {
                             self.stack.push((name, i));

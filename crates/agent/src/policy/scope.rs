@@ -95,10 +95,10 @@ fn validate_glob(pattern: &str) -> Result<(), String> {
                 if braces.pop().is_none() {
                     return Err("the glob closes an alternation that was never opened".to_string());
                 }
-                if let Some(open) = braces.last() {
-                    if *open + 1 == index {
-                        return Err("the glob carries an empty alternation".to_string());
-                    }
+                if let Some(open) = braces.last()
+                    && *open + 1 == index
+                {
+                    return Err("the glob carries an empty alternation".to_string());
                 }
             }
             _ => {}

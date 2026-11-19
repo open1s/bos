@@ -389,10 +389,10 @@ fn command_validate(args: &[String]) -> Result<i32, String> {
         println!("hash:    {}", package.hash);
         // The market index must carry the commit's digest. Name it when the
         // checkout differs, so a publisher cannot paste the wrong one.
-        if let Ok(committed) = package_hash_at_rev(&path, "HEAD") {
-            if committed != package.hash {
-                println!("commit:  {committed} (a market index must carry this one)");
-            }
+        if let Ok(committed) = package_hash_at_rev(&path, "HEAD")
+            && committed != package.hash
+        {
+            println!("commit:  {committed} (a market index must carry this one)");
         }
     }
     for warning in &package.report.warnings {
@@ -402,11 +402,9 @@ fn command_validate(args: &[String]) -> Result<i32, String> {
         println!("error:   {error}");
     }
     let mut valid = package.report.is_valid();
-    if valid {
-        if let Err(error) = validate_runtime(&package) {
-            println!("error:   {error}");
-            valid = false;
-        }
+    if valid && let Err(error) = validate_runtime(&package) {
+        println!("error:   {error}");
+        valid = false;
     }
     if valid {
         println!("valid");
@@ -999,28 +997,28 @@ fn command_logs(args: &[String], root: Option<PathBuf>) -> Result<i32, String> {
         println!("no audit log yet at {}", audit.display());
     }
     let directory = store.log_dir(&id);
-    if directory.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&directory) {
-            let mut files: Vec<PathBuf> = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| path.is_file())
-                .collect();
-            files.sort();
-            for file in files {
-                if let Ok(text) = std::fs::read_to_string(&file) {
-                    println!("--- {} ---", file.display());
-                    let lines: Vec<&str> = text.lines().collect();
-                    for line in lines
-                        .iter()
-                        .rev()
-                        .take(200)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                    {
-                        println!("{line}");
-                    }
+    if directory.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&directory)
+    {
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        files.sort();
+        for file in files {
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                println!("--- {} ---", file.display());
+                let lines: Vec<&str> = text.lines().collect();
+                for line in lines
+                    .iter()
+                    .rev()
+                    .take(200)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
+                    println!("{line}");
                 }
             }
         }
@@ -1087,10 +1085,10 @@ fn command_keygen(args: &[String]) -> Result<i32, String> {
         }
     }
     let (secret, public) = generate_key();
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     std::fs::write(&output, format!("{secret}\n")).map_err(|error| error.to_string())?;
     #[cfg(unix)]

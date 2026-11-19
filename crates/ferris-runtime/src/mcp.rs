@@ -282,14 +282,13 @@ impl Session {
     /// Drain queued notifications outside a request and mark a list change.
     fn drain_notifications(&mut self) {
         while let Ok(bytes) = self.lines.try_recv() {
-            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                if value
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+                && value
                     .get("method")
                     .and_then(Value::as_str)
                     .is_some_and(|method| method.ends_with("/list_changed"))
-                {
-                    self.catalog_dirty.store(true, Ordering::SeqCst);
-                }
+            {
+                self.catalog_dirty.store(true, Ordering::SeqCst);
             }
         }
     }
@@ -330,12 +329,11 @@ fn validate_response(
         Some(_) => return Err(protocol_error("response id is not an integer")),
     };
     if frame_id != Some(expected_id) {
-        if let Some(sender) = progress {
-            if object.get("method").and_then(Value::as_str) == Some("notifications/progress") {
-                if let Some(params) = object.get("params") {
-                    let _ = sender.try_send(params.clone());
-                }
-            }
+        if let Some(sender) = progress
+            && object.get("method").and_then(Value::as_str) == Some("notifications/progress")
+            && let Some(params) = object.get("params")
+        {
+            let _ = sender.try_send(params.clone());
         }
         // A notification has no id. A response for a different id is usually a
         // timed-out call's late result; neither answers this request.
@@ -697,10 +695,10 @@ impl McpCore {
         self.ensure_running()?;
         // A list_changed notification that arrived while the runtime was idle
         // is still queued; drain it before deciding whether the cache is fresh.
-        if let Ok(mut slot) = self.session.lock() {
-            if let Some(session) = slot.as_mut() {
-                session.drain_notifications();
-            }
+        if let Ok(mut slot) = self.session.lock()
+            && let Some(session) = slot.as_mut()
+        {
+            session.drain_notifications();
         }
         let mut catalog = self.catalog.lock().map_err(|_| ExtensionError::Corrupt {
             path: self.root.clone(),
@@ -1298,10 +1296,10 @@ impl McpCore {
     /// Cancel the sampler before the child is reaped.
     fn stop_watchdog(&self) {
         #[cfg(unix)]
-        if let Ok(mut slot) = self.watchdog.lock() {
-            if let Some(watchdog) = slot.take() {
-                watchdog.stop();
-            }
+        if let Ok(mut slot) = self.watchdog.lock()
+            && let Some(watchdog) = slot.take()
+        {
+            watchdog.stop();
         }
     }
 
@@ -1432,11 +1430,11 @@ impl McpCore {
     /// just to deliver a notification.
     fn pump(&self) {
         let mut queued = Vec::new();
-        if let Ok(slot) = self.subscription.lock() {
-            if let Some(subscription) = slot.as_ref() {
-                while let Some(event) = subscription.try_recv() {
-                    queued.push(event);
-                }
+        if let Ok(slot) = self.subscription.lock()
+            && let Some(subscription) = slot.as_ref()
+        {
+            while let Some(event) = subscription.try_recv() {
+                queued.push(event);
             }
         }
         if queued.is_empty() {

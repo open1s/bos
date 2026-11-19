@@ -780,14 +780,14 @@ pub fn execute_query(
 
     let source = document.source();
     let source_len = source.len();
-    if let Some(range) = options.range {
-        if !range.fits(source_len) {
-            return Err(QueryExecutionError::InvalidRange {
-                start: range.start_byte,
-                end: range.end_byte,
-                source_len,
-            });
-        }
+    if let Some(range) = options.range
+        && !range.fits(source_len)
+    {
+        return Err(QueryExecutionError::InvalidRange {
+            start: range.start_byte,
+            end: range.end_byte,
+            source_len,
+        });
     }
 
     control.check()?;

@@ -134,10 +134,10 @@ pub(crate) fn search(root: &Path, base: &Path, query: &Query) -> Result<Found, S
     // The reader's own ignore file is checked before the walk, so naming an
     // excluded directory explicitly gets the same refusal the other file tools
     // give instead of a silently empty result.
-    if let Some(rules) = query.workspace_ignore {
-        if rules.is_ignored(root, true) {
-            return Err(rules.refusal(root));
-        }
+    if let Some(rules) = query.workspace_ignore
+        && rules.is_ignored(root, true)
+    {
+        return Err(rules.refusal(root));
     }
     // One include pattern is the tool's contract. Override globs read a leading
     // ! as an exclusion (ripgrep's -g), and a lone exclusion would match

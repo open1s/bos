@@ -215,10 +215,10 @@ impl McpServer {
         {
             return Err(McpRefusal::NameInvalid);
         }
-        if let Some(original) = original {
-            if original == name {
-                return validate_transport(self);
-            }
+        if let Some(original) = original
+            && original == name
+        {
+            return validate_transport(self);
         }
         if others
             .iter()

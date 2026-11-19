@@ -155,13 +155,13 @@ impl EgressGate {
     /// client could pick the unknown one.
     pub fn authorize(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, EgressDenial> {
         let key = format!("{host}:{port}");
-        if let Ok(cache) = self.cache.lock() {
-            if let Some(cached) = cache.get(&key) {
-                return match &cached.denial {
-                    Some(denial) => Err(denial.clone()),
-                    None => Ok(cached.addrs.clone()),
-                };
-            }
+        if let Ok(cache) = self.cache.lock()
+            && let Some(cached) = cache.get(&key)
+        {
+            return match &cached.denial {
+                Some(denial) => Err(denial.clone()),
+                None => Ok(cached.addrs.clone()),
+            };
         }
 
         let resolved = match self.resolver.resolve(host, port) {

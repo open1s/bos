@@ -554,41 +554,41 @@ impl McpClient {
                         // is answered with JSON-RPC's "method not found"
                         // instead of being dropped (which left the server
                         // waiting).
-                        if let Some(request_id) = message.get("id") {
-                            if !request_id.is_null() {
-                                let method = message
-                                    .get("method")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("");
-                                let reply = if method == "ping" {
-                                    // `ping` is the one request either peer
-                                    // may send; it must be answered, not
-                                    // refused.
-                                    serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "id": request_id.clone(),
-                                        "result": {}
-                                    })
-                                } else {
-                                    serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "id": request_id.clone(),
-                                        "error": {
-                                            "code": -32601,
-                                            "message": format!("Method not found: {method}")
-                                        }
-                                    })
-                                };
-                                transport.send(&serde_json::to_vec(&reply)?).await?;
-                            }
+                        if let Some(request_id) = message.get("id")
+                            && !request_id.is_null()
+                        {
+                            let method = message
+                                .get("method")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            let reply = if method == "ping" {
+                                // `ping` is the one request either peer
+                                // may send; it must be answered, not
+                                // refused.
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": request_id.clone(),
+                                    "result": {}
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": request_id.clone(),
+                                    "error": {
+                                        "code": -32601,
+                                        "message": format!("Method not found: {method}")
+                                    }
+                                })
+                            };
+                            transport.send(&serde_json::to_vec(&reply)?).await?;
                         }
                         continue;
                     }
 
-                    if let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(message) {
-                        if resp.id == serde_json::json!(id) {
-                            return Ok(resp);
-                        }
+                    if let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(message)
+                        && resp.id == serde_json::json!(id)
+                    {
+                        return Ok(resp);
                     }
                 }
             }

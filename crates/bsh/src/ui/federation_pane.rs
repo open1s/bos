@@ -2113,10 +2113,10 @@ fn capability_label_localized(lang: crate::i18n::Lang, id: &str) -> String {
 /// the grant menu and the expose list speak the same language; the knowledge
 /// service has its own two lines.
 fn grantable_label(lang: crate::i18n::Lang, id: &str) -> String {
-    if let Some(name) = id.strip_prefix("builtin/") {
-        if crate::federation_node::exposable_capabilities().contains(&name) {
-            return expose_label(lang, name);
-        }
+    if let Some(name) = id.strip_prefix("builtin/")
+        && crate::federation_node::exposable_capabilities().contains(&name)
+    {
+        return expose_label(lang, name);
     }
     match id {
         "builtin/knowledge_query" => lang.tr("right.federation.grantKnowledgeQuery"),

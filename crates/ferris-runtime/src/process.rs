@@ -186,12 +186,11 @@ impl ProcessSession {
                 if value.get("id").and_then(Value::as_u64) != Some(id) {
                     // A notification or an earlier response. Progress
                     // notifications are forwarded; everything else is skipped.
-                    if let Some(sender) = progress {
-                        if value.get("method").and_then(Value::as_str) == Some("$/progress") {
-                            if let Some(params) = value.get("params") {
-                                let _ = sender.try_send(params.clone());
-                            }
-                        }
+                    if let Some(sender) = progress
+                        && value.get("method").and_then(Value::as_str) == Some("$/progress")
+                        && let Some(params) = value.get("params")
+                    {
+                        let _ = sender.try_send(params.clone());
                     }
                     continue;
                 }
@@ -920,10 +919,10 @@ impl ProcessRuntime {
     /// child's pid is never sampled (or signalled) again.
     fn stop_watchdog(&self) {
         #[cfg(unix)]
-        if let Ok(mut slot) = self.watchdog.lock() {
-            if let Some(watchdog) = slot.take() {
-                watchdog.stop();
-            }
+        if let Ok(mut slot) = self.watchdog.lock()
+            && let Some(watchdog) = slot.take()
+        {
+            watchdog.stop();
         }
     }
 

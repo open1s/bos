@@ -75,12 +75,12 @@ impl<A: ReActApp> ReActEngine<A> {
         call_id: &str,
     ) -> Result<Value, ReactError> {
         let result = self.run_tool(name, input, call_id).await;
-        if let Err(error) = &result {
-            if self.retryable_tool_failure(name, error) {
-                log::warn!("retrying read-only tool {name} after a transient failure: {error}");
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                return self.run_tool(name, input, call_id).await;
-            }
+        if let Err(error) = &result
+            && self.retryable_tool_failure(name, error)
+        {
+            log::warn!("retrying read-only tool {name} after a transient failure: {error}");
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            return self.run_tool(name, input, call_id).await;
         }
         result
     }

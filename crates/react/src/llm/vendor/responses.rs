@@ -562,11 +562,11 @@ fn serialize_tools(tools: Option<&[LlmTool]>) -> Option<Vec<Value>> {
                 // nested under a sub-key.
                 LlmToolKind::WebSearch | LlmToolKind::FileSearch | LlmToolKind::ComputerUse => {
                     let mut v = serde_json::json!({ "type": tool.kind.as_str() });
-                    if let Some(cfg) = &tool.config {
-                        if let Some(obj) = cfg.as_object() {
-                            for (key, val) in obj {
-                                v[key] = val.clone();
-                            }
+                    if let Some(cfg) = &tool.config
+                        && let Some(obj) = cfg.as_object()
+                    {
+                        for (key, val) in obj {
+                            v[key] = val.clone();
                         }
                     }
                     out.push(v);
@@ -603,26 +603,26 @@ fn build_instructions(
         instructions.push_str(&crate::llm::render_skill_catalog(skills, query));
     }
 
-    if let Some(rules) = context.rules() {
-        if !rules.is_empty() {
-            let rule_texts = rules
-                .iter()
-                .map(|r| r.content.clone())
-                .collect::<Vec<_>>()
-                .join("\n");
-            instructions.push_str(&format!("You should follow below rules:\n{}\n", rule_texts));
-        }
+    if let Some(rules) = context.rules()
+        && !rules.is_empty()
+    {
+        let rule_texts = rules
+            .iter()
+            .map(|r| r.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        instructions.push_str(&format!("You should follow below rules:\n{}\n", rule_texts));
     }
 
-    if let Some(inst) = context.instructions() {
-        if !inst.is_empty() {
-            let inst_texts = inst
-                .iter()
-                .map(|i| format!("- {}: {}", i.name, i.description))
-                .collect::<Vec<_>>()
-                .join("\n");
-            instructions.push_str(&format!("Instructions:\n{}\n", inst_texts));
-        }
+    if let Some(inst) = context.instructions()
+        && !inst.is_empty()
+    {
+        let inst_texts = inst
+            .iter()
+            .map(|i| format!("- {}: {}", i.name, i.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        instructions.push_str(&format!("Instructions:\n{}\n", inst_texts));
     }
 
     if instructions.trim().is_empty() {
@@ -862,10 +862,10 @@ impl StreamExtractor for ResponsesExtractor {
         for span in spans.iter() {
             if span.is_root() {
                 let json_str = self.inner.extract(span);
-                if let Ok(event) = serde_json::from_slice::<ResponsesStreamEvent>(json_str) {
-                    if !matches!(event, ResponsesStreamEvent::Other) {
-                        events.push(event);
-                    }
+                if let Ok(event) = serde_json::from_slice::<ResponsesStreamEvent>(json_str)
+                    && !matches!(event, ResponsesStreamEvent::Other)
+                {
+                    events.push(event);
                 }
             }
         }
@@ -920,18 +920,18 @@ impl ResponsesFunctionCallAccumulator {
     pub fn add_item(&mut self, item: &Value) {
         let item_type = item.get("type").and_then(|v| v.as_str());
         let item_id = item.get("id").and_then(|v| v.as_str());
-        if item_type == Some("function_call") {
-            if let Some(item_id) = item_id {
-                let entry = self.pending.entry(item_id.to_string()).or_default();
-                if entry.name.is_none() {
-                    entry.name = item.get("name").and_then(|v| v.as_str()).map(String::from);
-                }
-                if entry.call_id.is_none() {
-                    entry.call_id = item
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                }
+        if item_type == Some("function_call")
+            && let Some(item_id) = item_id
+        {
+            let entry = self.pending.entry(item_id.to_string()).or_default();
+            if entry.name.is_none() {
+                entry.name = item.get("name").and_then(|v| v.as_str()).map(String::from);
+            }
+            if entry.call_id.is_none() {
+                entry.call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
             }
         }
     }
@@ -957,10 +957,10 @@ impl ResponsesFunctionCallAccumulator {
         if entry.finalized {
             return None;
         }
-        if let Some(args) = &final_arguments {
-            if !args.is_empty() {
-                entry.arguments = args.clone();
-            }
+        if let Some(args) = &final_arguments
+            && !args.is_empty()
+        {
+            entry.arguments = args.clone();
         }
         let name = entry.name.clone().unwrap_or_default();
         let call_id = entry.call_id.clone();

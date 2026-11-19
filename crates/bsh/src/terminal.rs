@@ -684,10 +684,10 @@ impl AuditRing {
     /// Append one row, trimming the oldest first so the ring stays bounded.
     fn push(&mut self, row: Audit) {
         while self.rows.len() >= AUDIT_LIMIT {
-            if let Some(old) = self.rows.pop_front() {
-                if !old.allow || old.redacted {
-                    self.blocked = self.blocked.saturating_sub(1);
-                }
+            if let Some(old) = self.rows.pop_front()
+                && (!old.allow || old.redacted)
+            {
+                self.blocked = self.blocked.saturating_sub(1);
             }
         }
         if !row.allow || row.redacted {

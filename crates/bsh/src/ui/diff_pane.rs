@@ -313,10 +313,10 @@ pub(crate) fn load(rel: &str, bytes: &[u8]) -> Result<(Vec<DiffFile>, DiffSource
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Err("diff.binary");
     };
-    if let Ok(files) = DiffFile::parse(text) {
-        if !files.is_empty() {
-            return Ok((files, DiffSource::Patch));
-        }
+    if let Ok(files) = DiffFile::parse(text)
+        && !files.is_empty()
+    {
+        return Ok((files, DiffSource::Patch));
     }
     if text.contains("<<<<<<<") {
         // A conflicted file is a document the reader is mid-way through, so it
@@ -407,21 +407,18 @@ pub(crate) fn classify(
     {
         return Ok((files, source));
     }
-    if let Some(patch) = git {
-        if let Ok(parsed) = DiffFile::parse(patch) {
-            if !parsed.is_empty() {
-                return Ok((parsed, DiffSource::Patch));
-            }
-        }
+    if let Some(patch) = git
+        && let Ok(parsed) = DiffFile::parse(patch)
+        && !parsed.is_empty()
+    {
+        return Ok((parsed, DiffSource::Patch));
     }
-    if untracked {
-        if let Some(patch) = added_file_patch(label, bytes) {
-            if let Ok(parsed) = DiffFile::parse(&patch) {
-                if !parsed.is_empty() {
-                    return Ok((parsed, DiffSource::Patch));
-                }
-            }
-        }
+    if untracked
+        && let Some(patch) = added_file_patch(label, bytes)
+        && let Ok(parsed) = DiffFile::parse(&patch)
+        && !parsed.is_empty()
+    {
+        return Ok((parsed, DiffSource::Patch));
     }
     Ok((files, source))
 }
@@ -731,15 +728,15 @@ pub(crate) fn preview_for_workspace(
     changes: &[(char, String)],
 ) -> Vec<PreviewLine> {
     let rel = workspace_relative(root, path);
-    if let Some(patch) = git_diff(root, &rel) {
-        if let Some(rows) = rows_of(&patch) {
-            return rows;
-        }
+    if let Some(patch) = git_diff(root, &rel)
+        && let Some(rows) = rows_of(&patch)
+    {
+        return rows;
     }
-    if let Ok(bytes) = crate::files::read(root, &rel) {
-        if let Ok(text) = String::from_utf8(bytes) {
-            return preview_lines(path, changes, Some(&text));
-        }
+    if let Ok(bytes) = crate::files::read(root, &rel)
+        && let Ok(text) = String::from_utf8(bytes)
+    {
+        return preview_lines(path, changes, Some(&text));
     }
     preview_lines(path, changes, None)
 }

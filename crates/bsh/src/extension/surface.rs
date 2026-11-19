@@ -232,16 +232,16 @@ impl SurfaceHost {
                 continue;
             }
             let slot = HostSlot::from_panel_location(admission.location);
-            if slot.occupancy() == Occupancy::Single {
-                if let Some(other) = self.occupied_by(slot, panel_id) {
-                    let error = format!(
-                        "the {} slot admits one presenter; {other} is already mounted there",
-                        slot.id()
-                    );
-                    self.refused.insert(panel_id.to_string(), error.clone());
-                    report.errors.push(format!("{panel_id}: {error}"));
-                    continue;
-                }
+            if slot.occupancy() == Occupancy::Single
+                && let Some(other) = self.occupied_by(slot, panel_id)
+            {
+                let error = format!(
+                    "the {} slot admits one presenter; {other} is already mounted there",
+                    slot.id()
+                );
+                self.refused.insert(panel_id.to_string(), error.clone());
+                report.errors.push(format!("{panel_id}: {error}"));
+                continue;
             }
             match self.admit(panel_id, admission) {
                 Ok(instance) => {
@@ -449,27 +449,21 @@ impl SurfaceHost {
         match value {
             serde_json::Value::Object(mut map) => {
                 if map.get("type").and_then(serde_json::Value::as_str) == Some("slot") {
-                    if let Some(child) = self.slot_target(&map) {
-                        if depth < self.limits.max_slot_depth && !chain.contains(&child.0) {
-                            if let Ok(instance) = self.engine.instance(child.1) {
-                                if let Some(document) = instance.document() {
-                                    if let Ok(root) = serde_json::to_value(&document.root) {
-                                        chain.push(child.0.clone());
-                                        let mut expanded =
-                                            self.expand_value(root, depth + 1, chain);
-                                        chain.pop();
-                                        // A child control's action names its own panel,
-                                        // so the parent view can route the press to the
-                                        // provider that owns the region.
-                                        prefix_actions(
-                                            &mut expanded,
-                                            &format!("{}\u{1f}", child.0),
-                                        );
-                                        return expanded;
-                                    }
-                                }
-                            }
-                        }
+                    if let Some(child) = self.slot_target(&map)
+                        && depth < self.limits.max_slot_depth
+                        && !chain.contains(&child.0)
+                        && let Ok(instance) = self.engine.instance(child.1)
+                        && let Some(document) = instance.document()
+                        && let Ok(root) = serde_json::to_value(&document.root)
+                    {
+                        chain.push(child.0.clone());
+                        let mut expanded = self.expand_value(root, depth + 1, chain);
+                        chain.pop();
+                        // A child control's action names its own panel,
+                        // so the parent view can route the press to the
+                        // provider that owns the region.
+                        prefix_actions(&mut expanded, &format!("{}\u{1f}", child.0));
+                        return expanded;
                     }
                     if let Some(fallback) = map.remove("fallback") {
                         return self.expand_value(fallback, depth, chain);
@@ -575,13 +569,13 @@ impl SurfaceHost {
         document: SurfaceDocument,
     ) -> Result<InstanceId, String> {
         let slot = HostSlot::from_panel_location(location);
-        if slot.occupancy() == Occupancy::Single {
-            if let Some(other) = self.occupied_by(slot, panel_id) {
-                return Err(format!(
-                    "the {} slot admits one presenter; {other} is already mounted there",
-                    slot.id()
-                ));
-            }
+        if slot.occupancy() == Occupancy::Single
+            && let Some(other) = self.occupied_by(slot, panel_id)
+        {
+            return Err(format!(
+                "the {} slot admits one presenter; {other} is already mounted there",
+                slot.id()
+            ));
         }
         let contract = self.contract_for_surface(panel_id, Some(&document))?;
         let instance = self

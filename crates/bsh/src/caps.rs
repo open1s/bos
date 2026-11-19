@@ -467,10 +467,10 @@ impl agent::agent::AgentPlugin for DispatcherPlugin {
             "input": request.input.as_text().unwrap_or_default(),
             "temperature": request.temperature,
         });
-        if let Some(value) = crate::extension::dispatcher().waterfall("model.before", payload) {
-            if let Some(model) = value.get("model").and_then(serde_json::Value::as_str) {
-                request.model = model.to_string();
-            }
+        if let Some(value) = crate::extension::dispatcher().waterfall("model.before", payload)
+            && let Some(model) = value.get("model").and_then(serde_json::Value::as_str)
+        {
+            request.model = model.to_string();
         }
         Some(request)
     }
@@ -977,10 +977,10 @@ fn build_agent_for_session_inner(
     // Minimal mounts nothing, and an empty list must not read as "no preset".
     let preset_bundles = (!eff.preset_id.is_empty()).then(|| eff.preset_plugins.clone());
     let off_bundle = |name: &str| {
-        if let Some(allowed) = &preset_bundles {
-            if !allowed.iter().any(|bundle| bundle == name) {
-                return true;
-            }
+        if let Some(allowed) = &preset_bundles
+            && !allowed.iter().any(|bundle| bundle == name)
+        {
+            return true;
         }
         false
     };
@@ -1745,20 +1745,20 @@ fn build_agent_for_session_inner(
             let root = settings.active_workspace_root();
             (!root.is_empty()).then(|| std::path::PathBuf::from(root))
         });
-    if let Some(workspace) = task_root {
-        if !off_tool("task_create") {
-            let task_bash = agent.registry().and_then(|registry| registry.get("bash"));
-            crate::task_tools::attach(
-                &mut agent,
-                crate::task_tools::TaskToolsContext {
-                    session: session.to_string(),
-                    workspace,
-                    subagents: task_subagents,
-                    bash: task_bash,
-                    jobs: Some(jobs.clone()),
-                },
-            );
-        }
+    if let Some(workspace) = task_root
+        && !off_tool("task_create")
+    {
+        let task_bash = agent.registry().and_then(|registry| registry.get("bash"));
+        crate::task_tools::attach(
+            &mut agent,
+            crate::task_tools::TaskToolsContext {
+                session: session.to_string(),
+                workspace,
+                subagents: task_subagents,
+                bash: task_bash,
+                jobs: Some(jobs.clone()),
+            },
+        );
     }
 
     // The built-in browser: its tools act on ONE shared pane. The handle is the
@@ -1808,28 +1808,29 @@ fn build_agent_for_session_inner(
     // A trusted peer's capabilities reach the model only when the reader asked
     // for them. The node is a process singleton; a build with no running node
     // (federation disabled, or the node failed to start) has no remote tools.
-    if settings.global.federation.enabled && settings.global.federation.include_remote_tools {
-        if let Some(federation) = crate::federation_node::running() {
-            let workspace = agent::capability::WorkspaceId::new(format!("ws:session:{session}"))
-                .unwrap_or_else(|_| {
-                    agent::capability::WorkspaceId::new("ws:session")
-                        .expect("a valid fallback workspace id")
-                });
-            match crate::federation_node::attach_remote_tools(
-                &agent,
-                &federation,
-                workspace,
-                agent::capability::Principal::Local {
-                    session: session.to_string(),
-                    preset: preset.clone(),
-                },
-            ) {
-                Ok(0) => {}
-                Ok(count) => {
-                    log::info!("federation: {count} remote capabilities offered to the model")
-                }
-                Err(error) => log::warn!("federation remote tools were not attached: {error}"),
+    if settings.global.federation.enabled
+        && settings.global.federation.include_remote_tools
+        && let Some(federation) = crate::federation_node::running()
+    {
+        let workspace = agent::capability::WorkspaceId::new(format!("ws:session:{session}"))
+            .unwrap_or_else(|_| {
+                agent::capability::WorkspaceId::new("ws:session")
+                    .expect("a valid fallback workspace id")
+            });
+        match crate::federation_node::attach_remote_tools(
+            &agent,
+            &federation,
+            workspace,
+            agent::capability::Principal::Local {
+                session: session.to_string(),
+                preset: preset.clone(),
+            },
+        ) {
+            Ok(0) => {}
+            Ok(count) => {
+                log::info!("federation: {count} remote capabilities offered to the model")
             }
+            Err(error) => log::warn!("federation remote tools were not attached: {error}"),
         }
     }
     // The capability registry is opt-in: it rebuilds this turn's tools through
@@ -3484,15 +3485,15 @@ fn attach_subagent_interrupt_tool(agent: &mut Agent, context: Arc<SubagentContex
                     // It may have settled between the status check and the
                     // abort: report the state it reached rather than claiming a
                     // failure to stop something that already finished.
-                    if let Some(now) = context.registry.run(&id) {
-                        if !now.status.is_running() {
-                            return Ok(serde_json::json!({
-                                "subagent_id": id,
-                                "interrupted": false,
-                                "status": now.status.as_str(),
-                                "note": "The run settled before it could be stopped; read it with subagent_result."
-                            }));
-                        }
+                    if let Some(now) = context.registry.run(&id)
+                        && !now.status.is_running()
+                    {
+                        return Ok(serde_json::json!({
+                            "subagent_id": id,
+                            "interrupted": false,
+                            "status": now.status.as_str(),
+                            "note": "The run settled before it could be stopped; read it with subagent_result."
+                        }));
                     }
                     return Err(ToolError::Failed(format!(
                         "subagent run '{id}' has no live process to stop (it was restored after a restart); its status is unchanged. Start a new subagent instead."
@@ -4037,10 +4038,10 @@ fn ignore_rules(root: Option<&Path>) -> Option<Rules> {
 /// preference, not a security boundary, so it runs before the policy and names
 /// the file to edit.
 fn refuse_ignored(rules: Option<&Rules>, target: &Path) -> Result<(), ToolError> {
-    if let Some(rules) = rules {
-        if rules.is_ignored(target, target.is_dir()) {
-            return Err(ToolError::Failed(rules.refusal(target)));
-        }
+    if let Some(rules) = rules
+        && rules.is_ignored(target, target.is_dir())
+    {
+        return Err(ToolError::Failed(rules.refusal(target)));
     }
     Ok(())
 }
@@ -4404,16 +4405,16 @@ fn write_bytes(target: &Path, bytes: &[u8]) -> Result<WriteOutcome, ToolError> {
                     target.display()
                 )));
             }
-            if meta.is_file() && meta.len() == bytes.len() as u64 {
-                if let Ok(old) = fs::read(target) {
-                    if old == bytes {
-                        return Ok(WriteOutcome {
-                            bytes: bytes.len(),
-                            unchanged: true,
-                            existed: true,
-                        });
-                    }
-                }
+            if meta.is_file()
+                && meta.len() == bytes.len() as u64
+                && let Ok(old) = fs::read(target)
+                && old == bytes
+            {
+                return Ok(WriteOutcome {
+                    bytes: bytes.len(),
+                    unchanged: true,
+                    existed: true,
+                });
             }
             Some(meta)
         }
@@ -5736,15 +5737,15 @@ fn write_file_tool(
                 .unwrap_or(SnapshotState::Absent);
             let existed = before.is_present();
             let outcome = write_bytes(&target, content.as_bytes())?;
-            if !outcome.unchanged {
-                if let Some(runtime) = &review {
-                    let operation = if existed {
-                        ChangeOperation::Write
-                    } else {
-                        ChangeOperation::Create
-                    };
-                    runtime.record(&target, operation, before, "write_file");
-                }
+            if !outcome.unchanged
+                && let Some(runtime) = &review
+            {
+                let operation = if existed {
+                    ChangeOperation::Write
+                } else {
+                    ChangeOperation::Create
+                };
+                runtime.record(&target, operation, before, "write_file");
             }
             let mut result = serde_json::json!({
                 "path": target.display().to_string(),
@@ -6012,10 +6013,11 @@ fn sed_tool(
                     crate::sed::Error::Refused(message) => ToolError::InvalidInput(message),
                     crate::sed::Error::Failed(message) => ToolError::Failed(message),
                 })?;
-            if !dry_run && outcome.changed {
-                if let Some(runtime) = &review {
-                    runtime.record(&target, ChangeOperation::Edit, before, "sed");
-                }
+            if !dry_run
+                && outcome.changed
+                && let Some(runtime) = &review
+            {
+                runtime.record(&target, ChangeOperation::Edit, before, "sed");
             }
             let empty = dry_run && outcome.content.as_ref().is_none_or(String::is_empty);
             let truncated = if dry_run {
@@ -6317,14 +6319,13 @@ fn schedule_tools(
                     GlobalSettings::NAME_LIMIT
                 )));
             }
-            if let Some(wanted) = args.get("session_id").and_then(serde_json::Value::as_str) {
-                if !wanted.trim().is_empty() && wanted.trim() != create_session {
+            if let Some(wanted) = args.get("session_id").and_then(serde_json::Value::as_str)
+                && !wanted.trim().is_empty() && wanted.trim() != create_session {
                     return Err(ToolError::InvalidInput(
                         "a task runs in the session that created it; omit session_id to use this one"
                             .to_string(),
                     ));
                 }
-            }
             let every_seconds = args
                 .get("every_seconds")
                 .and_then(serde_json::Value::as_u64)
@@ -6421,14 +6422,13 @@ fn schedule_tools(
                 )));
             }
             let name = optional_text(args, "name")?;
-            if let Some(name) = &name {
-                if name.chars().count() > GlobalSettings::NAME_LIMIT {
+            if let Some(name) = &name
+                && name.chars().count() > GlobalSettings::NAME_LIMIT {
                     return Err(ToolError::InvalidInput(format!(
                         "name is longer than {} characters",
                         GlobalSettings::NAME_LIMIT
                     )));
                 }
-            }
             let prompt = optional_text(args, "prompt")?;
             let every_seconds = args
                 .get("every_seconds")

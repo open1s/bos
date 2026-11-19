@@ -338,13 +338,13 @@ fn validate_binding(key: &str, binding: &ActionBinding, report: &mut ValidationR
             ),
         );
     }
-    if let Some(operation) = &binding.operation {
-        if operation.trim().is_empty() || operation.contains(char::is_whitespace) {
-            report.error(
-                "surface.bindings.operation",
-                format!("binding {key:?} names an empty or spaced operation"),
-            );
-        }
+    if let Some(operation) = &binding.operation
+        && (operation.trim().is_empty() || operation.contains(char::is_whitespace))
+    {
+        report.error(
+            "surface.bindings.operation",
+            format!("binding {key:?} names an empty or spaced operation"),
+        );
     }
 }
 
@@ -441,13 +441,13 @@ impl Walk<'_> {
                     format!("slot names {surface:?}, which is not a provider-qualified surface id"),
                 );
             }
-            if let Some(version) = version {
-                if semver::VersionReq::parse(version).is_err() {
-                    self.report.error(
-                        "surface.slot.version",
-                        format!("slot version range {version:?} is not valid semver"),
-                    );
-                }
+            if let Some(version) = version
+                && semver::VersionReq::parse(version).is_err()
+            {
+                self.report.error(
+                    "surface.slot.version",
+                    format!("slot version range {version:?} is not valid semver"),
+                );
             }
             if !props.is_null() && !props.is_object() {
                 self.report.error(

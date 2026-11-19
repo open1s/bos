@@ -63,10 +63,10 @@ pub(crate) fn resolve_profile(configured: Option<&str>) -> String {
     if let Some(name) = PROFILE.get() {
         return name.clone();
     }
-    if let Ok(name) = std::env::var("BSH_FEDERATION_PROFILE") {
-        if valid_profile(&name) {
-            return name.trim().to_string();
-        }
+    if let Ok(name) = std::env::var("BSH_FEDERATION_PROFILE")
+        && valid_profile(&name)
+    {
+        return name.trim().to_string();
     }
     configured
         .filter(|name| valid_profile(name))

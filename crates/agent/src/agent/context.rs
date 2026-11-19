@@ -824,24 +824,24 @@ fn extract_quantities(text: &str) -> Vec<String> {
         } else if "天日周月年小时分钟秒次元".contains(chars[index]) {
             // Chinese unit attached to the preceding number: reconstruct it.
             let start = quantities.len().saturating_sub(1);
-            if let Some(last) = quantities.get_mut(start) {
-                if last.chars().all(|c| c.is_ascii_digit()) {
-                    let unit = match chars[index] {
-                        '天' | '日' => "d",
-                        '周' => "w",
-                        '月' => "mo",
-                        '年' => "y",
-                        '小' => "h",
-                        '时' => "h",
-                        '分' => "m",
-                        '钟' => "m",
-                        '秒' => "s",
-                        '次' => "x",
-                        '元' => "cny",
-                        _ => "",
-                    };
-                    last.push_str(unit);
-                }
+            if let Some(last) = quantities.get_mut(start)
+                && last.chars().all(|c| c.is_ascii_digit())
+            {
+                let unit = match chars[index] {
+                    '天' | '日' => "d",
+                    '周' => "w",
+                    '月' => "mo",
+                    '年' => "y",
+                    '小' => "h",
+                    '时' => "h",
+                    '分' => "m",
+                    '钟' => "m",
+                    '秒' => "s",
+                    '次' => "x",
+                    '元' => "cny",
+                    _ => "",
+                };
+                last.push_str(unit);
             }
             index += 1;
         } else {
@@ -2054,22 +2054,22 @@ impl AgentSession {
                     payload_bytes.len()
                 ));
             }
-        } else if let Some(recorded_bytes) = checkpoint.archive_bytes {
-            if recorded_bytes != payload_bytes.len() {
-                return CheckpointSourceStatus::Corrupted(format!(
-                    "legacy checkpoint archive bytes {recorded_bytes} do not match payload {}",
-                    payload_bytes.len()
-                ));
-            }
+        } else if let Some(recorded_bytes) = checkpoint.archive_bytes
+            && recorded_bytes != payload_bytes.len()
+        {
+            return CheckpointSourceStatus::Corrupted(format!(
+                "legacy checkpoint archive bytes {recorded_bytes} do not match payload {}",
+                payload_bytes.len()
+            ));
         }
-        if let Some(recorded) = self.archive_entry_bytes.get(&checkpoint.source_digest) {
-            if *recorded != payload_bytes.len() {
-                return CheckpointSourceStatus::Corrupted(format!(
-                    "archive byte accounting {} does not match payload {}",
-                    recorded,
-                    payload_bytes.len()
-                ));
-            }
+        if let Some(recorded) = self.archive_entry_bytes.get(&checkpoint.source_digest)
+            && *recorded != payload_bytes.len()
+        {
+            return CheckpointSourceStatus::Corrupted(format!(
+                "archive byte accounting {} does not match payload {}",
+                recorded,
+                payload_bytes.len()
+            ));
         }
         CheckpointSourceStatus::Valid
     }
@@ -3110,29 +3110,25 @@ impl ReActApp for AgentReActApp {
         // block belongs in the request's instruction section, not in the
         // transcript: a later task must not inherit it. The tool result keeps
         // a short acknowledgement so the call still has an answer.
-        if tool_name == "load_skill" {
-            if let Ok(value) = result {
-                if value.get("error").is_none() {
-                    if let Some(instructions) =
-                        value.get("instructions").and_then(|text| text.as_str())
-                    {
-                        let instructions = instructions.to_string();
-                        if !instructions.is_empty() {
-                            context.set_skill_instructions(instructions);
-                            if let Some(object) = value.as_object_mut() {
-                                object.insert(
-                                    "instructions".to_string(),
-                                    serde_json::json!(
-                                        "The skill instructions are in the system prompt for this task."
-                                    ),
-                                );
-                                object.insert(
-                                    "instructions_in_context".to_string(),
-                                    serde_json::json!(true),
-                                );
-                            }
-                        }
-                    }
+        if tool_name == "load_skill"
+            && let Ok(value) = result
+            && value.get("error").is_none()
+            && let Some(instructions) = value.get("instructions").and_then(|text| text.as_str())
+        {
+            let instructions = instructions.to_string();
+            if !instructions.is_empty() {
+                context.set_skill_instructions(instructions);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "instructions".to_string(),
+                        serde_json::json!(
+                            "The skill instructions are in the system prompt for this task."
+                        ),
+                    );
+                    object.insert(
+                        "instructions_in_context".to_string(),
+                        serde_json::json!(true),
+                    );
                 }
             }
         }

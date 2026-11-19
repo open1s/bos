@@ -223,86 +223,86 @@ impl RustProvider {
                 });
             }
 
-            if node.kind() == "mod_item" {
-                if let (Some(range), Some(name_node)) = (
+            if node.kind() == "mod_item"
+                && let (Some(range), Some(name_node)) = (
                     source_range(node, source.len()),
                     node.child_by_field_name("name"),
-                ) {
-                    if facts
-                        .len()
-                        .saturating_add(imports.len())
-                        .saturating_add(modules.len())
-                        >= limits.max_facts
-                    {
-                        limit_reason = Some(ParseLimitKind::Facts);
-                        break;
-                    }
-                    if let Some(name) = text_for_node(name_node, source) {
-                        modules.push(RustModuleFact {
-                            scope_path: enclosing_module_path(node, source),
-                            name: name.trim_start_matches("r#").to_owned(),
-                            is_inline: node.child_by_field_name("body").is_some(),
-                            has_resolution_attributes: has_resolution_attributes(node, source),
+                )
+            {
+                if facts
+                    .len()
+                    .saturating_add(imports.len())
+                    .saturating_add(modules.len())
+                    >= limits.max_facts
+                {
+                    limit_reason = Some(ParseLimitKind::Facts);
+                    break;
+                }
+                if let Some(name) = text_for_node(name_node, source) {
+                    modules.push(RustModuleFact {
+                        scope_path: enclosing_module_path(node, source),
+                        name: name.trim_start_matches("r#").to_owned(),
+                        is_inline: node.child_by_field_name("body").is_some(),
+                        has_resolution_attributes: has_resolution_attributes(node, source),
+                        range,
+                    });
+                }
+            }
+
+            if node.kind() == "use_declaration"
+                && let Some(range) = source_range(node, source.len())
+            {
+                let scope_path = enclosing_module_path(node, source);
+                let argument = node.child_by_field_name("argument").or_else(|| {
+                    node.named_child(node.named_child_count().saturating_sub(1) as u32)
+                });
+                if let Some(argument) = argument {
+                    let mut expanded = Vec::new();
+                    flatten_use_tree(argument, &[], source, &mut expanded);
+                    for (path, alias, is_glob) in expanded {
+                        if facts
+                            .len()
+                            .saturating_add(imports.len())
+                            .saturating_add(modules.len())
+                            >= limits.max_facts
+                        {
+                            limit_reason = Some(ParseLimitKind::Facts);
+                            break;
+                        }
+                        imports.push(ImportFact {
+                            scope_path: scope_path.clone(),
+                            path,
+                            alias,
+                            is_glob,
                             range,
                         });
                     }
                 }
-            }
-
-            if node.kind() == "use_declaration" {
-                if let Some(range) = source_range(node, source.len()) {
-                    let scope_path = enclosing_module_path(node, source);
-                    let argument = node.child_by_field_name("argument").or_else(|| {
-                        node.named_child(node.named_child_count().saturating_sub(1) as u32)
-                    });
-                    if let Some(argument) = argument {
-                        let mut expanded = Vec::new();
-                        flatten_use_tree(argument, &[], source, &mut expanded);
-                        for (path, alias, is_glob) in expanded {
-                            if facts
-                                .len()
-                                .saturating_add(imports.len())
-                                .saturating_add(modules.len())
-                                >= limits.max_facts
-                            {
-                                limit_reason = Some(ParseLimitKind::Facts);
-                                break;
-                            }
-                            imports.push(ImportFact {
-                                scope_path: scope_path.clone(),
-                                path,
-                                alias,
-                                is_glob,
-                                range,
-                            });
-                        }
-                    }
-                    if limit_reason.is_some() {
-                        break;
-                    }
+                if limit_reason.is_some() {
+                    break;
                 }
             }
 
-            if let Some((kind, name)) = classify_node(node, source) {
-                if let Some(range) = source_range(node, source.len()) {
-                    if facts
-                        .len()
-                        .saturating_add(imports.len())
-                        .saturating_add(modules.len())
-                        >= limits.max_facts
-                    {
-                        limit_reason = Some(ParseLimitKind::Facts);
-                        break;
-                    }
-                    facts.push(SyntaxFact {
-                        kind,
-                        name,
-                        scope_path: enclosing_module_path(node, source),
-                        is_module_scope: is_module_scope(node),
-                        visibility: rust_visibility(node, source),
-                        range,
-                    });
+            if let Some((kind, name)) = classify_node(node, source)
+                && let Some(range) = source_range(node, source.len())
+            {
+                if facts
+                    .len()
+                    .saturating_add(imports.len())
+                    .saturating_add(modules.len())
+                    >= limits.max_facts
+                {
+                    limit_reason = Some(ParseLimitKind::Facts);
+                    break;
                 }
+                facts.push(SyntaxFact {
+                    kind,
+                    name,
+                    scope_path: enclosing_module_path(node, source),
+                    is_module_scope: is_module_scope(node),
+                    visibility: rust_visibility(node, source),
+                    range,
+                });
             }
 
             let child_count = node.child_count();
@@ -402,13 +402,12 @@ fn enclosing_module_path(node: Node<'_>, source: &str) -> Vec<String> {
     let mut modules = Vec::new();
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
-        if current.kind() == "mod_item" {
-            if let Some(name) = current
+        if current.kind() == "mod_item"
+            && let Some(name) = current
                 .child_by_field_name("name")
                 .and_then(|name| text_for_node(name, source))
-            {
-                modules.push(name.trim_start_matches("r#").to_owned());
-            }
+        {
+            modules.push(name.trim_start_matches("r#").to_owned());
         }
         ancestor = current.parent();
     }

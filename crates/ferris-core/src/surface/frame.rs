@@ -317,10 +317,10 @@ fn contains(node: &SurfaceNode, id: &str) -> bool {
     if node.id() == Some(id) {
         return true;
     }
-    if let Some(children) = node.container_children() {
-        if children.iter().any(|child| contains(child, id)) {
-            return true;
-        }
+    if let Some(children) = node.container_children()
+        && children.iter().any(|child| contains(child, id))
+    {
+        return true;
     }
     match node {
         SurfaceNode::Tabs { tabs, .. } => tabs.iter().any(|tab| contains(&tab.content, id)),

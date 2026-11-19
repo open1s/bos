@@ -1069,13 +1069,13 @@ impl Store {
         for dir in self.session_dirs() {
             let document = dir.join(format!("{id}.json"));
             let _ = fs::remove_file(dir.join(format!("{id}.json.tmp")));
-            if document.is_file() {
-                if let Err(error) = fs::remove_file(&document) {
-                    log::warn!(
-                        "session {id} document could not be removed ({}): {error}",
-                        document.display()
-                    );
-                }
+            if document.is_file()
+                && let Err(error) = fs::remove_file(&document)
+            {
+                log::warn!(
+                    "session {id} document could not be removed ({}): {error}",
+                    document.display()
+                );
             }
             let history = History::dir_for(&dir, id);
             if history.is_dir() {
@@ -1493,11 +1493,11 @@ impl Store {
                 .write(true)
                 .open(&lock_path)
                 .ok();
-            if let Some(lock) = &lock {
-                if lock.try_lock_exclusive().is_err() {
-                    // A live process owns this turn; its own save clears it.
-                    continue;
-                }
+            if let Some(lock) = &lock
+                && lock.try_lock_exclusive().is_err()
+            {
+                // A live process owns this turn; its own save clears it.
+                continue;
             }
             if has_journal && !self.sessions.iter().any(|session| session.id == id) {
                 // The document is gone: a delete that crashed before removing
@@ -1690,21 +1690,21 @@ impl Store {
             return Recovery::AlreadyCovered;
         }
         let mut rows = journal.rows;
-        if let Some(last) = rows.last_mut() {
-            if last.role == Role::Assistant {
-                // The process died mid-turn: an answer-less row is a cancelled
-                // turn, exactly as a stop records one, so the transcript says
-                // why it ends and the next request does not replay an empty
-                // assistant message.
-                let empty = last.text.is_empty()
-                    && last.reasoning.is_empty()
-                    && last.tools.is_empty()
-                    && last.error.is_none();
-                if empty {
-                    last.meta
-                        .get_or_insert_with(crate::model::MessageMeta::default)
-                        .cancelled = true;
-                }
+        if let Some(last) = rows.last_mut()
+            && last.role == Role::Assistant
+        {
+            // The process died mid-turn: an answer-less row is a cancelled
+            // turn, exactly as a stop records one, so the transcript says
+            // why it ends and the next request does not replay an empty
+            // assistant message.
+            let empty = last.text.is_empty()
+                && last.reasoning.is_empty()
+                && last.tools.is_empty()
+                && last.error.is_none();
+            if empty {
+                last.meta
+                    .get_or_insert_with(crate::model::MessageMeta::default)
+                    .cancelled = true;
             }
         }
         let outcome = if len == journal.base {

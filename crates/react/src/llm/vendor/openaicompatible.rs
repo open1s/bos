@@ -424,15 +424,14 @@ impl StreamToolCallAccumulator {
         }
         entry.arguments.push_str(args_delta);
 
-        if may_be_complete {
-            if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&entry.arguments) {
-                if let (Some(n), Some(i)) = (entry.name.as_ref(), entry.id.as_ref()) {
-                    let result = (n.clone(), args_val, Some(i.clone()));
-                    self.pending.remove(&index);
-                    self.scans.remove(&index);
-                    return Some(result);
-                }
-            }
+        if may_be_complete
+            && let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&entry.arguments)
+            && let (Some(n), Some(i)) = (entry.name.as_ref(), entry.id.as_ref())
+        {
+            let result = (n.clone(), args_val, Some(i.clone()));
+            self.pending.remove(&index);
+            self.scans.remove(&index);
+            return Some(result);
         }
         None
     }

@@ -139,10 +139,10 @@ impl GlobalSettings {
                 return Err(ScheduleRefusal::Name);
             }
         }
-        if let Some(prompt) = prompt {
-            if prompt.trim().is_empty() {
-                return Err(ScheduleRefusal::Prompt);
-            }
+        if let Some(prompt) = prompt
+            && prompt.trim().is_empty()
+        {
+            return Err(ScheduleRefusal::Prompt);
         }
         let Some(entry) = self.schedules.iter_mut().find(|entry| entry.id == id) else {
             return Err(ScheduleRefusal::Unknown);
@@ -2316,15 +2316,13 @@ impl GlobalSettings {
         // field instead of quietly becoming an allow-everything or a dropped
         // deny entry.
         for (id, preset) in &self.presets {
-            if let Some(level) = preset.level {
-                if level > MAX_PRESET_LEVEL {
-                    return Err(SettingsError::InvalidPreset {
-                        preset: id.clone(),
-                        why: format!(
-                            "level: expected an integer 0..={MAX_PRESET_LEVEL}, got {level}"
-                        ),
-                    });
-                }
+            if let Some(level) = preset.level
+                && level > MAX_PRESET_LEVEL
+            {
+                return Err(SettingsError::InvalidPreset {
+                    preset: id.clone(),
+                    why: format!("level: expected an integer 0..={MAX_PRESET_LEVEL}, got {level}"),
+                });
             }
             if let Some((field, entry, why)) = preset.scope_problem() {
                 return Err(SettingsError::InvalidPreset {
@@ -2342,13 +2340,13 @@ impl GlobalSettings {
     /// through [`GlobalSettings::validate`]; this is the same check with the id
     /// the reader is editing in the message.
     pub(crate) fn validate_preset(id: &str, preset: &Preset) -> Result<(), SettingsError> {
-        if let Some(level) = preset.level {
-            if level > MAX_PRESET_LEVEL {
-                return Err(SettingsError::InvalidPreset {
-                    preset: id.to_string(),
-                    why: format!("level: expected an integer 0..={MAX_PRESET_LEVEL}, got {level}"),
-                });
-            }
+        if let Some(level) = preset.level
+            && level > MAX_PRESET_LEVEL
+        {
+            return Err(SettingsError::InvalidPreset {
+                preset: id.to_string(),
+                why: format!("level: expected an integer 0..={MAX_PRESET_LEVEL}, got {level}"),
+            });
         }
         match preset.scope_problem() {
             Some((field, entry, why)) => Err(SettingsError::InvalidPreset {

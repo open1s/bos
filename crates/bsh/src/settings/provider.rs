@@ -228,10 +228,10 @@ fn model_id_refusal(leaf: &ModelEntry, taken: &BTreeSet<String>) -> Option<Provi
     if taken.iter().any(|other| fold(other) == folded) {
         return Some(ProviderRefusal::ModelIdDuplicate);
     }
-    if let Some(name) = leaf.name.as_deref() {
-        if name.trim().is_empty() {
-            return Some(ProviderRefusal::ModelNameInvalid);
-        }
+    if let Some(name) = leaf.name.as_deref()
+        && name.trim().is_empty()
+    {
+        return Some(ProviderRefusal::ModelNameInvalid);
     }
     None
 }
@@ -532,10 +532,10 @@ impl GlobalSettings {
         };
         if self.add_named_model(provider, nickname, leaf)? {
             let mode = api_mode.trim();
-            if !mode.is_empty() {
-                if let Some(entry) = self.model_entry_mut(provider, &key) {
-                    entry.api_mode = Some(mode.to_string());
-                }
+            if !mode.is_empty()
+                && let Some(entry) = self.model_entry_mut(provider, &key)
+            {
+                entry.api_mode = Some(mode.to_string());
             }
         }
         Ok(())

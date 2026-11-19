@@ -153,11 +153,11 @@ impl SubagentRun {
                             ms: None,
                             at: None,
                         };
-                        if let Some(last) = out.last_mut() {
-                            if last.role == Role::Assistant {
-                                last.tools.push(event);
-                                continue;
-                            }
+                        if let Some(last) = out.last_mut()
+                            && last.role == Role::Assistant
+                        {
+                            last.tools.push(event);
+                            continue;
                         }
                         let mut message = ChatMessage::assistant();
                         message.tools.push(event);
@@ -378,16 +378,16 @@ impl SubagentRegistry {
         transcript: Vec<SubagentMessage>,
     ) {
         self.forget_handle(id);
-        if let Ok(mut runs) = self.runs.lock() {
-            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
-                run.status = SubagentStatus::Done;
-                run.finished_at = Some(now_ms());
-                run.revision += 1;
-                run.prompt_tokens = usage.0;
-                run.completion_tokens = usage.1;
-                run.result = Some(result);
-                run.transcript = transcript;
-            }
+        if let Ok(mut runs) = self.runs.lock()
+            && let Some(run) = runs.iter_mut().find(|run| run.id == id)
+        {
+            run.status = SubagentStatus::Done;
+            run.finished_at = Some(now_ms());
+            run.revision += 1;
+            run.prompt_tokens = usage.0;
+            run.completion_tokens = usage.1;
+            run.result = Some(result);
+            run.transcript = transcript;
         }
     }
 
@@ -400,18 +400,18 @@ impl SubagentRegistry {
         transcript: Vec<SubagentMessage>,
     ) {
         self.forget_handle(id);
-        if let Ok(mut runs) = self.runs.lock() {
-            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
-                run.status = SubagentStatus::Failed;
-                run.finished_at = Some(now_ms());
-                run.revision += 1;
-                if let Some((prompt, completion)) = usage {
-                    run.prompt_tokens = prompt;
-                    run.completion_tokens = completion;
-                }
-                run.error = Some(error);
-                run.transcript = transcript;
+        if let Ok(mut runs) = self.runs.lock()
+            && let Some(run) = runs.iter_mut().find(|run| run.id == id)
+        {
+            run.status = SubagentStatus::Failed;
+            run.finished_at = Some(now_ms());
+            run.revision += 1;
+            if let Some((prompt, completion)) = usage {
+                run.prompt_tokens = prompt;
+                run.completion_tokens = completion;
             }
+            run.error = Some(error);
+            run.transcript = transcript;
         }
     }
 
@@ -448,14 +448,14 @@ impl SubagentRegistry {
             return false;
         };
         handle.abort();
-        if let Ok(mut runs) = self.runs.lock() {
-            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
-                run.status = SubagentStatus::Failed;
-                run.finished_at = Some(now_ms());
-                run.error = Some("interrupted by the parent turn".to_string());
-                run.pending.clear();
-                run.revision += 1;
-            }
+        if let Ok(mut runs) = self.runs.lock()
+            && let Some(run) = runs.iter_mut().find(|run| run.id == id)
+        {
+            run.status = SubagentStatus::Failed;
+            run.finished_at = Some(now_ms());
+            run.error = Some("interrupted by the parent turn".to_string());
+            run.pending.clear();
+            run.revision += 1;
         }
         true
     }
@@ -541,13 +541,12 @@ impl SubagentRegistry {
     /// credential refuses - so a refusal is reported once instead of being
     /// retried on every clock tick.
     pub(crate) fn drop_pending(&self, id: &str) {
-        if let Ok(mut runs) = self.runs.lock() {
-            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
-                if !run.pending.is_empty() {
-                    run.pending.clear();
-                    run.revision += 1;
-                }
-            }
+        if let Ok(mut runs) = self.runs.lock()
+            && let Some(run) = runs.iter_mut().find(|run| run.id == id)
+            && !run.pending.is_empty()
+        {
+            run.pending.clear();
+            run.revision += 1;
         }
     }
 
@@ -556,61 +555,62 @@ impl SubagentRegistry {
         if text.is_empty() {
             return;
         }
-        if let Ok(mut runs) = self.runs.lock() {
-            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
-                if let Some(last) = run.transcript.last_mut() {
-                    if last.role == "assistant" && last.tool.is_none() {
-                        last.content.push_str(text);
-                        run.revision += 1;
-                        return;
-                    }
-                }
-                run.transcript.push(SubagentMessage {
-                    role: "assistant".to_string(),
-                    content: text.to_string(),
-                    tool: None,
-                });
+        if let Ok(mut runs) = self.runs.lock()
+            && let Some(run) = runs.iter_mut().find(|run| run.id == id)
+        {
+            if let Some(last) = run.transcript.last_mut()
+                && last.role == "assistant"
+                && last.tool.is_none()
+            {
+                last.content.push_str(text);
                 run.revision += 1;
+                return;
             }
+            run.transcript.push(SubagentMessage {
+                role: "assistant".to_string(),
+                content: text.to_string(),
+                tool: None,
+            });
+            run.revision += 1;
         }
     }
 
     /// Record a live tool call.
     pub(crate) fn append_tool_call(&self, id: &str, name: &str, args: &str) {
-        if let Ok(mut runs) = self.runs.lock() {
-            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
-                run.transcript.push(SubagentMessage {
-                    role: "tool".to_string(),
-                    content: format!("{name} {args}"),
-                    tool: Some(name.to_string()),
-                });
-                run.revision += 1;
-            }
+        if let Ok(mut runs) = self.runs.lock()
+            && let Some(run) = runs.iter_mut().find(|run| run.id == id)
+        {
+            run.transcript.push(SubagentMessage {
+                role: "tool".to_string(),
+                content: format!("{name} {args}"),
+                tool: Some(name.to_string()),
+            });
+            run.revision += 1;
         }
     }
 
     /// Record a live tool result.
     pub(crate) fn append_tool_result(&self, id: &str, output: &str) {
-        if let Ok(mut runs) = self.runs.lock() {
-            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
-                run.transcript.push(SubagentMessage {
-                    role: "tool".to_string(),
-                    content: output.to_string(),
-                    tool: None,
-                });
-                run.revision += 1;
-            }
+        if let Ok(mut runs) = self.runs.lock()
+            && let Some(run) = runs.iter_mut().find(|run| run.id == id)
+        {
+            run.transcript.push(SubagentMessage {
+                role: "tool".to_string(),
+                content: output.to_string(),
+                tool: None,
+            });
+            run.revision += 1;
         }
     }
 
     /// Update usage while the child is still running.
     pub(crate) fn set_usage(&self, id: &str, prompt: u64, completion: u64) {
-        if let Ok(mut runs) = self.runs.lock() {
-            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
-                run.prompt_tokens = prompt;
-                run.completion_tokens = completion;
-                run.revision += 1;
-            }
+        if let Ok(mut runs) = self.runs.lock()
+            && let Some(run) = runs.iter_mut().find(|run| run.id == id)
+        {
+            run.prompt_tokens = prompt;
+            run.completion_tokens = completion;
+            run.revision += 1;
         }
     }
 

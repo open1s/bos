@@ -1716,10 +1716,10 @@ impl Shell {
         // is in the catalog at the trailing edge.
         let active_pane = self.right.tab;
         let mut open_panes = self.right.open_panes.clone();
-        if let Some(tab) = active_pane {
-            if !open_panes.contains(&tab) {
-                open_panes.push(tab);
-            }
+        if let Some(tab) = active_pane
+            && !open_panes.contains(&tab)
+        {
+            open_panes.push(tab);
         }
         let panes: Vec<(RightTab, f32, f32)> = open_panes
             .iter()
@@ -2103,10 +2103,10 @@ impl Shell {
             })
             .collect();
         let mut open_panes = self.right.open_panes.clone();
-        if let Some(tab) = self.right.tab {
-            if !open_panes.contains(&tab) {
-                open_panes.push(tab);
-            }
+        if let Some(tab) = self.right.tab
+            && !open_panes.contains(&tab)
+        {
+            open_panes.push(tab);
         }
         let panes: Vec<(RightTab, String, bool)> = open_panes
             .iter()
@@ -4863,13 +4863,11 @@ impl Shell {
 
     fn reload_federation_with(&mut self, announce: bool) {
         let runtime = crate::federation_node::running();
-        if announce {
-            if let Some(runtime) = &runtime {
-                // A refresh also says "still here", which is what makes a peer
-                // that started late appear on the other side without waiting
-                // for the next interval.
-                runtime.reannounce();
-            }
+        if announce && let Some(runtime) = &runtime {
+            // A refresh also says "still here", which is what makes a peer
+            // that started late appear on the other side without waiting
+            // for the next interval.
+            runtime.reannounce();
         }
         let rows = if let Some(runtime) = &runtime {
             runtime
@@ -4885,11 +4883,11 @@ impl Shell {
         } else {
             Vec::new()
         };
-        if let Some(selected) = self.right.federation.selected {
-            if selected >= rows.len() {
-                self.right.federation.selected = None;
-                self.right.federation.grant_choices.clear();
-            }
+        if let Some(selected) = self.right.federation.selected
+            && selected >= rows.len()
+        {
+            self.right.federation.selected = None;
+            self.right.federation.grant_choices.clear();
         }
         self.right.federation.peers = rows;
         self.right.federation.discovered = runtime
@@ -5415,15 +5413,15 @@ impl Shell {
             element.label.clone()
         };
         row = row.child(txt(label, theme::CHIP_SIZE, theme::text()).truncate());
-        if let Some(href) = element.href.clone() {
-            if element.kind == "link" {
-                row = row
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::hover())))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.browser_go(href.clone(), cx);
-                    }));
-            }
+        if let Some(href) = element.href.clone()
+            && element.kind == "link"
+        {
+            row = row
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::hover())))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.browser_go(href.clone(), cx);
+                }));
         }
         row
     }
@@ -5624,22 +5622,22 @@ impl Shell {
             // application's - the shell never sees Cmd-Q, and Ghostty's own
             // Cmd-W would close the surface under the pane.
             let key = keystroke.key.as_str();
-            if key == "c" || key == "v" {
-                if let Some(view) = self.right.terminal_view.clone() {
-                    view.update(cx, |view, cx| {
-                        // The software terminal owns its clipboard (issue #296);
-                        // Ghostty sees the chord itself.
-                        if view.is_software_terminal() {
-                            if key == "c" {
-                                view.copy_screen(cx);
-                            } else {
-                                view.paste_clipboard(cx);
-                            }
+            if (key == "c" || key == "v")
+                && let Some(view) = self.right.terminal_view.clone()
+            {
+                view.update(cx, |view, cx| {
+                    // The software terminal owns its clipboard (issue #296);
+                    // Ghostty sees the chord itself.
+                    if view.is_software_terminal() {
+                        if key == "c" {
+                            view.copy_screen(cx);
                         } else {
-                            view.key_down(keystroke, event.is_held);
+                            view.paste_clipboard(cx);
                         }
-                    });
-                }
+                    } else {
+                        view.key_down(keystroke, event.is_held);
+                    }
+                });
             }
             return;
         }
@@ -5668,10 +5666,10 @@ impl Shell {
             }
             return;
         }
-        if let Some(edit) = terminal_edit(keystroke) {
-            if let Some(terminal) = self.right.terminal.as_mut() {
-                terminal.track(edit);
-            }
+        if let Some(edit) = terminal_edit(keystroke)
+            && let Some(terminal) = self.right.terminal.as_mut()
+        {
+            terminal.track(edit);
         }
         crate::terminal::trace_key(&keystroke.key, None);
         view.update(cx, |view, _| {
@@ -6446,11 +6444,11 @@ impl Shell {
                 }
             }
             crate::recent::RecentKind::Document => {
-                if let Some(workspace) = &entry.workspace {
-                    if workspace != &self.state.settings.global.general.active_workspace {
-                        self.state.set_workspace(workspace);
-                        self.refile_workspace(cx);
-                    }
+                if let Some(workspace) = &entry.workspace
+                    && workspace != &self.state.settings.global.general.active_workspace
+                {
+                    self.state.set_workspace(workspace);
+                    self.refile_workspace(cx);
                 }
                 self.open_file(std::path::Path::new(&entry.id), window, cx);
             }
@@ -7127,11 +7125,9 @@ impl Shell {
             entries.push((row, rel.clone(), depth));
             if row.dir {
                 let expanded = self.files.expanded.iter().any(|p| p == &rel);
-                if expanded {
-                    if let Some(children) = self.files.children.get(&rel) {
-                        for child in children.iter().rev() {
-                            stack.push((child, rel.clone(), depth + 1));
-                        }
+                if expanded && let Some(children) = self.files.children.get(&rel) {
+                    for child in children.iter().rev() {
+                        stack.push((child, rel.clone(), depth + 1));
                     }
                 }
             }
@@ -7658,10 +7654,10 @@ impl Shell {
     pub(crate) fn open_comment_card(&mut self, cx: &mut Context<Self>) {
         // The card quotes source lines, so a rendered Markdown tab shows its
         // source first: commenting from the preview is not a dead control.
-        if let Some(rel) = self.files.active_tab().map(|tab| tab.rel.clone()) {
-            if self.files.active_tab().is_some_and(|tab| tab.preview) {
-                self.set_preview(&rel, false, cx);
-            }
+        if let Some(rel) = self.files.active_tab().map(|tab| tab.rel.clone())
+            && self.files.active_tab().is_some_and(|tab| tab.preview)
+        {
+            self.set_preview(&rel, false, cx);
         }
         // The card is the write surface and the thread panel is the reading one,
         // so raising the card does not also open the drawer: the drawer would
@@ -9114,10 +9110,10 @@ impl Shell {
     /// made visible explicitly when its tab is chosen.
     pub(crate) fn activate_pane(&mut self, tab: RightTab, cx: &mut Context<Self>) {
         self.show_right_tab(tab, cx);
-        if tab == RightTab::Terminal {
-            if let Some(view) = self.right.terminal_view.clone() {
-                view.update(cx, |view, _| view.set_visible(true));
-            }
+        if tab == RightTab::Terminal
+            && let Some(view) = self.right.terminal_view.clone()
+        {
+            view.update(cx, |view, _| view.set_visible(true));
         }
         cx.notify();
     }
@@ -9392,12 +9388,12 @@ impl Shell {
         // below feeds the TEXT model the agent tools read; the reader's pane
         // does not need it, and its failures would draw a banner over a page
         // that actually loaded.
-        if let Some(webview) = self.browser_webview.clone() {
-            if url.starts_with("http://") || url.starts_with("https://") {
-                webview.update(cx, |view, _| view.load_url(&url));
-                cx.notify();
-                return;
-            }
+        if let Some(webview) = self.browser_webview.clone()
+            && (url.starts_with("http://") || url.starts_with("https://"))
+        {
+            webview.update(cx, |view, _| view.load_url(&url));
+            cx.notify();
+            return;
         }
         // The GPUI background executor, not the runner's tokio runtime: this is
         // work the window started, and it is the executor the test scheduler
@@ -9419,10 +9415,10 @@ impl Shell {
                 this.browser_refresh_pane();
                 // A refused or failed load already carries its sentence in the
                 // pane; the notice ring would only repeat it.
-                if let Err(failure) = &outcome {
-                    if failure.kind == "scheme" {
-                        this.state.notice(failure.tool_message());
-                    }
+                if let Err(failure) = &outcome
+                    && failure.kind == "scheme"
+                {
+                    this.state.notice(failure.tool_message());
                 }
                 cx.notify();
             });
@@ -9568,26 +9564,27 @@ impl Shell {
         let _ = webview.read(cx).set_visible(visible);
         // A link that asked for a new window: the pane has one page, so load
         // it here. This is what makes a search RESULT open at all.
-        if let Some(url) = self.browser_script.take_new_window() {
-            if url.starts_with("http://") || url.starts_with("https://") {
-                webview.update(cx, |view, _| view.load_url(&url));
-                self.state.browser.mutate(|browser| browser.follow(&url));
-                self.browser_refresh_pane();
-                cx.notify();
-            }
+        if let Some(url) = self.browser_script.take_new_window()
+            && (url.starts_with("http://") || url.starts_with("https://"))
+        {
+            webview.update(cx, |view, _| view.load_url(&url));
+            self.state.browser.mutate(|browser| browser.follow(&url));
+            self.browser_refresh_pane();
+            cx.notify();
         }
         // Follow a link click or a redirect from the navigation handler. This
         // never calls `WebView::url()`: that unwraps a nil NSURL before the
         // first commit, which aborts the process.
         let navigated = self.browser_script.take_navigation();
-        if let Some(url) = navigated {
-            if !url.is_empty() && url != "about:blank" {
-                let changed = self.state.browser.read(|browser| browser.address() != url);
-                if changed {
-                    self.state.browser.mutate(|browser| browser.follow(&url));
-                    self.browser_refresh_pane();
-                    cx.notify();
-                }
+        if let Some(url) = navigated
+            && !url.is_empty()
+            && url != "about:blank"
+        {
+            let changed = self.state.browser.read(|browser| browser.address() != url);
+            if changed {
+                self.state.browser.mutate(|browser| browser.follow(&url));
+                self.browser_refresh_pane();
+                cx.notify();
             }
         }
     }
@@ -10148,12 +10145,11 @@ impl Shell {
     ) {
         let dragging = pressed.is_some() && pressed == self.browser_pressed;
         let now = std::time::Instant::now();
-        if !dragging {
-            if let Some(last) = self.browser_last_move {
-                if now.duration_since(last) < std::time::Duration::from_millis(16) {
-                    return;
-                }
-            }
+        if !dragging
+            && let Some(last) = self.browser_last_move
+            && now.duration_since(last) < std::time::Duration::from_millis(16)
+        {
+            return;
         }
         self.browser_last_move = Some(now);
         let Some((x, y)) = self.browser_page_point(position) else {
@@ -11039,11 +11035,10 @@ impl Shell {
                             // marked by the first one's keystrokes.
                             if let Some(tab) = this.files.tabs.iter_mut().find(|tab| {
                                 tab.rel == open_rel && tab.editor.as_ref() == Some(&editor_id)
-                            }) {
-                                if !tab.dirty {
-                                    tab.dirty = true;
-                                    cx.notify();
-                                }
+                            }) && !tab.dirty
+                            {
+                                tab.dirty = true;
+                                cx.notify();
                             }
                             // A keystroke can move the focused comment's code, so
                             // the cached excerpt is refreshed here, once per edit,
@@ -11346,10 +11341,10 @@ impl Shell {
         // The terminal surface is a window layer, not part of this tree; hiding
         // it for the overview means it has to be brought back explicitly when
         // the pane it belongs to is still the one on screen.
-        if self.right.tab == Some(RightTab::Terminal) {
-            if let Some(view) = self.right.terminal_view.clone() {
-                view.update(cx, |view, _| view.set_visible(true));
-            }
+        if self.right.tab == Some(RightTab::Terminal)
+            && let Some(view) = self.right.terminal_view.clone()
+        {
+            view.update(cx, |view, _| view.set_visible(true));
         }
         cx.notify();
     }

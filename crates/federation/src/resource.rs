@@ -309,14 +309,14 @@ impl LeaseStore {
         if !lease.is_valid(now_ms) {
             return Err(ResourceError::Expired { lease: id.clone() });
         }
-        if let Some(remaining) = lease.remaining() {
-            if bytes > remaining {
-                return Err(ResourceError::QuotaExceeded {
-                    lease: id.clone(),
-                    requested: bytes,
-                    remaining,
-                });
-            }
+        if let Some(remaining) = lease.remaining()
+            && bytes > remaining
+        {
+            return Err(ResourceError::QuotaExceeded {
+                lease: id.clone(),
+                requested: bytes,
+                remaining,
+            });
         }
         Ok(())
     }

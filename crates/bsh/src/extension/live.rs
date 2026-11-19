@@ -117,14 +117,13 @@ fn reconcile(
     changed: Option<&str>,
 ) {
     for entry in entries {
-        if let Some(name) = changed {
-            if !entry
+        if let Some(name) = changed
+            && !entry
                 .requirements
                 .iter()
                 .any(|(required, _)| required == name)
-            {
-                continue;
-            }
+        {
+            continue;
         }
         let ready = entry.ready(services);
         let suspended = entry.suspended.load(Ordering::Acquire);

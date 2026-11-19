@@ -1342,22 +1342,18 @@ impl Orchestrator {
                                 report.detail.clone().unwrap_or_default()
                             );
                             let final_failure = self.graph.fail(&id, reason)?;
-                            if final_failure {
-                                if let Some(task) = task {
-                                    if task.compensation.is_some() {
-                                        let compensation = executor.compensate(&task).await;
-                                        let receipt = if compensation.is_ok() {
-                                            executor.compensation_evidence(&task)
-                                        } else {
-                                            None
-                                        };
-                                        self.graph.set_compensated(
-                                            &id,
-                                            compensation.err(),
-                                            receipt,
-                                        )?;
-                                    }
-                                }
+                            if final_failure
+                                && let Some(task) = task
+                                && task.compensation.is_some()
+                            {
+                                let compensation = executor.compensate(&task).await;
+                                let receipt = if compensation.is_ok() {
+                                    executor.compensation_evidence(&task)
+                                } else {
+                                    None
+                                };
+                                self.graph
+                                    .set_compensated(&id, compensation.err(), receipt)?;
                             }
                             self.persist()?;
                             continue;
@@ -1370,19 +1366,18 @@ impl Orchestrator {
                 }
                 Ok((id, Err(error))) => {
                     let task = self.graph.tasks.get(&id).cloned();
-                    if self.graph.fail(&id, error)? {
-                        if let Some(task) = task {
-                            if task.compensation.is_some() {
-                                let compensation = executor.compensate(&task).await;
-                                let receipt = if compensation.is_ok() {
-                                    executor.compensation_evidence(&task)
-                                } else {
-                                    None
-                                };
-                                self.graph
-                                    .set_compensated(&id, compensation.err(), receipt)?;
-                            }
-                        }
+                    if self.graph.fail(&id, error)?
+                        && let Some(task) = task
+                        && task.compensation.is_some()
+                    {
+                        let compensation = executor.compensate(&task).await;
+                        let receipt = if compensation.is_ok() {
+                            executor.compensation_evidence(&task)
+                        } else {
+                            None
+                        };
+                        self.graph
+                            .set_compensated(&id, compensation.err(), receipt)?;
                     }
                 }
                 Err(error) => {

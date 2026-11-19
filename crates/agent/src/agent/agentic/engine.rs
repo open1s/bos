@@ -513,12 +513,11 @@ impl Agent {
         // One assembly per task: the inject event and the request share it, so
         // the memory recall is not paid twice on the same turn.
         let task_key = task.retrieval_text().unwrap_or_default();
-        if let Ok(cache) = self.system_prompt_cache.lock() {
-            if let Some((key, assembly)) = cache.as_ref() {
-                if *key == task_key {
-                    return assembly.clone();
-                }
-            }
+        if let Ok(cache) = self.system_prompt_cache.lock()
+            && let Some((key, assembly)) = cache.as_ref()
+            && *key == task_key
+        {
+            return assembly.clone();
         }
         // Identity opens the prompt; the discovery block follows it and still
         // precedes every operational rule, so "check what you were given" is
@@ -849,10 +848,10 @@ impl Agent {
         // A cached context can carry the previous task's skill block (an
         // aborted run never reached on_final_answer), so the reset clears it
         // as well as the runtime.
-        if let Ok(mut cache) = self.context_cache.lock() {
-            if let Some(context) = cache.as_mut() {
-                context.clear_skill_instructions();
-            }
+        if let Ok(mut cache) = self.context_cache.lock()
+            && let Some(context) = cache.as_mut()
+        {
+            context.clear_skill_instructions();
         }
     }
 

@@ -227,10 +227,10 @@ impl DelegationStore {
         }
         // An expired bound is not a bound: refuse it at acceptance rather than
         // letting the execution path treat it as "no deadline".
-        if let Some(deadline) = request.deadline_ms {
-            if deadline <= now_ms {
-                return Err(DelegationError::DeadlineExpired);
-            }
+        if let Some(deadline) = request.deadline_ms
+            && deadline <= now_ms
+        {
+            return Err(DelegationError::DeadlineExpired);
         }
         let id = request.id.clone();
         self.records.insert(

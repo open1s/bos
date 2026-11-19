@@ -163,13 +163,13 @@ impl DiscoveryRecord {
         if self.schema_version != 0 && !crate::envelope::accepts_schema(self.schema_version) {
             return Err(DiscoveryError::Incompatible);
         }
-        if let Some(known) = known_ms {
-            if self.published_at_ms < known {
-                return Err(DiscoveryError::Stale {
-                    published_ms: self.published_at_ms,
-                    known_ms: known,
-                });
-            }
+        if let Some(known) = known_ms
+            && self.published_at_ms < known
+        {
+            return Err(DiscoveryError::Stale {
+                published_ms: self.published_at_ms,
+                known_ms: known,
+            });
         }
         Ok(())
     }

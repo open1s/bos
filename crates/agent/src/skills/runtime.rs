@@ -319,10 +319,10 @@ impl SkillRuntime {
         if self.is_active(task, name) {
             return Ok(Activation::AlreadyActive);
         }
-        if let Some(plan) = self.plan_for(task) {
-            if !plan.order.iter().any(|planned| planned == name) {
-                return Err(RuntimeError::NotPlanned(name.to_string()));
-            }
+        if let Some(plan) = self.plan_for(task)
+            && !plan.order.iter().any(|planned| planned == name)
+        {
+            return Err(RuntimeError::NotPlanned(name.to_string()));
         }
         self.policy.authorize(&content.metadata, permission)?;
         let bytes = content.instructions.len();
@@ -486,10 +486,10 @@ impl SkillRuntime {
         }
         // A plan is authoritative: activating outside it would assemble
         // instructions the task never selected.
-        if let Some(plan) = self.plan_for(task) {
-            if !plan.order.iter().any(|planned| planned == name) {
-                return Err(RuntimeError::NotPlanned(name.to_string()));
-            }
+        if let Some(plan) = self.plan_for(task)
+            && !plan.order.iter().any(|planned| planned == name)
+        {
+            return Err(RuntimeError::NotPlanned(name.to_string()));
         }
         let bytes = match self.load(task, name, permission) {
             Ok(bytes) => bytes,

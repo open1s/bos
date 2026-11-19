@@ -546,23 +546,23 @@ fn has_tls(config: &crate::settings::global::FederationSection) -> bool {
 /// which is a supervised restart rather than a zero-interruption handoff.
 /// Returns whether a node is running afterwards.
 pub(crate) fn reload_tls(settings: &crate::settings::Settings) -> bool {
-    if let Ok(slot) = terminator_slot().lock() {
-        if let Some(terminator) = slot.as_ref() {
-            match terminator.reload() {
-                Ok(()) => {
-                    if let Ok(clients) = client_slot().lock() {
-                        for client in clients.iter() {
-                            if let Err(error) = client.reload() {
-                                log::warn!("federation: TLS client reload failed: {error}");
-                            }
+    if let Ok(slot) = terminator_slot().lock()
+        && let Some(terminator) = slot.as_ref()
+    {
+        match terminator.reload() {
+            Ok(()) => {
+                if let Ok(clients) = client_slot().lock() {
+                    for client in clients.iter() {
+                        if let Err(error) = client.reload() {
+                            log::warn!("federation: TLS client reload failed: {error}");
                         }
                     }
-                    log::info!("federation: TLS certificate reloaded without dropping sessions");
-                    return running().is_some();
                 }
-                Err(error) => {
-                    log::warn!("federation: TLS reload failed, restarting listener: {error}");
-                }
+                log::info!("federation: TLS certificate reloaded without dropping sessions");
+                return running().is_some();
+            }
+            Err(error) => {
+                log::warn!("federation: TLS reload failed, restarting listener: {error}");
             }
         }
     }
@@ -613,10 +613,10 @@ pub(crate) fn stop_profile(profile: &str) -> bool {
     // that owned them.
     let empty = nodes().read().map(|nodes| nodes.is_empty()).unwrap_or(true);
     if empty {
-        if let Ok(mut slot) = terminator_slot().lock() {
-            if let Some(terminator) = slot.take() {
-                terminator.abort();
-            }
+        if let Ok(mut slot) = terminator_slot().lock()
+            && let Some(terminator) = slot.take()
+        {
+            terminator.abort();
         }
         if let Ok(mut clients) = client_slot().lock() {
             for client in clients.drain(..) {
@@ -1320,13 +1320,13 @@ async fn build(
     let identity = load_identity(&identity_path, &settings.global.federation.identity_custody)?;
     let peers = PeerStore::load(&peers_path).map_err(|error| error.to_string())?;
     let mut config = config;
-    if let Some(terminator) = start_tls_terminator(&mut config, &settings).await {
-        if let Ok(mut slot) = terminator_slot().lock() {
-            if let Some(old) = slot.take() {
-                old.abort();
-            }
-            *slot = Some(terminator);
+    if let Some(terminator) = start_tls_terminator(&mut config, &settings).await
+        && let Ok(mut slot) = terminator_slot().lock()
+    {
+        if let Some(old) = slot.take() {
+            old.abort();
         }
+        *slot = Some(terminator);
     }
     let explicit_listen = !settings.global.federation.listen.is_empty();
     let bus = open_bus(config, explicit_listen).await?;
@@ -1571,17 +1571,16 @@ pub(crate) fn assemble_with_federation(
                 if let Err(error) = queue.save() {
                     log::debug!("federation: compensation queue was not saved: {error}");
                 }
-                if tasks_path.is_file() {
-                    if let Ok(graph) = federation::TaskGraph::load(&tasks_path) {
-                        let tasks: Vec<federation::TaskNode> =
-                            graph.tasks.values().cloned().collect();
-                        let mismatches = auditor.audit(&tasks).await;
-                        if !mismatches.is_empty() {
-                            log::warn!(
-                                "federation: {} compensation receipt(s) disagree with their target",
-                                mismatches.len()
-                            );
-                        }
+                if tasks_path.is_file()
+                    && let Ok(graph) = federation::TaskGraph::load(&tasks_path)
+                {
+                    let tasks: Vec<federation::TaskNode> = graph.tasks.values().cloned().collect();
+                    let mismatches = auditor.audit(&tasks).await;
+                    if !mismatches.is_empty() {
+                        log::warn!(
+                            "federation: {} compensation receipt(s) disagree with their target",
+                            mismatches.len()
+                        );
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;

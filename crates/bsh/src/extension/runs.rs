@@ -240,13 +240,12 @@ pub(crate) fn clear_runs_service() {
 /// Remove the host's service only when it is this exact one, so dropping one
 /// window cannot withdraw a service another window installed.
 pub(crate) fn clear_runs_service_if(service: &Arc<dyn RunsService>) {
-    if let Ok(mut slot) = installed().lock() {
-        if slot
+    if let Ok(mut slot) = installed().lock()
+        && slot
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, service))
-        {
-            *slot = None;
-        }
+    {
+        *slot = None;
     }
 }
 

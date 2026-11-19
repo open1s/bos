@@ -320,8 +320,8 @@ impl Runner {
             // carries the checkpoint. A failure or a no-op continues on the
             // un-compacted history, exactly the reference's "log a warning and
             // continue the turn" rule.
-            if let Some(retain) = auto_retain {
-                if let Ok(Some(outcome)) = agent.compact_now(retain, &stop_task).await {
+            if let Some(retain) = auto_retain
+                && let Ok(Some(outcome)) = agent.compact_now(retain, &stop_task).await {
                     let event = AgentEvent::AutoCompacted {
                         before: outcome.before_tokens,
                         dropped: outcome.replaced,
@@ -331,7 +331,6 @@ impl Runner {
                         return;
                     }
                 }
-            }
             if stop_task.load(Ordering::SeqCst) {
                 return;
             }
@@ -351,11 +350,9 @@ impl Runner {
             if intent == ActionIntent::Unknown
                 && text.trim().chars().count() >= 12
                 && !text.contains("<extension_command")
-            {
-                if let Some(classified) = agent.classify_intent_with_model(&text).await {
+                && let Some(classified) = agent.classify_intent_with_model(&text).await {
                     intent = classified;
                 }
-            }
             agent.set_action_intent(intent);
             // The classifier is a provider request too: its usage joins the
             // turn's totals instead of being billed invisibly.
@@ -840,8 +837,8 @@ impl Runner {
             // only a Done turn offers evidence - a stopped or failed turn does
             // not - and the capture runs ASYNCHRONOUSLY beside the terminal
             // event, so a capture failure never invalidates the turn.
-            if matches!(terminal_event, Some(AgentEvent::Done)) {
-                if let Some(capture) = &capture {
+            if matches!(terminal_event, Some(AgentEvent::Done))
+                && let Some(capture) = &capture {
                     let evidence = agent::memory::capture::TurnEvidence {
                         user_text: text.clone(),
                         assistant_text: answer.clone(),
@@ -851,7 +848,6 @@ impl Runner {
                     };
                     capture.spawn(&tokio::runtime::Handle::current(), evidence);
                 }
-            }
             if let Some(event) = terminal_event {
                 let _ = tx.send_blocking(event);
             }

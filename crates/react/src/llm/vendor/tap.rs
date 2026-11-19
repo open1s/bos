@@ -309,9 +309,9 @@ impl TracedResponse {
             };
             futures::pin_mut!(inner);
             while let Some(chunk) = inner.next().await {
-                if let Ok(bytes) = &chunk {
-                    if let Ok(mut state) = state.lock() {
-                        if !state.truncated {
+                if let Ok(bytes) = &chunk
+                    && let Ok(mut state) = state.lock()
+                        && !state.truncated {
                             let room = TAP_BODY_CAP.saturating_sub(state.collected.len());
                             if bytes.len() <= room {
                                 state.collected.extend_from_slice(bytes);
@@ -320,8 +320,6 @@ impl TracedResponse {
                                 state.truncated = true;
                             }
                         }
-                    }
-                }
                 yield chunk;
             }
             finish_state(&state);

@@ -295,10 +295,10 @@ impl ExtensionPanelView {
             refresh_pending: false,
             surface_resolver: Arc::new(crate::extension::live_panel),
         };
-        if let Some(panel) = view.panels.get(selected).cloned() {
-            if let Some(document) = panel.initial.clone() {
-                view.seed(&panel, &document);
-            }
+        if let Some(panel) = view.panels.get(selected).cloned()
+            && let Some(document) = panel.initial.clone()
+        {
+            view.seed(&panel, &document);
         }
         view
     }
@@ -770,31 +770,31 @@ impl ExtensionPanelView {
             .iter()
             .find(|descriptor| descriptor.id.as_str() == action.as_str())
             .cloned();
-        if descriptor.is_none() {
-            if let Some(binding) = self.store.binding(&panel.panel_id, &action) {
-                let local = binding.capability.rsplit('/').next().unwrap_or_default();
-                match panel
-                    .tools
-                    .iter()
-                    .find(|descriptor| {
-                        descriptor.id.as_str() == local
-                            || descriptor.id.as_str() == binding.capability
-                            || descriptor.id.as_str().ends_with(&format!("__{local}"))
-                    })
-                    .cloned()
-                {
-                    Some(found) => {
-                        call_name = found.id.as_str().to_string();
-                        descriptor = Some(found);
-                    }
-                    None => {
-                        self.error = Some(format!(
-                            "binding {action:?} names {}, which has no tool in this panel",
-                            binding.capability
-                        ));
-                        cx.notify();
-                        return;
-                    }
+        if descriptor.is_none()
+            && let Some(binding) = self.store.binding(&panel.panel_id, &action)
+        {
+            let local = binding.capability.rsplit('/').next().unwrap_or_default();
+            match panel
+                .tools
+                .iter()
+                .find(|descriptor| {
+                    descriptor.id.as_str() == local
+                        || descriptor.id.as_str() == binding.capability
+                        || descriptor.id.as_str().ends_with(&format!("__{local}"))
+                })
+                .cloned()
+            {
+                Some(found) => {
+                    call_name = found.id.as_str().to_string();
+                    descriptor = Some(found);
+                }
+                None => {
+                    self.error = Some(format!(
+                        "binding {action:?} names {}, which has no tool in this panel",
+                        binding.capability
+                    ));
+                    cx.notify();
+                    return;
                 }
             }
         }
@@ -1595,12 +1595,12 @@ impl ExtensionPanelView {
                 .into_any_element()
             }
             UiNode::Image { src, alt } => {
-                if let Some(asset) = src.strip_prefix("asset/") {
-                    if let Some(root) = &self.panel_root {
-                        let path = root.join(asset);
-                        if path.is_file() {
-                            return img(path).max_w(relative(1.0)).into_any_element();
-                        }
+                if let Some(asset) = src.strip_prefix("asset/")
+                    && let Some(root) = &self.panel_root
+                {
+                    let path = root.join(asset);
+                    if path.is_file() {
+                        return img(path).max_w(relative(1.0)).into_any_element();
                     }
                 }
                 div()
