@@ -1297,7 +1297,7 @@ impl Agent {
 
 #[cfg(test)]
 mod web_tool_tests {
-    use super::{offers_web_search, Agent, AgentConfig};
+    use super::{Agent, AgentConfig, offers_web_search};
 
     /// The switch removes the hosted tool from the REQUEST's tool array, not
     /// only from a call-time decision: a preset with `web_search = false`

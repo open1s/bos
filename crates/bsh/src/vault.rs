@@ -72,8 +72,8 @@ use std::path::{Path, PathBuf};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use rand::rngs::SysRng;
 use rand::TryRng;
+use rand::rngs::SysRng;
 use zeroize::Zeroizing;
 
 /// The four bytes a vault file starts with.
@@ -825,7 +825,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{provider_key, EntryInfo, Vault, VaultError, MAGIC};
+    use super::{EntryInfo, MAGIC, Vault, VaultError, provider_key};
 
     /// A scratch directory this test owns, cleared first.
     fn scratch(label: &str) -> std::path::PathBuf {

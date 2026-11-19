@@ -778,9 +778,9 @@ mod tests {
     // parent module brought in, and GPUI's `test` macro shadows the builtin
     // `#[test]` these unit tests rely on.
     use super::{
-        classify, load, mode_key, mode_of, patch_for, patch_for_located, preview_for_workspace,
-        preview_lines, preview_top, read_for, turn_files, turn_rows, DiffMode, DiffSource,
-        TurnBasis, TurnEmpty, TurnView,
+        DiffMode, DiffSource, TurnBasis, TurnEmpty, TurnView, classify, load, mode_key, mode_of,
+        patch_for, patch_for_located, preview_for_workspace, preview_lines, preview_top, read_for,
+        turn_files, turn_rows,
     };
     use crate::model::ToolEvent;
     use gpui_kit::component::diff::DiffFile;
@@ -982,9 +982,10 @@ five
             ),
         );
         assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .all(|row| row.old.is_none() && row.new.is_none()));
+        assert!(
+            rows.iter()
+                .all(|row| row.old.is_none() && row.new.is_none())
+        );
         assert_eq!(rows[0].mark, '-');
         assert_eq!(rows[1].mark, '+');
     }
@@ -1227,9 +1228,11 @@ two"}"#,
         assert_eq!(added.text, "let a = 2;");
         assert_eq!(added.new, Some(1), "the hunk is located at its real line");
         let unlocated = turn_rows(&files[0], None).expect("still diffable");
-        assert!(unlocated
-            .iter()
-            .all(|row| row.old.is_none() && row.new.is_none()));
+        assert!(
+            unlocated
+                .iter()
+                .all(|row| row.old.is_none() && row.new.is_none())
+        );
     }
 
     #[test]

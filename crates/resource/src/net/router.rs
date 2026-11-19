@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
-use crate::action::{decode_action, encode_action, ResourceAction, ResourceEvent, ResourceOutput};
+use crate::action::{ResourceAction, ResourceEvent, ResourceOutput, decode_action, encode_action};
 use crate::error::{ResourceError, Result};
 use crate::handler::ResourceHandler;
 use crate::meta::{ResourceInfo, ResourceMeta, ResourceType};
@@ -294,10 +294,10 @@ impl crate::transport::ChunkWriter for RelayChunkWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::stream::BoxStream;
     use futures::StreamExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use futures::stream::BoxStream;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Minimal transport that answers relayed Read/Write forwards.
     #[derive(Default)]
@@ -316,7 +316,7 @@ mod tests {
                     return Err(ResourceError::Unsupported(format!(
                         "fake transport got {:?}",
                         other.name()
-                    )))
+                    )));
                 }
             };
             match inner {

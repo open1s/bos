@@ -22,8 +22,8 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use super::capability::unix_now;
-use super::manifest::{Manifest, MANIFEST_FILE};
-use super::signing::{PackageSignature, SignatureVerification, TrustStore, SIGNATURE_FILE};
+use super::manifest::{MANIFEST_FILE, Manifest};
+use super::signing::{PackageSignature, SIGNATURE_FILE, SignatureVerification, TrustStore};
 use super::types::{ExtensionError, ExtensionId, ExtensionSource, TrustLevel, ValidationReport};
 
 /// The largest package tree the installer will copy or hash.
@@ -1835,11 +1835,13 @@ max_execution_ms = 1000
         store.uninstall(&id, false).expect("uninstall");
         assert!(!store.version_root(&id, "1.2.3").exists());
         assert!(store.data_dir(&id).join("keep.json").is_file());
-        assert!(!store
-            .read_registry()
-            .expect("registry")
-            .extensions
-            .contains_key(id.as_str()));
+        assert!(
+            !store
+                .read_registry()
+                .expect("registry")
+                .extensions
+                .contains_key(id.as_str())
+        );
 
         let again = store.install(&source).expect("reinstall");
         assert_eq!(again.id(), &id);

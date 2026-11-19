@@ -11,7 +11,7 @@ use regorus::{Engine, Rc, Value};
 use super::audit::{PolicyAudit, PolicyAuditEntry};
 use super::baseline_source;
 use super::egress::EgressRuleSet;
-use super::target::{inside_root, normalize_path, Action, Decision, PolicyInput, Target};
+use super::target::{Action, Decision, PolicyInput, Target, inside_root, normalize_path};
 
 /// Where one policy module came from.
 ///
@@ -1103,7 +1103,7 @@ impl PolicySet {
             Err(_) => {
                 return Evaluated::hard(
                     self.failure_decision(input, "the policy VM lock is poisoned"),
-                )
+                );
             }
         };
         if let Some(vms) = vm_guard.as_mut() {
@@ -1174,7 +1174,7 @@ impl PolicySet {
             Err(_) => {
                 return Evaluated::hard(
                     self.failure_decision(input, "the policy engine lock is poisoned"),
-                )
+                );
             }
         };
         let Some(engine) = guard.as_mut() else {

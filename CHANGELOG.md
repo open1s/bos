@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v4.1.20 (2026-11-19)
 
 - **Reasoning is turn-local; the thinking-summary channel is removed.**
   `AssistantReasoning` blocks may be replayed only inside the turn that

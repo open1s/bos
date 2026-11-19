@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use gpui_kit::Focusable;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::input::{
@@ -28,14 +29,13 @@ use gpui_kit::component::input::{
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::Focusable;
 use gpui_kit::*;
 
 use super::diff_pane::{self, DiffSource};
 use super::federation_pane::{FederationActivity, FederationPreview};
 use super::shell::{Shell, SideDrag};
 use super::terminal_view::TerminalView;
-use super::{hairline_bottom, hairline_left, handle_bar, icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, hairline_bottom, hairline_left, handle_bar, icon, txt};
 use crate::browser::engine::cdp::PointerButton;
 use crate::files::{self, Kind};
 use crate::model::Role;
@@ -4071,7 +4071,7 @@ impl Shell {
         lang: crate::i18n::Lang,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        use crate::ui::task_graph::{GraphStatus, NodeKind, CARD_H, CARD_W, MARGIN};
+        use crate::ui::task_graph::{CARD_H, CARD_W, GraphStatus, MARGIN, NodeKind};
         let (kind_key, kind_ink) = match node.kind {
             NodeKind::Main => ("right.tasks.mainAgent", theme::accent()),
             NodeKind::Subagent => ("right.tasks.subagent", theme::accent()),
@@ -13121,14 +13121,14 @@ fn terminal_confinement(
 #[cfg(test)]
 mod tests {
     use gpui_kit::{
-        point, px, size, Bounds, Keystroke, Modifiers, MouseButton, Pixels, ScrollDelta,
+        Bounds, Keystroke, Modifiers, MouseButton, Pixels, ScrollDelta, point, px, size,
     };
 
     use super::{
-        anchor_line, chord_modifiers, file_tab_floor_with, file_tab_w, file_tab_w_with, named_key,
-        page_point, page_wheel, pane_tab_floor_with, pane_tab_w, pane_tab_w_with, plan_open_strip,
-        plan_tab_strip, typed_text, BrowserClick, RightTab, StripSlot, BROWSER_WHEEL_GAIN,
-        STRIP_GAP, STRIP_OVERFLOW_W, STRIP_TAB_MIN_W,
+        BROWSER_WHEEL_GAIN, BrowserClick, RightTab, STRIP_GAP, STRIP_OVERFLOW_W, STRIP_TAB_MIN_W,
+        StripSlot, anchor_line, chord_modifiers, file_tab_floor_with, file_tab_w, file_tab_w_with,
+        named_key, page_point, page_wheel, pane_tab_floor_with, pane_tab_w, pane_tab_w_with,
+        plan_open_strip, plan_tab_strip, typed_text,
     };
 
     fn key(key: &str, key_char: Option<&str>) -> Keystroke {
@@ -13309,14 +13309,16 @@ mod tests {
         let files = [file_tab_w("README.md"), file_tab_w("Cargo.toml")];
         let plan = plan_tab_strip(365.0, None, pane_tab_w("Start"), &files, Some(0), &[]);
         assert_eq!(plan.visible[0].0, StripSlot::Start);
-        assert!(plan
-            .visible
-            .iter()
-            .any(|(slot, _)| *slot == StripSlot::File(0)));
-        assert!(plan
-            .visible
-            .iter()
-            .any(|(slot, _)| *slot == StripSlot::File(1)));
+        assert!(
+            plan.visible
+                .iter()
+                .any(|(slot, _)| *slot == StripSlot::File(0))
+        );
+        assert!(
+            plan.visible
+                .iter()
+                .any(|(slot, _)| *slot == StripSlot::File(1))
+        );
         assert!(!plan.overflow, "both documents fit beside the Start tab");
     }
 
@@ -14030,7 +14032,7 @@ mod federation_pane_tests {
 
 #[cfg(test)]
 mod files_window_tests {
-    use super::{files_band, FILES_LIST_PAD_Y, FILES_ROW_H};
+    use super::{FILES_LIST_PAD_Y, FILES_ROW_H, files_band};
 
     /// The tree's rows are one exact height, so the built band and the two
     /// spacers must reproduce the whole listing's height.

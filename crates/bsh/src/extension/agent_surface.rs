@@ -226,7 +226,7 @@ impl Runtime for AgentSurfaceRuntime {
 mod tests {
     use super::*;
     use ferris_sdk::surface::frame::PatchOp;
-    use ferris_sdk::surface::{SurfaceNode, SURFACE_SCHEMA_VERSION};
+    use ferris_sdk::surface::{SURFACE_SCHEMA_VERSION, SurfaceNode};
 
     static LOCK: Mutex<()> = Mutex::new(());
 

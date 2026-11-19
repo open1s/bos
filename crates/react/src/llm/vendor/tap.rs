@@ -16,8 +16,8 @@ use async_stream::stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use reqwest::{Client, Error, RequestBuilder, Response, StatusCode};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// Most body bytes one exchange carries, per side.
 ///

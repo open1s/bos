@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    classification::LanguageId, syntax::valid_relative_path, ParseResult, SourceRange, WorkspaceId,
+    ParseResult, SourceRange, WorkspaceId, classification::LanguageId, syntax::valid_relative_path,
 };
 
 /// State of a syntactic Rust module's file-path lookup.

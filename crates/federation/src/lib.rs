@@ -36,15 +36,16 @@ pub mod task;
 pub mod zenoh;
 
 pub use artifacts::{
-    ArtifactCleanupRequest, ArtifactCleanupResponse, ArtifactFailure, ArtifactStore,
-    FileArtifactStore, ARTIFACT_CLEANUP_KIND, ARTIFACT_CLEANUP_SCHEMA, MAX_CLEANUP_ARTIFACTS,
+    ARTIFACT_CLEANUP_KIND, ARTIFACT_CLEANUP_SCHEMA, ArtifactCleanupRequest,
+    ArtifactCleanupResponse, ArtifactFailure, ArtifactStore, FileArtifactStore,
+    MAX_CLEANUP_ARTIFACTS,
 };
 pub use audit::{Direction, FederationAudit, FederationEvent, MemoryAudit};
 pub use capability::{FederationMessage, FederationTransport, MessageId, PeerSession};
 pub use collaboration::{
-    ArtifactRef, CollaborationError, DelegationExecutor, Orchestrator, ReceiptAuditor,
-    ReceiptMismatch, TaskExecutor, TaskGraph, TaskNode, TaskNodeId, TaskOutcome, TaskProgress,
-    TaskState, COLLABORATION_SCHEMA,
+    ArtifactRef, COLLABORATION_SCHEMA, CollaborationError, DelegationExecutor, Orchestrator,
+    ReceiptAuditor, ReceiptMismatch, TaskExecutor, TaskGraph, TaskNode, TaskNodeId, TaskOutcome,
+    TaskProgress, TaskState,
 };
 pub use compensation::{CompensationQueue, PendingCompensation};
 pub use delegation::{
@@ -55,28 +56,28 @@ pub use discovery::DiscoveryRecord;
 pub use envelope::{Envelope, EnvelopeError, PROTOCOL, SCHEMA_VERSION};
 pub use identity::{IdentityError, NodeIdentity};
 pub use knowledge::{
-    knowledge_hash, KnowledgeAudit, KnowledgeAuthorizer, KnowledgeClass, KnowledgeError,
-    KnowledgeItem, KnowledgeOrigin, KnowledgePublication, KnowledgePurpose, KnowledgeQuery,
-    KnowledgeResponse, KnowledgeService, Provenance, KNOWLEDGE_PROTOCOL, KNOWLEDGE_SCHEMA,
-    MAX_KNOWLEDGE_BYTES, MAX_KNOWLEDGE_ITEMS,
+    KNOWLEDGE_PROTOCOL, KNOWLEDGE_SCHEMA, KnowledgeAudit, KnowledgeAuthorizer, KnowledgeClass,
+    KnowledgeError, KnowledgeItem, KnowledgeOrigin, KnowledgePublication, KnowledgePurpose,
+    KnowledgeQuery, KnowledgeResponse, KnowledgeService, MAX_KNOWLEDGE_BYTES, MAX_KNOWLEDGE_ITEMS,
+    Provenance, knowledge_hash,
 };
 pub use membership::FederationId;
 pub use memory::{InMemoryNetwork, InMemoryTransport};
 pub use peers::{Grant, PeerError, PeerRecord, PeerStore, TrustState};
 pub use provider::RemoteCapabilityProvider;
 pub use resource::{
-    checksum, LeaseId, LeaseStore, ResourceError, ResourceLease, ResourceStreamMessage,
-    StreamReceiver, StreamSender,
+    LeaseId, LeaseStore, ResourceError, ResourceLease, ResourceStreamMessage, StreamReceiver,
+    StreamSender, checksum,
 };
 pub use rotation::RotationRecord;
 pub use service::{
-    AdmissionLimits, FederationNode, InvocationScope, RemoteStream, ResourceSource,
-    MAX_CONCURRENT_STREAMS, MAX_IN_FLIGHT_CONTROL, MAX_IN_FLIGHT_CONTROL_PER_PEER,
-    MAX_IN_FLIGHT_HANDLERS, MAX_IN_FLIGHT_PER_PEER, MAX_RESOURCE_STREAMS, MAX_STREAM_DURATION,
-    STREAM_CHUNK,
+    AdmissionLimits, FederationNode, InvocationScope, MAX_CONCURRENT_STREAMS,
+    MAX_IN_FLIGHT_CONTROL, MAX_IN_FLIGHT_CONTROL_PER_PEER, MAX_IN_FLIGHT_HANDLERS,
+    MAX_IN_FLIGHT_PER_PEER, MAX_RESOURCE_STREAMS, MAX_STREAM_DURATION, RemoteStream,
+    ResourceSource, STREAM_CHUNK,
 };
 pub use task::{
     FederatedTask, FederatedTaskState, TaskCreateRequest, TaskIdRequest, TaskQueue, TaskQueueError,
     TaskSchedule,
 };
-pub use zenoh::{inbox_key, node_key, Inbox, ZenohTransport};
+pub use zenoh::{Inbox, ZenohTransport, inbox_key, node_key};

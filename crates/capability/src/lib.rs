@@ -34,9 +34,9 @@ pub mod workspace;
 
 pub use catalogue::Catalogue;
 pub use composition::{
-    resolve_host, Binding, CapabilityRequirement, CompositionError, CompositionId, CompositionSpec,
-    GrantRef, LocalScope, PeerCatalogue, PeerRef, RemotePolicy, ResolvedCapability,
-    ResolvedComposition,
+    Binding, CapabilityRequirement, CompositionError, CompositionId, CompositionSpec, GrantRef,
+    LocalScope, PeerCatalogue, PeerRef, RemotePolicy, ResolvedCapability, ResolvedComposition,
+    resolve_host,
 };
 pub use context::{
     CancelToken, DelegationHop, InvocationContext, InvocationId, PolicyDecisionRef, Principal,
@@ -56,7 +56,7 @@ pub use provider::{
     ProviderKind, Usage,
 };
 pub use snapshot::{CapabilitySnapshot, CompositionSnapshot, SnapshotOrigin};
-pub use transport::{unix_ms, FederationMessage, FederationTransport, MessageId, PeerSession};
+pub use transport::{FederationMessage, FederationTransport, MessageId, PeerSession, unix_ms};
 pub use workspace::{
-    remote_provider_id, WorkspaceError, WorkspaceLifecycle, WorkspaceRuntime, WorkspaceState,
+    WorkspaceError, WorkspaceLifecycle, WorkspaceRuntime, WorkspaceState, remote_provider_id,
 };

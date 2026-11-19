@@ -9,9 +9,9 @@ use crate::plugins::{Plugin, PluginCommand, PluginRegistry, UiPanel};
 use crate::tools::Tool;
 
 use super::{
-    codex, dsh, Capability, Contribution, ContributionKind, Extension, ExtensionError,
-    ExtensionStandard, HookContribution, PromptContribution, ProviderContribution, Refusal,
-    SkillContribution, SkillDirContribution, Trust,
+    Capability, Contribution, ContributionKind, Extension, ExtensionError, ExtensionStandard,
+    HookContribution, PromptContribution, ProviderContribution, Refusal, SkillContribution,
+    SkillDirContribution, Trust, codex, dsh,
 };
 
 /// A parsed package: the extension plus every part the shim refused.

@@ -322,13 +322,15 @@ async fn multimodal_retrieval_uses_accompanying_text() {
 
     // Text-only: retrieves.
     let text = Content::text("where is the deploy target");
-    assert!(agent
-        .assemble_prompt(&text)
-        .await
-        .memory
-        .block
-        .unwrap_or_default()
-        .contains("staging"));
+    assert!(
+        agent
+            .assemble_prompt(&text)
+            .await
+            .memory
+            .block
+            .unwrap_or_default()
+            .contains("staging")
+    );
 
     // Mixed text + image: retrieves on the text part.
     let mixed = Content::parts(vec![
@@ -339,35 +341,41 @@ async fn multimodal_retrieval_uses_accompanying_text() {
             binary: react::llm::Binary::from_url("image/png", "http://x/i.png", None),
         },
     ]);
-    assert!(agent
-        .assemble_prompt(&mixed)
-        .await
-        .memory
-        .block
-        .unwrap_or_default()
-        .contains("staging"));
+    assert!(
+        agent
+            .assemble_prompt(&mixed)
+            .await
+            .memory
+            .block
+            .unwrap_or_default()
+            .contains("staging")
+    );
 
     // Image-only: no usable query, retrieval skipped, no memory injected.
     let image_only = Content::parts(vec![ContentPart::Binary {
         binary: react::llm::Binary::from_url("image/png", "http://x/i.png", None),
     }]);
-    assert!(!agent
-        .assemble_prompt(&image_only)
-        .await
-        .memory
-        .block
-        .unwrap_or_default()
-        .contains("staging"));
+    assert!(
+        !agent
+            .assemble_prompt(&image_only)
+            .await
+            .memory
+            .block
+            .unwrap_or_default()
+            .contains("staging")
+    );
 
     // Audio-only: likewise skipped.
     let audio_only = Content::audio("QUJD", "wav");
-    assert!(!agent
-        .assemble_prompt(&audio_only)
-        .await
-        .memory
-        .block
-        .unwrap_or_default()
-        .contains("staging"));
+    assert!(
+        !agent
+            .assemble_prompt(&audio_only)
+            .await
+            .memory
+            .block
+            .unwrap_or_default()
+            .contains("staging")
+    );
 }
 
 /// retrieval_text extracts text parts and never reads binary as text.
@@ -5091,9 +5099,11 @@ async fn compact_now_classifies_a_provider_failure_and_keeps_its_text() {
         }
         other => panic!("a provider failure, not {other:?}"),
     }
-    assert!(error
-        .to_string()
-        .contains("maximum context length exceeded"));
+    assert!(
+        error
+            .to_string()
+            .contains("maximum context length exceeded")
+    );
     assert_eq!(
         agent.session().messages().len(),
         4,
@@ -5566,9 +5576,11 @@ async fn compact_now_refuses_a_summary_that_does_not_shrink_the_context() {
         error,
         AgentError::Compaction(CompactionFailure::NotSmaller { .. })
     ));
-    assert!(error
-        .to_string()
-        .contains("not smaller than the shadowed content"));
+    assert!(
+        error
+            .to_string()
+            .contains("not smaller than the shadowed content")
+    );
     assert_eq!(
         agent.session().messages().len(),
         4,

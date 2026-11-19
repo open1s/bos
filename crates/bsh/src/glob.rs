@@ -19,8 +19,8 @@
 
 use std::path::{Path, PathBuf};
 
-use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 
 /// The most bytes one pattern may carry.
 ///
@@ -495,9 +495,11 @@ mod tests {
                 workspace_ignore: None,
             },
         );
-        assert!(oversized
-            .err()
-            .is_some_and(|error| error.contains("ceiling")));
+        assert!(
+            oversized
+                .err()
+                .is_some_and(|error| error.contains("ceiling"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

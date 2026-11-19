@@ -19,7 +19,7 @@
 
 use crate::tools::{FunctionTool, ToolRegistry};
 use react::llm::LlmTool;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
@@ -819,10 +819,12 @@ mod tests {
         );
         let result = search_skills(&entries, &json!({"query": "commit message"}));
         assert_eq!(result["skills"][0]["name"], "git-commit");
-        assert!(result["skills"][0]["description"]
-            .as_str()
-            .unwrap()
-            .contains("commit"));
+        assert!(
+            result["skills"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("commit")
+        );
     }
 
     #[test]
@@ -1244,10 +1246,12 @@ mod tests {
             result["name"], "extdev__design",
             "the answer carries the name the direct call can run: {result}"
         );
-        assert!(result["hint"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("extdev__design"));
+        assert!(
+            result["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("extdev__design")
+        );
     }
 
     /// Two tools whose last segment is the same word stay unresolved: picking

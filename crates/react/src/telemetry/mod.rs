@@ -193,10 +193,7 @@ impl Telemetry {
                         composition.system_bytes,
                         composition.tools_bytes,
                         composition.tool_count,
-                        composition
-                            .largest_tool
-                            .as_deref()
-                            .unwrap_or("-"),
+                        composition.largest_tool.as_deref().unwrap_or("-"),
                         composition.largest_tool_bytes,
                         composition.skills_bytes,
                         composition.history_bytes,

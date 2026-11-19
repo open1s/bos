@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use capability::transport::{unix_ms, FederationTransport, PeerSession};
+use base64::engine::general_purpose::STANDARD;
+use capability::transport::{FederationTransport, PeerSession, unix_ms};
 use capability::{CapabilityError, DeliveryState, NodeId};
 use tokio::sync::mpsc;
 
@@ -266,7 +266,7 @@ pub fn node_key(node: &NodeId) -> Result<String, CapabilityError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{announcement_allowed, frame_allowed, MAX_ANNOUNCE_FRAME_BYTES, MAX_FRAME_BYTES};
+    use super::{MAX_ANNOUNCE_FRAME_BYTES, MAX_FRAME_BYTES, announcement_allowed, frame_allowed};
 
     /// The ceiling admits the limit and rejects one byte over it.
     #[test]

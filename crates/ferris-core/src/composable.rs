@@ -1107,8 +1107,8 @@ impl Fiber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn a_name_survives_revoking_one_of_two_concrete_types() {
@@ -1336,9 +1336,11 @@ mod tests {
         );
         let one = semver::VersionReq::parse("^1").expect("one");
         let two = semver::VersionReq::parse("^2").expect("two");
-        assert!(registry
-            .acquire_contract::<Search>(&scope, "search", "search-a", &one)
-            .is_some());
+        assert!(
+            registry
+                .acquire_contract::<Search>(&scope, "search", "search-a", &one)
+                .is_some()
+        );
         assert!(
             registry
                 .acquire_contract::<Search>(&scope, "search", "search-a", &two)
@@ -1416,20 +1418,30 @@ mod tests {
             "default"
         );
         // An unknown realm has no provider and must not fall back.
-        assert!(registry
-            .acquire_contract_in_realm::<Search>(
-                &scope,
-                Some("c"),
-                "search",
-                "search-api",
-                &requirement
-            )
-            .is_none());
+        assert!(
+            registry
+                .acquire_contract_in_realm::<Search>(
+                    &scope,
+                    Some("c"),
+                    "search",
+                    "search-api",
+                    &requirement
+                )
+                .is_none()
+        );
         // An incompatible version is refused inside a realm too.
         let two = semver::VersionReq::parse("^2").expect("two");
-        assert!(registry
-            .acquire_contract_in_realm::<Search>(&scope, Some("a"), "search", "search-api", &two)
-            .is_none());
+        assert!(
+            registry
+                .acquire_contract_in_realm::<Search>(
+                    &scope,
+                    Some("a"),
+                    "search",
+                    "search-api",
+                    &two
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -1485,12 +1497,16 @@ mod tests {
     fn service_scope_isolation_is_strict() {
         let registry = ServiceRegistry::new();
         registry.provide(Scope::Workspace("w1".into()), "index", Arc::new(7_u32));
-        assert!(registry
-            .get::<u32>(&Scope::Workspace("w1".into()), "index")
-            .is_some());
-        assert!(registry
-            .get::<u32>(&Scope::Workspace("w2".into()), "index")
-            .is_none());
+        assert!(
+            registry
+                .get::<u32>(&Scope::Workspace("w1".into()), "index")
+                .is_some()
+        );
+        assert!(
+            registry
+                .get::<u32>(&Scope::Workspace("w2".into()), "index")
+                .is_none()
+        );
         assert!(registry.get::<u32>(&Scope::Host, "index").is_none());
     }
 

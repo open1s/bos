@@ -254,7 +254,7 @@ impl ferris_sdk::RuntimeResolver for FerrisRuntimeResolver {
                     code: ferris_sdk::ErrorCode::Runtime,
                     message: format!("runtime {other} is not wired through the manager yet"),
                     details: serde_json::Value::Null,
-                })
+                });
             }
         };
         Ok(Arc::new(

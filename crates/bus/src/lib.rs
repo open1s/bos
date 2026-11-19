@@ -15,7 +15,7 @@ pub mod tls_terminator;
 
 pub use callable::Callable;
 pub use caller::Caller;
-pub use codec::{Codec, RkyvCodec, DEFAULT_CODEC};
+pub use codec::{Codec, DEFAULT_CODEC, RkyvCodec};
 pub use error::ZenohError;
 pub use publisher::Publisher;
 pub use query::{Query, QueryWrapper, Queryable, TopicQueryable};

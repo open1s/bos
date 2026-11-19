@@ -23,14 +23,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::plugins::PluginCommand;
 use crate::tools::{Tool, ToolError};
 
 use super::{
-    manifest_error, read_text, Contribution, ExtensionError, ExtensionStandard, PromptContribution,
-    ProviderContribution, ProviderModel, SkillContribution,
+    Contribution, ExtensionError, ExtensionStandard, PromptContribution, ProviderContribution,
+    ProviderModel, SkillContribution, manifest_error, read_text,
 };
 
 /// Replace every character of `raw` that is not ASCII alphanumeric with `_`.

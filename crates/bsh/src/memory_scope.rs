@@ -19,8 +19,8 @@ use std::path::PathBuf;
 
 use agent::memory::MemoryScope;
 
-use crate::settings::resolve::SessionChoice;
 use crate::settings::Settings;
+use crate::settings::resolve::SessionChoice;
 
 /// The resolved storage identity and access scope for one session.
 #[derive(Debug, Clone)]

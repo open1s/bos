@@ -15,9 +15,15 @@ pub trait ReactSession {
     /// Reasoning may be replayed to the provider that produced it, but only
     /// inside the turn that produced it: a tool loop needs the block, a later
     /// turn must not receive it. The engine calls this before a turn's first
-    /// request. The default is a no-op for sessions that cannot mutate their
-    /// history; `LlmSession` and `AgentSession` implement it.
-    fn clear_reasoning(&mut self) {}
+    /// request, so every session implementation must remove all
+    /// [`LlmMessage::AssistantReasoning`] messages (and the provider state they
+    /// carry) from the history it will return.
+    ///
+    /// This method is deliberately required rather than defaulted to a no-op:
+    /// a session that keeps history but skips this cleanup would replay a
+    /// previous turn's chain of thought and provider state. A session with no
+    /// history still implements it explicitly to acknowledge the contract.
+    fn clear_reasoning(&mut self);
     /// Estimate the tokens this history contributes to the next request.
     ///
     /// `None` means the session cannot price itself; the engine then skips
@@ -357,6 +363,11 @@ impl ReactSession for () {
     fn push(&mut self, _msg: LlmMessage) {}
     fn history(&self) -> Option<&[LlmMessage]> {
         None
+    }
+    fn clear_reasoning(&mut self) {
+        // This session keeps no history, so there is nothing to drop. The
+        // explicit implementation records that choice instead of inheriting a
+        // silent no-op from the trait.
     }
 }
 
@@ -1752,7 +1763,7 @@ fn clip(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_content_parts, ApiMode, Content, ContentPart, LlmError};
+    use super::{ApiMode, Content, ContentPart, LlmError, parse_content_parts};
 
     #[test]
     fn content_from_json_still_decodes_with_leading_whitespace() {

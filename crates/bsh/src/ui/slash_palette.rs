@@ -38,7 +38,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, icon, txt};
 use crate::extension::CommandSurface;
 use crate::i18n::Lang;
 use crate::theme;

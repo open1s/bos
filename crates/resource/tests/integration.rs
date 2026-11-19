@@ -709,8 +709,8 @@ async fn operate_local_and_remote_identically_via_facade() {
 
 #[tokio::test]
 async fn vnode_fans_out_writes_and_aggregates_list() {
-    use resource::transport::inprocess::InProcessTransport;
     use resource::transport::Transport;
+    use resource::transport::inprocess::InProcessTransport;
 
     // Two separate managers, each hosting its own `mem://` resource.
     let mgr_a = Arc::new(ResourceManager::new(allow_all()));
@@ -785,8 +785,8 @@ async fn vnode_fans_out_writes_and_aggregates_list() {
 
 #[tokio::test]
 async fn vnode_write_failure_surfaces_failed_members() {
-    use resource::transport::inprocess::InProcessTransport;
     use resource::transport::Transport;
+    use resource::transport::inprocess::InProcessTransport;
 
     // mgr_a is alive; mgr_b has no resource → Put on mem://b fails.
     let mgr_a = Arc::new(ResourceManager::new(allow_all()));
@@ -836,8 +836,8 @@ async fn vnode_write_failure_surfaces_failed_members() {
 
 #[tokio::test]
 async fn vnode_with_transport_convenience_constructor() {
-    use resource::transport::inprocess::InProcessTransport;
     use resource::transport::Transport;
+    use resource::transport::inprocess::InProcessTransport;
 
     let mgr = Arc::new(ResourceManager::new(allow_all()));
     mgr.register(Box::new(MemResource::new("x")), "agent1".into())
@@ -880,8 +880,8 @@ async fn vnode_with_transport_convenience_constructor() {
 
 #[tokio::test]
 async fn vnode_member_accessors() {
-    use resource::transport::inprocess::InProcessTransport;
     use resource::transport::Transport;
+    use resource::transport::inprocess::InProcessTransport;
 
     let mgr_a = Arc::new(ResourceManager::new(allow_all()));
     mgr_a

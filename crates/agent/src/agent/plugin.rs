@@ -628,8 +628,10 @@ mod tests {
     async fn a_snapshotted_plugin_list_honours_a_veto() {
         let plugins: Vec<Arc<dyn AgentPlugin>> = vec![Arc::new(Upper), Arc::new(Veto)];
         let wrapped = StreamTokenWrapper::from_token(react::llm::StreamToken::Text("hi".into()));
-        assert!(PluginRegistry::on_stream_token_with(&plugins, wrapped)
-            .await
-            .is_none());
+        assert!(
+            PluginRegistry::on_stream_token_with(&plugins, wrapped)
+                .await
+                .is_none()
+        );
     }
 }

@@ -1,7 +1,7 @@
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
-use pyo3::IntoPyObjectExt;
 use std::sync::Arc;
 
 use bus::Bus;

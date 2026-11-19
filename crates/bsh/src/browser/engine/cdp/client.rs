@@ -48,11 +48,11 @@ pub(crate) const NETWORK_IDLE: Duration = Duration::from_millis(400);
 /// Requests that may still be in flight and count as idle.
 pub(crate) const IDLE_IN_FLIGHT: u64 = 2;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::super::reap;
-use super::wire::{self, Incoming, Request, Socket};
 use super::EngineError;
+use super::wire::{self, Incoming, Request, Socket};
 
 /// How long a launch may take before it is reported as a failed handshake.
 ///

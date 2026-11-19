@@ -1052,10 +1052,12 @@ mod tests {
         }
         let report = document.validate(&id());
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "ui.button.action"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "ui.button.action")
+        );
     }
 
     /// Badges spend the node budget and cap at eight per row: a row cannot
@@ -1075,10 +1077,12 @@ mod tests {
         .expect("document");
         let report = document.validate(&id());
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "ui.list.item.badges"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "ui.list.item.badges")
+        );
     }
 
     /// A timeline row's chips and a tree node's action validate like any
@@ -1114,10 +1118,12 @@ mod tests {
         }))
         .expect("document");
         let report = bad.validate(&id());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "ui.tree.action"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "ui.tree.action")
+        );
     }
 
     /// A collapsed section still validates its body: a hidden mistake must be
@@ -1153,20 +1159,24 @@ mod tests {
         .expect("document");
         let report = document.validate(&id());
         assert!(!report.is_valid(), "a short weight list is a load error");
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "ui.table.widths"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "ui.table.widths")
+        );
     }
 
     /// A tone is a named role; an unknown one is a parse error, so a document
     /// cannot smuggle a raw colour past the theme.
     #[test]
     fn a_tone_is_a_named_role_not_a_colour() {
-        assert!(serde_json::from_value::<UiNode>(serde_json::json!({
-            "type": "text", "text": "hi", "tone": "chartreuse"
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<UiNode>(serde_json::json!({
+                "type": "text", "text": "hi", "tone": "chartreuse"
+            }))
+            .is_err()
+        );
         let parsed = serde_json::from_value::<UiNode>(serde_json::json!({
             "type": "text", "text": "hi", "tone": "error"
         }))

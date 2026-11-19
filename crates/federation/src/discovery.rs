@@ -6,7 +6,7 @@
 //! named (ADR-009). A valid record proves what a Node claims; it never proves
 //! that a later call will be authorized or will succeed.
 
-use capability::{unix_ms, CapabilityDescriptor, CapabilityId, NodeId, Visibility};
+use capability::{CapabilityDescriptor, CapabilityId, NodeId, Visibility, unix_ms};
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{self, NodeIdentity};

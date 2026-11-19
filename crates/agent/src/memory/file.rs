@@ -20,14 +20,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
-use hostkit::coord::{canonical_identity, FileLock};
+use hostkit::coord::{FileLock, canonical_identity};
 use hostkit::durable::{self, CommitGate, Loaded, NoFaults, Privacy};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use super::error::MemoryError;
 use super::record::{
-    parse_record, EvidenceSource, Lifecycle, MemoryKind, MemoryRecord, MemoryScope, Provenance,
+    EvidenceSource, Lifecycle, MemoryKind, MemoryRecord, MemoryScope, Provenance, parse_record,
 };
 use super::repository::MemoryRepository;
 use super::retrieval::{self, RecallOutcome, RecallRequest};

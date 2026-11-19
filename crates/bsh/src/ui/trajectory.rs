@@ -20,9 +20,9 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::text::TextView;
 
 use super::lane::{
-    block_box, decimate, equal_lane, fixed_box, lane_hit, time_lane, LaneRecord, TimeAxis,
+    LaneRecord, TimeAxis, block_box, decimate, equal_lane, fixed_box, lane_hit, time_lane,
 };
-use super::{icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, icon, txt};
 use crate::i18n::Lang;
 use crate::model::{ChatMessage, MessageTiming, Session};
 use crate::theme;
@@ -999,11 +999,7 @@ const TRAJ_FIRST_VIEWPORT: f32 = 800.0;
 
 /// A log row's height, exact by construction.
 fn traj_row_height(summary: bool) -> f32 {
-    if summary {
-        TRAJ_SUMMARY_H
-    } else {
-        TRAJ_ROW_H
-    }
+    if summary { TRAJ_SUMMARY_H } else { TRAJ_ROW_H }
 }
 
 /// The window's band, and the exact height of the rows on either side.
@@ -3220,9 +3216,9 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_of, collapse_turns, duration_label, events, events_for, preview_body,
-        preview_images, preview_markdown, project_lane, verdict_for, BlockWidth, Event, Kind,
-        PolicyVerdict, Projection, MINIMUM_BLOCK_MS,
+        BlockWidth, Event, Kind, MINIMUM_BLOCK_MS, PolicyVerdict, Projection, action_of,
+        collapse_turns, duration_label, events, events_for, preview_body, preview_images,
+        preview_markdown, project_lane, verdict_for,
     };
     use crate::i18n::Lang;
     use crate::model::{ChatMessage, Session, ToolEvent};

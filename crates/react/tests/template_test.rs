@@ -1,6 +1,6 @@
 //! Tests for prompt rendering and memory placement.
 
-use react::prelude::{render_template, with_memory, PromptTemplate, TemplateError};
+use react::prelude::{PromptTemplate, TemplateError, render_template, with_memory};
 use std::collections::BTreeMap;
 
 #[test]

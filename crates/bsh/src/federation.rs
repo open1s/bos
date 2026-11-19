@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use agent::capability::{unix_ms, CapabilityId, NodeId};
+use agent::capability::{CapabilityId, NodeId, unix_ms};
 use federation::identity::is_valid_node_id;
 use federation::{
     DelegationState, DelegationStore, NodeIdentity, PeerStore, RotationRecord, TrustState,

@@ -177,7 +177,7 @@ pub(crate) fn has_references(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_mention, has_references, parse_references, split_range, FILE_REFERENCE_PROMPT,
+        FILE_REFERENCE_PROMPT, format_mention, has_references, parse_references, split_range,
     };
 
     #[test]

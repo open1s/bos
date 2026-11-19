@@ -4,9 +4,9 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 use bus::{Bus, BusConfig};
-use capability::transport::{unix_ms, FederationMessage, FederationTransport};
 use capability::DeliveryState;
-use federation::{inbox_key, node_key, Envelope, NodeIdentity, ZenohTransport};
+use capability::transport::{FederationMessage, FederationTransport, unix_ms};
+use federation::{Envelope, NodeIdentity, ZenohTransport, inbox_key, node_key};
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")

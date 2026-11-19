@@ -572,22 +572,25 @@ mod tests {
         let mut set = RuleSet::new();
         set.add(ToolRule::allow("fs_*"));
 
-        assert!(set
-            .decide("fs_read", &json!({}), &global())
-            .effect
-            .is_allowed());
-        assert!(set
-            .decide("fs_write", &json!({}), &global())
-            .effect
-            .is_allowed());
+        assert!(
+            set.decide("fs_read", &json!({}), &global())
+                .effect
+                .is_allowed()
+        );
+        assert!(
+            set.decide("fs_write", &json!({}), &global())
+                .effect
+                .is_allowed()
+        );
         assert!(set.decide("net_get", &json!({}), &global()).effect.is_ask());
         // A bare `*` matches everything.
         let mut any = RuleSet::new();
         any.add(ToolRule::allow("*"));
-        assert!(any
-            .decide("anything", &json!({}), &global())
-            .effect
-            .is_allowed());
+        assert!(
+            any.decide("anything", &json!({}), &global())
+                .effect
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -610,14 +613,16 @@ mod tests {
         let mut set = RuleSet::new();
         set.add(ToolRule::allow("bash").with_arg(ArgPredicate::exact("command", "ls")));
 
-        assert!(set
-            .decide("bash", &json!({"command": "ls"}), &global())
-            .effect
-            .is_allowed());
-        assert!(set
-            .decide("bash", &json!({"command": "ls -la"}), &global())
-            .effect
-            .is_ask());
+        assert!(
+            set.decide("bash", &json!({"command": "ls"}), &global())
+                .effect
+                .is_allowed()
+        );
+        assert!(
+            set.decide("bash", &json!({"command": "ls -la"}), &global())
+                .effect
+                .is_ask()
+        );
     }
 
     #[test]
@@ -625,14 +630,16 @@ mod tests {
         let mut set = RuleSet::new();
         set.add(ToolRule::allow("bash").with_arg(ArgPredicate::prefix("command", "git status")));
 
-        assert!(set
-            .decide("bash", &json!({"command": "git status --short"}), &global())
-            .effect
-            .is_allowed());
-        assert!(set
-            .decide("bash", &json!({"command": "git push"}), &global())
-            .effect
-            .is_ask());
+        assert!(
+            set.decide("bash", &json!({"command": "git status --short"}), &global())
+                .effect
+                .is_allowed()
+        );
+        assert!(
+            set.decide("bash", &json!({"command": "git push"}), &global())
+                .effect
+                .is_ask()
+        );
     }
 
     #[test]
@@ -640,14 +647,16 @@ mod tests {
         let mut set = RuleSet::new();
         set.add(ToolRule::allow("bash").with_arg(ArgPredicate::contains("command", "test")));
 
-        assert!(set
-            .decide("bash", &json!({"command": "cargo test"}), &global())
-            .effect
-            .is_allowed());
-        assert!(set
-            .decide("bash", &json!({"command": "cargo build"}), &global())
-            .effect
-            .is_ask());
+        assert!(
+            set.decide("bash", &json!({"command": "cargo test"}), &global())
+                .effect
+                .is_allowed()
+        );
+        assert!(
+            set.decide("bash", &json!({"command": "cargo build"}), &global())
+                .effect
+                .is_ask()
+        );
     }
 
     #[test]
@@ -656,10 +665,11 @@ mod tests {
         set.add(ToolRule::allow("bash").with_arg(ArgPredicate::exact("command", "ls")));
 
         assert!(set.decide("bash", &json!({}), &global()).effect.is_ask());
-        assert!(set
-            .decide("bash", &json!({"command": 42}), &global())
-            .effect
-            .is_ask());
+        assert!(
+            set.decide("bash", &json!({"command": 42}), &global())
+                .effect
+                .is_ask()
+        );
     }
 
     #[test]
@@ -730,16 +740,18 @@ mod tests {
     fn revoke_removes_the_rule() {
         let mut set = RuleSet::new();
         let id = set.add(ToolRule::allow("read_file"));
-        assert!(set
-            .decide("read_file", &json!({}), &global())
-            .effect
-            .is_allowed());
+        assert!(
+            set.decide("read_file", &json!({}), &global())
+                .effect
+                .is_allowed()
+        );
 
         assert!(set.revoke(&id));
-        assert!(set
-            .decide("read_file", &json!({}), &global())
-            .effect
-            .is_ask());
+        assert!(
+            set.decide("read_file", &json!({}), &global())
+                .effect
+                .is_ask()
+        );
         assert!(!set.revoke(&id));
         assert!(set.is_empty());
     }
@@ -762,18 +774,22 @@ mod tests {
         let (loaded, warnings) = RuleSet::load(&path).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(loaded.list().len(), 2);
-        assert!(loaded
-            .decide("read_file", &json!({}), &global())
-            .effect
-            .is_allowed());
-        assert!(loaded
-            .decide(
-                "bash",
-                &json!({"command": "rm -rf /"}),
-                &RuleScope::Workspace("proj".into())
-            )
-            .effect
-            .is_denied());
+        assert!(
+            loaded
+                .decide("read_file", &json!({}), &global())
+                .effect
+                .is_allowed()
+        );
+        assert!(
+            loaded
+                .decide(
+                    "bash",
+                    &json!({"command": "rm -rf /"}),
+                    &RuleScope::Workspace("proj".into())
+                )
+                .effect
+                .is_denied()
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -792,14 +808,16 @@ mod tests {
         assert_eq!(set.list().len(), 2, "kept the two valid rules");
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(warnings.iter().all(|w| w.contains("rules[")));
-        assert!(set
-            .decide("read_file", &json!({}), &global())
-            .effect
-            .is_allowed());
-        assert!(set
-            .decide("write_file", &json!({}), &global())
-            .effect
-            .is_denied());
+        assert!(
+            set.decide("read_file", &json!({}), &global())
+                .effect
+                .is_allowed()
+        );
+        assert!(
+            set.decide("write_file", &json!({}), &global())
+                .effect
+                .is_denied()
+        );
     }
 
     #[test]

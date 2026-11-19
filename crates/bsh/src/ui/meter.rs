@@ -10,7 +10,7 @@
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{hairline_all, txt, DivExt};
+use super::{DivExt, hairline_all, txt};
 use crate::i18n::Lang;
 use crate::model::ContextBreakdown;
 use crate::state::human_tokens;

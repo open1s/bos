@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hostkit::programs::{executable, executable_names, find_in};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The shim source, embedded so a load needs no file on the host side.
 pub const HOST_SHIM_SOURCE: &str = include_str!("bridge/dsh-host-shim.js");
@@ -142,11 +142,9 @@ impl std::fmt::Display for BridgeRefusal {
                 f,
                 "no Node interpreter was found (looked for `{NODE_ENV_VAR}`, `node`, `nodejs`, a version manager's own selection and bin directories, and the runtime BSH ships), so the package JavaScript host entry cannot be executed"
             ),
-            BridgeRefusal::BadEntry { path, reason } => write!(
-                f,
-                "the host entry {} was refused: {reason}",
-                path.display()
-            ),
+            BridgeRefusal::BadEntry { path, reason } => {
+                write!(f, "the host entry {} was refused: {reason}", path.display())
+            }
             BridgeRefusal::Spawn { program, reason } => write!(
                 f,
                 "the Node interpreter {program} could not be started: {reason}"

@@ -7,8 +7,8 @@ use crate::llm::{
     VendorBuilderError,
 };
 
-use super::openai::ReasoningReplay;
 use super::OpenAiVendor;
+use super::openai::ReasoningReplay;
 
 /// OpenRouter vendor.
 ///

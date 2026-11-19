@@ -2696,10 +2696,12 @@ tls_mtls = true
             },
         );
         settings.set_plugin_presets(contributed);
-        assert!(settings
-            .preset_ids()
-            .iter()
-            .any(|id| id == "ext.com.example.reader"));
+        assert!(
+            settings
+                .preset_ids()
+                .iter()
+                .any(|id| id == "ext.com.example.reader")
+        );
         assert_eq!(
             settings
                 .preset("ext.com.example.reader")

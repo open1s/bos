@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
@@ -115,8 +115,8 @@ pub fn sign_package(
 
 /// Generate a new key pair. Returns (secret base64, public base64).
 pub fn generate_key() -> (String, String) {
-    use rand::rngs::SysRng;
     use rand::TryRng as _;
+    use rand::rngs::SysRng;
     let mut seed = [0u8; 32];
     SysRng
         .try_fill_bytes(&mut seed)

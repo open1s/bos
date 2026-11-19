@@ -1,7 +1,7 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use bus::{Session, ZenohError, DEFAULT_CODEC};
+use bus::{DEFAULT_CODEC, Session, ZenohError};
 use futures::StreamExt;
 use tokio::task::JoinHandle;
 use zenoh::query::Query as ZenohQuery;
@@ -529,9 +529,11 @@ mod tests {
             .and_then(|v| v.get("tools"))
             .and_then(|v| v.as_array())
             .unwrap();
-        assert!(tools
-            .iter()
-            .any(|t| t.get("name") == Some(&serde_json::json!("echo_json"))));
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name") == Some(&serde_json::json!("echo_json")))
+        );
     }
 
     #[tokio::test]
@@ -598,9 +600,11 @@ mod tests {
             .and_then(|v| v.get("tools"))
             .and_then(|v| v.as_array())
             .unwrap();
-        assert!(tools
-            .iter()
-            .any(|t| t.get("name") == Some(&serde_json::json!("echo_json"))));
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name") == Some(&serde_json::json!("echo_json")))
+        );
 
         let call_resp = handle_rpc_request(
             agent,

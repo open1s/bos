@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use resource::explorer::{handler_for, Explorer, Row};
+use resource::explorer::{Explorer, Row, handler_for};
 use resource::policy::{Effect, PolicyDoc, Rule, SharedPolicy};
 use resource::prelude::*;
 use resource::transport::inprocess::InProcessTransport;

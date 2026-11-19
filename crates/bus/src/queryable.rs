@@ -1,17 +1,17 @@
 //! Zenoh queryable wrapper
 
 use rkyv::{
+    Archive, Deserialize, Serialize,
     api::high::HighDeserializer,
     rancor::{Error, Strategy},
-    ser::{allocator::ArenaHandle, sharing::Share, Serializer},
+    ser::{Serializer, allocator::ArenaHandle, sharing::Share},
     util::AlignedVec,
-    Archive, Deserialize, Serialize,
 };
 
-use crate::{error::ZenohError, Codec, Session};
+use crate::{Codec, Session, error::ZenohError};
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::task::JoinHandle;
 use zenoh::query::Query;
 

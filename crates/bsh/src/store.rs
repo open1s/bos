@@ -2061,7 +2061,7 @@ pub(crate) fn sort_rows(rows: &mut Vec<&Session>, sort: SessionSort) {
 
 #[cfg(test)]
 mod tests {
-    use super::{sort_rows, SessionSort};
+    use super::{SessionSort, sort_rows};
     use crate::model::Session;
 
     /// A session carrying only what the view options read.

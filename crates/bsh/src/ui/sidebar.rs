@@ -6,7 +6,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{asset_icon, hairline_all, icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, asset_icon, hairline_all, icon, txt};
 use crate::state::age;
 use crate::theme;
 use crate::ui::todo_panel::{SPIN_FPS, SPIN_PERIOD};
@@ -1437,7 +1437,7 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{workspace_folder, WORKSPACE_FOLDER_CLOSED, WORKSPACE_FOLDER_OPEN};
+    use super::{WORKSPACE_FOLDER_CLOSED, WORKSPACE_FOLDER_OPEN, workspace_folder};
     use crate::theme;
 
     /// The measured reference pair: expanded rows carry the open folder,

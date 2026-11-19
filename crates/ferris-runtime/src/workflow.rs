@@ -11,11 +11,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::declarative::RawContribution;
-use ferris_core::capability::{authorize_each, call_scope, PolicyEngine};
+use ferris_core::capability::{PolicyEngine, authorize_each, call_scope};
 use ferris_core::types::{ExtensionError, RuntimeKind, TrustLevel};
 
 /// One step in a workflow.

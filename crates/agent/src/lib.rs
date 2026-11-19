@@ -33,6 +33,6 @@ pub use capability;
 // identity and workflow framework the default prompt uses.
 pub use agent::prompts;
 pub use agent::prompts::{
-    compose_system_prompt, guidance_for_tool, DEFAULT_PERSONA, HARNESS_IDENTITY, TOOL_GUIDANCE,
-    WORKFLOW_GUIDANCE,
+    DEFAULT_PERSONA, HARNESS_IDENTITY, TOOL_GUIDANCE, WORKFLOW_GUIDANCE, compose_system_prompt,
+    guidance_for_tool,
 };

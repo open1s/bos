@@ -35,46 +35,46 @@ pub mod workspace;
 pub use fs::{DirectoryListing, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs, WorkspaceFsError};
 pub use ignore::{IgnoreAction, IgnorePolicy, IgnorePolicyError, IgnoreRule};
 pub use index::{
-    index_rust_workspace, index_workspace, index_workspace_with_limits, SourceFileResult,
-    SourceFileStatus, SourceIndexDiagnostic, SourceIndexDiagnosticKind, SourceIndexReport,
-    SourceIndexStatus,
+    SourceFileResult, SourceFileStatus, SourceIndexDiagnostic, SourceIndexDiagnosticKind,
+    SourceIndexReport, SourceIndexStatus, index_rust_workspace, index_workspace,
+    index_workspace_with_limits,
 };
 pub use module_graph::{
-    build_rust_module_graph, RustModuleEdge, RustModuleEdgeStatus, RustModuleGraph,
-    RustModuleGraphError, RustModuleGraphLimits, RustModuleGraphStatus, RustModuleNode,
-    RustModuleNodeKind,
+    RustModuleEdge, RustModuleEdgeStatus, RustModuleGraph, RustModuleGraphError,
+    RustModuleGraphLimits, RustModuleGraphStatus, RustModuleNode, RustModuleNodeKind,
+    build_rust_module_graph,
 };
 pub use resolution::{
-    build_symbol_candidates, CandidateState, ReferenceCandidates, ReferenceKind,
-    SymbolCandidateError, SymbolCandidateReport, SymbolId, SymbolKind, SymbolRecord,
+    CandidateState, ReferenceCandidates, ReferenceKind, SymbolCandidateError,
+    SymbolCandidateReport, SymbolId, SymbolKind, SymbolRecord, build_symbol_candidates,
 };
 pub use rust_imports::{
-    resolve_rust_import_module_candidates, RustImportResolution, RustImportResolutionError,
-    RustImportResolutionReport, RustImportResolutionStatus,
+    RustImportResolution, RustImportResolutionError, RustImportResolutionReport,
+    RustImportResolutionStatus, resolve_rust_import_module_candidates,
 };
 pub use rust_modules::{
-    resolve_rust_module_candidates, RustModuleResolution, RustModuleResolutionError,
-    RustModuleResolutionReport, RustModuleResolutionStatus,
+    RustModuleResolution, RustModuleResolutionError, RustModuleResolutionReport,
+    RustModuleResolutionStatus, resolve_rust_module_candidates,
 };
 pub use rust_symbol_imports::{
-    resolve_rust_import_symbols, RustSymbolImportCandidate, RustSymbolImportResolution,
-    RustSymbolImportResolutionError, RustSymbolImportResolutionReport, RustSymbolImportStatus,
+    RustSymbolImportCandidate, RustSymbolImportResolution, RustSymbolImportResolutionError,
+    RustSymbolImportResolutionReport, RustSymbolImportStatus, resolve_rust_import_symbols,
 };
 pub use rust_symbols::{
-    build_rust_scoped_symbols, RustScopedSymbol, RustScopedSymbolError, RustScopedSymbolId,
-    RustScopedSymbolKind, RustScopedSymbolReport,
+    RustScopedSymbol, RustScopedSymbolError, RustScopedSymbolId, RustScopedSymbolKind,
+    RustScopedSymbolReport, build_rust_scoped_symbols,
 };
 pub use scan_budget::{ScanBudget, ScanBudgetError, ScanLimits, ScanUsage};
 pub use scanner::{
-    scan_workspace, scan_workspace_with_policy, ScanDiagnostic, ScanDiagnosticKind, ScanStatus,
-    WorkspaceScanReport,
+    ScanDiagnostic, ScanDiagnosticKind, ScanStatus, WorkspaceScanReport, scan_workspace,
+    scan_workspace_with_policy,
 };
 pub use syntax::query::{
-    execute_query, QueryCaptureRecord, QueryCompileErrorKind, QueryControl, QueryExecution,
-    QueryExecutionError, QueryExecutionLimits, QueryExecutionOptions, QueryExecutionStatus,
-    QueryMatchRecord, QueryOutputLimit, QueryRange, QueryRangeMode, QueryRegistrationError,
-    QueryRegistry, RegisteredQuery, MAX_MATCH_LIMIT, MAX_QUERY_ID_BYTES, MAX_QUERY_VERSION_BYTES,
-    MIN_MATCH_LIMIT,
+    MAX_MATCH_LIMIT, MAX_QUERY_ID_BYTES, MAX_QUERY_VERSION_BYTES, MIN_MATCH_LIMIT,
+    QueryCaptureRecord, QueryCompileErrorKind, QueryControl, QueryExecution, QueryExecutionError,
+    QueryExecutionLimits, QueryExecutionOptions, QueryExecutionStatus, QueryMatchRecord,
+    QueryOutputLimit, QueryRange, QueryRangeMode, QueryRegistrationError, QueryRegistry,
+    RegisteredQuery, execute_query,
 };
 pub use syntax::rust::RustProvider;
 pub use syntax::{

@@ -2,12 +2,12 @@
 
 use std::collections::BTreeSet;
 
+use capability::Catalogue;
 use capability::composition::{
-    resolve_host, CapabilityRequirement, CompositionSpec, LocalScope, PeerRef, RemotePolicy,
+    CapabilityRequirement, CompositionSpec, LocalScope, PeerRef, RemotePolicy, resolve_host,
 };
 use capability::id::{CapabilityId, WorkspaceId};
-use capability::proposal::{resolve_proposal, validate_proposal, ProposalError, ProposalRejection};
-use capability::Catalogue;
+use capability::proposal::{ProposalError, ProposalRejection, resolve_proposal, validate_proposal};
 use capability::{CapabilityDescriptor, CapabilityKind, Risk, VersionSource};
 use semver::{Version, VersionReq};
 
@@ -104,11 +104,10 @@ fn an_approved_remote_only_capability_passes_and_resolves() {
     let (peer, remote) = remote_peer("peer-a", "remote_search", Risk::Low);
     let node = capability::NodeId::new("peer-a").expect("a node");
     let allowed: BTreeSet<_> = [capability("remote_search")].into_iter().collect();
-    let mut spec = spec(vec![CapabilityRequirement::new(
-        capability("remote_search"),
-        VersionReq::STAR,
-    )
-    .with_remote(RemotePolicy::Allowed)]);
+    let mut spec = spec(vec![
+        CapabilityRequirement::new(capability("remote_search"), VersionReq::STAR)
+            .with_remote(RemotePolicy::Allowed),
+    ]);
     spec.peers.push(peer);
 
     let plan = resolve_proposal(
@@ -134,11 +133,10 @@ fn a_remote_only_capability_the_host_did_not_approve_is_refused() {
     let local = catalogue();
     let (peer, remote) = remote_peer("peer-a", "remote_search", Risk::Low);
     let allowed: BTreeSet<_> = [capability("read_file")].into_iter().collect();
-    let mut spec = spec(vec![CapabilityRequirement::new(
-        capability("remote_search"),
-        VersionReq::STAR,
-    )
-    .with_remote(RemotePolicy::Allowed)]);
+    let mut spec = spec(vec![
+        CapabilityRequirement::new(capability("remote_search"), VersionReq::STAR)
+            .with_remote(RemotePolicy::Allowed),
+    ]);
     spec.peers.push(peer);
 
     assert_eq!(
@@ -154,11 +152,10 @@ fn a_remote_capability_above_the_risk_ceiling_is_refused() {
     let local = catalogue();
     let (peer, remote) = remote_peer("peer-a", "remote_search", Risk::High);
     let allowed: BTreeSet<_> = [capability("remote_search")].into_iter().collect();
-    let mut spec = spec(vec![CapabilityRequirement::new(
-        capability("remote_search"),
-        VersionReq::STAR,
-    )
-    .with_remote(RemotePolicy::Allowed)]);
+    let mut spec = spec(vec![
+        CapabilityRequirement::new(capability("remote_search"), VersionReq::STAR)
+            .with_remote(RemotePolicy::Allowed),
+    ]);
     spec.peers.push(peer);
 
     assert_eq!(
@@ -181,11 +178,10 @@ fn a_remote_peer_without_a_grant_cannot_satisfy_the_proposal() {
     let node = capability::NodeId::new("peer-a").expect("a node");
     let remote = capability::composition::PeerCatalogue::new(node.clone(), remote_catalogue);
     let allowed: BTreeSet<_> = [capability("remote_search")].into_iter().collect();
-    let mut spec = spec(vec![CapabilityRequirement::new(
-        capability("remote_search"),
-        VersionReq::STAR,
-    )
-    .with_remote(RemotePolicy::Allowed)]);
+    let mut spec = spec(vec![
+        CapabilityRequirement::new(capability("remote_search"), VersionReq::STAR)
+            .with_remote(RemotePolicy::Allowed),
+    ]);
     spec.peers.push(capability::composition::PeerRef::new(node));
 
     assert_eq!(
@@ -201,11 +197,10 @@ fn a_peer_outside_the_spec_allowlist_cannot_satisfy_a_proposal() {
     let local = catalogue();
     let (_peer, remote) = remote_peer("peer-a", "remote_search", Risk::Low);
     let allowed: BTreeSet<_> = [capability("remote_search")].into_iter().collect();
-    let spec = spec(vec![CapabilityRequirement::new(
-        capability("remote_search"),
-        VersionReq::STAR,
-    )
-    .with_remote(RemotePolicy::Allowed)]);
+    let spec = spec(vec![
+        CapabilityRequirement::new(capability("remote_search"), VersionReq::STAR)
+            .with_remote(RemotePolicy::Allowed),
+    ]);
 
     assert_eq!(
         validate_proposal(&spec, &local, &[remote], &remote_policy(&allowed)).unwrap_err(),
@@ -280,11 +275,10 @@ fn a_risk_above_the_ceiling_is_refused() {
 fn a_remote_binding_is_refused_when_the_host_forbids_it() {
     let catalogue = catalogue();
     let allowed: BTreeSet<_> = [capability("read_file")].into_iter().collect();
-    let spec = spec(vec![CapabilityRequirement::new(
-        capability("read_file"),
-        VersionReq::STAR,
-    )
-    .with_remote(RemotePolicy::Allowed)]);
+    let spec = spec(vec![
+        CapabilityRequirement::new(capability("read_file"), VersionReq::STAR)
+            .with_remote(RemotePolicy::Allowed),
+    ]);
 
     assert_eq!(
         validate_proposal(&spec, &catalogue, &[], &policy(&allowed)).unwrap_err(),

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::{
     llm::vendor::openaicompatible::{
-        sse_has_done_signal, ChatCompletionResponse, OpenAIExtractor, StreamToolCallAccumulator,
-        Usage,
+        ChatCompletionResponse, OpenAIExtractor, StreamToolCallAccumulator, Usage,
+        sse_has_done_signal,
     },
     utils::{JsonExtractor, StreamExtractor},
 };

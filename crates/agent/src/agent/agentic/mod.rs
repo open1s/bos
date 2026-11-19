@@ -36,7 +36,7 @@ mod engine;
 mod llm;
 
 use adapters::{AsyncExtensibleToolAdapter, ExtensibleToolAdapter};
-pub use llm::{build_vendor, LlmProvider};
+pub use llm::{LlmProvider, build_vendor};
 
 // ============================================================================
 // Simplified Agent API - Builder Pattern

@@ -4,12 +4,12 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 
+use react::ReActEngineBuilder;
 use react::llm::{
     Content, LlmClient, LlmContext, LlmError, LlmMessage, LlmRequest, LlmResponseResult,
     LlmSession, ReactSession, ReasoningState, StreamToken, TokenStream,
 };
 use react::runtime::ReActApp;
-use react::ReActEngineBuilder;
 
 #[derive(Default)]
 struct TestApp;

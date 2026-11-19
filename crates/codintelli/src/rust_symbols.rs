@@ -7,9 +7,9 @@
 use std::path::PathBuf;
 
 use crate::{
+    WorkspaceId,
     module_graph::{RustModuleGraph, RustModuleGraphStatus, RustModuleNodeKind},
     syntax::{ParseResult, ParseStatus, RustVisibility, SourceRange, SyntaxFactKind},
-    WorkspaceId,
 };
 
 /// Declaration category retained by the crate-root-aware Rust symbol catalog.

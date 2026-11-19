@@ -3,9 +3,9 @@ use crate::utils::{
     invoke_python_handler_to_pyany, invoke_python_string_handler, session_from_bus,
 };
 use bus::{Callable, Caller};
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
-use pyo3::IntoPyObjectExt;
 use std::sync::Arc;
 
 #[pyclass(name = "Caller", skip_from_py_object)]

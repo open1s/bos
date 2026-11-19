@@ -282,9 +282,11 @@ mod tests {
 
         assert_eq!(dispatcher.matching(&HookEvent::BeforeToolCall).len(), 1);
         assert_eq!(dispatcher.matching(&HookEvent::AfterToolCall).len(), 0);
-        assert!(dispatcher
-            .dispatch_event(&HookEvent::AfterToolCall)
-            .is_empty());
+        assert!(
+            dispatcher
+                .dispatch_event(&HookEvent::AfterToolCall)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -330,7 +332,7 @@ mod tests {
         };
         let mut dispatcher = HookDispatcher::new();
         dispatcher.register(ExternalHook::any(vec![
-            "/definitely/not/a/real/binary-xyz".to_string()
+            "/definitely/not/a/real/binary-xyz".to_string(),
         ]));
         dispatcher.register(ExternalHook::any(vec![echo, "ok".to_string()]));
 

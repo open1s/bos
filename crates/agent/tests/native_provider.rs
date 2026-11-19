@@ -1,7 +1,7 @@
 //! The native provider executes a capability call through a real registry.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use agent::capabilities::NativeToolProvider;
@@ -11,7 +11,7 @@ use capability::{
     CancelToken, CapabilityCall, CapabilityError, CapabilityId, CapabilityProvider,
     InvocationContext, InvocationId, Principal, WorkspaceId,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn workspace() -> WorkspaceId {
     WorkspaceId::new("ws:test").expect("a valid workspace id")

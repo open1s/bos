@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{classification::LanguageId, ScanBudget, ScanBudgetError, WorkspaceId};
+use crate::{ScanBudget, ScanBudgetError, WorkspaceId, classification::LanguageId};
 
 pub mod document;
 pub mod query;

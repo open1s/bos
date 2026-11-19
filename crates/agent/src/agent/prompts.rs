@@ -29,8 +29,7 @@ pub const HARNESS_IDENTITY: &str = "You are an AI agent powered by BOS Harness."
 /// system prompt for the whole build rather than re-rendering it per request, so
 /// the model is named as the selected one instead of by id; the exact id is
 /// already on the wire and in the Models pane.
-pub const DEFAULT_PERSONA: &str =
-    "You are a coding agent working directly in the user's workspace, powered by the selected model.";
+pub const DEFAULT_PERSONA: &str = "You are a coding agent working directly in the user's workspace, powered by the selected model.";
 
 /// The standing operating contract every build carries.
 ///

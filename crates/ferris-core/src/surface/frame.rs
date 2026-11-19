@@ -193,7 +193,7 @@ pub fn apply_patch(
                     _ => {
                         return Err(SurfaceError::Invalid(format!(
                             "node {id:?} is not a slot and has no props"
-                        )))
+                        )));
                     }
                 }
             }
@@ -375,7 +375,7 @@ fn set_text(node: &mut SurfaceNode, text: &str) -> Result<(), SurfaceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::surface::document::{ActionMode, SurfaceDocument, SURFACE_SCHEMA_VERSION};
+    use crate::surface::document::{ActionMode, SURFACE_SCHEMA_VERSION, SurfaceDocument};
     use crate::surface::node::SurfaceNode;
     use crate::ui::Tone;
 

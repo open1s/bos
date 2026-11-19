@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use react::tool::{Tool, ToolError};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::goal::{Goal, GoalFence, MODEL_REPORTED};
 
@@ -387,9 +387,10 @@ mod tests {
     fn blocked_without_a_reason_is_rejected_and_sets_nothing() {
         let store = seeded();
         let tool = UpdateGoalTool::new(store.clone());
-        assert!(tool
-            .run(&json!({"action": "blocked", "blocked_reason": "   "}))
-            .is_err());
+        assert!(
+            tool.run(&json!({"action": "blocked", "blocked_reason": "   "}))
+                .is_err()
+        );
         assert!(tool.run(&json!({"action": "blocked"})).is_err());
         assert!(store.take_settle().is_none());
         assert_eq!(

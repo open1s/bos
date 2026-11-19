@@ -9,7 +9,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, icon, txt};
 use crate::i18n::{tr, tr_args};
 use crate::review::domain::{
     CaptureMode, Change, ChangeKind, ChangeSet, Decision, FileDiff, ReviewSnapshot, ReviewStatus,
@@ -1018,7 +1018,7 @@ fn short_digest(digest: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{review_band, REVIEW_ROW_H};
+    use super::{REVIEW_ROW_H, review_band};
 
     /// The list's rows are exact heights, so the built band and the two spacers
     /// must reproduce the whole list's height.

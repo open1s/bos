@@ -17,7 +17,7 @@ impl Extension for Demo {
 
     async fn start(&self, _ctx: &ExtensionContext) -> Result<Vec<Contribution>> {
         Ok(vec![
-            ContributionSpec::tool("echo").into_contribution(json!({ "description": "Echo" }))
+            ContributionSpec::tool("echo").into_contribution(json!({ "description": "Echo" })),
         ])
     }
 

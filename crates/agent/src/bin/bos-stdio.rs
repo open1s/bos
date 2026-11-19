@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// JSON-RPC code for an unparseable line.
 const PARSE_ERROR: i32 = -32700;

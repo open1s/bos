@@ -149,10 +149,12 @@ fn message_send_rejects_an_unknown_session() {
 
     let error = recv(&mut reader);
     assert_eq!(error["error"]["code"], -32602);
-    assert!(error["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("unknown session"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown session")
+    );
 
     let shutdown = recv(&mut reader);
     assert_eq!(shutdown["result"]["ok"], true);

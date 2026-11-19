@@ -9,8 +9,8 @@ use react::llm::{
     TokenStream,
 };
 use react::runtime::ReActApp;
-use react::tool::registry::ToolVariant;
 use react::tool::FnTool;
+use react::tool::registry::ToolVariant;
 
 #[derive(Default)]
 struct TestApp;

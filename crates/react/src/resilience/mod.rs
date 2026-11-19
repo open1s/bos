@@ -2,9 +2,9 @@
 //! This module provides simple, production-friendly resilience patterns.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -960,15 +960,19 @@ mod tests {
         };
         let resilience = ReActResilience::new(config);
 
-        assert!(resilience
-            .execute(|| async { Ok::<_, ()>(1) })
-            .await
-            .is_ok());
+        assert!(
+            resilience
+                .execute(|| async { Ok::<_, ()>(1) })
+                .await
+                .is_ok()
+        );
 
-        assert!(resilience
-            .execute(|| async { Ok::<_, ()>(2) })
-            .await
-            .is_ok());
+        assert!(
+            resilience
+                .execute(|| async { Ok::<_, ()>(2) })
+                .await
+                .is_ok()
+        );
         let result = resilience.execute(|| async { Ok::<_, ()>(2) }).await;
         assert!(matches!(result, Ok(2)));
     }

@@ -15,8 +15,7 @@ use agent::Agent;
 /// The reference's glob walks in everything; BSH's walk respects ignore files
 /// and hidden entries unless `include_ignored` is set, so the guidance says so
 /// instead of promising a listing the tool will not produce.
-pub(crate) const GLOB: &str =
-    "Use the glob tool — not shell find — to discover files by path pattern. It matches paths, not file contents. Use grep for content searches. A pattern with no \"/\" matches the basename at any depth, so \"*\" and \"*.ts\" both search the whole tree; include a separator to anchor the depth. Ignored and hidden files are skipped unless include_ignored is set.";
+pub(crate) const GLOB: &str = "Use the glob tool — not shell find — to discover files by path pattern. It matches paths, not file contents. Use grep for content searches. A pattern with no \"/\" matches the basename at any depth, so \"*\" and \"*.ts\" both search the whole tree; include a separator to anchor the depth. Ignored and hidden files are skipped unless include_ignored is set.";
 
 /// The reference's grep guidance, with BSH's tool name.
 ///
@@ -24,26 +23,22 @@ pub(crate) const GLOB: &str =
 /// facts this tool adds are stated: case folding is opt-in, the walk is
 /// ignore-aware unless `include_ignored` is set, and `path` may name a single
 /// file so a known file is grepped directly.
-pub(crate) const GREP: &str =
-    "Use the grep tool — not shell grep or rg — to search file contents. It returns each matching line with its file and line number. path may be a directory, searched recursively, or one file; a file you name is searched even if it is hidden or ignored. Matching is case-sensitive unless case_insensitive is set; ignored and hidden files are skipped unless include_ignored is set. include takes one glob filter for which files to search, invert reports the lines that do not match, context adds that many lines around each match, files_without_match returns the paths that had none, and text searches binary files as text. Use read_file on one matched file when you need surrounding context; use read_files when you need to inspect several known matches.";
+pub(crate) const GREP: &str = "Use the grep tool — not shell grep or rg — to search file contents. It returns each matching line with its file and line number. path may be a directory, searched recursively, or one file; a file you name is searched even if it is hidden or ignored. Matching is case-sensitive unless case_insensitive is set; ignored and hidden files are skipped unless include_ignored is set. include takes one glob filter for which files to search, invert reports the lines that do not match, context adds that many lines around each match, files_without_match returns the paths that had none, and text searches binary files as text. Use read_file on one matched file when you need surrounding context; use read_files when you need to inspect several known matches.";
 
 /// Guidance for one-file reads.
 ///
 /// Use the batch variant when several known files need inspection, avoiding
 /// repeated tool-call envelopes while retaining a bounded aggregate result.
-pub(crate) const READ_FILE: &str =
-    "Use the read_file tool — not shell commands like cat — to inspect one text file. offset is required and 1-based (the first line is 1, not 0); use limit to page through a large file.";
+pub(crate) const READ_FILE: &str = "Use the read_file tool — not shell commands like cat — to inspect one text file. offset is required and 1-based (the first line is 1, not 0); use limit to page through a large file.";
 
-pub(crate) const READ_FILES: &str =
-    "When you need to inspect several known files, use read_files once instead of making repeated read_file calls. It accepts up to 10 distinct paths, applies offset and limit to each file, and caps combined returned content at 1 MiB; inspect each file's truncated or error field.";
+pub(crate) const READ_FILES: &str = "When you need to inspect several known files, use read_files once instead of making repeated read_file calls. It accepts up to 10 distinct paths, applies offset and limit to each file, and caps combined returned content at 1 MiB; inspect each file's truncated or error field.";
 
 /// The reference's `write` guidance, with BSH's tool name and no policy claim.
 ///
 /// The reference's parenthetical "(the default fs-observation-policy requires
 /// it)" is dropped because BSH does not enforce read-before-write; the rule
 /// stays as discipline.
-pub(crate) const WRITE_FILE: &str =
-    "Read an existing file before overwriting it with write_file, and prefer edit_file for targeted changes.";
+pub(crate) const WRITE_FILE: &str = "Read an existing file before overwriting it with write_file, and prefer edit_file for targeted changes.";
 
 /// The reference's `edit` guidance, with BSH's tool name and no policy claim.
 pub(crate) const EDIT_FILE: &str =
@@ -54,18 +49,15 @@ pub(crate) const EDIT_FILE: &str =
 /// The tool is a TRANSFORMER, not a reader: in-place mode points every output
 /// command at the file, so the three facts a model needs are the two refusals
 /// and the dry run.
-pub(crate) const SED: &str =
-    "Use the sed tool for a global, pattern-based or line-addressed change that would be awkward as an exact edit_file replacement. The script processes a private copy of one workspace file and replaces it only when the bytes change. Output is GNU's in-place output: p, P, =, l, F and s///p write to the edited file, so quiet=true plus '/pattern/p' filters the file to matching lines. backup_suffix keeps the original at path + suffix. e, r, R, w and W are refused by the engine's sandbox. Pass dry_run=true to see the resulting text without writing.";
+pub(crate) const SED: &str = "Use the sed tool for a global, pattern-based or line-addressed change that would be awkward as an exact edit_file replacement. The script processes a private copy of one workspace file and replaces it only when the bytes change. Output is GNU's in-place output: p, P, =, l, F and s///p write to the edited file, so quiet=true plus '/pattern/p' filters the file to matching lines. backup_suffix keeps the original at path + suffix. e, r, R, w and W are refused by the engine's sandbox. Pass dry_run=true to see the resulting text without writing.";
 
-pub(crate) const APPLY_PATCH: &str =
-    "For coordinated changes across several files, use apply_patch with grouped exact-text edits instead of separate edit_file calls. Each file is validated before its atomic write; a failed edit leaves that file unchanged. This is not a cross-file transaction, so inspect every per-file result.";
+pub(crate) const APPLY_PATCH: &str = "For coordinated changes across several files, use apply_patch with grouped exact-text edits instead of separate edit_file calls. Each file is validated before its atomic write; a failed edit leaves that file unchanged. This is not a cross-file transaction, so inspect every per-file result.";
 
 /// BSH-only guidance for the directory listing tool.
 ///
 /// The reference discovers paths with `glob`, which BSH does not register; it
 /// lists a directory instead, and says so plainly.
-pub(crate) const LIST_DIR: &str =
-    "Use list_dir to see what a directory holds before reading or creating files; it reports names and kinds, not contents.";
+pub(crate) const LIST_DIR: &str = "Use list_dir to see what a directory holds before reading or creating files; it reports names and kinds, not contents.";
 
 /// The reference's `web_search` guidance, verbatim.
 ///

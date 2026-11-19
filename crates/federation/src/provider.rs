@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use capability::{
-    remote_provider_id, CapabilityCall, CapabilityDescriptor, CapabilityError, CapabilityOutput,
-    CapabilityProvider, ProviderHealth, ProviderId, ProviderKind,
+    CapabilityCall, CapabilityDescriptor, CapabilityError, CapabilityOutput, CapabilityProvider,
+    ProviderHealth, ProviderId, ProviderKind, remote_provider_id,
 };
 
 use crate::service::FederationNode;

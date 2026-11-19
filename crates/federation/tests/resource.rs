@@ -239,9 +239,11 @@ fn a_grant_and_its_charge_survive_a_restart() {
     assert_eq!(lease.max_bytes, Some(16));
 
     let mut reopened = reopened;
-    assert!(reopened
-        .revoke(&LeaseId::new("l-persist"))
-        .expect("revoked"));
+    assert!(
+        reopened
+            .revoke(&LeaseId::new("l-persist"))
+            .expect("revoked")
+    );
     drop(reopened);
     let after = LeaseStore::open(&path).expect("reopen after revoke");
     assert!(after.get(&LeaseId::new("l-persist")).is_none());

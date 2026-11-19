@@ -8,8 +8,8 @@
 //! Skill without retaining any of their instructions.
 
 use super::{
-    digest_bytes, SkillContent, SkillDependency, SkillLoader, SkillMetadata, SkillMetadataError,
-    SkillSource, MAX_SKILL_BYTES,
+    MAX_SKILL_BYTES, SkillContent, SkillDependency, SkillLoader, SkillMetadata, SkillMetadataError,
+    SkillSource, digest_bytes,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -993,9 +993,11 @@ mod tests {
         third_party.publisher = Some("acme".to_string());
         let mut widened = TrustPolicy::default();
         widened.allowed_sources.insert(SkillSource::ThirdParty);
-        assert!(widened
-            .authorize(&third_party, SkillPermission::Model)
-            .is_ok());
+        assert!(
+            widened
+                .authorize(&third_party, SkillPermission::Model)
+                .is_ok()
+        );
     }
 
     fn remote(name: &str, version: (u32, u32, u32), digest: &str, peer: &str) -> RemoteSkill {

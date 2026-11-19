@@ -5,8 +5,8 @@
 //! provider must serve the second attempt from the stored offset, and the
 //! checkpoint must disappear only when the stream completes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use capability::CapabilityId;

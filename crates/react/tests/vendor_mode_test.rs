@@ -1,6 +1,6 @@
 use react::llm::vendor::{
-    merge_system_prompt, ChatCompletionResponse, ChatMessage, Choice, FunctionCall,
-    OpenAiVendorBuilder, ToolCall,
+    ChatCompletionResponse, ChatMessage, Choice, FunctionCall, OpenAiVendorBuilder, ToolCall,
+    merge_system_prompt,
 };
 use react::llm::{LlmClient, LlmContext, LlmResponse, LlmSession};
 

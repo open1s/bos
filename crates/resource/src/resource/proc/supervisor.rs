@@ -20,14 +20,14 @@
 //! Health signal = exit status. There are no separate liveness probes: a
 //! process that is running is healthy by definition.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 
 use crate::action::{ResourceAction, ResourceEvent, ResourceOutput};
 use crate::error::{ResourceError, Result};

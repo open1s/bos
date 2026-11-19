@@ -4,16 +4,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent::capabilities::{
-    catalogue_from_registry, CapabilityTool, NativeToolProvider, ProxySource, ToolFacts,
+    CapabilityTool, NativeToolProvider, ProxySource, ToolFacts, catalogue_from_registry,
 };
 use agent::tools::{AsyncTool, FunctionTool, Tool, ToolError, ToolRegistry};
 use capability::composition::{
-    resolve_host, CapabilityRequirement, CompositionSpec, LocalScope, RemotePolicy,
+    CapabilityRequirement, CompositionSpec, LocalScope, RemotePolicy, resolve_host,
 };
 use capability::id::WorkspaceId;
 use capability::{CapabilityId, InvocationContext, InvocationId, Principal, WorkspaceRuntime};
 use semver::{Version, VersionReq};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn workspace() -> WorkspaceId {
     WorkspaceId::new("ws:test").expect("a valid workspace id")

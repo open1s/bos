@@ -23,16 +23,16 @@ use ferris_sdk::composable::dispatch::InterceptorPolicy;
 use ferris_sdk::composable::{
     Context, DisposalReport, Fiber, FiberState, Scope, ServiceAuthorizer, ServiceToken,
 };
-use ferris_sdk::events::{lifecycle_event, topics, EventBus, ExtensionEvent};
+use ferris_sdk::events::{EventBus, ExtensionEvent, lifecycle_event, topics};
 use ferris_sdk::host_runtime::builtin::{BuiltinRuntime, ClosureExtension};
 use ferris_sdk::host_runtime::declarative::DeclarativeContributions;
-use ferris_sdk::host_runtime::{empty_schema, CallContext, LazyRuntime, Runtime, ToolDescriptor};
+use ferris_sdk::host_runtime::{CallContext, LazyRuntime, Runtime, ToolDescriptor, empty_schema};
 use ferris_sdk::lifecycle::{Health, LifecycleManager};
-use ferris_sdk::package::{write_atomic, ExtensionStore, Package};
+use ferris_sdk::package::{ExtensionStore, Package, write_atomic};
 use ferris_sdk::resolver;
 use ferris_sdk::types::{
-    ContributionId, ExtensionError, ExtensionId, ExtensionSource, LifecycleState, RuntimeKind,
-    StartupPolicy, TrustLevel, ValidationReport, EXTENSION_API_VERSION, HOST_VERSION,
+    ContributionId, EXTENSION_API_VERSION, ExtensionError, ExtensionId, ExtensionSource,
+    HOST_VERSION, LifecycleState, RuntimeKind, StartupPolicy, TrustLevel, ValidationReport,
 };
 use ferris_sdk::ui::{PanelLocation, PanelVisibility, ThemePalette, UiDocument};
 use serde_json::Value;
@@ -3359,7 +3359,7 @@ impl ExtensionHost {
                             extension: id.to_string(),
                             capability: capability.capability.clone(),
                             reason: "process extension has no declared executable".to_string(),
-                        })
+                        });
                     }
                 },
                 // A secret or a host cannot be named from this pane, and
@@ -5112,10 +5112,12 @@ mod tests {
             },
             "writes land at the activation's viewer scope"
         );
-        assert!(committed
-            .provenance
-            .evidence
-            .contains(&"extension:com.bos.bsh.memory-tools".to_string()));
+        assert!(
+            committed
+                .provenance
+                .evidence
+                .contains(&"extension:com.bos.bsh.memory-tools".to_string())
+        );
 
         // Recall through the same contract.
         let outcome = super::super::block_on_tokio_scoped(lease.recall(
@@ -5326,10 +5328,12 @@ tools = ["echo"]
         let committed =
             super::super::block_on_tokio_scoped(lease.add(memory_dto("granted consumer note")))
                 .expect("commit");
-        assert!(committed
-            .provenance
-            .evidence
-            .contains(&"extension:com.example.memory-consumer".to_string()));
+        assert!(
+            committed
+                .provenance
+                .evidence
+                .contains(&"extension:com.example.memory-consumer".to_string())
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5652,18 +5656,22 @@ tools = ["echo"]
             );
         }
         let panels = host.panel_surfaces();
-        assert!(panels
-            .iter()
-            .any(|panel| panel.owner.as_str() == "com.example.extism-echo"));
-        assert!(host
-            .model_provider_surfaces()
-            .contains_key("ext.com.example.extism-echo.example"));
+        assert!(
+            panels
+                .iter()
+                .any(|panel| panel.owner.as_str() == "com.example.extism-echo")
+        );
+        assert!(
+            host.model_provider_surfaces()
+                .contains_key("ext.com.example.extism-echo.example")
+        );
         let presets = host.preset_surfaces();
         assert!(presets.contains_key("ext.com.example.extism-echo.reader"));
         assert!(presets.contains_key("ext.com.example.extism-echo.agent.helper"));
-        assert!(host
-            .theme_surfaces()
-            .contains_key("ext.com.example.extism-echo.midnight"));
+        assert!(
+            host.theme_surfaces()
+                .contains_key("ext.com.example.extism-echo.midnight")
+        );
         assert!(
             host.metrics().memory_limit_bytes > 0,
             "the loaded runtimes report their memory ceilings"
@@ -5746,9 +5754,10 @@ tools = ["echo"]
         // so the tool is not reachable.
         assert!(!status.applied);
         assert_ne!(status.state, LifecycleState::Active);
-        assert!(host
-            .why("com.bos.bsh.extensions")
-            .is_some_and(|why| why.contains("disabled")));
+        assert!(
+            host.why("com.bos.bsh.extensions")
+                .is_some_and(|why| why.contains("disabled"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5769,9 +5778,10 @@ tools = ["echo"]
         assert!(!status.configured);
         assert!(!status.applied);
         assert_ne!(status.state, LifecycleState::Active);
-        assert!(host
-            .why("com.bos.bsh.diagnostics")
-            .is_some_and(|why| why.contains("disabled")));
+        assert!(
+            host.why("com.bos.bsh.diagnostics")
+                .is_some_and(|why| why.contains("disabled"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5898,9 +5908,11 @@ tools = ["echo"]
             workspace: Some(root.clone()),
         };
 
-        assert!(authorizer
-            .authorize("com.example.consumer", &Scope::Host, "search")
-            .is_err());
+        assert!(
+            authorizer
+                .authorize("com.example.consumer", &Scope::Host, "search")
+                .is_err()
+        );
         policy
             .grant(
                 "com.example.consumer",
@@ -5909,9 +5921,11 @@ tools = ["echo"]
                 None,
             )
             .expect("grant");
-        assert!(authorizer
-            .authorize("com.example.consumer", &Scope::Host, "search")
-            .is_ok());
+        assert!(
+            authorizer
+                .authorize("com.example.consumer", &Scope::Host, "search")
+                .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5947,9 +5961,11 @@ tools = ["echo"]
             trust: TrustLevel::Community,
             workspace: Some(root.clone()),
         };
-        assert!(interceptor
-            .authorize("com.example.interceptor", "tool.before")
-            .is_err());
+        assert!(
+            interceptor
+                .authorize("com.example.interceptor", "tool.before")
+                .is_err()
+        );
         assert!(
             interceptor
                 .authorize("com.example.other", "tool.before")
@@ -5967,9 +5983,11 @@ tools = ["echo"]
                 None,
             )
             .expect("grant");
-        assert!(interceptor
-            .authorize("com.example.interceptor", "tool.before")
-            .is_ok());
+        assert!(
+            interceptor
+                .authorize("com.example.interceptor", "tool.before")
+                .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5991,9 +6009,11 @@ tools = ["echo"]
             workspace: Some(root.clone()),
         };
 
-        assert!(interceptor
-            .authorize("com.example.requester", "tool.before")
-            .is_err());
+        assert!(
+            interceptor
+                .authorize("com.example.requester", "tool.before")
+                .is_err()
+        );
         policy
             .grant(
                 "com.example.requester",
@@ -6002,9 +6022,11 @@ tools = ["echo"]
                 None,
             )
             .expect("grant");
-        assert!(interceptor
-            .authorize("com.example.requester", "tool.before")
-            .is_ok());
+        assert!(
+            interceptor
+                .authorize("com.example.requester", "tool.before")
+                .is_ok()
+        );
 
         let audit = std::fs::read_to_string(root.join("audit.jsonl")).unwrap_or_default();
         assert!(
@@ -6163,10 +6185,12 @@ requires = [{ name = "com.example.search", contract = "com.example.search-api", 
             "{status:?}"
         );
         let report = host.doctor();
-        assert!(report
-            .issues
-            .iter()
-            .any(|issue| issue.message.contains("hash")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("hash"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6749,8 +6773,10 @@ tools = ["echo"]
         drop(lease);
         // The provider unloads: revoking its token removes the service.
         assert!(registry.revoke(&token));
-        assert!(registry
-            .acquire_contract::<Hello>(&Scope::Host, "greeter", "test.greeter", &requirement)
-            .is_none());
+        assert!(
+            registry
+                .acquire_contract::<Hello>(&Scope::Host, "greeter", "test.greeter", &requirement)
+                .is_none()
+        );
     }
 }

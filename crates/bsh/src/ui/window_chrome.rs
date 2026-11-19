@@ -320,7 +320,7 @@ pub(crate) fn drag_grip(grip: Stateful<Div>) -> Stateful<Div> {
 #[cfg(test)]
 mod tests {
     use super::{
-        draws_buttons_for, is_over_buttons, is_strip, lights_origin, strip_height, Host, LIGHT_CELL,
+        Host, LIGHT_CELL, draws_buttons_for, is_over_buttons, is_strip, lights_origin, strip_height,
     };
     use crate::theme;
     use gpui_kit::Decorations;

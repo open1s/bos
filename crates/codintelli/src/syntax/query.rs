@@ -1635,12 +1635,14 @@ mod tests {
         let execution = execute(&registry, "rust.functions.v1", &document, &options());
         assert!(execution.is_complete());
         assert_eq!(execution.document_status, ParsedDocumentStatus::Recovered);
-        assert!(execution
-            .matches
-            .iter()
-            .any(|record| record.captures.iter().any(|capture| {
-                &document.source()[capture.range.start_byte..capture.range.end_byte] == b"good"
-            })));
+        assert!(
+            execution
+                .matches
+                .iter()
+                .any(|record| record.captures.iter().any(|capture| {
+                    &document.source()[capture.range.start_byte..capture.range.end_byte] == b"good"
+                }))
+        );
     }
 
     #[test]

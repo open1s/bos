@@ -3,7 +3,7 @@
 use capability::composition::{CapabilityRequirement, CompositionSpec, LocalScope};
 use capability::descriptor::{CapabilityDescriptor, OutputContract};
 use capability::id::{CapabilityId, CapabilityKind, NodeId, VersionSource, WorkspaceId};
-use capability::{resolve_host, Catalogue, CompositionSnapshot, SnapshotOrigin};
+use capability::{Catalogue, CompositionSnapshot, SnapshotOrigin, resolve_host};
 use semver::{Version, VersionReq};
 
 fn descriptor(id: &str, version: &str) -> CapabilityDescriptor {

@@ -6,8 +6,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use capability::{CapabilityError, CapabilityId, FederationTransport, NodeId};
 use federation::{
-    checksum, FederationNode, InMemoryNetwork, LeaseId, NodeIdentity, RemoteStream, ResourceLease,
-    ResourceSource, ResourceStreamMessage,
+    FederationNode, InMemoryNetwork, LeaseId, NodeIdentity, RemoteStream, ResourceLease,
+    ResourceSource, ResourceStreamMessage, checksum,
 };
 
 struct Bytes(Vec<u8>);

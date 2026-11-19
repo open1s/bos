@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ValidationIssue, ValidationReport};
 use crate::Risk;
+use crate::types::{ValidationIssue, ValidationReport};
 
-use super::{SurfaceError, SurfaceId, SurfaceLimits, SURFACE_CONTRACT};
+use super::{SURFACE_CONTRACT, SurfaceError, SurfaceId, SurfaceLimits};
 
 /// A rendering affordance level the host can ask for.
 ///

@@ -140,11 +140,12 @@ async fn a_successful_executor_result_must_pass_acceptance() {
     assert_eq!(progress.succeeded, 0);
     let task = &orchestrator.graph().tasks[&id("a")];
     assert_eq!(task.state, TaskState::Failed);
-    assert!(task
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .starts_with("acceptance rejected"));
+    assert!(
+        task.error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("acceptance rejected")
+    );
     let report = task
         .acceptance_result
         .as_ref()
@@ -177,10 +178,11 @@ async fn a_matching_acceptance_marks_the_task_succeeded() {
     assert_eq!(progress.succeeded, 1);
     let task = &orchestrator.graph().tasks[&id("a")];
     assert_eq!(task.state, TaskState::Succeeded);
-    assert!(task
-        .acceptance_result
-        .as_ref()
-        .is_some_and(|report| report.accepted));
+    assert!(
+        task.acceptance_result
+            .as_ref()
+            .is_some_and(|report| report.accepted)
+    );
 }
 
 #[tokio::test]
@@ -245,10 +247,12 @@ async fn a_graph_persists_and_recovers_a_running_task() {
     let recovered = TaskGraph::load(&path).expect("loaded");
     assert_eq!(recovered.tasks[&id("a")].state, TaskState::Failed);
     assert_eq!(recovered.tasks[&id("b")].state, TaskState::Cancelled);
-    assert!(recovered.tasks[&id("a")]
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("indeterminate")));
+    assert!(
+        recovered.tasks[&id("a")]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("indeterminate"))
+    );
     let _ = std::fs::remove_file(path);
     let _ = executor;
 }

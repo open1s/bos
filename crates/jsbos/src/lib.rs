@@ -4,8 +4,8 @@
 //! classes so JavaScript programs can build agents and message over the bus.
 #![warn(missing_docs)]
 
-use napi::threadsafe_function::ThreadsafeFunction;
 use napi::Unknown;
+use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -34,9 +34,9 @@ pub(crate) async fn call_js_string_handler(
   handler: &ThreadsafeFunction<String, Unknown<'static>>,
   input: String,
 ) -> std::result::Result<String, String> {
+  use napi::JsValue;
   use napi::bindgen_prelude::{CallbackContext, PromiseRaw};
   use napi::threadsafe_function::ThreadsafeFunctionCallMode;
-  use napi::JsValue;
 
   let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
   let tx = Arc::new(Mutex::new(Some(tx)));

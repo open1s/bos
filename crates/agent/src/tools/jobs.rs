@@ -517,9 +517,10 @@ verdict := {"allow": false, "rule": "no-job-output", "reason": "job output is no
         let jobs = listed["jobs"].as_array().expect("jobs");
         assert_eq!(jobs[0]["id"], serde_json::json!(newer), "newest first");
         assert_eq!(jobs[1]["id"], serde_json::json!(older));
-        assert!(jobs
-            .iter()
-            .all(|job| job["id"] != serde_json::json!(foreign)));
+        assert!(
+            jobs.iter()
+                .all(|job| job["id"] != serde_json::json!(foreign))
+        );
         assert_eq!(jobs[0]["status"], serde_json::json!("running"));
         assert_eq!(jobs[0]["running"], serde_json::json!(true));
         assert!(
@@ -550,11 +551,13 @@ verdict := {"allow": false, "rule": "no-job-output", "reason": "job output is no
         assert_eq!(schema["properties"], serde_json::json!({}));
         assert_eq!(schema["additionalProperties"], serde_json::json!(false));
         let definition = tool.to_openai_definition();
-        assert!(definition
-            .function
-            .parameters
-            .as_ref()
-            .and_then(|parameters| parameters.required.as_ref())
-            .is_none_or(|required| required.is_empty()));
+        assert!(
+            definition
+                .function
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.required.as_ref())
+                .is_none_or(|required| required.is_empty())
+        );
     }
 }

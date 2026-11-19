@@ -7,8 +7,8 @@ use crate::llm::{
     VendorBuilderError,
 };
 
-use super::openai::ReasoningReplay;
 use super::OpenAiVendor;
+use super::openai::ReasoningReplay;
 
 /// DeepSeek vendor. DeepSeek's API is OpenAI-compatible on both protocols:
 /// `/chat/completions` for `ApiMode::Chat` and `/responses` for

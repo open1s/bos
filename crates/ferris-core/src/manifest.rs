@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::Capability;
 use crate::types::{
-    extension_api_version, host_version, ContributionId, ContributionKind, ExtensionError,
-    ExtensionId, Requirement, RuntimeKind, StartupPolicy, TrustLevel, ValidationReport,
-    MANIFEST_SCHEMA_VERSION,
+    ContributionId, ContributionKind, ExtensionError, ExtensionId, MANIFEST_SCHEMA_VERSION,
+    Requirement, RuntimeKind, StartupPolicy, TrustLevel, ValidationReport, extension_api_version,
+    host_version,
 };
 
 /// Hook points the manifest validator accepts.
@@ -1167,14 +1167,18 @@ provides = [
         );
         let report = parse(&text).validate();
         assert!(!report.is_valid(), "{report:?}");
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "services.provides[0].name"));
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "services.provides[2]"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "services.provides[0].name")
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "services.provides[2]")
+        );
     }
 
     #[test]
@@ -1191,10 +1195,12 @@ provides = [
         let text = sample().replace("schema_version = \"1.0\"", "schema_version = \"2.0\"");
         let report = parse(&text).validate();
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "schema_version"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "schema_version")
+        );
     }
 
     #[test]
@@ -1202,10 +1208,12 @@ provides = [
         let text = sample().replace(">=3.0.0, <4.0.0", ">=999.0.0");
         let report = parse(&text).validate();
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "compatibility.bsh"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "compatibility.bsh")
+        );
     }
 
     #[test]
@@ -1229,10 +1237,12 @@ provides = [
         );
         let report = parse(&text).validate();
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "runtime.entry"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "runtime.entry")
+        );
     }
 
     #[test]
@@ -1240,10 +1250,12 @@ provides = [
         let text = sample().replace("max_memory_mb = 128", "max_memory_mb = 100_000");
         let report = parse(&text).validate();
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "resources.max_memory_mb"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "resources.max_memory_mb")
+        );
     }
 
     #[test]
@@ -1254,10 +1266,12 @@ provides = [
         );
         let report = parse(&text).validate();
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "runtime.env.LD_PRELOAD"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "runtime.env.LD_PRELOAD")
+        );
     }
 
     #[test]
@@ -1268,10 +1282,12 @@ provides = [
         );
         let report = parse(&text).validate();
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "contributes"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "contributes")
+        );
     }
 
     #[test]
@@ -1319,10 +1335,12 @@ provides = [
             "[contributes]\nhooks = [\"model.telepathy\"]",
         );
         let report = parse(&text).validate();
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "contributes.hooks.model.telepathy"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "contributes.hooks.model.telepathy")
+        );
     }
 
     #[test]
@@ -1333,10 +1351,12 @@ provides = [
         );
         let report = parse(&text).validate();
         assert!(!report.is_valid(), "{report:?}");
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "contributes"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "contributes")
+        );
     }
 
     #[test]
@@ -1347,10 +1367,12 @@ provides = [
         );
         let report = parse(&text).validate();
         assert!(report.is_valid(), "{report:?}");
-        assert!(report
-            .warnings
-            .iter()
-            .any(|issue| issue.field == "capabilities"));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|issue| issue.field == "capabilities")
+        );
     }
 
     #[test]

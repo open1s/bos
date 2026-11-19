@@ -17,4 +17,4 @@ mod shim;
 
 pub use catalogue::{builtin_contract_version, builtin_provider, catalogue_from_registry};
 pub use native::NativeToolProvider;
-pub use shim::{to_tool_error, CapabilityTool, ProxySource, ToolFacts};
+pub use shim::{CapabilityTool, ProxySource, ToolFacts, to_tool_error};

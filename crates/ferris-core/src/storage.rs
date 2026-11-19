@@ -88,7 +88,7 @@ impl ExtensionStorage {
         }
         #[cfg(unix)]
         let root_fd = {
-            use rustix::fs::{open, Mode, OFlags};
+            use rustix::fs::{Mode, OFlags, open};
             let fd = open(
                 &canonical_root,
                 OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -192,7 +192,7 @@ impl ExtensionStorage {
         key: &str,
         create: bool,
     ) -> Result<(std::os::fd::OwnedFd, std::ffi::OsString), ExtensionError> {
-        use rustix::fs::{mkdirat, openat, Mode, OFlags};
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
         let relative = validate_relative_path(key).map_err(|reason| ExtensionError::Corrupt {
             path: self.root.join(key),
             message: reason,
@@ -249,7 +249,7 @@ impl ExtensionStorage {
     /// renameat within that same directory handle.
     #[cfg(unix)]
     fn write_anchored(&self, key: &str, bytes: &[u8]) -> Result<(), ExtensionError> {
-        use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
+        use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
         use std::io::Write as _;
 
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

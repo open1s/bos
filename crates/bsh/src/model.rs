@@ -871,8 +871,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{
-        price_block, price_system_prompt, price_tools, ChatMessage, ContextBreakdown, MessageUsage,
-        Session, ToolEvent, TurnPart, UsageSummary, IMAGE_TOKENS, ROLE_OVERHEAD,
+        ChatMessage, ContextBreakdown, IMAGE_TOKENS, MessageUsage, ROLE_OVERHEAD, Session,
+        ToolEvent, TurnPart, UsageSummary, price_block, price_system_prompt, price_tools,
     };
     /// The timeline keeps the ORDER the stream produced, merging only runs of
     /// the same kind: thinking, the reply, a tool, then thinking again is four

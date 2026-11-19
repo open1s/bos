@@ -3,7 +3,7 @@
 //! This module is only available with the `serde-backend` feature.
 
 use crate::error::QserdeError;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// Serde JSON backend
 ///
@@ -36,7 +36,7 @@ impl SerdeJsonBackend {
 #[cfg(feature = "cbor-backend")]
 mod cbor_backend {
     use crate::error::QserdeError;
-    use serde::{de::DeserializeOwned, Serialize};
+    use serde::{Serialize, de::DeserializeOwned};
 
     /// Serde CBOR backend
     #[derive(Clone, Default)]

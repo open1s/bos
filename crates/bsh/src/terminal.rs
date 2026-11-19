@@ -1435,10 +1435,12 @@ decision := {"allow": false, "reason": "no rm here"} if {
             "the refusal names the file: {:?}",
             terminal.policy_error()
         );
-        assert!(terminal
-            .audit()
-            .iter()
-            .any(|row| row.action == "policy" && !row.allow));
+        assert!(
+            terminal
+                .audit()
+                .iter()
+                .any(|row| row.action == "policy" && !row.allow)
+        );
     }
 
     #[test]

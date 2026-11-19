@@ -121,7 +121,7 @@ mod host {
     use ferris_sdk::capability::PolicyEngine;
     use ferris_sdk::core_manifest::Manifest;
     use ferris_sdk::events::EventBus;
-    use ferris_sdk::host_runtime::factory::{build, RuntimePorts};
+    use ferris_sdk::host_runtime::factory::{RuntimePorts, build};
     use ferris_sdk::terminal::TerminalService;
     use ferris_sdk::types::RuntimeKind;
     use ferris_sdk::{

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bus::{Caller, Session, DEFAULT_CODEC};
+use bus::{Caller, DEFAULT_CODEC, Session};
 use tokio_stream::wrappers::ReceiverStream;
 use zenoh::query::ConsolidationMode;
 

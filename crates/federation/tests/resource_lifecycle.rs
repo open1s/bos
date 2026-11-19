@@ -1,8 +1,8 @@
 //! Resource-stream lifecycle: cancellation, deadlines, and attempt correlation
 //! (issues #347 and #348).
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;

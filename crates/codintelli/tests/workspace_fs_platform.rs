@@ -81,7 +81,9 @@ fn absolute_workspace_paths_are_rejected_on_the_host_platform() {
     let workspace = workspace_fs(root.path());
 
     assert!(workspace.read_dir(root.path(), 16).is_err());
-    assert!(workspace
-        .read_file(root.path().join("outside"), 1024)
-        .is_err());
+    assert!(
+        workspace
+            .read_file(root.path().join("outside"), 1024)
+            .is_err()
+    );
 }

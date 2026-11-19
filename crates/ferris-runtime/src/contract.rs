@@ -6,8 +6,8 @@
 //! same diagnostics. Concrete runtimes live in this module's children.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use ferris_core::capability::Capability;
-use ferris_core::manifest::{validate_relative_path, Manifest};
+use ferris_core::manifest::{Manifest, validate_relative_path};
 use ferris_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind};
 
 /// The largest tool descriptor file.
@@ -948,12 +948,16 @@ tools = ["echo", "greet"]
         let implementation = Implementation::Template {
             text: "x".repeat(64),
         };
-        assert!(implementation
-            .run(&serde_json::json!({}), 1024, &extension)
-            .is_ok());
-        assert!(implementation
-            .run(&serde_json::json!({}), 16, &extension)
-            .is_err());
+        assert!(
+            implementation
+                .run(&serde_json::json!({}), 1024, &extension)
+                .is_ok()
+        );
+        assert!(
+            implementation
+                .run(&serde_json::json!({}), 16, &extension)
+                .is_err()
+        );
     }
 
     struct FlakyRuntime {

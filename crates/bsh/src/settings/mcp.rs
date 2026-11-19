@@ -6,7 +6,7 @@
 //! knows how to read, validate and write that shape, so the pane and the
 //! connection pool cannot disagree about it.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Which document declared an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

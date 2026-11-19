@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
 
 use super::domain::{
-    hex_lower, local_actor, new_id, now_ms, review_root, ChangeOperation, ChangeSet,
-    ChangeSetStatus, Decision, ResourceFamily, ResourcePath, Review, ReviewSnapshot, SnapshotRef,
-    SnapshotSource, SnapshotState, ToolRef, UnavailableReason, MAX_BINARY_BYTES, MAX_TEXT_BYTES,
+    ChangeOperation, ChangeSet, ChangeSetStatus, Decision, MAX_BINARY_BYTES, MAX_TEXT_BYTES,
+    ResourceFamily, ResourcePath, Review, ReviewSnapshot, SnapshotRef, SnapshotSource,
+    SnapshotState, ToolRef, UnavailableReason, hex_lower, local_actor, new_id, now_ms, review_root,
 };
 
 /// A workspace-scoped review store.

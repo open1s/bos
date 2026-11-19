@@ -13,11 +13,11 @@
 
 use std::collections::BTreeMap;
 
+use ferris_sdk::Version;
 use ferris_sdk::surface::{
     InstanceId, IsolationClass, Profile, Revision, StateModel, SurfaceContract, SurfaceDocument,
     SurfaceEngine, SurfaceFrame, SurfaceId, SurfaceLimits, SurfaceNode,
 };
-use ferris_sdk::Version;
 
 /// Where the host is willing to mount a surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1009,13 +1009,14 @@ mod tests {
             surface_document(text("one")),
         )
         .expect("first");
-        assert!(host
-            .mount_external(
+        assert!(
+            host.mount_external(
                 "com.example.two",
                 PanelLocation::Center,
                 surface_document(text("two")),
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]

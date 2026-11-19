@@ -1722,7 +1722,7 @@ impl RegoEgress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{baseline_source, EgressRuleSet, PolicyData, PolicySource};
+    use crate::policy::{EgressRuleSet, PolicyData, PolicySource, baseline_source};
 
     /// A compiled policy for one root and permission, plus an egress allowlist.
     fn policy(root: &Path, permission: &str, egress: &[&str]) -> Arc<PolicySet> {

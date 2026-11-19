@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::FrameSlot;
 use client::{Client, NETWORK_IDLE};
@@ -807,7 +807,7 @@ impl Engine {
                         ),
                         data: None,
                     },
-                })
+                });
             }
         };
         let modifiers = i64::from(modifiers | implied);

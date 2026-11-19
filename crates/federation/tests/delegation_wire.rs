@@ -160,13 +160,14 @@ async fn a_scope_the_target_did_not_grant_is_denied() {
         matches!(error, CapabilityError::Denied { ref reason, .. } if reason.contains("no valid grant")),
         "{error:?}"
     );
-    assert!(pair
-        .target
-        .delegations()
-        .read()
-        .expect("delegations")
-        .record(&DelegationId::new("d-2"))
-        .is_none());
+    assert!(
+        pair.target
+            .delegations()
+            .read()
+            .expect("delegations")
+            .record(&DelegationId::new("d-2"))
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

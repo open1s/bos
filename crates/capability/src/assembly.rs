@@ -13,16 +13,16 @@ use sha2::{Digest, Sha256};
 
 use crate::catalogue::Catalogue;
 use crate::composition::{
-    resolve_host, Binding, Budgets, CapabilityRequirement, CompositionError, CompositionSpec,
-    LocalScope, PeerCatalogue, PeerRef, RemotePolicy, ResolvedComposition,
+    Binding, Budgets, CapabilityRequirement, CompositionError, CompositionSpec, LocalScope,
+    PeerCatalogue, PeerRef, RemotePolicy, ResolvedComposition, resolve_host,
 };
 use crate::descriptor::Risk;
 use crate::id::{CapabilityId, NodeId, WorkspaceId};
 use crate::lock::{
-    catalogue_revision, lock_resolution, CompositionLock, CompositionManifest, DependencyEdge,
-    LockError,
+    CompositionLock, CompositionManifest, DependencyEdge, LockError, catalogue_revision,
+    lock_resolution,
 };
-use crate::proposal::{validate_proposal, ProposalError, ProposalPolicy};
+use crate::proposal::{ProposalError, ProposalPolicy, validate_proposal};
 use crate::provider::CapabilityProvider;
 use crate::workspace::{WorkspaceError, WorkspaceLifecycle};
 use std::sync::Arc;

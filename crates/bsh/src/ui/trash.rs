@@ -8,7 +8,7 @@
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{hairline_all, icon, txt, IconName};
+use super::{IconName, hairline_all, icon, txt};
 use crate::i18n::tr;
 use crate::theme;
 use crate::trash::{Entry, Kind};

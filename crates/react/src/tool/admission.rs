@@ -486,9 +486,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["read_file", "bash", "federation_search"]
         );
-        assert!(withheld
-            .iter()
-            .all(|tool| tool.reason == WithheldReason::IntentScope));
+        assert!(
+            withheld
+                .iter()
+                .all(|tool| tool.reason == WithheldReason::IntentScope)
+        );
 
         let (kept, withheld) = split_for_intent(ActionIntent::Action, tools, &scope);
         let kept_names: Vec<&str> = kept.iter().map(|tool| tool.name.as_str()).collect();

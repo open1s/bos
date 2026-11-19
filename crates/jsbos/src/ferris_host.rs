@@ -10,16 +10,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use crate::ferris::{call_js, JsCall, JsExtension, SharedJsCall};
+use crate::ferris::{JsCall, JsExtension, SharedJsCall, call_js};
 
 use async_trait::async_trait;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use ferris_bindings::{
-  event_runtime, parse_capability, parse_policy_mode, parse_scope, parse_trust,
   AppliedContributions, BindingHostSpec, BindingRuntimeOptions, BindingRuntimeResolver,
-  ContributionCallback, HostContributionSink, NoopLeaseHost, ShellTerminal,
+  ContributionCallback, HostContributionSink, NoopLeaseHost, ShellTerminal, event_runtime,
+  parse_capability, parse_policy_mode, parse_scope, parse_trust,
 };
 use ferris_sdk::capability::PolicyEngine;
 use ferris_sdk::events::{EventBus, EventFilter};

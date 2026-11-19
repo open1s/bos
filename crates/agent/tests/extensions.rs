@@ -61,10 +61,12 @@ fn a_dsh_package_is_discovered_and_parsed() {
         extension.details.bundle_patch.as_ref(),
         Some(&fixture("dsh-echo").join("cordis.patch.yml"))
     );
-    assert!(package
-        .refusals
-        .iter()
-        .any(|refusal| refusal.feature == RefusedFeature::BundleMount));
+    assert!(
+        package
+            .refusals
+            .iter()
+            .any(|refusal| refusal.feature == RefusedFeature::BundleMount)
+    );
 
     let mut registry = ExtensionRegistry::new();
     registry.install(package).expect("installs");

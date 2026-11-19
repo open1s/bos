@@ -9,8 +9,8 @@ use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{icon, txt, IconName};
-use crate::i18n::{tr, Lang};
+use super::{IconName, icon, txt};
+use crate::i18n::{Lang, tr};
 use crate::theme;
 
 /// One menu row, drawn as an element so the destructive cell can carry the

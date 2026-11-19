@@ -282,9 +282,10 @@ mod tests {
     fn missing_items_or_unknown_status_is_rejected() {
         let tool = tool();
         assert!(tool.run(&serde_json::json!({})).is_err());
-        assert!(tool
-            .run(&serde_json::json!({"items": [{"text": "a", "status": "done"}]}))
-            .is_err());
+        assert!(
+            tool.run(&serde_json::json!({"items": [{"text": "a", "status": "done"}]}))
+                .is_err()
+        );
         // The store is untouched by a rejected call.
         assert!(tool.store().items().is_empty());
     }
@@ -331,11 +332,12 @@ mod tests {
     fn oversized_step_text_is_rejected_without_truncation() {
         let tool = tool();
         let long = "x".repeat(MAX_TEXT + 1);
-        assert!(tool
-            .run(&serde_json::json!({
+        assert!(
+            tool.run(&serde_json::json!({
                 "items": [{"text": long, "status": "in_progress"}]
             }))
-            .is_err());
+            .is_err()
+        );
         assert!(tool.store().items().is_empty());
     }
 

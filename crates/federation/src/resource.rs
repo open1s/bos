@@ -10,8 +10,8 @@
 //! module enforces the lease, the order, the quota, and the checksum.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use capability::{CapabilityId, NodeId};
 use serde::{Deserialize, Serialize};
@@ -442,11 +442,7 @@ impl TransferStore {
 
 /// The offset to request: a nonzero request wins, else the stored checkpoint.
 pub fn resume_offset(requested: u64, stored: u64) -> u64 {
-    if requested == 0 {
-        stored
-    } else {
-        requested
-    }
+    if requested == 0 { stored } else { requested }
 }
 
 /// The messages a resource stream is made of.

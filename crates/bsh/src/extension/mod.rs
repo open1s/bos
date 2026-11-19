@@ -133,8 +133,8 @@ pub(crate) mod market;
 
 pub(crate) use ferris_sdk::events::topics;
 pub(crate) use host::{
-    activate, approve_process, cached_commands, grant_required, install_with_fibers,
-    launch_surfaces, live_panel, panels, publish, statuses, themes, uninstall, CommandSurface,
+    CommandSurface, activate, approve_process, cached_commands, grant_required,
+    install_with_fibers, launch_surfaces, live_panel, panels, publish, statuses, themes, uninstall,
 };
 
 /// Run the developer CLI and return the process exit code.

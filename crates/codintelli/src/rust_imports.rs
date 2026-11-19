@@ -8,10 +8,10 @@
 use std::path::PathBuf;
 
 use crate::{
+    ImportFact, ParseResult, SourceRange, WorkspaceId,
     classification::LanguageId,
     module_graph::{RustModuleEdge, RustModuleEdgeStatus, RustModuleGraph, RustModuleNodeKind},
     syntax::valid_relative_path,
-    ImportFact, ParseResult, SourceRange, WorkspaceId,
 };
 
 /// Outcome of mapping an import path onto the known Rust module graph.
@@ -693,21 +693,27 @@ mod tests {
             ],
         );
         let report = resolve_rust_import_module_candidates(&[parsed], &graph).expect("imports");
-        assert!(report
-            .imports
-            .iter()
-            .any(|item| item.import_path[1] == "optional"
-                && item.status == RustImportResolutionStatus::UncertainModuleTarget));
-        assert!(report
-            .imports
-            .iter()
-            .any(|item| item.import_path[1] == "missing_parse"
-                && item.status == RustImportResolutionStatus::UnparsedModuleTarget));
-        assert!(report
-            .imports
-            .iter()
-            .any(|item| item.import_path[1] == "deep"
-                && item.status == RustImportResolutionStatus::DepthLimitedModuleTarget));
+        assert!(
+            report
+                .imports
+                .iter()
+                .any(|item| item.import_path[1] == "optional"
+                    && item.status == RustImportResolutionStatus::UncertainModuleTarget)
+        );
+        assert!(
+            report
+                .imports
+                .iter()
+                .any(|item| item.import_path[1] == "missing_parse"
+                    && item.status == RustImportResolutionStatus::UnparsedModuleTarget)
+        );
+        assert!(
+            report
+                .imports
+                .iter()
+                .any(|item| item.import_path[1] == "deep"
+                    && item.status == RustImportResolutionStatus::DepthLimitedModuleTarget)
+        );
     }
 
     #[test]

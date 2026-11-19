@@ -17,17 +17,17 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use crate::contract::{load_tool_descriptors, CallContext, Runtime, ToolDescriptor, ToolResult};
+use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult, load_tool_descriptors};
 use ferris_core::capability::{CallScope, Capability, PolicyEngine};
 use ferris_core::events::{EventBus, EventFilter, ExtensionEvent, Subscription};
-use ferris_core::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
+use ferris_core::manifest::{Manifest, is_allowlisted_command, validate_relative_path};
 use ferris_core::types::{
-    ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel, HOST_VERSION,
+    ContributionId, ExtensionError, ExtensionId, HOST_VERSION, RuntimeKind, TrustLevel,
 };
 
 /// The protocol generation a process must speak.
@@ -1516,11 +1516,7 @@ mod tests {
         resource: RlimitResource,
         _limit: *const libc::rlimit,
     ) -> libc::c_int {
-        if resource == libc::RLIMIT_CPU {
-            -1
-        } else {
-            0
-        }
+        if resource == libc::RLIMIT_CPU { -1 } else { 0 }
     }
 
     #[cfg(unix)]
@@ -1790,10 +1786,12 @@ max_execution_ms = 2000
             read_limited_line(&mut reader, 16, &id).await.expect("line"),
             Some(b"cc".to_vec())
         );
-        assert!(read_limited_line(&mut reader, 16, &id)
-            .await
-            .expect("eof")
-            .is_none());
+        assert!(
+            read_limited_line(&mut reader, 16, &id)
+                .await
+                .expect("eof")
+                .is_none()
+        );
         let mut short = BufReader::new(&b"aaaaaaaaaaaaaaaaaaaa\n"[..]);
         assert!(read_limited_line(&mut short, 8, &id).await.is_err());
     }

@@ -15,11 +15,11 @@ use agent::extensions::ExtensionStandard;
 use agent::policy::EgressRuleSet;
 
 use super::shell::{ModelRowEditor, ModelsAddRoute, PresetEditor, SettingsToast, Shell};
-use super::{hairline_all, hairline_bottom, hairline_top, icon, txt, DivExt, IconName};
-use crate::i18n::{tr, tr_args, Lang};
+use super::{DivExt, IconName, hairline_all, hairline_bottom, hairline_top, icon, txt};
+use crate::i18n::{Lang, tr, tr_args};
+use crate::settings::Settings;
 use crate::settings::mcp::{McpScope, McpServer, McpTransport};
 use crate::settings::resolve::DiscoveredSkill;
-use crate::settings::Settings;
 use crate::theme;
 
 /// The rail, in display order; the index is the section number narrowest the
@@ -754,11 +754,7 @@ pub(crate) fn preset_use_action(
 
 /// How the clauses of one confirmation sentence are joined.
 fn clause_separator(lang: Lang) -> &'static str {
-    if lang == Lang::Zh {
-        "；"
-    } else {
-        "; "
-    }
+    if lang == Lang::Zh { "；" } else { "; " }
 }
 
 /// One consequence, in the reader's words.
@@ -2304,32 +2300,34 @@ impl Shell {
             IconName::Clock,
             "settings.recentActivity",
             Some(refresh.into_any_element()),
-            vec![div()
-                .py(px(10.0))
-                .flex()
-                .items_start()
-                .gap(px(9.0))
-                .child(
-                    div()
-                        .mt(px(5.0))
-                        .w(px(7.0))
-                        .h(px(7.0))
-                        .rounded_full()
-                        .bg(rgb(theme::success())),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .child(txt(
-                            tr(lang, "settings.activityConfigLoaded"),
-                            12.0,
-                            theme::text(),
-                        ))
-                        .child(txt(loaded_at, 10.5, theme::faint())),
-                )
-                .into_any_element()],
+            vec![
+                div()
+                    .py(px(10.0))
+                    .flex()
+                    .items_start()
+                    .gap(px(9.0))
+                    .child(
+                        div()
+                            .mt(px(5.0))
+                            .w(px(7.0))
+                            .h(px(7.0))
+                            .rounded_full()
+                            .bg(rgb(theme::success())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(txt(
+                                tr(lang, "settings.activityConfigLoaded"),
+                                12.0,
+                                theme::text(),
+                            ))
+                            .child(txt(loaded_at, 10.5, theme::faint())),
+                    )
+                    .into_any_element(),
+            ],
         );
 
         let mut content = vec![basic, activity];
@@ -7438,48 +7436,52 @@ impl Shell {
         // The section's hint is drawn under the title by the pane header, so it is
         // NOT repeated as the first row: the sentence appeared twice, once above
         // the list and once at the top of it.
-        let mut rows: Vec<AnyElement> = vec![hairline_bottom(
-            div()
-                .py(px(12.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(24.0))
-                .border_color(rgb(theme::border_soft()))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .gap(px(4.0))
-                        .min_w_0()
-                        .pr(px(48.0))
-                        .child(txt(tr(lang, "settings.webToolsTitle"), 14.0, theme::text()))
-                        .child(txt(
-                            tr(lang, "settings.webToolsDescription"),
-                            12.0,
-                            theme::faint(),
-                        )),
-                )
-                .child({
-                    let target = section_index("web-search");
-                    self.models_link(
-                        "settings-web-search-open".to_string(),
-                        tr(lang, "settings.webSearchOpen"),
+        let mut rows: Vec<AnyElement> = vec![
+            hairline_bottom(
+                div()
+                    .py(px(12.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(24.0))
+                    .border_color(rgb(theme::border_soft()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .gap(px(4.0))
+                            .min_w_0()
+                            .pr(px(48.0))
+                            .child(txt(tr(lang, "settings.webToolsTitle"), 14.0, theme::text()))
+                            .child(txt(
+                                tr(lang, "settings.webToolsDescription"),
+                                12.0,
+                                theme::faint(),
+                            )),
                     )
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        // The same write the built-in row makes, so the tool's
-                        // switch and the pane its settings live in cannot
-                        // disagree about where that pane is.
-                        if let Some(section) = target {
-                            this.state.settings_section = section;
-                            cx.notify();
-                        }
-                    }))
-                })
-                .child(self.switch("settings-web-tools", web, true, web_tools_action, cx)),
-        )
-        .into_any_element()];
+                    .child({
+                        let target = section_index("web-search");
+                        self.models_link(
+                            "settings-web-search-open".to_string(),
+                            tr(lang, "settings.webSearchOpen"),
+                        )
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                // The same write the built-in row makes, so the tool's
+                                // switch and the pane its settings live in cannot
+                                // disagree about where that pane is.
+                                if let Some(section) = target {
+                                    this.state.settings_section = section;
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                    })
+                    .child(self.switch("settings-web-tools", web, true, web_tools_action, cx)),
+            )
+            .into_any_element(),
+        ];
         // The filter sits where the list starts: it narrows the rows below it
         // and leaves the tool's own master switch above it alone, the same
         // shape the Installed tab gives its inventory.
@@ -7671,38 +7673,40 @@ impl Shell {
         let lang = self.state.lang;
         let web = self.state.draft().workspace.agent.web_tools_enabled;
         let configured = self.state.vault.contains(crate::vault::WEB_SEARCH_KEY);
-        let mut rows: Vec<AnyElement> = vec![hairline_bottom(
-            div()
-                .py(px(12.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(24.0))
-                .border_color(rgb(theme::border_soft()))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .gap(px(4.0))
-                        .min_w_0()
-                        .pr(px(48.0))
-                        .child(txt(tr(lang, "settings.webToolsTitle"), 14.0, theme::text()))
-                        .child(txt(
-                            tr(lang, "settings.webSearchToggleHint"),
-                            12.0,
-                            theme::faint(),
-                        )),
-                )
-                .child(self.switch(
-                    "settings-web-search-enabled",
-                    web,
-                    true,
-                    web_tools_action,
-                    cx,
-                )),
-        )
-        .into_any_element()];
+        let mut rows: Vec<AnyElement> = vec![
+            hairline_bottom(
+                div()
+                    .py(px(12.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(24.0))
+                    .border_color(rgb(theme::border_soft()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .gap(px(4.0))
+                            .min_w_0()
+                            .pr(px(48.0))
+                            .child(txt(tr(lang, "settings.webToolsTitle"), 14.0, theme::text()))
+                            .child(txt(
+                                tr(lang, "settings.webSearchToggleHint"),
+                                12.0,
+                                theme::faint(),
+                            )),
+                    )
+                    .child(self.switch(
+                        "settings-web-search-enabled",
+                        web,
+                        true,
+                        web_tools_action,
+                        cx,
+                    )),
+            )
+            .into_any_element(),
+        ];
         // The endpoint and the budget: two plain fields, with the shipped
         // default they reset to.
         rows.push(self.input_row(
@@ -14429,8 +14433,8 @@ impl Shell {
     fn run_vault_op(
         &mut self,
         op: impl FnOnce(&mut crate::vault::Vault) -> Result<(), crate::vault::VaultError>
-            + Send
-            + 'static,
+        + Send
+        + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -14962,8 +14966,8 @@ mod label_tests {
     #[test]
     fn the_persona_owner_label_follows_the_persona_in_force() {
         use crate::i18n::Lang;
-        use crate::settings::global::Preset;
         use crate::settings::Settings;
+        use crate::settings::global::Preset;
         use crate::ui::settings::persona_owner_label;
 
         let mut settings = Settings::default();

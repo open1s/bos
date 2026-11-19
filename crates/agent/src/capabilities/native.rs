@@ -13,7 +13,7 @@ use react::tool::ToolError;
 use serde_json::Value;
 
 use super::catalogue::catalogue_from_registry;
-use crate::tools::{validate_args, ToolRegistry};
+use crate::tools::{ToolRegistry, validate_args};
 
 /// Registered tools exposed as one built-in capability provider.
 pub struct NativeToolProvider {

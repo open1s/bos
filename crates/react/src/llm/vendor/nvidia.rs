@@ -144,8 +144,8 @@ mod tests {
 
     use crate::llm::{Content, LlmClient, LlmRequest, LlmSession};
     use crate::{
-        llm::vendor::{NvidiaVendor, OpenAIExtractor},
         JsonExtractor, StreamExtractor,
+        llm::vendor::{NvidiaVendor, OpenAIExtractor},
     };
 
     #[test]

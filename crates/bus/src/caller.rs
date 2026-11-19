@@ -1,8 +1,8 @@
 use crate::ZenohError;
 use rkyv::rancor::{Error, Strategy};
+use rkyv::ser::Serializer;
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::ser::sharing::Share;
-use rkyv::ser::Serializer;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Serialize};
 use std::sync::Arc;

@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent::{Agent, StreamToken};
 use futures::StreamExt;
@@ -1220,6 +1220,114 @@ mod tests {
         }
     }
 
+    /// A provider that scripts the reasoning blocks and tool calls of a
+    /// two-step tool loop, then answers the next turn. It records every typed
+    /// request so the test can assert exactly what each step replayed.
+    struct ReasoningLifecycleLlm {
+        seen: Arc<std::sync::Mutex<Vec<react::llm::ProviderRequest>>>,
+        step: std::sync::atomic::AtomicUsize,
+    }
+
+    fn lifecycle_state(signature: &str) -> react::llm::ReasoningState {
+        react::llm::ReasoningState::new(
+            "anthropic",
+            serde_json::json!({ "type": "thinking", "signature": signature }),
+        )
+    }
+
+    /// The reasoning blocks a request carried, in wire order.
+    fn reasoning_blocks(
+        messages: &[react::LlmMessage],
+    ) -> Vec<(String, Option<react::llm::ReasoningState>)> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                react::LlmMessage::AssistantReasoning {
+                    content,
+                    provider_state,
+                } => Some((content.clone(), provider_state.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[async_trait::async_trait]
+    impl agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContext>
+        for ReasoningLifecycleLlm
+    {
+        async fn complete(
+            &self,
+            _persona: Option<String>,
+            _req: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> react::llm::LlmResponseResult {
+            Err(react::llm::LlmError::Other(
+                "this fixture streams".to_string(),
+            ))
+        }
+
+        async fn stream_complete(
+            &self,
+            _persona: Option<String>,
+            request: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> Result<react::llm::TokenStream, react::llm::LlmError> {
+            if let Some(snapshot) = request.provider_request.clone() {
+                self.seen.lock().unwrap().push(snapshot);
+            }
+            let index = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let tokens: Vec<Result<react::llm::StreamToken, react::llm::LlmError>> = match index {
+                0 => vec![
+                    Ok(react::llm::StreamToken::ReasoningContent(
+                        "alpha".to_string(),
+                    )),
+                    Ok(react::llm::StreamToken::ReasoningState(lifecycle_state(
+                        "sig-alpha",
+                    ))),
+                    Ok(react::llm::StreamToken::ToolCall {
+                        name: "echo".to_string(),
+                        args: serde_json::json!({ "n": 1 }),
+                        id: Some("call-alpha".to_string()),
+                    }),
+                    Ok(react::llm::StreamToken::Done),
+                ],
+                1 => vec![
+                    Ok(react::llm::StreamToken::ReasoningContent(
+                        "beta".to_string(),
+                    )),
+                    Ok(react::llm::StreamToken::ReasoningState(lifecycle_state(
+                        "sig-beta",
+                    ))),
+                    Ok(react::llm::StreamToken::ToolCall {
+                        name: "echo".to_string(),
+                        args: serde_json::json!({ "n": 2 }),
+                        id: Some("call-beta".to_string()),
+                    }),
+                    Ok(react::llm::StreamToken::Done),
+                ],
+                2 => vec![
+                    Ok(react::llm::StreamToken::Text("finished".to_string())),
+                    Ok(react::llm::StreamToken::Done),
+                ],
+                _ => vec![
+                    Ok(react::llm::StreamToken::Text("second answer".to_string())),
+                    Ok(react::llm::StreamToken::Done),
+                ],
+            };
+            Ok(Box::pin(futures::stream::iter(tokens)))
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "reasoning-lifecycle-mock"
+        }
+    }
+
     /// Records the tool names the provider request actually carried.
     struct AdmissionCapturingLlm(Arc<std::sync::Mutex<Vec<Vec<String>>>>);
 
@@ -2043,6 +2151,206 @@ mod tests {
                 react::llm::LlmMessage::Assistant { content } if content == "answer"
             )),
             "the visible answer still replays"
+        );
+    }
+
+    /// The complete turn-local reasoning lifecycle across a real BSH turn:
+    /// two reasoning blocks with distinct provider state survive a two-step
+    /// tool loop in order, then the next turn is seeded from the transcript
+    /// and carries neither block nor either state. This drives the production
+    /// seed path and the engine request builder, not a helper in isolation.
+    #[test]
+    fn a_bsh_turn_replays_its_reasoning_and_the_next_turn_drops_it() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut provider = agent::agent::agentic::LlmProvider::new();
+        provider.register_vendor(
+            "mock".to_string(),
+            Box::new(ReasoningLifecycleLlm {
+                seen: Arc::clone(&seen),
+                step: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+        let mut agent = agent::Agent::new(
+            agent::AgentConfig {
+                model: "mock-model".to_string(),
+                ..Default::default()
+            },
+            Arc::new(provider),
+        );
+        agent.add_tool(Arc::new(agent::tools::FunctionTool::new(
+            "echo",
+            "echo the argument",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "n": { "type": "integer" } }
+            }),
+            |args| Ok(serde_json::json!({ "echoed": args.get("n").cloned().unwrap_or_default() })),
+        )));
+        let agent = Arc::new(agent);
+
+        let root = workspace("reasoning-lifecycle");
+        let mut runner = Runner::new();
+        let receiver = spawn_turn(
+            &mut runner,
+            "reasoning-lifecycle",
+            Arc::clone(&agent),
+            "go",
+            &root,
+        );
+        drain(receiver);
+
+        // The transcript the reader keeps: visible answer, reasoning for the
+        // disclosure, and the two tool exchanges. Reasoning is display-only.
+        let mut assistant = crate::model::ChatMessage::assistant();
+        assistant.text = "finished".to_string();
+        assistant.reasoning = "alpha beta".to_string();
+        assistant.tools = vec![
+            crate::model::ToolEvent {
+                name: "echo".to_string(),
+                args: r#"{"n":1}"#.to_string(),
+                output: Some(r#"{"echoed":1}"#.to_string()),
+                ms: Some(1),
+                at: None,
+            },
+            crate::model::ToolEvent {
+                name: "echo".to_string(),
+                args: r#"{"n":2}"#.to_string(),
+                output: Some(r#"{"echoed":2}"#.to_string()),
+                ms: Some(1),
+                at: None,
+            },
+        ];
+        let transcript = vec![crate::model::ChatMessage::user("go"), assistant];
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        let receiver = runner.spawn(
+            "reasoning-lifecycle",
+            agent,
+            react::llm::Content::Text("next".to_string()),
+            transcript,
+            facts,
+            None,
+            1_000,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
+            None,
+        );
+        drain(receiver);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "two tool steps, the answer, then the reseeded turn: {}",
+            requests.len()
+        );
+        assert!(
+            reasoning_blocks(&requests[0].messages).is_empty(),
+            "the first step has no reasoning to replay"
+        );
+        assert_eq!(
+            reasoning_blocks(&requests[1].messages),
+            vec![("alpha".to_string(), Some(lifecycle_state("sig-alpha")),)],
+            "the second request replays block A with its own state"
+        );
+        assert_eq!(
+            reasoning_blocks(&requests[2].messages),
+            vec![
+                ("alpha".to_string(), Some(lifecycle_state("sig-alpha"))),
+                ("beta".to_string(), Some(lifecycle_state("sig-beta"))),
+            ],
+            "the third request replays A then B, each with its matching state"
+        );
+
+        let messages = &requests[2].messages;
+        let alpha = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    react::llm::LlmMessage::AssistantReasoning { content, .. }
+                        if content == "alpha"
+                )
+            })
+            .expect("block A is in the request");
+        let first_call = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    react::llm::LlmMessage::AssistantToolCall { name, args, .. }
+                        if name == "echo" && args["n"] == 1
+                )
+            })
+            .expect("the first call is in the request");
+        let first_result = messages
+            .iter()
+            .position(|message| matches!(message, react::llm::LlmMessage::ToolResult { .. }))
+            .expect("the first result is in the request");
+        let beta = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    react::llm::LlmMessage::AssistantReasoning { content, .. }
+                        if content == "beta"
+                )
+            })
+            .expect("block B is in the request");
+        let second_call = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    react::llm::LlmMessage::AssistantToolCall { name, args, .. }
+                        if name == "echo" && args["n"] == 2
+                )
+            })
+            .expect("the second call is in the request");
+        assert!(
+            alpha < first_call
+                && first_call < first_result
+                && first_result < beta
+                && beta < second_call,
+            "the blocks keep the order the turn produced them: {messages:?}"
+        );
+
+        let turn_two = &requests[3].messages;
+        assert!(
+            reasoning_blocks(turn_two).is_empty(),
+            "the reseeded turn begins with no previous-turn reasoning: {turn_two:?}"
+        );
+        let turn_two_text = format!("{turn_two:?}");
+        for private in ["alpha", "beta", "sig-alpha", "sig-beta"] {
+            assert!(
+                !turn_two_text.contains(private),
+                "the reseeded turn carries no {private}: {turn_two_text}"
+            );
+        }
+        assert!(
+            turn_two.iter().any(|message| matches!(
+                message,
+                react::llm::LlmMessage::Assistant { content } if content == "finished"
+            )),
+            "the visible answer still replays from the transcript"
+        );
+        assert_eq!(
+            turn_two
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    react::llm::LlmMessage::AssistantToolCall { name, .. } if name == "echo"
+                ))
+                .count(),
+            2,
+            "the turn's tool traffic still replays"
         );
     }
 

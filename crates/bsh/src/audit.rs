@@ -1274,8 +1274,8 @@ pub(crate) fn duration_text(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        full_text, outcome_of, preview, preview_bounded, redact_secrets, AuditAllows,
-        AuditCategory, AuditOutcome, AuditPolicy, AuditView, PREVIEW_LIMIT, TARGET_LIMIT,
+        AuditAllows, AuditCategory, AuditOutcome, AuditPolicy, AuditView, PREVIEW_LIMIT,
+        TARGET_LIMIT, full_text, outcome_of, preview, preview_bounded, redact_secrets,
     };
     use crate::model::{ChatMessage, Session, ToolEvent};
     use agent::policy::{Action, PolicyAuditEntry, Target};

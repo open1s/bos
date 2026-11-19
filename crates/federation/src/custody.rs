@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use rand::rngs::SysRng;
 use rand::TryRng;
+use rand::rngs::SysRng;
 use zeroize::Zeroizing;
 
 /// The encrypted-custody file magic.
@@ -194,7 +194,7 @@ impl Custody for PassphraseCustody {
                 return Err(CustodyError::Io {
                     path: path.display().to_string(),
                     message: error.to_string(),
-                })
+                });
             }
         };
         if document.len() < 5 + SALT_LEN + NONCE_LEN || &document[0..4] != MAGIC {

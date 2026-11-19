@@ -10,15 +10,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-use agent::capabilities::{catalogue_from_registry, NativeToolProvider};
+use agent::capabilities::{NativeToolProvider, catalogue_from_registry};
 use agent::capability::composition::{
-    resolve_host, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope, PeerCatalogue,
-    PeerRef, RemotePolicy,
+    CapabilityRequirement, CompositionSpec, GrantRef, LocalScope, PeerCatalogue, PeerRef,
+    RemotePolicy, resolve_host,
 };
 use agent::capability::transport::FederationTransport;
 use agent::capability::{
-    unix_ms, CapabilityProvider, Catalogue, CompositionSnapshot, NodeId, WorkspaceId,
-    WorkspaceRuntime,
+    CapabilityProvider, Catalogue, CompositionSnapshot, NodeId, WorkspaceId, WorkspaceRuntime,
+    unix_ms,
 };
 use agent::tools::{AsyncTool, ToolError, ToolRegistry};
 use bus::{Bus, BusConfig};
@@ -2238,9 +2238,11 @@ mod tests {
                 .expect("status polls");
         }
         assert_eq!(record.state, DelegationState::Succeeded, "{record:?}");
-        assert!(serde_json::to_string(&record.result)
-            .expect("result")
-            .contains("tcp delegated content"));
+        assert!(
+            serde_json::to_string(&record.result)
+                .expect("result")
+                .contains("tcp delegated content")
+        );
     }
 
     /// The same exposed capability must execute through a *delegation*, not only
@@ -2492,7 +2494,7 @@ mod tests {
             ResourceLease, ResourceSource, ResourceStreamMessage,
         };
         use semver::Version;
-        use serde_json::{json, Value};
+        use serde_json::{Value, json};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct Echo {
@@ -2921,9 +2923,11 @@ mod tests {
         let cache = cache.read().expect("the cache");
         let catalogue = cache.get(&provider_id).expect("the peer was discovered");
         assert_eq!(catalogue.len(), 1);
-        assert!(catalogue
-            .get(&"builtin/read_file".parse().expect("an id"))
-            .is_some());
+        assert!(
+            catalogue
+                .get(&"builtin/read_file".parse().expect("an id"))
+                .is_some()
+        );
         assert!(
             runtime.status().contains("catalogues=1"),
             "{}",
@@ -2941,7 +2945,7 @@ mod tests {
         };
         use agent::tools::{FunctionTool, ToolRegistry};
         use async_trait::async_trait;
-        use serde_json::{json, Value};
+        use serde_json::{Value, json};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct Echo {

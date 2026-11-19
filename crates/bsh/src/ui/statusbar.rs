@@ -7,8 +7,8 @@
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{hairline_all, icon, txt, DivExt, IconName};
-use crate::i18n::{tr_args, Lang};
+use super::{DivExt, IconName, hairline_all, icon, txt};
+use crate::i18n::{Lang, tr_args};
 use crate::model::UsageSummary;
 use crate::state::{cache_hit_percent, exact_tokens, human_tokens};
 use crate::theme;

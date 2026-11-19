@@ -18,9 +18,9 @@ use serde_json::Value;
 use super::bridge;
 use super::declarative;
 use super::{
-    dedup_capabilities, manifest_error, manifest_string, read_json, read_prefix,
-    resolve_package_path, Capability, ClientManifest, Contribution, Extension, ExtensionDetails,
-    ExtensionError, ExtensionStandard, LoadedPackage, Refusal, RefusedFeature, Trust, UiPanel,
+    Capability, ClientManifest, Contribution, Extension, ExtensionDetails, ExtensionError,
+    ExtensionStandard, LoadedPackage, Refusal, RefusedFeature, Trust, UiPanel, dedup_capabilities,
+    manifest_error, manifest_string, read_json, read_prefix, resolve_package_path,
 };
 
 const STANDARD: ExtensionStandard = ExtensionStandard::DeepSeekHarness;

@@ -870,9 +870,11 @@ mod tests {
             restored.revoke(&stranger, "k-live"),
             Err(KnowledgeError::RevokeDenied { .. })
         ));
-        assert!(restored
-            .revoke(&node, "k-live")
-            .expect("the publisher revokes"));
+        assert!(
+            restored
+                .revoke(&node, "k-live")
+                .expect("the publisher revokes")
+        );
         // The revoked marker survived and still refuses a republication.
         assert!(restored.is_revoked("k-1"));
         assert!(restored.get("k-1").is_none());

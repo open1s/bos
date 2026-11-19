@@ -132,7 +132,7 @@ impl RecentStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecentKind, RecentStore, MAX_RECENT};
+    use super::{MAX_RECENT, RecentKind, RecentStore};
 
     /// Re-opening a row moves it instead of copying it, and the cap holds.
     #[test]

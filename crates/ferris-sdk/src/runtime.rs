@@ -7,7 +7,7 @@ use ferris_core::Runtime;
 use crate::{Contribution, ContributionRef, InvokeContext, RuntimeContext};
 use serde_json::Value;
 
-use crate::error::{runtime as runtime_error, Result};
+use crate::error::{Result, runtime as runtime_error};
 use crate::manifest::ExtensionManifest;
 
 /// One invocation addressed to an extension.

@@ -13,8 +13,8 @@ use std::{
 };
 
 use cap_fs_ext::{
-    ambient_authority, DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt,
-    OpenOptionsSyncExt,
+    DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt, OpenOptionsSyncExt,
+    ambient_authority,
 };
 use cap_std::fs::{Dir, File, OpenOptions};
 

@@ -17,7 +17,7 @@ pub mod benchmark;
 /// Governed federated Skill metadata discovery.
 pub mod federation;
 
-pub use benchmark::{run_benchmark, BenchmarkCase, BenchmarkReport, CaseOutcome};
+pub use benchmark::{BenchmarkCase, BenchmarkReport, CaseOutcome, run_benchmark};
 pub use federation::{
     FederatedSkills, FederationError, FederationPolicy, RefreshReport, SkillMetadataTransport,
 };
@@ -26,8 +26,8 @@ pub use index::{
     SkillPlan, SkillPlanError, TrustError, TrustPolicy,
 };
 pub use runtime::{
-    retrieval_metrics, Activation, ActiveSkill, ComposedSkills, RetrievalMetrics, RuntimeError,
-    SkillEvent, SkillLimits, SkillRuntime,
+    Activation, ActiveSkill, ComposedSkills, RetrievalMetrics, RuntimeError, SkillEvent,
+    SkillLimits, SkillRuntime, retrieval_metrics,
 };
 
 pub use session::{SkillActivation, SkillAuthoringRecord, SkillValidationError};
@@ -436,7 +436,7 @@ impl SkillLoader {
             Some(other) => {
                 return Err(SkillMetadataError::BadDescription(format!(
                     "description must be a string, found {other}"
-                )))
+                )));
             }
         };
         if description.is_empty() {
@@ -462,7 +462,7 @@ impl SkillLoader {
             Some(other) => {
                 return Err(SkillMetadataError::BadVersion(format!(
                     "version must be a quoted major.minor.patch string, found {other}"
-                )))
+                )));
             }
         };
 
@@ -622,7 +622,7 @@ fn parse_dependencies(
             other => {
                 return Err(SkillMetadataError::BadDependency(format!(
                     "dependency {other} is neither a name nor an object"
-                )))
+                )));
             }
         };
         if name.is_empty() {
@@ -751,8 +751,8 @@ pub enum SkillError {
 #[cfg(test)]
 mod tests {
     use super::{
-        lookup_for_model, lookup_for_model_in, ModelSkillLookup, SkillCategory, SkillContent,
-        SkillLoader, SkillMetadata, SkillMetadataError, SkillSource, SkillVersion,
+        ModelSkillLookup, SkillCategory, SkillContent, SkillLoader, SkillMetadata,
+        SkillMetadataError, SkillSource, SkillVersion, lookup_for_model, lookup_for_model_in,
     };
     use std::path::PathBuf;
 

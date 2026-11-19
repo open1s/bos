@@ -3,7 +3,7 @@
 //! This module is only available with the `cbor-backend` feature.
 
 use crate::error::QserdeError;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// CBOR backend using ciborium
 ///

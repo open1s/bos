@@ -12,7 +12,7 @@ use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{hairline_all, icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, hairline_all, icon, txt};
 use crate::theme;
 
 impl Shell {

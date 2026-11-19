@@ -323,11 +323,13 @@ mod tests {
             "required": ["options"]
         });
         assert!(validate_args(&schema, &json!({"options": {"enabled": true}})).is_ok());
-        assert!(validate_args(
-            &schema,
-            &json!({"options": {"enabled": true, "typo": true}})
-        )
-        .is_err());
+        assert!(
+            validate_args(
+                &schema,
+                &json!({"options": {"enabled": true, "typo": true}})
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -13,20 +13,20 @@ use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use crate::declarative::{DeclarativeContributions, TextContribution};
 use ferris_core::capability::{CallScope, Capability, PolicyEngine};
 use ferris_core::events::{EventBus, EventFilter, Subscription};
-use ferris_core::manifest::{is_allowlisted_command, validate_relative_path, Manifest};
+use ferris_core::manifest::{Manifest, is_allowlisted_command, validate_relative_path};
 use ferris_core::types::{
-    ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel, HOST_VERSION,
+    ContributionId, ExtensionError, ExtensionId, HOST_VERSION, RuntimeKind, TrustLevel,
 };
 
 /// The protocol version this adapter sends.
@@ -1887,13 +1887,15 @@ required = ["process.execute"]
             command
         };
         let child = command.spawn().expect("long-running child");
-        assert!(cancelled_runtime
-            .core
-            .register_child({
-                let owner = hostkit::proc::TreeOwner::from_pid(child.id());
-                McpChild(child, owner)
-            })
-            .is_err());
+        assert!(
+            cancelled_runtime
+                .core
+                .register_child({
+                    let owner = hostkit::proc::TreeOwner::from_pid(child.id());
+                    McpChild(child, owner)
+                })
+                .is_err()
+        );
         assert!(
             cancelled_runtime
                 .core
@@ -1925,13 +1927,15 @@ required = ["process.execute"]
             command
         };
         let child = command.spawn().expect("late child");
-        assert!(cancelled_runtime
-            .core
-            .register_child({
-                let owner = hostkit::proc::TreeOwner::from_pid(child.id());
-                McpChild(child, owner)
-            })
-            .is_err());
+        assert!(
+            cancelled_runtime
+                .core
+                .register_child({
+                    let owner = hostkit::proc::TreeOwner::from_pid(child.id());
+                    McpChild(child, owner)
+                })
+                .is_err()
+        );
         assert!(
             cancelled_runtime
                 .core
@@ -2058,10 +2062,12 @@ required = ["process.execute"]
         assert!(runtime.contributions().is_err());
         assert!(runtime.activate().await.is_err());
         assert!(runtime.pump().await.is_err());
-        assert!(runtime
-            .call_tool("echo", serde_json::json!({"x": 2}), &context)
-            .await
-            .is_err());
+        assert!(
+            runtime
+                .call_tool("echo", serde_json::json!({"x": 2}), &context)
+                .await
+                .is_err()
+        );
         runtime
             .shutdown()
             .await
@@ -2151,16 +2157,20 @@ required = ["process.execute"]
         assert!(rejected(json!({"jsonrpc": "1.0", "id": 7, "result": {}})).contains("jsonrpc"));
         assert!(rejected(json!({"jsonrpc": "2.0", "id": "7", "result": {}})).contains("integer"));
         assert!(rejected(json!({"jsonrpc": "2.0", "id": 7})).contains("neither"));
-        assert!(rejected(json!({
-            "jsonrpc": "2.0", "id": 7, "result": {},
-            "error": {"code": 1, "message": "both"}
-        }))
-        .contains("both"));
+        assert!(
+            rejected(json!({
+                "jsonrpc": "2.0", "id": 7, "result": {},
+                "error": {"code": 1, "message": "both"}
+            }))
+            .contains("both")
+        );
         assert!(rejected(json!({"jsonrpc": "2.0", "id": 7, "error": {}})).contains("error object"));
-        assert!(rejected(json!({
-            "jsonrpc": "2.0", "id": 7, "method": "tools/list", "result": {}
-        }))
-        .contains("method"));
+        assert!(
+            rejected(json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/list", "result": {}
+            }))
+            .contains("method")
+        );
     }
 
     #[test]

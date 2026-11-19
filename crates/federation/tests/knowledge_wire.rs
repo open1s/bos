@@ -6,9 +6,8 @@ use capability::{
     CapabilityError, InvocationContext, InvocationId, NodeId, Principal, WorkspaceId,
 };
 use federation::{
-    knowledge_hash, InMemoryNetwork, KnowledgeAuthorizer, KnowledgeClass, KnowledgeItem,
-    KnowledgePublication, KnowledgePurpose, KnowledgeQuery, KnowledgeService, NodeIdentity,
-    Provenance,
+    InMemoryNetwork, KnowledgeAuthorizer, KnowledgeClass, KnowledgeItem, KnowledgePublication,
+    KnowledgePurpose, KnowledgeQuery, KnowledgeService, NodeIdentity, Provenance, knowledge_hash,
 };
 use serde_json::json;
 use std::sync::RwLock;
@@ -168,11 +167,13 @@ async fn a_publication_is_authenticated_and_stored() {
         .await
         .expect("published");
     assert_eq!(accepted, 1);
-    assert!(service
-        .read()
-        .expect("knowledge service")
-        .get("k-2")
-        .is_some());
+    assert!(
+        service
+            .read()
+            .expect("knowledge service")
+            .get("k-2")
+            .is_some()
+    );
     for task in tasks {
         task.abort();
     }

@@ -7,9 +7,9 @@
 //! test attribute macro, which shadows the builtin one its own expansion emits.
 
 use gpui_kit::{
-    img, px, relative, AppContext as _, ClipboardEntry, ClipboardItem, ClipboardString, Context,
-    Entity, ExternalPaths, FileDropEvent, ImageFormat, ImageSource, IntoElement, Modifiers, Render,
-    Styled, TestAppContext, VisualTestContext, Window,
+    AppContext as _, ClipboardEntry, ClipboardItem, ClipboardString, Context, Entity,
+    ExternalPaths, FileDropEvent, ImageFormat, ImageSource, IntoElement, Modifiers, Render, Styled,
+    TestAppContext, VisualTestContext, Window, img, px, relative,
 };
 
 /// A 1x1 red PNG: the smallest payload the clipboard and the image decoder
@@ -563,7 +563,7 @@ fn the_running_step_draws_the_shared_spinner(cx: &mut TestAppContext) {
 /// the sheet's reduced-motion rule is that same pair's midpoint.
 #[test]
 fn the_state_dot_breathes_on_the_measured_cycle() {
-    use crate::ui::todo_panel::{spin_rest, spin_sweep, SPIN_CIRCUMFERENCE};
+    use crate::ui::todo_panel::{SPIN_CIRCUMFERENCE, spin_rest, spin_sweep};
     let units = |sweep: f32| sweep * SPIN_CIRCUMFERENCE;
     let (start, sweep) = spin_sweep(0.0);
     assert!(start.abs() < 1e-4, "the cycle opens at the path's origin");
@@ -2927,7 +2927,7 @@ fn review_tab_renders_a_captured_changeset(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_large_changeset_only_builds_the_rows_near_the_viewport(cx: &mut TestAppContext) {
     use crate::review::domain::ChangeOperation;
-    use crate::ui::review::{review_rows_built, REVIEW_ROW_H};
+    use crate::ui::review::{REVIEW_ROW_H, review_rows_built};
 
     /// Enough files that an unwindowed list is several viewports long.
     const FILES: usize = 200;
@@ -12299,7 +12299,7 @@ fn skill_entry(
 /// unchosen segments still report their sizes.
 #[test]
 fn the_skill_filter_counts_and_narrows_the_catalogue() {
-    use super::settings::{browse_skills, skill_filter_counts, SkillFilter};
+    use super::settings::{SkillFilter, browse_skills, skill_filter_counts};
     let skills = vec![
         skill_entry("alpha", "First", true),
         skill_entry("beta", "First", true),
@@ -14595,11 +14595,13 @@ fn dropping_files_attaches_images_and_mentions_the_rest(cx: &mut TestAppContext)
     });
     assert_eq!(
         names,
-        vec![image
-            .file_name()
-            .expect("a name")
-            .to_string_lossy()
-            .to_string()],
+        vec![
+            image
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .to_string()
+        ],
         "the dropped image is attached"
     );
     assert_eq!(
@@ -16747,7 +16749,7 @@ fn the_job_duration_takes_the_reference_units() {
 /// seconds is already too long for the failure to still be showing.
 #[test]
 fn the_kill_phase_windows_are_the_measured_ones() {
-    use crate::ui::header::{JobArm, JobPhase, JOB_KILL_ARM, JOB_KILL_FAILED};
+    use crate::ui::header::{JOB_KILL_ARM, JOB_KILL_FAILED, JobArm, JobPhase};
     use std::time::{Duration, Instant};
     let at = Instant::now();
     let armed = JobArm {
@@ -17033,7 +17035,7 @@ fn the_settings_rail_draws_every_nav_cell_and_about_lives_in_general(cx: &mut Te
 /// inventory lists.
 #[gpui::test]
 fn the_web_search_rail_cell_opens_the_tool_settings(cx: &mut TestAppContext) {
-    use super::settings::{section_index, NAV};
+    use super::settings::{NAV, section_index};
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("rail-web-search"));
@@ -17075,7 +17077,7 @@ fn the_web_search_rail_cell_opens_the_tool_settings(cx: &mut TestAppContext) {
 /// only by knowing what the Extensions pane's inventory lists.
 #[gpui::test]
 fn the_agent_loop_rail_cell_opens_the_turn_settings(cx: &mut TestAppContext) {
-    use super::settings::{section_index, NAV};
+    use super::settings::{NAV, section_index};
     init_test_app(cx);
     let (harness, cx) = cx.add_window_view(move |window, cx| {
         let state = AppState::with_store(scratch_store("rail-agent-loop"));
@@ -25201,7 +25203,7 @@ fn the_files_pane_lists_the_workspace_and_opens_a_file(cx: &mut TestAppContext) 
 /// one row element per visible entry.
 #[gpui::test]
 fn a_large_workspace_only_builds_the_tree_rows_near_the_viewport(cx: &mut TestAppContext) {
-    use crate::ui::right_panel::{files_rows_built, FILES_ROW_H};
+    use crate::ui::right_panel::{FILES_ROW_H, files_rows_built};
 
     /// Enough files that an unwindowed tree is several viewports long.
     const FILES: usize = 300;
@@ -28095,7 +28097,7 @@ fn the_slash_palette_list_scrolls_with_the_wheel(cx: &mut TestAppContext) {
 #[test]
 fn the_slash_view_model_filters_every_source_and_the_trigger_is_the_leading_slash() {
     use super::slash_palette::{
-        slash_palette_query, SlashAction, SlashCatalogue, SlashCommand, SlashKind, SlashSkill,
+        SlashAction, SlashCatalogue, SlashCommand, SlashKind, SlashSkill, slash_palette_query,
     };
     assert_eq!(slash_palette_query("/"), Some(""));
     assert_eq!(slash_palette_query("/mo"), Some("mo"));
@@ -28429,8 +28431,8 @@ fn an_extension_skill_does_not_warn_as_missing(cx: &mut TestAppContext) {
 #[gpui::test]
 fn every_listed_command_runs_a_real_handler(cx: &mut TestAppContext) {
     use super::slash_palette::{
-        slash_skills, NoteKind, SlashAction, SlashCatalogue, SlashCommand, SlashEffect, SlashKind,
-        SlashPane,
+        NoteKind, SlashAction, SlashCatalogue, SlashCommand, SlashEffect, SlashKind, SlashPane,
+        slash_skills,
     };
     let root = skills_scratch("slash-handlers");
     let (harness, cx) = slash_shell(cx, "slash-handlers", root, 8);
@@ -30358,9 +30360,10 @@ fn a_goal_round_continues_without_a_user_line(cx: &mut TestAppContext) {
             assert!(this.state.disarm_goal(&id));
         })
     });
-    assert!(cx
-        .update(|_, cx| shell.read(cx).state.goal(&id))
-        .is_some_and(|goal| goal.state.is_open() && !goal.activation.is_armed()));
+    assert!(
+        cx.update(|_, cx| shell.read(cx).state.goal(&id))
+            .is_some_and(|goal| goal.state.is_open() && !goal.activation.is_armed())
+    );
     let next = cx.update(|_, cx| shell.update(cx, |this, _cx| this.state.begin_goal_turn_in(&id)));
     assert!(next.is_none(), "a disarmed active goal waits for resume");
 }

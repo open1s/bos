@@ -169,10 +169,11 @@ async fn an_objective_delegation_is_claimed_and_settled() {
         .claim_objective_delegations(capability::unix_ms());
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].state, DelegationState::Running);
-    assert!(pair
-        .target
-        .claim_objective_delegations(capability::unix_ms())
-        .is_empty());
+    assert!(
+        pair.target
+            .claim_objective_delegations(capability::unix_ms())
+            .is_empty()
+    );
 
     assert!(pair.target.settle_objective_delegation(
         "d-obj",

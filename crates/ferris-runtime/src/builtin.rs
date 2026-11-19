@@ -207,9 +207,9 @@ impl ClosureExtension {
         manifest_toml: &'static str,
         tools: Vec<ToolDescriptor>,
         handler: impl Fn(&str, &Value, &CallContext) -> Result<Value, ExtensionError>
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             manifest_toml,
@@ -339,10 +339,12 @@ tools = ["echo"]
             .await
             .expect("call");
         assert_eq!(result["x"], 1);
-        assert!(runtime
-            .call_tool("missing", serde_json::json!({}), &context)
-            .await
-            .is_err());
+        assert!(
+            runtime
+                .call_tool("missing", serde_json::json!({}), &context)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -461,27 +463,31 @@ scope = "host"
 
         // An incompatible version requirement is refused.
         let too_new = semver::VersionReq::parse("^2").unwrap();
-        assert!(registry
-            .acquire_contract::<Counter>(
-                &Scope::Host,
-                "com.example.counter",
-                "com.example.counter-api",
-                &too_new,
-            )
-            .is_none());
+        assert!(
+            registry
+                .acquire_contract::<Counter>(
+                    &Scope::Host,
+                    "com.example.counter",
+                    "com.example.counter-api",
+                    &too_new,
+                )
+                .is_none()
+        );
 
         // The provider unloads: its token revokes the service, so a consumer
         // can no longer acquire it (no stale lease).
         assert!(registry.revoke(&token));
         assert!(!registry.has_name("com.example.counter"));
-        assert!(registry
-            .acquire_contract::<Counter>(
-                &Scope::Host,
-                "com.example.counter",
-                "com.example.counter-api",
-                &requirement,
-            )
-            .is_none());
+        assert!(
+            registry
+                .acquire_contract::<Counter>(
+                    &Scope::Host,
+                    "com.example.counter",
+                    "com.example.counter-api",
+                    &requirement,
+                )
+                .is_none()
+        );
     }
 
     /// A runtime that provides no services returns none (the guest default).

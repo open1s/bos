@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::Value;
-use wasmtime::component::{bindgen, Component, HasSelf, Linker};
+use wasmtime::component::{Component, HasSelf, Linker, bindgen};
 use wasmtime::{
     Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline,
 };
@@ -28,11 +28,11 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult};
 use ferris_core::capability::{CallScope, Capability, GrantScope, PolicyEngine};
 use ferris_core::events::{EventBus, EventFilter, ExtensionEvent, TopicPattern};
-use ferris_core::manifest::{validate_relative_path, Manifest, ResourcesSpec};
+use ferris_core::manifest::{Manifest, ResourcesSpec, validate_relative_path};
 use ferris_core::package::write_atomic;
 use ferris_core::storage::ExtensionStorage;
 use ferris_core::types::{
-    ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel, HOST_VERSION,
+    ContributionId, ExtensionError, ExtensionId, HOST_VERSION, RuntimeKind, TrustLevel,
 };
 
 bindgen!({
@@ -122,9 +122,11 @@ fn engine() -> &'static Engine {
         let ticker = engine.clone();
         std::thread::Builder::new()
             .name("bsh-wasm-epoch".to_string())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(EPOCH_TICK_MS));
-                ticker.increment_epoch();
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(EPOCH_TICK_MS));
+                    ticker.increment_epoch();
+                }
             })
             .expect("the epoch thread starts");
         engine
@@ -1721,10 +1723,12 @@ mod tests {
         runtime.shutdown().await.expect("shutdown");
         assert!(runtime.tools().await.is_err(), "shutdown must be terminal");
         assert!(runtime.panel("status").await.is_err());
-        assert!(runtime
-            .command("test", serde_json::json!({}))
-            .await
-            .is_err());
+        assert!(
+            runtime
+                .command("test", serde_json::json!({}))
+                .await
+                .is_err()
+        );
         assert!(runtime.pump().await.is_err());
         assert!(
             runtime.instance.lock().expect("instance lock").is_none(),

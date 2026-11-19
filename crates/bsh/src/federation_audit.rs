@@ -226,7 +226,7 @@ pub(crate) fn load(path: &Path, limit: usize) -> Vec<FederationEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, push_recent, record_bounded, subscribe, DurableAudit, FileAudit};
+    use super::{DurableAudit, FileAudit, load, push_recent, record_bounded, subscribe};
     use federation::{Direction, FederationAudit, FederationEvent};
 
     fn event(peer: &str) -> FederationEvent {

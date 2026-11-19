@@ -574,11 +574,7 @@ fn serialize_tools(tools: Option<&[LlmTool]>) -> Option<Vec<Value>> {
             }
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn build_instructions(
@@ -1576,7 +1572,12 @@ mod tests {
             .collect();
         assert_eq!(
             item_types,
-            vec!["message", "message", "function_call", "function_call_output"],
+            vec![
+                "message",
+                "message",
+                "function_call",
+                "function_call_output"
+            ],
             "system folds into instructions; history maps to user/assistant messages + tool round-trip items"
         );
 
@@ -1804,7 +1805,9 @@ mod tests {
             provider_request: Some(crate::llm::ProviderRequest {
                 system_prompt: Some("HOST POLICY".to_string()),
                 messages: vec![
-                    LlmMessage::system("<untrusted_context source=\"workspace-instructions\" trust=\"untrusted-data\">\nDATA\n</untrusted_context>"),
+                    LlmMessage::system(
+                        "<untrusted_context source=\"workspace-instructions\" trust=\"untrusted-data\">\nDATA\n</untrusted_context>",
+                    ),
                     LlmMessage::user("hello"),
                 ],
                 input: Content::text("hello"),

@@ -4,8 +4,8 @@
 pub mod rules;
 
 pub use rules::{
-    ArgMatch, ArgPredicate, AuditEntry, Decision, DecisionEffect, RuleEffect, RuleScope, RuleSet,
-    ToolRule, DEFAULT_AUDIT_CAPACITY,
+    ArgMatch, ArgPredicate, AuditEntry, DEFAULT_AUDIT_CAPACITY, Decision, DecisionEffect,
+    RuleEffect, RuleScope, RuleSet, ToolRule,
 };
 
 use std::fs;

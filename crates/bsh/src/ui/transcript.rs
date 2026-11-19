@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use super::shell::{BodySlot, ChangesHover, Shell};
 use super::todo_panel::spinner;
-use super::{glyph, icon, selectable_txt, txt, DivExt, IconName};
-use crate::i18n::{tr, Lang};
+use super::{DivExt, IconName, glyph, icon, selectable_txt, txt};
+use crate::i18n::{Lang, tr};
 use crate::model::{ChatMessage, PlanStatus, Role, Session, ToolEvent, TurnPart};
 use crate::settings::{StepGrouping, TranscriptPolicy};
 use crate::theme;
@@ -750,11 +750,7 @@ pub(crate) fn tool_diff(name: &str, args: &str) -> Option<Vec<(char, String)>> {
             if let Some(new) = json_field_exact(args, "new_string") {
                 lines.extend(new.lines().map(|line| ('+', line.to_string())));
             }
-            if lines.is_empty() {
-                None
-            } else {
-                Some(lines)
-            }
+            if lines.is_empty() { None } else { Some(lines) }
         }
         _ => None,
     }

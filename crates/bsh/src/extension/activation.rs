@@ -476,9 +476,11 @@ mod tests {
         );
         assert_eq!(plan.active.len(), 1);
         assert_eq!(plan.active[0].reason, "explicit command /devkit__scaffold");
-        assert!(plan.active[0].prompts[0]
-            .reason
-            .contains("explicit command"));
+        assert!(
+            plan.active[0].prompts[0]
+                .reason
+                .contains("explicit command")
+        );
     }
 
     #[test]
@@ -489,9 +491,11 @@ mod tests {
             &["devkit__scaffold".to_string()],
         );
         assert_eq!(plan.active.len(), 1, "{plan:?}");
-        assert!(plan.active[0].prompts[0]
-            .reason
-            .contains("admitted capability"));
+        assert!(
+            plan.active[0].prompts[0]
+                .reason
+                .contains("admitted capability")
+        );
     }
 
     #[test]
@@ -508,9 +512,11 @@ mod tests {
             &["devkit__scaffold".to_string()],
         );
         assert_eq!(plan.active.len(), 1, "{plan:?}");
-        assert!(plan.active[0]
-            .reason
-            .contains("task names admitted capability"));
+        assert!(
+            plan.active[0]
+                .reason
+                .contains("task names admitted capability")
+        );
     }
 
     /// The reported regression: an admitted extension tool does not make a
@@ -641,10 +647,12 @@ mod tests {
         let plan = activate(&[guide, checklist], "build a new extension package", &[]);
         assert_eq!(plan.active.len(), 1);
         assert_eq!(plan.active[0].prompts.len(), 2);
-        assert!(plan.active[0]
-            .prompts
-            .iter()
-            .all(|selected| selected.reason.contains("shares")));
+        assert!(
+            plan.active[0]
+                .prompts
+                .iter()
+                .all(|selected| selected.reason.contains("shares"))
+        );
     }
 
     #[test]
@@ -660,9 +668,11 @@ mod tests {
             &[],
         );
         assert!(plan.is_empty());
-        assert!(plan.omissions[0]
-            .reason
-            .contains("per-extension turn budget"));
+        assert!(
+            plan.omissions[0]
+                .reason
+                .contains("per-extension turn budget")
+        );
     }
 
     #[test]
@@ -676,10 +686,11 @@ mod tests {
         ];
         let plan = activate(&prompts, "build an extension", &[]);
         assert!(plan.bytes() <= MAX_ACTIVE_TOTAL);
-        assert!(plan
-            .omissions
-            .iter()
-            .any(|omission| omission.reason.contains("aggregate turn budget")));
+        assert!(
+            plan.omissions
+                .iter()
+                .any(|omission| omission.reason.contains("aggregate turn budget"))
+        );
     }
 
     #[test]

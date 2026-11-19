@@ -334,9 +334,11 @@ mod tests {
         };
         let policy = SharedPolicy::new(doc);
         assert!(policy.authorize("agent1", "file:///x", "read").is_ok());
-        assert!(policy
-            .authorize("agent1", "file:///blocked", "read")
-            .is_err());
+        assert!(
+            policy
+                .authorize("agent1", "file:///blocked", "read")
+                .is_err()
+        );
     }
 
     #[test]
@@ -507,13 +509,17 @@ mod tests {
         );
 
         // Correctness tests
-        assert!(policy
-            .authorize("alice", "file:///readme.md", "read")
-            .is_ok());
+        assert!(
+            policy
+                .authorize("alice", "file:///readme.md", "read")
+                .is_ok()
+        );
         assert!(policy.authorize("bob", "file:///readme.md", "read").is_ok());
-        assert!(policy
-            .authorize("dave", "file:///readme.md", "read")
-            .is_err());
+        assert!(
+            policy
+                .authorize("dave", "file:///readme.md", "read")
+                .is_err()
+        );
     }
 
     #[tokio::test]

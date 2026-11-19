@@ -8,7 +8,7 @@
 //! count is its context cost.
 
 use super::index::SkillIndex;
-use super::runtime::{retrieval_metrics, RetrievalMetrics, SkillLimits, SkillRuntime};
+use super::runtime::{RetrievalMetrics, SkillLimits, SkillRuntime, retrieval_metrics};
 use super::{SkillContent, SkillPermission, TrustPolicy};
 
 /// The score below which the simulated planner decides no Skill is needed.

@@ -277,12 +277,12 @@ impl Plugin for SurfaceProviderPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferris_core::Risk;
     use ferris_core::surface::contract::{ActionSpec, Confirmation, Profile, SurfaceContract};
     use ferris_core::surface::document::{
-        ActionBinding, ActionMode, DispatchPrincipal, SurfaceDocument, SURFACE_SCHEMA_VERSION,
+        ActionBinding, ActionMode, DispatchPrincipal, SURFACE_SCHEMA_VERSION, SurfaceDocument,
     };
     use ferris_core::surface::node::SurfaceNode;
-    use ferris_core::Risk;
 
     struct StatusProvider {
         contract: SurfaceContract,

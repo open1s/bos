@@ -529,9 +529,9 @@ impl McpClient {
                 loop {
                     iterations += 1;
                     if iterations > MAX_ITERATIONS {
-                        return Err(McpError::Protocol(
-                            format!("Exceeded {MAX_ITERATIONS} non-response lines waiting for request id={id} method={method}")
-                        ));
+                        return Err(McpError::Protocol(format!(
+                            "Exceeded {MAX_ITERATIONS} non-response lines waiting for request id={id} method={method}"
+                        )));
                     }
 
                     buffer.clear();

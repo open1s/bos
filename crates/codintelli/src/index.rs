@@ -7,11 +7,11 @@
 use std::path::PathBuf;
 
 use crate::{
-    classification::{classify_entry, FileCategory, LanguageId},
-    fs::{WorkspaceEntryKind, WorkspaceFs},
-    scanner::{scan_workspace_with_policy, ScanStatus, WorkspaceScanReport},
-    syntax::{LanguageProvider, ParseControl, ParseInput, ParseLimits, ParseResult, ProviderError},
     IgnorePolicy, ScanBudget, ScanBudgetError,
+    classification::{FileCategory, LanguageId, classify_entry},
+    fs::{WorkspaceEntryKind, WorkspaceFs},
+    scanner::{ScanStatus, WorkspaceScanReport, scan_workspace_with_policy},
+    syntax::{LanguageProvider, ParseControl, ParseInput, ParseLimits, ParseResult, ProviderError},
 };
 
 /// Outcome of processing one source file.
@@ -545,9 +545,11 @@ mod tests {
         assert_eq!(report.recovered_files, 1);
         assert_eq!(report.status, SourceIndexStatus::Partial);
         assert_eq!(report.files[0].status, SourceFileStatus::Recovered);
-        assert!(report.files[0]
-            .parse
-            .as_ref()
-            .is_some_and(|parse| !parse.diagnostics.is_empty()));
+        assert!(
+            report.files[0]
+                .parse
+                .as_ref()
+                .is_some_and(|parse| !parse.diagnostics.is_empty())
+        );
     }
 }

@@ -19,7 +19,7 @@ use futures::StreamExt;
 use log::info;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::openaicompatible::{ChatCompletionResponse, Usage};
@@ -512,8 +512,8 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             .await?;
 
         let mut text = String::new();
-        let mut reasoning = String::new();
-        let mut reasoning_state: Option<ReasoningState> = None;
+        let mut reasoning_blocks: Vec<(String, Option<ReasoningState>)> = Vec::new();
+        let mut reasoning_text = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut usage_in = 0u32;
         let mut usage_out = 0u32;
@@ -521,10 +521,14 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             match item? {
                 StreamToken::Text(chunk) => text.push_str(&chunk),
                 // The blocking path must not throw away what the streamed path
-                // preserves: the turn's reasoning and its signature are what a
-                // tool loop replays to Anthropic.
-                StreamToken::ReasoningContent(chunk) => reasoning.push_str(&chunk),
-                StreamToken::ReasoningState(state) => reasoning_state = Some(state),
+                // preserves: each reasoning block and its signature are what a
+                // tool loop replays to Anthropic. A state closes the block whose
+                // text arrived before it; a state with no text is its own block
+                // (redacted thinking), so several blocks keep their boundaries.
+                StreamToken::ReasoningContent(chunk) => reasoning_text.push_str(&chunk),
+                StreamToken::ReasoningState(state) => {
+                    reasoning_blocks.push((std::mem::take(&mut reasoning_text), Some(state)));
+                }
                 StreamToken::ToolCall { name, args, id } => tool_calls.push(json!({
                     "id": id.unwrap_or_default(),
                     "type": "function",
@@ -537,6 +541,10 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 _ => {}
             }
         }
+        // Reasoning that arrived without a closing state is one block too.
+        if !reasoning_text.is_empty() {
+            reasoning_blocks.push((reasoning_text, None));
+        }
 
         let content = if text.is_empty() {
             Value::Null
@@ -548,20 +556,32 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         } else {
             "tool_calls"
         };
-        let message = if tool_calls.is_empty() {
-            let mut message = json!({ "role": "assistant", "content": content });
-            if !reasoning.is_empty() {
-                message["reasoning_content"] = Value::String(reasoning.clone());
-            }
-            message
+        let mut message = if tool_calls.is_empty() {
+            json!({ "role": "assistant", "content": content })
         } else {
-            let mut message =
-                json!({ "role": "assistant", "content": content, "tool_calls": tool_calls });
-            if !reasoning.is_empty() {
-                message["reasoning_content"] = Value::String(reasoning.clone());
-            }
-            message
+            json!({ "role": "assistant", "content": content, "tool_calls": tool_calls })
         };
+        // A single block keeps the original response fields, so existing
+        // consumers see the same message they did before. Several blocks must
+        // never be joined into one reasoning_content under one signature: the
+        // block array carries each text beside its own opaque state instead.
+        if reasoning_blocks.len() == 1 {
+            let (block_text, state) = &reasoning_blocks[0];
+            if !block_text.is_empty() {
+                message["reasoning_content"] = Value::String(block_text.clone());
+            }
+            if let Some(state) = state {
+                message["_bos_reasoning_state"] = state.payload.clone();
+            }
+        }
+        if !reasoning_blocks.is_empty() {
+            message["_bos_reasoning_blocks"] = Value::Array(
+                reasoning_blocks
+                    .iter()
+                    .map(|(content, state)| json!({ "content": content, "state": state }))
+                    .collect(),
+            );
+        }
         let created = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -582,15 +602,8 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 "total_tokens": usage_in.saturating_add(usage_out),
             },
         });
-        let mut parsed: ChatCompletionResponse =
+        let parsed: ChatCompletionResponse =
             serde_json::from_value(body).map_err(|e| LlmError::Parse(e.to_string()))?;
-        // The Chat wire has no field for the signature; hand it to the engine
-        // through the message extension so it can attach a ReasoningState.
-        if let Some(state) = reasoning_state {
-            if let Some(choice) = parsed.choices.first_mut() {
-                choice.message.extra = json!({ "_bos_reasoning_state": state.payload });
-            }
-        }
         let response = LlmResponse::OpenAI(parsed);
         context.notify_response(&response);
         Ok(response)
@@ -1053,7 +1066,9 @@ mod tests {
             provider_request: Some(crate::llm::ProviderRequest {
                 system_prompt: Some("HOST POLICY".to_string()),
                 messages: vec![
-                    LlmMessage::system("<untrusted_context source=\"workspace-instructions\" trust=\"untrusted-data\">\nDATA\n</untrusted_context>"),
+                    LlmMessage::system(
+                        "<untrusted_context source=\"workspace-instructions\" trust=\"untrusted-data\">\nDATA\n</untrusted_context>",
+                    ),
                     LlmMessage::user("hello"),
                 ],
                 input: Content::text("hello"),
@@ -1166,6 +1181,254 @@ mod tests {
         );
         let serialized = serde_json::to_string(&foreign.messages).expect("serializes");
         assert!(!serialized.contains("thinking"), "{serialized}");
+    }
+
+    /// A local Messages endpoint that answers with one fixed SSE stream.
+    async fn spawn_sse_mock(sse: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = socket.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                    let len = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < head_end + len {
+                        let Ok(n) = socket.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// One redacted block followed by two signed thinking blocks: the shape
+    /// that used to collapse into one reasoning string with one signature.
+    const MULTI_BLOCK_SSE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-redacted\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"alpha\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-alpha\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"beta\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-beta\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    #[tokio::test]
+    async fn complete_preserves_every_reasoning_block_and_replays_it() {
+        use crate::llm::{Content, LlmClient, LlmMessage, LlmResponse, ProviderRequest};
+        let addr = spawn_sse_mock(MULTI_BLOCK_SSE).await;
+        let vendor = AnthropicVendor::new(
+            Arc::new(reqwest::Client::new()),
+            format!("http://{addr}"),
+            "claude-3-5-sonnet-latest",
+            "sk-test",
+        );
+        let mut blocking = request(None);
+        blocking.input = Content::text("think");
+        let response = vendor
+            .complete(None, blocking, &mut (), &mut ())
+            .await
+            .expect("the blocking path completes");
+        let rsp = match response {
+            LlmResponse::OpenAI(rsp) => rsp,
+            _ => panic!("the Messages vendor returns a chat completion"),
+        };
+        let message = &rsp.choices[0].message;
+        let blocks = message
+            .attached_reasoning_blocks()
+            .expect("every block is attached separately");
+        assert_eq!(blocks.len(), 3, "redacted plus two signed blocks");
+        assert_eq!(blocks[0].0, "", "redacted thinking has no visible text");
+        assert_eq!(
+            blocks[0]
+                .1
+                .as_ref()
+                .map(|state| state.payload["type"].clone()),
+            Some(json!("redacted_thinking"))
+        );
+        assert_eq!(
+            blocks[0]
+                .1
+                .as_ref()
+                .map(|state| state.payload["data"].clone()),
+            Some(json!("opaque-redacted"))
+        );
+        assert_eq!(blocks[1].0, "alpha");
+        assert_eq!(
+            blocks[1]
+                .1
+                .as_ref()
+                .map(|state| state.payload["signature"].clone()),
+            Some(json!("sig-alpha"))
+        );
+        assert_eq!(blocks[2].0, "beta");
+        assert_eq!(
+            blocks[2]
+                .1
+                .as_ref()
+                .map(|state| state.payload["signature"].clone()),
+            Some(json!("sig-beta"))
+        );
+        assert!(
+            message.reasoning_content.is_none(),
+            "multi-block text is never merged into one reasoning_content"
+        );
+        assert!(
+            message.extra.get("_bos_reasoning_state").is_none(),
+            "multi-block state has no single signature to attach"
+        );
+
+        let mut replay_messages = vec![LlmMessage::user("think")];
+        for (content, state) in &blocks {
+            replay_messages.push(LlmMessage::AssistantReasoning {
+                content: content.clone(),
+                provider_state: state.clone(),
+            });
+        }
+        replay_messages.push(LlmMessage::assistant("answer"));
+        replay_messages.push(LlmMessage::user("next"));
+        let mut replay_request = request(None);
+        replay_request.input = Content::text("next");
+        replay_request.provider_request = Some(ProviderRequest {
+            messages: replay_messages,
+            input: Content::text("next"),
+            ..Default::default()
+        });
+        let replay = vendor.build_request(&None, &replay_request, &(), &());
+        let assistant = replay
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("the assistant turn");
+        let wire = assistant.content.as_array().expect("blocks");
+        let kinds: Vec<&str> = wire
+            .iter()
+            .filter_map(|block| block["type"].as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["redacted_thinking", "thinking", "thinking", "text"],
+            "the blocks replay in provider order"
+        );
+        assert_eq!(wire[0]["data"], json!("opaque-redacted"));
+        assert_eq!(wire[1]["thinking"], json!("alpha"));
+        assert_eq!(wire[1]["signature"], json!("sig-alpha"));
+        assert_eq!(wire[2]["thinking"], json!("beta"));
+        assert_eq!(wire[2]["signature"], json!("sig-beta"));
+    }
+
+    /// A single signed thinking block still produces the original
+    /// `reasoning_content` plus attached-state fields.
+    const SINGLE_BLOCK_SSE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"only\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-only\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    #[tokio::test]
+    async fn complete_keeps_the_single_block_response_shape() {
+        use crate::llm::{Content, LlmClient, LlmResponse};
+        let addr = spawn_sse_mock(SINGLE_BLOCK_SSE).await;
+        let vendor = AnthropicVendor::new(
+            Arc::new(reqwest::Client::new()),
+            format!("http://{addr}"),
+            "claude-3-5-sonnet-latest",
+            "sk-test",
+        );
+        let mut blocking = request(None);
+        blocking.input = Content::text("think");
+        let response = vendor
+            .complete(None, blocking, &mut (), &mut ())
+            .await
+            .expect("the blocking path completes");
+        let rsp = match response {
+            LlmResponse::OpenAI(rsp) => rsp,
+            _ => panic!("the Messages vendor returns a chat completion"),
+        };
+        let message = &rsp.choices[0].message;
+        assert_eq!(message.reasoning_content.as_deref(), Some("only"));
+        let state = message
+            .attached_reasoning_state()
+            .expect("the single state stays attached");
+        assert_eq!(state.payload["signature"], json!("sig-only"));
+        let blocks = message
+            .attached_reasoning_blocks()
+            .expect("the block array also carries one entry");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, "only");
     }
 
     #[test]

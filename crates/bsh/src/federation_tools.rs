@@ -7,14 +7,14 @@
 use std::time::{Duration, Instant};
 
 use agent::capability::{
-    unix_ms, CapabilityId, InvocationContext, InvocationId, NodeId, Principal, WorkspaceId,
+    CapabilityId, InvocationContext, InvocationId, NodeId, Principal, WorkspaceId, unix_ms,
 };
 use agent::tools::{Tool, ToolError};
 use federation::{
     ArtifactCleanupRequest, ArtifactRef, DelegationId, DelegationRequest, KnowledgePurpose,
     KnowledgeQuery,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// One federation tool, selected by name.
 pub(crate) struct FederationTool {
@@ -463,7 +463,7 @@ impl FederationTool {
                             return Err(ToolError::Failed(format!(
                                 "delegation {} submitted, but status failed: {error}",
                                 id.as_str()
-                            )))
+                            )));
                         }
                     }
                 }

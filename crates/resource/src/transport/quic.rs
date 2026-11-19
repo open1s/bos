@@ -10,8 +10,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -20,8 +20,8 @@ use tokio::sync::Mutex;
 
 use super::{Dispatcher, Transport};
 use crate::action::{
-    decode_action, decode_event, decode_output, encode_action, encode_event, encode_output,
-    ResourceAction, ResourceEvent, ResourceOutput,
+    ResourceAction, ResourceEvent, ResourceOutput, decode_action, decode_event, decode_output,
+    encode_action, encode_event, encode_output,
 };
 use crate::error::{ResourceError, Result};
 use crate::meta::{ResourceInfo, ResourceType};
@@ -437,7 +437,7 @@ impl Transport for QuicTransport {
             TAG_ERR => {
                 return Err(ResourceError::Other(
                     String::from_utf8_lossy(&body).into_owned(),
-                ))
+                ));
             }
             other => return Err(ResourceError::Transport(format!("unexpected tag {other}"))),
         }
@@ -481,7 +481,7 @@ impl Transport for QuicTransport {
             TAG_ERR => {
                 return Err(ResourceError::Other(
                     String::from_utf8_lossy(&body).into_owned(),
-                ))
+                ));
             }
             other => return Err(ResourceError::Transport(format!("unexpected tag {other}"))),
         }

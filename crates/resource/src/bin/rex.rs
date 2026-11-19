@@ -26,15 +26,15 @@ use bus::{Bus, BusConfig};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use rcgen::{BasicConstraints, CertificateParams, CertifiedKey, DnType, IsCa, KeyPair};
-use resource::discovery::{discovery_topic, LoadSnapshot, NodeAnnounce, DISCOVERY_TOPIC};
-use resource::explorer::{handler_for, Explorer, Row};
+use resource::discovery::{DISCOVERY_TOPIC, LoadSnapshot, NodeAnnounce, discovery_topic};
+use resource::explorer::{Explorer, Row, handler_for};
 use resource::meta::ResourceStateLabel;
 use resource::policy::{Effect, PolicyDoc, Rule, SharedPolicy};
 use resource::transport::Transport;
 use resource::transport::{QuicServer, QuicTransport};
 use resource::{
-    d, init_logging, ResourceClient, ResourceError, ResourceManager, ResourceType,
-    VirtualNodeResource,
+    ResourceClient, ResourceError, ResourceManager, ResourceType, VirtualNodeResource, d,
+    init_logging,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -945,7 +945,9 @@ async fn serve(
                         if let Err(e) = cleanup_mgr.deregister(&uri).await {
                             eprintln!("peer-loss: failed to unregister {uri}: {e}");
                         } else {
-                            d!("peer-loss: unregistered {uri} (no announcements for {PEER_LOST_SECS}s)");
+                            d!(
+                                "peer-loss: unregistered {uri} (no announcements for {PEER_LOST_SECS}s)"
+                            );
                         }
                     }
                     cleanup_net.remove(peer_id).await; // evict pooled transport

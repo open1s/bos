@@ -15,10 +15,10 @@ use agent::memory::{
 };
 use ferris_sdk::capability::{CallScope, Capability, PolicyEngine};
 use ferris_sdk::memory::{
-    memory_error, MemoryRecordDto, MemoryRecords, RecallHitDto, RecallOutcomeDto, RecallRequestDto,
-    ScoreFeatureDto, MEMORY_CONTRACT, MEMORY_ERR_CONFLICT, MEMORY_ERR_CORRUPT, MEMORY_ERR_INVALID,
+    MEMORY_CONTRACT, MEMORY_ERR_CONFLICT, MEMORY_ERR_CORRUPT, MEMORY_ERR_INVALID,
     MEMORY_ERR_NOT_FOUND, MEMORY_ERR_SCOPE, MEMORY_ERR_STORAGE, MEMORY_ERR_UNAVAILABLE,
-    MEMORY_SERVICE,
+    MEMORY_SERVICE, MemoryRecordDto, MemoryRecords, RecallHitDto, RecallOutcomeDto,
+    RecallRequestDto, ScoreFeatureDto, memory_error,
 };
 use ferris_sdk::types::{ExtensionError, TrustLevel};
 
@@ -378,10 +378,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!committed.id.is_empty());
-        assert!(committed
-            .provenance
-            .evidence
-            .contains(&"extension:com.example.test".to_string()));
+        assert!(
+            committed
+                .provenance
+                .evidence
+                .contains(&"extension:com.example.test".to_string())
+        );
         // Hybrid recall over the same kernel the agent uses.
         let outcome = service
             .recall(RecallRequestDto {

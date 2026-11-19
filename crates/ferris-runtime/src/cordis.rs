@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 use crate::bridge::{
-    find_interpreter, BridgeKind, BridgeOptions, BridgeRegistration, BridgeSession,
+    BridgeKind, BridgeOptions, BridgeRegistration, BridgeSession, find_interpreter,
 };
 
-use crate::contract::{empty_schema, CallContext, Runtime, ToolDescriptor};
-use ferris_core::capability::{authorize_each, CallScope, Capability, PolicyEngine};
+use crate::contract::{CallContext, Runtime, ToolDescriptor, empty_schema};
+use ferris_core::capability::{CallScope, Capability, PolicyEngine, authorize_each};
 use ferris_core::manifest::Manifest;
 use ferris_core::types::{ContributionId, ExtensionError, RuntimeKind, TrustLevel};
 

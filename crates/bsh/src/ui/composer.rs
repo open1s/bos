@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::shell::Shell;
 use super::todo_panel::spinner;
-use super::{hairline_all, icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, hairline_all, icon, txt};
 use crate::theme;
 
 /// The glyph colour on the filled primary control.

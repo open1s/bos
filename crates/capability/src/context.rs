@@ -5,8 +5,8 @@
 //! deliberately not serializable.
 
 use crate::id::{NodeId, WorkspaceId};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// One invocation.

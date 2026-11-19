@@ -774,10 +774,12 @@ mod tests {
         });
         let report = document.validate();
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "surface.id"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "surface.id")
+        );
     }
 
     #[test]
@@ -788,10 +790,12 @@ mod tests {
         });
         let report = document.validate();
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "surface.action"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "surface.action")
+        );
     }
 
     #[test]
@@ -881,10 +885,12 @@ mod tests {
         ensure_valid(document.validate_remote("acme.git")).expect("the producing node may bind it");
         let report = document.validate_remote("other.node");
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "surface.bindings.remote"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "surface.bindings.remote")
+        );
     }
 
     #[test]
@@ -927,10 +933,12 @@ mod tests {
         });
         let report = document.validate();
         assert!(!report.is_valid());
-        assert!(report
-            .errors
-            .iter()
-            .any(|issue| issue.field == "surface.slot.fallback"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.field == "surface.slot.fallback")
+        );
     }
 
     #[test]

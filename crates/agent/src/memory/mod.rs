@@ -19,7 +19,7 @@ pub use error::MemoryError;
 pub use file::{FileMemory, FileRepository};
 pub use record::{
     Confidence, ConfidenceLevel, EvidenceSource, Lifecycle, MemoryKind, MemoryRecord, MemoryScope,
-    Provenance, Relations, RECORD_SCHEMA,
+    Provenance, RECORD_SCHEMA, Relations,
 };
 pub use repository::MemoryRepository;
 pub use retrieval::{RecallHit, RecallOutcome, RecallRequest, ScoreFeature};

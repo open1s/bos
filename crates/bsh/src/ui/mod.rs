@@ -50,11 +50,7 @@ use gpui_kit::*;
 pub(crate) trait DivExt: Sized {
     /// Apply the builder only when the condition holds.
     fn when(self, condition: bool, f: impl FnOnce(Self) -> Self) -> Self {
-        if condition {
-            f(self)
-        } else {
-            self
-        }
+        if condition { f(self) } else { self }
     }
 
     /// Apply the builder with a value that may be absent.

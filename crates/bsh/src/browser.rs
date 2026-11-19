@@ -119,9 +119,15 @@ impl Failure {
             "connect" => {
                 "The connection failed, so no page was read. The host may be down or the port closed; try again, or open a different page."
             }
-            "scheme" => "Only http and https URLs can be opened. Call browser_open with an http(s) URL.",
-            "redirect" => "The redirect chain did not settle. Call browser_open with the final URL directly.",
-            "engine" => "The rendered view could not read this page. The text view is the fallback: call browser_snapshot to read it, or install Google Chrome or Chromium as docs/bsh-browser-substrate.md describes.",
+            "scheme" => {
+                "Only http and https URLs can be opened. Call browser_open with an http(s) URL."
+            }
+            "redirect" => {
+                "The redirect chain did not settle. Call browser_open with the final URL directly."
+            }
+            "engine" => {
+                "The rendered view could not read this page. The text view is the fallback: call browser_snapshot to read it, or install Google Chrome or Chromium as docs/bsh-browser-substrate.md describes."
+            }
             _ => "The response body could not be read. Call browser_open again.",
         }
     }
@@ -1996,7 +2002,7 @@ fn web_press(
         other => {
             return Err(ToolError::Failed(format!(
                 "{other} is not a key this view supports. Use Enter, Tab, Shift+Tab, the arrow keys, Backspace, Delete, Home, End, PageUp, PageDown or Escape.",
-            )))
+            )));
         }
     };
     let js = format!(
@@ -2360,8 +2366,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                     }
                     let handle = tools.browser.clone();
                     let target = url.clone();
-                    let loaded =
-                        blocking(move || navigate_in(&handle, &target)).await?;
+                    let loaded = blocking(move || navigate_in(&handle, &target)).await?;
                     loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                     tools.snapshot_result("open")
                 }
@@ -2445,8 +2450,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                         Action::Navigate(url) => {
                             let handle = tools.browser.clone();
                             let target = url.clone();
-                            let loaded =
-                                blocking(move || navigate_in(&handle, &target)).await?;
+                            let loaded = blocking(move || navigate_in(&handle, &target)).await?;
                             loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                             tools.snapshot_result("navigated")
                         }
@@ -2546,8 +2550,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                         Action::Navigate(url) => {
                             let handle = tools.browser.clone();
                             let target = url.clone();
-                            let loaded =
-                                blocking(move || navigate_in(&handle, &target)).await?;
+                            let loaded = blocking(move || navigate_in(&handle, &target)).await?;
                             loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                             tools.snapshot_result("navigated")
                         }
@@ -2618,8 +2621,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                 async move {
                     if tools.browser.engine_ready() {
                         let handle = tools.browser.clone();
-                        let mut value =
-                            blocking(move || reload_live(&handle)).await??;
+                        let mut value = blocking(move || reload_live(&handle)).await??;
                         tools.stamp(&mut value);
                         return Ok(value);
                     }
@@ -2633,8 +2635,7 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
                         })?;
                     let handle = tools.browser.clone();
                     let target = url.clone();
-                    let loaded =
-                        blocking(move || navigate_in(&handle, &target)).await?;
+                    let loaded = blocking(move || navigate_in(&handle, &target)).await?;
                     loaded.map_err(|failure| ToolError::Failed(failure.tool_message()))?;
                     tools.snapshot_result("reloaded")
                 }
@@ -4112,8 +4113,8 @@ mod tests {
     /// front of a reader whose only problem was a typo in a host name.
     #[test]
     fn a_navigation_chromium_refused_is_a_load_failure() {
-        use crate::browser::engine::cdp::wire::RpcError;
         use crate::browser::engine::EngineError;
+        use crate::browser::engine::cdp::wire::RpcError;
 
         let navigation = |text: &str| EngineError::Rpc {
             method: String::from("Page.navigate"),

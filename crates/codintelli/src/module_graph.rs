@@ -8,11 +8,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use crate::{
+    ParseResult, ParseStatus, SourceRange, WorkspaceId,
     classification::LanguageId,
     resolve_rust_module_candidates,
     rust_modules::{RustModuleResolutionError, RustModuleResolutionStatus},
     syntax::valid_relative_path,
-    ParseResult, ParseStatus, SourceRange, WorkspaceId,
 };
 
 /// Resource limits for building a crate-root-anchored module graph.
@@ -592,14 +592,18 @@ mod tests {
         assert_eq!(graph.status, RustModuleGraphStatus::Complete);
         assert!(graph.nodes.iter().any(|node| node.module_path
             == vec!["outer".to_owned(), "inner".to_owned(), "leaf".to_owned()]));
-        assert!(graph
-            .edges
-            .iter()
-            .any(|edge| edge.status == RustModuleEdgeStatus::Inline));
-        assert!(graph
-            .edges
-            .iter()
-            .any(|edge| edge.status == RustModuleEdgeStatus::UniqueCandidateParsed));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.status == RustModuleEdgeStatus::Inline)
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.status == RustModuleEdgeStatus::UniqueCandidateParsed)
+        );
     }
 
     #[test]
@@ -750,10 +754,12 @@ mod tests {
         .expect("module graph");
         assert_eq!(graph.status, RustModuleGraphStatus::Partial);
         assert_eq!(graph.nodes.len(), 1);
-        assert!(graph
-            .edges
-            .iter()
-            .any(|edge| { edge.status == RustModuleEdgeStatus::SkippedUncertainParentScope }));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| { edge.status == RustModuleEdgeStatus::SkippedUncertainParentScope })
+        );
     }
 
     #[test]

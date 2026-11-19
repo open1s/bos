@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::global::{GlobalSettings, ModelRef, PolicyMode, Preset, SandboxChoice, WorkspaceRef};
 use super::workspace::WorkspaceSettings;
-use super::{dir, TranscriptPolicy};
+use super::{TranscriptPolicy, dir};
 
 /// One skill source after resolution: the label, the expanded path, and whether
 /// the directory is actually there.
@@ -1626,7 +1626,14 @@ mcp_servers = [
         assert_eq!(r.preset_id.as_deref(), Some("standard"));
         assert_eq!(
             r.plugins,
-            vec!["shell", "files", "plan", "schedule", "federation", "surface"],
+            vec![
+                "shell",
+                "files",
+                "plan",
+                "schedule",
+                "federation",
+                "surface"
+            ],
             "the shipped standard preset mounts the core bundles, scheduling, federation and surfaces"
         );
         assert!(r.refusal().is_none());

@@ -8,9 +8,9 @@
 use std::path::PathBuf;
 
 use crate::{
+    WorkspaceId,
     index::{SourceFileStatus, SourceIndexReport},
     syntax::SyntaxFactKind,
-    WorkspaceId,
 };
 
 /// Kind of declaration represented in the candidate symbol catalog.
@@ -358,8 +358,8 @@ mod tests {
     #[test]
     fn builds_unique_and_ambiguous_candidates_from_real_rust_facts() {
         use crate::{
-            index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor,
-            WorkspaceFs,
+            IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor, WorkspaceFs,
+            index_rust_workspace,
         };
         use std::{fs, time::Duration};
         use tempfile::tempdir;
@@ -390,8 +390,8 @@ mod tests {
     #[test]
     fn duplicate_names_remain_ambiguous_instead_of_selecting_arbitrarily() {
         use crate::{
-            index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor,
-            WorkspaceFs,
+            IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor, WorkspaceFs,
+            index_rust_workspace,
         };
         use std::{fs, time::Duration};
         use tempfile::tempdir;
@@ -424,8 +424,8 @@ mod tests {
     #[test]
     fn rejects_facts_from_another_workspace() {
         use crate::{
-            index_rust_workspace, IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor,
-            WorkspaceFs,
+            IgnorePolicy, ScanBudget, ScanLimits, WorkspaceDescriptor, WorkspaceFs,
+            index_rust_workspace,
         };
         use std::{fs, time::Duration};
         use tempfile::tempdir;

@@ -1,13 +1,13 @@
 use crate::{QueryableWrapper, ZenohError};
 use rkyv::api::high::HighDeserializer;
 use rkyv::rancor::{Error, Strategy};
+use rkyv::ser::Serializer;
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::ser::sharing::Share;
-use rkyv::ser::Serializer;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use zenoh::Session;
 
 /// Serves requests for one topic, replying with a handler result.

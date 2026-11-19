@@ -8,23 +8,23 @@
 //! runtimes.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use extism::{
     CancelHandle, Manifest as ExtismManifest, Plugin, PluginBuilder, UserData, ValType, Wasm,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::contract::{load_tool_descriptors, CallContext, Runtime, ToolDescriptor, ToolResult};
+use crate::contract::{CallContext, Runtime, ToolDescriptor, ToolResult, load_tool_descriptors};
 use crate::declarative::DeclarativeContributions;
 use ferris_core::capability::{CallScope, Capability, PolicyEngine};
 use ferris_core::events::{EventBus, EventFilter, ExtensionEvent, Subscription, TopicPattern};
-use ferris_core::manifest::{validate_relative_path, Manifest};
+use ferris_core::manifest::{Manifest, validate_relative_path};
 use ferris_core::storage::ExtensionStorage;
 use ferris_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind, TrustLevel};
 
@@ -166,10 +166,12 @@ impl Bridge {
                 Ok(Value::Null)
             }
             "config" => Ok(Value::String(self.config.clone())),
-            "now_millis" => Ok(json!(SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or_default())),
+            "now_millis" => Ok(json!(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or_default()
+            )),
             "read_file" => {
                 let raw = request
                     .get("path")

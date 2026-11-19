@@ -5,8 +5,8 @@
 #[path = "../../react/tests/common/mock_llm_server.rs"]
 mod mock_llm_server;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent::agent::agentic::{Agent, AgentConfig, LlmProvider};
 use agent::tools::FunctionTool;

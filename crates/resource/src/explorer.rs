@@ -210,7 +210,7 @@ impl Explorer {
             other => {
                 return Err(ResourceError::Unsupported(format!(
                     "peek is not supported for `{other}://` (files and sockets only)"
-                )))
+                )));
             }
         };
         match out {

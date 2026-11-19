@@ -10,9 +10,9 @@ use tree_sitter::{Node, ParseOptions, ParseState, Parser};
 use crate::classification::LanguageId;
 
 use super::{
-    valid_relative_path, ImportFact, LanguageProvider, ParseControl, ParseDiagnostic, ParseInput,
-    ParseLimitKind, ParseLimits, ParseResult, ParseStatus, ParsedDocument, ProviderError,
-    RustModuleFact, SourceRange, SyntaxFact, SyntaxFactKind,
+    ImportFact, LanguageProvider, ParseControl, ParseDiagnostic, ParseInput, ParseLimitKind,
+    ParseLimits, ParseResult, ParseStatus, ParsedDocument, ProviderError, RustModuleFact,
+    SourceRange, SyntaxFact, SyntaxFactKind, valid_relative_path,
 };
 
 /// Rust provider using the upstream Tree-sitter Rust grammar.
@@ -781,10 +781,12 @@ fn helper() {}
         assert_eq!(result.status, ParseStatus::Complete);
         assert_eq!(result.imports.len(), 1);
         assert_eq!(result.imports[0].path, vec!["std", "fmt", "Debug"]);
-        assert!(result
-            .modules
-            .iter()
-            .any(|item| item.name == "nested" && item.is_inline));
+        assert!(
+            result
+                .modules
+                .iter()
+                .any(|item| item.name == "nested" && item.is_inline)
+        );
         for kind in [
             SyntaxFactKind::Module,
             SyntaxFactKind::Import,
@@ -852,11 +854,10 @@ mod nested {
 }
 "#,
         );
-        assert!(result
-            .imports
-            .iter()
-            .any(|item| item.path
-                == vec!["crate".to_owned(), "model".to_owned(), "Widget".to_owned()]));
+        assert!(
+            result.imports.iter().any(|item| item.path
+                == vec!["crate".to_owned(), "model".to_owned(), "Widget".to_owned()])
+        );
         assert!(result.imports.iter().any(|item| item.path
             == vec!["crate".to_owned(), "model".to_owned()]
             && item.alias.is_none()
@@ -886,12 +887,14 @@ mod external_child;
         assert!(result.modules.iter().any(|item| item.name == "nested"
             && !item.is_inline
             && item.scope_path == vec!["inline_child".to_owned()]));
-        assert!(result
-            .modules
-            .iter()
-            .any(|item| item.name == "external_child"
-                && !item.is_inline
-                && item.scope_path.is_empty()));
+        assert!(
+            result
+                .modules
+                .iter()
+                .any(|item| item.name == "external_child"
+                    && !item.is_inline
+                    && item.scope_path.is_empty())
+        );
     }
 
     #[test]
@@ -905,18 +908,24 @@ mod custom;
 mod documented;
 "#,
         );
-        assert!(result
-            .modules
-            .iter()
-            .any(|item| item.name == "optional" && item.has_resolution_attributes));
-        assert!(result
-            .modules
-            .iter()
-            .any(|item| item.name == "custom" && item.has_resolution_attributes));
-        assert!(result
-            .modules
-            .iter()
-            .any(|item| item.name == "documented" && !item.has_resolution_attributes));
+        assert!(
+            result
+                .modules
+                .iter()
+                .any(|item| item.name == "optional" && item.has_resolution_attributes)
+        );
+        assert!(
+            result
+                .modules
+                .iter()
+                .any(|item| item.name == "custom" && item.has_resolution_attributes)
+        );
+        assert!(
+            result
+                .modules
+                .iter()
+                .any(|item| item.name == "documented" && !item.has_resolution_attributes)
+        );
     }
 
     #[test]

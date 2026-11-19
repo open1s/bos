@@ -16,9 +16,9 @@ use react::llm::{
     TokenStream,
 };
 use react::runtime::{HookDecision, ReActApp};
-use react::tool::registry::{AsyncTool, ToolVariant};
 use react::tool::ToolError;
-use serde_json::{json, Value};
+use react::tool::registry::{AsyncTool, ToolVariant};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// App whose hooks record the args/result they received, so the test can

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The hook points this build dispatches. Adding one is a standard change.
 pub const HOOK_POINTS: [&str; 8] = [
@@ -395,10 +395,12 @@ mod tests {
             "text/event-stream"
         );
         assert_eq!(event["request_body"], body);
-        assert!(event["response_body"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("data"));
+        assert!(
+            event["response_body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("data")
+        );
         assert_eq!(event["body_truncated"], false);
     }
 }

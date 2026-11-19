@@ -5,12 +5,12 @@ use agent::agent::plugin::{
   StreamTokenWrapper, ToolCallWrapper, ToolResultWrapper, TurnEndWrapper, TurnStartWrapper,
 };
 use async_trait::async_trait;
+use napi::Unknown;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::Unknown;
 use napi_derive::napi;
-use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
 use react::llm::Content;
+use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice};
 use std::collections::HashMap;
 use std::sync::Arc;
 

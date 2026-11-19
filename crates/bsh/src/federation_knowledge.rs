@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use agent::capability::{unix_ms, CapabilityId, NodeId, WorkspaceId};
+use agent::capability::{CapabilityId, NodeId, WorkspaceId, unix_ms};
 use federation::{KnowledgeAuthorizer, KnowledgeClass, KnowledgePurpose, PeerStore};
 
 /// Query grant a peer must hold to ask this node for public knowledge.

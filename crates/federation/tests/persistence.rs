@@ -3,8 +3,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use capability::{CapabilityId, NodeId};
 use federation::{NodeIdentity, PeerError, PeerStore, TrustState};
 
@@ -61,9 +61,11 @@ fn a_peer_store_survives_a_round_trip() {
 
     assert_eq!(loaded, store);
     assert!(loaded.is_trusted(&trusted, now));
-    assert!(loaded
-        .authorize(&trusted, &capability("build"), now)
-        .is_ok());
+    assert!(
+        loaded
+            .authorize(&trusted, &capability("build"), now)
+            .is_ok()
+    );
     assert_eq!(
         loaded.record(&revoked).map(|record| record.state),
         Some(TrustState::Revoked)

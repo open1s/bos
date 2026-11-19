@@ -874,12 +874,14 @@ mod tests {
         let manager = scratch.path().join("bin").join("mise");
         script(&manager, "sleep 5");
         let started = std::time::Instant::now();
-        assert!(super::ask_manager_with_timeout(
-            &manager,
-            "node",
-            std::time::Duration::from_millis(150)
-        )
-        .is_none());
+        assert!(
+            super::ask_manager_with_timeout(
+                &manager,
+                "node",
+                std::time::Duration::from_millis(150)
+            )
+            .is_none()
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 

@@ -4,8 +4,8 @@
 //! Zenoh id, or a display name: those are endpoints and labels, and a Node
 //! keeps its identity when either changes (RFC section 11.2).
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use capability::NodeId;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
@@ -152,8 +152,8 @@ impl NodeIdentity {
 }
 
 fn random_seed() -> Result<[u8; 32], IdentityError> {
-    use rand::rngs::SysRng;
     use rand::TryRng as _;
+    use rand::rngs::SysRng;
     let mut seed = [0u8; 32];
     SysRng
         .try_fill_bytes(&mut seed)

@@ -4,8 +4,8 @@
 //! stopped it at the cap (`finish_reason: "length"`), and the turn closed on a
 //! fragment. Eight such turns cost 48 minutes and produced one sentence each.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures::StreamExt;

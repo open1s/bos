@@ -187,7 +187,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create and register test plugin
     let test_plugin = Arc::new(TestPlugin::new());
-    println!("Registering test plugin (on_llm_request, on_llm_response, on_tool_call, on_tool_result)...");
+    println!(
+        "Registering test plugin (on_llm_request, on_llm_response, on_tool_call, on_tool_result)..."
+    );
     agent.plugins().register_blocking(test_plugin.clone());
     println!("Plugin registered.\n");
 

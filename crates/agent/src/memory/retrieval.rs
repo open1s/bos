@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::record::{MemoryKind, MemoryRecord, MemoryScope};
-use super::{now_millis, MetadataFilter};
+use super::{MetadataFilter, now_millis};
 use crate::agent::context::estimate_tokens;
 
 /// BM25 term-frequency saturation parameter (documented default).
@@ -405,10 +405,12 @@ mod tests {
         assert_eq!(outcome.hits[0].record.id, "a");
         // The legacy alphanumeric tokenizer cannot match this query at all:
         // the whole sentence is one token. The n-gram tokenizer can.
-        assert!(outcome.hits[0]
-            .features
-            .iter()
-            .any(|f| f.name == "bm25" && f.value > 0.0));
+        assert!(
+            outcome.hits[0]
+                .features
+                .iter()
+                .any(|f| f.name == "bm25" && f.value > 0.0)
+        );
     }
 
     #[test]
@@ -482,9 +484,11 @@ mod tests {
         assert_eq!(outcome.hits[0].record.id, "decision");
         let features = &outcome.hits[0].features;
         assert!(features.iter().any(|f| f.name == "kind" && f.value > 0.0));
-        assert!(features
-            .iter()
-            .any(|f| f.name == "verified" && f.value > 0.0));
+        assert!(
+            features
+                .iter()
+                .any(|f| f.name == "verified" && f.value > 0.0)
+        );
     }
 
     #[test]

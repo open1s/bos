@@ -3,7 +3,7 @@
 //! This module is only available with the `postcard-backend` feature.
 
 use crate::error::QserdeError;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// Postcard backend for no_std/embedded
 ///

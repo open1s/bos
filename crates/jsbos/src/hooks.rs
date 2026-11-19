@@ -2,9 +2,9 @@
 
 use agent::agent::hooks::{AgentHook, HookContext, HookRegistry as InnerHookRegistry};
 use async_trait::async_trait;
+use napi::Unknown;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::Unknown;
 use napi_derive::napi;
 use std::collections::HashMap;
 use std::sync::Arc;

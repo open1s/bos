@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use capability::catalogue::Catalogue;
 use capability::composition::{
-    resolve_host, Binding, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope,
-    PeerCatalogue, PeerRef, RemotePolicy,
+    Binding, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope, PeerCatalogue, PeerRef,
+    RemotePolicy, resolve_host,
 };
 use capability::{
     CapabilityDescriptor, CapabilityId, CapabilityKind, CapabilityOutput, InvocationContext,

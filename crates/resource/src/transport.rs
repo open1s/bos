@@ -10,8 +10,8 @@ pub use quic::{QuicServer, QuicTransport};
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::Stream;
+use futures::stream::BoxStream;
 
 use crate::action::{ResourceAction, ResourceEvent, ResourceOutput};
 use crate::error::Result;

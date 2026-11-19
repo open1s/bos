@@ -1,19 +1,19 @@
 //! A remote binding executes through the peer provider, with no local fallback.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use capability::composition::{
-    resolve_host, Binding, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope,
-    PeerCatalogue, PeerRef, RemotePolicy,
+    Binding, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope, PeerCatalogue, PeerRef,
+    RemotePolicy, resolve_host,
 };
 use capability::{
-    remote_provider_id, CapabilityCall, CapabilityDescriptor, CapabilityError, CapabilityId,
-    CapabilityKind, CapabilityOutput, CapabilityProvider, Catalogue, DeliveryState,
-    InvocationContext, InvocationId, NodeId, Principal, ProviderHealth, ProviderId, ProviderKind,
-    VersionSource, WorkspaceId, WorkspaceRuntime,
+    CapabilityCall, CapabilityDescriptor, CapabilityError, CapabilityId, CapabilityKind,
+    CapabilityOutput, CapabilityProvider, Catalogue, DeliveryState, InvocationContext,
+    InvocationId, NodeId, Principal, ProviderHealth, ProviderId, ProviderKind, VersionSource,
+    WorkspaceId, WorkspaceRuntime, remote_provider_id,
 };
 use federation::{FederationNode, InMemoryNetwork, NodeIdentity, RemoteCapabilityProvider};
 use semver::{Version, VersionReq};

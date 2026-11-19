@@ -7,9 +7,9 @@ use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::text::TextViewState;
 use gpui_kit::*;
 
+use super::DivExt;
 use super::paging::{PageFlow, PageKey};
 use super::settings::{SettingsInputs, SkillFilter, TrustConfirm, VaultInputs};
-use super::DivExt;
 use crate::runner::AgentEvent;
 use crate::settings::mcp::McpScope;
 use crate::state::{AppState, Overlay};
@@ -2541,40 +2541,42 @@ impl Shell {
         // Federation discovery tick: announcements arrive on the runtime's
         // background task, so the pane has to notice them. It runs only while
         // the Federation pane is on screen, and only re-renders on a change.
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(2))
-                .await;
-            let observed = this.update(cx, |this, cx| {
-                if !this.right.open
-                    || this.right.tab != Some(super::right_panel::RightTab::Federation)
-                {
-                    return false;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                let observed = this.update(cx, |this, cx| {
+                    if !this.right.open
+                        || this.right.tab != Some(super::right_panel::RightTab::Federation)
+                    {
+                        return false;
+                    }
+                    let before: Vec<String> = this
+                        .right
+                        .federation
+                        .discovered
+                        .iter()
+                        .map(|row| row.node.clone())
+                        .collect();
+                    this.reload_federation_quiet();
+                    let after: Vec<String> = this
+                        .right
+                        .federation
+                        .discovered
+                        .iter()
+                        .map(|row| row.node.clone())
+                        .collect();
+                    if before == after {
+                        false
+                    } else {
+                        cx.notify();
+                        true
+                    }
+                });
+                if observed.is_err() {
+                    break;
                 }
-                let before: Vec<String> = this
-                    .right
-                    .federation
-                    .discovered
-                    .iter()
-                    .map(|row| row.node.clone())
-                    .collect();
-                this.reload_federation_quiet();
-                let after: Vec<String> = this
-                    .right
-                    .federation
-                    .discovered
-                    .iter()
-                    .map(|row| row.node.clone())
-                    .collect();
-                if before == after {
-                    false
-                } else {
-                    cx.notify();
-                    true
-                }
-            });
-            if observed.is_err() {
-                break;
             }
         })
         .detach();
@@ -2582,17 +2584,19 @@ impl Shell {
         // The jobs clock: the reference re-renders its elapsed figures once a
         // second while the panel is open over a live job, and bsh needs the same
         // cadence to expire an armed stop inside its measured window.
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(1))
-                .await;
-            if this
-                .update(cx, |this, cx| {
-                    this.tick_jobs(std::time::Instant::now(), cx);
-                })
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.tick_jobs(std::time::Instant::now(), cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -2638,12 +2642,14 @@ impl Shell {
         // poll remains the fallback for what no frame announces: a tool that
         // moved the document from the turn's runtime, and the pane's own
         // resize want.
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(120))
-                .await;
-            if this.update(cx, |this, cx| this.sync_browser(cx)).is_err() {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(120))
+                    .await;
+                if this.update(cx, |this, cx| this.sync_browser(cx)).is_err() {
+                    break;
+                }
             }
         })
         .detach();
@@ -2665,30 +2671,32 @@ impl Shell {
         .detach();
         // The scheduler: one check every 30 seconds, so a task comes due while the
         // window is open without needing a turn of its own to hang off.
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(5))
-                .await;
-            if this
-                .update(cx, |this, cx| {
-                    if !this.state.settings.global.schedules.is_empty() {
-                        this.check_schedules(cx);
-                        this.check_task_schedules(cx);
-                        this.expire_task_deadlines(cx);
-                    }
-                    // Peer work must not depend on the reader having a local
-                    // schedule: an accepted delegation is claimed by this tick.
-                    this.settle_observed_tasks();
-                    this.check_peer_delegation_cancels();
-                    this.check_task_resumes(cx);
-                    this.check_peer_tasks(cx);
-                    this.check_peer_delegations(cx);
-                    this.check_peer_task_deadlines();
-                    this.refresh_peer_mirrors();
-                })
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(5))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if !this.state.settings.global.schedules.is_empty() {
+                            this.check_schedules(cx);
+                            this.check_task_schedules(cx);
+                            this.expire_task_deadlines(cx);
+                        }
+                        // Peer work must not depend on the reader having a local
+                        // schedule: an accepted delegation is claimed by this tick.
+                        this.settle_observed_tasks();
+                        this.check_peer_delegation_cancels();
+                        this.check_task_resumes(cx);
+                        this.check_peer_tasks(cx);
+                        this.check_peer_delegations(cx);
+                        this.check_peer_task_deadlines();
+                        this.refresh_peer_mirrors();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -8333,7 +8341,7 @@ mod tests {
     // Named import: a glob would pull in gpui's re-export of the test attribute
     // macro, which shadows the builtin one its own expansion emits.
     use super::selection_drag;
-    use super::{compact_error_text, compact_failure_text, ChangesCache};
+    use super::{ChangesCache, compact_error_text, compact_failure_text};
 
     /// A delegation's terminal state maps to a task outcome; a live one maps
     /// to nothing so the record stays Running.

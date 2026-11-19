@@ -66,7 +66,7 @@ where
         .into_any_element()
 }
 use super::shell::Shell;
-use super::{icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, icon, txt};
 use crate::theme;
 
 /// One record as the pane lists it.

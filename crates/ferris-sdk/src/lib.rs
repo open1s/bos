@@ -16,13 +16,13 @@ pub mod runtime;
 pub use ferris_core::manifest as core_manifest;
 #[cfg(feature = "tokio")]
 pub use ferris_core::{
-    capability, composable, config, events, lifecycle, manager, manifest_v2, package, resolver,
-    signing, sources, surface, terminal, types, ui,
+    CapabilityRegistry, CapabilitySpec, ContributionLease, ContributionSink, HostSpec, LeaseHost,
+    Risk, Runtime, RuntimeResolver, Scope, ScopePath, ServiceContractRegistry,
 };
 #[cfg(feature = "tokio")]
 pub use ferris_core::{
-    CapabilityRegistry, CapabilitySpec, ContributionLease, ContributionSink, HostSpec, LeaseHost,
-    Risk, Runtime, RuntimeResolver, Scope, ScopePath, ServiceContractRegistry,
+    capability, composable, config, events, lifecycle, manager, manifest_v2, package, resolver,
+    signing, sources, surface, terminal, types, ui,
 };
 #[cfg(feature = "host-runtime")]
 pub use ferris_runtime as host_runtime;
@@ -43,20 +43,20 @@ pub use ferris_core::{Contribution, ContributionRef, InvokeContext, RuntimeConte
 pub use semver::Version;
 pub use toml;
 
-pub use contribution::{kinds, ContributionSpec};
+pub use contribution::{ContributionSpec, kinds};
 pub use error::{ErrorCode, ExtError, Result};
 pub use manifest::{ExtensionManifest, ManifestBuilder};
 pub use runtime::{Call, Extension, ExtensionContext, ExtensionRuntime, TestHarness};
 
 /// Common authoring imports.
 pub mod prelude {
-    pub use crate::contribution::{kinds, ContributionSpec};
+    pub use crate::contribution::{ContributionSpec, kinds};
     pub use crate::error::{ErrorCode, ExtError, Result};
     pub use crate::manifest::{ExtensionManifest, ManifestBuilder};
     pub use crate::memory::{
-        dispatch_memory_json, memory_error, MemoryKindDto, MemoryRecordDto, MemoryRecords,
-        MemoryScopeDto, RecallHitDto, RecallOutcomeDto, RecallRequestDto, MEMORY_CONTRACT,
-        MEMORY_CONTRACT_VERSION, MEMORY_SERVICE,
+        MEMORY_CONTRACT, MEMORY_CONTRACT_VERSION, MEMORY_SERVICE, MemoryKindDto, MemoryRecordDto,
+        MemoryRecords, MemoryScopeDto, RecallHitDto, RecallOutcomeDto, RecallRequestDto,
+        dispatch_memory_json, memory_error,
     };
     pub use crate::runtime::{Call, Extension, ExtensionContext, ExtensionRuntime, TestHarness};
     pub use crate::{
@@ -65,7 +65,7 @@ pub mod prelude {
         ServicesSpec, StartupPolicy, TrustLevel, Version,
     };
     pub use async_trait::async_trait;
-    pub use serde_json::{json, Value};
+    pub use serde_json::{Value, json};
     pub use toml;
 }
 

@@ -1,9 +1,9 @@
 #![allow(clippy::unnecessary_cast)]
 
 use async_trait::async_trait;
+use napi::Unknown;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::Unknown;
 use napi_derive::napi;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -1818,7 +1818,7 @@ impl Agent {
         return Err(Error::new(
           napi::Status::InvalidArg,
           format!("unsupported message role: {other}"),
-        ))
+        ));
       }
     };
     let mut guard = self
@@ -1973,9 +1973,11 @@ mod tests {
     });
     registry.register_async(tool).unwrap();
 
-    assert!(registry
-      .async_tool_names()
-      .contains(&"test_async".to_string()));
+    assert!(
+      registry
+        .async_tool_names()
+        .contains(&"test_async".to_string())
+    );
     assert_eq!(registry.list().len(), 1);
   }
 

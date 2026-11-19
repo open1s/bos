@@ -1,6 +1,6 @@
 //! The ReAct engine: an LLM loop with tools, skills, streaming, and telemetry.
 
-use crate::llm::types::{load_skill_tool, HostGuidance, ReactContext, ReactSession};
+use crate::llm::types::{HostGuidance, ReactContext, ReactSession, load_skill_tool};
 use crate::llm::vendor::responses::{ResponsesContentPart, ResponsesItem};
 use crate::llm::{
     ActionIntent, LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, ReasoningState,
@@ -26,11 +26,11 @@ pub const TOOL_BATCH_CONCURRENCY: usize = 8;
 use log::info;
 use serde_json::Value;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use thiserror::Error;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 mod builder;
@@ -43,8 +43,8 @@ mod tool_run;
 
 pub use error::{BuilderError, ReactError};
 pub use schema_budget::{
-    SchemaAccount, SchemaBudget, SchemaRejection, SchemaRevision, DEFAULT_PER_TOOL_BUDGET,
-    DEFAULT_SCHEMA_BUDGET,
+    DEFAULT_PER_TOOL_BUDGET, DEFAULT_SCHEMA_BUDGET, SchemaAccount, SchemaBudget, SchemaRejection,
+    SchemaRevision,
 };
 pub use skill_cache::{CachedSkill, SkillCache};
 pub use tool_run::{ToolCallEvent, ToolRunManager};
@@ -710,7 +710,7 @@ impl<A: ReActApp> ReActEngine<A> {
             {
                 HookDecision::Continue => {}
                 HookDecision::Abort => {
-                    return Err(ReactError::HookAbort("before_llm_call aborted".to_string()))
+                    return Err(ReactError::HookAbort("before_llm_call aborted".to_string()));
                 }
                 HookDecision::Error(msg) => return Err(ReactError::HookAbort(msg)),
             }
@@ -762,20 +762,37 @@ impl<A: ReActApp> ReActEngine<A> {
                         // a tool loop can replay it to the same provider, never
                         // as assistant text. The session was cleared of earlier
                         // turns before this request, so nothing crosses a turn.
-                        let reasoning = message.reasoning_text().unwrap_or_default();
-                        let provider_state = message.attached_reasoning_state().or_else(|| {
-                            message.reasoning_details().map(|details| {
-                                ReasoningState::new(
-                                    "openai-chat",
-                                    serde_json::json!({ "details": details }),
-                                )
-                            })
-                        });
-                        if !reasoning.trim().is_empty() || provider_state.is_some() {
-                            session.push(LlmMessage::AssistantReasoning {
-                                content: reasoning.to_string(),
-                                provider_state,
+                        //
+                        // A decoder that saw several signed or redacted blocks
+                        // attaches them separately, each with its own state; one
+                        // message per block is what keeps two signatures from
+                        // sharing one text. A single-block response keeps the
+                        // original reasoning_content / attached-state path.
+                        if let Some(blocks) = message.attached_reasoning_blocks() {
+                            for (content, provider_state) in blocks {
+                                if !content.trim().is_empty() || provider_state.is_some() {
+                                    session.push(LlmMessage::AssistantReasoning {
+                                        content,
+                                        provider_state,
+                                    });
+                                }
+                            }
+                        } else {
+                            let reasoning = message.reasoning_text().unwrap_or_default();
+                            let provider_state = message.attached_reasoning_state().or_else(|| {
+                                message.reasoning_details().map(|details| {
+                                    ReasoningState::new(
+                                        "openai-chat",
+                                        serde_json::json!({ "details": details }),
+                                    )
+                                })
                             });
+                            if !reasoning.trim().is_empty() || provider_state.is_some() {
+                                session.push(LlmMessage::AssistantReasoning {
+                                    content: reasoning.to_string(),
+                                    provider_state,
+                                });
+                            }
                         }
 
                         // The model's own words belong in the transcript even
@@ -1986,8 +2003,8 @@ impl<A: ReActApp> ReActEngine<A> {
 #[cfg(test)]
 mod repeat_guard_tests {
     use super::{
-        cap_tool_result, failure_signature, mid_turn_ceiling, RepeatedFailure,
-        MID_TURN_FIXED_RESERVE, REPEAT_FAILURE_LIMIT, TOOL_RESULT_CAP,
+        MID_TURN_FIXED_RESERVE, REPEAT_FAILURE_LIMIT, RepeatedFailure, TOOL_RESULT_CAP,
+        cap_tool_result, failure_signature, mid_turn_ceiling,
     };
 
     #[test]

@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use crate::{
-    fs::{WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs},
     IgnorePolicy, ScanBudget, ScanBudgetError, ScanUsage,
+    fs::{WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs},
 };
 
 /// Final state of a workspace inventory scan.
@@ -334,10 +334,12 @@ mod tests {
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == ScanDiagnosticKind::Budget(ScanBudgetError::DepthLimitExceeded)
         }));
-        assert!(!report
-            .entries
-            .iter()
-            .any(|entry| { entry.relative_path == std::path::Path::new("src/nested/file.rs") }));
+        assert!(
+            !report
+                .entries
+                .iter()
+                .any(|entry| { entry.relative_path == std::path::Path::new("src/nested/file.rs") })
+        );
     }
 
     #[test]
@@ -490,10 +492,12 @@ mod tests {
         assert_eq!(report.usage.files, 1);
         assert_eq!(report.usage.entries, 4);
         assert_eq!(report.entries.len(), 2);
-        assert!(report
-            .entries
-            .iter()
-            .any(|entry| { entry.relative_path == std::path::Path::new("src/main.rs") }));
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| { entry.relative_path == std::path::Path::new("src/main.rs") })
+        );
         assert!(!report.entries.iter().any(|entry| {
             entry.relative_path.starts_with("target")
                 || entry.relative_path.starts_with("node_modules")

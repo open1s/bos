@@ -17,9 +17,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::contract::{
-    load_tool_descriptors, CallContext, Implementation, Runtime, ToolDescriptor, ToolFile,
+    CallContext, Implementation, Runtime, ToolDescriptor, ToolFile, load_tool_descriptors,
 };
-use ferris_core::manifest::{validate_relative_path, Manifest};
+use ferris_core::manifest::{Manifest, validate_relative_path};
 use ferris_core::surface::{SurfaceDocument, SurfaceLimits};
 use ferris_core::types::{ContributionId, ExtensionError, ExtensionId, RuntimeKind};
 use ferris_core::ui::{PanelLocation, PanelVisibility, UiDocument, UiSession};
@@ -944,10 +944,12 @@ max_output_bytes = 4096
             .await
             .expect("greet");
         assert_eq!(greeted, "hello world");
-        assert!(runtime
-            .call_tool("missing", serde_json::json!({}), &context)
-            .await
-            .is_err());
+        assert!(
+            runtime
+                .call_tool("missing", serde_json::json!({}), &context)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

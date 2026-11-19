@@ -307,8 +307,8 @@ pub(crate) fn equal_lane(lane: &[LaneRecord]) -> Vec<LaneBlock> {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_box, decimate, equal_lane, fixed_box, lane_hit, time_lane, LaneBlock, LaneRecord,
-        TimeAxis, MAX_LANE_BLOCKS,
+        LaneBlock, LaneRecord, MAX_LANE_BLOCKS, TimeAxis, block_box, decimate, equal_lane,
+        fixed_box, lane_hit, time_lane,
     };
 
     fn record(index: usize, start: Option<u64>, duration_ms: Option<u64>) -> LaneRecord {

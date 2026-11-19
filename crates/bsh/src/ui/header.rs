@@ -9,7 +9,7 @@ use gpui_kit::*;
 use super::shell::{HandleSide, Shell};
 use super::todo_panel::spinner;
 use super::{
-    hairline_all, hairline_bottom, hairline_left, hairline_top, icon, txt, DivExt, IconName,
+    DivExt, IconName, hairline_all, hairline_bottom, hairline_left, hairline_top, icon, txt,
 };
 use crate::state::Tab;
 use crate::subagent::SubagentStatus;

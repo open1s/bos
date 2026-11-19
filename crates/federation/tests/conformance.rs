@@ -5,7 +5,7 @@
 //! even when both ends of the suite still agree with each other.
 
 use capability::transport::FederationMessage;
-use federation::envelope::{accepts_protocol, accepts_schema, EnvelopeError, PROTOCOL};
+use federation::envelope::{EnvelopeError, PROTOCOL, accepts_protocol, accepts_schema};
 use federation::{Envelope, NodeIdentity};
 
 /// The pinned signature for the vector below.

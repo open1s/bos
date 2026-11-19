@@ -6,11 +6,11 @@
 use std::path::PathBuf;
 
 use crate::{
+    RustModuleGraphStatus, WorkspaceId,
     rust_imports::{RustImportResolution, RustImportResolutionReport, RustImportResolutionStatus},
     rust_symbols::{
         RustScopedSymbol, RustScopedSymbolId, RustScopedSymbolKind, RustScopedSymbolReport,
     },
-    RustModuleGraphStatus, WorkspaceId,
 };
 
 /// Outcome of matching one import against the scoped symbol catalog.
@@ -258,9 +258,9 @@ fn make_candidate(symbol: &RustScopedSymbol, alias: Option<&str>) -> RustSymbolI
 mod tests {
     use super::*;
     use crate::{
+        SourceRange,
         rust_imports::RustImportResolution,
         rust_symbols::{RustScopedSymbol, RustScopedSymbolId},
-        SourceRange,
     };
 
     fn symbol(

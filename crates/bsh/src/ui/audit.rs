@@ -29,7 +29,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, icon, txt};
 use crate::audit::{
     self, AuditAllows, AuditCall, AuditCategory, AuditOutcome, AuditPolicy, AuditRefusal,
     AuditTurn, AuditView,

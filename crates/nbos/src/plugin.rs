@@ -6,8 +6,8 @@ use agent::agent::plugin::{
     TurnStartWrapper as InnerTurnStart,
 };
 use async_trait::async_trait;
-use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
+use pyo3::prelude::*;
 use react::llm::vendor::{ChatCompletionResponse, ChatMessage, Choice, FunctionCall, ToolCall};
 use std::sync::Arc;
 

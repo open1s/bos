@@ -17,7 +17,7 @@ use react::llm::{
 use react::runtime::{HookDecision, ReActApp};
 use react::tool::registry::ToolVariant;
 use react::tool::{Tool, ToolError};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Records the name each tool hook was given.
 #[derive(Default)]

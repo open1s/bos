@@ -16,7 +16,7 @@ use tar::Archive;
 
 use super::capability::unix_now;
 use super::manifest::MANIFEST_FILE;
-use super::package::{write_atomic, ExtensionStore, Package};
+use super::package::{ExtensionStore, Package, write_atomic};
 use super::types::{ExtensionError, ExtensionSource};
 
 /// The largest archive or index this build downloads.
@@ -567,8 +567,8 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     fn scratch(label: &str) -> PathBuf {
         let path =

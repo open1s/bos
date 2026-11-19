@@ -11,8 +11,8 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::effects::{BoxFuture, DisposalReport, Disposer, EffectScope};
 use super::{Scope, ServiceLease, ServiceRegistry, ServiceToken};
@@ -618,13 +618,17 @@ mod tests {
             Arc::new(Search),
         );
         let two = semver::VersionReq::parse("^2").expect("two");
-        assert!(isolated
-            .acquire_contract_at::<Search>(&Scope::Host, "search", "search-api", &two)
-            .is_none());
+        assert!(
+            isolated
+                .acquire_contract_at::<Search>(&Scope::Host, "search", "search-api", &two)
+                .is_none()
+        );
         let one = semver::VersionReq::parse("^1").expect("one");
-        assert!(isolated
-            .acquire_contract_at::<Search>(&Scope::Host, "search", "search-api", &one)
-            .is_some());
+        assert!(
+            isolated
+                .acquire_contract_at::<Search>(&Scope::Host, "search", "search-api", &one)
+                .is_some()
+        );
     }
 
     // A Tokio test, not a plain one: dropping the Context runs async cleanup
@@ -734,11 +738,12 @@ mod tests {
 
         assert!(one.acquire::<u64>("secret").is_some());
         assert!(two.acquire::<u64>("secret").is_none());
-        assert!(two
-            .path()
-            .iter()
-            .all(|scope| !matches!(scope, Scope::Extension(_))
-                || scope == &Scope::Extension("b".into())));
+        assert!(
+            two.path()
+                .iter()
+                .all(|scope| !matches!(scope, Scope::Extension(_))
+                    || scope == &Scope::Extension("b".into()))
+        );
     }
 
     #[tokio::test]

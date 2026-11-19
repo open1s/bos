@@ -45,19 +45,19 @@ pub mod tool;
 pub mod transport;
 
 pub use action::{
-    decode_action, decode_output, encode_action, encode_output, ResourceAction, ResourceEvent,
-    ResourceOutput,
+    ResourceAction, ResourceEvent, ResourceOutput, decode_action, decode_output, encode_action,
+    encode_output,
 };
 pub use client::{Resource, ResourceClient};
 pub use debug::init_logging;
-pub use discovery::{LoadSnapshot, NodeAnnounce, DISCOVERY_TOPIC};
+pub use discovery::{DISCOVERY_TOPIC, LoadSnapshot, NodeAnnounce};
 pub use error::{ResourceError, Result};
-pub use explorer::{handler_for, Explorer, Row};
+pub use explorer::{Explorer, Row, handler_for};
 pub use handler::ResourceHandler;
 pub use manager::ResourceManager;
 pub use meta::{ResourceInfo, ResourceMeta, ResourceStateLabel, ResourceType};
-pub use net::router::{RelayResource, RelayTransport};
 pub use net::Net;
+pub use net::router::{RelayResource, RelayTransport};
 pub use platform::{Os, Terminate};
 pub use policy::{Effect, PolicyDoc, Rule, SharedPolicy};
 pub use resource::combine::CombineResource;
@@ -67,9 +67,9 @@ pub use resource::{
     folder::FolderResource,
     mem::MemResource,
     proc::{
+        ProcResource,
         manager::ProcManager,
         supervisor::{ChildSpec, RestartPolicy, SupPolicy, Supervisor},
-        ProcResource,
     },
     sock::SockResource,
 };
@@ -81,7 +81,7 @@ pub mod prelude {
     pub use crate::action::{ResourceAction, ResourceEvent, ResourceOutput};
     pub use crate::client::{Resource, ResourceClient};
     pub use crate::error::{ResourceError, Result};
-    pub use crate::explorer::{handler_for, Explorer, Row};
+    pub use crate::explorer::{Explorer, Row, handler_for};
     pub use crate::handler::ResourceHandler;
     pub use crate::manager::ResourceManager;
     pub use crate::meta::{ResourceInfo, ResourceMeta, ResourceType};
@@ -93,9 +93,9 @@ pub mod prelude {
         folder::FolderResource,
         mem::MemResource,
         proc::{
+            ProcResource,
             manager::ProcManager,
             supervisor::{ChildSpec, RestartPolicy, SupPolicy, Supervisor},
-            ProcResource,
         },
         sock::SockResource,
         vnode::VirtualNodeResource,

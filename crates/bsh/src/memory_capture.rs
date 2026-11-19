@@ -11,10 +11,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use agent::memory::capture::{
-    commit_candidates, CandidateExtractor, CapturePolicy, DeterministicExtractor, TurnEvidence,
-};
 use agent::memory::FileMemory;
+use agent::memory::capture::{
+    CandidateExtractor, CapturePolicy, DeterministicExtractor, TurnEvidence, commit_candidates,
+};
 
 /// A content-free account of one capture run, for diagnostics.
 #[derive(Debug, Clone, Default)]

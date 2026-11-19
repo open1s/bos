@@ -290,10 +290,10 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Risk;
     use crate::surface::contract::{ActionSpec, Profile, SurfaceContract};
     use crate::surface::node::{Sizing, SurfaceNode};
     use crate::surface::{Confirmation, SurfaceLimits};
-    use crate::Risk;
     use semver::Version;
 
     fn contract(name: &str, version: (u64, u64, u64)) -> SurfaceContract {

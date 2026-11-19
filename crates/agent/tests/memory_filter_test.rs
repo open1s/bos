@@ -46,10 +46,12 @@ async fn filter_equality_is_type_strict() {
 
     // A string "1" must not match the number 1, and missing metadata never matches.
     let string = MetadataFilter::new("n", json!("1"));
-    assert!(memory
-        .search_filtered("counted no metadata", 5, Some(&string))
-        .await
-        .is_empty());
+    assert!(
+        memory
+            .search_filtered("counted no metadata", 5, Some(&string))
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]

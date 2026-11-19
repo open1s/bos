@@ -477,9 +477,9 @@ fn load_icon(bundle: &std::path::Path) -> Option<Arc<gpui_kit::Image>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Entry, Label, open_command};
     #[cfg(target_os = "macos")]
     use super::{installed_in, preferred_index};
-    use super::{open_command, Entry, Label};
     // Path is the argument of the bundle probe, which only macOS has.
     #[cfg(target_os = "macos")]
     use std::path::Path;

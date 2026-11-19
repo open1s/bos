@@ -1,18 +1,18 @@
 //! Manifests, dependency graphs, and lock reproducibility.
 
+use capability::Catalogue;
 use capability::composition::{
-    resolve_host, Binding, Budgets, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope,
-    PeerCatalogue, PeerRef, RemotePolicy,
+    Binding, Budgets, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope, PeerCatalogue,
+    PeerRef, RemotePolicy, resolve_host,
 };
 use capability::descriptor::{CapabilityDescriptor, OutputContract};
 use capability::id::{
     CapabilityId, CapabilityKind, NodeId, SurfaceName, VersionSource, WorkspaceId,
 };
 use capability::lock::{
-    lock_resolution, resolve_locked, CompositionLock, CompositionManifest, DependencyEdge,
-    DependencyGraph, LockError,
+    CompositionLock, CompositionManifest, DependencyEdge, DependencyGraph, LockError,
+    lock_resolution, resolve_locked,
 };
-use capability::Catalogue;
 use semver::{Version, VersionReq};
 
 fn cap(value: &str) -> CapabilityId {
@@ -231,10 +231,12 @@ fn a_lock_records_exact_bindings_and_reproduces() {
     assert_eq!(binding.version, Version::new(2, 1, 0));
     assert!(matches!(binding.binding, Binding::Remote { .. }));
     assert!(lock.catalogue.len() == 64, "a sha-256 catalogue revision");
-    assert!(lock.peers[0]
-        .catalogue
-        .as_ref()
-        .is_some_and(|rev| rev.len() == 64));
+    assert!(
+        lock.peers[0]
+            .catalogue
+            .as_ref()
+            .is_some_and(|rev| rev.len() == 64)
+    );
     assert_eq!(
         lock.activation_order,
         vec![cap("builtin/build"), cap("builtin/read_file")]
@@ -270,12 +272,16 @@ fn re_resolution_reports_drift_instead_of_changing_bindings() {
         .expect_err("the catalogue changed");
     match error {
         LockError::Drift { differences } => {
-            assert!(differences
-                .iter()
-                .any(|drift| matches!(drift, capability::lock::Drift::Catalogue { .. })));
-            assert!(differences
-                .iter()
-                .any(|drift| matches!(drift, capability::lock::Drift::Binding { .. })));
+            assert!(
+                differences
+                    .iter()
+                    .any(|drift| matches!(drift, capability::lock::Drift::Catalogue { .. }))
+            );
+            assert!(
+                differences
+                    .iter()
+                    .any(|drift| matches!(drift, capability::lock::Drift::Binding { .. }))
+            );
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -307,9 +313,11 @@ fn a_peer_catalogue_change_is_drift() {
         .verify(&manifest, &local, &second, &scope)
         .expect_err("the peer catalogue changed");
     match error {
-        LockError::Drift { differences } => assert!(differences
-            .iter()
-            .any(|drift| matches!(drift, capability::lock::Drift::Peer { .. }))),
+        LockError::Drift { differences } => assert!(
+            differences
+                .iter()
+                .any(|drift| matches!(drift, capability::lock::Drift::Peer { .. }))
+        ),
         other => panic!("unexpected error: {other:?}"),
     }
 }
@@ -369,9 +377,11 @@ fn budgets_and_manifest_fingerprint_are_part_of_the_lock() {
         .verify(&other, &local, &[], &scope)
         .expect_err("a different manifest");
     match error {
-        LockError::Drift { differences } => assert!(differences
-            .iter()
-            .any(|drift| matches!(drift, capability::lock::Drift::Manifest { .. }))),
+        LockError::Drift { differences } => assert!(
+            differences
+                .iter()
+                .any(|drift| matches!(drift, capability::lock::Drift::Manifest { .. }))
+        ),
         other => panic!("unexpected error: {other:?}"),
     }
 }

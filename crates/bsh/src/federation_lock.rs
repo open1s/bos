@@ -106,7 +106,7 @@ impl NodeLocks {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_dirs, DataDirLock, NodeLocks};
+    use super::{DataDirLock, NodeLocks, lock_dirs};
     use std::path::{Path, PathBuf};
 
     fn scratch(label: &str) -> std::path::PathBuf {

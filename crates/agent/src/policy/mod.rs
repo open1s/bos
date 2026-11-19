@@ -80,14 +80,14 @@ pub mod set;
 /// The principal, the action and the target a decision is about.
 pub mod target;
 
-pub use audit::{AllowCounts, PolicyAudit, PolicyAuditEntry, DEFAULT_AUDIT_CAPACITY};
+pub use audit::{AllowCounts, DEFAULT_AUDIT_CAPACITY, PolicyAudit, PolicyAuditEntry};
 pub use baseline::{
     BASELINE_POLICY_REGO, PRESET_EGRESS_REGO, PRESET_PERMISSION_REGO, SESSION_PERMISSION_REGO,
 };
-pub use scope::{is_glob, preset_scope_source, validate_scope_entry, PRESET_SCOPE_REGO};
+pub use scope::{PRESET_SCOPE_REGO, is_glob, preset_scope_source, validate_scope_entry};
 pub use set::{
-    builtin_policy_ids, PolicyData, PolicyError, PolicyModuleInfo, PolicyOrigin, PolicySet,
-    PolicySource,
+    PolicyData, PolicyError, PolicyModuleInfo, PolicyOrigin, PolicySet, PolicySource,
+    builtin_policy_ids,
 };
 
 /// The shipped baseline under its stable built-in id.
@@ -112,7 +112,7 @@ pub fn preset_permission_source() -> PolicySource {
 pub use egress::{
     EgressDenial, EgressError, EgressGate, EgressRuleSet, PolicyResolver, Resolver, SystemResolver,
 };
-pub use fetch::{fetch, http_host, join, FetchError, FetchLimits, FetchedPage};
+pub use fetch::{FetchError, FetchLimits, FetchedPage, fetch, http_host, join};
 pub use target::{Action, Decision, PolicyInput, Target};
 
 #[cfg(test)]

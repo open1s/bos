@@ -20,7 +20,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures::Stream;
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::action::{ResourceAction, ResourceEvent, ResourceOutput};
 use crate::error::{ResourceError, Result};

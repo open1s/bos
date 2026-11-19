@@ -7,7 +7,7 @@ use similar::{ChangeTag, TextDiff};
 use tree_sitter::{Language, Node, Parser};
 
 use super::domain::{Change, DiffLine, FileDiff, ResourceFamily, SnapshotState, StructuralNode};
-use super::store::{snapshot_text, ReviewStore};
+use super::store::{ReviewStore, snapshot_text};
 
 /// The most text this module will diff in one change.
 const MAX_DIFF_TEXT: usize = 4 * 1024 * 1024;
@@ -691,10 +691,11 @@ mod tests {
         let diff = build(&store, &change);
         assert_eq!(diff.added, 1);
         assert_eq!(diff.removed, 1);
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.mark == "+" && line.text == "c"));
+        assert!(
+            diff.lines
+                .iter()
+                .any(|line| line.mark == "+" && line.text == "c")
+        );
     }
 
     #[test]
@@ -721,10 +722,11 @@ mod tests {
             "fn keep() {}\nfn changed(a: i32, b: i32) {}\n",
         );
         let diff = build(&store, &change);
-        assert!(diff
-            .structural
-            .iter()
-            .any(|node| node.qualified_name == "changed" && node.change == "modified"));
+        assert!(
+            diff.structural
+                .iter()
+                .any(|node| node.qualified_name == "changed" && node.change == "modified")
+        );
     }
 
     #[test]
@@ -758,10 +760,11 @@ mod tests {
             "{\"a\":1,\"b\":3}",
         );
         let diff = build(&store, &change);
-        assert!(diff
-            .structural
-            .iter()
-            .any(|node| node.qualified_name == "b" && node.change == "modified"));
+        assert!(
+            diff.structural
+                .iter()
+                .any(|node| node.qualified_name == "b" && node.change == "modified")
+        );
     }
 
     #[test]

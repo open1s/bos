@@ -14,9 +14,9 @@ pub use deepseek::{DeepSeekVendor, DeepSeekVendorBuilder};
 pub use nvidia::NvidiaVendor;
 pub use openai::{OpenAiClient, OpenAiVendor, OpenAiVendorBuilder, ReasoningReplay};
 pub use openaicompatible::{
-    sse_has_done_signal, ChatCompletionChunk, ChatCompletionResponse, ChatMessage, Choice,
-    ChunkChoice, Delta, FunctionCall, FunctionCallDelta, LogProbContent, LogProbs, OpenAIExtractor,
-    PendingToolCall, StreamToolCallAccumulator, ToolCall, ToolCallDelta, Usage,
+    ChatCompletionChunk, ChatCompletionResponse, ChatMessage, Choice, ChunkChoice, Delta,
+    FunctionCall, FunctionCallDelta, LogProbContent, LogProbs, OpenAIExtractor, PendingToolCall,
+    StreamToolCallAccumulator, ToolCall, ToolCallDelta, Usage, sse_has_done_signal,
 };
 pub use openrouter::OpenRouterVendor;
 pub use responses::{
@@ -25,7 +25,7 @@ pub use responses::{
     ResponsesStreamEvent, ResponsesTransport, ResponsesUsage,
 };
 pub use router::LlmRouter;
-pub use tap::{set_http_tap, HttpExchange, HttpTap};
+pub use tap::{HttpExchange, HttpTap, set_http_tap};
 
 use std::time::Duration;
 

@@ -647,10 +647,12 @@ mod tests {
             .unwrap();
         assert_eq!(committed.provenance.session.as_deref(), Some("s1"));
         assert_eq!(committed.provenance.turn.as_deref(), Some("t1"));
-        assert!(committed
-            .provenance
-            .evidence
-            .iter()
-            .any(|e| e == "turn:s1/t1"));
+        assert!(
+            committed
+                .provenance
+                .evidence
+                .iter()
+                .any(|e| e == "turn:s1/t1")
+        );
     }
 }

@@ -1,6 +1,6 @@
 use qserde::{
-    decode, encode, from_bytes, load, snapshot, to_bytes, Archived, Deserialize, DeserializeExt,
-    Serialize,
+    Archived, Deserialize, DeserializeExt, Serialize, decode, encode, from_bytes, load, snapshot,
+    to_bytes,
 };
 
 #[qserde::Archive]

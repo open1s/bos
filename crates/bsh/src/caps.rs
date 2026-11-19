@@ -2136,7 +2136,7 @@ pub(crate) fn plan_for_registry(
     agent: &Agent,
 ) -> Result<agent::capability::composition::ResolvedComposition, String> {
     use agent::capability::composition::{
-        resolve_host, CapabilityRequirement, CompositionSpec, LocalScope,
+        CapabilityRequirement, CompositionSpec, LocalScope, resolve_host,
     };
     use agent::capability::id::WorkspaceId;
     use semver::{Version, VersionReq};
@@ -3445,12 +3445,8 @@ fn attach_subagent_message_tool(agent: &mut Agent, context: Arc<SubagentContext>
                         "subagent run '{id}' is already running a turn and refused the queue; read it with subagent_result"
                     )));
                 }
-                let handle = tokio::spawn(continue_child(
-                    context.clone(),
-                    id.clone(),
-                    child,
-                    message,
-                ));
+                let handle =
+                    tokio::spawn(continue_child(context.clone(), id.clone(), child, message));
                 context.registry.set_handle(&id, handle.abort_handle());
                 Ok(serde_json::json!({
                     "subagent_id": id,
@@ -4894,7 +4890,9 @@ pub(crate) fn grep_tool(
             // the default 50 and push the match itself out of the result.
             let limit = match arg_positive(args, "limit")? {
                 Some(limit) => limit,
-                None if context > 0 => (context.saturating_mul(2) + 1).min(crate::grep::MAX_RESULTS),
+                None if context > 0 => {
+                    (context.saturating_mul(2) + 1).min(crate::grep::MAX_RESULTS)
+                }
                 None => crate::grep::DEFAULT_RESULTS,
             };
             if limit > crate::grep::MAX_RESULTS {
@@ -5184,7 +5182,10 @@ pub(crate) fn read_files_tool(
             }
             {
                 let mut seen = HashSet::with_capacity(targets.len());
-                for target in targets.iter().filter_map(|(_, target)| target.as_ref().ok()) {
+                for target in targets
+                    .iter()
+                    .filter_map(|(_, target)| target.as_ref().ok())
+                {
                     if !seen.insert(target.clone()) {
                         return Err(ToolError::InvalidInput(format!(
                             "duplicate target path in read_files: {}",
@@ -5240,11 +5241,9 @@ pub(crate) fn read_files_tool(
 
                     let read = match (offset, limit) {
                         (None, None) => read_whole(&target)?,
-                        (offset, limit) => read_window(
-                            &target,
-                            offset.unwrap_or(1),
-                            limit.unwrap_or(usize::MAX),
-                        )?,
+                        (offset, limit) => {
+                            read_window(&target, offset.unwrap_or(1), limit.unwrap_or(usize::MAX))?
+                        }
                     };
                     let ReadOutcome {
                         content,
@@ -5270,9 +5269,7 @@ pub(crate) fn read_files_tool(
                     let end_line = if returned_lines == 0 {
                         start_line.saturating_sub(1)
                     } else {
-                        start_line
-                            .saturating_add(returned_lines)
-                            .saturating_sub(1)
+                        start_line.saturating_add(returned_lines).saturating_sub(1)
                     };
                     let bytes = returned.len();
                     remaining -= bytes;
@@ -5299,9 +5296,8 @@ pub(crate) fn read_files_tool(
                         file_result["next"] = serde_json::json!({ "offset": next_offset });
                     }
                     if past_end {
-                        file_result["hint"] = serde_json::json!(format!(
-                            "offset {start_line} is past the last line"
-                        ));
+                        file_result["hint"] =
+                            serde_json::json!(format!("offset {start_line} is past the last line"));
                     }
                     Ok(file_result)
                 })();
@@ -5436,13 +5432,11 @@ fn apply_patch_tool(
                     .get("path")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| {
-                        ToolError::InvalidInput(
-                            "every change requires a string path".to_string(),
-                        )
+                        ToolError::InvalidInput("every change requires a string path".to_string())
                     })?;
                 input_bytes = input_bytes.saturating_add(raw.len());
-                let target = resolve_path(root.as_deref(), raw, enforce)
-                    .map_err(ToolError::InvalidInput)?;
+                let target =
+                    resolve_path(root.as_deref(), raw, enforce).map_err(ToolError::InvalidInput)?;
                 if !seen_targets.insert(target.clone()) {
                     return Err(ToolError::InvalidInput(format!(
                         "duplicate target path in apply_patch: {}",
@@ -5462,9 +5456,7 @@ fn apply_patch_tool(
                 let edits = change
                     .get("edits")
                     .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| {
-                        ToolError::InvalidInput("edits must be an array".to_string())
-                    })?;
+                    .ok_or_else(|| ToolError::InvalidInput("edits must be an array".to_string()))?;
                 if edits.is_empty() || edits.len() > MAX_PATCH_EDITS {
                     return Err(ToolError::InvalidInput(format!(
                         "edits must contain between 1 and {MAX_PATCH_EDITS} operations per file"
@@ -5475,17 +5467,13 @@ fn apply_patch_tool(
                         .get("old_string")
                         .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| {
-                            ToolError::InvalidInput(
-                                "each edit requires old_string".to_string(),
-                            )
+                            ToolError::InvalidInput("each edit requires old_string".to_string())
                         })?;
                     let new = edit
                         .get("new_string")
                         .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| {
-                            ToolError::InvalidInput(
-                                "each edit requires new_string".to_string(),
-                            )
+                            ToolError::InvalidInput("each edit requires new_string".to_string())
                         })?;
                     if old.is_empty() || old == new {
                         return Err(ToolError::InvalidInput(
@@ -5567,12 +5555,7 @@ fn apply_patch_tool(
                     if !unchanged {
                         write_bytes(&target, content.as_bytes())?;
                         if let Some(runtime) = &review {
-                            runtime.record(
-                                &target,
-                                ChangeOperation::Patch,
-                                before,
-                                "apply_patch",
-                            );
+                            runtime.record(&target, ChangeOperation::Patch, before, "apply_patch");
                         }
                         changed_files += 1;
                     }
@@ -5700,12 +5683,7 @@ fn write_file_tool(
                 },
                 "bytes": outcome.bytes,
             });
-            crate::file_result::finish(
-                &mut result,
-                "write_file",
-                crate::file_result::OK,
-                None,
-            );
+            crate::file_result::finish(&mut result, "write_file", crate::file_result::OK, None);
             Ok(result)
         },
     )
@@ -5823,12 +5801,7 @@ fn edit_file_tool(
                     "the diff was truncated; read the file with read_file for the rest"
                 );
             }
-            crate::file_result::finish(
-                &mut result,
-                "edit_file",
-                crate::file_result::OK,
-                None,
-            );
+            crate::file_result::finish(&mut result, "edit_file", crate::file_result::OK, None);
             Ok(result)
         },
     )
@@ -5959,12 +5932,11 @@ fn sed_tool(
                 line_length,
                 backup: backup.as_deref(),
             };
-            let outcome = crate::sed::apply(&target, &request, dry_run).map_err(|error| {
-                match error {
+            let outcome =
+                crate::sed::apply(&target, &request, dry_run).map_err(|error| match error {
                     crate::sed::Error::Refused(message) => ToolError::InvalidInput(message),
                     crate::sed::Error::Failed(message) => ToolError::Failed(message),
-                }
-            })?;
+                })?;
             if !dry_run && outcome.changed {
                 if let Some(runtime) = &review {
                     runtime.record(&target, ChangeOperation::Edit, before, "sed");
@@ -5989,11 +5961,8 @@ fn sed_tool(
                     Some(content) => serde_json::Value::String(content),
                     None => serde_json::Value::Null,
                 };
-                result["content_kind"] = serde_json::json!(if outcome.binary {
-                    "binary"
-                } else {
-                    "text"
-                });
+                result["content_kind"] =
+                    serde_json::json!(if outcome.binary { "binary" } else { "text" });
                 result["content_status"] = serde_json::json!(if outcome.truncated {
                     "truncated"
                 } else {
@@ -6612,16 +6581,16 @@ fn open_memory(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_messages, allows_writes, build_agent, check_spawn, compactable_span,
-        egress_allowlist_path, is_confined, offers_local_web_search, plugin_provider_node,
-        read_egress_rules, refresh_plugin_providers, sandbox_spec_for, surfaced_capabilities,
-        tool_gates_for, web_search_config, with_bridge_pool, workspace_tool_scope, write_file_tool,
-        BuiltAgent, WorkspaceEgress, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, MAX_BATCH_READ_BYTES,
-        READ_ONLY, WORKSPACE_WRITE,
+        BuiltAgent, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, MAX_BATCH_READ_BYTES, READ_ONLY,
+        WORKSPACE_WRITE, WorkspaceEgress, agent_messages, allows_writes, build_agent, check_spawn,
+        compactable_span, egress_allowlist_path, is_confined, offers_local_web_search,
+        plugin_provider_node, read_egress_rules, refresh_plugin_providers, sandbox_spec_for,
+        surfaced_capabilities, tool_gates_for, web_search_config, with_bridge_pool,
+        workspace_tool_scope, write_file_tool,
     };
+    use crate::settings::Settings;
     use crate::settings::global::{ModelEntry, Preset};
     use crate::settings::resolve::SessionChoice;
-    use crate::settings::Settings;
     use crate::vault::Vault;
     use agent::policy::{Action, EgressRuleSet, PolicyData, PolicyInput, PolicySet, Target};
     use agent::tools::Tool as _;
@@ -7150,10 +7119,12 @@ mod tests {
             !built.extension_activations.is_empty(),
             "the production build retains the package Fiber handle"
         );
-        assert!(built
-            .extension_activations
-            .iter()
-            .all(|activation| activation.state() == ferris_sdk::composable::FiberState::Active));
+        assert!(
+            built
+                .extension_activations
+                .iter()
+                .all(|activation| activation.state() == ferris_sdk::composable::FiberState::Active)
+        );
 
         // The path-installed package above is served by the legacy DSH shim,
         // whose synchronous tool carries no gate. The Fiber-owned gate belongs
@@ -7670,8 +7641,8 @@ mod tests {
         };
         use async_trait::async_trait;
         use federation::{FederationNode, InMemoryNetwork, NodeIdentity, PeerStore};
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct Echo {
             descriptor: CapabilityDescriptor,
@@ -8093,11 +8064,13 @@ mod tests {
         assert!(crate::settings::global::ships_preset("ptc"));
         let built = build(&settings);
         assert!(built.agent.config().parallel_tool_calls);
-        assert!(built
-            .agent
-            .config()
-            .system_prompt
-            .contains(crate::prompts::FEDERATION_PERSONA));
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(crate::prompts::FEDERATION_PERSONA)
+        );
     }
 
     /// Standard keeps the federation queries but not distributed delegation;
@@ -8607,11 +8580,13 @@ mod tests {
             built.agent.config().persona_complete,
             "the workspace owns the persona here"
         );
-        assert!(built
-            .agent
-            .config()
-            .system_prompt
-            .starts_with("workspace persona"));
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .starts_with("workspace persona")
+        );
 
         settings.global.presets.insert(
             "slot".to_string(),
@@ -8627,11 +8602,13 @@ mod tests {
             !built.agent.config().persona_complete,
             "the preset owns the flag, and it says off"
         );
-        assert!(built
-            .agent
-            .config()
-            .system_prompt
-            .contains(agent::HARNESS_IDENTITY));
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .contains(agent::HARNESS_IDENTITY)
+        );
 
         // The same preset with no persona: the workspace arm is back.
         settings
@@ -8642,11 +8619,13 @@ mod tests {
             .system_prompt = None;
         let built = build(&settings);
         assert!(built.agent.config().persona_complete);
-        assert!(built
-            .agent
-            .config()
-            .system_prompt
-            .starts_with("workspace persona"));
+        assert!(
+            built
+                .agent
+                .config()
+                .system_prompt
+                .starts_with("workspace persona")
+        );
 
         // A BLANK preset persona is no persona: it must not blank the
         // workspace prompt or steal the flag.
@@ -9457,10 +9436,11 @@ mod tests {
     #[test]
     fn a_disabled_plugin_contributes_no_tools() {
         let on = build(&bare());
-        assert!(on
-            .plugins
-            .iter()
-            .any(|plugin| plugin.enabled && plugin.tools.iter().any(|tool| tool == "bash")));
+        assert!(
+            on.plugins
+                .iter()
+                .any(|plugin| plugin.enabled && plugin.tools.iter().any(|tool| tool == "bash"))
+        );
 
         let mut off_tree = bare();
         off_tree.workspace.disabled.extensions = vec!["shell".to_string()];
@@ -9503,12 +9483,11 @@ mod tests {
             snapshot.changeset.changes[0].kind,
             crate::review::domain::ChangeKind::Created
         );
-        assert!(snapshot.changeset.changes[0]
-            .revisions
-            .last()
-            .is_some_and(
+        assert!(
+            snapshot.changeset.changes[0].revisions.last().is_some_and(
                 |revision| revision.before == crate::review::domain::SnapshotState::Absent
-            ));
+            )
+        );
     }
 
     /// A scratch directory no other test shares.
@@ -11573,9 +11552,11 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             serde_json::json!((0..11).map(|_| "a").collect::<Vec<_>>()),
             serde_json::json!(["a", "a"]),
         ] {
-            assert!(registry
-                .execute("read_files", &serde_json::json!({"paths": paths}))
-                .is_err());
+            assert!(
+                registry
+                    .execute("read_files", &serde_json::json!({"paths": paths}))
+                    .is_err()
+            );
         }
     }
 

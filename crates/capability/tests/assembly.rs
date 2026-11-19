@@ -113,10 +113,12 @@ fn selection_is_deterministic_and_explains_every_binding() {
     assert_eq!(first.fingerprint, second.fingerprint);
     assert!(!first.rationale.is_empty());
     assert_eq!(first.selected().len(), 2);
-    assert!(first
-        .selected()
-        .iter()
-        .all(|candidate| candidate.binding.is_some()));
+    assert!(
+        first
+            .selected()
+            .iter()
+            .all(|candidate| candidate.binding.is_some())
+    );
     let remote = first
         .selected()
         .into_iter()
@@ -210,7 +212,9 @@ fn an_unavailable_required_peer_fails_but_an_optional_one_is_skipped() {
     let policy = policy(&["builtin/build"], Risk::Medium, true);
 
     let required = request(
-        vec![requirement("builtin/build", "^1").with_remote(RemotePolicy::Required(node("node-b")))],
+        vec![
+            requirement("builtin/build", "^1").with_remote(RemotePolicy::Required(node("node-b"))),
+        ],
         vec![build_peer()],
     );
     assert!(matches!(
@@ -221,17 +225,21 @@ fn an_unavailable_required_peer_fails_but_an_optional_one_is_skipped() {
     ));
 
     let optional = request(
-        vec![requirement("builtin/build", "^1")
-            .with_remote(RemotePolicy::Allowed)
-            .with_required(false)],
+        vec![
+            requirement("builtin/build", "^1")
+                .with_remote(RemotePolicy::Allowed)
+                .with_required(false),
+        ],
         vec![build_peer()],
     );
     let proposal = engine.assemble(&optional, &policy).expect("optional skips");
     assert!(proposal.selected().is_empty());
-    assert!(proposal
-        .rationale
-        .iter()
-        .any(|line| line.contains("no provider")));
+    assert!(
+        proposal
+            .rationale
+            .iter()
+            .any(|line| line.contains("no provider"))
+    );
 }
 
 struct CountingProvider {

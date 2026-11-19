@@ -4,8 +4,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use tree_sitter::Tree;
 
-use crate::classification::LanguageId;
 use crate::WorkspaceId;
+use crate::classification::LanguageId;
 
 /// Native Tree-sitter parse coverage for one source snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -359,10 +359,11 @@ impl BashTool {
         // Same attribution as the foreground result: a bare "none" is never
         // left unexplained, whether a preset or the permission released it.
         if backend == "none" {
-            answer["sandbox_reason"] = serde_json::json!(self
-                .sandbox_reason
-                .as_deref()
-                .unwrap_or(SANDBOX_RELEASED_REASON));
+            answer["sandbox_reason"] = serde_json::json!(
+                self.sandbox_reason
+                    .as_deref()
+                    .unwrap_or(SANDBOX_RELEASED_REASON)
+            );
         }
         Ok(answer)
     }
@@ -1493,9 +1494,11 @@ mod tests {
     fn the_write_scan_finds_obvious_targets() {
         let root = std::path::Path::new("/workspace");
         let targets = write_targets("echo hi > /tmp/out.txt", root);
-        assert!(targets
-            .iter()
-            .any(|path| path == std::path::Path::new("/tmp/out.txt")));
+        assert!(
+            targets
+                .iter()
+                .any(|path| path == std::path::Path::new("/tmp/out.txt"))
+        );
         assert!(write_targets("true 2>/dev/null", root).is_empty());
         let relative = write_targets("touch src/new.rs", root);
         assert_eq!(

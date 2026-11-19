@@ -25,7 +25,7 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::*;
 
-use super::{icon, IconName};
+use super::{IconName, icon};
 use crate::reference::{self, FileRef};
 use crate::theme;
 

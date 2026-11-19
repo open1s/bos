@@ -8,8 +8,8 @@
 //! not a silent no-op.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -22,7 +22,7 @@ use crate::plugins::PluginInfo;
 use agent::agent::ConditionalPrompt;
 use ferris_sdk::capability::{CallScope, Capability, PolicyEngine};
 use ferris_sdk::composable::Fiber;
-use ferris_sdk::events::{topics, EventBus, ExtensionEvent};
+use ferris_sdk::events::{EventBus, ExtensionEvent, topics};
 use ferris_sdk::host_runtime::{CallContext, Runtime, ToolDescriptor};
 use ferris_sdk::types::{ExtensionError, ExtensionId, TrustLevel};
 
@@ -1699,10 +1699,12 @@ mod tests {
         assert_eq!(records[0].version, "0.0.0");
         assert_eq!(records[0].kind, "prompt");
         assert!(records[0].triggers.iter().any(|term| term == "devkit"));
-        assert!(records[0]
-            .commands
-            .iter()
-            .any(|command| command == "tool__scaffold"));
+        assert!(
+            records[0]
+                .commands
+                .iter()
+                .any(|command| command == "tool__scaffold")
+        );
 
         // An upgraded install replaces the old record instead of stacking it.
         let mut upgraded = contributed.clone();
@@ -2310,13 +2312,17 @@ mod metadata_tests {
 
         assert!(metadata.version.is_none(), "a package versions as a whole");
         assert_eq!(metadata.risk.as_deref(), Some("medium"));
-        assert!(metadata
-            .side_effects
-            .iter()
-            .any(|effect| effect == "extension"));
-        assert!(metadata
-            .permissions
-            .iter()
-            .any(|scope| scope == "extension.call"));
+        assert!(
+            metadata
+                .side_effects
+                .iter()
+                .any(|effect| effect == "extension")
+        );
+        assert!(
+            metadata
+                .permissions
+                .iter()
+                .any(|scope| scope == "extension.call")
+        );
     }
 }

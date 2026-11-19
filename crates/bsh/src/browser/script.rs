@@ -6,8 +6,8 @@
 //! clock on the UI thread. A tool posts a command and blocks on its reply,
 //! which keeps the tools' synchronous shape without moving the view.
 
-use std::sync::mpsc::Sender;
 use std::sync::Mutex;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 /// How long a tool waits for the view to answer one command.

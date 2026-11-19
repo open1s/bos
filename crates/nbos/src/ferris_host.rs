@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use pyo3::prelude::*;
 
-use crate::ferris::{call_python, PyForeignExtension};
+use crate::ferris::{PyForeignExtension, call_python};
 use crate::utils::{json_to_py, py_to_json};
 use ferris_bindings::{
-    event_runtime, parse_capability, parse_policy_mode, parse_scope, parse_trust,
     AppliedContributions, BindingHostSpec, BindingRuntimeOptions, BindingRuntimeResolver,
-    ContributionCallback, HostContributionSink, NoopLeaseHost, ShellTerminal,
+    ContributionCallback, HostContributionSink, NoopLeaseHost, ShellTerminal, event_runtime,
+    parse_capability, parse_policy_mode, parse_scope, parse_trust,
 };
 use ferris_sdk::capability::PolicyEngine;
 use ferris_sdk::events::{EventBus, EventFilter};
@@ -177,10 +177,12 @@ impl PyFerrisHost {
     /// Installed id/version pairs.
     fn installed(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let entries = self.manager.installed().map_err(host_error)?;
-        let value = serde_json::json!(entries
-            .iter()
-            .map(|entry| serde_json::json!({ "id": entry.id, "version": entry.version }))
-            .collect::<Vec<_>>());
+        let value = serde_json::json!(
+            entries
+                .iter()
+                .map(|entry| serde_json::json!({ "id": entry.id, "version": entry.version }))
+                .collect::<Vec<_>>()
+        );
         json_to_py(py, &value)
     }
 

@@ -43,8 +43,8 @@ pub use contract::{
     SurfaceContract, SurfaceLimitsSpec,
 };
 pub use document::{
-    ActionBinding, ActionMode, DispatchPrincipal, HiddenAction, SurfaceDocument,
-    SURFACE_SCHEMA_VERSION,
+    ActionBinding, ActionMode, DispatchPrincipal, HiddenAction, SURFACE_SCHEMA_VERSION,
+    SurfaceDocument,
 };
 pub use engine::{
     ActionCall, InstanceState, SurfaceDisposalReport, SurfaceEngine, SurfaceEvent, SurfaceInstance,
@@ -53,8 +53,8 @@ pub use frame::{PatchOp, SurfaceFrame};
 pub use node::{Overflow, Sizing, SurfaceNode, SurfaceTab};
 pub use runtime::{SurfaceProvider, SurfaceRequest};
 pub use wire::{
-    decode, decode_with, encode, encode_with, SurfaceAction, SurfaceEnvelope, SurfaceMessage,
-    WireLimits, MAX_WIRE_BYTES, SURFACE_WIRE_VERSION,
+    MAX_WIRE_BYTES, SURFACE_WIRE_VERSION, SurfaceAction, SurfaceEnvelope, SurfaceMessage,
+    WireLimits, decode, decode_with, encode, encode_with,
 };
 
 /// The contract family every surface answers.

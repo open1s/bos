@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use capability::transport::{unix_ms, FederationTransport, PeerSession};
+use capability::transport::{FederationTransport, PeerSession, unix_ms};
 use capability::{CapabilityError, DeliveryState, NodeId};
 use tokio::sync::mpsc;
 

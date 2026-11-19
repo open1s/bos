@@ -186,7 +186,7 @@ pub fn user_environment() -> EnvMap {
 #[cfg(windows)]
 fn windows_user_environment() -> Option<Vec<(OsString, OsString)>> {
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegEnumValueW, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_READ,
+        HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegEnumValueW, RegOpenKeyExW,
     };
 
     let subkey: Vec<u16> = "Environment"

@@ -18,8 +18,8 @@ use react::llm::{
     TokenStream,
 };
 use react::runtime::ReActApp;
-use react::tool::registry::{AsyncTool, ToolVariant};
 use react::tool::ToolError;
+use react::tool::registry::{AsyncTool, ToolVariant};
 
 /// How long each tool in the batch waits.
 const TOOL_MILLIS: u64 = 400;
@@ -288,8 +288,8 @@ fn many_call_response(count: usize) -> LlmResponse {
 fn a_large_batch_is_bounded_and_keeps_the_models_order() {
     use react::engine::TOOL_BATCH_CONCURRENCY;
     use react::llm::ReactSession;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let current = Arc::new(AtomicUsize::new(0));

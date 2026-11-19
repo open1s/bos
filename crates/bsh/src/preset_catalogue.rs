@@ -15,7 +15,7 @@
 //! workspace.
 
 use super::settings::global::{
-    GlobalSettings, PolicyMode, Preset, SandboxChoice, MAX_PRESET_LEVEL,
+    GlobalSettings, MAX_PRESET_LEVEL, PolicyMode, Preset, SandboxChoice,
 };
 use agent::policy::PolicySet;
 
@@ -459,7 +459,7 @@ pub(crate) fn widening_facts(current: Option<&Preset>, target: &Preset) -> Vec<R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::global::{built_in_preset, PolicyMode};
+    use crate::settings::global::{PolicyMode, built_in_preset};
 
     fn shipped(id: &str) -> Preset {
         built_in_preset(id).expect("a shipped preset")

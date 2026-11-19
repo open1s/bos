@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use super::*;
@@ -117,9 +117,11 @@ fn the_session_permission_module_follows_the_effective_level() {
         "workspace-write keeps the baseline's in-workspace write"
     );
     // An unknown level fails closed: it is generated as read-only.
-    assert!(session_permission_source("typo")
-        .rego
-        .contains("session_permission := \"read-only\""));
+    assert!(
+        session_permission_source("typo")
+            .rego
+            .contains("session_permission := \"read-only\"")
+    );
     // The raw template fails closed too: a consumer that forgets to run the
     // generator gets the read-only arm, not an allow-all module.
     let raw = PolicySet::compile(
@@ -223,9 +225,10 @@ fn an_empty_workspace_root_has_no_inside() {
     let set = PolicySet::compile_baseline(PolicyData::new(""));
     let path = std::path::Path::new("/tmp/anything");
     assert!(set.check(&ask("read_file", Action::Read, path)).is_denied());
-    assert!(set
-        .check(&ask("write_file", Action::Write, path))
-        .is_denied());
+    assert!(
+        set.check(&ask("write_file", Action::Write, path))
+            .is_denied()
+    );
 }
 
 #[test]
@@ -588,9 +591,10 @@ verdict := {"allow": false, "rule": "preset-deny-secrets", "reason": "secrets ar
     assert!(narrowed.is_denied(), "{narrowed:?}");
     assert_eq!(narrowed.rule.as_deref(), Some("preset-deny-secrets"));
     let ordinary = dir.path().join("notes.txt");
-    assert!(set
-        .check(&ask("read_file", Action::Read, &ordinary))
-        .is_allowed());
+    assert!(
+        set.check(&ask("read_file", Action::Read, &ordinary))
+            .is_allowed()
+    );
 }
 
 #[test]
@@ -649,9 +653,10 @@ fn a_denial_is_recorded_with_its_rule_and_allows_only_move_counters() {
     }
     let inside = dir.path().join("allowed.txt");
     for _ in 0..3 {
-        assert!(set
-            .check(&ask("read_file", Action::Read, &inside))
-            .is_allowed());
+        assert!(
+            set.check(&ask("read_file", Action::Read, &inside))
+                .is_allowed()
+        );
     }
 
     let denials = set.denials();

@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::catalogue::Catalogue;
 use crate::composition::{
-    resolve_host, Binding, Budgets, CapabilityRequirement, CompositionError, CompositionId,
-    CompositionSpec, GrantRef, LocalScope, PeerCatalogue, ResolvedComposition,
+    Binding, Budgets, CapabilityRequirement, CompositionError, CompositionId, CompositionSpec,
+    GrantRef, LocalScope, PeerCatalogue, ResolvedComposition, resolve_host,
 };
 use crate::id::{CapabilityId, NodeId, WorkspaceId};
 

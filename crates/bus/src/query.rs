@@ -1,16 +1,16 @@
 //! Zenoh query wrapper with simplified API
 
 use rkyv::{
-    rancor::{Error, Strategy},
-    ser::{allocator::ArenaHandle, sharing::Share, Serializer},
-    util::AlignedVec,
     Archive, Serialize,
+    rancor::{Error, Strategy},
+    ser::{Serializer, allocator::ArenaHandle, sharing::Share},
+    util::AlignedVec,
 };
 use std::sync::Arc;
-use zenoh::query::ConsolidationMode;
 use zenoh::Session;
+use zenoh::query::ConsolidationMode;
 
-use crate::{error::ZenohError, DEFAULT_CODEC};
+use crate::{DEFAULT_CODEC, error::ZenohError};
 
 /// Type alias for backward compatibility
 pub type QueryWrapper = Query;

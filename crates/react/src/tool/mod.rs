@@ -12,7 +12,7 @@ pub mod metadata;
 pub mod registry;
 
 pub use admission::{
-    admit, Admission, AdmissionPolicy, WithheldReason, WithheldTool, DEFAULT_DISCOVERY_RESERVE,
+    Admission, AdmissionPolicy, DEFAULT_DISCOVERY_RESERVE, WithheldReason, WithheldTool, admit,
 };
 pub use descriptor::{ToolDefinition, ToolFunction, ToolParameterProperty, ToolParameters};
 pub use error::ToolError;

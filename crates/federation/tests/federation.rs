@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use capability::transport::{unix_ms, FederationMessage, FederationTransport};
+use capability::transport::{FederationMessage, FederationTransport, unix_ms};
 use capability::{CapabilityError, DeliveryState};
 use federation::envelope::{EnvelopeError, PROTOCOL, SUPPORTED_SCHEMA_MAX, SUPPORTED_SCHEMA_MIN};
 use federation::{Envelope, InMemoryNetwork, NodeIdentity};

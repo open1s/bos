@@ -29,7 +29,7 @@ pub use registry::ToolRegistry;
 pub use translator::describe_schema;
 pub use validator::validate_args;
 
-pub use react::tool::registry::AsyncTool;
 pub use react::tool::Tool;
 pub use react::tool::ToolError;
 pub use react::tool::ToolMetadata;
+pub use react::tool::registry::AsyncTool;

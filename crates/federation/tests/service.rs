@@ -1,7 +1,7 @@
 //! Dual authorization: the caller's kernel and the provider's kernel both decide.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;

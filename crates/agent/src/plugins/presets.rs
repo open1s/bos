@@ -325,9 +325,11 @@ mod tests {
         };
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, "max_steps");
-        assert!(errors[0]
-            .message
-            .contains("expected a non-negative integer"));
+        assert!(
+            errors[0]
+                .message
+                .contains("expected a non-negative integer")
+        );
         assert!(errors[0].message.contains("string"));
     }
 

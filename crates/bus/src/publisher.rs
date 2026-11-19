@@ -1,13 +1,13 @@
 //! Zenoh publisher wrapper with simplified API
 
 use rkyv::{
-    rancor::{Error, Strategy},
-    ser::{allocator::ArenaHandle, sharing::Share, Serializer},
-    util::AlignedVec,
     Archive, Serialize,
+    rancor::{Error, Strategy},
+    ser::{Serializer, allocator::ArenaHandle, sharing::Share},
+    util::AlignedVec,
 };
 
-use crate::{error::ZenohError, Codec, Session};
+use crate::{Codec, Session, error::ZenohError};
 use std::sync::Arc;
 
 /// Publishes rkyv-encoded messages to a single topic.

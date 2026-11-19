@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use agent::tools::{AsyncFunctionTool, DeclaredAsyncTool};
 use agent::{Agent, ToolError};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::extension::runs::{Limits, RunSpec, RunState, RunTier, Runs};
 use crate::extension::tasks::{
@@ -2688,8 +2688,8 @@ fn state_name(state: RunState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     use crate::extension::runs::{RunHandle, RunSnapshot, RunsService};
@@ -2875,10 +2875,12 @@ mod tests {
         .await
         .expect_err("peer contract refused");
         assert!(format!("{peer:?}").contains("peer-owned"), "{peer:?}");
-        assert!(FileTasksStore
-            .list(&context.workspace)
-            .expect("list")
-            .is_empty());
+        assert!(
+            FileTasksStore
+                .list(&context.workspace)
+                .expect("list")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -3041,10 +3043,12 @@ mod tests {
             .await
             .expect_err("no service");
         assert!(format!("{error:?}").contains("no host.runs service"));
-        assert!(FileTasksStore
-            .list(&context.workspace)
-            .expect("list")
-            .is_empty());
+        assert!(
+            FileTasksStore
+                .list(&context.workspace)
+                .expect("list")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -3117,24 +3121,30 @@ mod tests {
     #[tokio::test]
     async fn create_refuses_a_bad_trigger() {
         let context = context("bad-trigger");
-        assert!(create_with(
-            &Runs::empty(),
-            &context,
-            &json!({"intent": "x", "trigger": {"every_seconds": 5}})
-        )
-        .await
-        .is_err());
-        assert!(create_with(
-            &Runs::empty(),
-            &context,
-            &json!({"intent": "x", "trigger": {}})
-        )
-        .await
-        .is_err());
-        assert!(FileTasksStore
-            .list(&context.workspace)
-            .expect("list")
-            .is_empty());
+        assert!(
+            create_with(
+                &Runs::empty(),
+                &context,
+                &json!({"intent": "x", "trigger": {"every_seconds": 5}})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            create_with(
+                &Runs::empty(),
+                &context,
+                &json!({"intent": "x", "trigger": {}})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            FileTasksStore
+                .list(&context.workspace)
+                .expect("list")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -3151,10 +3161,12 @@ mod tests {
         .await
         .expect_err("no subagent context");
         assert!(format!("{error:?}").contains("subagents are not available"));
-        assert!(FileTasksStore
-            .list(&context.workspace)
-            .expect("list")
-            .is_empty());
+        assert!(
+            FileTasksStore
+                .list(&context.workspace)
+                .expect("list")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -3198,10 +3210,12 @@ mod tests {
         .expect_err("no node");
         assert!(format!("{no_node:?}").contains("federation node is not running"));
 
-        assert!(FileTasksStore
-            .list(&context.workspace)
-            .expect("list")
-            .is_empty());
+        assert!(
+            FileTasksStore
+                .list(&context.workspace)
+                .expect("list")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -3224,10 +3238,12 @@ mod tests {
         .await
         .expect_err("no federation node");
         assert!(format!("{error:?}").contains("federation node is not running"));
-        assert!(FileTasksStore
-            .list(&context.workspace)
-            .expect("list")
-            .is_empty());
+        assert!(
+            FileTasksStore
+                .list(&context.workspace)
+                .expect("list")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -3409,10 +3425,12 @@ mod tests {
         .await
         .expect_err("no trigger");
         assert!(format!("{no_trigger:?}").contains("needs a schedule"));
-        assert!(FileTasksStore
-            .list(&context.workspace)
-            .expect("list")
-            .is_empty());
+        assert!(
+            FileTasksStore
+                .list(&context.workspace)
+                .expect("list")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -3434,10 +3452,12 @@ mod tests {
         .await
         .expect_err("no node");
         assert!(format!("{error:?}").contains("federation node is not running"));
-        assert!(FileTasksStore
-            .list(&context.workspace)
-            .expect("list")
-            .is_empty());
+        assert!(
+            FileTasksStore
+                .list(&context.workspace)
+                .expect("list")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -3495,10 +3515,12 @@ mod tests {
         .await
         .expect_err("no shell tool");
         assert!(format!("{no_shell:?}").contains("shell tool is not available"));
-        assert!(FileTasksStore
-            .list(&context.workspace)
-            .expect("list")
-            .is_empty());
+        assert!(
+            FileTasksStore
+                .list(&context.workspace)
+                .expect("list")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&context.workspace);
     }
 
@@ -4123,8 +4145,8 @@ mod tests {
         // A command that overruns the controlled shell's deadline is stopped
         // by that runtime, not left running behind a timed-out await. This is
         // the same BashTool path normal task execution uses (issue #418).
-        use agent::tools::bash::BashToolConfig;
         use agent::Tool as _;
+        use agent::tools::bash::BashToolConfig;
         let bash = agent::tools::BashTool::new("bash")
             .with_config(BashToolConfig {
                 timeout_secs: 1,

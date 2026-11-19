@@ -1571,7 +1571,7 @@ impl PyAgent {
                 })?;
                 guard.as_callable_server(endpoint, session)
             }; // guard is dropped here
-               // Start the server
+            // Start the server
             if let Err(e) = server.start().await {
                 return Err(to_py_runtime_error(e));
             }

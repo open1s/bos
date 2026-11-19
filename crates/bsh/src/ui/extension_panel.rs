@@ -14,17 +14,17 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use gpui_kit::component::IndexPath;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
-use gpui_kit::component::IndexPath;
 use gpui_kit::*;
 
 use crate::extension::host::PanelSurface;
-use crate::i18n::{tr, tr_args, Lang};
+use crate::i18n::{Lang, tr, tr_args};
 use crate::theme;
 use ferris_sdk::host_runtime::CallContext;
 use ferris_sdk::types::ExtensionError;
@@ -33,7 +33,7 @@ use ferris_sdk::ui::{
     UiDocument, UiNode,
 };
 
-use super::{hairline_bottom, icon, txt, IconName};
+use super::{IconName, hairline_bottom, icon, txt};
 
 /// The host palette with a panel's theme tokens layered over it.
 struct Palette {
@@ -1678,11 +1678,7 @@ impl ExtensionPanelView {
             row = row.child(div().w(px(12.0)).flex_shrink_0());
         }
         let icon_name = node.icon.as_deref().unwrap_or(if has_children {
-            if is_open {
-                "folder-open"
-            } else {
-                "folder"
-            }
+            if is_open { "folder-open" } else { "folder" }
         } else {
             "file"
         });
@@ -1966,7 +1962,7 @@ impl Render for ExtensionPanelView {
 
 #[cfg(test)]
 mod tests {
-    use super::{live_surface, ExtensionPanelView, PanelItem};
+    use super::{ExtensionPanelView, PanelItem, live_surface};
     use crate::extension::host::PanelSurface;
     use crate::i18n::Lang;
     use crate::theme;
@@ -1976,8 +1972,8 @@ mod tests {
     use ferris_sdk::ui::{PanelLocation, ThemePalette, UiDocument};
     use gpui_kit::component::searchable_list::SearchableListItem;
     use serde_json::Value;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct Noop;
 
@@ -2190,17 +2186,19 @@ mod tests {
         view.live_failure("boom".to_string());
         assert!(view.document.is_some());
         assert!(view.error.is_none());
-        assert!(view
-            .message
-            .as_deref()
-            .is_some_and(|message| message.contains("boom")));
+        assert!(
+            view.message
+                .as_deref()
+                .is_some_and(|message| message.contains("boom"))
+        );
 
         let mut bare = ExtensionPanelView::new(vec![surface_with(Arc::new(Noop), None)], Lang::En);
         bare.live_failure("boom".to_string());
-        assert!(bare
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("boom")));
+        assert!(
+            bare.error
+                .as_deref()
+                .is_some_and(|error| error.contains("boom"))
+        );
     }
 
     /// A pane that outlived a host rebuild must ask the new runtime, not the
@@ -2264,8 +2262,8 @@ mod tests {
     // -------------------------------------------------------------------
 
     use gpui_kit::{
-        px, AppContext as _, Context, Entity, Focusable, IntoElement, Modifiers, Render,
-        TestAppContext, VisualTestContext, Window,
+        AppContext as _, Context, Entity, Focusable, IntoElement, Modifiers, Render,
+        TestAppContext, VisualTestContext, Window, px,
     };
 
     /// A runtime that records every tool call the panel dispatches.

@@ -22,9 +22,9 @@ use serde_json::Value;
 
 use super::declarative;
 use super::{
-    dedup_capabilities, manifest_error, manifest_string, read_json, resolve_package_path,
     Capability, CodexInterface, Extension, ExtensionDetails, ExtensionError, ExtensionStandard,
-    LoadedPackage, Refusal, RefusedFeature,
+    LoadedPackage, Refusal, RefusedFeature, dedup_capabilities, manifest_error, manifest_string,
+    read_json, resolve_package_path,
 };
 
 const STANDARD: ExtensionStandard = ExtensionStandard::Codex;

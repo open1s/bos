@@ -317,9 +317,11 @@ mod tests {
         manager
             .transition("com.example.a", LifecycleState::Resolved)
             .expect("resolve");
-        assert!(manager
-            .transition("com.example.a", LifecycleState::Discovered)
-            .is_err());
+        assert!(
+            manager
+                .transition("com.example.a", LifecycleState::Discovered)
+                .is_err()
+        );
     }
 
     #[test]

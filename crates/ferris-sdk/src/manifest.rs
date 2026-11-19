@@ -9,7 +9,7 @@ use ferris_core::manifest_v2::ManifestV2;
 use ferris_core::types::StartupPolicy;
 
 use crate::contribution::ContributionSpec;
-use crate::error::{invalid_input, Result};
+use crate::error::{Result, invalid_input};
 
 /// A validated 2.0 manifest.
 #[derive(Debug, Clone)]

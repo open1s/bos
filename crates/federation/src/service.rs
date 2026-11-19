@@ -16,13 +16,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use capability::transport::{unix_ms, FederationMessage, FederationTransport};
+use capability::transport::{FederationMessage, FederationTransport, unix_ms};
 use capability::{
     CancelToken, CapabilityDescriptor, CapabilityError, CapabilityId, CapabilityOutput,
     DelegationHop, DeliveryState, InvocationContext, InvocationId, NodeId, Principal, TaskId,
     TraceContext, WorkspaceRuntime,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
@@ -185,7 +185,7 @@ impl ReplayCache {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((cache, false))
+                return Ok((cache, false));
             }
             Err(error) => return Err(error),
         };
@@ -5512,22 +5512,22 @@ async fn serve_coordinator(
                 .get("member")
                 .and_then(|value| serde_json::from_value(value.clone()).ok());
             match member {
-                Some(member) => {
-                    match state.register(&envelope.sender, member) {
-                        Ok(()) => {
-                            if let Some(path) = path {
-                                if let Err(error) = state.save(path) {
-                                    tracing::warn!("federation: coordinator membership was not written: {error}");
-                                }
+                Some(member) => match state.register(&envelope.sender, member) {
+                    Ok(()) => {
+                        if let Some(path) = path {
+                            if let Err(error) = state.save(path) {
+                                tracing::warn!(
+                                    "federation: coordinator membership was not written: {error}"
+                                );
                             }
-                            json!({ "ok": true, "topology": state.topology() })
                         }
-                        Err(error) => json!({
-                            "ok": false,
-                            "error": { "kind": "denied", "message": error.to_string() },
-                        }),
+                        json!({ "ok": true, "topology": state.topology() })
                     }
-                }
+                    Err(error) => json!({
+                        "ok": false,
+                        "error": { "kind": "denied", "message": error.to_string() },
+                    }),
+                },
                 None => json!({
                     "ok": false,
                     "error": { "kind": "invalid", "message": "the request names no member" },
@@ -5631,8 +5631,8 @@ fn decode_discovery(payload: &Value) -> Result<DiscoveryRecord, CapabilityError>
 #[cfg(test)]
 mod admission_tests {
     use super::{
-        Admission, AdmissionLimits, ReplayCache, MAX_IN_FLIGHT_HANDLERS, MAX_IN_FLIGHT_PER_PEER,
-        REPLAY_CAPACITY,
+        Admission, AdmissionLimits, MAX_IN_FLIGHT_HANDLERS, MAX_IN_FLIGHT_PER_PEER,
+        REPLAY_CAPACITY, ReplayCache,
     };
     use crate::identity::NodeIdentity;
 
@@ -6191,9 +6191,11 @@ mod rotation_durability_tests {
                     store.is_trusted(&old.node_id(), unix_ms()),
                     "case {case}: the old identity stays trusted"
                 );
-                assert!(store
-                    .authorize(&old.node_id(), &capability_id(), unix_ms())
-                    .is_ok());
+                assert!(
+                    store
+                        .authorize(&old.node_id(), &capability_id(), unix_ms())
+                        .is_ok()
+                );
                 assert!(
                     store.record(&new.node_id()).is_none(),
                     "case {case}: the new identity is not enrolled"
@@ -6229,9 +6231,11 @@ mod rotation_durability_tests {
             let store = peers.read().expect("peers");
             assert!(store.is_trusted(&new.node_id(), unix_ms()));
             assert!(!store.is_trusted(&old.node_id(), unix_ms()));
-            assert!(store
-                .authorize(&new.node_id(), &capability_id(), unix_ms())
-                .is_ok());
+            assert!(
+                store
+                    .authorize(&new.node_id(), &capability_id(), unix_ms())
+                    .is_ok()
+            );
             drop(store);
             let on_disk = PeerStore::load(&peer_path).expect("committed");
             assert!(on_disk.is_trusted(&new.node_id(), unix_ms()));
@@ -6272,16 +6276,18 @@ mod rotation_durability_tests {
 
         let restarted = PeerStore::load(&path).expect("load after the response");
         assert!(restarted.is_trusted(&new.node_id(), now));
-        assert!(restarted
-            .authorize_scoped(
-                &new.node_id(),
-                &capability_id(),
-                now,
-                Some("read"),
-                Some("/workspace/notes.txt"),
-                None,
-            )
-            .is_ok());
+        assert!(
+            restarted
+                .authorize_scoped(
+                    &new.node_id(),
+                    &capability_id(),
+                    now,
+                    Some("read"),
+                    Some("/workspace/notes.txt"),
+                    None,
+                )
+                .is_ok()
+        );
         let old_record = restarted.record(&old.node_id()).expect("kept for audit");
         assert_eq!(old_record.state, TrustState::Revoked);
         assert!(old_record.grants.is_empty());
@@ -6321,10 +6327,12 @@ mod rotation_durability_tests {
         let events = sink.events();
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| event.outcome == "ok"));
-        assert!(events[1]
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("already durably committed")));
+        assert!(
+            events[1]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("already durably committed"))
+        );
 
         // A restart loads the committed log and still answers ok.
         let restarted = Arc::new(RwLock::new(PeerStore::load(&path).expect("load")));
@@ -6431,10 +6439,12 @@ mod rotation_durability_tests {
             events[0].subject.as_deref(),
             Some(format!("{} -> {}", old.node_id(), new.node_id()).as_str())
         );
-        assert!(peers
-            .read()
-            .expect("peers")
-            .is_trusted(&old.node_id(), unix_ms()));
+        assert!(
+            peers
+                .read()
+                .expect("peers")
+                .is_trusted(&old.node_id(), unix_ms())
+        );
     }
 }
 
@@ -6442,7 +6452,7 @@ mod rotation_durability_tests {
 mod knowledge_durability_tests {
     use super::*;
     use crate::audit::MemoryAudit;
-    use crate::knowledge::{knowledge_hash, KnowledgeClass, KnowledgePurpose, Provenance};
+    use crate::knowledge::{KnowledgeClass, KnowledgePurpose, Provenance, knowledge_hash};
     use capability::{MessageId, WorkspaceId};
 
     struct Allow;
@@ -6601,10 +6611,12 @@ mod knowledge_durability_tests {
         assert_eq!(reply["accepted"], json!(1));
         assert!(service.read().expect("service").get("k-fail").is_some());
         let text = std::fs::read_to_string(&path).expect("committed");
-        assert!(KnowledgeService::from_json(&text)
-            .expect("snapshot")
-            .get("k-fail")
-            .is_some());
+        assert!(
+            KnowledgeService::from_json(&text)
+                .expect("snapshot")
+                .get("k-fail")
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

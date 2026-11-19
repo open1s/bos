@@ -412,10 +412,12 @@ mod tests {
 
         let token = registry.provide(Scope::Host, "clock", Arc::new(1_u64));
         assert_eq!(fiber.refresh(&registry), RefreshAction::Reload);
-        assert!(fiber
-            .epoch()
-            .deps
-            .contains_key(&(Scope::Host, None, "clock".into())));
+        assert!(
+            fiber
+                .epoch()
+                .deps
+                .contains_key(&(Scope::Host, None, "clock".into()))
+        );
 
         registry.revoke(&token);
         assert_eq!(fiber.refresh(&registry), RefreshAction::Suspend);

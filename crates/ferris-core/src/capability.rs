@@ -1216,8 +1216,8 @@ impl AuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -1366,23 +1366,27 @@ mod tests {
         let scratch = Scratch::new("skills");
         let policy = engine(&scratch);
         // §6's table allows agent.skills.provide at every trust level.
-        assert!(policy
-            .evaluate(
-                "com.example.skills",
-                TrustLevel::Community,
-                Capability::AgentSkillsProvide,
-                &CallScope::default(),
-            )
-            .is_allowed());
+        assert!(
+            policy
+                .evaluate(
+                    "com.example.skills",
+                    TrustLevel::Community,
+                    Capability::AgentSkillsProvide,
+                    &CallScope::default(),
+                )
+                .is_allowed()
+        );
         // The other medium capabilities still need a grant at community trust.
-        assert!(!policy
-            .evaluate(
-                "com.example.skills",
-                TrustLevel::Community,
-                Capability::AgentModelsProvide,
-                &CallScope::default(),
-            )
-            .is_allowed());
+        assert!(
+            !policy
+                .evaluate(
+                    "com.example.skills",
+                    TrustLevel::Community,
+                    Capability::AgentModelsProvide,
+                    &CallScope::default(),
+                )
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -1486,14 +1490,16 @@ mod tests {
     fn builtins_are_allowed_by_default_and_denials_are_audited() {
         let scratch = Scratch::new("audit");
         let policy = engine(&scratch);
-        assert!(policy
-            .evaluate(
-                "com.bos.bsh.builtin",
-                TrustLevel::Builtin,
-                Capability::ProcessExecute,
-                &CallScope::default(),
-            )
-            .is_allowed());
+        assert!(
+            policy
+                .evaluate(
+                    "com.bos.bsh.builtin",
+                    TrustLevel::Builtin,
+                    Capability::ProcessExecute,
+                    &CallScope::default(),
+                )
+                .is_allowed()
+        );
         let _ = policy.evaluate(
             "com.example.no",
             TrustLevel::Community,
@@ -1526,17 +1532,19 @@ mod tests {
             .cloned()
             .expect("persisted grant");
         assert_eq!(grant.scope, GrantScope::Domain("example.com".to_string()));
-        assert!(policy
-            .evaluate(
-                "com.example.tool",
-                TrustLevel::Community,
-                Capability::NetworkHttp,
-                &CallScope {
-                    domain: Some("api.example.com".to_string()),
-                    ..CallScope::default()
-                },
-            )
-            .is_allowed());
+        assert!(
+            policy
+                .evaluate(
+                    "com.example.tool",
+                    TrustLevel::Community,
+                    Capability::NetworkHttp,
+                    &CallScope {
+                        domain: Some("api.example.com".to_string()),
+                        ..CallScope::default()
+                    },
+                )
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -1607,14 +1615,16 @@ mod tests {
             PolicyMode::Enforce,
         )
         .expect("policy");
-        assert!(policy
-            .grant(
-                "com.example",
-                Capability::WorkspaceRead,
-                GrantScope::Any,
-                None,
-            )
-            .is_err());
+        assert!(
+            policy
+                .grant(
+                    "com.example",
+                    Capability::WorkspaceRead,
+                    GrantScope::Any,
+                    None,
+                )
+                .is_err()
+        );
         assert!(
             policy.grants_for("com.example").is_empty(),
             "a grant that could not be written must not be applied in memory"
@@ -1638,9 +1648,11 @@ mod tests {
             .expect("grant");
         std::fs::remove_file(&path).expect("remove grant file");
         std::fs::create_dir_all(&path).expect("a directory where the grant file was");
-        assert!(policy
-            .revoke("com.example", Capability::WorkspaceRead)
-            .is_err());
+        assert!(
+            policy
+                .revoke("com.example", Capability::WorkspaceRead)
+                .is_err()
+        );
         assert!(
             policy
                 .grants_for("com.example")

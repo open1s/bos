@@ -75,7 +75,7 @@ mod tests {
     // By name, never `use super::*`: this file imports gpui at module scope, and a
     // glob would bring gpui's own `test` attribute macro into scope - the builtin
     // then resolves back to it and the expansion recurses until rustc gives up.
-    use super::{wheel_target, Smooth};
+    use super::{Smooth, wheel_target};
 
     /// An eased scroll walks towards its target instead of jumping to it, and it
     /// stops asking for frames once it arrives.

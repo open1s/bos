@@ -194,6 +194,37 @@ impl ChatMessage {
             .get("_bos_reasoning_state")
             .map(|payload| crate::llm::ReasoningState::new("anthropic", payload.clone()))
     }
+
+    /// Every reasoning block a non-OpenAI adapter attached, in provider order.
+    ///
+    /// A decoder that saw more than one signed or redacted block writes this
+    /// array instead of the single `_bos_reasoning_state` field, so no two
+    /// blocks are merged under one signature. Each entry is `{content, state}`;
+    /// an entry without opaque state carries `null`.
+    pub fn attached_reasoning_blocks(
+        &self,
+    ) -> Option<Vec<(String, Option<crate::llm::ReasoningState>)>> {
+        let blocks = self.extra.get("_bos_reasoning_blocks")?.as_array()?;
+        Some(
+            blocks
+                .iter()
+                .map(|block| {
+                    let content = block
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let provider_state = block
+                        .get("state")
+                        .filter(|value| !value.is_null())
+                        .and_then(|value| {
+                            serde_json::from_value::<crate::llm::ReasoningState>(value.clone()).ok()
+                        });
+                    (content, provider_state)
+                })
+                .collect(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,11 +293,7 @@ impl StreamExtractor for OpenAIExtractor {
             }
         }
 
-        if chats.is_empty() {
-            None
-        } else {
-            Some(chats)
-        }
+        if chats.is_empty() { None } else { Some(chats) }
     }
 
     fn extract<'a>(&'a self, span: &StreamSpan) -> &'a [u8] {

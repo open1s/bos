@@ -5,8 +5,8 @@
 
 use capability::catalogue::Catalogue;
 use capability::composition::{
-    resolve_host, Binding, CapabilityRequirement, CompositionError, CompositionSpec, GrantRef,
-    LocalScope, PeerCatalogue, PeerRef, RemotePolicy,
+    Binding, CapabilityRequirement, CompositionError, CompositionSpec, GrantRef, LocalScope,
+    PeerCatalogue, PeerRef, RemotePolicy, resolve_host,
 };
 use capability::descriptor::{CapabilityDescriptor, OutputContract};
 use capability::id::{

@@ -20,7 +20,7 @@ use std::fmt;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{Message, WebSocket};
 

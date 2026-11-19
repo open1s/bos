@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use gpui_kit::*;
 use gpui_libghostty::__private::{
-    spawn_surface, KeyAction, Modifiers, MouseButton as GhosttyButton, NativeSurface,
-    TerminalThemeState,
+    KeyAction, Modifiers, MouseButton as GhosttyButton, NativeSurface, TerminalThemeState,
+    spawn_surface,
 };
 use gpui_libghostty::{
     ClipboardApproval, ClipboardOperation, TerminalColor, TerminalConfiguration, TerminalOptions,
@@ -468,17 +468,19 @@ impl TerminalView {
                 surface.tick();
                 let wakeup = surface.wakeup();
                 let view = cx.entity().downgrade();
-                self.pump = Some(cx.spawn(async move |_, cx| loop {
-                    wakeup.wait().await;
-                    // Ghostty draws its native child during the tick; GPUI has
-                    // no terminal pixels to repaint for this wakeup.
-                    let alive = view.update(cx, |view, _| {
-                        if let Some(surface) = view.surface.ghostty_mut() {
-                            surface.tick();
+                self.pump = Some(cx.spawn(async move |_, cx| {
+                    loop {
+                        wakeup.wait().await;
+                        // Ghostty draws its native child during the tick; GPUI has
+                        // no terminal pixels to repaint for this wakeup.
+                        let alive = view.update(cx, |view, _| {
+                            if let Some(surface) = view.surface.ghostty_mut() {
+                                surface.tick();
+                            }
+                        });
+                        if alive.is_err() {
+                            break;
                         }
-                    });
-                    if alive.is_err() {
-                        break;
                     }
                 }));
             }
@@ -487,12 +489,14 @@ impl TerminalView {
             #[cfg(windows)]
             Surface::ConPty(_) => {
                 let view = cx.entity().downgrade();
-                self.pump = Some(cx.spawn(async move |_, cx| loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(50))
-                        .await;
-                    if view.update(cx, |_, cx| cx.notify()).is_err() {
-                        break;
+                self.pump = Some(cx.spawn(async move |_, cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(50))
+                            .await;
+                        if view.update(cx, |_, cx| cx.notify()).is_err() {
+                            break;
+                        }
                     }
                 }));
             }

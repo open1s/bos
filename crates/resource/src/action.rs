@@ -11,14 +11,14 @@ use rkyv::api::high::{from_bytes, to_bytes};
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
-use crate::meta::ResourceStateLabel;
 use crate::ResourceError;
+use crate::meta::ResourceStateLabel;
 
 /// Serde (de)serialization helpers that encode `Vec<u8>` as base64 strings, so
 /// the JSON tool surface is LLM-friendly (binary is not raw number arrays).
 mod b64 {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
@@ -31,8 +31,8 @@ mod b64 {
 }
 
 mod b64_vec {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error> {
@@ -48,8 +48,8 @@ mod b64_vec {
 }
 
 mod b64_opt {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {

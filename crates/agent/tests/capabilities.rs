@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 
-use agent::capabilities::{catalogue_from_registry, NativeToolProvider};
+use agent::capabilities::{NativeToolProvider, catalogue_from_registry};
 use agent::tools::{FunctionTool, ToolMetadata, ToolRegistry};
 use capability::composition::{
-    resolve_host, Binding, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope,
-    PeerCatalogue, PeerRef, RemotePolicy,
+    Binding, CapabilityRequirement, CompositionSpec, GrantRef, LocalScope, PeerCatalogue, PeerRef,
+    RemotePolicy, resolve_host,
 };
 use capability::id::{NodeId, WorkspaceId};
 use capability::{
@@ -282,14 +282,18 @@ fn an_mcp_tool_declares_the_network_and_no_version() {
 
     assert!(metadata.version.is_none());
     assert_eq!(metadata.risk.as_deref(), Some("medium"));
-    assert!(metadata
-        .side_effects
-        .iter()
-        .any(|effect| effect == "network"));
-    assert!(metadata
-        .permissions
-        .iter()
-        .any(|scope| scope == "net.egress"));
+    assert!(
+        metadata
+            .side_effects
+            .iter()
+            .any(|effect| effect == "network")
+    );
+    assert!(
+        metadata
+            .permissions
+            .iter()
+            .any(|scope| scope == "net.egress")
+    );
 }
 
 /// An extension tool's declaration maps to the extension side effect: the host

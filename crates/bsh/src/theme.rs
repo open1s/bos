@@ -6,8 +6,8 @@
 //! from the kit after the theme changes, and [`toggle`] flips the mode. Sizes
 //! and layout metrics stay constant.
 use gpui_kit::component::{
-    theme::{Theme, ThemeMode, ThemeRegistry},
     ActiveTheme as _,
+    theme::{Theme, ThemeMode, ThemeRegistry},
 };
 use gpui_kit::*;
 use std::cell::{Cell, RefCell};
@@ -599,11 +599,7 @@ pub(crate) const TODO_DONE: u32 = 0x22C55E;
 /// Measured: `state-idle-primary` is `static-neutral-300` (#D4D4D4) in light
 /// and `-600` (#545557) in dark.
 pub(crate) fn todo_idle() -> u32 {
-    if is_dark() {
-        0x545557
-    } else {
-        0xD4D4D4
-    }
+    if is_dark() { 0x545557 } else { 0xD4D4D4 }
 }
 
 /// The hero preview badge's fill.
@@ -612,11 +608,7 @@ pub(crate) fn todo_idle() -> u32 {
 /// `--dsw-static-deepseek-100` (#E4EDFD) in light and `-800` (#34415B) in
 /// dark.
 pub(crate) fn hero_badge_bg() -> u32 {
-    if is_dark() {
-        0x34415B
-    } else {
-        0xE4EDFD
-    }
+    if is_dark() { 0x34415B } else { 0xE4EDFD }
 }
 
 /// The hero preview badge's text.
@@ -624,11 +616,7 @@ pub(crate) fn hero_badge_bg() -> u32 {
 /// Measured: `label-primary-bluish` is `--dsw-static-blue-900` (#0E3074) in
 /// light and `--dsw-static-neutral-bluish-50` (#F9FAFB) in dark.
 pub(crate) fn hero_badge_fg() -> u32 {
-    if is_dark() {
-        0xF9FAFB
-    } else {
-        0x0E3074
-    }
+    if is_dark() { 0xF9FAFB } else { 0x0E3074 }
 }
 
 /// The hero preview badge's `.5px` ring.
@@ -644,11 +632,7 @@ pub(crate) fn hero_badge_border() -> u32 {
 /// Measured: `label-caption` is `--dsw-static-neutral-bluish-400` (#ADB2B8)
 /// in light and `-600` (#81858C) in dark.
 pub(crate) fn caption() -> u32 {
-    if is_dark() {
-        0x81858C
-    } else {
-        0xADB2B8
-    }
+    if is_dark() { 0x81858C } else { 0xADB2B8 }
 }
 
 /// A stat pill's text size: the reference's `secondary - 1px`.
@@ -1045,11 +1029,7 @@ pub(crate) fn handle_width_at(column: f32, content: f32) -> f32 {
 /// (#e5e5e5) in light and --dsw-static-neutral-700 (#3c3c3d) in dark. RGBA,
 /// since the fades need the same colour at zero alpha.
 pub(crate) fn scrollbar_bar() -> u32 {
-    if is_dark() {
-        0x3C3C3DFF
-    } else {
-        0xE5E5E5FF
-    }
+    if is_dark() { 0x3C3C3DFF } else { 0xE5E5E5FF }
 }
 
 /// The wash behind an added line of a step's patch.
@@ -1091,21 +1071,13 @@ pub(crate) fn diff_del() -> u32 {
 /// OPAQUE, because `rgb()` reads only the low 24 bits: an `AARRGGBB` literal
 /// here rendered as its blue channel, which made the dark header BLUE.
 pub(crate) fn changes_fill() -> u32 {
-    if is_dark() {
-        0x2A2A2B
-    } else {
-        0xFAFAFA
-    }
+    if is_dark() { 0x2A2A2B } else { 0xFAFAFA }
 }
 
 /// The header's fill under the pointer: `--changes-hover`, measured as
 /// `--dsw-static-neutral-100` (light) / `-800` (dark).
 pub(crate) fn changes_hover() -> u32 {
-    if is_dark() {
-        0x333334
-    } else {
-        0xF5F5F5
-    }
+    if is_dark() { 0x333334 } else { 0xF5F5F5 }
 }
 
 /// The 40x40 file tile's fill: the reference mixes the static neutral-00 -
@@ -1394,7 +1366,7 @@ pub(crate) fn terminal_palette() -> [u32; 16] {
 mod tests {
     use super::terminal_font_size;
     use super::{
-        apply_extension_tokens, clear_extension_tokens, hx_over, set_extension_tokens, Palette,
+        Palette, apply_extension_tokens, clear_extension_tokens, hx_over, set_extension_tokens,
     };
     use gpui_kit::hsla;
     use std::collections::BTreeMap;

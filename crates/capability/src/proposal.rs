@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 
 use crate::catalogue::Catalogue;
 use crate::composition::{
-    resolve_host, CapabilityRequirement, CompositionError, CompositionSpec, LocalScope,
-    PeerCatalogue, RemotePolicy,
+    CapabilityRequirement, CompositionError, CompositionSpec, LocalScope, PeerCatalogue,
+    RemotePolicy, resolve_host,
 };
 use crate::descriptor::Risk;
 use crate::id::CapabilityId;
@@ -109,7 +109,7 @@ pub fn validate_proposal(
             Ok(None) => {
                 return Err(ProposalError::Unknown {
                     capability: requirement.id.clone(),
-                })
+                });
             }
             Err(ProposalError::Ungranted { .. }) if !requirement.required => continue,
             Err(error) => return Err(error),

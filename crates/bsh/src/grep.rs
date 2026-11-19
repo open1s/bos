@@ -25,14 +25,14 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use grep::matcher::Matcher;
-use grep::printer::{JSONSink, JSON};
+use grep::printer::{JSON, JSONSink};
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch,
 };
 use ignore::overrides::{Override, OverrideBuilder};
 
-use crate::glob::{build_walker, relative_to, MAX_PATTERN_BYTES};
+use crate::glob::{MAX_PATTERN_BYTES, build_walker, relative_to};
 
 /// The most rows one call returns by default.
 pub(crate) const DEFAULT_RESULTS: usize = 500;

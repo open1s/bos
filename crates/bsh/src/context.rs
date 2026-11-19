@@ -25,8 +25,8 @@
 
 use std::path::Path;
 
-use agent::tools::bash::SANDBOX_RELEASED_REASON;
 use agent::Agent;
+use agent::tools::bash::SANDBOX_RELEASED_REASON;
 
 use crate::settings::Effective;
 
@@ -575,9 +575,9 @@ fn render_snapshot(facts: &RuntimeFacts, child: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Settings;
     use crate::settings::global::{Preset, SandboxChoice};
     use crate::settings::resolve::SessionChoice;
-    use crate::settings::Settings;
     use crate::vault::Vault;
     use agent::tools::bash::{PRESET_SANDBOX_OFF_REASON, SANDBOX_SETTINGS_OFF_REASON};
 
@@ -814,8 +814,10 @@ mod tests {
             facts(&settings).sandbox_reason,
             Some(SANDBOX_SETTINGS_OFF_REASON)
         );
-        assert!(render_snapshot(&facts(&settings), false)
-            .contains(&format!("Sandbox: none ({SANDBOX_SETTINGS_OFF_REASON}).")));
+        assert!(
+            render_snapshot(&facts(&settings), false)
+                .contains(&format!("Sandbox: none ({SANDBOX_SETTINGS_OFF_REASON})."))
+        );
 
         // 2. a preset's own widening at full access.
         let mut settings = rooted(&root);
@@ -833,8 +835,10 @@ mod tests {
             facts(&settings).sandbox_reason,
             Some(PRESET_SANDBOX_OFF_REASON)
         );
-        assert!(render_snapshot(&facts(&settings), false)
-            .contains(&format!("Sandbox: none ({PRESET_SANDBOX_OFF_REASON}).")));
+        assert!(
+            render_snapshot(&facts(&settings), false)
+                .contains(&format!("Sandbox: none ({PRESET_SANDBOX_OFF_REASON})."))
+        );
 
         // 3. the permission's own release, with no policy arm involved.
         let mut settings = rooted(&root);
@@ -844,8 +848,10 @@ mod tests {
             facts(&settings).sandbox_reason,
             Some(SANDBOX_RELEASED_REASON)
         );
-        assert!(render_snapshot(&facts(&settings), false)
-            .contains(&format!("Sandbox: none ({SANDBOX_RELEASED_REASON}).")));
+        assert!(
+            render_snapshot(&facts(&settings), false)
+                .contains(&format!("Sandbox: none ({SANDBOX_RELEASED_REASON})."))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -863,9 +869,11 @@ mod tests {
             &RuntimeFacts::from_effective(&running_build.effective),
             false,
         );
-        assert!(running
-            .snapshot
-            .contains("Sandbox: confined to the workspace."));
+        assert!(
+            running
+                .snapshot
+                .contains("Sandbox: confined to the workspace.")
+        );
         settings.global.general.sandbox_enabled = Some(false);
         let still_running = TurnContext::from_facts(
             &RuntimeFacts::from_effective(&running_build.effective),

@@ -664,8 +664,8 @@ impl SkillRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::index::SkillIndex;
     use crate::skills::SkillSource;
+    use crate::skills::index::SkillIndex;
     use std::path::Path;
 
     fn write_skill(dir: &Path, name: &str, body: &str, extra: &str) {
@@ -774,11 +774,13 @@ mod tests {
             Err(RuntimeError::TotalBudget { .. })
         ));
         assert_eq!(runtime.active("task"), vec!["base"]);
-        assert!(runtime
-            .compose("task")
-            .expect("compose")
-            .text
-            .contains("BASE"));
+        assert!(
+            runtime
+                .compose("task")
+                .expect("compose")
+                .text
+                .contains("BASE")
+        );
     }
 
     #[test]
@@ -840,15 +842,21 @@ mod tests {
         runtime.compose("task").expect("compose");
         runtime.finish("task");
         let events = runtime.drain_events();
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, SkillEvent::Activated { .. })));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, SkillEvent::Composed { .. })));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, SkillEvent::TaskEnded { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SkillEvent::Activated { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SkillEvent::Composed { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SkillEvent::TaskEnded { .. }))
+        );
         let rendered = format!("{events:?}");
         assert!(
             !rendered.contains("BASE"),

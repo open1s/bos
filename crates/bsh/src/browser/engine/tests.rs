@@ -22,12 +22,12 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::cdp::client::discover_binary;
 use super::cdp::PointerButton;
+use super::cdp::client::discover_binary;
 use super::{Engine, FrameSlot, Navigation, Settle};
 
 /// A loopback origin that records every path it served, one body for all of them.

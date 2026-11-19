@@ -11,6 +11,10 @@ impl ReactSession for DummySession {
     fn history(&self) -> Option<&[LlmMessage]> {
         None
     }
+    fn clear_reasoning(&mut self) {
+        // This example keeps no history; the explicit no-op satisfies the
+        // session contract.
+    }
 }
 
 #[derive(Default)]

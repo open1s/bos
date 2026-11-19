@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use capability::{unix_ms, NodeId};
+use capability::{NodeId, unix_ms};
 use federation::{FederationId, InMemoryNetwork, NodeIdentity, PeerRecord, PeerStore};
 
 fn node(seed: u8) -> NodeId {
@@ -97,7 +97,7 @@ async fn discovery_advertises_the_configured_federation_and_revision() {
 
 #[test]
 fn a_signed_rotation_moves_grants_and_revokes_the_old_key() {
-    use capability::{unix_ms, CapabilityId};
+    use capability::{CapabilityId, unix_ms};
 
     let old = NodeIdentity::from_seed([91; 32]);
     let new = NodeIdentity::from_seed([92; 32]);
@@ -218,9 +218,11 @@ async fn a_rotation_record_is_delivered_and_applied_over_the_wire() {
     drop(store);
     let reloaded = PeerStore::load(&peers_path).expect("persisted");
     assert!(reloaded.is_trusted(&new_id, capability::unix_ms()));
-    assert!(reloaded
-        .authorize(&new_id, &capability, capability::unix_ms())
-        .is_ok());
+    assert!(
+        reloaded
+            .authorize(&new_id, &capability, capability::unix_ms())
+            .is_ok()
+    );
 
     provider_task.abort();
     sender_task.abort();

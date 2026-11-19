@@ -88,7 +88,7 @@ mod tests {
     use agent::capability::composition::{CapabilityRequirement, CompositionSpec, LocalScope};
     use agent::capability::descriptor::CapabilityDescriptor;
     use agent::capability::id::{CapabilityKind, VersionSource, WorkspaceId};
-    use agent::capability::{resolve_host, Catalogue};
+    use agent::capability::{Catalogue, resolve_host};
     use semver::{Version, VersionReq};
 
     fn snapshot(index: usize) -> CompositionSnapshot {

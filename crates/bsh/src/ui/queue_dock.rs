@@ -20,7 +20,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::shell::Shell;
-use super::{hairline_all, hairline_no_bottom, hairline_top, icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, hairline_all, hairline_no_bottom, hairline_top, icon, txt};
 use crate::i18n::tr_args;
 use crate::state::Queued;
 use crate::theme;

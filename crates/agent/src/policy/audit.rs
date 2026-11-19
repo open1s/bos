@@ -14,8 +14,8 @@
 //! a path or a host and resolved address.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::target::{Action, Decision, PolicyInput};
 

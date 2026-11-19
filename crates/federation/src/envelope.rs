@@ -5,9 +5,9 @@
 //! signature covers a canonical serialization with the signature field empty,
 //! so a relay cannot alter a field without invalidating the message.
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use capability::{unix_ms, FederationMessage, NodeId};
+use base64::engine::general_purpose::STANDARD;
+use capability::{FederationMessage, NodeId, unix_ms};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

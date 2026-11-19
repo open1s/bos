@@ -6,8 +6,8 @@
 //! that a peer stops publishing. Loading remote instructions is a separate,
 //! explicit grant.
 
-use super::index::{RemoteAdmission, RemoteSkill, SkillIndex};
 use super::SkillMetadata;
+use super::index::{RemoteAdmission, RemoteSkill, SkillIndex};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One peer's metadata endpoint.

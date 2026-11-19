@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent::agent::context::{
-    extract_critical_facts, validate_checkpoint, AgentSession, CheckpointSourceStatus,
+    AgentSession, CheckpointSourceStatus, extract_critical_facts, validate_checkpoint,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::extension::runs::{RunHandle, RunSnapshot, RunState, RunsService};
 use crate::extension::tasks::{

@@ -5,7 +5,7 @@
 
 mod common;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use common::mock_llm_server::{CapturedRequest, MockLlmServer, MockReply};
 use react::llm::vendor::OpenAiVendor;

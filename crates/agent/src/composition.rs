@@ -11,7 +11,7 @@ use capability::composition::{
     CapabilityRequirement, CompositionError, CompositionSpec, LocalScope, RemotePolicy,
     ResolvedComposition,
 };
-use capability::proposal::{approve, resolve_approved, ProposalError, ProposalPolicy};
+use capability::proposal::{ProposalError, ProposalPolicy, approve, resolve_approved};
 use capability::{CapabilityId, Catalogue, NodeId};
 use semver::{Version, VersionReq};
 use serde::Deserialize;

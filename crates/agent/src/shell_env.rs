@@ -146,9 +146,11 @@ mod tests {
             ("PATH".to_string(), "/usr/bin".to_string()),
             ("KEEP".to_string(), "yes".to_string()),
         ]);
-        assert!(merged
-            .iter()
-            .any(|(key, value)| key == "KEEP" && value == "yes"));
+        assert!(
+            merged
+                .iter()
+                .any(|(key, value)| key == "KEEP" && value == "yes")
+        );
     }
 
     #[test]

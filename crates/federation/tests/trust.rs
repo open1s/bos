@@ -72,9 +72,11 @@ fn revoking_a_peer_removes_every_grant() {
         store.record(&peer).map(|record| record.state),
         Some(TrustState::Revoked)
     );
-    assert!(store
-        .authorize(&peer, &capability("read_file"), now)
-        .is_err());
+    assert!(
+        store
+            .authorize(&peer, &capability("read_file"), now)
+            .is_err()
+    );
 }
 
 #[test]
@@ -87,12 +89,16 @@ fn an_expired_grant_is_denied() {
         .grant(&peer, capability("read_file"), now, Some(now + 1))
         .unwrap();
 
-    assert!(store
-        .authorize(&peer, &capability("read_file"), now)
-        .is_ok());
-    assert!(store
-        .authorize(&peer, &capability("read_file"), now + 1)
-        .is_err());
+    assert!(
+        store
+            .authorize(&peer, &capability("read_file"), now)
+            .is_ok()
+    );
+    assert!(
+        store
+            .authorize(&peer, &capability("read_file"), now + 1)
+            .is_err()
+    );
 }
 
 #[test]
@@ -114,9 +120,11 @@ fn an_expired_enrollment_is_denied_even_with_a_grant() {
         note: None,
     });
 
-    assert!(store
-        .authorize(&peer, &capability("read_file"), now)
-        .is_ok());
+    assert!(
+        store
+            .authorize(&peer, &capability("read_file"), now)
+            .is_ok()
+    );
     let error = store
         .authorize(&peer, &capability("read_file"), now + 1)
         .expect_err("the enrollment expired");

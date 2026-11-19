@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
+use napi::Unknown;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::Unknown;
 use napi_derive::napi;
 
 use ferris_sdk::{

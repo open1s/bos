@@ -5,8 +5,8 @@ use bus::Session;
 use futures::Stream;
 
 use super::client::AgentRpcClient;
-use react::tool::Tool;
 use react::ToolError;
+use react::tool::Tool;
 
 #[cfg(test)]
 use super::transport::RpcTransport;

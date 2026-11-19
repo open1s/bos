@@ -321,13 +321,13 @@ impl WorkspaceRuntime {
                     Ok(Err(_)) => {
                         return Err(CapabilityError::Unavailable {
                             reason: "the workspace dispatcher is closed".to_string(),
-                        })
+                        });
                     }
                     Err(_) => {
                         return Err(CapabilityError::Timeout {
                             elapsed_ms: started.elapsed().as_millis() as u64,
                             partial: None,
-                        })
+                        });
                     }
                 }
             }
@@ -336,7 +336,7 @@ impl WorkspaceRuntime {
                 Err(_) => {
                     return Err(CapabilityError::Unavailable {
                         reason: "the workspace dispatcher is closed".to_string(),
-                    })
+                    });
                 }
             },
         };
@@ -486,7 +486,7 @@ impl WorkspaceLifecycle {
                     return Err(WorkspaceError::InvalidState {
                         state: other,
                         action: "activate",
-                    })
+                    });
                 }
             }
         }
@@ -595,7 +595,7 @@ impl WorkspaceLifecycle {
                     return Err(WorkspaceError::InvalidState {
                         state: other,
                         action: "shut down",
-                    })
+                    });
                 }
             }
         }

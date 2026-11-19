@@ -344,9 +344,11 @@ mod tests {
     #[test]
     fn interceptor_registration_is_capability_gated() {
         let denied = EventDispatcher::with_interceptor_policy(Arc::new(DenyInterceptors));
-        assert!(denied
-            .on_interceptor("ext", "tool.before", 0, |_value, _next| None)
-            .is_err());
+        assert!(
+            denied
+                .on_interceptor("ext", "tool.before", 0, |_value, _next| None)
+                .is_err()
+        );
 
         let allowed = EventDispatcher::with_interceptor_policy(Arc::new(AllowInterceptors));
         let _subscription = allowed

@@ -681,16 +681,18 @@ mod tests {
             .grant(&peer, capability(), 1_000, None)
             .expect("grant");
         assert!(store.authorize(&peer, &capability(), 1_000).is_ok());
-        assert!(store
-            .authorize_scoped(
-                &peer,
-                &capability(),
-                1_000,
-                Some("write"),
-                Some("/etc/passwd"),
-                None
-            )
-            .is_ok());
+        assert!(
+            store
+                .authorize_scoped(
+                    &peer,
+                    &capability(),
+                    1_000,
+                    Some("write"),
+                    Some("/etc/passwd"),
+                    None
+                )
+                .is_ok()
+        );
         assert_eq!(
             store.unscoped_grants().len(),
             1,
@@ -717,16 +719,18 @@ mod tests {
             store.unscoped_grants().is_empty(),
             "a scoped grant is not legacy"
         );
-        assert!(store
-            .authorize_scoped(
-                &peer,
-                &capability(),
-                1_000,
-                Some("read"),
-                Some("/workspace/notes.txt"),
-                None
-            )
-            .is_ok());
+        assert!(
+            store
+                .authorize_scoped(
+                    &peer,
+                    &capability(),
+                    1_000,
+                    Some("read"),
+                    Some("/workspace/notes.txt"),
+                    None
+                )
+                .is_ok()
+        );
         assert!(
             store
                 .authorize_scoped(
@@ -776,16 +780,18 @@ mod tests {
                 None,
             )
             .expect("grant");
-        assert!(store
-            .authorize_scoped(
-                &peer,
-                &capability(),
-                1_000,
-                Some("read"),
-                None,
-                Some("ws:research")
-            )
-            .is_ok());
+        assert!(
+            store
+                .authorize_scoped(
+                    &peer,
+                    &capability(),
+                    1_000,
+                    Some("read"),
+                    None,
+                    Some("ws:research")
+                )
+                .is_ok()
+        );
         assert!(
             store
                 .authorize_scoped(

@@ -11,7 +11,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use ferris_sdk::package::{package_hash_at_rev, ExtensionStore, Package};
+use ferris_sdk::package::{ExtensionStore, Package, package_hash_at_rev};
 use ferris_sdk::types::{ExtensionError, ExtensionSource, TrustLevel};
 
 /// The official provider repository.

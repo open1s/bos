@@ -28,7 +28,7 @@ use workspace::WorkspaceSettings;
 // The automation tasks, the clock they read and their refusals live on the
 // global document, because a task is a machine-level instruction that names
 // a session rather than belonging to one workspace.
-pub(crate) use self::global::{unix_now, Schedule, ScheduleRefusal};
+pub(crate) use self::global::{Schedule, ScheduleRefusal, unix_now};
 
 /// The harness settings, held as the two documents they are stored in.
 ///
@@ -1221,10 +1221,10 @@ mod tests {
         );
     }
 
+    use super::Settings;
     use super::global::{self, GlobalSettings, ModelEntry};
     use super::mcp::{McpRefusal, McpScope, McpServer, McpTransport};
     use super::workspace::WorkspaceSettings;
-    use super::Settings;
 
     /// The reference font-size default and the appearance default, both on the
     /// global tier because neither is a workspace fact.

@@ -68,11 +68,11 @@ fn windows_private_dacl(path: &Path) -> io::Result<()> {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{GENERIC_ALL, HANDLE};
-    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
     use windows_sys::Win32::Security::{
-        AddAccessAllowedAce, GetLengthSid, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACL,
-        ACL_REVISION, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY,
-        TOKEN_USER,
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, DACL_SECURITY_INFORMATION,
+        GetLengthSid, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 

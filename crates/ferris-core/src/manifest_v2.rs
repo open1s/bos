@@ -10,8 +10,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{
-    ConfigurationSpec, Identity, Manifest, ResourcesSpec, ServicesSpec, MANIFEST_FILE,
-    MAX_MANIFEST_BYTES,
+    ConfigurationSpec, Identity, MANIFEST_FILE, MAX_MANIFEST_BYTES, Manifest, ResourcesSpec,
+    ServicesSpec,
 };
 use crate::types::{ContributionId, ExtensionError, ExtensionId, Requirement};
 
@@ -388,7 +388,7 @@ impl ManifestV2 {
                     return Err(ExtensionError::Manifest {
                         path: Path::new(MANIFEST_FILE).to_path_buf(),
                         message: format!("unknown contribution kind {other:?}"),
-                    })
+                    });
                 }
             }
         }
@@ -574,10 +574,12 @@ id = "echo"
         let legacy = Manifest::load(&root).expect("legacy");
         let v2 = ManifestV2::from_legacy(&legacy);
         assert_eq!(v2.schema_version, "2.0");
-        assert!(v2
-            .contributions
-            .iter()
-            .any(|contribution| contribution.kind == "tool" && contribution.id.as_str() == "echo"));
+        assert!(
+            v2.contributions
+                .iter()
+                .any(|contribution| contribution.kind == "tool"
+                    && contribution.id.as_str() == "echo")
+        );
         let text = v2.to_toml().expect("serialize");
         let reparsed = ManifestV2::parse(&text, Path::new("extension.toml")).expect("reparse");
         assert_eq!(reparsed.extension.id, legacy.extension.id);
@@ -608,12 +610,14 @@ id = "echo"
         )
         .expect("package");
         assert!(package.report.is_valid(), "{:?}", package.report.errors);
-        assert!(package
-            .manifest
-            .contributes
-            .tools
-            .iter()
-            .any(|id| id.as_str() == "echo"));
+        assert!(
+            package
+                .manifest
+                .contributes
+                .tools
+                .iter()
+                .any(|id| id.as_str() == "echo")
+        );
     }
 
     #[test]

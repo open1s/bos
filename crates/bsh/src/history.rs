@@ -97,8 +97,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 
@@ -4984,8 +4984,8 @@ mod tests {
         cache.put(2, vec![sized_row(&"c".repeat(272))], 1); // 400
         assert_eq!(cache.bytes, 856);
         cache.put(3, vec![sized_row(&"d".repeat(172))], 1); // 300
-                                                            // 856 + 300 > 1000, so the front - page 1, never touched - is evicted,
-                                                            // not page 0, which is older but was read again.
+        // 856 + 300 > 1000, so the front - page 1, never touched - is evicted,
+        // not page 0, which is older but was read again.
         assert_eq!(cache.evictions, 1);
         assert!(cache.get(1).is_none(), "the untouched page went first");
         assert!(cache.get(0).is_some(), "the touched page stayed");

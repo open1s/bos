@@ -223,15 +223,19 @@ async fn the_computer_use_example_exposes_every_declared_surface() {
         .find(|status| status.id == "com.example.computer-use")
         .expect("computer-use status");
     assert!(status.applied, "computer-use applies: {:?}", status.error);
-    assert!(status
-        .tools
-        .iter()
-        .any(|tool| tool.ends_with("__screen_size")));
+    assert!(
+        status
+            .tools
+            .iter()
+            .any(|tool| tool.ends_with("__screen_size"))
+    );
     assert!(status.tools.iter().any(|tool| tool.ends_with("__inspect")));
-    assert!(status
-        .commands
-        .iter()
-        .any(|command| command.ends_with("__refresh")));
+    assert!(
+        status
+            .commands
+            .iter()
+            .any(|command| command.ends_with("__refresh"))
+    );
     assert_eq!(status.panels, ["computer-use__desktop"]);
     assert_eq!(host.integrations().len(), 2);
     host.shutdown().await;
@@ -303,10 +307,11 @@ async fn a_profile_mount_applies_config_to_an_installed_package() {
     .expect("profile");
     let mounted = host.mount_profile(&profile).expect("mount");
     assert_eq!(mounted, vec!["com.example.hello".to_string()]);
-    assert!(host
-        .statuses()
-        .into_iter()
-        .any(|status| status.id == "com.example.hello" && status.applied));
+    assert!(
+        host.statuses()
+            .into_iter()
+            .any(|status| status.id == "com.example.hello" && status.applied)
+    );
     host.shutdown().await;
 }
 
@@ -800,9 +805,11 @@ async fn disabling_the_annotations_package_disables_the_notes_store() {
     let store = ExtensionStore::open(&root).expect("store");
     store.set_enabled(&id, false).expect("disable");
     let mut host = ExtensionHost::open(config(&root)).expect("host");
-    assert!(crate::notes::Notes::load(&root)
-        .on(std::path::Path::new("a.txt"))
-        .is_empty());
+    assert!(
+        crate::notes::Notes::load(&root)
+            .on(std::path::Path::new("a.txt"))
+            .is_empty()
+    );
     assert!(notes.save(&root).is_err());
     host.shutdown().await;
 }

@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use super::package::Package;
 use super::types::{
-    extension_api_version, host_version, ContributionKind, ExtensionError, ExtensionId,
-    ExtensionSource, Requirement,
+    ContributionKind, ExtensionError, ExtensionId, ExtensionSource, Requirement,
+    extension_api_version, host_version,
 };
 
 /// One resolved package in dependency-first order.

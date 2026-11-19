@@ -13,8 +13,13 @@ thinking, a Responses reasoning item, DeepSeek's `reasoning_content`); a later
 turn must never receive them. The engine drops every prior-turn
 `AssistantReasoning` before a turn's first request
 (`ReactSession::clear_reasoning`), and BSH does not seed reasoning from the
-transcript at all. There is no persisted thinking summary: the old
-`thinking_context` feature and its `ThinkingSnapshot` are gone.
+transcript at all. `clear_reasoning` is a required trait method, not a
+defaulted no-op: a custom session that keeps history must remove every
+`AssistantReasoning` message and its provider state before the engine starts a
+turn. A session with no history still implements it explicitly, which records
+the contract instead of silently inheriting it. There is no persisted thinking
+summary: the old `thinking_context` feature and its `ThinkingSnapshot` are
+gone.
 
 ## Message contract
 
@@ -67,7 +72,11 @@ ever serialized, and it was produced by the provider this turn is talking to.
 
 - **Non-streaming**: `message.reasoning_content` / `reasoning` is pushed as
   `AssistantReasoning` before the assistant text; an Anthropic signature arrives
-  in the message extension and is attached as `ReasoningState`.
+  in the message extension and is attached as `ReasoningState`. When the
+  Messages stream carried several signed or redacted blocks, the vendor writes
+  `_bos_reasoning_blocks` (one `{content, state}` per block) and the engine
+  pushes one `AssistantReasoning` per entry. A single block keeps the original
+  `reasoning_content` + attached-state fields.
 - **Streaming**: reasoning chunks accumulate per block. A
   `StreamToken::ReasoningState` closes the block (Anthropic's
   `signature_delta`, a Responses `output_item.done`); a state with no text is

@@ -325,14 +325,16 @@ mod tests {
             }],
             policy: Some("policy:turn".to_string()),
         }];
-        let federation = vec![federation::FederationEvent::new(
-            federation::Direction::Inbound,
-            "peer-a",
-            "invoke",
-            Some("builtin/read_file"),
-            "denied",
-        )
-        .with_reason("capability not granted")];
+        let federation = vec![
+            federation::FederationEvent::new(
+                federation::Direction::Inbound,
+                "peer-a",
+                "invoke",
+                Some("builtin/read_file"),
+                "denied",
+            )
+            .with_reason("capability not granted"),
+        ];
         let chosen = root.join("audit.md");
         let (markdown_path, json_path) = write_audit(
             &view,

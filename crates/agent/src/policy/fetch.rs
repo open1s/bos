@@ -27,7 +27,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::egress::{host_and_port, EgressDenial, EgressGate, PolicyResolver};
+use super::egress::{EgressDenial, EgressGate, PolicyResolver, host_and_port};
 
 /// How much a fetch may read, and how far it may follow.
 #[derive(Debug, Clone, Copy)]

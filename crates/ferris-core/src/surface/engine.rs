@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::document::{DispatchPrincipal, SurfaceDocument};
-use super::frame::{apply_patch, SurfaceFrame};
+use super::frame::{SurfaceFrame, apply_patch};
 use super::{Generation, InstanceId, Revision, SurfaceContract, SurfaceError, SurfaceLimits};
 
 /// The lifecycle state of one mounted surface.
@@ -304,7 +304,7 @@ impl SurfaceEngine {
                 return Err(SurfaceError::Invalid(
                     "a frame carries either a document or a patch base, not both or neither"
                         .to_string(),
-                ))
+                ));
             }
         };
         let report = document.validate_against(&instance.contract, limits);
@@ -533,11 +533,11 @@ fn materialize(input: &Value, event: &SurfaceEvent, props: &Value) -> Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Risk;
     use crate::surface::contract::{ActionSpec, Profile};
     use crate::surface::document::{ActionBinding, ActionMode};
     use crate::surface::node::SurfaceNode;
-    use crate::surface::{SurfaceId, SURFACE_SCHEMA_VERSION};
-    use crate::Risk;
+    use crate::surface::{SURFACE_SCHEMA_VERSION, SurfaceId};
 
     fn contract() -> SurfaceContract {
         SurfaceContract::new(
@@ -704,16 +704,20 @@ mod tests {
         let mut broken = document();
         broken.bindings.clear();
         let frame = SurfaceFrame::full(id, Generation::initial(), Revision(2), broken);
-        assert!(engine
-            .apply_frame(&frame, &SurfaceLimits::default())
-            .is_err());
+        assert!(
+            engine
+                .apply_frame(&frame, &SurfaceLimits::default())
+                .is_err()
+        );
         let instance = engine.instance(id).expect("instance");
         assert_eq!(instance.state(), InstanceState::Degraded);
         assert!(instance.last_good().is_some());
-        assert!(instance
-            .last_good()
-            .expect("last good")
-            .binding("refresh")
-            .is_some());
+        assert!(
+            instance
+                .last_good()
+                .expect("last good")
+                .binding("refresh")
+                .is_some()
+        );
     }
 }

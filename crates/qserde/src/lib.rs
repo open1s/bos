@@ -20,17 +20,17 @@
 #![warn(missing_docs)]
 
 use rkyv::{
+    Archive as RkyvArchive, Place,
     api::high::{HighDeserializer, HighValidator},
     bytecheck::CheckBytes,
     rancor::{Error as RkyvError, Fallible, Strategy},
-    ser::{allocator::ArenaHandle, sharing::Share, Serializer},
+    ser::{Serializer, allocator::ArenaHandle, sharing::Share},
     util::AlignedVec,
     with::{ArchiveWith, DeserializeWith, SerializeWith},
-    Archive as RkyvArchive, Place,
 };
 use thiserror::Error;
 
-pub use qserde_derive::{archive, snapshot, Archive, Snapshot};
+pub use qserde_derive::{Archive, Snapshot, archive, snapshot};
 pub use rkyv;
 
 type SerializeStrategy<'a> = Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, RkyvError>;
@@ -41,8 +41,8 @@ pub mod error;
 /// Common trait and helper imports.
 pub mod prelude {
     pub use crate::{
-        archive, decode, dump, encode, load, snapshot, Archive, Archived, Deserialize,
-        DeserializeExt, Result, Serialize, SkipNone, Snapshot,
+        Archive, Archived, Deserialize, DeserializeExt, Result, Serialize, SkipNone, Snapshot,
+        archive, decode, dump, encode, load, snapshot,
     };
 }
 

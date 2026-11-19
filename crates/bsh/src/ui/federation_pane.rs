@@ -25,11 +25,11 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::right_panel::{
-    display_name, enroll_and_grant, federation_status_off, parse_peer, revoke_grant_action,
-    revoke_peer_action, short_node, FederationPeerRow,
+    FederationPeerRow, display_name, enroll_and_grant, federation_status_off, parse_peer,
+    revoke_grant_action, revoke_peer_action, short_node,
 };
 use super::shell::Shell;
-use super::{hairline_all, hairline_bottom, icon, txt, DivExt, IconName};
+use super::{DivExt, IconName, hairline_all, hairline_bottom, icon, txt};
 use crate::theme;
 
 /// The card corner the design uses for every section.
@@ -4417,8 +4417,8 @@ fn switch_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_label, capability_label, capability_label_localized, expose_candidates,
-        grantable_label, grantable_label_with, opaque, FederationActivityState,
+        FederationActivityState, activity_label, capability_label, capability_label_localized,
+        expose_candidates, grantable_label, grantable_label_with, opaque,
     };
     use crate::extension::host::NodeToolInfo;
     use crate::i18n::Lang;

@@ -29,9 +29,9 @@ use agent::mcp::adapter::{McpCallRecord, McpGovernance};
 use agent::mcp::policy::{McpDecision, McpPolicy};
 use agent::mcp::{McpClient, McpToolAdapter};
 use agent::policy::{Action, PolicyInput, Target};
-use react::tool::registry::AsyncTool;
 use react::tool::ToolError;
-use serde_json::{json, Value};
+use react::tool::registry::AsyncTool;
+use serde_json::{Value, json};
 
 use crate::settings::mcp::{McpServer, McpTransport};
 
@@ -874,7 +874,7 @@ mod tests {
     #[test]
     fn a_workspace_policy_can_refuse_an_mcp_stdio_spawn() {
         use agent::policy::{
-            baseline_source, EgressGate, PolicyData, PolicySet, PolicySource, SystemResolver,
+            EgressGate, PolicyData, PolicySet, PolicySource, SystemResolver, baseline_source,
         };
 
         let deny = PolicySource::new(

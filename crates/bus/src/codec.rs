@@ -4,10 +4,10 @@
 //! instance the bus uses.
 
 use rkyv::{
-    rancor::{Error, Strategy},
-    ser::{allocator::ArenaHandle, sharing::Share, Serializer},
-    util::AlignedVec,
     Archive, Serialize,
+    rancor::{Error, Strategy},
+    ser::{Serializer, allocator::ArenaHandle, sharing::Share},
+    util::AlignedVec,
 };
 
 /// Stateless rkyv codec for the bus wire format.

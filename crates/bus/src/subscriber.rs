@@ -1,8 +1,8 @@
 //! Zenoh subscriber wrapper with simplified API
 
-use rkyv::{api::high::HighDeserializer, rancor::Error, Archive, Deserialize};
+use rkyv::{Archive, Deserialize, api::high::HighDeserializer, rancor::Error};
 
-use crate::{error::ZenohError, Codec, Session};
+use crate::{Codec, Session, error::ZenohError};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use zenoh::sample::Sample;

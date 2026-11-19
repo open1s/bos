@@ -10,8 +10,8 @@ use react::llm::{
 };
 use react::runtime::app::ReActApp;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use serde_json::Value as JsonValue;
+use serde_json::json;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -212,8 +212,7 @@ pub fn looks_like_context_overflow(detail: &str) -> bool {
 pub const COMPACTION_MAX_OUTPUT_TOKENS: u32 = 4_096;
 
 /// The marker a bounded digest puts where it omitted the span's middle.
-pub const COMPACTION_OMISSION: &str =
-    "[... the middle of this span was omitted so the compaction request fits the summarizer budget ...]";
+pub const COMPACTION_OMISSION: &str = "[... the middle of this span was omitted so the compaction request fits the summarizer budget ...]";
 
 /// Render the shadowed span as the plain text a summarizer reads.
 ///

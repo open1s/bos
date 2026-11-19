@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent::SteerMailbox;
 use agent::goal::GoalState;
 use agent::tools::{GoalSettle, GoalStore};
-use agent::SteerMailbox;
 
 use crate::i18n::Lang;
 use crate::model::{
@@ -6544,7 +6544,7 @@ mod tests {
     /// other suffix an objective, and `/plan off` the one non-objective word.
     #[test]
     fn the_slash_command_line_grammar_is_the_references() {
-        use super::{parse_slash_line, GoalRequest, PlanRequest, SlashLine};
+        use super::{GoalRequest, PlanRequest, SlashLine, parse_slash_line};
         assert_eq!(
             parse_slash_line("/plan"),
             Some(SlashLine::Plan(PlanRequest::On))
@@ -7656,9 +7656,11 @@ mod tests {
     fn an_automatic_compaction_records_the_marker_and_keeps_durable_state() {
         use crate::model::{ChatMessage, PlanItem, PlanStatus};
         let (mut state, id) = goal_state("compact-auto");
-        assert!(state
-            .create_goal(&id, "survive automatic compaction")
-            .is_ok());
+        assert!(
+            state
+                .create_goal(&id, "survive automatic compaction")
+                .is_ok()
+        );
         state.set_plan_mode(&id, true);
         {
             let session = state.store.session_mut(&id).expect("the session");
@@ -7770,7 +7772,7 @@ mod tests {
     /// refusal, and it is a command even when the slash card is closed.
     #[test]
     fn the_compact_grammar_is_argument_free() {
-        use super::{parse_slash_line, SlashLine};
+        use super::{SlashLine, parse_slash_line};
         assert_eq!(
             parse_slash_line("/compact"),
             Some(SlashLine::Compact(String::new()))
@@ -9198,10 +9200,11 @@ mod tests {
                 .is_file(),
             "launch must ensure the active workspace's policy template: {root:?}"
         );
-        assert!(root
-            .join(".bsh")
-            .join(crate::workspace_templates::ALLOWLIST_TEMPLATE_NAME)
-            .is_file());
+        assert!(
+            root.join(".bsh")
+                .join(crate::workspace_templates::ALLOWLIST_TEMPLATE_NAME)
+                .is_file()
+        );
         assert!(
             root.join(".bsh")
                 .join(crate::workspace_templates::TERMINAL_TEMPLATE_NAME)
@@ -9221,19 +9224,23 @@ mod tests {
         let mut state =
             super::AppState::with_store(crate::store::Store::open_at(base.join("store")));
         state.set_preset_trusted("strict", true);
-        assert!(state
-            .draft()
-            .global
-            .presets
-            .get("strict")
-            .is_some_and(|preset| preset.trusted));
+        assert!(
+            state
+                .draft()
+                .global
+                .presets
+                .get("strict")
+                .is_some_and(|preset| preset.trusted)
+        );
         state.set_preset_trusted("strict", false);
-        assert!(!state
-            .draft()
-            .global
-            .presets
-            .get("strict")
-            .is_some_and(|preset| preset.trusted));
+        assert!(
+            !state
+                .draft()
+                .global
+                .presets
+                .get("strict")
+                .is_some_and(|preset| preset.trusted)
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -9468,10 +9475,12 @@ mod tests {
         assert!(!state.turn_extension_activations.contains_key(&id));
         assert!(!state.turn_policy_generation.contains_key(&id));
         assert!(!state.inbox.contains_key(&id));
-        assert!(!state
-            .steering
-            .values()
-            .any(|steering| steering.session == id));
+        assert!(
+            !state
+                .steering
+                .values()
+                .any(|steering| steering.session == id)
+        );
 
         let parked = state
             .trash()

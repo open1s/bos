@@ -12,13 +12,13 @@ use std::sync::Arc;
 use crate::extension::host::{DiagnosticsReport, ExtensionHost, ExtensionStatus, HostConfig};
 use ferris_sdk::capability::{Capability, GrantScope};
 use ferris_sdk::core_manifest::MANIFEST_FILE;
-use ferris_sdk::host_runtime::declarative::{load_contributions, DeclarativeRuntime};
+use ferris_sdk::host_runtime::declarative::{DeclarativeRuntime, load_contributions};
 use ferris_sdk::host_runtime::mcp::McpRuntime;
 use ferris_sdk::host_runtime::process::ProcessRuntime;
-use ferris_sdk::package::{is_ignored, package_hash, package_hash_at_rev, ExtensionStore, Package};
+use ferris_sdk::package::{ExtensionStore, Package, is_ignored, package_hash, package_hash_at_rev};
 use ferris_sdk::resolver;
 use ferris_sdk::signing::{
-    generate_key, sign_package, verify_package, SignatureVerification, TrustStore,
+    SignatureVerification, TrustStore, generate_key, sign_package, verify_package,
 };
 use ferris_sdk::sources::{self, RegistryList};
 use ferris_sdk::types::{ExtensionId, ExtensionSource, RuntimeKind, TrustLevel};
@@ -2107,9 +2107,11 @@ source_path = "{source_path}"
         let target = root.join("target");
         super::command_reproduce(&[lock_path.display().to_string()], Some(target.clone()))
             .expect("reproduce");
-        assert!(target
-            .join("installed/com.example.reproduced/1.0.0/extension.toml")
-            .is_file());
+        assert!(
+            target
+                .join("installed/com.example.reproduced/1.0.0/extension.toml")
+                .is_file()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]

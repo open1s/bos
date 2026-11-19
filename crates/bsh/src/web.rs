@@ -43,7 +43,7 @@ use std::time::Duration;
 use agent::policy::{EgressGate, PolicySet, SystemResolver};
 use agent::tools::{AsyncFunctionTool, DeclaredAsyncTool};
 use agent::{Agent, ToolError};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// The shipped endpoint: the DeepSeek Search and Fetch API base, without an
 /// operation name (this tool appends the configured path, `/search`).

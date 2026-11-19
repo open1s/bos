@@ -56,8 +56,8 @@
 //! this reader finds it; the model's own catalogue and its `load_skill` tool
 //! use `agent::skills::lookup_for_model`, so the two paths cannot disagree.
 
-use agent::skills::SkillContent;
 use agent::Agent;
+use agent::skills::SkillContent;
 use react::llm::{Content, ContentPart};
 
 use crate::model::SkillInvocation;

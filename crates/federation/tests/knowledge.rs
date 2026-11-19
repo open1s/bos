@@ -2,8 +2,9 @@
 
 use capability::NodeId;
 use federation::{
-    knowledge_hash, KnowledgeAudit, KnowledgeClass, KnowledgeError, KnowledgeItem, KnowledgeOrigin,
+    KnowledgeAudit, KnowledgeClass, KnowledgeError, KnowledgeItem, KnowledgeOrigin,
     KnowledgePublication, KnowledgePurpose, KnowledgeQuery, KnowledgeService, Provenance,
+    knowledge_hash,
 };
 use serde_json::json;
 

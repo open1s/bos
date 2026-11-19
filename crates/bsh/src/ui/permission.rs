@@ -49,9 +49,9 @@
 //! audit, and a row cannot mention it without outgrowing the scannable shape.
 
 use crate::caps::WorkspaceEgress;
-use crate::i18n::{tr, tr_args, Lang};
-use crate::settings::resolve::{PermissionResolution, SandboxResolution};
+use crate::i18n::{Lang, tr, tr_args};
 use crate::settings::Effective;
+use crate::settings::resolve::{PermissionResolution, SandboxResolution};
 use crate::state::AppState;
 
 /// The three modes, in the reference's own order.
@@ -595,12 +595,16 @@ mod tests {
         let none: Vec<String> = Vec::new();
         let open = absent(&none);
         for mode in MODES {
-            assert!(!mode
-                .consequence(Lang::En, false, ShellRelease::None, &open)
-                .is_empty());
-            assert!(!mode
-                .consequence(Lang::Zh, false, ShellRelease::None, &open)
-                .is_empty());
+            assert!(
+                !mode
+                    .consequence(Lang::En, false, ShellRelease::None, &open)
+                    .is_empty()
+            );
+            assert!(
+                !mode
+                    .consequence(Lang::Zh, false, ShellRelease::None, &open)
+                    .is_empty()
+            );
         }
     }
 

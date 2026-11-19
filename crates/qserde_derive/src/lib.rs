@@ -8,7 +8,7 @@ use proc_macro::TokenStream;
 
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{parse_macro_input, Attribute, Error, Item, Path, Result, Token};
+use syn::{Attribute, Error, Item, Path, Result, Token, parse_macro_input};
 
 struct ArchiveArgs {
     crate_path: Option<Path>,

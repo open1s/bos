@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use agent::composition::{compose, parse, prompt, ComposeError};
+use agent::composition::{ComposeError, compose, parse, prompt};
 use capability::composition::LocalScope;
 use capability::descriptor::OutputContract;
 use capability::proposal::{ProposalError, ProposalPolicy};
