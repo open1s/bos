@@ -5129,7 +5129,7 @@ pub(crate) fn read_files_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "read_files",
-        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next_offset (the 1-based line to read next in that file, or null when it is fully read). offset and limit apply to every file. To continue one cut file, call read_file with that file's path and its next_offset as offset. Combined content is capped at 1 MiB; inspect each entry's truncated or error field.",
+        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next_offset (the 1-based line to read next in that file, or null when it is fully read). offset and limit apply to every file. To continue one cut file, call read_files again with only that path and its next_offset as offset. Combined content is capped at 1 MiB; inspect each entry's truncated or error field.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -5148,7 +5148,7 @@ pub(crate) fn read_files_tool(
                 "offset": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional 1-based starting line, applied to EVERY file in this call; defaults to 1. To continue one cut file, call read_file with only that path and its next_offset."
+                    "description": "Optional 1-based starting line, applied to EVERY file in this call; defaults to 1. To continue one cut file, call again with only that path and its next_offset."
                 },
                 "limit": {
                     "type": "integer",
@@ -5251,7 +5251,7 @@ pub(crate) fn read_files_tool(
                             "next_offset": offset.unwrap_or(1),
                             "reason": "combined batch output budget reached",
                             "hint": format!(
-                                "the batch byte budget is spent; to read this file, call read_file with offset={}",
+                                "the batch byte budget is spent; to read this file, call read_files again with only this path and offset={}",
                                 offset.unwrap_or(1)
                             )
                         }));
@@ -5318,7 +5318,7 @@ pub(crate) fn read_files_tool(
                         // One continuation field: the hint names `next_offset`
                         // and the number to pass as `offset`.
                         file_result["hint"] = serde_json::json!(format!(
-                            "more lines remain; to continue this file, call read_file with offset={next_offset} (its next_offset)"
+                            "more lines remain; to continue this file, call read_files again with only this path and offset={next_offset} (its next_offset)"
                         ));
                     }
                     if past_end {
@@ -11724,7 +11724,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(result["files"][2]["next_offset"], 1);
         let hint = result["files"][2]["hint"].as_str().unwrap_or_default();
         assert!(
-            hint.contains("budget") && hint.contains("read_file") && hint.contains("offset=1"),
+            hint.contains("budget") && hint.contains("read_files") && hint.contains("offset=1"),
             "the spent-budget entry is actionable: {result}"
         );
     }
@@ -11755,7 +11755,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert!(result["files"][0].get("next").is_none());
         let hint = result["files"][0]["hint"].as_str().unwrap_or_default();
         assert!(
-            hint.contains("read_file") && hint.contains("offset=5"),
+            hint.contains("read_files") && hint.contains("offset=5"),
             "the cut entry says which file tool and line to continue with: {result}"
         );
         assert!(

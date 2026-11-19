@@ -393,8 +393,8 @@ an offset past EOF are distinguished by `status` and `hint`, because empty
 `content` alone reads as "the file is empty". A batch cut in the middle of a
 line points `next_offset` at that same line, so the continuation re-reads the
 partial line instead of skipping it. `read_files` applies `offset`/`limit` to
-every file, so continuing one cut entry means calling `read_file` (or
-`read_files`) with only that path and the entry's `next_offset`. A first line larger than the read-window
+every file, so continuing one cut entry means calling `read_files` again with
+only that path and the entry's `next_offset` as `offset`. A first line larger than the read-window
 ceiling is refused rather than returned as an empty page whose `next_offset`
 would point at the same line forever.
 
