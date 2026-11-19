@@ -273,6 +273,94 @@ pub(crate) fn merge(global: &[McpServer], workspace: &[McpServer]) -> Vec<McpSer
     merged
 }
 
+/// Split the form's argument text the way a shell would.
+///
+/// The args field is one line of text, so an argument that needs a space has to
+/// be quotable: `-m "pkg.module"` is two arguments and the quotes are syntax,
+/// never part of the module name. Splitting on whitespace alone kept them, so
+/// `python -m "mcp_server_tree_sitter.server"` asked Python for a module
+/// literally named `"mcp_server_tree_sitter.server"` and died at once, which the
+/// pool could only report as a server that closed its stdout.
+///
+/// An unmatched quote is not an error: the pane's text is half-typed most of the
+/// time, so the quote is dropped and the rest of the line is kept.
+pub(crate) fn split_args(text: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    for character in text.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            started = true;
+            continue;
+        }
+        match character {
+            '\\' if !single => {
+                escaped = true;
+                started = true;
+            }
+            '\'' if !double => {
+                single = !single;
+                started = true;
+            }
+            '"' if !single => {
+                double = !double;
+                started = true;
+            }
+            separator if separator.is_whitespace() && !single && !double => {
+                if started {
+                    args.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            other => {
+                current.push(other);
+                started = true;
+            }
+        }
+    }
+    if escaped {
+        // A trailing backslash is literal text, not a dangling escape.
+        current.push('\\');
+    }
+    if started {
+        args.push(current);
+    }
+    args
+}
+
+/// Render args back into the form's text, so an edit and a save round-trip.
+pub(crate) fn join_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Quote one argument when a [`split_args`] pass would otherwise change it.
+fn quote_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty()
+        || arg
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '"' | '\'' | '\\'));
+    if !needs_quotes {
+        return arg.to_string();
+    }
+    let mut quoted = String::from("\"");
+    for character in arg.chars() {
+        if matches!(character, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +572,37 @@ mod tests {
             url: "https://b.example".to_string(),
         };
         assert_ne!(reconnected.signature(), http.signature());
+    }
+
+    #[test]
+    fn argument_text_splits_the_way_a_shell_does() {
+        assert_eq!(
+            split_args(r#"-m "mcp_server_tree_sitter.server" --root "/a b""#),
+            vec![
+                "-m".to_string(),
+                "mcp_server_tree_sitter.server".to_string(),
+                "--root".to_string(),
+                "/a b".to_string(),
+            ]
+        );
+        assert_eq!(split_args(" -y   ''  x "), vec!["-y", "", "x"]);
+        assert_eq!(split_args(r"a\ b"), vec!["a b"]);
+        assert_eq!(split_args(""), Vec::<String>::new());
+        assert_eq!(split_args(r"trailing\"), vec!["trailing\\"]);
+        assert_eq!(split_args("'single quoted'"), vec!["single quoted"]);
+        assert_eq!(split_args(r#"x="a b" y"#), vec!["x=a b", "y"]);
+    }
+
+    #[test]
+    fn args_round_trip_through_the_form_text() {
+        let args = vec![
+            "-m".to_string(),
+            "mcp_server_tree_sitter.server".to_string(),
+            "/a b".to_string(),
+            "quote\"inside".to_string(),
+            String::new(),
+            "back\\slash".to_string(),
+        ];
+        assert_eq!(split_args(&join_args(&args)), args);
     }
 }

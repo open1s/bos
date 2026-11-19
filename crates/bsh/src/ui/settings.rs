@@ -18,7 +18,7 @@ use super::shell::{ModelRowEditor, ModelsAddRoute, PresetEditor, SettingsToast, 
 use super::{DivExt, IconName, hairline_all, hairline_bottom, hairline_top, icon, txt};
 use crate::i18n::{Lang, tr, tr_args};
 use crate::settings::Settings;
-use crate::settings::mcp::{McpScope, McpServer, McpTransport};
+use crate::settings::mcp::{McpScope, McpServer, McpTransport, join_args, split_args};
 use crate::settings::resolve::DiscoveredSkill;
 use crate::theme;
 
@@ -13022,7 +13022,7 @@ impl Shell {
             Some(server) => {
                 let (command, args, url, http) = match &server.transport {
                     McpTransport::Stdio { command, args } => {
-                        (command.clone(), args.join(" "), String::new(), false)
+                        (command.clone(), join_args(args), String::new(), false)
                     }
                     McpTransport::Http { url } => (String::new(), String::new(), url.clone(), true),
                 };
@@ -13088,13 +13088,7 @@ impl Shell {
         } else {
             McpTransport::Stdio {
                 command: self.mcp_command.read(cx).value().trim().to_string(),
-                args: self
-                    .mcp_args
-                    .read(cx)
-                    .value()
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect(),
+                args: split_args(&self.mcp_args.read(cx).value()),
             }
         };
         // An edit keeps the row's enabled state: changing an address must not
