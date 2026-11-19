@@ -340,6 +340,26 @@ mod tests {
         command.spawn().expect("a sleeper")
     }
 
+    /// Block until the OS exposes `token` in the pid's argv.
+    ///
+    /// `Command::spawn` returns before the child's exec is always observable:
+    /// for a moment `/proc/<pid>/cmdline` is empty, and `process_info`
+    /// correctly reports that as unreadable instead of guessing. Production
+    /// never races here (the orphan was spawned by an earlier process), so the
+    /// wait belongs in the test - without it this test measures the spawn
+    /// window, not the reaper.
+    fn wait_for_argv(pid: u32, token: &str) {
+        let table = SystemProcesses;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if table.argv(pid).is_some_and(|argv| argv.contains(token)) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("pid {pid} never reported {token} in its argv");
+    }
+
     #[test]
     fn the_reaper_kills_exactly_the_marker_carrying_orphan() {
         let dir = scratch("kill");
@@ -349,6 +369,8 @@ mod tests {
         let mut unmarked = spawn_sleeper(&foreign, false);
         let marked_pid = marked.id();
         let unmarked_pid = unmarked.id();
+        wait_for_argv(marked_pid, &owned);
+        wait_for_argv(unmarked_pid, "unrelated-token");
 
         // Both look orphaned to the fake table; only one carries the marker in
         // its REAL argv, which is the identification that matters.
