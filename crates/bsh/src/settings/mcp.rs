@@ -41,6 +41,12 @@ pub(crate) enum McpTransport {
     Http {
         /// The endpoint's URL.
         url: String,
+        /// Extra request headers, in the order the pane wrote them.
+        ///
+        /// This is where a credential lives: `Authorization: Bearer …` or
+        /// `X-API-Key: …`. The shape is the `headers` object every MCP client
+        /// uses, so an entry pasted from another client keeps its credentials.
+        headers: Vec<(String, String)>,
     },
 }
 
@@ -72,6 +78,8 @@ pub(crate) enum McpRefusal {
     UrlEmpty,
     /// The URL is not an http(s) endpoint.
     UrlScheme,
+    /// A header cannot be sent: the name is not a token, or the value spans lines.
+    HeaderInvalid,
     /// The entry an edit started from is no longer in its document.
     NotFound,
 }
@@ -86,6 +94,7 @@ impl McpRefusal {
             Self::CommandEmpty => "settings.mcpNeedsCommand",
             Self::UrlEmpty => "settings.mcpNeedsUrl",
             Self::UrlScheme => "settings.mcpUrlScheme",
+            Self::HeaderInvalid => "settings.mcpHeaderInvalid",
             Self::NotFound => "settings.mcpMissing",
         }
     }
@@ -114,6 +123,7 @@ impl McpServer {
         {
             Some(url) => McpTransport::Http {
                 url: url.to_string(),
+                headers: read_headers(value.get("headers")),
             },
             None => {
                 let command = value
@@ -158,8 +168,15 @@ impl McpServer {
                     map.insert("args".to_string(), json!(args));
                 }
             }
-            McpTransport::Http { url } => {
+            McpTransport::Http { url, headers } => {
                 map.insert("url".to_string(), json!(url));
+                if !headers.is_empty() {
+                    let mut object = Map::new();
+                    for (name, value) in headers {
+                        object.insert(name.clone(), Value::String(value.clone()));
+                    }
+                    map.insert("headers".to_string(), Value::Object(object));
+                }
             }
         }
         // Enabled is the default, so only the exception is written.
@@ -178,7 +195,7 @@ impl McpServer {
             McpTransport::Stdio { command, args } => {
                 format!("stdio · {command} {}", args.join(" "))
             }
-            McpTransport::Http { url } => format!("http · {url}"),
+            McpTransport::Http { url, .. } => format!("http · {url}"),
         }
     }
 
@@ -188,7 +205,14 @@ impl McpServer {
             McpTransport::Stdio { command, args } => {
                 format!("{}|stdio|{}|{}", self.name, command, args.join(""))
             }
-            McpTransport::Http { url } => format!("{}|http|{}", self.name, url),
+            McpTransport::Http { url, headers } => {
+                format!(
+                    "{}|http|{}|{}",
+                    self.name,
+                    url,
+                    headers_fingerprint(headers)
+                )
+            }
         }
     }
 
@@ -235,7 +259,7 @@ fn validate_transport(server: &McpServer) -> Result<(), McpRefusal> {
         McpTransport::Stdio { command, .. } if command.trim().is_empty() => {
             Err(McpRefusal::CommandEmpty)
         }
-        McpTransport::Http { url } => {
+        McpTransport::Http { url, headers } => {
             let url = url.trim();
             if url.is_empty() {
                 return Err(McpRefusal::UrlEmpty);
@@ -243,10 +267,106 @@ fn validate_transport(server: &McpServer) -> Result<(), McpRefusal> {
             if !(url.starts_with("http://") || url.starts_with("https://")) {
                 return Err(McpRefusal::UrlScheme);
             }
+            if headers
+                .iter()
+                .any(|(name, value)| !header_name_is_valid(name) || !header_value_is_valid(value))
+            {
+                return Err(McpRefusal::HeaderInvalid);
+            }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// Read the `headers` object an entry carries.
+///
+/// A non-string value is dropped rather than guessed at, and a blank name is
+/// ignored: this is the shape a pasted entry may arrive in.
+fn read_headers(value: Option<&Value>) -> Vec<(String, String)> {
+    value
+        .and_then(Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .filter(|(name, _)| !name.trim().is_empty())
+                .filter_map(|(name, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (name.trim().to_string(), value.trim().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A stable fingerprint of the configured headers.
+///
+/// The signature decides whether a live connection can be reused, so a changed
+/// credential must change it. Hashing keeps the credential itself out of any
+/// string that reaches a log line.
+fn headers_fingerprint(headers: &[(String, String)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    headers.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether a header name is an RFC 9110 token.
+fn header_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '|'
+                        | '~'
+                )
+        })
+}
+
+/// Whether a header value is a single line of visible text.
+fn header_value_is_valid(value: &str) -> bool {
+    !value.contains(['\r', '\n'])
+}
+
+/// Parse the headers field: one `Name: value` per line.
+///
+/// A line without a colon, or with a blank name, is skipped: the field is
+/// half-typed most of the time, and refusing the whole entry mid-edit would
+/// lose the lines already written.
+pub(crate) fn parse_headers(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Render headers back into the form's text, so an edit and a save round-trip.
+pub(crate) fn format_headers(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Read every entry one document holds.
@@ -392,6 +512,7 @@ mod tests {
             http.transport,
             McpTransport::Http {
                 url: "https://mcp.example/v1".to_string(),
+                headers: Vec::new(),
             }
         );
         assert_eq!(http.scope, McpScope::Workspace);
@@ -450,6 +571,7 @@ mod tests {
             name: "github".to_string(),
             transport: McpTransport::Http {
                 url: "https://a.example".to_string(),
+                headers: Vec::new(),
             },
             enabled: true,
             scope: McpScope::Global,
@@ -457,6 +579,7 @@ mod tests {
         let mut candidate = existing.clone();
         candidate.transport = McpTransport::Http {
             url: "https://b.example".to_string(),
+            headers: Vec::new(),
         };
         assert_eq!(
             candidate.validate(std::slice::from_ref(&existing), None),
@@ -488,6 +611,7 @@ mod tests {
             name: "a".to_string(),
             transport: McpTransport::Http {
                 url: "  ".to_string(),
+                headers: Vec::new(),
             },
             enabled: true,
             scope: McpScope::Global,
@@ -497,6 +621,7 @@ mod tests {
             name: "a".to_string(),
             transport: McpTransport::Http {
                 url: "mcp.example".to_string(),
+                headers: Vec::new(),
             },
             enabled: true,
             scope: McpScope::Global,
@@ -511,6 +636,7 @@ mod tests {
                 name: "one".to_string(),
                 transport: McpTransport::Http {
                     url: "https://global.example/one".to_string(),
+                    headers: Vec::new(),
                 },
                 enabled: true,
                 scope: McpScope::Global,
@@ -519,6 +645,7 @@ mod tests {
                 name: "two".to_string(),
                 transport: McpTransport::Http {
                     url: "https://global.example/two".to_string(),
+                    headers: Vec::new(),
                 },
                 enabled: true,
                 scope: McpScope::Global,
@@ -529,6 +656,7 @@ mod tests {
                 name: "two".to_string(),
                 transport: McpTransport::Http {
                     url: "https://local.example/two".to_string(),
+                    headers: Vec::new(),
                 },
                 enabled: false,
                 scope: McpScope::Workspace,
@@ -537,6 +665,7 @@ mod tests {
                 name: "three".to_string(),
                 transport: McpTransport::Http {
                     url: "https://local.example/three".to_string(),
+                    headers: Vec::new(),
                 },
                 enabled: true,
                 scope: McpScope::Workspace,
@@ -555,6 +684,7 @@ mod tests {
             name: "docs".to_string(),
             transport: McpTransport::Http {
                 url: "https://a.example".to_string(),
+                headers: Vec::new(),
             },
             enabled: true,
             scope: McpScope::Global,
@@ -570,6 +700,7 @@ mod tests {
         let mut reconnected = http.clone();
         reconnected.transport = McpTransport::Http {
             url: "https://b.example".to_string(),
+            headers: Vec::new(),
         };
         assert_ne!(reconnected.signature(), http.signature());
     }
@@ -604,5 +735,84 @@ mod tests {
             "back\\slash".to_string(),
         ];
         assert_eq!(split_args(&join_args(&args)), args);
+    }
+
+    #[test]
+    fn an_http_entry_keeps_its_headers() {
+        let server = McpServer::parse(
+            &json!({
+                "name": "broker",
+                "url": "http://127.0.0.1:8080",
+                "headers": {"Authorization": "Bearer secret", "X-API-Key": "k"}
+            }),
+            McpScope::Global,
+        )
+        .expect("an http entry");
+        let McpTransport::Http { headers, .. } = &server.transport else {
+            panic!("an http entry is an HTTP transport");
+        };
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "Authorization" && value == "Bearer secret"),
+            "{headers:?}"
+        );
+        let written = server.to_value();
+        assert_eq!(written["headers"]["Authorization"], json!("Bearer secret"));
+    }
+
+    #[test]
+    fn a_header_that_cannot_be_sent_is_refused() {
+        let server = McpServer {
+            name: "broker".to_string(),
+            transport: McpTransport::Http {
+                url: "http://127.0.0.1:8080".to_string(),
+                headers: vec![("Bad Name".to_string(), "x".to_string())],
+            },
+            enabled: true,
+            scope: McpScope::Global,
+        };
+        assert_eq!(server.validate(&[], None), Err(McpRefusal::HeaderInvalid));
+        let injected = McpServer {
+            transport: McpTransport::Http {
+                url: "http://127.0.0.1:8080".to_string(),
+                headers: vec![("X-Key".to_string(), "a\r\nInjected: 1".to_string())],
+            },
+            ..server
+        };
+        assert_eq!(injected.validate(&[], None), Err(McpRefusal::HeaderInvalid));
+    }
+
+    #[test]
+    fn a_changed_credential_reconnects() {
+        let server = McpServer {
+            name: "broker".to_string(),
+            transport: McpTransport::Http {
+                url: "http://127.0.0.1:8080".to_string(),
+                headers: vec![("Authorization".to_string(), "Bearer one".to_string())],
+            },
+            enabled: true,
+            scope: McpScope::Global,
+        };
+        let mut changed = server.clone();
+        if let McpTransport::Http { headers, .. } = &mut changed.transport {
+            headers[0].1 = "Bearer two".to_string();
+        }
+        assert_ne!(server.signature(), changed.signature());
+        assert_eq!(server.signature(), server.clone().signature());
+    }
+
+    #[test]
+    fn headers_round_trip_through_the_form_text() {
+        let headers = vec![
+            ("Authorization".to_string(), "Bearer a b".to_string()),
+            ("X-API-Key".to_string(), "k:v".to_string()),
+        ];
+        assert_eq!(parse_headers(&format_headers(&headers)), headers);
+        assert_eq!(
+            parse_headers("Authorization:  x  \n\nbare line\n: empty"),
+            vec![("Authorization".to_string(), "x".to_string())]
+        );
     }
 }

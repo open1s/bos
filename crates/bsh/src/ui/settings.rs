@@ -18,7 +18,9 @@ use super::shell::{ModelRowEditor, ModelsAddRoute, PresetEditor, SettingsToast, 
 use super::{DivExt, IconName, hairline_all, hairline_bottom, hairline_top, icon, txt};
 use crate::i18n::{Lang, tr, tr_args};
 use crate::settings::Settings;
-use crate::settings::mcp::{McpScope, McpServer, McpTransport, join_args, split_args};
+use crate::settings::mcp::{
+    McpScope, McpServer, McpTransport, format_headers, join_args, parse_headers, split_args,
+};
 use crate::settings::resolve::DiscoveredSkill;
 use crate::theme;
 
@@ -6888,6 +6890,27 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The editor's multiline field, for text that is a list (one per line).
+    fn editor_textarea(&self, input: &Entity<TextareaState>, id: String) -> AnyElement {
+        let selector = id.clone();
+        let field = div()
+            .w_full()
+            .h(px(72.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme::page()))
+            .border_1()
+            .border_color(rgb(theme::border()))
+            .p(px(8.0))
+            .child(Textarea::new(input).appearance(false))
+            .into_any_element();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || selector.clone())
+            .w_full()
+            .child(field)
+            .into_any_element()
+    }
+
     /// The editor's protocol segments: a pick writes the open provider's
     /// family protocol, leaving the typed address alone.
     fn api_mode_choices(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -13018,17 +13041,28 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (name, command, args, url, http) = match server {
+        let (name, command, args, url, headers, http) = match server {
             Some(server) => {
-                let (command, args, url, http) = match &server.transport {
-                    McpTransport::Stdio { command, args } => {
-                        (command.clone(), join_args(args), String::new(), false)
-                    }
-                    McpTransport::Http { url } => (String::new(), String::new(), url.clone(), true),
+                let (command, args, url, headers, http) = match &server.transport {
+                    McpTransport::Stdio { command, args } => (
+                        command.clone(),
+                        join_args(args),
+                        String::new(),
+                        String::new(),
+                        false,
+                    ),
+                    McpTransport::Http { url, headers } => (
+                        String::new(),
+                        String::new(),
+                        url.clone(),
+                        format_headers(headers),
+                        true,
+                    ),
                 };
-                (server.name.clone(), command, args, url, http)
+                (server.name.clone(), command, args, url, headers, http)
             }
             None => (
+                String::new(),
                 String::new(),
                 String::new(),
                 String::new(),
@@ -13040,6 +13074,7 @@ impl Shell {
         set(&self.mcp_command, command, window, cx);
         set(&self.mcp_args, args, window, cx);
         set(&self.mcp_url, url, window, cx);
+        set_textarea_value(&self.mcp_headers, headers, window, cx);
         self.mcp_http = http;
     }
 
@@ -13084,6 +13119,7 @@ impl Shell {
         let transport = if self.mcp_http {
             McpTransport::Http {
                 url: self.mcp_url.read(cx).value().trim().to_string(),
+                headers: parse_headers(&self.mcp_headers.read(cx).value()),
             }
         } else {
             McpTransport::Stdio {
@@ -13495,10 +13531,15 @@ impl Shell {
             ))
             .child(self.editor_field("settings.mcpTransport", transport));
         if self.mcp_http {
-            fields = fields.child(self.editor_field(
-                "settings.mcpUrl",
-                self.editor_input(&self.mcp_url, "mcp-field-url".to_string()),
-            ));
+            fields = fields
+                .child(self.editor_field(
+                    "settings.mcpUrl",
+                    self.editor_input(&self.mcp_url, "mcp-field-url".to_string()),
+                ))
+                .child(self.editor_field(
+                    "settings.mcpHeaders",
+                    self.editor_textarea(&self.mcp_headers, "mcp-field-headers".to_string()),
+                ));
         } else {
             fields = fields
                 .child(self.editor_field(

@@ -13759,6 +13759,9 @@ fn the_mcp_pane_manages_the_draft(cx: &mut TestAppContext) {
             this.mcp_url.update(cx, |state, cx| {
                 state.set_value("https://mcp.example/v1".to_string(), window, cx);
             });
+            this.mcp_headers.update(cx, |state, cx| {
+                state.set_value("Authorization: Bearer secret".to_string(), window, cx);
+            });
             this.mcp_save(cx);
         })
     });
@@ -13775,10 +13778,24 @@ fn the_mcp_pane_manages_the_draft(cx: &mut TestAppContext) {
     assert_eq!(
         server.transport,
         McpTransport::Http {
-            url: "https://mcp.example/v1".to_string()
+            url: "https://mcp.example/v1".to_string(),
+            headers: vec![("Authorization".to_string(), "Bearer secret".to_string())],
         },
-        "the edit replaced the transport"
+        "the edit replaced the transport and kept the credential"
     );
+
+    // The form loads the headers back, so an edit is not a silent reset.
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.mcp_begin_edit(McpScope::Global, "github", window, cx);
+            assert_eq!(
+                this.mcp_headers.read(cx).value().to_string(),
+                "Authorization: Bearer secret",
+                "the form shows the stored headers"
+            );
+            this.mcp_cancel(cx);
+        })
+    });
 
     // Disable, then move it into the workspace document.
     cx.update(|_, cx| {
@@ -13832,6 +13849,36 @@ fn the_mcp_pane_manages_the_draft(cx: &mut TestAppContext) {
             .len()
     });
     assert_eq!(workspace, 0, "delete drops the entry");
+}
+
+/// The HTTP form carries the credential slot; the stdio form does not.
+#[gpui::test]
+fn the_mcp_http_form_draws_a_headers_field(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = AppState::with_store(scratch_store("mcp-headers-form"));
+        let shell = cx.new(|cx| Shell::build_for_test(window, section_index("mcp"), state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.mcp_begin_add(window, cx);
+            this.mcp_http = true;
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("mcp-field-headers").is_some(),
+        "an HTTP server form draws the headers field"
+    );
+    cx.update(|window, cx| shell.update(cx, |this, cx| this.mcp_begin_add(window, cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds("mcp-field-headers").is_none(),
+        "a stdio server form does not"
+    );
 }
 
 /// `--settings=mcp` must land on the Extensions pane with the MCP tab chosen:

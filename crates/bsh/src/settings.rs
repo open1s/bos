@@ -1760,6 +1760,7 @@ mod tests {
     fn the_mcp_documents_hold_their_own_servers() {
         let http = |url: &str| McpTransport::Http {
             url: url.to_string(),
+            headers: Vec::new(),
         };
         let mut settings = Settings::default();
         let global = McpServer {

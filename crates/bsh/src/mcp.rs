@@ -98,7 +98,7 @@ impl ExtensionMcp {
                 }
                 text
             }
-            McpTransport::Http { url } => format!("url {url}"),
+            McpTransport::Http { url, .. } => format!("url {url}"),
         };
         let env_keys = self
             .env
@@ -469,7 +469,22 @@ fn extension_server(
         .map(str::trim)
         .filter(|url| !url.is_empty())
     {
-        McpTransport::Http { url: expand(url) }
+        let headers = config
+            .get("headers")
+            .and_then(serde_json::Value::as_object)
+            .map(|headers| {
+                headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value.as_str().map(|value| (expand(name), expand(value)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        McpTransport::Http {
+            url: expand(url),
+            headers,
+        }
     } else {
         let command = config
             .get("command")
@@ -636,9 +651,11 @@ fn connect(
                         .await
                         .map_err(|error| error.to_string())?
                 }
-                McpTransport::Http { url } => {
-                    McpClient::connect_http_with_egress(url.clone(), egress.clone())
-                }
+                McpTransport::Http { url, headers } => McpClient::connect_http_with_headers(
+                    url.clone(),
+                    headers.clone(),
+                    egress.clone(),
+                ),
             };
             client
                 .initialize()

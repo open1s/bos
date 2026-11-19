@@ -9,6 +9,7 @@ pub type EgressSlot =
 /// Posts JSON-RPC messages to an MCP server over streamable HTTP.
 pub struct HttpTransport {
     base_url: String,
+    headers: Vec<(String, String)>,
     session_id: std::sync::Mutex<Option<String>>,
     egress: EgressSlot,
 }
@@ -45,6 +46,27 @@ struct HttpResponse {
     body: String,
 }
 
+/// Header names the transport owns; a configured value must not shadow them.
+const RESERVED_HEADERS: [&str; 4] = [
+    "accept",
+    "content-type",
+    "mcp-protocol-version",
+    "mcp-session-id",
+];
+
+/// The configured headers a request may carry.
+///
+/// The streamable-HTTP contract owns its own header names, so those are
+/// dropped: a configured `Content-Type` would relabel the body, and a stale
+/// `Mcp-Session-Id` would bind the request to the wrong session. Credentials
+/// (`Authorization`, `X-API-Key`, …) pass through untouched.
+fn configured_headers(headers: &[(String, String)]) -> impl Iterator<Item = (&str, &str)> {
+    headers.iter().filter_map(|(name, value)| {
+        let lowered = name.to_ascii_lowercase();
+        (!RESERVED_HEADERS.contains(&lowered.as_str())).then_some((name.as_str(), value.as_str()))
+    })
+}
+
 /// Perform the request and drain the body on a blocking thread.
 ///
 /// `ureq` is synchronous, so both the round trip and reading the response
@@ -55,6 +77,7 @@ fn post_json(
     base_url: &str,
     session_id: Option<String>,
     body: Vec<u8>,
+    headers: &[(String, String)],
     egress: Option<std::sync::Arc<crate::policy::EgressGate>>,
 ) -> Result<HttpResponse, String> {
     // With a gate installed, ureq resolves through the policy. Its resolver is
@@ -76,6 +99,9 @@ fn post_json(
         .header("MCP-Protocol-Version", super::protocol::PROTOCOL_VERSION);
     if let Some(sid) = session_id {
         request = request.header("Mcp-Session-Id", sid);
+    }
+    for (name, value) in configured_headers(headers) {
+        request = request.header(name, value);
     }
 
     let response = request.send(body.as_slice()).map_err(|error| {
@@ -119,6 +145,7 @@ impl HttpTransport {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            headers: Vec::new(),
             session_id: std::sync::Mutex::new(None),
             egress: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -128,9 +155,20 @@ impl HttpTransport {
     pub fn with_egress(base_url: impl Into<String>, egress: EgressSlot) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            headers: Vec::new(),
             session_id: std::sync::Mutex::new(None),
             egress,
         }
+    }
+
+    /// Send `headers` on every request.
+    ///
+    /// This is where a credential rides: `Authorization: Bearer …` or
+    /// `X-API-Key: …`. The protocol's own header names are dropped, so a
+    /// configured entry can never break the streamable-HTTP contract.
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
+        self
     }
 
     /// Install (or clear) the gate this transport asks before a request.
@@ -153,13 +191,15 @@ impl HttpTransport {
         let base_url = self.base_url.clone();
         let body = serde_json::to_vec(msg).map_err(|e| HttpTransportError::Http(e.to_string()))?;
         let session_id = self.session_id.lock().unwrap().clone();
+        let headers = self.headers.clone();
         let egress = self.egress();
 
-        let response =
-            tokio::task::spawn_blocking(move || post_json(&base_url, session_id, body, egress))
-                .await
-                .map_err(|e| HttpTransportError::Http(format!("Join error: {e}")))?
-                .map_err(HttpTransportError::Http)?;
+        let response = tokio::task::spawn_blocking(move || {
+            post_json(&base_url, session_id, body, &headers, egress)
+        })
+        .await
+        .map_err(|e| HttpTransportError::Http(format!("Join error: {e}")))?
+        .map_err(HttpTransportError::Http)?;
 
         if let Some(sid) = response.session_id {
             *self.session_id.lock().unwrap() = Some(sid);
@@ -257,15 +297,68 @@ mod tests {
 
     /// Serve exactly one HTTP response, then close.
     fn serve_once(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
+        let (url, handle) = serve_once_capturing(response);
+        (
+            url,
+            std::thread::spawn(move || {
+                let _ = handle.join();
+            }),
+        )
+    }
+
+    /// Like [`serve_once`], but hands back the request bytes it read, so a test
+    /// can prove which headers went on the wire.
+    fn serve_once_capturing(response: &'static [u8]) -> (String, std::thread::JoinHandle<Vec<u8>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("local addr");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
             let mut buffer = [0u8; 8192];
-            let _ = std::io::Read::read(&mut stream, &mut buffer);
+            let read = std::io::Read::read(&mut stream, &mut buffer).unwrap_or(0);
             std::io::Write::write_all(&mut stream, response).expect("write response");
+            buffer[..read].to_vec()
         });
         (format!("http://{address}/mcp"), handle)
+    }
+
+    #[test]
+    fn configured_headers_drop_the_protocol_names() {
+        let configured = vec![
+            ("Authorization".to_string(), "Bearer secret".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("Mcp-Session-Id".to_string(), "stale".to_string()),
+        ];
+        let kept: Vec<(&str, &str)> = configured_headers(&configured).collect();
+        assert_eq!(kept, vec![("Authorization", "Bearer secret")]);
+    }
+
+    #[tokio::test]
+    async fn a_configured_credential_reaches_the_request() {
+        let (url, handle) = serve_once_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        let transport = HttpTransport::new(url).with_headers(vec![
+            ("Authorization".to_string(), "Bearer secret".to_string()),
+            ("Content-Type".to_string(), "text/plain".to_string()),
+        ]);
+        transport
+            .send(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+            .await
+            .expect("a response");
+        let request =
+            String::from_utf8_lossy(&handle.join().expect("server thread")).to_ascii_lowercase();
+        assert!(
+            request.contains("authorization: bearer secret"),
+            "{request}"
+        );
+        assert!(
+            !request.contains("content-type: text/plain"),
+            "the protocol owns Content-Type: {request}"
+        );
+        assert!(
+            request.contains(r#""method":"ping""#),
+            "the JSON-RPC body is sent: {request:?}"
+        );
     }
 
     /// A stream may carry notifications before the response; the response is
@@ -321,7 +414,7 @@ mod tests {
               Mcp-Session-Id: session-7\r\nContent-Length: 11\r\n\
               Connection: close\r\n\r\n{\"ok\":true}",
         );
-        let response = post_json(&url, None, b"{}".to_vec(), None).expect("request succeeds");
+        let response = post_json(&url, None, b"{}".to_vec(), &[], None).expect("request succeeds");
         handle.join().expect("server thread");
 
         assert_eq!(response.status, 200);
@@ -333,8 +426,14 @@ mod tests {
     fn post_json_forwards_the_session_header() {
         let (url, handle) =
             serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
-        let response =
-            post_json(&url, Some("session-1".to_string()), b"{}".to_vec(), None).expect("request");
+        let response = post_json(
+            &url,
+            Some("session-1".to_string()),
+            b"{}".to_vec(),
+            &[],
+            None,
+        )
+        .expect("request");
         handle.join().expect("server thread");
         assert_eq!(response.body, "{}");
     }
@@ -359,7 +458,7 @@ mod tests {
             "mcp",
         ));
         let url = format!("http://{address}/mcp");
-        let error = post_json(&url, None, b"{}".to_vec(), Some(gate))
+        let error = post_json(&url, None, b"{}".to_vec(), &[], Some(gate))
             .expect_err("the empty allowlist denies 127.0.0.1");
         assert!(
             error.contains("egress-not-allowlisted"),
@@ -396,7 +495,7 @@ mod tests {
             "preset",
             "mcp",
         ));
-        let response = post_json(&url, None, b"{}".to_vec(), Some(gate))
+        let response = post_json(&url, None, b"{}".to_vec(), &[], Some(gate))
             .expect("an allowlisted address connects");
         handle.join().expect("server thread");
         assert_eq!(response.body, "{\"ok\":true}");
@@ -421,7 +520,7 @@ mod tests {
             request
         });
         let url = format!("http://{address}/mcp");
-        post_json(&url, None, b"{}".to_vec(), None).expect("request");
+        post_json(&url, None, b"{}".to_vec(), &[], None).expect("request");
         let request = handle.join().expect("server thread").to_ascii_lowercase();
         assert!(
             request.contains("mcp-protocol-version: 2025-03-26"),

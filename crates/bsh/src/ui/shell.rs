@@ -1102,6 +1102,8 @@ pub(crate) struct Shell {
     pub(crate) mcp_command: Entity<InputState>,
     pub(crate) mcp_args: Entity<InputState>,
     pub(crate) mcp_url: Entity<InputState>,
+    /// The form's request headers, one `Name: value` per line (HTTP only).
+    pub(crate) mcp_headers: Entity<TextareaState>,
     /// Live subscriptions (input events).
     _subs: Vec<Subscription>,
 }
@@ -1980,6 +1982,7 @@ impl Shell {
         let mcp_command = cx.new(|cx| InputState::new(window, cx));
         let mcp_args = cx.new(|cx| InputState::new(window, cx));
         let mcp_url = cx.new(|cx| InputState::new(window, cx));
+        let mcp_headers = cx.new(|cx| TextareaState::new(window, cx));
         let settings_inputs = SettingsInputs::new(window, state.lang, cx);
         let vault_inputs = VaultInputs::new(window, state.lang, cx);
         // The passphrase fields repaint the strength and mismatch notes as they
@@ -2331,6 +2334,7 @@ impl Shell {
             mcp_command,
             mcp_args,
             mcp_url,
+            mcp_headers,
             transcript_scroll: ScrollHandle::new(),
             changes_preview_scroll: ScrollHandle::new(),
             turn_index_cache: std::cell::RefCell::new(TurnIndexCache::default()),

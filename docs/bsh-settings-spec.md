@@ -347,11 +347,20 @@ workspace's is the project's; a workspace entry with the same name wins. An
 entry with no `name` cannot be matched, so it is appended rather than dropped.
 The global order survives and a collision is replaced in place.
 
-An entry is `{name, command, args}` for a stdio server or `{name, url}` for a
-streamable HTTP one, plus an optional `enabled` (default `true`) so a server
-can be parked without deleting it. The name is the tool namespace, so it is
-limited to `[A-Za-z0-9._-]`: the registry exposes a server's tool as
-`<name>_<tool>`.
+An entry is `{name, command, args}` for a stdio server or `{name, url,
+headers}` for a streamable HTTP one, plus an optional `enabled` (default
+`true`) so a server can be parked without deleting it. The name is the tool
+namespace, so it is limited to `[A-Za-z0-9._-]`: the registry exposes a
+server's tool as `<name>_<tool>`.
+
+`headers` is the credential slot: `{"Authorization": "Bearer ..."}` or
+`{"X-API-Key": "..."}`, sent on every JSON-RPC request so a server that
+answers 401 without a key works. The pane edits it as one `Name: value` per
+line and stores it as the object every MCP client uses, so an entry pasted
+from another client keeps its credentials. The protocol's own header names
+(`Content-Type`, `Accept`, `Mcp-Session-Id`, `Mcp-Protocol-Version`) are
+dropped from a configured entry rather than sent twice, and a name that is not
+an RFC 9110 token (or a value spanning lines) refuses the save.
 
 **Connections are a pool, not a document read.** `src/mcp.rs` keeps one live
 connection per enabled server, reconciled at launch, after the MCP pane saves,

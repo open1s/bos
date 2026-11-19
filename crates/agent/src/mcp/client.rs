@@ -165,9 +165,22 @@ impl McpClient {
         base_url: impl Into<String>,
         egress: super::http_transport::EgressSlot,
     ) -> Self {
+        Self::connect_http_with_headers(base_url, Vec::new(), egress)
+    }
+
+    /// Create an HTTP client whose requests carry `headers`.
+    ///
+    /// This is the credential path: the settings entry's `headers` ride on every
+    /// JSON-RPC request, so a server that answers 401 without an API key works
+    /// without a second auth scheme in the client.
+    pub fn connect_http_with_headers(
+        base_url: impl Into<String>,
+        headers: Vec<(String, String)>,
+        egress: super::http_transport::EgressSlot,
+    ) -> Self {
         Self {
             transport: Arc::new(Mutex::new(TransportBackend::Http(
-                HttpTransport::with_egress(base_url, egress),
+                HttpTransport::with_egress(base_url, egress).with_headers(headers),
             ))),
             request_id: std::sync::atomic::AtomicU64::new(1),
             capabilities: std::sync::Mutex::new(None),
@@ -240,7 +253,16 @@ impl McpClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.state.lock().unwrap() = ConnectionState::Connected;
 
-        self.notify("notifications/initialized", None).await?;
+        // The handshake is complete: the server answered `initialize` and is
+        // ready for requests. The `initialized` notification is a courtesy the
+        // spec asks the client to send, so a server that rejects it (some parse
+        // `id` as required and answer 400) must not make a working connection
+        // look dead - the pool would drop a server whose `tools/list` already
+        // answers. A transport that is really gone surfaces on the next call.
+        let notified = self.notify("notifications/initialized", None).await;
+        if let Err(error) = notified {
+            *self.last_error.lock().unwrap() = Some(error.to_string());
+        }
 
         Ok(caps)
     }
@@ -724,6 +746,96 @@ for _ in sys.stdin:
             .initialize()
             .await
             .expect("a server request does not break initialization");
+    }
+
+    /// A server that answers requests but rejects notifications with 400.
+    ///
+    /// This is the llm-broker behaviour that made an otherwise usable server
+    /// look disconnected: it parses the id as required, so the spec's
+    /// notifications/initialized (which has none) is a parse error to it.
+    fn serve_rejecting_notifications() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(8) {
+                let Ok(mut stream) = stream else { continue };
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let read = stream.read(&mut chunk).expect("read");
+                    if read == 0 {
+                        break Vec::new();
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buffer).to_string();
+                    let Some(split) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = text[..split]
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let body = &buffer[split + 4..];
+                    if body.len() >= length {
+                        break body[..length].to_vec();
+                    }
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                let requested = request.get("id").is_some();
+                let answer = if requested {
+                    let result = match request["method"].as_str().unwrap_or_default() {
+                        "initialize" => serde_json::json!({
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": {},
+                            "serverInfo": {"name": "probe", "version": "1"}
+                        }),
+                        _ => serde_json::json!({"tools": []}),
+                    };
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {"code": -32700, "message": "missing field id"}
+                    })
+                };
+                let status = if requested {
+                    "200 OK"
+                } else {
+                    "400 Bad Request"
+                };
+                let payload = answer.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{address}/mcp")
+    }
+
+    /// The handshake stands when the courtesy notification is refused.
+    #[tokio::test]
+    async fn a_rejected_initialized_notification_does_not_fail_the_connection() {
+        let client = McpClient::connect_http_with_headers(
+            serve_rejecting_notifications(),
+            Vec::new(),
+            McpClient::empty_egress_slot(),
+        );
+        client
+            .initialize()
+            .await
+            .expect("a 400 on the notification is not a failed handshake");
+        let tools = client
+            .list_tools()
+            .await
+            .expect("the connection still works");
+        assert!(tools.is_empty());
     }
 
     #[test]
