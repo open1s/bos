@@ -472,11 +472,14 @@ second contract and an existing component still loads. Only the `extism` and
 Scope of the coverage, stated rather than implied:
 
 - An MCP **tool call** is a tool call: it arrives at `tool.before`/`tool.after`
-  with a namespaced `tool_name`. When the MCP gateway is in use (more than 12
-  tools on one turn), the observed call is the gateway itself — `tool_name = "mcp"`
-  and `tool_args` carries `{server, tool, arguments}` — so the inner call is
-  visible in the envelope rather than as its own pair. The MCP **wire**
-  (initialize, tools/list, the JSON-RPC frames) is not observed yet.
+  with a namespaced `tool_name`. Above 12 tools on one turn the roster is
+  also reachable through a gateway, and a call made THROUGH it is observed as
+  the gateway itself — `tool_name = "mcp"` and `tool_args` carries
+  `{server, tool, arguments}` — so the inner call is visible in the envelope
+  rather than as its own pair. The individual tools stay registered and
+  discoverable, so a direct call is observed under its namespaced name instead.
+  The MCP **wire** (initialize, tools/list, the JSON-RPC frames) is not observed
+  yet.
 - Network activity is observed where the host mediates it: LLM vendors, the
   extism/process HTTP bridge, and anything that goes through the tap. A shell
   command's own sockets are outside the host and are not visible.

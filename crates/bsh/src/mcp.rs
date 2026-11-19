@@ -703,17 +703,24 @@ fn connect(
     }
 }
 
-/// How many MCP tools a turn may carry before they collapse behind one gateway.
+/// How many MCP tools a turn may carry before a gateway joins them.
 ///
-/// Below this, separate tools are easier for the model and cost less than the
-/// indirection; above it, the schema tax is the bigger problem.
+/// Below this, the tools speak for themselves; above it, the model also gets
+/// ONE cheap way to browse the whole roster (`action=list`). The gateway never
+/// replaces the tools: they stay registered, marked MCP, and therefore withheld
+/// from the advertised array - the definition cost the gateway was introduced
+/// for is already paid by that mark, and `find_tool` can only report a tool the
+/// registry holds.
 pub(crate) const MCP_GATEWAY_THRESHOLD: usize = 12;
 
-/// One small tool that discovers and calls the MCP roster on demand.
+/// One small tool that browses and calls the MCP roster on demand.
 ///
-/// A server that advertises forty tools would otherwise put forty schemas in
-/// every request. The gateway keeps one schema in the prompt and returns a
-/// matching tool's own schema only when the model asks for it.
+/// A server that advertises forty tools would otherwise make the model search
+/// forty names to find one. The gateway answers that with a single query, and
+/// returns a matching tool's own schema only when the model asks for it. It is
+/// a shortcut to the registered tools, not a replacement for them: those carry
+/// their own MCP mark and never enter the advertised array, so keeping them
+/// registered costs no prompt bytes and keeps `find_tool` able to report them.
 pub(crate) struct McpGateway {
     tools: Vec<McpTool>,
 }

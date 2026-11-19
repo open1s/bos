@@ -1532,30 +1532,26 @@ fn build_agent_for_session_inner(
         ));
         match agent.try_add_async_tool(gateway) {
             Ok(()) => log::info!(
-                "mcp: {} tools behind one gateway (threshold {})",
+                "mcp: {} tools browse through one gateway (threshold {})",
                 mcp_tools.len(),
                 crate::mcp::MCP_GATEWAY_THRESHOLD
             ),
-            Err(error) => {
-                log::warn!(
-                    "MCP gateway was not registered: {error}; registering tools individually"
-                );
-                for tool in &mcp_tools {
-                    if let Err(error) =
-                        agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone())
-                    {
-                        log::warn!("MCP tool '{}' was not registered: {error}", tool.name);
-                    }
-                }
-            }
+            Err(error) => log::warn!("MCP gateway was not registered: {error}"),
         }
-    } else {
-        for tool in &mcp_tools {
-            if let Err(error) =
-                agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone())
-            {
-                log::warn!("MCP tool '{}' was not registered: {error}", tool.name);
-            }
+    }
+    // The gateway is a BROWSING shortcut for a large roster, never the only
+    // route to those tools. `find_tool` reports a tool only when the registry
+    // holds it, and registering the gateway alone left the per-server tools
+    // outside every catalogue: measured on a live build, 36 connected tools
+    // answered `find_tool {"query":"llmbroker"}` with `{"tools":[],"other_names":[]}`
+    // and the model concluded the capability was missing. Each tool carries its
+    // own MCP mark, so it is withheld from the advertised array anyway - the
+    // schema cost the gateway was introduced for is already paid - and
+    // registering it adds no prompt bytes while making it discoverable and
+    // directly callable.
+    for tool in &mcp_tools {
+        if let Err(error) = agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone()) {
+            log::warn!("MCP tool '{}' was not registered: {error}", tool.name);
         }
     }
 
@@ -9354,6 +9350,72 @@ mod tests {
             caps.iter()
                 .any(|cap| cap.name == "github_search" && !cap.description.is_empty()),
             "the MCP tool is listed with its description: {caps:?}"
+        );
+    }
+
+    /// A roster above the gateway threshold stays reachable through discovery.
+    ///
+    /// Measured failure: with 36 connected MCP tools the build registered only
+    /// the `mcp` gateway, so `find_tool` - which can only report a tool the
+    /// registry holds - answered `{"tools":[],"other_names":[]}` for
+    /// "llmbroker" and the model concluded the capability was missing. The
+    /// gateway is a browsing shortcut; the tools themselves are what discovery
+    /// reports, and their MCP mark already keeps them out of the request.
+    #[test]
+    fn a_large_mcp_roster_stays_discoverable_through_find_tool() {
+        use react::tool::registry::AsyncTool;
+        use std::sync::Arc;
+        let count = crate::mcp::MCP_GATEWAY_THRESHOLD + 4;
+        let roster: Vec<crate::mcp::McpTool> = (0..count)
+            .map(|index| {
+                let adapter: Arc<dyn AsyncTool> =
+                    Arc::new(agent::tools::AsyncFunctionTool::from_fn(
+                        &format!("llmbroker_tool_{index}"),
+                        "Read one record from the broker",
+                        serde_json::json!({ "type": "object", "properties": {} }),
+                        |_args| async move { Ok(serde_json::json!({"ok": true})) },
+                    ));
+                crate::mcp::McpTool {
+                    namespace: "llmbroker".to_string(),
+                    name: format!("tool_{index}"),
+                    adapter,
+                }
+            })
+            .collect();
+        let pool = crate::mcp::McpPool::with_tools(roster);
+        let built = build_agent(
+            &bare(),
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &pool,
+        );
+        let registry = built.agent.registry().expect("the build has a registry");
+        let registered = registry.async_tool_names();
+        assert!(
+            registered.contains(&"mcp".to_string()),
+            "the gateway still browses the roster: {registered:?}"
+        );
+        for index in 0..count {
+            let name = format!("llmbroker_tool_{index}");
+            assert!(
+                registered.contains(&name),
+                "{name} is registered next to the gateway: {registered:?}"
+            );
+            assert!(
+                registry.is_mcp_tool(&name),
+                "{name} keeps the mark that withholds it from the request"
+            );
+        }
+        // The search offers a tool the request does not already carry, and
+        // classifies an MCP tool by its registry mark (asserted above), so the
+        // tool is reportable while the request array carries none of them.
+        assert!(
+            !built
+                .agent
+                .model_tools()
+                .iter()
+                .any(|tool| tool.name.starts_with("llmbroker_")),
+            "registering it added no prompt bytes"
         );
     }
 

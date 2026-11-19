@@ -880,7 +880,7 @@ publishes = ["git.changed"]
 - 隔离：一个包失败不影响下一个，也不影响生产者；
 - 调 guest 时不持宿主锁；worker 空转 sleep 50 ms。
 
-不保证：投递、跨点顺序、恰好一次、正文（vendor tap 有，WASM/Extism fetch 只有形状）、process/MCP 子进程自开的 HTTP 不可见。MCP 的工具调用可见；当一轮工具数超过 12 个走 MCP gateway 时，看到的是 gateway 本身（`tool_name = "mcp"`，参数里带 `{server, tool, arguments}`），MCP wire 本身不可见。
+不保证：投递、跨点顺序、恰好一次、正文（vendor tap 有，WASM/Extism fetch 只有形状）、process/MCP 子进程自开的 HTTP 不可见。MCP 的工具调用可见；经 MCP gateway 发起的调用看到的是 gateway 本身（`tool_name = "mcp"`，参数里带 `{server, tool, arguments}`），而直接调用某个已注册的 MCP 工具时看到的是它带命名空间的名字；无论哪条路径，MCP wire 本身都不可见。
 
 ### 10.4 guest 契约
 

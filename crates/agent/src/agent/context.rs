@@ -2273,15 +2273,16 @@ impl AgentSession {
 
     /// Summarize all but the most recent `keep_recent` messages and prepend a summary.
     ///
-    /// This is the MECHANICAL path: the summary is the dropped messages
-    /// truncated, not a model-written checkpoint, and it prepends a system
-    /// message rather than replacing the span with a user one. It backs the
-    /// automatic pre-send trim, where a request must be made to fit without a
-    /// second model call.
+    /// This is the MECHANICAL path: the summary is a bounded rendering of the
+    /// dropped messages, not a model-written checkpoint, and it prepends a
+    /// system message rather than replacing the span with a user one. It backs
+    /// the automatic pre-send trim and the mid-turn ceiling, where a request
+    /// must be made to fit without a second model call.
     ///
     /// The split is the same safe selection the checkpoint path uses: a leading
     /// system prompt is never folded, and the cut never lands between an
-    /// assistant tool call and its result.
+    /// assistant tool call and its result. The summary's own budget goes to the
+    /// span's intent and newest work, never to the host context in front of it.
     pub fn compact(&mut self, keep_recent: usize, max_summary_chars: usize) {
         let Some((removed, recent)) = self.split_for_compaction(keep_recent) else {
             return;
@@ -2290,31 +2291,11 @@ impl AgentSession {
         // summary follows it.
         let head = system_head_len(&self.messages);
 
-        let summary_input: String = removed
-            .iter()
-            .map(|msg| match msg {
-                Message::System { content } => content.clone(),
-                Message::Developer { content } => format!("[developer] {content}"),
-                Message::User { content } => content_to_summary_string(content),
-                Message::Assistant { content } => content.clone(),
-                // Raw reasoning stays out of the mechanical prompt too.
-                Message::AssistantReasoning { .. } => String::new(),
-                Message::AssistantToolCall { name, args, .. } => {
-                    format!("Tool call {}: {}", name, args)
-                }
-                Message::ToolResult { content, .. } => content.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let summary = if summary_input.is_empty() {
+        let summary_text = mechanical_summary(&removed, max_summary_chars);
+        let summary = if summary_text.is_empty() {
             "Prior conversation history has been compacted.".to_string()
         } else {
-            let summary_text: String = summary_input.chars().take(max_summary_chars).collect();
-            format!(
-                "Prior conversation history has been compacted. Summary: {}",
-                summary_text
-            )
+            format!("Prior conversation history has been compacted. Summary: {summary_text}")
         };
 
         let summary_message = Message::system(summary.clone());
@@ -2338,6 +2319,85 @@ impl AgentSession {
             }
         }
         self.update_metadata();
+    }
+}
+
+/// The marker a mechanical summary puts where it omitted the span's middle.
+///
+/// The mechanical path makes no model call, so its summary is the span itself,
+/// bounded. Unlike the checkpoint instruction's marker, this text is read by
+/// the model continuing the turn, not by a summarizer.
+pub const MECHANICAL_OMISSION: &str = "[... the middle of the compacted history was omitted ...]";
+
+/// Render the mechanical summary for one folded span.
+///
+/// The budget goes to the span's INTENT and to its newest work. The host
+/// injects its per-turn context - the runtime snapshot, the time context and
+/// the workspace instructions - as a leading run of `Developer` rows ahead of
+/// the conversation. A head-only truncation spent every summary character on
+/// that context, so the reader's request, the first `User` row behind it, was
+/// folded away without ever reaching the summary, and the model went on with a
+/// "summary" that no longer said what it had been asked to do. Skipping the
+/// leading run starts the head slice at the history the summary exists to
+/// carry; the tail slice keeps the newest work.
+///
+/// Characters, not bytes, are the unit: the cap is a character budget, and a
+/// CJK span must not be cut mid-code-point.
+fn mechanical_summary(span: &[Message], max_chars: usize) -> String {
+    // The leading developer run is host context, not history. It is
+    // regenerated for the next request, so it must not eat the budget.
+    let mut start = 0;
+    while matches!(span.get(start), Some(Message::Developer { .. })) {
+        start += 1;
+    }
+    // A span that is ALL host context keeps it: an empty summary would say
+    // nothing at all about what was folded.
+    let start = if start == span.len() { 0 } else { start };
+    let whole = span[start..]
+        .iter()
+        .map(render_mechanical_message)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if max_chars == 0 {
+        return String::new();
+    }
+    if whole.chars().count() <= max_chars {
+        return whole;
+    }
+    let marker = MECHANICAL_OMISSION.chars().count() + 2;
+    let content = max_chars.saturating_sub(marker);
+    if content == 0 {
+        return MECHANICAL_OMISSION.to_string();
+    }
+    let head_budget = content / 2;
+    let tail_budget = content - head_budget;
+    let head: String = whole.chars().take(head_budget).collect();
+    let total = whole.chars().count();
+    let tail: String = whole
+        .chars()
+        .skip(total.saturating_sub(tail_budget))
+        .collect();
+    if tail.is_empty() {
+        format!("{head}\n{MECHANICAL_OMISSION}")
+    } else {
+        format!("{head}\n{MECHANICAL_OMISSION}\n{tail}")
+    }
+}
+
+/// Render one folded message the way the mechanical summary reads it.
+///
+/// Unlike the checkpoint renderer, this text is the folded history as the model
+/// itself reads it, so a tool call keeps its arguments in one legible line.
+fn render_mechanical_message(message: &Message) -> String {
+    match message {
+        Message::System { content } => content.clone(),
+        Message::Developer { content } => format!("[developer] {content}"),
+        Message::User { content } => content_to_summary_string(content),
+        Message::Assistant { content } => content.clone(),
+        // Raw reasoning stays out of the mechanical summary too.
+        Message::AssistantReasoning { .. } => String::new(),
+        Message::AssistantToolCall { name, args, .. } => format!("Tool call {name}: {args}"),
+        Message::ToolResult { content, .. } => content.clone(),
     }
 }
 
@@ -3642,6 +3702,113 @@ mod budget_tests {
         assert!(
             after < before,
             "the mechanical path shrank: {before} -> {after}"
+        );
+    }
+
+    /// The mechanical summary after one compaction, if there is one.
+    fn mechanical_text(session: &AgentSession) -> Option<String> {
+        session.messages().iter().find_map(|message| match message {
+            Message::System { content }
+                if content.starts_with("Prior conversation history has been compacted.") =>
+            {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// The mid-turn ceiling folds the oldest rows without a model call, and the
+    /// host's per-turn context sits AHEAD of the history as Developer rows. A
+    /// head-only truncation spent every summary character on that context: the
+    /// reader's request, the first User row behind it, was folded away unread
+    /// and the model continued a turn it no longer knew the ask of.
+    #[test]
+    fn a_mechanical_summary_keeps_the_request_behind_the_injected_context() {
+        let mut session = AgentSession::new();
+        session.push(Message::developer(format!(
+            "<runtime-context>{}</runtime-context>",
+            "context ".repeat(1_200)
+        )));
+        session.add_user("Rename the parser entry point to parse_request".to_string());
+        session.add_assistant("Reading the parser now.".to_string());
+        for index in 0..10 {
+            session.add_user(format!("step {index} {}", "y".repeat(300)));
+            session.add_assistant(format!("done {index}"));
+        }
+        session.compact(4, 1_000);
+        let summary = mechanical_text(&session).expect("a mechanical summary");
+        assert!(
+            summary.contains("Rename the parser entry point to parse_request"),
+            "the request must survive the fold: {summary}"
+        );
+        assert!(
+            !summary.contains("context context context"),
+            "the injected host context must not take the summary budget: {summary}"
+        );
+    }
+
+    /// The same budget keeps the newest work as well as the intent: a checkpoint
+    /// that only said what the turn started with would drop the step it is on.
+    #[test]
+    fn a_mechanical_summary_keeps_the_newest_work_beside_the_request() {
+        let mut session = AgentSession::new();
+        session.add_user("Ship the parser rename in one change".to_string());
+        session.add_assistant("Starting.".to_string());
+        for index in 0..10 {
+            session.add_user(format!("step {index} {}", "y".repeat(300)));
+            session.add_assistant(format!("done {index}"));
+        }
+        session.compact(4, 1_000);
+        let summary = mechanical_text(&session).expect("a mechanical summary");
+        assert!(summary.contains("Ship the parser rename"), "{summary}");
+        assert!(
+            summary.contains("step 7") || summary.contains("step 8"),
+            "the newest folded work must survive too: {summary}"
+        );
+        assert!(summary.contains(MECHANICAL_OMISSION), "{summary}");
+    }
+
+    /// The character cap is a real bound: a long span may not grow the summary
+    /// past it, and a CJK span is cut on a character boundary, never a byte.
+    #[test]
+    fn a_mechanical_summary_stays_inside_its_character_budget() {
+        let span = vec![
+            Message::developer("c".repeat(5_000)),
+            Message::user("request ".repeat(500)),
+            Message::assistant("work ".repeat(2_000)),
+        ];
+        let summary = mechanical_summary(&span, 600);
+        assert!(
+            summary.chars().count() <= 600,
+            "the summary outgrew its cap: {}",
+            summary.chars().count()
+        );
+        assert!(summary.starts_with("request"), "{summary}");
+
+        let cjk = vec![Message::user("修改解析器入口 ".repeat(400))];
+        let summary = mechanical_summary(&cjk, 500);
+        assert!(summary.chars().count() <= 500);
+        assert!(summary.contains(MECHANICAL_OMISSION));
+    }
+
+    /// A second mechanical pass folds the first summary back in. The request it
+    /// carried has to survive that pass too, or a long turn loses it step by
+    /// step.
+    #[test]
+    fn a_repeated_mechanical_compaction_keeps_the_request() {
+        let mut session = AgentSession::new();
+        session.add_user("Keep the public API stable while you refactor".to_string());
+        session.add_assistant("Understood.".to_string());
+        for index in 0..20 {
+            session.add_user(format!("step {index} {}", "y".repeat(300)));
+            session.add_assistant(format!("done {index}"));
+        }
+        session.compact(4, 800);
+        session.compact(4, 800);
+        let summary = mechanical_text(&session).expect("a mechanical summary");
+        assert!(
+            summary.contains("Keep the public API stable"),
+            "a repeated fold lost the request: {summary}"
         );
     }
 

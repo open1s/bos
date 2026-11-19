@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **A large MCP roster stays discoverable through `find_tool`.** Above the
+  gateway threshold (12 tools) the build registered only the `mcp` gateway, so
+  the per-server tools were in no catalogue at all: a search for the server or
+  the tool name answered `{"tools":[],"other_names":[]}`, and the model
+  concluded the capability was missing (measured on a live turn with 36
+  connected tools, `query: "llmbroker"`). The gateway is now a browsing
+  shortcut beside the tools: every MCP tool is registered and carries its MCP
+  mark, which withholds it from the advertised array anyway, so discovery can
+  report it and the model can call it by its namespaced name without adding a
+  request byte. A regression test pins registration, the MCP mark the search
+  classifies by, and the empty advertised array.
+
 ## v4.1.21 (2026-11-19)
 
 - Release v4.1.21.
