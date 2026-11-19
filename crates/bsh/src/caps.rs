@@ -4842,7 +4842,12 @@ pub(crate) fn grep_tool(
             let limit = match arg_positive(args, "limit")? {
                 Some(limit) => limit,
                 None if context > 0 => {
-                    (context.saturating_mul(2) + 1).min(crate::grep::MAX_RESULTS)
+                    // One row is held back for a possible next match, so a
+                    // full block needs two extra rows: the context on each
+                    // side plus that reserve. With 2c+1 the final after-context
+                    // row was always dropped and a complete block was reported
+                    // as truncated.
+                    (context.saturating_mul(2) + 2).min(crate::grep::MAX_RESULTS)
                 }
                 None => crate::grep::DEFAULT_RESULTS,
             };
@@ -4903,7 +4908,14 @@ pub(crate) fn grep_tool(
                     row
                 })
                 .collect();
-            let count = matches.len();
+            // `count` counts matching lines; context rows are framing. Report
+            // the total separately so "12 results" never silently includes 8
+            // context lines.
+            let returned_rows = matches.len();
+            let count = matches
+                .iter()
+                .filter(|row| row.get("kind").is_none())
+                .count();
             let empty = matches.is_empty() && found.binary.is_empty();
             let next = (found.truncated && limit < crate::grep::MAX_RESULTS).then(|| {
                 serde_json::json!({
@@ -4916,6 +4928,9 @@ pub(crate) fn grep_tool(
                 "count": count,
                 "matches": matches,
             });
+            if context > 0 {
+                result["rows"] = serde_json::json!(returned_rows);
+            }
             if !found.binary.is_empty() {
                 result["binary"] = serde_json::json!(
                     found
@@ -4979,13 +4994,13 @@ pub(crate) fn read_file_tool(
     let cursor: ReadCursor = Arc::new(Mutex::new(HashMap::new()));
     FunctionTool::new(
         "read_file",
-        "Read a UTF-8 text file. With only path it starts at line 1; after a partial read, a path-only call continues from the previous next_offset while the file is unchanged, so pass offset=1 to re-read from the start. limit bounds the window. Paths are workspace-relative or absolute inside the workspace; ignored paths are refused. The result returns start_line, end_line, total_lines and next_offset: the 1-based line to read next, or null when the file is fully read. To continue a cut read, pass next_offset as offset.",
+        "Read a UTF-8 text file. With only path it starts at line 1; after a partial read the same call continues from next_offset, so pass offset=1 to restart. limit bounds the window. Paths are workspace-relative or absolute inside the workspace; ignored paths are refused. Returns start_line, end_line, total_lines and next_offset: the line to read next, or null when done.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path of the UTF-8 text file to read, relative to the workspace or absolute inside the allowed workspace." },
                 "offset": { "type": "integer", "minimum": 1, "description": "Optional 1-based starting line; defaults to 1 (the first line is 1, not 0). Pass the previous result's next_offset to continue." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Optional maximum lines to return from offset. A window that stops before the end returns next_offset for the next call." }
+                "limit": { "type": "integer", "minimum": 1, "description": "Optional maximum lines from offset; a cut window returns next_offset." }
             },
             "required": ["path"],
             "additionalProperties": false
@@ -5129,7 +5144,7 @@ pub(crate) fn read_files_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "read_files",
-        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next_offset (the 1-based line to read next in that file, or null when it is fully read). offset and limit apply to every file. To continue one cut file, call read_files again with only that path and its next_offset as offset. Combined content is capped at 1 MiB; inspect each entry's truncated or error field.",
+        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next_offset: the line to read next, or null when done. Combined content is capped at 1 MiB; inspect each entry's error field.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -5148,12 +5163,12 @@ pub(crate) fn read_files_tool(
                 "offset": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional 1-based starting line, applied to EVERY file in this call; defaults to 1. To continue one cut file, call again with only that path and its next_offset."
+                    "description": "Applied to every file; to continue a cut file, pass only its path and next_offset."
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional maximum number of lines per file, applied to every file. A file that stops early returns its next_offset."
+                    "description": "Optional maximum lines per file; a cut file returns next_offset."
                 }
             },
             "required": ["paths"],
@@ -5349,9 +5364,11 @@ pub(crate) fn read_files_tool(
             let empty = results
                 .iter()
                 .all(|file| file["status"].as_str() == Some(crate::file_result::EMPTY));
-            let status = if failed == results.len() {
-                crate::file_result::ERROR
-            } else if failed > 0 || truncated {
+            // A batch reports per-file outcomes: an entry that failed is data,
+            // not a call-level failure. The call completed and every path has a
+            // verdict, so the status is `partial` (even when every entry
+            // failed); only a request-level refusal returns `Err`.
+            let status = if failed > 0 || truncated {
                 crate::file_result::PARTIAL
             } else if empty {
                 crate::file_result::EMPTY
@@ -5365,6 +5382,23 @@ pub(crate) fn read_files_tool(
                 "failed": failed,
                 "bytes": total_bytes,
                 "max_bytes": MAX_BATCH_READ_BYTES
+            });
+            // The envelope prefers a tool-supplied summary. "partial" alone
+            // does not say whether the call was cut or some files failed.
+            result["summary"] = serde_json::json!(if failed > 0 {
+                format!(
+                    "read {returned} of {} files; {failed} failed",
+                    results.len()
+                )
+            } else if truncated {
+                format!(
+                    "read {returned} of {} files; output was cut by the batch byte budget",
+                    results.len()
+                )
+            } else if empty {
+                format!("read {} files; no content found", results.len())
+            } else {
+                format!("read {returned} files")
             });
             crate::file_result::finish(&mut result, "read_files", status, None);
             Ok(result)
@@ -5623,9 +5657,9 @@ fn apply_patch_tool(
             let diff_truncated = results
                 .iter()
                 .any(|file| file["diff_status"].as_str() == Some("truncated"));
-            let status = if failed == results.len() {
-                crate::file_result::ERROR
-            } else if failed > 0 {
+            // Item failures are per-file entries, not a call-level error. See
+            // `read_files`: the batch completed and every target has a verdict.
+            let status = if failed > 0 {
                 crate::file_result::PARTIAL
             } else {
                 crate::file_result::OK
@@ -5636,6 +5670,17 @@ fn apply_patch_tool(
                 "failed": failed,
                 "changed_files": changed_files,
                 "diff_status": if diff_truncated { "truncated" } else { "complete" }
+            });
+            result["summary"] = serde_json::json!(if failed > 0 {
+                format!(
+                    "patched {} of {} files; {failed} failed",
+                    changed_files,
+                    results.len()
+                )
+            } else if changed_files == 0 {
+                format!("{} files unchanged", results.len())
+            } else {
+                format!("patched {changed_files} of {} files", results.len())
             });
             crate::file_result::finish(&mut result, "apply_patch", status, None);
             Ok(result)
@@ -5878,6 +5923,7 @@ fn sed_tool(
                     .unwrap_or(false)
             };
             let dry_run = flag("dry_run");
+            let quiet = flag("quiet");
             let line_length = match args.get("line_length").filter(|value| !value.is_null()) {
                 Some(value) => {
                     let Some(number) = value.as_u64() else {
@@ -5957,7 +6003,7 @@ fn sed_tool(
                 script: &script,
                 extended: flag("extended"),
                 posix: flag("posix"),
-                quiet: flag("quiet"),
+                quiet,
                 line_length,
                 backup: backup.as_deref(),
             };
@@ -6017,6 +6063,17 @@ fn sed_tool(
                 } else {
                     "the diff was truncated; read the file with read_file for the rest"
                 });
+            }
+            if quiet {
+                result["quiet"] = serde_json::json!(true);
+                if !dry_run && outcome.changed && !truncated {
+                    // A quiet print script filters the file. The diff is the
+                    // honest record of that, but "changed" plus deleted lines
+                    // reads like collateral loss without this sentence.
+                    result["hint"] = serde_json::json!(
+                        "quiet mode: the file holds only what the script printed; the deleted diff lines are that filter, not unintended loss"
+                    );
+                }
             }
             crate::file_result::finish(
                 &mut result,
@@ -11649,6 +11706,10 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(result["files"][1]["content"], "fn b() {}");
         assert_eq!(result["files"][2]["status"], "error");
         assert!(result["files"][2]["error"].as_str().is_some());
+        assert_eq!(
+            result["summary"], "read 2 of 3 files; 1 failed",
+            "the summary counts what was read, not just that something failed: {result}"
+        );
         assert!(!result.to_string().contains("outside-secret"));
         // Every entry names its next line, including a failed read: the field
         // is always present and null when there is nothing to continue.
@@ -11981,6 +12042,86 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "let value = 1;\n"
         );
         assert_eq!(result["changed_files"], 0);
+        assert_eq!(
+            result["summary"], "patched 0 of 1 files; 1 failed",
+            "{result}"
+        );
+    }
+
+    /// A missing file is one failed entry, not a refusal of the whole patch;
+    /// the other files still apply and the summary counts them.
+    #[test]
+    fn apply_patch_reports_a_missing_file_per_entry() {
+        let root = scratch("apply-patch-missing");
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").expect("seed");
+        let result = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "apply_patch",
+                &serde_json::json!({
+                    "changes": [
+                        {"path": "a.txt", "edits": [{"old_string": "one", "new_string": "ONE"}]},
+                        {"path": "missing.txt", "edits": [{"old_string": "x", "new_string": "y"}]}
+                    ]
+                }),
+            )
+            .expect("a missing file is a per-file outcome");
+        assert_eq!(result["files"][0]["status"], "ok", "{result}");
+        assert_eq!(result["files"][1]["status"], "error", "{result}");
+        assert_eq!(result["status"], "partial", "{result}");
+        assert_eq!(result["failed"], 1);
+        assert_eq!(result["changed_files"], 1);
+        assert_eq!(result["summary"], "patched 1 of 2 files; 1 failed");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("patched"),
+            "ONE\ntwo\n"
+        );
+    }
+
+    /// A batch whose entries all failed is still a completed call: `partial`
+    /// with per-file errors, never a call-level error object with a synthetic
+    /// code.
+    #[test]
+    fn an_all_failed_batch_is_partial_not_a_call_error() {
+        let root = scratch("all-failed-batch");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let reads = registry
+            .execute(
+                "read_files",
+                &serde_json::json!({"paths": ["missing-a.txt", "missing-b.txt"]}),
+            )
+            .expect("a missing file is a per-file outcome");
+        assert_eq!(reads["status"], "partial", "{reads}");
+        assert_eq!(reads["failed"], 2);
+        assert_eq!(reads["summary"], "read 0 of 2 files; 2 failed");
+        let envelope = react::tool::ToolResult::from_value("read_files", reads);
+        assert_eq!(envelope.status, react::tool::ToolStatus::Partial);
+        assert!(
+            envelope.error.is_none(),
+            "an item failure is not a call-level error: {envelope:?}"
+        );
+
+        let patch = registry
+            .execute(
+                "apply_patch",
+                &serde_json::json!({"changes": [
+                    {"path": "missing-a.txt",
+                     "edits": [{"old_string": "x", "new_string": "y"}]}
+                ]}),
+            )
+            .expect("a missing file is a per-file outcome");
+        assert_eq!(patch["status"], "partial", "{patch}");
+        assert_eq!(patch["summary"], "patched 0 of 1 files; 1 failed");
+        let envelope = react::tool::ToolResult::from_value("apply_patch", patch);
+        assert_eq!(envelope.status, react::tool::ToolStatus::Partial);
+        assert!(
+            envelope.error.is_none(),
+            "an item failure is not a call-level error: {envelope:?}"
+        );
     }
 
     #[test]
@@ -12084,6 +12225,14 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("the filter runs");
         assert_eq!(filtered["outcome"], "changed", "{filtered}");
+        assert_eq!(filtered["quiet"], true, "{filtered}");
+        assert!(
+            filtered["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("filter"),
+            "a quiet print is labeled as a filter, not as data loss: {filtered}"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).expect("the filter"),
             "two\n"
@@ -12950,6 +13099,46 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert!(
             with_context["matches"][1].get("kind").is_none(),
             "a match row keeps its old shape: {with_context}"
+        );
+        // A one-match block is complete: both context rows fit the default
+        // budget, and the call must not look truncated. `count` is matching
+        // lines; `rows` is the framing too.
+        assert_eq!(with_context["count"], 1, "{with_context}");
+        assert_eq!(with_context["rows"], 3, "{with_context}");
+        assert_eq!(with_context["status"], "ok", "{with_context}");
+        assert_eq!(with_context["matches"][2]["line"], 3, "{with_context}");
+        assert_eq!(with_context["matches"][2]["kind"], "context");
+        assert!(
+            with_context.get("truncated").is_none(),
+            "a complete block is not flagged: {with_context}"
+        );
+        assert!(
+            !with_context["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("row limit"),
+            "no row-limit hint when the block fits: {with_context}"
+        );
+
+        // The exact budget a caller asked for: three rows hold a before row,
+        // the match, and the after row. The after row must not be sacrificed
+        // for a match that does not exist, and the match must not be crowded
+        // out by the before row.
+        let exact = registry
+            .execute(
+                "grep",
+                &serde_json::json!({
+                    "pattern": "needle", "context": 1, "limit": 3, "path": "one.rs"
+                }),
+            )
+            .expect("grep runs");
+        assert_eq!(exact["count"], 1, "{exact}");
+        assert_eq!(exact["rows"], 3, "{exact}");
+        assert_eq!(exact["status"], "ok", "{exact}");
+        assert_eq!(exact["matches"][1]["line"], 2, "{exact}");
+        assert!(
+            exact.get("truncated").is_none(),
+            "three rows are exactly enough: {exact}"
         );
 
         let included = registry

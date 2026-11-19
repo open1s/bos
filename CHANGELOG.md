@@ -22,6 +22,21 @@
   schema keeps the simple `offset`/`limit` pair. See
   `docs/rfc/tools-2.0.md`.
 
+- **Tool failures stop stacking their own labels.** The agent's tool adapter no
+  longer rewrites every failure as `Failed(error.to_string())`, so a class
+  (`permission_denied`, `timeout`, `unavailable`, …) survives to the envelope
+  and the message no longer reads "Tool execution failed: Tool error: …".
+  `grep` with `context` now defaults to the full block plus the match reserve
+  (2×context+2), and only before-context rows reserve a slot, so one complete
+  hit is `ok` even at `limit: 2×context+1`, not a false `partial`; `count`
+  counts matching lines and `rows` adds the context framing. Quiet
+  `p` filters say so: `sed` returns `quiet: true` and a hint that the deleted
+  diff lines are the filter. `read_files`/`apply_patch` supply count-based
+  summaries ("read 3 of 4 files; 1 failed"), and a missing file in
+  `apply_patch` is a per-file error, never a batch refusal - even when every
+  target is missing, the batch is `partial` with per-file errors, not a
+  call-level `error` with a synthetic `internal` code.
+
 - **Reasoning is turn-local; the thinking-summary channel is removed.**
   `AssistantReasoning` blocks may be replayed only inside the turn that
   produced them: a tool loop sends them back (DeepSeek `reasoning_content`,

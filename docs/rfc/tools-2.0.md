@@ -55,7 +55,7 @@ change; **open** — still missing.
 | FR-01 definition contract | done / partial | `ToolMetadata` (version, risk, side effects, permissions, limits, category, tags, intents, capability id); `catalogue_from_registry` validates declarations; `ToolRegistry::register` refuses duplicate names | No output JSON schema per tool (`OutputContract::json()` has no schema); no explicit sync/async/timeout field on the trait itself (timeout lives in metadata) |
 | FR-02 input schemas | added | `validate_args` now returns `ToolError::InvalidField { field, missing }` for missing, undeclared, wrong-type, enum, length and bound violations; `CapabilityTool::run_with_call_id` validates against the descriptor before crossing the boundary, so the field survives that path | Conditional requirements (if A then B) are still home-grown per tool; provider-side JSON-Schema feature subset is not centrally listed |
 | FR-03 result envelope | added | `react::tool::result::ToolResult`: `status` (success / partial / pending / error), `summary`, `data`, `error`, `effects`, `continuation`, `truncated`; applied at `render_tool_result` for batch and streaming paths | `effects` has no producer (see FR-06); `next_actions` deliberately omitted until a producer exists |
-| FR-04 error semantics | added | `ToolErrorCode` (10 stable classes) + `ToolError::{code, retryable, indeterminate, field, missing_field}`; `ToolError::Cancelled`, `PermissionDenied`, `Conflict`, `Unavailable`, `Unsupported`, `InvalidField`; `ToolErrorInfo` serializes the class, advice and field | Some `Failed(String)` sites still carry prose the class cannot refine; `ToolError`→`CapabilityError` cannot represent `Conflict`/`Unsupported` (mapped to `ProviderFailed`, documented) |
+| FR-04 error semantics | added | `ToolErrorCode` (10 stable classes) + `ToolError::{code, retryable, indeterminate, field, missing_field}`; `ToolError::Cancelled`, `PermissionDenied`, `Conflict`, `Unavailable`, `Unsupported`, `InvalidField`; `ToolErrorInfo` serializes the class, advice and field; the agent's tool adapters pass the canonical error through instead of flattening it to `Failed(e.to_string())`; | Some `Failed(String)` sites still carry prose the class cannot refine; `ToolError`→`CapabilityError` cannot represent `Conflict`/`Unsupported` (mapped to `ProviderFailed`, documented) |
 | FR-05 lifecycle | partial | `run_tool` registers/completes/fails one call; `NativeToolProvider` enforces deadline, cancellation token and bounded async admission | No single admission helper shared by every provider; timeout/cancel correlation is per-provider |
 | FR-06 idempotency | open | `ToolMetadata.side_effects` declares read/write/network/process/spend/auth; the read-only retry guard in `tool_calls.rs` respects it | No idempotency declaration, no execution/idempotency key, no automatic retry policy for non-idempotent tools |
 | FR-07 continuation | added (producers partial) | `ToolContinuation` reads the search tools' `next` pointer; the read tools carry `next_offset` as their only continuation (no `next` or `continuation` duplicate); `next_offset` is always present (the line to pass as `offset`, or `null` when fully read), per file for a batch including a failed entry; the hint names it and the input remains `offset`; `truncated` distinguishes a cut report from a failed operation | Most non-file tools still return no continuation; a truncated envelope keeps both ends but does not synthesize a narrower call |
@@ -65,7 +65,7 @@ change; **open** — still missing.
 | FR-11 scheduling | partial | `bsh::schedule` validates recurrence before activation and returns normalized next time | Tool results do not yet carry a continuation/next-execution field in the envelope |
 | FR-12 federation delegation | partial | `capability::FederationTransport`, `federation::service` delegation lifecycle; `federation_tools` exposes peers/capabilities/delegate | No task-intent-level delegation result envelope (delegation id, state, result, continuation) |
 | FR-13 agent recovery | added (seam) | Envelope distinguishes execution outcome from completion (`partial`/`pending` ≠ failure); `retryable`/`indeterminate` give the recovery decision a structural answer; the read-only retry guard now reads the class | The loop's guidance still composes prose; no policy that blocks repeating a permission failure |
-| FR-14 evaluation | open | Existing unit + integration suites (react 191 lib tests, agent 613 lib tests, bsh 1906 lib tests) exercise the paths | No selection/argument/result-comprehension benchmark, no token-overhead measurement |
+| FR-14 evaluation | open | Existing unit + integration suites (react 192 lib tests, agent 614 lib tests, bsh 2000 lib tests) exercise the paths | No selection/argument/result-comprehension benchmark, no token-overhead measurement |
 
 ## 4. The implemented contract
 
@@ -114,6 +114,9 @@ Rules:
   tells the model the result is complete. The read tools use `next_offset` as
   their single continuation representation: no `next` object, and no
   `continuation` repeating the same offset.
+- A batch tool reports per-item outcomes: a failed entry is data with its own
+  `status: "error"`, and the call is `partial` (or `success` when nothing
+  failed), never a call-level `error` with a synthetic code.
 - `truncated` means the report was cut to fit the context; it does not change
   `status`.
 
@@ -174,6 +177,10 @@ Consumers of the old shapes were identified before migration and updated:
   classes instead of `Failed("denied: …")`.
 - `crates/agent/src/capabilities/native.rs::classify` — the reverse mapping, so
   a tool error keeps its class across the capability boundary.
+- `crates/agent/src/agent/agentic/adapters.rs` — the agent's sync/async tool
+  adapters pass the tool's `ToolError` through unchanged; the old
+  `Failed(e.to_string())` rewrite dropped the class and stacked a
+  "Tool execution failed:" prefix per layer.
 - `crates/bsh/src/tool_output.rs` — the one reader that unwraps `data` for
   stored results, used by `audit::confinement_of` (sandbox/network facts),
   `ui::transcript::result_change` (sed's diff preview) and
@@ -267,11 +274,11 @@ Targeted re-run of the areas this change touches: `bsh --lib` filters
 Observed results on this host:
 
 - `react`: 191 lib tests + all integration suites pass.
-- `agent`: 613 lib tests pass; 11 fail, all process-kill tests reporting
+- `agent`: 614 lib tests pass; 11 fail, all process-kill tests reporting
   `Failed { code: -1 }` instead of `Killed`. The same test fails identically
   at the parent commit (`git worktree` at `e49a39dc`), so it is the host, not
   this change.
-- `bsh --lib` (final run on the completed change): 1996 passed, 41 failed,
+- `bsh --lib` (final run on the completed change): 2000 passed, 41 failed,
   9 ignored. All 41 failures are environment-bound:
   - 25 `browser::*` tests: the native rendered engine cannot start in this
     sandbox ("WebSocket protocol error: Connection reset without closing

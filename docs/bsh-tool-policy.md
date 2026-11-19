@@ -370,8 +370,11 @@ existing shape; the shared fields add meaning without moving data:
   object and no envelope `continuation` repeating the same offset. The
   `hint` says to pass it as `offset`.
 - `count` is the number of returned items (`lines`, `matches`, `entries`,
-  `files`). `read_files` and `apply_patch` also report `failed`/`returned`,
-  and every per-file entry carries its own `status`.
+  `files`); for `grep` it counts matching lines only, and `rows` (when context
+  is set) counts the framing too. `read_files` and `apply_patch` also report `failed`/`returned`
+  and supply a `summary` with the counts, so the envelope says "read 3 of 4
+  files; 1 failed" instead of a generic "partial"; every per-file entry carries
+  its own `status`.
 - `hint` is one recovery sentence, present only when the payload alone would
   mislead: an empty glob, an offset past EOF, or a spent context row budget.
 
@@ -398,28 +401,40 @@ only that path and the entry's `next_offset` as `offset`. A first line larger th
 ceiling is refused rather than returned as an empty page whose `next_offset`
 would point at the same line forever.
 
-`grep` accepts up to 2000 context rows per side. A call without `limit` gets at
-least one full context window (2 x context + 1 rows, capped at the row
-maximum). The row budget also reserves its last row for the match, so a wide
-before-context cannot spend the budget and stop the search before the match
-appears. Context rows count toward `limit`; a cut result reports `status`
-`partial` and `next` (or a hint that the row maximum was reached). `glob` and
-`list_dir` report `count` and a `status`, and `glob` names the two common
-empty-result causes in its `hint`.
+`grep` accepts up to 2000 context rows per side. A call without `limit` gets
+one full context window plus the reserve (2 x context + 2 rows, capped at the
+row maximum). Only a before-context row reserves a row for the match that
+follows; an after-context row may use the last row, so a complete one-match
+block (2 x context + 1 rows) is `ok` even at `limit: 2 x context + 1`. Context
+rows still count toward `limit`; a wide before-window that would crowd out the
+match is skipped and reported as a cut instead. `count` is the number of
+matching lines; when `context` is set, `rows` is the total returned including
+context. A genuinely cut result reports `status` `partial` and `next` (or a
+hint that the row maximum was reached). `glob` and `list_dir` report `count`
+and a `status`, and `glob` names the two common empty-result causes in its
+`hint`.
 
 The mutating tools use the same envelope: `write_file` reports `outcome`
 (`created`/`updated`/`unchanged`) and `bytes`; `edit_file` reports `outcome`
 (`updated`/`unchanged`), `replacements`, `bytes`, `added`, `deleted`, a bounded
 `diff` of the changed lines, and `diff_status` (`complete`/`truncated`);
-`apply_patch` reports the same per-file fields plus `failed` and
-`changed_files`; `sed` reports `outcome` (`changed`/`unchanged`), `mode`
+`apply_patch` reports the same per-file fields plus `failed`,
+`changed_files` and a `summary` that counts the mixed outcome (a missing file
+is one failed entry, not a refusal of the batch; only an invalid request -
+duplicate path, ignored path, out-of-workspace path - fails the whole call);
+`sed` reports `outcome` (`changed`/`unchanged`), `mode`
 (`dry-run`/`applied`), `content_kind` (`text`/`binary`) and `content_status`
 (`complete`/`truncated`) for a dry run, and `diff`/`diff_status` when retained,
-with a hint that the rest is readable through `read_file`. A diff is capped at 20 changed lines and says so through
+with a hint that the rest is readable through `read_file`. A quiet `p` script is
+a filter: the result carries `quiet: true` and a hint that the deleted diff
+lines are that filter, not unintended loss. A diff is capped at 20 changed lines and says so through
 `diff_status`. A refused call is still a tool error, not an envelope: its
 message names the path and the reason (a binary file, an out-of-workspace path,
 an ambiguous edit), and a batch keeps that text in the per-file `error` field
-with `status: "error"`.
+with `status: "error"`. A batch with any failed or cut entry reports `partial`
+at the call level - even when every entry failed - because the call completed
+and every target has a verdict; only an invalid request (duplicate, ignored or
+out-of-workspace path) is a call-level error.
 
 ### Cross-platform file semantics
 

@@ -28,7 +28,8 @@ use grep::matcher::Matcher;
 use grep::printer::{JSON, JSONSink};
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{
-    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch,
+    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkFinish,
+    SinkMatch,
 };
 use ignore::overrides::{Override, OverrideBuilder};
 
@@ -478,11 +479,17 @@ impl<M: Matcher, W: io::Write> Sink for Emit<'_, '_, M, W> {
     }
 
     fn context(&mut self, searcher: &Searcher, ctx: &SinkContext<'_>) -> io::Result<bool> {
-        // Reserve the last row for a match. A wide before-context window must
-        // not spend the whole budget and then stop the search before the match
-        // that asked for it is ever printed. Skipping the excess context keeps
-        // the searcher moving; the match can still take the reserved row.
-        if self.rows.saturating_add(1) >= self.budget {
+        // Only a BEFORE-context row must leave room for the match it precedes:
+        // a wide before-window must not spend the budget and stop the search
+        // before the match that asked for it is printed. After-context owes no
+        // future match, so it may use the last row. Reserving unconditionally
+        // dropped the trailing context of a complete block and reported a
+        // complete result as truncated.
+        let full = match ctx.kind() {
+            SinkContextKind::Before => self.rows.saturating_add(1) >= self.budget,
+            _ => self.rows >= self.budget,
+        };
+        if full {
             self.exceeded = true;
             return Ok(true);
         }

@@ -71,7 +71,11 @@ pub enum ToolError {
     #[error("Tool not found: {0}")]
     NotFound(String),
     /// The tool ran but failed.
-    #[error("Tool execution failed: {0}")]
+    ///
+    /// The message is the tool's own account; it is not prefixed here, because
+    /// every wrapper that re-labels it would otherwise stack another prefix on
+    /// the same sentence.
+    #[error("{0}")]
     Failed(String),
     /// More than one registered tool matches the bare name.
     #[error("Tool name {name} is ambiguous: {candidates:?}")]

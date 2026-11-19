@@ -11,6 +11,9 @@ use crate::agent::context::CompactionOutcome;
 fn react_failure(e: react::engine::ReactError) -> AgentError {
     match e {
         react::engine::ReactError::Llm(llm) => AgentError::Llm(llm),
+        // A classified tool failure keeps its class (and one label) instead of
+        // becoming a generic session sentence.
+        react::engine::ReactError::ToolFailure(error) => AgentError::Tool(error),
         other => AgentError::Session(other.to_string()),
     }
 }
