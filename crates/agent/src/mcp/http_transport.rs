@@ -309,14 +309,38 @@ mod tests {
     /// Like [`serve_once`], but hands back the request bytes it read, so a test
     /// can prove which headers went on the wire.
     fn serve_once_capturing(response: &'static [u8]) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("local addr");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let mut buffer = [0u8; 8192];
-            let read = std::io::Read::read(&mut stream, &mut buffer).unwrap_or(0);
-            std::io::Write::write_all(&mut stream, response).expect("write response");
-            buffer[..read].to_vec()
+            // The client may write the headers and the body in separate
+            // segments, so read until the declared Content-Length has arrived:
+            // a single read captures the headers only, which made a body
+            // assertion measure TCP framing instead of the request.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                let Some(split) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let length = text[..split]
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= split + 4 + length {
+                    break;
+                }
+            }
+            stream.write_all(response).expect("write response");
+            request
         });
         (format!("http://{address}/mcp"), handle)
     }
