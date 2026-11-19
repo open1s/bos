@@ -360,10 +360,10 @@ impl NativeFerrisHost {
     let mut first = None;
     let mut lease_host = NoopLeaseHost;
     for activation in activations {
-      if let Err(error) = activation.unload(&mut lease_host).await {
-        if first.is_none() {
-          first = Some(error);
-        }
+      if let Err(error) = activation.unload(&mut lease_host).await
+        && first.is_none()
+      {
+        first = Some(error);
       }
     }
     first.map_or(Ok(()), |error| Err(host_error(error)))
@@ -378,15 +378,15 @@ impl NativeFerrisHost {
     let mut first = None;
     let mut lease_host = NoopLeaseHost;
     for linked in linked {
-      if let Err(error) = linked.lease.revoke(&mut lease_host).await {
-        if first.is_none() {
-          first = Some(error);
-        }
+      if let Err(error) = linked.lease.revoke(&mut lease_host).await
+        && first.is_none()
+      {
+        first = Some(error);
       }
-      if let Err(error) = linked.runtime.shutdown().await {
-        if first.is_none() {
-          first = Some(error);
-        }
+      if let Err(error) = linked.runtime.shutdown().await
+        && first.is_none()
+      {
+        first = Some(error);
       }
     }
     first.map_or(Ok(()), |error| Err(host_error(error)))

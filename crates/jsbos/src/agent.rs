@@ -97,10 +97,10 @@ fn tool_metadata_map(
       }
     }
     for name in registry.async_tool_names() {
-      if let Some(tool) = registry.get_async(&name) {
-        if let Some(metadata) = tool.metadata() {
-          map.insert(name, tool_metadata_json(metadata));
-        }
+      if let Some(tool) = registry.get_async(&name)
+        && let Some(metadata) = tool.metadata()
+      {
+        map.insert(name, tool_metadata_json(metadata));
       }
     }
   }
@@ -111,10 +111,10 @@ fn tool_metadata_map(
       }
     }
     for name in live.async_tool_names() {
-      if let Some(tool) = live.get_async(&name) {
-        if let Some(metadata) = tool.metadata() {
-          map.insert(name, tool_metadata_json(metadata));
-        }
+      if let Some(tool) = live.get_async(&name)
+        && let Some(metadata) = tool.metadata()
+      {
+        map.insert(name, tool_metadata_json(metadata));
       }
     }
   }
@@ -1170,18 +1170,18 @@ impl Agent {
     self.stop_flag.store(true, Ordering::SeqCst);
     self.is_running.store(false, Ordering::SeqCst);
 
-    if let Some(opts) = options {
-      if opts.clear_session.unwrap_or(false) {
-        // Never block the JavaScript thread on a run that owns the agent; the
-        // run applies the clear through `apply_pending_session_clear` when it
-        // ends.
-        match self.inner.try_write() {
-          Ok(mut guard) => {
-            guard.stop();
-            guard.session_mut().clear();
-          }
-          Err(_) => self.pending_session_clear.store(true, Ordering::SeqCst),
+    if let Some(opts) = options
+      && opts.clear_session.unwrap_or(false)
+    {
+      // Never block the JavaScript thread on a run that owns the agent; the
+      // run applies the clear through `apply_pending_session_clear` when it
+      // ends.
+      match self.inner.try_write() {
+        Ok(mut guard) => {
+          guard.stop();
+          guard.session_mut().clear();
         }
+        Err(_) => self.pending_session_clear.store(true, Ordering::SeqCst),
       }
     }
 

@@ -144,10 +144,10 @@ fn tool_metadata_map(agent: &Agent) -> BTreeMap<String, serde_json::Value> {
             }
         }
         for name in registry.async_tool_names() {
-            if let Some(tool) = registry.get_async(&name) {
-                if let Some(metadata) = tool.metadata() {
-                    map.insert(name, tool_metadata_json(metadata));
-                }
+            if let Some(tool) = registry.get_async(&name)
+                && let Some(metadata) = tool.metadata()
+            {
+                map.insert(name, tool_metadata_json(metadata));
             }
         }
     }
@@ -158,10 +158,10 @@ fn tool_metadata_map(agent: &Agent) -> BTreeMap<String, serde_json::Value> {
             }
         }
         for name in live.async_tool_names() {
-            if let Some(tool) = live.get_async(&name) {
-                if let Some(metadata) = tool.metadata() {
-                    map.insert(name, tool_metadata_json(metadata));
-                }
+            if let Some(tool) = live.get_async(&name)
+                && let Some(metadata) = tool.metadata()
+            {
+                map.insert(name, tool_metadata_json(metadata));
             }
         }
     }
@@ -1011,10 +1011,10 @@ impl PyAgent {
                 refused.push(message);
             }
         }
-        if !refused.is_empty() {
-            if let Ok(mut queue) = self.pending_steers.lock() {
-                queue.extend(refused);
-            }
+        if !refused.is_empty()
+            && let Ok(mut queue) = self.pending_steers.lock()
+        {
+            queue.extend(refused);
         }
         {
             let mut slot = self
@@ -1285,11 +1285,11 @@ impl PyAgent {
             }
             // The run owns a clone and publishes it back when it ends, so the
             // clear has to reach that clone too or the write-back would undo it.
-            if let Ok(mut running) = self.running.lock() {
-                if let Some(agent) = running.as_mut() {
-                    agent.stop();
-                    agent.session_mut().clear();
-                }
+            if let Ok(mut running) = self.running.lock()
+                && let Some(agent) = running.as_mut()
+            {
+                agent.stop();
+                agent.session_mut().clear();
             }
         }
         Ok(was_running)
@@ -2456,11 +2456,11 @@ impl PyAgent {
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Agent lock poisoned"))?;
-        let result = guard
+
+        guard
             .session_mut()
             .restore_from_json(&json)
-            .map_err(to_py_runtime_error);
-        result
+            .map_err(to_py_runtime_error)
     }
 
     fn save_session<'py>(&self, _py: Python<'py>, path: String) -> PyResult<()> {

@@ -706,51 +706,49 @@ impl AgentPlugin for JSPlugin {
             if let Some(c) = result.get("content").and_then(|v| v.as_str()) {
               choice.message.content = Some(c.to_string());
             }
-            if let Some(name) = result.get("name").and_then(|v| v.as_str()) {
-              if let Some(ref mut tc) = choice.message.tool_calls {
-                if let Some(first_tc) = tc.first_mut() {
-                  first_tc.function.name = Some(name.to_string());
-                }
-              }
+            if let Some(name) = result.get("name").and_then(|v| v.as_str())
+              && let Some(ref mut tc) = choice.message.tool_calls
+              && let Some(first_tc) = tc.first_mut()
+            {
+              first_tc.function.name = Some(name.to_string());
             }
-            if let Some(args) = result.get("args") {
-              if let Some(ref mut tc) = choice.message.tool_calls {
-                if let Some(first_tc) = tc.first_mut() {
-                  first_tc.function.arguments = Some(args.to_string());
-                }
-              }
+            if let Some(args) = result.get("args")
+              && let Some(ref mut tc) = choice.message.tool_calls
+              && let Some(first_tc) = tc.first_mut()
+            {
+              first_tc.function.arguments = Some(args.to_string());
             }
           }
           return Some(LlmResponseWrapper::OpenAI(rsp));
         }
         LlmResponseWrapper::Responses(mut rsp) => {
-          if let Some(c) = result.get("content").and_then(|v| v.as_str()) {
-            if !c.is_empty() {
-              let mut found = false;
-              for item in rsp.output.iter_mut() {
-                if let react::llm::vendor::ResponsesItem::Message { content, .. } = item {
-                  content.clear();
-                  content.push(react::llm::vendor::ResponsesContentPart::OutputText {
+          if let Some(c) = result.get("content").and_then(|v| v.as_str())
+            && !c.is_empty()
+          {
+            let mut found = false;
+            for item in rsp.output.iter_mut() {
+              if let react::llm::vendor::ResponsesItem::Message { content, .. } = item {
+                content.clear();
+                content.push(react::llm::vendor::ResponsesContentPart::OutputText {
+                  text: c.to_string(),
+                  annotations: vec![],
+                });
+                found = true;
+                break;
+              }
+            }
+            if !found {
+              rsp.output.insert(
+                0,
+                react::llm::vendor::ResponsesItem::Message {
+                  id: String::new(),
+                  role: "assistant".to_string(),
+                  content: vec![react::llm::vendor::ResponsesContentPart::OutputText {
                     text: c.to_string(),
                     annotations: vec![],
-                  });
-                  found = true;
-                  break;
-                }
-              }
-              if !found {
-                rsp.output.insert(
-                  0,
-                  react::llm::vendor::ResponsesItem::Message {
-                    id: String::new(),
-                    role: "assistant".to_string(),
-                    content: vec![react::llm::vendor::ResponsesContentPart::OutputText {
-                      text: c.to_string(),
-                      annotations: vec![],
-                    }],
-                  },
-                );
-              }
+                  }],
+                },
+              );
             }
           }
           return Some(LlmResponseWrapper::Responses(rsp));

@@ -566,15 +566,15 @@ async fn unload_linked(store: &StdMutex<Vec<PyLinkedActivation>>) -> PyResult<()
     let mut first = None;
     let mut lease_host = NoopLeaseHost;
     for activation in linked {
-        if let Err(error) = activation.lease.revoke(&mut lease_host).await {
-            if first.is_none() {
-                first = Some(error);
-            }
+        if let Err(error) = activation.lease.revoke(&mut lease_host).await
+            && first.is_none()
+        {
+            first = Some(error);
         }
-        if let Err(error) = activation.runtime.shutdown().await {
-            if first.is_none() {
-                first = Some(error);
-            }
+        if let Err(error) = activation.runtime.shutdown().await
+            && first.is_none()
+        {
+            first = Some(error);
         }
     }
     first.map_or(Ok(()), |error| Err(host_error(error)))
@@ -590,10 +590,10 @@ async fn unload_activations(store: &StdMutex<Vec<Activation>>) -> PyResult<()> {
     let mut first = None;
     let mut lease_host = NoopLeaseHost;
     for activation in activations {
-        if let Err(error) = activation.unload(&mut lease_host).await {
-            if first.is_none() {
-                first = Some(error);
-            }
+        if let Err(error) = activation.unload(&mut lease_host).await
+            && first.is_none()
+        {
+            first = Some(error);
         }
     }
     first.map_or(Ok(()), |error| Err(host_error(error)))

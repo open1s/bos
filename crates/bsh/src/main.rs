@@ -16,13 +16,13 @@ fn hide_launch_console() {
     use std::ffi::c_void;
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetConsoleProcessList(process_list: *mut u32, count: u32) -> u32;
         fn GetConsoleWindow() -> *mut c_void;
     }
 
     #[link(name = "user32")]
-    extern "system" {
+    unsafe extern "system" {
         fn ShowWindow(window: *mut c_void, command: i32) -> i32;
     }
 

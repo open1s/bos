@@ -126,16 +126,16 @@ impl From<&InnerLlmResponse> for PyLlmResponseWrapper {
         match resp {
             InnerLlmResponse::OpenAI(rsp) => {
                 if let Some(choice) = rsp.choices.first() {
-                    if let Some(tool_calls) = &choice.message.tool_calls {
-                        if let Some(tc) = tool_calls.first() {
-                            return Self {
-                                response_type: "ToolCall".to_string(),
-                                content: None,
-                                tool_name: tc.function.name.clone(),
-                                tool_args: tc.function.arguments.clone(),
-                                tool_id: Some(tc.id.clone()),
-                            };
-                        }
+                    if let Some(tool_calls) = &choice.message.tool_calls
+                        && let Some(tc) = tool_calls.first()
+                    {
+                        return Self {
+                            response_type: "ToolCall".to_string(),
+                            content: None,
+                            tool_name: tc.function.name.clone(),
+                            tool_args: tc.function.arguments.clone(),
+                            tool_id: Some(tc.id.clone()),
+                        };
                     }
                     if let Some(content) = &choice.message.content {
                         return Self {
