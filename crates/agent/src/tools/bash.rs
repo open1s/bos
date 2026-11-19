@@ -697,10 +697,11 @@ impl Tool for BashTool {
             .map(|runtime| runtime.dialect().to_string())
             .unwrap_or_else(|_| "no POSIX shell installed".to_string());
         let mut description = format!(
-            "Run a shell command in the {dialect} dialect and return its stdout, stderr and exit \
+            "Run one shell command in the {dialect} dialect and return stdout, stderr and exit \
              code. Pass the WHOLE command line in `command`; pipes, redirection and \
-             `&&` are supported. Relative paths resolve from the workspace root when \
-             one is configured. Commands are NOT reinterpreted as CMD or PowerShell."
+             `&&` are supported. Relative paths resolve from the workspace root. \
+             Commands are NOT reinterpreted as CMD or PowerShell. Use the file tools \
+             for file inspection and changes, not cat, sed, or shell redirection."
         );
         if self.background {
             description.push_str(

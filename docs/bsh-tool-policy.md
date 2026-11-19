@@ -374,10 +374,13 @@ There are no `truncated`/`unchanged`/`changed` booleans. Completeness is a word
 (`status`), continuation is an argument object (`next`), and a change is an
 outcome word (`created`, `updated`, `patched`, `unchanged`, `changed`).
 
-`read_file` requires `offset`, and every line number is 1-based: the first
-line is offset 1, `start_line`/`end_line`/`total_lines` use the same base, and
-`next.offset` is `end_line + 1`. Offset 0 is refused rather than silently
-meaning the first line. It returns raw `content` plus `start_line`, `end_line`
+`read_file` treats `offset` as optional and defaults it to 1: a path-only call
+starts at the first line, and after a partial window the same path-only call
+continues from the previous `next` instead of returning the same lines. Pass
+`offset: 1` explicitly to re-read from the start. Every line number is 1-based:
+`start_line`/`end_line`/`total_lines` use the same base, and `next.offset` is
+`end_line + 1`. Offset 0 is refused rather than silently meaning the first
+line. It returns raw `content` plus `start_line`, `end_line`
 and `total_lines` for a file inside the read ceiling; a window in a larger file
 reports `total_lines: null` rather than scanning the rest. An empty file and
 an offset past EOF are distinguished by `status` and `hint`, because empty

@@ -354,6 +354,8 @@ pub(crate) const STAT_PILL_ICON: f32 = 14.0;
 pub(crate) const STAT_PILL_GAP: f32 = 6.0;
 /// The pill's inner `·` separator (`.sep`, `margin: 0 6px`).
 pub(crate) const STAT_SEP_MARGIN: f32 = 6.0;
+/// The gap between the stat pills and the notice line under them.
+pub(crate) const STAT_NOTICE_GAP: f32 = 6.0;
 /// The stat dialog panel, from `stat-dialog.module.css`: `max-content` between
 /// a 300px floor and a 440px ceiling over 16px of padding at radius 16, opening
 /// 8px above its trigger (the reference also keeps a 12px viewport margin, which

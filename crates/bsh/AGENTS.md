@@ -4264,3 +4264,37 @@ Tests: `extension::host::tests::the_grant_button_scopes_a_cordis_package_to_any_
 and `extension::host::tests::an_external_grant_reaches_a_running_host`, both
 discrimination-checked by reverting the two fixes (each fails with the reported denial).
 
+Round 193: the stat pills no longer paint over each other when a warning shares
+the status area (user report: the context reading, the counts pill and the token
+pill overlapped in one line).
+
+- **Backend.** No new state: the notice and its retry prompt already live in
+  `AppState.notice` / `notice_retry`, and Retry keeps the same
+  `clear_notice` -> `set_composer_text` -> `send` path (a real turn open).
+- **Layout.** `render_statusbar` now returns a `status-bar` column: the
+  measured centred pills row on top, and, only while a notice exists, a second
+  `status-notice-row` holding the warning pill and Retry. Measured in the
+  harness at the chat column's 680px floor: before, the time pill's flex box was
+  `w=0` while its label painted over the usage pill (`usage.x=812`); after,
+  time `946.5..1090.5`, usage `1102.5..1317.5`, and the notice row at
+  `y=1056` under the pills row at `y=1028`.
+- **Tips.** The 560px text cap still ellipsises a longer sentence, so the
+  notice's full text is its tooltip (500ms), the reference's tip pattern.
+- **Errors.** The warning is now readable instead of hidden behind the figures;
+  Retry is a fixed-size control (`flex_shrink_0`) so it is never squeezed.
+- Traps worth keeping: `min_w_0()` on a pill is an invitation to flex shrink it
+  to zero and let its label overflow into the neighbour (exactly the screenshot);
+  a wrapper with an absolute panel must carry `flex_shrink_0` itself, because
+  flex shrinks the wrapper and not the inner pill; and a `text_ellipsis` leaf
+  needs a constrained parent, which is why the notice text keeps its 560px cap.
+
+Evidence: `shell_tests::a_notice_takes_its_own_line_under_the_stat_pills` pins
+the non-overlap and the row split at `content_width = 680`;
+`the_stat_pills_take_the_measured_chrome`,
+`the_usage_pill_opens_the_measured_token_dialog`,
+`the_context_meter_opens_the_measured_breakdown_panel` and
+`a_missed_action_offers_the_retry_control` stay green. Clippy is not a gate in
+this working copy: the installed 1.100 toolchain already fails `-D warnings` on
+206 `collapsible_if` errors in `shell_tests.rs` and `capability`, none in the
+two files this round touched.
+

@@ -3,7 +3,13 @@
 //! Measured from the reference's `StatsPills` (round 102): a centred row of
 //! pills over a 12px gap, each a 14px glyph plus a `secondary - 1px` label with
 //! a `·` between its parts, and the usage pill opens the measured token dialog.
+//!
+//! A notice is a sentence rather than a figure, so it draws on a second centred
+//! row under the pills. On the pills' line, a long warning made flex shrink the
+//! time pill to zero width, and its label painted over the usage pill's total:
+//! fixed-size figures do not shrink, and the warning gets its own line.
 
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::shell::Shell;
@@ -27,17 +33,25 @@ impl Shell {
             .active_session()
             .map(|session| (session.turn_count(), session.step_count()))
             .unwrap_or((0, 0));
+        // The figures and a notice are two different readings, so they get two
+        // rows: a fixed-size pill is not something flex may shrink, and a
+        // sentence sharing the line with them shrank the time pill to zero width
+        // while its label painted over the usage pill. The stats line stays the
+        // single centred row the reference measures; the warning, which is a
+        // sentence rather than a figure, gets a line of its own underneath.
         let mut row = div()
             .debug_selector(|| "status-pills".to_string())
+            .w_full()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .justify_center()
             .gap(px(theme::STAT_GAP));
         // The context reading leads the row: it is the one figure that answers
         // "how full is the prompt", which is what a reader looks for first.
         if let Some(meter) = self.context_meter(cx) {
-            row = row.child(meter);
+            row = row.child(meter.flex_shrink_0());
         }
         // The reference draws the counts pill only once a step has landed.
         if steps > 0 {
@@ -48,10 +62,52 @@ impl Shell {
         }
         // The model name is not repeated here: the composer's own chip already
         // names it, and this row belongs to the figures about the turn.
-        if let Some(notice) = &self.state.notice {
+        let mut bar = div()
+            .debug_selector(|| "status-bar".to_string())
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(theme::STAT_NOTICE_GAP))
+            .child(row);
+        if let Some(notice_row) = self.status_notice_row(size, cx) {
+            bar = bar.child(notice_row);
+        }
+        bar
+    }
+
+    /// The warning line under the figures, with its recovery control.
+    ///
+    /// The notice is a sentence, so it owns a row: on the stats line it stole
+    /// width from the pills until the time pill was squeezed to nothing and its
+    /// label painted over the usage pill. Capped at the 560px text budget and
+    /// ellipsised, the warning can never widen the row past the chat column,
+    /// and Retry keeps its intrinsic width.
+    fn status_notice_row(&self, size: u32, cx: &mut Context<Self>) -> Option<Div> {
+        let notice = self.state.notice.clone();
+        let prompt = self.state.notice_retry.clone();
+        if notice.is_none() && prompt.is_none() {
+            return None;
+        }
+        let mut row = div()
+            .debug_selector(|| "status-notice-row".to_string())
+            .w_full()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .justify_center()
+            .gap(px(theme::STAT_GAP));
+        if let Some(notice) = notice {
+            // The 560px text budget ellipsises a longer sentence, so the whole
+            // warning stays readable on hover - the ellipsis hides the half that
+            // says what to check, not a decorative tail.
+            let tip = notice.clone();
             row = row.child(
                 div()
                     .debug_selector(|| "status-notice".to_string())
+                    .id("status-notice")
+                    .flex_shrink_0()
                     .h(px(24.0))
                     .px(px(10.0))
                     .rounded(px(999.0))
@@ -61,9 +117,11 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .child(icon(IconName::Info, 12.0, theme::warn()))
+                    .tooltip_show_delay(std::time::Duration::from_millis(500))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .child(icon(IconName::Info, 12.0, theme::warn()).flex_none())
                     .child(
-                        txt(notice.clone(), theme::stat_size_at(size), theme::warn())
+                        txt(notice, theme::stat_size_at(size), theme::warn())
                             .max_w(px(560.0))
                             .whitespace_nowrap()
                             .text_ellipsis(),
@@ -72,12 +130,13 @@ impl Shell {
         }
         // A recoverable failure carries the reader's own message, so the
         // recovery is one click: resend it once the environment is fixed.
-        if let Some(prompt) = self.state.notice_retry.clone() {
-            let label: SharedString = lang.tr("turn.retry").into();
+        if let Some(prompt) = prompt {
+            let label: SharedString = self.state.lang.tr("turn.retry").into();
             row = row.child(
                 div()
                     .debug_selector(|| "status-retry".to_string())
                     .id("status-retry")
+                    .flex_shrink_0()
                     .h(px(24.0))
                     .px(px(10.0))
                     .rounded(px(999.0))
@@ -95,7 +154,7 @@ impl Shell {
                     .child(txt(label, theme::stat_size_at(size), theme::accent())),
             );
         }
-        row
+        Some(row)
     }
 
     /// A plain label in the stat row, at the pill's own size.
@@ -120,7 +179,9 @@ impl Shell {
             .px(px(theme::STAT_PILL_PAD_X))
             .py(px(theme::STAT_PILL_PAD_Y))
             .rounded(px(999.0))
-            .min_w_0()
+            // A pill is a fixed figure: shrinking it below its label's width
+            // painted that label over its neighbour instead of shortening it.
+            .flex_shrink_0()
             .child(
                 icon(glyph, theme::STAT_PILL_ICON, theme::faint())
                     .line_height(px(theme::stat_line_at(size))),
@@ -201,9 +262,13 @@ impl Shell {
         // The panel rides beside the pill in a relative wrapper: the stat row is
         // the last child of the centre column, so an absolute panel paints over
         // the composer rather than under it.
-        div().relative().child(pill).when(open, |anchor| {
-            anchor.child(self.stat_panel(size, summary, lang))
-        })
+        div()
+            .relative()
+            .flex_shrink_0()
+            .child(pill)
+            .when(open, |anchor| {
+                anchor.child(self.stat_panel(size, summary, lang))
+            })
     }
 
     /// The measured token dialog, drawn 8px above the pill that opened it.

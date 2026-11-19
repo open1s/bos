@@ -4516,9 +4516,19 @@ fn not_found_message(target: &Path, content: &str, old: &str) -> String {
         message.push_str("; the file uses CRLF line endings, so old_string must carry them");
     }
     if let Some(line) = first_line_match(content, old) {
+        let start = line.saturating_sub(3).max(1);
         message.push_str(&format!(
-            "; its first line matches line {line}, so check the rest of the block exactly"
+            "; its first line matches line {line}, so check the rest of the block exactly. \
+             Re-read that region with {{\"path\":\"{}\",\"offset\":{},\"limit\":20}} and copy \
+             old_string verbatim",
+            target.display(),
+            start
         ));
+    } else {
+        message.push_str(
+            "; re-read the file with read_file and copy old_string verbatim, including \
+             indentation and line breaks",
+        );
     }
     message
 }
@@ -4952,6 +4962,9 @@ pub(crate) fn grep_tool(
     )
 }
 
+/// Per-tool read cursor: resolved path -> (length, mtime nanos, next line).
+type ReadCursor = Arc<Mutex<HashMap<PathBuf, (u64, u64, usize)>>>;
+
 /// read_file - read a UTF-8 file inside the workspace.
 pub(crate) fn read_file_tool(
     root: Option<PathBuf>,
@@ -4960,27 +4973,26 @@ pub(crate) fn read_file_tool(
     session: String,
     preset: String,
 ) -> FunctionTool {
+    // Per-tool read cursor: a path-only call after a partial read continues
+    // where the previous window ended instead of returning the same lines. The
+    // stamp (length, mtime) resets the cursor when the file changes.
+    let cursor: ReadCursor = Arc::new(Mutex::new(HashMap::new()));
     FunctionTool::new(
         "read_file",
-        "Read a UTF-8 text file from a required 1-based offset line. Paths are absolute or workspace-relative; .bsh/.ignore exclusions are refused. Returns start_line, end_line, total_lines when known, and next={offset} while more lines remain.",
+        "Read a UTF-8 text file. With only path it starts at line 1; after a partial read the same call continues from next, so pass offset=1 to restart. limit bounds the window. Paths are workspace-relative or absolute inside the workspace; ignored paths are refused. Returns start_line, end_line, total_lines and next={offset} while more lines remain.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path of the UTF-8 text file to read, relative to the workspace or absolute inside the allowed workspace." },
-                "offset": { "type": "integer", "minimum": 1, "description": "Required 1-based starting line: the first line is 1, not 0. Line numbers and next offsets use the same base." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Max lines from offset; next continues." }
+                "offset": { "type": "integer", "minimum": 1, "description": "Optional 1-based starting line; defaults to 1 (the first line is 1, not 0). Pass the next offset to continue." },
+                "limit": { "type": "integer", "minimum": 1, "description": "Optional maximum lines from offset; next continues when more remain." }
             },
-            "required": ["path", "offset"],
+            "required": ["path"],
             "additionalProperties": false
         }),
         move |args| {
             let raw = arg_str(args, "path")?;
-            let offset = arg_positive(args, "offset")?.ok_or_else(|| {
-                ToolError::InvalidInput(
-                    "offset is required: pass the 1-based starting line (use 1 to start at the beginning)"
-                        .to_string(),
-                )
-            })?;
+            let explicit_offset = arg_positive(args, "offset")?;
             let limit = arg_positive(args, "limit")?;
             let target =
                 resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
@@ -4993,6 +5005,35 @@ pub(crate) fn read_file_tool(
                 Action::Read,
                 &target,
             )?;
+            let meta = fs::metadata(&target).map_err(|error| failed(&target, &error))?;
+            let stamp = (
+                meta.len(),
+                meta.modified()
+                    .ok()
+                    .and_then(|modified| {
+                        modified
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|duration| duration.as_nanos() as u64)
+                    })
+                    .unwrap_or(0),
+            );
+            let mut continued = false;
+            let offset = match explicit_offset {
+                Some(offset) => offset,
+                None => {
+                    let cursor = cursor
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match cursor.get(&target) {
+                        Some(&(len, modified, next)) if (len, modified) == stamp => {
+                            continued = true;
+                            next
+                        }
+                        _ => 1,
+                    }
+                }
+            };
             let read = read_window(&target, offset, limit.unwrap_or(usize::MAX))?;
             let ReadOutcome {
                 content,
@@ -5010,6 +5051,19 @@ pub(crate) fn read_file_tool(
                 end_line.saturating_sub(start_line).saturating_add(1)
             };
             let next_offset = truncated.then_some(end_line.saturating_add(1));
+            {
+                let mut cursor = cursor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match next_offset {
+                    Some(next) => {
+                        cursor.insert(target.clone(), (stamp.0, stamp.1, next));
+                    }
+                    None => {
+                        cursor.remove(&target);
+                    }
+                }
+            }
             let next = next_offset.map(|offset| serde_json::json!({ "offset": offset }));
             let mut result = serde_json::json!({
                 "path": target.display().to_string(),
@@ -5020,12 +5074,22 @@ pub(crate) fn read_file_tool(
                 "total_lines": total_lines,
                 "bytes": bytes,
             });
+            if continued {
+                result["continued"] = serde_json::json!(true);
+            }
             if let Some(next) = next_offset {
                 let of = total_lines
                     .map(|total| format!(" of {total}"))
                     .unwrap_or_default();
+                let resumed = if continued {
+                    format!(
+                        "resumed at line {offset} from the previous read; pass offset=1 to re-read from the start. "
+                    )
+                } else {
+                    String::new()
+                };
                 result["hint"] = serde_json::json!(format!(
-                    "showing lines {start_line}-{end_line}{of}; continue with offset {next}"
+                    "{resumed}showing lines {start_line}-{end_line}{of}; continue with offset {next}"
                 ));
             } else if past_end {
                 let total = match total_lines {
@@ -5295,7 +5359,7 @@ fn apply_patch_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "apply_patch",
-        "Apply up to 10 per-file groups of exact-text edits. Each file is checked for write permission before reading, all edits for that file are validated before its atomic write, and a failed edit leaves that file unchanged. This is not a cross-file transaction; inspect each result's error field.",
+        "Apply exact-text edits to 2–10 files in one call; use edit_file for one file. Each file is validated before its atomic write, and a failed edit leaves that file unchanged. Not a cross-file transaction; inspect each result's error field.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -5647,7 +5711,7 @@ fn edit_file_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "edit_file",
-        "Replace an exact string in a UTF-8 text file inside the workspace. By default old_string must occur exactly once; pass replace_all to replace every occurrence.",
+        "Replace an exact string in one existing UTF-8 text file. Read it first and copy old_string verbatim, including indentation; include surrounding lines when the snippet may repeat. It must occur exactly once unless replace_all=true.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -11408,19 +11472,65 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(empty["hint"], "the file is empty");
     }
 
-    /// The offset is part of the interface, not a default: a call without it is
-    /// refused before the file is opened, so the model always states where the
-    /// read starts.
+    /// The common call needs only the path: offset defaults to line 1, so a
+    /// model that says which file to read is not refused for omitting a
+    /// continuation detail.
     #[test]
-    fn read_file_requires_an_offset() {
-        let root = scratch("read-offset-required");
-        std::fs::write(root.join("a.txt"), "needle").expect("a");
+    fn read_file_defaults_to_the_first_line() {
+        let root = scratch("read-offset-default");
+        std::fs::write(root.join("a.txt"), "first\nsecond\n").expect("a");
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
-        let error = registry
+        let result = registry
             .execute("read_file", &serde_json::json!({ "path": "a.txt" }))
-            .expect_err("offset is required");
-        assert!(error.to_string().contains("offset"), "{error}");
+            .expect("the path is enough");
+        assert_eq!(result["start_line"], 1);
+        assert_eq!(result["content"], "first\nsecond\n");
+    }
+
+    /// A path-only read after a partial window continues instead of returning
+    /// the same first lines; an explicit offset=1 is how a deliberate re-read
+    /// from the start is expressed.
+    #[test]
+    fn read_file_path_only_continues_after_a_partial_window() {
+        let root = scratch("read-offset-continue");
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").expect("a");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let first = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": "a.txt", "limit": 1 }),
+            )
+            .expect("the first window");
+        assert_eq!(first["content"], "one\n");
+        assert_eq!(first["next"]["offset"], 2);
+
+        let continued = registry
+            .execute("read_file", &serde_json::json!({ "path": "a.txt" }))
+            .expect("the path-only call continues");
+        assert_eq!(continued["start_line"], 2);
+        assert_eq!(continued["continued"], true);
+        assert_eq!(continued["content"], "two\nthree\n");
+
+        let reread = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": "a.txt", "offset": 1, "limit": 1 }),
+            )
+            .expect("offset=1 re-reads from the start");
+        assert_eq!(reread["start_line"], 1);
+        assert_eq!(reread["content"], "one\n");
+
+        // A changed file invalidates the cursor: the next path-only call is a
+        // fresh read, not a continuation into bytes that no longer exist.
+        std::fs::write(root.join("a.txt"), "changed\nmore\n").expect("rewrite");
+        let fresh = registry
+            .execute("read_file", &serde_json::json!({ "path": "a.txt" }))
+            .expect("the changed file reads from the start");
+        assert_eq!(fresh["start_line"], 1);
+        assert_eq!(fresh["content"], "changed\nmore\n");
     }
 
     /// Line numbers are 1-based everywhere: the first line is offset 1, the

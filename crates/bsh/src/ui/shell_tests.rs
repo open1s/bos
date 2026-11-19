@@ -15139,13 +15139,19 @@ fn the_stat_pills_take_the_measured_chrome(cx: &mut TestAppContext) {
     );
 }
 
-/// Probe: a long notice with a retry control must not squeeze the pills into
-/// each other.
+/// A warning notice never shares the pills' line: its sentence and the retry
+/// control take a row of their own under the figures.
+///
+/// The regression was measured at the chat column's 680px floor: with a 560px
+/// notice on the same line, flex shrank the time pill to zero width and its
+/// label painted over the usage pill, so the counts and the token total were
+/// unreadable on top of each other. Fixed-size figures do not shrink, and the
+/// sentence gets its own line.
 #[gpui::test]
-fn probe_status_notice_overlap(cx: &mut TestAppContext) {
+fn a_notice_takes_its_own_line_under_the_stat_pills(cx: &mut TestAppContext) {
     init_test_app(cx);
     let (_harness, cx) = cx.add_window_view(move |window, cx| {
-        let mut state = state_with_turns("probe-stat-notice", 2);
+        let mut state = state_with_turns("stat-notice-row", 2);
         let id = state.active_id.clone().expect("an active session");
         if let Some(session) = state.store.session_mut(&id) {
             if let Some(message) = session.messages.last_mut() {
@@ -15167,35 +15173,62 @@ fn probe_status_notice_overlap(cx: &mut TestAppContext) {
                 });
             }
         }
-        state.notice = Some("本轮操作请求没有成功的工具调用（共 0 次，失败 0 次），请先核对对话记录再采信答复。".to_string());
+        state.notice = Some(
+            "本轮操作请求没有成功的工具调用（共 0 次，失败 0 次），请先核对对话记录再采信答复。"
+                .to_string(),
+        );
         state.notice_retry = Some("fix the parser".to_string());
         tests_pin_reference_defaults(&mut state);
-        // The screenshot's window: the chat column at its 680px floor, where a
+        // The screenshot's window: the chat column at its 680px floor, where the
         // 560px notice and the pills no longer fit on one line.
         state.settings.global.general.content_width = Some(680.0);
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    for key in [
-        "status-pills",
-        "status-time-pill",
-        "status-usage-pill",
-        "status-notice",
-        "status-retry",
-    ] {
-        let b = cx.debug_bounds(key);
-        match b {
-            Some(b) => println!(
-                "{key}: x={} y={} w={} h={}",
-                b.origin.x.as_f32(),
-                b.origin.y.as_f32(),
-                b.size.width.as_f32(),
-                b.size.height.as_f32()
-            ),
-            None => println!("{key}: none"),
-        }
-    }
+    let bar = cx
+        .debug_bounds("status-bar")
+        .expect("the status area renders");
+    let pills = cx
+        .debug_bounds("status-pills")
+        .expect("the stat line renders");
+    let time = cx
+        .debug_bounds("status-time-pill")
+        .expect("a landed step draws the counts pill");
+    let usage = cx
+        .debug_bounds("status-usage-pill")
+        .expect("billed usage draws the usage pill");
+    let notes = cx
+        .debug_bounds("status-notice-row")
+        .expect("the warning takes its own row");
+    let notice = cx
+        .debug_bounds("status-notice")
+        .expect("the notice renders on that row");
+    let retry = cx
+        .debug_bounds("status-retry")
+        .expect("the retry control renders beside it");
+
+    assert!(
+        time.size.width > px(0.0),
+        "the pill keeps its label's width instead of being squeezed away"
+    );
+    assert!(
+        usage.origin.x >= time.origin.x + time.size.width,
+        "the token pill starts after the counts pill, never on top of it"
+    );
+    assert!(
+        notes.origin.y >= pills.origin.y + pills.size.height,
+        "the notice sits below the figures' line"
+    );
+    assert!(
+        retry.origin.x >= notice.origin.x + notice.size.width,
+        "the retry control starts after the notice, never on top of it"
+    );
+    assert!(
+        notes.origin.x >= bar.origin.x
+            && notes.origin.x + notes.size.width <= bar.origin.x + bar.size.width,
+        "the notice row stays inside the chat column"
+    );
 }
 
 /// The usage pill is a live trigger, not a label: pressing it opens the measured
