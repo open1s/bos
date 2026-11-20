@@ -111,14 +111,26 @@ pub(crate) fn builtin_metadata(name: &str) -> Option<ToolMetadata> {
         "federation_status" | "federation_peers" | "federation_capabilities" => {
             read_only("net.federation")
         }
-        "federation_delegate" | "federation_cancel" | "federation_query" | "federation_cleanup" => {
-            ToolMetadata::new()
-                .with_version("1.0.0")
-                .with_risk("medium")
-                .with_side_effects(["network", "write"])
-                .with_permissions(["net.federation"])
-                .with_timeout_ms(30_000)
-        }
+        "federation_delegate" => ToolMetadata::new()
+            .with_version("1.0.0")
+            .with_risk("medium")
+            .with_side_effects(["network", "write"])
+            .with_permissions(["net.federation"])
+            // Submission plus the bounded wait it is allowed to honour.
+            .with_timeout_ms(90_000),
+        "federation_await" => ToolMetadata::new()
+            .with_version("1.0.0")
+            .with_risk("low")
+            .with_side_effects(["network", "read"])
+            .with_permissions(["net.federation"])
+            // Long-polling a submitted delegation is a read, not a write.
+            .with_timeout_ms(330_000),
+        "federation_cancel" | "federation_query" | "federation_cleanup" => ToolMetadata::new()
+            .with_version("1.0.0")
+            .with_risk("medium")
+            .with_side_effects(["network", "write"])
+            .with_permissions(["net.federation"])
+            .with_timeout_ms(30_000),
         _ => return None,
     };
     Some(metadata)

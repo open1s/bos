@@ -4167,6 +4167,11 @@ impl Shell {
             let transcript = crate::caps::child_transcript(&guard);
             (result, usage, transcript)
         });
+        // A follow-up turn is a child turn too: register its task so
+        // `interrupt_agent` (and a second stop) can abort THIS turn rather
+        // than reporting that the resumed child has no live process. A normal
+        // settle drops the handle in finish/fail.
+        self.state.subagents.set_handle(&id, handle.abort_handle());
         let task = cx.spawn(async move |this, cx| {
             let outcome = handle.await;
             let _ = this.update(cx, |this, cx| {
@@ -4178,12 +4183,25 @@ impl Shell {
                         registry.fail(&id, error, Some(usage), transcript);
                     }
                     Err(error) => {
-                        registry.fail(
-                            &id,
-                            format!("subagent task ended: {error}"),
-                            None,
-                            Vec::new(),
-                        );
+                        // Aborted (a stop) or panicked. A stop has already
+                        // settled the run and kept its rows; overwriting it
+                        // here would flip a turn the reader just reopened back
+                        // to failed and wipe the transcript a resume needs.
+                        if registry
+                            .status(&id)
+                            .is_some_and(|status| status.is_running())
+                        {
+                            let transcript = registry
+                                .run(&id)
+                                .map(|run| run.transcript)
+                                .unwrap_or_default();
+                            registry.fail(
+                                &id,
+                                format!("subagent task ended: {error}"),
+                                None,
+                                transcript,
+                            );
+                        }
                     }
                 }
                 this.state.refresh_subagent_preview();

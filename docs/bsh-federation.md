@@ -413,7 +413,17 @@ record's error). Three limits keep this safe:
   run.
 
 An objective with no structured contract is recorded and left `accepted`: bsh
-has no language-model executor, so a prose task is queued, not pretended.
+has no language-model executor, so a prose task is queued, not pretended. The
+delegate tool says so in its answer (`executable: false`) instead of waiting out
+its whole request on a state that cannot move.
+
+A delegation that is not terminal when the wait ends is not lost: the answer
+names its target and id, and `federation_await` reads the owner's record again
+with the same bounded wait. Awaiting never resubmits the work. Both waits ask
+less often as they run (50 ms, growing to a 2 s steady cadence, inside the
+requested wait), so one collection is a handful of round trips rather than five
+per second. Request ids are UUID-based, so two parallel tool calls in the same
+millisecond cannot collide on one delegation id.
 
 ## Delegations survive a restart
 
@@ -812,9 +822,9 @@ let progress = runner.run(executor, 4).await?;
   shape: BSH keeps Zenoh on a loopback client proxy that owns the client
   certificate, so Reload TLS also replaces the client cert and its CA.
 The model has the same surface as `federation_status`, `federation_peers`,
-`federation_delegate`, `federation_cancel`, `federation_query` and
-`federation_cleanup` tools; it reads peer ids from `federation_peers` instead of
-being asked to type them.
+`federation_delegate`, `federation_await`, `federation_cancel`,
+`federation_query` and `federation_cleanup` tools; it reads peer ids from
+`federation_peers` instead of being asked to type them.
 
 - Knowledge federation is opt-in: a host must install a `KnowledgeService` and a
   `KnowledgeAuthorizer`. BSH installs both when

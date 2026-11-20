@@ -41,11 +41,11 @@ transcript stay in the run registry and the subagent menu.
 A child is not a dead end once it starts: `send_message` continues it. On a
 running child the message takes the same path as a prompt the reader queues in
 the composer - it waits behind the current turn and starts the next one when
-that settles - and on a settled child it reopens the run and runs on the live
-agent that answered the last turn, so the conversation carries over. A run
-restored after a restart has no live process to continue, and the tool refuses
-it with that reason rather than starting a stranger; delegate again with the
-context the new child needs.
+that settles - and on a settled, stopped or restored child it reopens the run
+and continues the SAME conversation: the child is rebuilt from the rows it
+produced (a stop drops its process, a restart never had one) and seeded with
+them. Stopping a child is therefore not a dead end either; delegate again only
+when the work needs a fresh context.
 
 `interrupt_agent` is the stop control from the model side. It aborts the
 child's detached turn, releases its slot immediately, drops any prompts queued
@@ -136,8 +136,11 @@ restart cannot collide with an earlier child's file.
 
 A follow-up uses the live child Agent while it exists. After a restart the
 registry restores only the transcript, so the first prompt rebuilds the child
-from its saved Session (see the rebuild note above). The registry no longer
-evicts settled runs, so a child stays continuable for the life of the process.
+from its saved Session (see the rebuild note above; the model's `send_message`
+rebuilds from the run's own rows on the same principle). The registry no longer
+evicts settled runs, so a child stays continuable for the life of the process,
+and a stopped run is continuable too: the stop drops its process, not its
+conversation.
 
 ## UI (DSH mirror)
 

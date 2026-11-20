@@ -1434,8 +1434,11 @@ fn build_agent_for_session_inner(
                 continue;
             }
             // Standard keeps the federation queries but not distributed
-            // delegation; the Federation preset grants it.
-            if !eff.distributed_delegate && name == "federation_delegate" {
+            // delegation; the Federation preset grants it. Awaiting is the
+            // continuation of a delegation, so it rides the same gate.
+            if !eff.distributed_delegate
+                && (name == "federation_delegate" || name == "federation_await")
+            {
                 continue;
             }
             if off_tool(&name) {
@@ -2883,6 +2886,27 @@ impl SubagentContext {
         self.registry.interrupt(id)
     }
 
+    /// The live child behind one run, rebuilt from its own rows when the
+    /// process is gone.
+    ///
+    /// A stopped turn drops its process before the registry can keep it, and a
+    /// run restored after a restart never had one on this side. The rows the
+    /// run produced ARE its conversation, so the child is rebuilt from them
+    /// and continues it - the same thing the reader's composer does - instead
+    /// of refusing the follow-up.
+    fn live_or_rebuilt_child(
+        &self,
+        run: &crate::subagent::SubagentRun,
+    ) -> Arc<tokio::sync::Mutex<Agent>> {
+        if let Some(child) = self.registry.agent(&run.id) {
+            return child;
+        }
+        let child = self.child(&run.id);
+        crate::runner::Runner::seed_session(&child, &run.chat_messages());
+        let child = Arc::new(tokio::sync::Mutex::new(child));
+        self.registry.set_agent(&run.id, child.clone());
+        child
+    }
     /// Build a child and, below the depth cap, give it the subagent tool too.
     fn child(&self, child_id: &str) -> Agent {
         self.child_with_delegation(child_id, true)
@@ -3312,13 +3336,14 @@ fn attach_subagent_result_tool(
 /// - a SETTLED child reopens immediately and runs on the live agent that
 ///   answered its last turn, so the follow-up keeps the conversation.
 ///
-/// A run restored from disk has no live process on this side (the child agent
-/// is not persisted); that case is refused with the one action that works
-/// instead of silently starting a stranger.
+/// A stopped turn drops its process, and a run restored after a restart never
+/// had one on this side. In both cases the child is rebuilt from the rows it
+/// produced and seeded with them, so the follow-up continues the same
+/// conversation instead of being refused or starting a stranger.
 fn attach_subagent_message_tool(agent: &mut Agent, context: Arc<SubagentContext>) {
     let tool = agent::tools::AsyncFunctionTool::from_fn(
         "send_message",
-        "Send a message to a subagent run you started: a running child queues it behind its current turn, and a finished child starts a new turn with the message. Returns queued or started; read the answer with subagent_result. The child cannot see this conversation, so a follow-up must carry its own context. Start a new delegation instead when the run's process is gone (a restart).",
+        "Send a message to a subagent run you started: a running child queues it behind its current turn, and a finished or STOPPED child starts a new turn with the message (rebuilt from its own transcript, so the conversation continues). Returns queued or started; read the answer with subagent_result. The child cannot see this conversation, so a follow-up must carry its own context.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -3375,11 +3400,11 @@ fn attach_subagent_message_tool(agent: &mut Agent, context: Arc<SubagentContext>
                         "note": "The child is mid-turn; the message starts the next child turn when this one settles. Collect it with subagent_result."
                     }));
                 }
-                let Some(child) = context.registry.agent(&id) else {
-                    return Err(ToolError::Failed(format!(
-                        "subagent run '{id}' has no live process (it was restored after a restart), so a follow-up cannot continue it. Start a new subagent with the context it needs."
-                    )));
-                };
+                // A stopped turn drops its process, and a restart never had
+                // one here. The child is rebuilt from the rows it produced so
+                // the follow-up continues ITS conversation: the model must not
+                // be refused a resume the reader's composer can perform.
+                let child = context.live_or_rebuilt_child(&run);
                 if !context.registry.begin_followup(&id, &message) {
                     // It settled between the snapshot and the reopen: queue
                     // behind the turn that just started rather than opening a
@@ -3448,7 +3473,7 @@ async fn continue_child(
 fn attach_subagent_interrupt_tool(agent: &mut Agent, context: Arc<SubagentContext>) {
     let tool = agent::tools::AsyncFunctionTool::from_fn(
         "interrupt_agent",
-        "Stop a running subagent. The child's turn is aborted and its slot is released; the run is marked failed with 'interrupted by the parent turn', and any prompts queued behind it are dropped. A run that already settled is reported unchanged, not stopped. Use it when a child is clearly going the wrong way, then delegate again with a corrected prompt.",
+        "Stop a running subagent. The child's turn is aborted and its slot is released; the run is marked failed with 'interrupted by the parent turn', and any prompts queued behind it are dropped. A run that already settled is reported unchanged, not stopped. Use it when a child is clearly going the wrong way; continue the same child with send_message, or delegate again with a corrected prompt.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -3511,7 +3536,7 @@ fn attach_subagent_interrupt_tool(agent: &mut Agent, context: Arc<SubagentContex
                     "subagent_id": id,
                     "interrupted": true,
                     "status": "failed",
-                    "note": "The child's turn was stopped and its slot released. Start a new subagent if the work still matters."
+                    "note": "The child's turn was stopped and its slot released. Continue the same child with send_message (it is rebuilt from its transcript), or start a new subagent if the work needs a fresh context."
                 }))
             }
         },
@@ -8193,12 +8218,20 @@ mod tests {
             !names.iter().any(|n| n == "federation_delegate"),
             "Standard must not delegate to peers: {names:?}"
         );
+        assert!(
+            !names.iter().any(|n| n == "federation_await"),
+            "awaiting a delegation rides the same gate: {names:?}"
+        );
         settings.global.default_preset = "federation".to_string();
         let federated = build(&settings);
         let names = tool_names(&federated);
         assert!(
             names.iter().any(|n| n == "federation_delegate"),
             "Federation grants the delegate: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "federation_await"),
+            "and its continuation: {names:?}"
         );
     }
 
@@ -14113,14 +14146,28 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
 
     /// `send_message` queues behind a running child through the same registry
     /// call the reader's own composer uses, refuses a run it does not own, and
-    /// refuses a settled run with no live process instead of rebuilding a
-    /// stranger from nothing.
+    /// RESUMES a settled or stopped run by rebuilding its child from the rows
+    /// the run produced.
     #[test]
-    fn send_message_queues_behind_a_running_child_and_refuses_a_stale_run() {
+    fn send_message_queues_behind_a_running_child_and_resumes_a_settled_one() {
         use std::sync::Arc;
         let registry = Arc::new(crate::subagent::SubagentRegistry::default());
+        // A closed port keeps the rebuilt child's follow-up turn off the
+        // network: the request fails at once, and the assertions are about the
+        // rebuild, not about the provider.
+        let mut settings = bare();
+        settings
+            .global
+            .add_provider("work", "", "http://127.0.0.1:1/v1", &[]);
+        let _ = settings
+            .global
+            .add_model("work", "fast", "", "gpt-4o-mini", "");
+        settings.global.default_model = Some(crate::settings::global::ModelRef {
+            provider: "work".to_string(),
+            model: "fast".to_string(),
+        });
         let built = crate::caps::build_agent_for_session_with_subagents(
-            &bare(),
+            &settings,
             &Vault::disabled(),
             &SessionChoice::default(),
             &crate::mcp::McpPool::default(),
@@ -14182,16 +14229,38 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 .await;
             assert!(refused.is_err(), "another conversation's run is invisible");
 
-            registry.finish(&id, "done".to_string(), (1, 1), Vec::new());
-            match tool
+            // A settled (or stopped) run has no live process. The follow-up
+            // must rebuild the child from its recorded rows and continue it,
+            // exactly as the reader's composer does.
+            registry.finish(
+                &id,
+                "done".to_string(),
+                (1, 1),
+                vec![crate::subagent::SubagentMessage {
+                    role: "user".to_string(),
+                    content: "look".to_string(),
+                    tool: None,
+                }],
+            );
+            let resumed = tool
                 .run(&serde_json::json!({ "subagent_id": id, "message": "again" }))
                 .await
-            {
-                Err(agent::ToolError::Failed(message)) => {
-                    assert!(message.contains("no live process"), "{message}")
-                }
-                other => panic!("expected the stale-run refusal, got {other:?}"),
-            }
+                .expect("a settled run resumes");
+            assert_eq!(resumed["status"], "started", "{resumed:?}");
+            assert!(
+                registry.agent(&id).is_some(),
+                "the child was rebuilt and kept behind the run"
+            );
+            assert_eq!(
+                registry
+                    .run(&id)
+                    .expect("run")
+                    .transcript
+                    .last()
+                    .map(|row| row.content.as_str()),
+                Some("again"),
+                "the message is the child's next row",
+            );
         });
     }
 

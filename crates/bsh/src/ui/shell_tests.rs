@@ -4459,6 +4459,95 @@ fn a_queued_subagent_prompt_starts_when_the_child_settles(cx: &mut TestAppContex
     cx.run_until_parked();
 }
 
+/// A STOPPED child is not a dead end either. Stopping a turn marks the run
+/// failed and drops its process; the reader must be able to type the next
+/// request and have the child rebuilt from the rows it already produced.
+#[gpui::test]
+fn a_stopped_subagent_takes_the_next_prompt(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("subagent-stopped", 1);
+        let parent = state.active_id.clone().expect("a session");
+        let id = state.subagents.begin(
+            &parent,
+            &parent,
+            1,
+            0,
+            "Inspect the files",
+            "List the workspace files",
+        );
+        // What a stop leaves behind: a failed run, no live process, and the
+        // rows produced before the abort.
+        state.subagents.fail(
+            &id,
+            "interrupted by the parent turn".to_string(),
+            Some((1200, 3400)),
+            vec![crate::subagent::SubagentMessage {
+                role: "user".to_string(),
+                content: "List the workspace files".to_string(),
+                tool: None,
+            }],
+        );
+        state
+            .settings
+            .global
+            .add_provider("work", "", "http://127.0.0.1:1/v1", &[]);
+        let _ = state
+            .settings
+            .global
+            .add_model("work", "fast", "", "gpt-4o-mini", "");
+        if let Some(session) = state.store.session_mut(&parent) {
+            session.provider = Some("work".to_string());
+            session.model = Some("fast".to_string());
+        }
+        state.show_subagent(&id);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .subagents
+            .snapshot()
+            .first()
+            .expect("the run")
+            .id
+            .clone()
+    });
+    cx.update(|_, cx| shell.update(cx, |this, _| this.state.show_subagent(&id)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |this, cx| {
+            this.set_composer_text("pwd", window, cx);
+            this.send(window, cx);
+        });
+    });
+    let (status, live, tail, notice) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        let run = shell.state.subagents.run(&id).expect("the run");
+        (
+            run.status,
+            shell.state.subagents.agent(&id).is_some(),
+            run.transcript.last().map(|row| row.content.clone()),
+            shell.state.notice.clone(),
+        )
+    });
+    assert_eq!(
+        status,
+        crate::subagent::SubagentStatus::Running,
+        "the prompt reopened the stopped child: {notice:?}"
+    );
+    assert!(live, "the stopped child was rebuilt behind the run");
+    assert_eq!(tail.as_deref(), Some("pwd"), "the prompt is its next row");
+
+    cx.dispatcher.allow_parking();
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+}
+
 /// A settled child whose process is gone is not a dead end either: the prompt
 /// rebuilds the child and opens the turn THERE, so the message never jumps into
 /// the parent conversation.

@@ -29,6 +29,7 @@ impl FederationTool {
             "peers",
             "capabilities",
             "delegate",
+            "await",
             "cancel",
             "query",
             "cleanup",
@@ -40,6 +41,7 @@ impl FederationTool {
                 "peers" => "federation_peers",
                 "capabilities" => "federation_capabilities",
                 "delegate" => "federation_delegate",
+                "await" => "federation_await",
                 "cancel" => "federation_cancel",
                 "query" => "federation_query",
                 "cleanup" => "federation_cleanup",
@@ -57,7 +59,7 @@ fn runtime() -> Result<std::sync::Arc<crate::federation_node::FederationRuntime>
 
 fn context() -> InvocationContext {
     let mut context = InvocationContext::local(
-        InvocationId::new(format!("agent-fed-{}", unix_ms())),
+        InvocationId::new(agent_request_id("agent-fed")),
         Principal::Local {
             session: "agent".to_string(),
             preset: "federation".to_string(),
@@ -78,6 +80,21 @@ pub(crate) async fn delegate_record(
     capability: Option<&str>,
     input: Value,
 ) -> Result<federation::DelegationRecord, ToolError> {
+    delegate_record_until(target, objective, capability, input, unix_ms() + 30_000).await
+}
+
+/// The same submission with an explicit execution bound.
+///
+/// The tool's own wait sets this bound: a delegation whose deadline expires
+/// while the caller is still waiting would settle as failed for a reason the
+/// caller never chose.
+pub(crate) async fn delegate_record_until(
+    target: &str,
+    objective: &str,
+    capability: Option<&str>,
+    input: Value,
+    deadline_ms: u64,
+) -> Result<federation::DelegationRecord, ToolError> {
     let runtime = runtime()?;
     let node = runtime.node();
     let target = resolve_peer(target, &enrolled_peers()?)?;
@@ -93,14 +110,17 @@ pub(crate) async fn delegate_record(
         .to_string()
     });
     let request = DelegationRequest {
-        id: DelegationId::new(format!("agent-{}", unix_ms())),
+        // A millisecond stamp is not unique: two parallel tool calls in the
+        // same millisecond collided on one id and the peer refused the second
+        // as "already exists".
+        id: DelegationId::new(agent_request_id("agent")),
         parent: None,
         target: target.clone(),
         objective: objective.to_string(),
         capabilities: capability.into_iter().collect(),
         operations: Vec::new(),
         resources: Vec::new(),
-        deadline_ms: Some(unix_ms() + 30_000),
+        deadline_ms: Some(deadline_ms),
         allow_sub_delegation: false,
         result_contract: contract,
         trace_id: None,
@@ -109,6 +129,11 @@ pub(crate) async fn delegate_record(
     node.delegate(&target, request, &context())
         .await
         .map_err(|error| ToolError::Failed(error.to_string()))
+}
+
+/// A request id no two calls can share, whatever the clock says.
+fn agent_request_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
 /// Ask a peer to own a task.
@@ -299,6 +324,85 @@ fn target(input: &Value) -> Result<NodeId, ToolError> {
     resolve_peer(raw, &peers)
 }
 
+/// How long a tool call waits, clamped to the bound it may honour.
+fn wait_ms(input: &Value, default_ms: u64, cap_ms: u64) -> u64 {
+    input
+        .get("wait_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(default_ms)
+        .min(cap_ms)
+}
+
+/// Wait for one delegation to settle, asking less often as the wait grows.
+///
+/// A fixed 200 ms poll spent about a hundred round trips on one 20 s wait. The
+/// backoff starts fast enough to catch a quick capability invocation and grows
+/// to a two-second steady cadence, so a long wait costs a handful of RPCs. It
+/// never polls past the requested wait, and a status failure names the id and
+/// target so the caller can resume with federation_await instead of
+/// resubmitting the work.
+async fn await_delegation(
+    node: &federation::FederationNode,
+    mut record: federation::DelegationRecord,
+    wait_ms: u64,
+) -> Result<federation::DelegationRecord, ToolError> {
+    let target = record.request.target.clone();
+    let id = record.request.id.clone();
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    let mut interval = Duration::from_millis(50);
+    while !record.state.is_terminal() {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let nap = interval.min(deadline.saturating_duration_since(now));
+        tokio::time::sleep(nap).await;
+        match node.delegation_status(&target, &id, &context()).await {
+            Ok(next) => record = next,
+            Err(error) => {
+                return Err(ToolError::Failed(format!(
+                    "delegation {} on {target} is still open, but its status could not be read: {error}; call federation_await with this target and delegation id to keep waiting",
+                    id.as_str()
+                )));
+            }
+        }
+        interval = interval.mul_f32(1.5).min(Duration::from_secs(2));
+    }
+    Ok(record)
+}
+
+/// Whether the request names an executable capability.
+fn is_executable(record: &federation::DelegationRecord) -> bool {
+    record.request.result_contract.is_some() || !record.request.capabilities.is_empty()
+}
+
+/// The tool-facing shape of one delegation.
+///
+/// The note is the model's next move: keep waiting by id, or learn that a
+/// prose objective is queued rather than run. Terminal stays false for the
+/// prose case, so the tool never claims a settled answer it does not have.
+fn delegation_result(record: &federation::DelegationRecord) -> Value {
+    let executable = is_executable(record);
+    let terminal = record.state.is_terminal();
+    let note = if terminal {
+        String::new()
+    } else if !executable {
+        "recorded on the peer but NOT executed: a delegation runs one capability, so pass capability and input to run work; a prose objective is queued, not run".to_string()
+    } else {
+        "still running: call federation_await with this target and delegation id to keep waiting; do not submit it again".to_string()
+    };
+    json!({
+        "target": record.request.target.to_string(),
+        "delegation": record.request.id.as_str(),
+        "state": format!("{:?}", record.state).to_lowercase(),
+        "terminal": terminal,
+        "executable": executable,
+        "result": record.result,
+        "error": record.error,
+        "note": note,
+    })
+}
+
 fn string(input: &Value, key: &str) -> Result<String, ToolError> {
     input
         .get(key)
@@ -316,7 +420,8 @@ impl Tool for FederationTool {
         match self.name {
             "federation_status" => "Federation status: node identity, enrolled peers and outstanding delegations. The rest of the family (peers, delegate, query, cancel, cleanup) is reachable through find_tool.".to_string(),
             "federation_peers" => "List enrolled and discovered peers.".to_string(),
-            "federation_delegate" => "Run work on another node. Use this whenever the user asks a peer/node/other machine to do something. target may be omitted when exactly one trusted peer exists; the tool waits for the terminal result.".to_string(),
+            "federation_delegate" => "Run work on another node by naming a capability and its input. Use this whenever the user asks a peer/node/other machine to do something executable. target may be omitted when exactly one trusted peer exists. A prose objective is only queued, not run, on a peer with no language-model executor; when the answer is not ready within wait_ms, call federation_await with the returned id instead of submitting again.".to_string(),
+            "federation_await" => "Keep waiting for a delegation you already submitted, by id. It reads the owner's record and never resubmits the work; use it when federation_delegate returned terminal:false.".to_string(),
             "federation_cancel" => "Cancel a delegation.".to_string(),
             "federation_query" => "Ask a peer for knowledge.".to_string(),
             "federation_cleanup" => "Delete artifacts on a peer.".to_string(),
@@ -359,6 +464,15 @@ impl Tool for FederationTool {
                     "capability": {"type": "string"},
                     "input": {},
                     "wait_ms": {"type": "integer"}
+                }
+            }),
+            "federation_await" => json!({
+                "type": "object",
+                "required": ["target", "delegation"],
+                "properties": {
+                    "target": {"type": "string", "description": "peer id or name the delegation was sent to"},
+                    "delegation": {"type": "string", "description": "the id federation_delegate returned"},
+                    "wait_ms": {"type": "integer", "description": "how long to wait for a terminal state; the delegation's own deadline still wins"}
                 }
             }),
             "federation_cancel" => json!({
@@ -444,37 +558,51 @@ impl FederationTool {
                 let objective = string(input, "objective")?;
                 let capability = input.get("capability").and_then(Value::as_str);
                 let payload = input.get("input").cloned().unwrap_or(Value::Null);
-                let record =
-                    delegate_record(&target.to_string(), &objective, capability, payload).await?;
-                let target = record.request.target.clone();
-                let id = record.request.id.clone();
-                let wait_ms = input
-                    .get("wait_ms")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(20_000)
-                    .min(60_000);
-                let mut record = record;
-                let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
-                while !record.state.is_terminal() && std::time::Instant::now() < deadline {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    match node.delegation_status(&target, &id, &context()).await {
-                        Ok(next) => record = next,
-                        Err(error) => {
-                            return Err(ToolError::Failed(format!(
-                                "delegation {} submitted, but status failed: {error}",
-                                id.as_str()
-                            )));
-                        }
-                    }
-                }
-                Ok(json!({
-                    "target": target.to_string(),
-                    "delegation": id.as_str(),
-                    "state": format!("{:?}", record.state).to_lowercase(),
-                    "terminal": record.state.is_terminal(),
-                    "result": record.result,
-                    "error": record.error,
-                }))
+                let wait = wait_ms(input, 20_000, 60_000);
+                // The delegation's own bound must outlast the wait it is
+                // asked for, or the peer expires work the caller is still
+                // waiting on.
+                let deadline = unix_ms() + wait.saturating_add(5_000).max(30_000);
+                let record = delegate_record_until(
+                    &target.to_string(),
+                    &objective,
+                    capability,
+                    payload,
+                    deadline,
+                )
+                .await?;
+                // A prose objective is recorded and left accepted: bsh has no
+                // language-model executor on the peer. Waiting on it would
+                // burn the whole request for a state that cannot move, so the
+                // note says so instead.
+                let record = if is_executable(&record) {
+                    await_delegation(node.as_ref(), record, wait).await?
+                } else {
+                    record
+                };
+                Ok(delegation_result(&record))
+            }
+            "federation_await" => {
+                let target = target(input)?;
+                let id = DelegationId::new(string(input, "delegation")?);
+                let wait = wait_ms(input, 20_000, 300_000);
+                let record = node
+                    .delegation_status(&target, &id, &context())
+                    .await
+                    .map_err(|error| {
+                        ToolError::Failed(format!(
+                            "delegation {} on {target}: {error}",
+                            id.as_str()
+                        ))
+                    })?;
+                // A prose record cannot move; waiting on it would burn the
+                // request for a state nobody can settle.
+                let record = if is_executable(&record) {
+                    await_delegation(node.as_ref(), record, wait).await?
+                } else {
+                    record
+                };
+                Ok(delegation_result(&record))
             }
             "federation_cancel" => {
                 let target = target(input)?;
@@ -488,7 +616,7 @@ impl FederationTool {
             "federation_query" => {
                 let target = target(input)?;
                 let mut query =
-                    KnowledgeQuery::new(format!("agent-{}", unix_ms()), KnowledgePurpose::Answer);
+                    KnowledgeQuery::new(agent_request_id("agent"), KnowledgePurpose::Answer);
                 query.terms = string(input, "query")?
                     .split_whitespace()
                     .map(str::to_string)
@@ -515,8 +643,7 @@ impl FederationTool {
                     .filter_map(Value::as_str)
                     .map(|uri| ArtifactRef::new(uri, uri))
                     .collect::<Vec<_>>();
-                let request =
-                    ArtifactCleanupRequest::new(format!("agent-{}", unix_ms()), artifacts);
+                let request = ArtifactCleanupRequest::new(agent_request_id("agent"), artifacts);
                 let response = node
                     .cleanup_artifacts(&target, &request, &context())
                     .await
@@ -551,10 +678,88 @@ mod tests {
                 "federation_peers",
                 "federation_capabilities",
                 "federation_delegate",
+                "federation_await",
                 "federation_cancel",
                 "federation_query",
                 "federation_cleanup",
             ]
+        );
+    }
+
+    #[test]
+    fn a_request_id_is_unique_within_a_millisecond() {
+        let ids: std::collections::BTreeSet<String> =
+            (0..1_000).map(|_| agent_request_id("agent")).collect();
+        assert_eq!(ids.len(), 1_000, "no two calls share a request id");
+    }
+
+    #[test]
+    fn wait_is_clamped_to_the_bound_a_call_may_honour() {
+        assert_eq!(wait_ms(&json!({}), 20_000, 60_000), 20_000);
+        assert_eq!(wait_ms(&json!({"wait_ms": 5}), 20_000, 60_000), 5);
+        assert_eq!(
+            wait_ms(&json!({"wait_ms": 999_999}), 20_000, 60_000),
+            60_000
+        );
+    }
+
+    fn a_delegation(
+        state: federation::DelegationState,
+        executable: bool,
+    ) -> federation::DelegationRecord {
+        let node = NodeIdentity::from_seed([9u8; 32]).node_id();
+        federation::DelegationRecord {
+            origin: None,
+            request: federation::DelegationRequest {
+                id: DelegationId::new("agent-test"),
+                parent: None,
+                target: node,
+                objective: "look around".to_string(),
+                capabilities: if executable {
+                    vec!["builtin/read_file".parse().expect("capability")]
+                } else {
+                    Vec::new()
+                },
+                operations: Vec::new(),
+                resources: Vec::new(),
+                deadline_ms: None,
+                allow_sub_delegation: false,
+                result_contract: executable.then(|| "{}".to_string()),
+                trace_id: None,
+                span_id: None,
+            },
+            state,
+            updated_at_ms: 1,
+            result: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_prose_delegation_is_reported_as_queued_not_run() {
+        let payload =
+            delegation_result(&a_delegation(federation::DelegationState::Accepted, false));
+        assert_eq!(payload["terminal"], false);
+        assert_eq!(payload["executable"], false);
+        assert!(
+            payload["note"]
+                .as_str()
+                .expect("note")
+                .contains("NOT executed"),
+            "{payload}"
+        );
+    }
+
+    #[test]
+    fn a_running_delegation_points_at_await_instead_of_resubmitting() {
+        let payload = delegation_result(&a_delegation(federation::DelegationState::Running, true));
+        assert_eq!(payload["terminal"], false);
+        assert!(
+            payload["note"]
+                .as_str()
+                .expect("note")
+                .contains("federation_await"),
+            "{payload}"
         );
     }
 
@@ -566,6 +771,16 @@ mod tests {
         let schema = tool.json_schema();
         assert_eq!(schema["required"][0], "objective");
         assert!(schema["properties"]["target"].is_object());
+    }
+
+    #[test]
+    fn await_names_its_target_and_delegation() {
+        let tool = FederationTool {
+            name: "federation_await",
+        };
+        let schema = tool.json_schema();
+        assert_eq!(schema["required"][0], "target");
+        assert_eq!(schema["required"][1], "delegation");
     }
 
     #[test]
