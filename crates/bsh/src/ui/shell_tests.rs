@@ -1047,6 +1047,72 @@ fn user_rows(shell: &Entity<Shell>, id: &str, cx: &mut VisualTestContext) -> Vec
     })
 }
 
+/// The send-now arrow steers into a GOAL round exactly as it does into an
+/// ordinary running turn: the row leaves the dock and the round's mailbox
+/// carries the text.
+#[gpui::test]
+fn a_queued_message_steers_during_a_goal_round(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_queue("queue-goal-steer", &["write the missing code"]);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .active_id
+            .clone()
+            .expect("an active session")
+    });
+    let mailbox = cx.update(|_, cx| {
+        shell.update(cx, |shell, _| {
+            shell
+                .state
+                .create_goal(&id, "ship the palette")
+                .expect("the goal");
+            let _ = shell.state.begin_goal_turn_in(&id);
+            let mailbox = std::sync::Arc::new(agent::SteerMailbox::new());
+            shell.state.attach_steers(&id, mailbox.clone());
+            shell.queue_open = true;
+            mailbox
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let arrow = cx
+        .debug_bounds("queue-steer-1")
+        .expect("the send-now control renders on a queued row");
+    cx.simulate_click(arrow.center(), Modifiers::default());
+
+    let (left, waiting, carried) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell
+                .state
+                .inbox(&id)
+                .iter()
+                .map(|queued| queued.text.clone())
+                .collect::<Vec<_>>(),
+            shell.state.is_steering(1),
+            mailbox
+                .take()
+                .into_iter()
+                .map(|m| m.ticket)
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert!(
+        left.is_empty(),
+        "the pressed row leaves the queue: {left:?}"
+    );
+    assert!(waiting, "it waits for the round to take it");
+    assert_eq!(carried, vec![1], "the goal round's mailbox carries it");
+}
+
 /// The row's Send now steers exactly that message: the row leaves, its
 /// neighbours stay, the turn's mailbox carries the text, and the transcript
 /// records it where the turn took it.

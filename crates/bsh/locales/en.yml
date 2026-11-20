@@ -822,6 +822,7 @@
 "queue.remove": "Remove queued message"
 "queue.sendNow": "Send now"
 "queue.steerFailed": "Steering failed. Try again."
+"queue.steerStarting": "The turn is still starting; the message stays queued and will be sent."
 "skill.notEnabled": "No enabled skill is named \"{name}\" - the request is sent as text."
 "skill.invoked": "Skill"
 "inject.title": "Context injection"

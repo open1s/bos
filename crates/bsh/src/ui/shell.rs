@@ -3920,8 +3920,13 @@ impl Shell {
             return;
         }
         // No mailbox means the turn is between the store and the runner: keep
-        // the row queued rather than dropping it into nothing.
+        // the row queued rather than dropping it into nothing, and say so - a
+        // press that silently did nothing read as a broken control, especially
+        // while a goal round was opening.
         let Some(mailbox) = self.state.steers(id) else {
+            let why = crate::i18n::tr(self.state.lang, "queue.steerStarting");
+            self.state.notice(why);
+            cx.notify();
             return;
         };
         let Some(queued) = self.state.take_queued(id, seq) else {
@@ -4611,9 +4616,19 @@ impl Shell {
         );
         if let Some(error) = &built.credential_error {
             // No turn opens without a credential: a locked vault names itself
-            // instead of sending the request unauthenticated.
+            // instead of sending the request unauthenticated. The turn marker
+            // must be released here too: a `begin_turn_in` that opened a
+            // stream and a placeholder, then failed before attaching a
+            // mailbox, leaves a session that reads as RUNNING with no turn -
+            // every send and every Send now click on it became a silent no-op.
+            let why = error.message(self.state.lang);
             self.state.abandon_review(&id);
-            self.state.notice(error.message(self.state.lang));
+            self.state
+                .apply_event(&id, crate::runner::AgentEvent::Error(why.clone()));
+            self.state.notice(why);
+            // A goal round that cannot start keeps no armed round behind it;
+            // the reader resumes once the credential is available.
+            self.state.disarm_goal(&id);
             return None;
         }
         self.state.set_tools_schema(built.tools_schema_chars);

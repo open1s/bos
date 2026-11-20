@@ -817,6 +817,7 @@
 "queue.remove": "删除排队消息"
 "queue.sendNow": "立即发送"
 "queue.steerFailed": "插话发送失败，请重试。"
+"queue.steerStarting": "回合仍在启动；消息会留在队列中并随后发送。"
 "skill.notEnabled": "没有启用的技能\"{name}\"，请求已按原文发送。"
 "skill.invoked": "技能"
 "inject.title": "上下文注入"
