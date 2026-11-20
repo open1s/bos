@@ -4327,6 +4327,75 @@ async fn compact_now_installs_a_model_written_checkpoint() {
     );
 }
 
+/// A model summary is a paraphrase. The installed checkpoint still carries every
+/// user request from the shadowed span verbatim, so a request the model omitted
+/// - or a span head that the digest budget cut - cannot be discarded.
+#[tokio::test]
+async fn compact_now_carries_the_requests_the_summary_omitted() {
+    let agent = agent_with_summary("mock response");
+    four_messages(&agent);
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    let outcome = agent
+        .compact_now(0, &signal)
+        .await
+        .expect("the compaction request")
+        .expect("a checkpoint");
+    assert!(
+        outcome.summary.contains("<carried-requests>"),
+        "the installed checkpoint names the requests it carries: {}",
+        outcome.summary
+    );
+    for request in ["old one", "old two"] {
+        assert!(
+            outcome.summary.contains(request),
+            "the checkpoint lost the request {request:?}: {}",
+            outcome.summary
+        );
+    }
+    let session = agent.session();
+    let Some(react::LlmMessage::User { content }) = session.messages().first() else {
+        panic!("the checkpoint is the first user message");
+    };
+    let text = content.as_text().unwrap_or_default();
+    assert!(
+        text.contains("old one") && text.contains("old two"),
+        "{text}"
+    );
+}
+
+/// A second model-written fold keeps every request the first checkpoint
+/// carried: the newest summary is never trusted to repeat them.
+#[tokio::test]
+async fn a_second_compaction_keeps_the_first_checkpoints_requests() {
+    let agent = agent_with_summary("mock response");
+    four_messages(&agent);
+    let signal = std::sync::atomic::AtomicBool::new(false);
+    agent
+        .compact_now(0, &signal)
+        .await
+        .expect("the first compaction request")
+        .expect("a first checkpoint");
+    {
+        let mut session = agent.session();
+        session.add_user(format!("second round {}", "z".repeat(1200)));
+        session.add_assistant(format!("second reply {}", "w".repeat(1200)));
+        session.add_user(format!("third round {}", "z".repeat(1200)));
+        session.add_assistant(format!("third reply {}", "w".repeat(1200)));
+    }
+    let outcome = agent
+        .compact_now(0, &signal)
+        .await
+        .expect("the second compaction request")
+        .expect("a second checkpoint");
+    for request in ["old one", "old two", "second round", "third round"] {
+        assert!(
+            outcome.summary.contains(request),
+            "the second checkpoint lost the request {request:?}: {}",
+            outcome.summary
+        );
+    }
+}
+
 /// The described request carries the exact system prompt, history, model and
 /// advertised tools of the call (issue #421).
 #[test]

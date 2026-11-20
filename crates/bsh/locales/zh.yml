@@ -130,6 +130,7 @@
 "slash.compactFailed": "压缩失败：{error}"
 "slash.compactCommit": "压缩未能干净完成；部分会话历史可能已改变。重试前请检查当前会话状态。"
 "slash.compactPersistence": "压缩已完成，但会话无法保存。"
+"slash.compactHistoryUnavailable": "压缩无法读取需要折叠的较早历史；历史保持不变。"
 "slash.permission": "权限"
 "slash.permissionDetail": "切换权限模式"
 "slash.current": "当前"

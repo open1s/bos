@@ -1834,6 +1834,65 @@ impl Store {
         added
     }
 
+    /// How many unfolded rows sit above the loaded window.
+    ///
+    /// A restart loads only the tail window, so the rows between the compaction
+    /// boundary and the window's first row are in the log but not in memory.
+    /// Compaction may not fold them: the summarizer never saw them.
+    pub(crate) fn unfolded_rows(&self, id: &str) -> usize {
+        self.unfolded_bounds(id)
+            .map_or(0, |(floor, boundary)| floor.saturating_sub(boundary))
+    }
+
+    /// One session's paging floor and compaction boundary.
+    ///
+    /// The floor is where paging has reached, which is the lowest row in memory
+    /// (or the loaded window's start when nothing was paged). Everything
+    /// between the two is on disk and outside every summary.
+    fn unfolded_bounds(&self, id: &str) -> Option<(usize, usize)> {
+        let session = self.sessions.iter().find(|session| session.id == id)?;
+        Some((
+            session.paged_from.unwrap_or(session.loaded_from),
+            session.compacted,
+        ))
+    }
+
+    /// Page in every unfolded row above the loaded window.
+    ///
+    /// Compaction may only fold rows the summarizer was handed. A boundary
+    /// computed from the tail window alone would claim rows nobody read - the
+    /// reader's request among them - so the window is walked down to the
+    /// compaction boundary one bounded read at a time before a fold is chosen.
+    ///
+    /// Returns how many rows were added. A read failure or a log that no longer
+    /// covers the asked rows stops the walk where it is, leaving
+    /// [`Self::unfolded_rows`] above zero so the caller can refuse to fold
+    /// instead of silently skipping them.
+    pub(crate) fn load_unfolded(&mut self, id: &str) -> usize {
+        let mut added = 0;
+        while let Some((floor, boundary)) = self.unfolded_bounds(id) {
+            if floor <= boundary {
+                break;
+            }
+            // One read materializes at most MAX_WINDOW_ROWS rows, so a history
+            // longer than a window walks down a window at a time.
+            let len = (floor - boundary).min(crate::history::MAX_WINDOW_ROWS);
+            let Some(read) = self.older_read(id, len) else {
+                break;
+            };
+            let page = read.read();
+            if page.failure().is_some() {
+                break;
+            }
+            let rows = self.apply_older(page);
+            if rows == 0 {
+                break;
+            }
+            added += rows;
+        }
+        added
+    }
+
     /// The directory a session's history lives in.
     pub(crate) fn history_dir(&self, id: &str) -> Option<PathBuf> {
         let session = self.sessions.iter().find(|session| session.id == id)?;
@@ -2479,6 +2538,70 @@ mod raw_tests {
             opened.load_older("paged", WINDOW),
             0,
             "and nothing is left to page"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A compaction may only fold rows the summarizer was handed. A restart
+    /// leaves the tail window in memory, so the rows between the boundary and
+    /// that window are paged in BEFORE a fold is chosen: the reader's request
+    /// must not sit behind a boundary that would jump over it unseen.
+    #[test]
+    fn the_unfolded_prefix_is_paged_in_before_a_fold() {
+        use crate::model::ChatMessage;
+        use crate::store::Store;
+
+        let base = std::env::temp_dir().join(format!("bsh-unfolded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).expect("workspace");
+
+        let mut session = crate::model::Session::new("live", "long chat");
+        session.id = "unfolded".to_string();
+        session.workspace = "live".to_string();
+        for index in 0..600 {
+            session
+                .messages
+                .push(ChatMessage::user(format!("message {index}")));
+        }
+        // The boundary sits in the middle: everything above it is unfolded.
+        session.compacted = 300;
+        let store = Store::open_over(
+            &[("live".to_string(), root.to_string_lossy().to_string())],
+            base.join("quarantine"),
+        );
+        store.save(&session).expect("the save");
+
+        let mut opened = Store::open_over(
+            &[("live".to_string(), root.to_string_lossy().to_string())],
+            base.join("quarantine"),
+        );
+        opened.rehydrate("unfolded");
+        let loaded = opened.session("unfolded").expect("the session");
+        assert!(loaded.loaded_from > 300, "only the tail window is loaded");
+        assert_eq!(
+            opened.unfolded_rows("unfolded"),
+            loaded.loaded_from - 300,
+            "the rows between the boundary and the window are unfolded"
+        );
+
+        opened.load_unfolded("unfolded");
+        let after = opened.session("unfolded").expect("the session");
+        assert_eq!(
+            after.loaded_from, 300,
+            "the window now starts at the boundary"
+        );
+        assert_eq!(opened.unfolded_rows("unfolded"), 0);
+        assert_eq!(
+            after.messages.first().map(|m| m.text.as_str()),
+            Some("message 300"),
+            "the first row the fold may read is the boundary, not the request"
+        );
+        assert_eq!(
+            after.messages.len(),
+            300,
+            "the whole unfolded span is in memory"
         );
 
         let _ = std::fs::remove_dir_all(&base);

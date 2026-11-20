@@ -89,7 +89,8 @@ pub struct CompactionOutcome {
     pub before_tokens: usize,
     /// Estimated tokens in the session after the checkpoint was installed.
     pub after_tokens: usize,
-    /// The model-written checkpoint text, unframed.
+    /// The installed checkpoint text, unframed: the model-written summary
+    /// with the span's carried user requests ahead of it.
     pub summary: String,
     /// The recoverable checkpoint record, when it was archived (issue #413).
     pub checkpoint: Option<Checkpoint>,
@@ -409,6 +410,112 @@ pub fn render_for_summary(message: &Message) -> String {
     }
 }
 
+/// How much of one carried user request is kept verbatim.
+///
+/// A request is the one thing a compaction may never silently drop, so every
+/// folded user message is carried into the checkpoint text. The cap keeps an
+/// arbitrarily long paste from defeating the compaction it is part of; the
+/// tail past it is replaced by an explicit marker, never by silence.
+pub const CARRIED_REQUEST_CHARS: usize = 2_000;
+
+/// The marker a carried request puts where it was clipped.
+pub const CARRIED_REQUEST_CLIPPED: &str =
+    " [... the rest of this request was truncated to keep the checkpoint small]";
+
+/// Every user request in one folded span, framed as the block a checkpoint
+/// carries so none of them is lost.
+///
+/// The model-written summary is a paraphrase: it can omit a request, and the
+/// semantic gate only proves that the required sections exist. This block is
+/// built from the span itself, never from the model's answer, so the request
+/// that opened the work - and every steer and follow-up folded with it -
+/// reaches the next request verbatim (up to CARRIED_REQUEST_CHARS each).
+///
+/// A replayed checkpoint is already a summary, not a new request, so its
+/// framing is skipped: carrying it would duplicate history the checkpoint
+/// already condenses.
+pub(crate) fn render_carried_requests(span: &[Message]) -> Option<String> {
+    let mut carried: Vec<String> = Vec::new();
+    // A request carried by an EARLIER checkpoint is older than anything this
+    // span holds, so its bullets come first. Re-emitting them verbatim is what
+    // makes the guarantee hold across repeated folds: the model's newest
+    // summary cannot drop a request a prior checkpoint already carried.
+    for message in span {
+        let text = message_text(message);
+        for prior in prior_carried_requests(&text) {
+            keep_carried(&mut carried, prior);
+        }
+    }
+    for message in span {
+        let Message::User { content } = message else {
+            continue;
+        };
+        let text = content_to_summary_string(content);
+        let text = text.trim();
+        if text.is_empty() || is_checkpoint_text(text) {
+            continue;
+        }
+        let mut body: String = text.chars().take(CARRIED_REQUEST_CHARS).collect();
+        if text.chars().count() > CARRIED_REQUEST_CHARS {
+            body.push_str(CARRIED_REQUEST_CLIPPED);
+        }
+        keep_carried(&mut carried, format!("- {body}"));
+    }
+    if carried.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<carried-requests>\nEvery user request made in the span this checkpoint replaces, kept here so none is lost:\n{}\n</carried-requests>",
+        carried.join("\n")
+    ))
+}
+
+/// Add one carried bullet unless an identical one is already there.
+fn keep_carried(carried: &mut Vec<String>, bullet: String) {
+    if !carried.contains(&bullet) {
+        carried.push(bullet);
+    }
+}
+
+/// The bullets one earlier carried-requests block already holds.
+fn prior_carried_requests(text: &str) -> Vec<String> {
+    let open = "<carried-requests>";
+    let close = "</carried-requests>";
+    let Some(start) = text.find(open) else {
+        return Vec::new();
+    };
+    let rest = &text[start + open.len()..];
+    let Some(end) = rest.find(close) else {
+        return Vec::new();
+    };
+    rest[..end]
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("- ")
+                .filter(|body| !body.is_empty())
+                .map(|body| format!("- {body}"))
+        })
+        .collect()
+}
+
+/// One message's text, whatever role carries it.
+fn message_text(message: &Message) -> String {
+    match message {
+        Message::System { content } | Message::Developer { content } => content.clone(),
+        Message::User { content } => content_to_summary_string(content),
+        Message::Assistant { content } => content.clone(),
+        Message::AssistantReasoning { .. } => String::new(),
+        Message::AssistantToolCall { name, args, .. } => format!("{name} {args}"),
+        Message::ToolResult { content, .. } => content.clone(),
+    }
+}
+
+/// Whether one user row is a compaction checkpoint rather than reader input.
+fn is_checkpoint_text(text: &str) -> bool {
+    text.starts_with(CHECKPOINT_PREAMBLE) || text.contains("<compacted-summary>")
+}
+
 fn content_to_summary_string(content: &Content) -> String {
     match content {
         Content::Text(s) => s.clone(),
@@ -450,7 +557,8 @@ pub struct Checkpoint {
     pub retained_tail: Vec<Message>,
     /// The leading system instructions kept ahead of the checkpoint.
     pub head: Vec<Message>,
-    /// The model-written summary.
+    /// The installed summary: the model-written text plus the span's carried
+    /// user requests, which is what a later request replays.
     pub summary: String,
     /// The summary parsed into its fixed sections (issue #413), so a reader can
     /// inspect constraints, decisions, conflicts and open tasks without
@@ -2344,6 +2452,30 @@ pub const MECHANICAL_OMISSION: &str = "[... the middle of the compacted history 
 /// Characters, not bytes, are the unit: the cap is a character budget, and a
 /// CJK span must not be cut mid-code-point.
 fn mechanical_summary(span: &[Message], max_chars: usize) -> String {
+    let requests = render_carried_requests(span);
+    // The requests are half of what the model needs back, so when they are
+    // carried the traffic keeps half the cap; a request-free span still spends
+    // the whole cap on traffic.
+    let traffic_cap = if requests.is_some() {
+        max_chars / 2
+    } else {
+        max_chars
+    };
+    let conversation = mechanical_conversation(span, traffic_cap);
+    match (requests, conversation.is_empty()) {
+        (Some(requests), true) => requests,
+        (Some(requests), false) => format!("{requests}\n{conversation}"),
+        (None, _) => conversation,
+    }
+}
+
+/// The traffic half of a mechanical summary: what happened, bounded.
+///
+/// User rows are deliberately absent: every one of them is carried verbatim by
+/// render_carried_requests, ahead of this text, so the character budget can
+/// never cut a request. This slice spends what is left on the head and the tail
+/// of the assistant/tool traffic, and says where it cut.
+fn mechanical_conversation(span: &[Message], max_chars: usize) -> String {
     // The leading developer run is host context, not history. It is
     // regenerated for the next request, so it must not eat the budget.
     let mut start = 0;
@@ -2353,11 +2485,15 @@ fn mechanical_summary(span: &[Message], max_chars: usize) -> String {
     // A span that is ALL host context keeps it: an empty summary would say
     // nothing at all about what was folded.
     let start = if start == span.len() { 0 } else { start };
-    let whole = span[start..]
-        .iter()
-        .map(render_mechanical_message)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let whole = strip_carried_requests(
+        &span[start..]
+            .iter()
+            .filter(|message| !matches!(message, Message::User { .. }))
+            .map(render_mechanical_message)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
     if max_chars == 0 {
         return String::new();
     }
@@ -2382,6 +2518,28 @@ fn mechanical_summary(span: &[Message], max_chars: usize) -> String {
     } else {
         format!("{head}\n{MECHANICAL_OMISSION}\n{tail}")
     }
+}
+
+/// Remove carried-requests blocks from rendered history.
+///
+/// The bullets are re-emitted at the head of the new summary, so leaving an old
+/// block in the traffic slice would spend the budget on it twice and could cut
+/// the very requests it lists.
+fn strip_carried_requests(text: &str) -> String {
+    let open = "<carried-requests>";
+    let close = "</carried-requests>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(open) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + open.len()..];
+        match after.find(close) {
+            Some(end) => rest = &after[end + close.len()..],
+            None => rest = "",
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Render one folded message the way the mechanical summary reads it.
@@ -3747,29 +3905,108 @@ mod budget_tests {
         );
     }
 
-    /// The same budget keeps the newest work as well as the intent: a checkpoint
-    /// that only said what the turn started with would drop the step it is on.
+    /// Every reader request folded into the summary is carried verbatim, in
+    /// order, ahead of the traffic: the character budget may cut the traffic,
+    /// never a request.
     #[test]
-    fn a_mechanical_summary_keeps_the_newest_work_beside_the_request() {
+    fn a_mechanical_summary_carries_every_folded_request() {
         let mut session = AgentSession::new();
-        session.add_user("Ship the parser rename in one change".to_string());
-        session.add_assistant("Starting.".to_string());
+        session.push(Message::developer(format!(
+            "<runtime-context>{}</runtime-context>",
+            "context ".repeat(1_200)
+        )));
+        session.add_user("Rename the parser entry point to parse_request".to_string());
+        session.add_assistant("Reading the parser now.".to_string());
+        session.add_user("Also keep the old name as an alias".to_string());
         for index in 0..10 {
             session.add_user(format!("step {index} {}", "y".repeat(300)));
             session.add_assistant(format!("done {index}"));
         }
-        session.compact(4, 1_000);
+        session.compact(4, 600);
         let summary = mechanical_text(&session).expect("a mechanical summary");
-        assert!(summary.contains("Ship the parser rename"), "{summary}");
-        assert!(
-            summary.contains("step 7") || summary.contains("step 8"),
-            "the newest folded work must survive too: {summary}"
-        );
-        assert!(summary.contains(MECHANICAL_OMISSION), "{summary}");
+        for request in [
+            "Rename the parser entry point to parse_request",
+            "Also keep the old name as an alias",
+            "step 0",
+            "step 5",
+        ] {
+            assert!(
+                summary.contains(request),
+                "lost the folded request {request:?}: {summary}"
+            );
+        }
+        let first = summary
+            .find("Rename the parser entry point")
+            .expect("the opening request");
+        let second = summary
+            .find("Also keep the old name")
+            .expect("the follow-up request");
+        assert!(first < second, "requests keep their order: {summary}");
     }
 
-    /// The character cap is a real bound: a long span may not grow the summary
-    /// past it, and a CJK span is cut on a character boundary, never a byte.
+    /// A request carried by an earlier checkpoint survives the next fold: the
+    /// new checkpoint re-emits the prior bullets instead of trusting the newest
+    /// summary to repeat them.
+    #[test]
+    fn carried_requests_survive_a_repeated_fold() {
+        let opening = format!("the opening request {}", "x".repeat(400));
+        let first = vec![
+            Message::user(opening.clone()),
+            Message::assistant("working".to_string()),
+        ];
+        let carried = render_carried_requests(&first).expect("the opening request");
+        assert!(carried.contains("the opening request"));
+
+        let second = vec![
+            Message::system(format!(
+                "Prior conversation history has been compacted. Summary: {carried}"
+            )),
+            Message::assistant("still working".to_string()),
+            Message::user("the follow-up request".to_string()),
+        ];
+        let merged = render_carried_requests(&second).expect("merged requests");
+        assert!(
+            merged.contains("the opening request"),
+            "a repeated fold dropped the opening request: {merged}"
+        );
+        assert!(merged.contains("the follow-up request"), "{merged}");
+        assert_eq!(
+            merged.matches("the opening request").count(),
+            1,
+            "the prior bullet is carried once, not duplicated: {merged}"
+        );
+    }
+
+    /// The traffic half keeps the newest work. The carried requests are
+    /// additive, so the character cap applies to the traffic slice alone and a
+    /// request can never be what the cap cuts.
+    #[test]
+    fn a_mechanical_summary_keeps_the_newest_traffic_beside_the_requests() {
+        let mut session = AgentSession::new();
+        session.add_user("Ship the parser rename in one change".to_string());
+        session.add_assistant("Starting.".to_string());
+        for index in 0..5 {
+            session.add_assistant(format!("did the long work {index} {}", "y".repeat(300)));
+        }
+        // The newest folded row is short, so the tail slice holds it whole.
+        session.add_assistant("did the long work 5".to_string());
+        session.add_assistant("kept verbatim".to_string());
+        for index in 0..4 {
+            session.add_assistant(format!("tail {index}"));
+        }
+        session.compact(4, 600);
+        let summary = mechanical_text(&session).expect("a mechanical summary");
+        assert!(summary.contains("Ship the parser rename"), "{summary}");
+        assert!(summary.contains(MECHANICAL_OMISSION), "{summary}");
+        assert!(
+            summary.contains("did the long work 5"),
+            "the newest folded traffic must survive: {summary}"
+        );
+    }
+
+    /// The traffic slice is a real bound; a request past the per-request cap is
+    /// clipped with an explicit marker rather than dropped, and a CJK request is
+    /// cut on a character boundary, never a byte.
     #[test]
     fn a_mechanical_summary_stays_inside_its_character_budget() {
         let span = vec![
@@ -3778,17 +4015,20 @@ mod budget_tests {
             Message::assistant("work ".repeat(2_000)),
         ];
         let summary = mechanical_summary(&span, 600);
+        assert!(summary.contains("<carried-requests>"), "{summary}");
+        assert!(summary.contains("request request"), "{summary}");
+        assert!(summary.contains(CARRIED_REQUEST_CLIPPED), "{summary}");
+        let conversation = mechanical_conversation(&span, 600);
         assert!(
-            summary.chars().count() <= 600,
-            "the summary outgrew its cap: {}",
-            summary.chars().count()
+            conversation.chars().count() <= 600,
+            "the traffic slice outgrew its cap"
         );
-        assert!(summary.starts_with("request"), "{summary}");
+        assert!(conversation.contains(MECHANICAL_OMISSION));
 
-        let cjk = vec![Message::user("修改解析器入口 ".repeat(400))];
-        let summary = mechanical_summary(&cjk, 500);
-        assert!(summary.chars().count() <= 500);
-        assert!(summary.contains(MECHANICAL_OMISSION));
+        let cjk = vec![Message::assistant("修改解析器入口 ".repeat(400))];
+        let conversation = mechanical_conversation(&cjk, 500);
+        assert!(conversation.chars().count() <= 500);
+        assert!(conversation.contains(MECHANICAL_OMISSION));
     }
 
     /// A second mechanical pass folds the first summary back in. The request it

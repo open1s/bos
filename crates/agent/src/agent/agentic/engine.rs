@@ -1011,11 +1011,22 @@ impl Agent {
                 crate::agent::context::CompactionFailure::EmptySummary,
             ));
         }
+        // Every user request in the span is carried verbatim ahead of the
+        // model's summary. A summary is a paraphrase and the semantic gate can
+        // only prove that the required sections exist; this block is built from
+        // the span itself, so a request the model omitted - or the span's own
+        // head falling outside the digest budget - cannot lose it.
+        let installed = match crate::agent::context::render_carried_requests(&span) {
+            Some(requests) => format!("{requests}\n\n{summary}"),
+            None => summary.clone(),
+        };
+
         // The checkpoint must buy context back. The shipped backend rejects a
         // framed summary whose priced replacement is not smaller than the span
         // it shadows; without this gate a verbose summary grows the context it
-        // was supposed to shrink.
-        let framed = crate::agent::context::render_checkpoint(&summary);
+        // was supposed to shrink. The gate prices what would be INSTALLED, so
+        // the carried requests count too.
+        let framed = crate::agent::context::render_checkpoint(&installed);
         let framed_tokens = crate::agent::context::estimate_message_tokens(&LlmMessage::User {
             content: Content::Text(framed),
         });
@@ -1033,7 +1044,9 @@ impl Agent {
 
         // Semantic gate (issue #420): a summary that misses required sections
         // or drops an explicit constraint never replaces history. The original
-        // span is still intact at this point.
+        // span is still intact at this point. It runs on the MODEL's text, not
+        // on the composed checkpoint, so the carried requests cannot satisfy a
+        // constraint the model forgot.
         if let Err(reason) = crate::agent::context::validate_checkpoint(&summary, &span) {
             log::warn!("compaction checkpoint rejected by the semantic gate: {reason}");
             let failure = if reason.starts_with("cannot prove semantic equivalence") {
@@ -1053,7 +1066,7 @@ impl Agent {
             let mut session = self.session.lock().unwrap();
             replaced = session.install_priced_checkpoint_with(
                 retain_tokens,
-                &summary,
+                &installed,
                 Some(self.config.model.clone()),
             );
             checkpoint = session.checkpoints().last().cloned();
@@ -1070,7 +1083,7 @@ impl Agent {
             replaced,
             before_tokens,
             after_tokens,
-            summary,
+            summary: installed,
             checkpoint,
         }))
     }

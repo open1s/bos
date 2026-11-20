@@ -4311,6 +4311,16 @@ impl Shell {
             self.refuse_compact(&id, lang.tr("slash.compactBusy"), true, cx);
             return;
         }
+        // A restart leaves only the tail window in memory. The summarizer may
+        // only fold rows it was handed, so page the unfolded history down to
+        // the compaction boundary first: an older request must not sit behind a
+        // boundary the fold jumps over unseen. A log that cannot supply the
+        // rows refuses the command instead of folding across the gap.
+        self.state.store.load_unfolded(&id);
+        if self.state.store.unfolded_rows(&id) > 0 {
+            self.refuse_compact(&id, lang.tr("slash.compactHistoryUnavailable"), true, cx);
+            return;
+        }
         if !self.state.has_compactable_history(&id) {
             self.refuse_compact(&id, lang.tr("slash.nothingToCompact"), false, cx);
             return;
@@ -4654,6 +4664,26 @@ impl Shell {
                 .unwrap_or(&[]);
             self.state
                 .auto_compaction_retain(&id, &transcript, appended, budget)
+        };
+        // The automatic fold may only replace rows its summarizer saw. A
+        // restart loads just the tail window, so page the unfolded history in
+        // and rebuild the window the runner will seed; the reader's request
+        // must be inside the span rather than behind a boundary the fold would
+        // jump over. A log that cannot supply the rows skips the fold and runs
+        // the turn on the un-compacted history.
+        let (transcript, auto_retain) = match auto_retain {
+            Some(retain) => {
+                self.state.store.load_unfolded(&id);
+                if self.state.store.unfolded_rows(&id) > 0 {
+                    (transcript, None)
+                } else {
+                    match self.state.request_transcript_before(&id, 2) {
+                        Some(rebuilt) => (rebuilt, Some(retain)),
+                        None => (transcript, Some(retain)),
+                    }
+                }
+            }
+            None => (transcript, None),
         };
         let rx = self.state.runner.spawn(
             &id,

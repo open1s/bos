@@ -3324,6 +3324,13 @@ impl AppState {
     ///
     /// Returns how many messages left the context.
     pub(crate) fn mark_compacted(&mut self, id: &str, start: usize) -> usize {
+        // A fold may only replace rows the summarizer was handed. Rows between
+        // the boundary and the loaded window are on disk, not in memory; a
+        // boundary that jumped over them would discard the requests among them
+        // without a summary ever seeing them.
+        if self.store.unfolded_rows(id) > 0 {
+            return 0;
+        }
         let dropped;
         {
             let Some(session) = self.store.session_mut(id) else {
@@ -3408,6 +3415,24 @@ impl AppState {
         }
         transcript.extend_from_slice(&session.messages[start..]);
         transcript
+    }
+
+    /// The request transcript, minus the rows a send just appended.
+    ///
+    /// `begin_turn_in_with_images` appends the prompt and its placeholder to
+    /// the stored transcript; the window handed to the runner predates them, so
+    /// a compaction that reloads older pages has to rebuild the same view. The
+    /// trailing rows are dropped by count because they are the newest rows, and
+    /// the runner passes the prompt as the turn's input rather than history.
+    pub(crate) fn request_transcript_before(
+        &self,
+        id: &str,
+        trailing: usize,
+    ) -> Option<Vec<ChatMessage>> {
+        let session = self.store.session(id)?;
+        let mut transcript = self.request_transcript(session);
+        transcript.truncate(transcript.len().saturating_sub(trailing));
+        Some(transcript)
     }
 
     /// Whether the next request already starts on a replayed checkpoint.
@@ -3582,6 +3607,11 @@ impl AppState {
         dropped: usize,
         summary: String,
     ) -> usize {
+        // A fold may only replace rows the summarizer was handed; a boundary
+        // that jumped over an unread window would discard requests unseen.
+        if self.store.unfolded_rows(id) > 0 {
+            return 0;
+        }
         let Some(session) = self.store.session_mut(id) else {
             return 0;
         };
@@ -7449,6 +7479,41 @@ mod tests {
         assert!(
             !reopened.goal_can_advance(&id),
             "a restored goal waits for an explicit resume"
+        );
+    }
+
+    /// A fold may not move the boundary over rows that were never read. With
+    /// the window paged past the compaction boundary, both commit paths refuse
+    /// and the stored boundary stays where it was: the requests above it are
+    /// not folded into a summary that never saw them.
+    #[test]
+    fn a_fold_refuses_to_jump_over_unread_rows() {
+        use crate::model::ChatMessage;
+        let (mut state, id) = goal_state("unread-fold");
+        {
+            let session = state.store.session_mut(&id).expect("the session");
+            let mut reply = ChatMessage::assistant();
+            reply.text = "the reply".to_string();
+            session.messages = vec![ChatMessage::user("the request"), reply];
+            session.loaded_from = 40;
+            session.paged_from = Some(40);
+            session.compacted = 0;
+        }
+        assert_eq!(state.store.unfolded_rows(&id), 40);
+        assert_eq!(
+            state.mark_compacted(&id, 41),
+            0,
+            "a boundary may not jump over the unread prefix"
+        );
+        assert_eq!(
+            state.store.session(&id).expect("the session").compacted,
+            0,
+            "the stored boundary is unchanged"
+        );
+        assert_eq!(
+            state.land_automatic_compaction(&id, 900, 1, "auto body".to_string()),
+            0,
+            "the automatic fold is refused too"
         );
     }
 

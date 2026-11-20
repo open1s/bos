@@ -130,6 +130,7 @@
 "slash.compactFailed": "Compaction failed: {error}"
 "slash.compactCommit": "Compaction did not finish cleanly; some session history may have changed. Inspect the current session state before retrying."
 "slash.compactPersistence": "Compaction finished, but the session could not be saved."
+"slash.compactHistoryUnavailable": "Compaction could not read the older history it needs to fold; the history is unchanged."
 "slash.permission": "Permission"
 "slash.permissionDetail": "Switch the permission mode"
 "slash.current": "Current"
