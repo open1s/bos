@@ -108,7 +108,7 @@ pub const DISCOVERY_PRIORITY: &str = "## Check what you were given first";
 /// decision rule is the bold lead line - a missing tool means search, never a
 /// guess - and the mechanics ride as bullets under it, so the priority survives
 /// a skim: searching is a step before acting, not a fallback after a failure.
-pub const DISCOVERY_GUIDANCE: &str = "Your tool list is a subset of this machine's tools. **Need a tool you do not see? Call find_tool - never guess, and never conclude the capability is missing.**\n- Query with what you need to do, or with an exact tool name; with no query, find_tool lists the names it can offer.\n- Every tool it reports - name, description, and JSON Schema for its arguments - joins your tool list for the next step; then call that tool directly by its own name with args matching the reported schema.\n- A withheld tool is not callable before find_tool reports it.";
+pub const DISCOVERY_GUIDANCE: &str = "Your tool list is a subset of this machine's tools. **Need a tool you do not see? Call find_tool - never guess, and never conclude the capability is missing.**\n**Before you script it in bash, check your tools first:** if the work resembles something a tool could do - read or write files, search, fetch, schedule, track, call a peer - use that tool, and call find_tool for any capability you do not see. A dedicated tool is cheaper, reviewable and governed by this turn's policy; bash is the fallback for what no tool covers.\n- Query with what you need to do, or with an exact tool name; with no query, find_tool lists the names it can offer.\n- Every tool it reports - name, description, and JSON Schema for its arguments - joins your tool list for the next step; then call that tool directly by its own name with args matching the reported schema.\n- A withheld tool is not callable before find_tool reports it.";
 
 /// What the model is told when skills are searched instead of catalogued.
 ///
@@ -116,7 +116,7 @@ pub const DISCOVERY_GUIDANCE: &str = "Your tool list is a subset of this machine
 /// catalogue is off, for the same reason as [`DISCOVERY_GUIDANCE`]: a prompt
 /// that names a tool on an agent that does not carry it is a lie. It rides in
 /// the same priority block, so a skill is checked before the work starts.
-pub const SKILL_DISCOVERY_GUIDANCE: &str = "**Before you start work, check whether a skill covers it: call find_skill** with what you need to do - or with no query to list every skill name - then call load_skill with a name to read its instructions. Load one only when its description matches the request; being listed is not a reason.";
+pub const SKILL_DISCOVERY_GUIDANCE: &str = "**Before you start work, check whether a skill covers it: call find_skill** with what you need to do - or with no query to list every skill name - then call load_skill with a name to read its instructions. A skill that covers the work is better than improvising the procedure yourself, and better than scripting it out of habit. Load one only when its description matches the request; being listed is not a reason.";
 
 /// The default system prompt: identity, the default persona, then workflow guidance.
 ///
@@ -197,7 +197,7 @@ pub fn compose_system_prompt_with(persona: &str, complete: bool) -> String {
 /// The reference says `Check the [exit code: N] marker on every bash result`;
 /// BSH's bash result carries a numeric `exit_code` field and reports a non-zero
 /// exit as a result rather than a failure, so both facts appear here.
-pub const TOOL_BASH: &str = "Check `exit_code` in every bash result; a non-zero exit is reported, not failed. Investigate the failure before moving on.";
+pub const TOOL_BASH: &str = "Check `exit_code` in every bash result; a non-zero exit is reported, not failed. Investigate the failure before moving on. Before you write a script or a one-off command for work a dedicated tool already does, use that tool; the shell is for what no tool covers.";
 
 /// The reference's background-job rule, with BSH's `wait_ms` argument.
 pub const TOOL_JOBS: &str = "Track every background job id you start. You are notified in-session when a job finishes — do not busy-poll or sleep on one; keep working on independent steps and do not duplicate a running job's work. Before giving a final answer, collect every still-relevant job with job_output (pass wait_ms only when you are genuinely blocked on it), and job_kill jobs that stopped mattering.";
@@ -471,21 +471,50 @@ mod tests {
         }
     }
 
+    /// The bash guidance carries the tool-first rule too: a turn without a
+    /// search still reads this paragraph before it reaches for the shell.
+    #[test]
+    fn the_bash_guidance_prefers_a_tool_over_a_script() {
+        assert!(TOOL_BASH.contains("Before you write a script"));
+        assert!(TOOL_BASH.contains("the shell is for what no tool covers"));
+    }
+
     /// The discovery paragraph names the one search tool the agent carries and
     /// says the reported tools join the list for a direct call.
     #[test]
     fn the_discovery_guidance_names_the_search_it_uses() {
         assert!(DISCOVERY_GUIDANCE.contains("find_tool"));
+        assert!(DISCOVERY_GUIDANCE.contains("Before you script it in bash"));
+        assert!(DISCOVERY_GUIDANCE.contains("bash is the fallback"));
         assert!(DISCOVERY_GUIDANCE.contains("joins your tool list"));
         assert!(DISCOVERY_GUIDANCE.contains("directly"));
         assert!(DISCOVERY_GUIDANCE.contains("JSON Schema"));
         assert!(!DISCOVERY_GUIDANCE.trim().is_empty());
     }
 
+    /// The workaround rule has a measured order: the search is the first
+    /// move, the shell is the fallback. A prompt that listed them the other
+    /// way would license scripting around a tool it never looked for.
+    #[test]
+    fn discovery_puts_the_search_before_the_shell_fallback() {
+        let search = DISCOVERY_GUIDANCE
+            .find("call find_tool for any capability you do not see")
+            .expect("the tool-first rule");
+        let fallback = DISCOVERY_GUIDANCE
+            .find("bash is the fallback")
+            .expect("the shell fallback rule");
+        assert!(
+            search < fallback,
+            "the search is the first move, the shell the fallback"
+        );
+    }
+
     /// The skill paragraph names the pair a searched install actually carries.
     #[test]
     fn the_skill_guidance_names_the_pair_it_uses() {
         assert!(SKILL_DISCOVERY_GUIDANCE.contains("find_skill"));
+        assert!(SKILL_DISCOVERY_GUIDANCE.contains("better than improvising"));
+        assert!(SKILL_DISCOVERY_GUIDANCE.contains("better than scripting it"));
         assert!(SKILL_DISCOVERY_GUIDANCE.contains("load_skill"));
         assert!(!SKILL_DISCOVERY_GUIDANCE.trim().is_empty());
     }

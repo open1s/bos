@@ -31,7 +31,7 @@ pub const FIND_TOOL: &str = "find_tool";
 /// It promises the full argument schema, because a search that described a
 /// tool's parameters in shorthand left the model guessing at the JSON that
 /// actually runs it.
-const FIND_DESCRIPTION: &str = "Find a tool you were not given directly, by what you need to do or by its exact name. Returns each match's description and full JSON Schema for its arguments. The reported tools are added to your tool list, so call them directly by name with args matching that schema. Tools already in your list are not returned. Use it before concluding a capability is missing.";
+const FIND_DESCRIPTION: &str = "Find a tool you were not given directly, by what you need to do or by its exact name. Returns each match's description and full JSON Schema for its arguments. The reported tools are added to your tool list, so call them directly by name with args matching that schema. Tools already in your list are not returned. Use it before concluding a capability is missing, and before you script the work in bash: a dedicated tool may already exist.";
 
 /// Most tools one search describes in full.
 const FIND_DESCRIBED: usize = 3;

@@ -274,9 +274,13 @@ prompt: it is ranked against the request instead.
 
 The discovery block is extra when a search is carried: the heading base
 `DISCOVERY_PRIORITY` (34 bytes) plus the name it appends (15 for one search,
-28 for "with find_tool or find_skill"), `DISCOVERY_GUIDANCE` (617) and
-`SKILL_DISCOVERY_GUIDANCE` (274) - 957 bytes with both, written first and
-gated on the search that makes it true.
+28 for "with find_tool or find_skill"), `DISCOVERY_GUIDANCE` (911) and
+`SKILL_DISCOVERY_GUIDANCE` (414) - 1,391 bytes with both, written first and
+gated on the search that makes it true. The discovery paragraph also carries
+the workaround rule: before scripting the work in bash, check the tools you
+have and call `find_tool` for a capability you do not see. The skill paragraph
+says a skill that covers the work beats improvising the procedure or scripting
+it out of habit.
 
 ### The tool array spends the same budget as discovery
 
