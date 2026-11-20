@@ -466,7 +466,6 @@
 "settings.retriesTitle": "Retry attempts"
 "settings.retriesHint": "Transient provider failures are retried this many times before the turn gives up. 0 disables retries."
 "settings.shellTimeout": "Command timeout (seconds)"
-"settings.outputCap": "Output cap per stream (bytes)"
 "settings.overridden": "Overridden"
 "settings.reset": "Reset to default"
 "settings.systemPrompt": "System prompt"

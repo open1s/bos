@@ -3772,7 +3772,15 @@ impl Shell {
     fn request_text(&self, text: &str, plan: bool) -> String {
         let composed = crate::command_invocation::compose(&self.extension_commands, text)
             .unwrap_or_else(|| text.to_string());
-        crate::state::turn_text(&composed, plan)
+        let mut out = String::new();
+        // A stopped turn keeps its rows and tool results; the note tells the
+        // model to continue from them instead of re-reading the workspace.
+        if let Some(note) = self.state.resume_note(&composed) {
+            out.push_str(note);
+            out.push_str("\n\n");
+        }
+        out.push_str(&crate::state::turn_text(&composed, plan));
+        out
     }
 
     /// Put one message into the session: queue it behind a running turn, or
@@ -4671,7 +4679,6 @@ impl Shell {
         // A steer resolves its own `/name` gestures against THIS build, so the
         // turn's agent is kept beside the mailbox and dropped with it.
         self.state.attach_turn_agent(&id, agent.clone());
-        let cap = self.state.effective_in(&id).tool_output_cap;
         // The automatic trigger prices the request the turn is about to send:
         // the history window plus the rows `begin_turn_in` just appended (the
         // user prompt and its empty assistant placeholder). Above the workspace
@@ -4716,7 +4723,6 @@ impl Shell {
             transcript,
             facts,
             auto_retain,
-            cap,
             memory_state,
             persona_complete,
             memory_capture,

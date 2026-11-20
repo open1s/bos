@@ -208,7 +208,6 @@ pub(crate) struct SettingsInputs {
     /// Retries after the first attempt on a transient provider failure.
     pub(crate) retries: Entity<InputState>,
     shell_timeout: Entity<InputState>,
-    output_cap: Entity<InputState>,
     max_tokens: Entity<InputState>,
     /// The local web-search endpoint (the Search API base).
     pub(crate) web_search_base: Entity<InputState>,
@@ -228,7 +227,6 @@ impl SettingsInputs {
             temperature: cx.new(|cx| InputState::new(window, cx)),
             retries: cx.new(|cx| InputState::new(window, cx)),
             shell_timeout: cx.new(|cx| InputState::new(window, cx)),
-            output_cap: cx.new(|cx| InputState::new(window, cx)),
             max_tokens: cx.new(|cx| InputState::new(window, cx)),
             web_search_base: cx.new(|cx| InputState::new(window, cx)),
             web_search_results: cx.new(|cx| InputState::new(window, cx)),
@@ -282,12 +280,6 @@ impl SettingsInputs {
             cx,
         );
         set(
-            &self.output_cap,
-            effective.tool_output_cap.to_string(),
-            window,
-            cx,
-        );
-        set(
             &self.max_tokens,
             effective
                 .max_tokens
@@ -336,10 +328,6 @@ impl SettingsInputs {
         let timeout = self.shell_timeout.read(cx).value().trim().to_string();
         if let Ok(parsed) = timeout.parse::<u64>() {
             settings.workspace.agent.shell_timeout_secs = parsed.max(1);
-        }
-        let cap = self.output_cap.read(cx).value().trim().to_string();
-        if let Ok(parsed) = cap.parse::<usize>() {
-            settings.workspace.agent.tool_output_cap = parsed.max(256);
         }
         let tokens = self.max_tokens.read(cx).value().trim().to_string();
         if tokens.is_empty() {
@@ -982,8 +970,6 @@ enum Field {
     Retries,
     /// The shell command timeout.
     ShellTimeout,
-    /// The per-stream output cap.
-    OutputCap,
     /// The context budget.
     Budget,
     /// The cap on completion tokens per turn.
@@ -1008,7 +994,6 @@ impl Field {
                 .unwrap_or_default(),
             Field::Retries => default.workspace.agent.llm_max_retries.to_string(),
             Field::ShellTimeout => default.workspace.agent.shell_timeout_secs.to_string(),
-            Field::OutputCap => default.workspace.agent.tool_output_cap.to_string(),
             Field::Budget => default.workspace.agent.context_budget.to_string(),
             Field::MaxTokens => default
                 .workspace
@@ -7968,22 +7953,13 @@ impl Shell {
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
         let inputs = &self.settings_inputs;
-        let rows = vec![
-            self.input_row(
-                "settings.shellTimeout",
-                None,
-                &inputs.shell_timeout,
-                Field::ShellTimeout,
-                cx,
-            ),
-            self.input_row(
-                "settings.outputCap",
-                None,
-                &inputs.output_cap,
-                Field::OutputCap,
-                cx,
-            ),
-        ];
+        let rows = vec![self.input_row(
+            "settings.shellTimeout",
+            None,
+            &inputs.shell_timeout,
+            Field::ShellTimeout,
+            cx,
+        )];
         ("settings.shell", "settings.shellHint", rows)
     }
 

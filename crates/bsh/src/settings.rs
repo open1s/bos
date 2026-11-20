@@ -224,8 +224,6 @@ pub(crate) struct Effective {
     pub(crate) llm_max_retries: u32,
     /// Shell command timeout in seconds.
     pub(crate) shell_timeout_secs: u64,
-    /// Tool result truncation ceiling in bytes.
-    pub(crate) tool_output_cap: usize,
     /// Attach memory.
     pub(crate) memory_enabled: bool,
     /// How much of a turn the conversation renders.
@@ -1019,7 +1017,6 @@ impl Settings {
             llm_timeout_secs: resolution.llm_timeout_secs,
             llm_max_retries: resolution.llm_max_retries,
             shell_timeout_secs: resolution.shell_timeout_secs,
-            tool_output_cap: resolution.tool_output_cap,
             memory_enabled: resolution.memory_enabled,
             transcript_view: resolution.transcript_view,
             performance_usage: general.performance_usage.clone(),

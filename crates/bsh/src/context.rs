@@ -61,7 +61,9 @@ pub(crate) fn render_plan(items: &[PlanItem]) -> Option<String> {
     out.push_str(
         "\nKeep it current: mark a step completed the moment its work is done, \
          keep exactly one step in_progress while work remains, and update it \
-         before the final answer.\n",
+         before the final answer. Start from the first step that is not \
+         completed, and do not re-read a file whose result the conversation \
+         already holds unless it may have changed.\n",
     );
     let mut shown = 0_usize;
     for item in items {
@@ -789,6 +791,14 @@ mod tests {
         assert!(
             block.contains("update it before the final answer"),
             "the block names the final-answer moment: {block}"
+        );
+        assert!(
+            block.contains("first step that is not completed"),
+            "the block says where to resume: {block}"
+        );
+        assert!(
+            block.contains("do not re-read a file whose result the conversation"),
+            "the block says the transcript is evidence: {block}"
         );
         assert!(is_plan_context_text(&block));
     }

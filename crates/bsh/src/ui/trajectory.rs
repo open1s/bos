@@ -929,6 +929,7 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
                 turn: turn_now,
                 title: clip(&format!("# {} {}", tool.name, args), 120),
                 outcome,
+                // The pane shows the result the model saw, whole.
                 raw: format!(
                     "{}\n\n{}",
                     tool.args,

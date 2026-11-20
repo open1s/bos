@@ -41,25 +41,6 @@ fn plan_context_block(agent: &Agent) -> Option<crate::context_assembly::ContextB
     })
 }
 
-/// Cap the transcript-facing tool result by UTF-8 bytes, not Unicode scalar count.
-fn cap_display_tool_output(output: &str, cap_bytes: usize) -> String {
-    // A zero host cap delegates to the engine's documented default budget.
-    if cap_bytes == 0 || output.len() <= cap_bytes {
-        return output.to_string();
-    }
-
-    const MARKER: &str = "\n... [output truncated for display]";
-    if cap_bytes <= MARKER.len() {
-        return MARKER[..cap_bytes].to_string();
-    }
-
-    let mut end = cap_bytes - MARKER.len();
-    while end > 0 && !output.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{MARKER}", &output[..end])
-}
-
 /// One event the runner forwards to the shell.
 #[derive(Debug, Clone)]
 pub(crate) enum AgentEvent {
@@ -287,7 +268,6 @@ impl Runner {
         transcript: Vec<ChatMessage>,
         facts: crate::context::RuntimeFacts,
         auto_retain: Option<usize>,
-        tool_output_cap: usize,
         memory_state: crate::context_assembly::MemoryState,
         persona_complete: bool,
         capture: Option<Arc<crate::memory_capture::CaptureHandle>>,
@@ -805,7 +785,11 @@ impl Runner {
                             } else {
                                 tool_successes += 1;
                             }
-                            let output = cap_display_tool_output(&output, tool_output_cap);
+                            // The STORE keeps the engine's whole result: the next
+                            // turn replays it as the model's evidence, and a display
+                            // cap here truncated the envelope (invalid JSON on
+                            // replay), which is why a resumed session re-read
+                            // everything. The view caps when it draws.
                             AgentEvent::ToolResult { name, output, ms }
                         }
                         Ok(StreamToken::Usage(usage)) => AgentEvent::Usage {
@@ -886,15 +870,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn display_tool_output_cap_counts_bytes_and_preserves_utf8() {
-        let output = "界".repeat(100);
-        let capped = cap_display_tool_output(&output, 64);
-        assert!(capped.len() <= 64, "the cap is in bytes: {}", capped.len());
-        assert!(capped.is_char_boundary(capped.len()));
-        assert!(capped.contains("[output truncated for display]"));
-    }
-
-    #[test]
     fn a_failed_tool_result_is_recognised() {
         assert!(tool_result_failed("Error: permission denied"));
         assert!(tool_result_failed(
@@ -934,12 +909,6 @@ mod tests {
             "{}",
             block.text
         );
-    }
-
-    #[test]
-    fn zero_display_cap_leaves_the_engine_default_result_untouched() {
-        let output = "界".repeat(100);
-        assert_eq!(cap_display_tool_output(&output, 0), output);
     }
 
     /// A child turn awaits the engine's Tokio timeout; it must run on the
@@ -1076,7 +1045,6 @@ mod tests {
                 presets_disabled: false,
             },
             Some(0),
-            1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
             None,
@@ -1468,7 +1436,6 @@ mod tests {
             Vec::new(),
             facts,
             None,
-            1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
             None,
@@ -1592,7 +1559,6 @@ mod tests {
             Vec::new(),
             facts,
             None,
-            1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
             None,
@@ -1658,7 +1624,6 @@ mod tests {
             Vec::new(),
             facts,
             None,
-            1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
             None,
@@ -1743,7 +1708,6 @@ mod tests {
             Vec::new(),
             facts,
             None,
-            1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
             None,
@@ -2023,7 +1987,6 @@ mod tests {
             Vec::new(),
             facts,
             None,
-            1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
             None,
@@ -2288,7 +2251,6 @@ mod tests {
             transcript,
             facts,
             None,
-            1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
             None,
@@ -2474,7 +2436,6 @@ mod tests {
             transcript,
             facts,
             None,
-            1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
             None,
@@ -2656,7 +2617,6 @@ mod tests {
             Vec::new(),
             test_facts(),
             None,
-            1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
             Some(Arc::clone(&capture)),
@@ -2689,7 +2649,6 @@ mod tests {
             Vec::new(),
             test_facts(),
             None,
-            1_000,
             crate::context_assembly::MemoryState::Disabled,
             false,
             Some(Arc::clone(&stopped)),

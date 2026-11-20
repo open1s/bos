@@ -5528,6 +5528,10 @@ impl Shell {
                 ));
             }
             if let Some(output) = output.clone() {
+                // The stored result is the model's evidence, and the reader
+                // sees it whole: an expanded step is an inspection, and a cut
+                // here would hide the very text a resumed turn relied on. The
+                // engine no longer truncates a result either.
                 row = row.child(self.step_block(
                     StepBody {
                         slot: BodySlot::Step {

@@ -156,7 +156,11 @@ pub(crate) struct AgentSection {
     pub(crate) llm_max_retries: u32,
     /// Seconds one shell command may run before it is killed.
     pub(crate) shell_timeout_secs: u64,
-    /// Bytes of one tool result kept before the rest is truncated.
+    /// Retired: the engine keeps every tool result whole. Accepted here so an
+    /// existing settings file (which `deny_unknown_fields` would otherwise
+    /// reject) still loads; the value is never applied.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     pub(crate) tool_output_cap: usize,
     /// The skill folder, overriding the global one when set.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,7 +207,7 @@ impl Default for AgentSection {
             // first attempt, so a transient 429 does not fail a turn.
             llm_max_retries: 3,
             shell_timeout_secs: 300,
-            tool_output_cap: 16384,
+            tool_output_cap: 0,
             skills_dir: None,
             memory_path: None,
             mcp_servers: Vec::new(),

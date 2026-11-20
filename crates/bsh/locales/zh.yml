@@ -461,7 +461,6 @@
 "settings.retriesTitle": "失败重试次数"
 "settings.retriesHint": "瞬时的提供商失败在放弃本轮前重试的次数。0 表示不重试。"
 "settings.shellTimeout": "命令超时（秒）"
-"settings.outputCap": "单流输出上限（字节）"
 "settings.overridden": "已覆盖"
 "settings.reset": "恢复默认"
 "settings.systemPrompt": "系统提示词"

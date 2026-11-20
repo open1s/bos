@@ -520,8 +520,6 @@ pub(crate) struct Resolution {
     pub(crate) llm_max_retries: u32,
     /// Seconds one shell command may run before it is killed.
     pub(crate) shell_timeout_secs: u64,
-    /// Bytes of one tool result kept before the rest is truncated.
-    pub(crate) tool_output_cap: usize,
     /// MCP servers, the global list merged with the workspace's.
     pub(crate) mcp_servers: Vec<Value>,
     /// Tool names switched off.
@@ -738,7 +736,6 @@ pub(crate) fn resolve_with_catalogue(
         llm_timeout_secs: workspace.agent.llm_timeout_secs,
         llm_max_retries: workspace.agent.llm_max_retries,
         shell_timeout_secs: workspace.agent.shell_timeout_secs,
-        tool_output_cap: workspace.agent.tool_output_cap,
         mcp_servers: merge_mcp(&global.mcp_servers, &workspace.agent.mcp_servers),
         disabled_tools: workspace.disabled.tools.clone(),
         disabled_skills: workspace.disabled.skills.clone(),

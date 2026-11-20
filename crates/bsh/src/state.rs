@@ -2836,6 +2836,25 @@ impl AppState {
         self.goals.insert(id.to_string(), store);
     }
 
+    /// The note a turn carries when it resumes work the reader stopped.
+    ///
+    /// The evidence is the transcript itself: a stopped turn keeps its rows and
+    /// tool results, so the note points at them instead of asking the model to
+    /// rebuild them. Only the immediately preceding stopped turn counts, and
+    /// only for a continuation message.
+    pub(crate) fn resume_note(&self, text: &str) -> Option<&'static str> {
+        if !is_continuation(text) {
+            return None;
+        }
+        let id = self.active_id.as_deref()?;
+        let session = self.store.session(id)?;
+        let stopped = session.messages.last().is_some_and(|message| {
+            message.role == Role::Assistant
+                && message.meta.as_ref().is_some_and(|meta| meta.cancelled)
+        });
+        stopped.then_some(RESUME_AFTER_STOP)
+    }
+
     /// The plan to render for one session.
     ///
     /// A running turn reads through its live store; otherwise the copy its
@@ -6452,6 +6471,42 @@ fn parse_goal_request(rest: &str) -> GoalRequest {
     GoalRequest::Create(rest.to_string())
 }
 
+/// The fixed note a turn carries when the reader resumes stopped work.
+///
+/// A stopped turn leaves the transcript, the tool results and the plan in
+/// place. Without this note the next "continue" read as a new request: the
+/// model re-inspected the workspace to rebuild what it already had. The note
+/// names the state that exists and the evidence already in the conversation;
+/// it also lets a genuinely new instruction opt out, so a restart does not
+/// turn every request into a resume.
+pub(crate) const RESUME_AFTER_STOP: &str = "[Resuming interrupted work]\nThe previous turn was stopped before it answered, so this session already holds its work and the tool results it gathered. Continue from the plan's first unfinished step (or the last thing that worked), and do not re-read a file whose result the conversation already holds unless it may have changed. If this message starts something new instead, ignore this note.";
+
+/// Whether a message asks to resume the stopped work.
+///
+/// Deliberately narrow: a bare "continue" (and its common forms) is a
+/// continuation; anything with a subject stays an ordinary request, because
+/// guessing intent from a word would make the note fire on unrelated asks.
+pub(crate) fn is_continuation(text: &str) -> bool {
+    let text = text
+        .trim()
+        .trim_end_matches(['.', '!', '\u{3002}', '\u{ff01}'])
+        .to_lowercase();
+    matches!(
+        text.as_str(),
+        "continue"
+            | "go on"
+            | "keep going"
+            | "resume"
+            | "carry on"
+            | "\u{7ee7}\u{7eed}"
+            | "\u{63a5}\u{7740}"
+            | "\u{7ee7}\u{7eed}\u{5427}"
+    ) || text.starts_with("continue ")
+        || text.starts_with("keep going ")
+        || text.contains("where you left off")
+        || (text.contains("\u{63a5}\u{7740}") && text.chars().count() <= 20)
+}
+
 /// The instruction one GOAL ROUND carries.
 ///
 /// This is the reference driver's retained prompt: the JSON-quoted objective,
@@ -6839,6 +6894,44 @@ mod tests {
         let goal = state.goal(&id).expect("the goal");
         assert_eq!(goal.state, GoalState::Paused, "pause wins over the round");
         assert!(!goal.activation.is_armed());
+    }
+
+    /// A stopped turn plus a continuation message carries the resume note; a
+    /// new instruction or a completed turn does not.
+    #[test]
+    fn a_stopped_turn_resumes_only_a_continuation_message() {
+        let (mut state, id) = goal_state("resume-note");
+        {
+            let session = state.store.session_mut(&id).expect("a session");
+            let mut stopped = crate::model::ChatMessage::assistant();
+            stopped.meta.get_or_insert_with(Default::default).cancelled = true;
+            session.messages.push(stopped);
+        }
+        assert!(state.resume_note("continue").is_some());
+        assert!(state.resume_note("继续").is_some());
+        assert!(state.resume_note("go on!").is_some());
+        assert!(state.resume_note("continue with the parser fix").is_some());
+        assert!(
+            state.resume_note("fix the failing test").is_none(),
+            "a new instruction is not a resume"
+        );
+        assert!(super::is_continuation("continue"));
+        assert!(!super::is_continuation("explain the diff"));
+        {
+            let session = state.store.session_mut(&id).expect("a session");
+            session
+                .messages
+                .last_mut()
+                .unwrap()
+                .meta
+                .as_mut()
+                .unwrap()
+                .cancelled = false;
+        }
+        assert!(
+            state.resume_note("continue").is_none(),
+            "a completed turn has nothing to resume"
+        );
     }
 
     /// A model completion settles onto the durable goal and the loop refuses

@@ -112,6 +112,17 @@ It names `get_goal`/`update_goal` only when the build mounts that tool and
 calls `require_tool` for each name, so the paragraph and the request array
 cannot disagree. A paused, blocked or completed goal adds nothing.
 
+Stopped and restarted sessions resume from their own evidence. Two BSH rules
+make that true: the transcript stores the ENGINE's tool result (the whole
+envelope the model saw), not a display-capped copy, and the view draws that
+stored result whole - so a resumed turn replays valid, complete results
+instead of a truncated JSON blob, and an expanded step shows the same text;
+and a turn whose message is a
+continuation (`is_continuation`) after a cancelled row carries
+`RESUME_AFTER_STOP`, which points at the plan's first unfinished step and the
+evidence already in the conversation, and says not to re-read a file unless it
+may have changed. A new instruction carries no note.
+
 ## 3. What the reference harnesses do
 
 ### Codex: intent as a completion contract

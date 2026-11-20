@@ -240,7 +240,6 @@ context_budget = 32768
 llm_timeout_secs = 3600        # one model request: the engine's ceiling AND the wire guard
 llm_max_retries = 3            # retries after the first attempt on a transient failure
 shell_timeout_secs = 300
-tool_output_cap = 16384
 skills_dir = "…"               # absent inherits the global one
 memory_path = "…"              # absent uses the shared default
 mcp_servers = []               # merged with the global list; this one wins
@@ -250,6 +249,9 @@ tools = []
 skills = []
 extentions = []                # subtracts from the global installed inventory
 ```
+
+A `tool_output_cap` key from an older file is accepted and ignored: the engine
+keeps every tool result whole, and the view draws it whole too.
 
 The file is AGENT CONFIGURATION ONLY. It carries no model and no session
 identity: a model is a per-session choice, and which session is on screen is

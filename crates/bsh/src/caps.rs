@@ -897,11 +897,11 @@ fn build_agent_for_session_inner(
         // the provider whole and came back as an error the UI called a useless
         // summary.
         compaction_input_tokens: compaction_input_tokens(&eff),
-        // The workspace's tool-output cap governs what one result may add to
-        // the MODEL's session too, not only what the UI displays: a 16 KB cap
-        // halves the context growth per big tool call against the engine's
-        // 48 KB default, which is what kept the auto-compaction trigger hot.
-        tool_output_cap: eff.tool_output_cap,
+        // No cut: the reader asked for the whole result, and the view no
+        // longer truncates either. The engine's `usize::MAX` cap keeps every
+        // tool result whole; context pressure is the reader's Stop button and
+        // the provider's own window, not a silent mid-result cut.
+        tool_output_cap: usize::MAX,
         // A slow provider is not a failed one. This one number bounds a request
         // at both layers the reader can see: the engine's per-call ceiling and
         // the vendor's idle-socket guard. Inheriting the framework's 60s
@@ -1972,12 +1972,6 @@ fn build_agent_for_session_inner(
     {
         crate::compositions::record(&path, snapshot);
     }
-    // The read tools bound their own page (a 4096-line floor and a byte
-    // ceiling). The generic tool-output cap is sized for a shell dump; applied
-    // here it would cut the page a second time, and next_offset would point
-    // past text the model never saw. The page's own bound is the whole bound.
-    agent.set_tool_output_cap("read_file", MAX_READ_RESULT_BYTES);
-    agent.set_tool_output_cap("read_files", MAX_READ_RESULT_BYTES);
     let mut built = BuiltAgent {
         agent: Arc::new(agent),
         snapshot,
@@ -2736,12 +2730,6 @@ pub(crate) struct SubagentContext {
     /// A spawn used to pay that read per child; the cell now keeps the first
     /// render for the life of the build.
     child_context: std::sync::OnceLock<crate::context::TurnContext>,
-    /// Per-tool result caps the parent build carries.
-    ///
-    /// A child inherits them: a paged read is bounded by its own window, and a
-    /// child that fell back to the generic shell cap would have its pages cut
-    /// a second time, with next_offset skipping the cut text.
-    tool_output_caps: Vec<(String, usize)>,
     /// The parent's parsed skills, inherited by the child.
     ///
     /// A child is a build of the same turn, so it reads the same catalogue the
@@ -2808,7 +2796,6 @@ impl SubagentContext {
             runtime,
             context_budget: agent.context_budget(),
             child_context: std::sync::OnceLock::new(),
-            tool_output_caps: agent.tool_output_caps(),
             // The model-facing set, not the pre-extension set: a child must
             // inherit the package skills the parent turn actually carries.
             skills: agent.all_skills(),
@@ -2979,11 +2966,6 @@ impl SubagentContext {
             config.system_prompt
         );
         let mut child = Agent::from_config(config).with_context_budget(self.context_budget);
-        // The parent's per-tool caps travel with the tools: a paged read in a
-        // child is bounded by its own window, not by the shell-sized cap.
-        for (tool, bytes) in &self.tool_output_caps {
-            child.set_tool_output_cap(tool.clone(), *bytes);
-        }
         crate::extension::hooks::install_agent_hooks(&mut child);
         // The same skills the parent turn carries: a delegated prompt can name
         // one (the `/name` gesture), and the child's own catalogue and
@@ -4218,15 +4200,6 @@ const DEFAULT_READ_LINES: usize = MIN_READ_LINES;
 /// page whole (about 256 bytes a line) and still refuses the multi-megabyte
 /// single line that would otherwise flood the request.
 const MAX_READ_PAGE_BYTES: usize = 1024 * 1024;
-
-/// The engine result cap a read page may use.
-///
-/// The generic tool-output setting (16 KiB by default) is sized for a shell
-/// dump; applied to a page that already bounds itself it cuts the page a
-/// second time, and the continuation then points past text the model never
-/// saw. JSON escaping can double a page of quotes and backslashes, so the cap
-/// leaves room for that and for the envelope's own fields.
-const MAX_READ_RESULT_BYTES: usize = MAX_READ_PAGE_BYTES.saturating_mul(2) + 64 * 1024;
 
 /// The entries one `list_dir` call collects before it stops reading.
 const MAX_LIST_ENTRIES: usize = 10_000;
@@ -9566,6 +9539,16 @@ mod tests {
         assert_eq!(build(&smaller).agent.config().max_tokens, Some(2048));
     }
 
+    /// No tool result is cut: the build hands the engine an unbounded cap, and
+    /// the retired workspace key no longer changes it.
+    #[test]
+    fn no_tool_result_is_cut() {
+        let mut settings = bare();
+        settings.workspace.agent.tool_output_cap = 256;
+        let built = build(&settings);
+        assert_eq!(built.agent.config().tool_output_cap, usize::MAX);
+    }
+
     /// A selected preset narrows the tools the agent is built with, so the
     /// agent-presets pane changes the agent rather than a label.
     #[test]
@@ -11846,60 +11829,6 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .expect("the batch page");
         assert_eq!(batch["files"][0]["end_line"], 4096, "{batch}");
         assert_eq!(batch["files"][0]["next_offset"], 4097);
-    }
-
-    /// The read tools carry their own result cap, so the shell-sized workspace
-    /// cap does not cut a page the tool already bounded. Every other tool keeps
-    /// the workspace cap.
-    #[test]
-    fn the_read_tools_carry_their_own_result_cap() {
-        let root = scratch("read-result-cap");
-        let built = build(&confined(&root));
-        assert_eq!(
-            built.agent.tool_output_cap_for("read_file"),
-            crate::caps::MAX_READ_RESULT_BYTES
-        );
-        assert_eq!(
-            built.agent.tool_output_cap_for("read_files"),
-            crate::caps::MAX_READ_RESULT_BYTES
-        );
-        assert_eq!(
-            built.agent.tool_output_cap_for("bash"),
-            built.effective.tool_output_cap,
-            "every other tool keeps the workspace cap"
-        );
-    }
-
-    /// A child build inherits the read tools' own result cap, so a paged read
-    /// inside a subagent is bounded by its window rather than the shell cap.
-    #[test]
-    fn a_child_build_inherits_the_read_result_cap() {
-        let root = scratch("read-cap-child");
-        let built = build(&confined(&root));
-        let context = crate::caps::SubagentContext::new(
-            built.agent.as_ref(),
-            "session",
-            "session",
-            1,
-            std::sync::Arc::new(crate::subagent::SubagentRegistry::default()),
-            built.policy.clone(),
-            built.effective.preset_id.clone(),
-            root.to_string_lossy().to_string(),
-            crate::context::RuntimeFacts::from_effective(&built.effective),
-            crate::caps::SubagentTools {
-                message: true,
-                interrupt: true,
-            },
-        );
-        let child = context.child("child-1");
-        assert_eq!(
-            child.tool_output_cap_for("read_file"),
-            crate::caps::MAX_READ_RESULT_BYTES
-        );
-        assert_eq!(
-            child.tool_output_cap_for("read_files"),
-            crate::caps::MAX_READ_RESULT_BYTES
-        );
     }
 
     /// The common call needs only the path: offset defaults to line 1, so a
