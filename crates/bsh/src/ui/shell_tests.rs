@@ -30553,7 +30553,7 @@ fn a_goal_round_continues_without_a_user_line(cx: &mut TestAppContext) {
     let prompt = crate::state::goal_round_input("ship the slash palette", 1, 256);
     assert_eq!(
         prompt,
-        "<goal_round>\nObjective: \"ship the slash palette\"\nRound: 1/256\n\nContinue working toward the objective in this same session. Treat the current workspace, tool results, and durable session state as authoritative; inspect them instead of assuming earlier narration is still current. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal, and mark it complete. If work remains, leave the goal active for the next round. Follow the configured goal-tool policy before reporting a blocker.\n</goal_round>"
+        "<goal_round>\nObjective: \"ship the slash palette\"\nRound: 1/256\n\nContinue working toward the objective in this same session. The checkpoint, the working plan and the durable goal are the record of what is already done; inspect the workspace only for what the next step needs or what may have changed since. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal, and mark it complete. If work remains, leave the goal active for the next round. Follow the configured goal-tool policy before reporting a blocker.\n</goal_round>"
     );
     assert!(
         prompt.starts_with("<goal_round>\nObjective: \"ship the slash palette\"\nRound: 1/256"),

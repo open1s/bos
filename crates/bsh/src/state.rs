@@ -6479,7 +6479,7 @@ fn parse_goal_request(rest: &str) -> GoalRequest {
 /// names the state that exists and the evidence already in the conversation;
 /// it also lets a genuinely new instruction opt out, so a restart does not
 /// turn every request into a resume.
-pub(crate) const RESUME_AFTER_STOP: &str = "[Resuming interrupted work]\nThe previous turn was stopped before it answered, so this session already holds its work and the tool results it gathered. Continue from the plan's first unfinished step (or the last thing that worked), and do not re-read a file whose result the conversation already holds unless it may have changed. If this message starts something new instead, ignore this note.";
+pub(crate) const RESUME_AFTER_STOP: &str = "[Resuming interrupted work]\nThe previous turn was stopped before it answered, so this session already holds its work and the tool results it gathered. Continue from the plan's first unfinished step (or the last thing that worked), and do not re-read a file whose result the conversation already holds unless it may have changed; do not re-run git status or git diff to rediscover the work. If this message starts something new instead, ignore this note.";
 
 /// Whether a message asks to resume the stopped work.
 ///
@@ -6517,7 +6517,7 @@ pub(crate) fn goal_round_input(objective: &str, round: u32, max_rounds: u32) -> 
     let objective = serde_json::to_string(objective)
         .unwrap_or_else(|_| format!("\"{}\"", objective.replace('"', "\\\"")));
     format!(
-        "<goal_round>\nObjective: {objective}\nRound: {round}/{max_rounds}\n\nContinue working toward the objective in this same session. Treat the current workspace, tool results, and durable session state as authoritative; inspect them instead of assuming earlier narration is still current. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal, and mark it complete. If work remains, leave the goal active for the next round. Follow the configured goal-tool policy before reporting a blocker.\n</goal_round>"
+        "<goal_round>\nObjective: {objective}\nRound: {round}/{max_rounds}\n\nContinue working toward the objective in this same session. The checkpoint, the working plan and the durable goal are the record of what is already done; inspect the workspace only for what the next step needs or what may have changed since. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal, and mark it complete. If work remains, leave the goal active for the next round. Follow the configured goal-tool policy before reporting a blocker.\n</goal_round>"
     )
 }
 

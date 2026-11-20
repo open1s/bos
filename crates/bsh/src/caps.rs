@@ -5947,7 +5947,7 @@ fn sed_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "sed",
-        "Apply one sed program to a workspace file over a private copy, replacing by rename so a failed script leaves the original untouched. GNU in-place output: the automatic print and p, P, =, l, F and s///p write to the file. e, r, R, w and W are refused. Prefer edit_file when the exact text is known.",
+        "Edit one workspace file with a sed program - use this instead of a `sed -i`/`perl -i` command through bash: this path is policy-checked, records the change, and keeps the original when the script fails. The program runs over a private copy, replacing by rename. GNU in-place output: the automatic print and p, P, =, l, F and s///p write to the file; e, r, R, w and W are refused. When the exact text is known and unique, edit_file is simpler; for a global or pattern-based change this is the tool.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -6146,7 +6146,7 @@ fn list_dir_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "list_dir",
-        "List a directory's entries (name and kind), sorted. .bsh/.ignore exclusions are omitted; up to 2000 entries, truncated means more.",
+        "List one workspace directory's entries (name and kind), sorted - use this instead of `ls` through bash: the same listing, minus .bsh/.bos and the ignore-rule exclusions, with name/kind rows and a truncation hint past 2000 entries.",
         serde_json::json!({
             "type": "object",
             "properties": { "path": { "type": "string", "description": "Directory to list, relative to the workspace or absolute inside the allowed workspace." } },
@@ -8272,6 +8272,14 @@ mod tests {
         assert!(
             prompt.contains(agent::prompts::TOOL_PLAN),
             "the plan rule reaches the request"
+        );
+        assert!(
+            prompt.contains("For file work, use the builtin tools, not the shell."),
+            "the file-tool contract reaches the request"
+        );
+        assert!(
+            prompt.contains("## Writing code"),
+            "the engineering contract reaches the request"
         );
         assert!(
             prompt.contains("A question ends without an edit"),
@@ -12425,6 +12433,24 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         );
     }
 
+    /// The listing tool names the shell habit it replaces, so the model is not
+    /// left to discover that `ls` is the wrong path.
+    #[test]
+    fn the_list_dir_description_names_the_shell_it_replaces() {
+        let built = build(&bare());
+        let description = built
+            .agent
+            .registry()
+            .expect("registry")
+            .get("list_dir")
+            .expect("the list tool")
+            .description();
+        assert!(
+            description.contains("instead of `ls` through bash"),
+            "{description}"
+        );
+    }
+
     /// The sed tool is a write tool with a read-only dry run: the dry run
     /// returns the resulting text and leaves the file alone, the edit lands
     /// atomically, and a script whose output would be redirected into the file
@@ -12435,6 +12461,11 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         std::fs::write(root.join("a.txt"), "one two one\n").expect("seed");
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
+        let description = registry.get("sed").expect("the sed tool").description();
+        assert!(
+            description.contains("instead of a `sed -i`/`perl -i` command through bash"),
+            "the tool says which shell habit it replaces: {description}"
+        );
 
         let dry = registry
             .execute(

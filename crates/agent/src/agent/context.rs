@@ -337,7 +337,7 @@ pub fn response_text(response: &ReactLlmResponse) -> String {
 /// Mirrors the shipped backend's own copy: the reader is told this is an
 /// automatically generated checkpoint, to treat it as background, and not to
 /// acknowledge it.
-pub const CHECKPOINT_PREAMBLE: &str = "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.";
+pub const CHECKPOINT_PREAMBLE: &str = "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. It is the authoritative record of the work already done; the live plan and goal blocks that follow carry the current state. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint. Your completed work is already recorded here; inspect the workspace only for what the next change needs.";
 
 /// The instruction the summarizer call carries as its final user message.
 ///

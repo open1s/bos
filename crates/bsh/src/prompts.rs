@@ -49,7 +49,7 @@ pub(crate) const EDIT_FILE: &str =
 /// The tool is a TRANSFORMER, not a reader: in-place mode points every output
 /// command at the file, so the three facts a model needs are the two refusals
 /// and the dry run.
-pub(crate) const SED: &str = "Use the sed tool for a global, pattern-based or line-addressed change that would be awkward as an exact edit_file replacement. The script processes a private copy of one workspace file and replaces it only when the bytes change. Output is GNU's in-place output: p, P, =, l, F and s///p write to the edited file, so quiet=true plus '/pattern/p' filters the file to matching lines. backup_suffix keeps the original at path + suffix. e, r, R, w and W are refused by the engine's sandbox. Pass dry_run=true to see the resulting text without writing.";
+pub(crate) const SED: &str = "Use the sed tool for a global, pattern-based or line-addressed change that would be awkward as an exact edit_file replacement. **Do not run `sed` (or `perl -i`) through bash for a file edit:** that path skips the reviewed one - the builtin works on a private copy, checks policy, records the change, and refuses the escaping commands. The script processes a private copy of one workspace file and replaces it only when the bytes change. Output is GNU's in-place output: p, P, =, l, F and s///p write to the edited file, so quiet=true plus '/pattern/p' filters the file to matching lines. backup_suffix keeps the original at path + suffix. e, r, R, w and W are refused by the engine's sandbox. Pass dry_run=true to see the resulting text without writing.";
 
 pub(crate) const APPLY_PATCH: &str = "For coordinated changes across several files, use apply_patch with grouped exact-text edits instead of separate edit_file calls. Each file is validated before its atomic write; a failed edit leaves that file unchanged. This is not a cross-file transaction, so inspect every per-file result.";
 
@@ -57,7 +57,7 @@ pub(crate) const APPLY_PATCH: &str = "For coordinated changes across several fil
 ///
 /// The reference discovers paths with `glob`, which BSH does not register; it
 /// lists a directory instead, and says so plainly.
-pub(crate) const LIST_DIR: &str = "Use list_dir to see what a directory holds before reading or creating files; it reports names and kinds, not contents.";
+pub(crate) const LIST_DIR: &str = "Use list_dir to see what a directory holds before reading or creating files; it reports names and kinds, not contents. **Do not run `ls` through bash:** list_dir applies the workspace exclusions, never exposes .bsh/.bos, and returns the same entries with their kind and a truncation hint.";
 
 /// The reference's `web_search` guidance, verbatim.
 ///
@@ -217,7 +217,20 @@ pub(crate) fn preset_persona(body: &str) -> String {
 /// with its own text; this compact footer keeps the harness's work-first,
 /// evidence and verification rules in the prompt, so the setting changes the
 /// persona rather than the execution contract.
-pub(crate) const COMPLETE_PERSONA_CONTRACT: &str = "\n\n## Execution contract (harness)\nThis section belongs to the harness, not the persona: a complete persona keeps it.\n- Work first, report briefly: for a concrete coding request, inspect, run or edit before describing what you plan to do.\n- A question about this repository is answered from evidence you gathered, not from memory.\n- Prove a change with the command that checks it, or say what you could not check.\n- Stop when the request is answered; report outcome first, then evidence, then anything unverified.";
+pub(crate) const COMPLETE_PERSONA_CONTRACT: &str = "\n\n## Execution contract (harness)\nThis section belongs to the harness, not the persona: a complete persona keeps it.\n- Work first, report briefly: for a concrete coding request, inspect, run or edit before describing what you plan to do. Once you can write the change, write it: re-reading the same file or area a second time without editing means you have enough. A change request ends with the edit and its check, not with a plan.\n- A question about this repository is answered from evidence you gathered, not from memory.\n- Prove a change with the command that checks it, or say what you could not check.\n- Stop when the request is answered; report outcome first, then evidence, then anything unverified.";
+
+/// The engineering execution contract: a coding request ends in a change.
+///
+/// Measured failure: a turn could spend its whole budget reading one file from
+/// several angles and end with prose, so the reader got no code. The contract
+/// makes the deliverable and the investigation budget explicit: read what the
+/// change needs, then write.
+pub(crate) const CODING_CONTRACT: &str = "## Writing code\n\
+    - A coding request's deliverable is the file change, not a description. Inspect only what it needs, then edit: stop once you can write the first line.\n\
+    - Read the same file or area twice without editing and you have enough: make the smallest correct change now; the project's check finds the rest.\n\
+    - Create with write_file, change with edit_file or apply_patch, then run the project's check and fix what it reports.\n\
+    - When the request asks for a change, never end the turn with only prose. Keep the loop short: read, edit, verify, report. A plan is not a substitute for the edit.";
+
 /// The plan-mode directive carried in front of a turn's own text.
 ///
 /// The reference expresses plan mode as a system section that names its
@@ -258,8 +271,8 @@ pub(crate) fn goal_pursuit(goal: &agent::goal::Goal, read: bool, settle: bool) -
          This session is pursuing a goal: {objective}. It is a durable objective, not one \
          message: keep working until the WHOLE objective is achieved, not just the current step. \
          The goal is at round {rounds} of {max_rounds}.\n\
-         - Treat the workspace, the tool results and the durable goal as authoritative; inspect \
-         them instead of assuming the last round's narration is still current.\n",
+         - The checkpoint, the working plan and the durable goal are the record of what is already \
+         done; inspect the workspace only for what the next step needs or what may have changed.\n",
         rounds = goal.rounds,
         max_rounds = goal.max_rounds,
     );
@@ -277,6 +290,86 @@ pub(crate) fn goal_pursuit(goal: &agent::goal::Goal, read: bool, settle: bool) -
         );
     }
     out
+}
+
+/// The strong file-work contract: the shell habits each builtin file tool
+/// replaces, naming only the tools this build actually carries.
+///
+/// Per-tool paragraphs say how to use a tool; this one says when to reach for
+/// it at all. A model that knows `list_dir` exists still types `ls` by habit,
+/// so the contract names the habit explicitly and gives the shell a narrow
+/// role: what no file tool covers.
+fn file_tool_contract(names: &[String]) -> Option<String> {
+    fn carried(names: &[String], wanted: &[&str]) -> Option<String> {
+        let present: Vec<&str> = wanted
+            .iter()
+            .copied()
+            .filter(|name| names.iter().any(|carried| carried == name))
+            .collect();
+        match present.as_slice() {
+            [] => None,
+            [one] => Some((*one).to_string()),
+            [a, b] => Some(format!("{a} and {b}")),
+            many => Some(many.join(", ")),
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    if names.iter().any(|name| name == "list_dir") {
+        lines.push("- List a directory with list_dir, not `ls`.".to_string());
+    }
+    if let Some(tools) = carried(names, &["read_file", "read_files"]) {
+        lines.push(format!(
+            "- Read files with {tools}, not `cat`, `head`, `tail` or `less`."
+        ));
+    }
+    if names.iter().any(|name| name == "glob") {
+        lines.push("- Find paths with glob, not `find` or `fd`.".to_string());
+    }
+    if names.iter().any(|name| name == "grep") {
+        lines.push("- Search contents with grep, not a shell `grep`, `rg` or `ag`.".to_string());
+    }
+    if let Some(tools) = carried(names, &["edit_file", "apply_patch"]) {
+        lines.push(format!(
+            "- Change known text with {tools}, not `sed -i`, `perl -i` or a `python -c` rewrite."
+        ));
+    }
+    if names.iter().any(|name| name == "sed") {
+        lines.push(
+            "- Run a sed program with the sed tool, not `sed`, `awk` or `perl -i` through bash."
+                .to_string(),
+        );
+    }
+    if names.iter().any(|name| name == "write_file") {
+        lines.push(
+            "- Create or overwrite a file with write_file, not `echo >`, `tee` or a heredoc."
+                .to_string(),
+        );
+    }
+    // The exact habit the contract is for: a workspace read dressed as a
+    // shell pipeline (`cd … && grep … | sed -n`, `cat | head`). Name it, and
+    // name the tools' own paging, because that pipeline is usually page one of
+    // a search the model could have limited instead.
+    if names
+        .iter()
+        .any(|name| matches!(name.as_str(), "grep" | "read_file" | "read_files" | "glob"))
+    {
+        lines.push(
+            "- Page with the tool's own limit/offset (grep limit, read_file offset and limit), \
+             not `| sed -n` or `| head`."
+                .to_string(),
+        );
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "**For file work, use the builtin tools, not the shell.** Every read, search, list, \
+         edit and create of a workspace file has a tool here; a pipeline such as \
+         `cd <workspace> && grep ... | sed -n` is the habit this section replaces. The shell \
+         is for what no file tool covers:\n{}",
+        lines.join("\n")
+    ))
 }
 
 /// Append guidance for every tool the agent actually carries.
@@ -297,10 +390,20 @@ pub(crate) fn append_tool_guidance(agent: &mut Agent) {
     if !agent.config().system_prompt.contains(HARNESS_CONTEXT) {
         agent.append_system_prompt(HARNESS_CONTEXT);
     }
+    // The deliverable rule sits directly after the product context: a coding
+    // turn is judged by the change it lands, not by how much it inspected.
+    if !agent.config().system_prompt.contains(CODING_CONTRACT) {
+        agent.append_system_prompt(CODING_CONTRACT);
+    }
     let names = agent
         .registry()
         .map(|registry| registry.list())
         .unwrap_or_default();
+    // The contract comes before the per-tool paragraphs: it says WHEN to use a
+    // file tool at all, and the details below say how.
+    if let Some(contract) = file_tool_contract(&names) {
+        agent.append_system_prompt(&contract);
+    }
     // The agent crate owns bash, the job tools and update_plan; this crate
     // owns the file tools, search and the subagent rule. The chain keeps the
     // deterministic order and puts the subagent rule last.
@@ -372,6 +475,72 @@ mod tests {
         );
     }
 
+    /// The engineering contract names the deliverable and bounds the read
+    /// loop: a coding turn ends in an edit, not in more investigation.
+    #[test]
+    fn the_coding_contract_asks_for_the_edit() {
+        assert!(CODING_CONTRACT.contains("## Writing code"));
+        assert!(CODING_CONTRACT.contains("the file change, not a description"));
+        assert!(CODING_CONTRACT.contains("Read the same file or area twice"));
+        assert!(CODING_CONTRACT.contains("never end the turn with only prose"));
+        assert!(COMPLETE_PERSONA_CONTRACT.contains("ends with the edit and its check"));
+    }
+
+    /// The file-work contract names the shell habit for the tools present, and
+    /// no tool the build does not carry.
+    #[test]
+    fn the_file_tool_contract_names_the_shell_habits() {
+        let contract = file_tool_contract(&[
+            "list_dir".to_string(),
+            "read_file".to_string(),
+            "sed".to_string(),
+        ])
+        .expect("a contract");
+        assert!(
+            contract.contains("**For file work, use the builtin tools, not the shell.**"),
+            "{contract}"
+        );
+        assert!(contract.contains("not `ls`"), "{contract}");
+        assert!(
+            contract.contains("cd <workspace> && grep ... | sed -n"),
+            "the contract names the exact pipeline habit: {contract}"
+        );
+        assert!(
+            contract.contains("not `| sed -n` or `| head`"),
+            "the contract names the tool's own paging: {contract}"
+        );
+        assert!(contract.contains("Read files with read_file"), "{contract}");
+        assert!(contract.contains("not `cat`"), "{contract}");
+        assert!(contract.contains("not `sed`"), "{contract}");
+        assert!(!contract.contains("read_files"), "{contract}");
+        assert!(!contract.contains("glob"), "{contract}");
+        assert!(!contract.contains("write_file"), "{contract}");
+        assert!(file_tool_contract(&[]).is_none());
+        assert!(file_tool_contract(&["bash".to_string()]).is_none());
+    }
+
+    /// A real append puts the contract in the prompt the model reads.
+    #[test]
+    fn the_file_work_contract_reaches_the_prompt() {
+        let mut agent = Agent::from_config(agent::AgentConfig::default());
+        for name in ["list_dir", "read_file", "grep"] {
+            agent.add_tool(std::sync::Arc::new(agent::tools::FunctionTool::new(
+                name,
+                "a tool",
+                serde_json::json!({"type": "object"}),
+                |_args| Ok(serde_json::json!("ok")),
+            )));
+        }
+        append_tool_guidance(&mut agent);
+        assert!(
+            agent
+                .config()
+                .system_prompt
+                .contains("For file work, use the builtin tools"),
+            "the contract is a standing rule"
+        );
+    }
+
     /// The product context carries the facts the model cannot discover from
     /// the code: the internal directory and the three ways a reader interrupts
     /// a turn.
@@ -414,6 +583,27 @@ mod tests {
         let tools_off = goal_pursuit(&goal, false, false);
         assert!(!tools_off.contains("`get_goal`"), "{tools_off}");
         assert!(!tools_off.contains("`update_goal`"), "{tools_off}");
+    }
+
+    /// The listing rule names the shell habit it replaces, for the same reason
+    /// the sed rule does: the tool existing is not knowing not to run `ls`.
+    #[test]
+    fn the_list_dir_guidance_names_the_shell_it_replaces() {
+        assert!(
+            LIST_DIR.contains("Do not run `ls` through bash"),
+            "{LIST_DIR}"
+        );
+    }
+
+    /// The sed rule names the shell habit it replaces: knowing the tool exists
+    /// is not the same as knowing not to run `sed -i` through bash.
+    #[test]
+    fn the_sed_guidance_names_the_shell_it_replaces() {
+        assert!(
+            SED.contains("Do not run `sed` (or `perl -i`) through bash"),
+            "{SED}"
+        );
+        assert!(SED.contains("records the change"), "{SED}");
     }
 
     /// The parallel preset must read the intent before it batches, or it
