@@ -18,9 +18,13 @@
 //! host-managed metadata and supply it again when opening the workspace.
 
 pub mod classification;
+pub mod evidence;
+pub mod evidence_index;
 pub mod fs;
 pub mod ignore;
 pub mod index;
+pub mod lexical;
+pub mod model;
 pub mod module_graph;
 pub mod resolution;
 pub mod rust_imports;
@@ -28,10 +32,21 @@ pub mod rust_modules;
 pub mod rust_symbol_imports;
 pub mod rust_symbols;
 pub mod scan_budget;
+pub mod scope;
 pub mod scanner;
 pub mod syntax;
 pub mod workspace;
 
+pub use evidence::{
+    CaptureIdentity, EvidenceBatch, EvidenceCoverage, EvidenceDiagnostic, EvidenceDiagnosticKind,
+    EvidenceRecord, FingerprintAlgorithm, ParseCoverage, ProviderIdentity, QueryCoverage,
+    QueryIdentity, SourceFingerprint,
+};
+pub use evidence_index::{
+    ChangeKind, ChangeSet, EvidenceIndex, FileChange, FileEvidence, IndexError, IndexLimits,
+    IndexSnapshot, IndexUpdate, Publication, QueryEvidence, SourceObservation, StaleMarks,
+    StaleReason,
+};
 pub use fs::{DirectoryListing, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFs, WorkspaceFsError};
 pub use ignore::{IgnoreAction, IgnorePolicy, IgnorePolicyError, IgnoreRule};
 pub use index::{

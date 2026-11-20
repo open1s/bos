@@ -207,7 +207,7 @@ pub const TOOL_JOBS: &str = "Track every background job id you start. You are no
 /// The reference replaces a whole `todos` list and may allow several items
 /// `in_progress`; BSH's plan persists one list of `{text, status}` items and
 /// asks for exactly one active item.
-pub const TOOL_PLAN: &str = "Record and update a task list to plan multi-step work and show progress; skip it for trivial single-step tasks. Add one item per concrete step before you start. While work remains, keep exactly one item in_progress. Mark each item completed as soon as it is done.";
+pub const TOOL_PLAN: &str = "Record and update a task list to plan multi-step work and show progress; skip it for trivial single-step tasks. Add one item per concrete step before you start. While work remains, keep exactly one item in_progress. Mark each item completed as soon as it is done, and update the whole list before you give the final answer.";
 
 /// The ordered per-tool guidance for the tools this crate owns.
 ///
@@ -469,6 +469,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The plan rule names the moment the plan must be current: the final
+    /// answer. "As soon as it is done" alone let a model answer first and
+    /// leave the last steps pending.
+    #[test]
+    fn the_plan_guidance_asks_for_the_final_update() {
+        assert!(TOOL_PLAN.contains("Mark each item completed as soon as it is done"));
+        assert!(TOOL_PLAN.contains("before you give the final answer"));
     }
 
     /// The bash guidance carries the tool-first rule too: a turn without a

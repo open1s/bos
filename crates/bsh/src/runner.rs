@@ -26,6 +26,21 @@ fn tool_result_failed(output: &str) -> bool {
     react::tool::ToolResult::text_is_error(output)
 }
 
+/// The live plan block for one turn, when the agent has a plan.
+///
+/// Built from the agent's own store (the `update_plan` tool writes through the
+/// same one), so the block is the plan the panel shows and not a second copy.
+fn plan_context_block(agent: &Agent) -> Option<crate::context_assembly::ContextBlock> {
+    let plan = crate::context::render_plan(&agent.plan_items())?;
+    Some(crate::context_assembly::ContextBlock {
+        source: crate::context_assembly::ContextSource::Plan,
+        trust: crate::context_assembly::ContextSource::Plan.trust(),
+        token_estimate: agent::agent::context::estimate_tokens(&plan),
+        provenance: Some("plan".to_string()),
+        text: plan,
+    })
+}
+
 /// Cap the transcript-facing tool result by UTF-8 bytes, not Unicode scalar count.
 fn cap_display_tool_output(output: &str, cap_bytes: usize) -> String {
     // A zero host cap delegates to the engine's documented default budget.
@@ -405,6 +420,12 @@ impl Runner {
                         token_estimate: agent::agent::context::estimate_tokens(&context.snapshot),
                         provenance: Some("runtime-context".to_string()),
                     });
+                }
+                // The working plan is host state the model maintains, so it
+                // rides the request like the runtime facts: after a compaction
+                // or a long turn the old tool row may be all the model has.
+                if let Some(block) = plan_context_block(&agent) {
+                    blocks.push(block);
                 }
                 if !context.time_context.is_empty() {
                     blocks.push(crate::context_assembly::ContextBlock {
@@ -881,6 +902,38 @@ mod tests {
         ));
         assert!(!tool_result_failed("{\"success\":true}"));
         assert!(!tool_result_failed("plain output"));
+    }
+
+    /// A plan in the agent's own store becomes the request's plan block; an
+    /// empty store adds nothing.
+    #[test]
+    fn a_plan_becomes_a_context_block_for_the_request() {
+        let provider = std::sync::Arc::new(agent::agent::agentic::LlmProvider::new());
+        let agent = Agent::new(agent::AgentConfig::default(), provider);
+        assert!(plan_context_block(&agent).is_none(), "no plan, no block");
+        agent.plan().replace(vec![
+            agent::tools::PlanItem {
+                text: "Read the file".to_string(),
+                status: agent::tools::PlanStatus::Completed,
+            },
+            agent::tools::PlanItem {
+                text: "Edit it".to_string(),
+                status: agent::tools::PlanStatus::InProgress,
+            },
+        ]);
+        let block = plan_context_block(&agent).expect("the plan block");
+        assert_eq!(block.source, crate::context_assembly::ContextSource::Plan);
+        assert_eq!(block.trust, crate::context_assembly::Trust::HostAuthority);
+        assert!(
+            block.text.contains("[completed] Read the file"),
+            "{}",
+            block.text
+        );
+        assert!(
+            block.text.contains("[in_progress] Edit it"),
+            "{}",
+            block.text
+        );
     }
 
     #[test]

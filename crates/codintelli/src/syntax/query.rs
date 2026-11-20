@@ -576,7 +576,7 @@ pub struct QueryExecutionOptions {
 }
 
 /// Which retained-output cap stopped execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum QueryOutputLimit {
     /// The retained match cap was reached.
     Matches,

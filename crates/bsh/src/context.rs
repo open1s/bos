@@ -27,12 +27,70 @@ use std::path::Path;
 
 use agent::Agent;
 use agent::tools::bash::SANDBOX_RELEASED_REASON;
+use agent::tools::{PlanItem, PlanStatus};
 
 use crate::settings::Effective;
 
 /// The reference's snapshot heading, byte-for-byte.
 pub(crate) const RUNTIME_CONTEXT_PREAMBLE: &str =
     "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.";
+
+/// The heading of the live plan block.
+///
+/// The model writes the plan with `update_plan`, but a tool call is a moment,
+/// not a state: after a compaction or a long turn the only copy of the plan was
+/// the old tool row, so the model finished work without marking the step
+/// completed. The host renders the plan store back into every turn, the same
+/// way it renders the runtime facts, and the block supersedes its predecessor.
+pub(crate) const PLAN_CONTEXT_PREAMBLE: &str =
+    "Current plan. This snapshot supersedes earlier plan snapshots.";
+
+/// The most characters the rendered plan may add to one request.
+pub(crate) const PLAN_CONTEXT_CHARS: usize = 2_000;
+
+/// Render the working plan the model maintains, or `None` when there is none.
+///
+/// The text is bounded twice: one step keeps its first 160 characters, and the
+/// whole block stops at [`PLAN_CONTEXT_CHARS`] with a count of what did not
+/// fit, because a 100-step plan must not become a request of its own.
+pub(crate) fn render_plan(items: &[PlanItem]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut out = String::from(PLAN_CONTEXT_PREAMBLE);
+    out.push_str(
+        "\nKeep it current: mark a step completed the moment its work is done, \
+         keep exactly one step in_progress while work remains, and update it \
+         before the final answer.\n",
+    );
+    let mut shown = 0_usize;
+    for item in items {
+        let status = match item.status {
+            PlanStatus::Pending => "pending",
+            PlanStatus::InProgress => "in_progress",
+            PlanStatus::Completed => "completed",
+        };
+        let text: String = item.text.trim().chars().take(160).collect();
+        let line = format!("- [{status}] {text}\n");
+        if out.chars().count() + line.chars().count() > PLAN_CONTEXT_CHARS {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    if shown < items.len() {
+        out.push_str(&format!(
+            "- ... {} more step(s); read them from the latest update_plan result\n",
+            items.len() - shown
+        ));
+    }
+    Some(out)
+}
+
+/// Whether a row carries the live plan block.
+pub(crate) fn is_plan_context_text(text: &str) -> bool {
+    text.starts_with(PLAN_CONTEXT_PREAMBLE)
+}
 
 /// The reference's child context, with BSH's own permission fact.
 ///
@@ -316,7 +374,20 @@ pub(crate) fn inject_snapshot(agent: &Agent, snapshot: &crate::context_assembly:
         .filter(|(source, _)| *source == crate::context_assembly::ContextSource::Extension)
         .map(|(_, text)| text.as_str())
         .collect();
+    // The plan is a live projection: the newest block replaces the previous
+    // one instead of accumulating a row per turn, and a turn with no plan (a
+    // fresh session, or a plan the model cleared) drops the old row.
+    let current_plan = blocks
+        .iter()
+        .find(|(source, _)| *source == crate::context_assembly::ContextSource::Plan)
+        .map(|(_, text)| text.as_str());
     let history = session.messages().iter().filter(|message| {
+        if let Some(text) = message_text(message)
+            && is_plan_context_text(text)
+            && Some(text) != current_plan
+        {
+            return false;
+        }
         let Some(want) = current_instructions else {
             return match message {
                 react::llm::LlmMessage::User { content } => content
@@ -687,6 +758,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The plan block carries every status and the upkeep rule, and a clear
+    /// plan (or one that never existed) adds nothing to the request.
+    #[test]
+    fn the_plan_block_states_every_status_and_its_upkeep_rule() {
+        assert!(render_plan(&[]).is_none(), "no plan, no block");
+        let items = vec![
+            PlanItem {
+                text: "Read the file".to_string(),
+                status: PlanStatus::Completed,
+            },
+            PlanItem {
+                text: "Edit it".to_string(),
+                status: PlanStatus::InProgress,
+            },
+            PlanItem {
+                text: "Run the tests".to_string(),
+                status: PlanStatus::Pending,
+            },
+        ];
+        let block = render_plan(&items).expect("a block");
+        assert!(block.starts_with(PLAN_CONTEXT_PREAMBLE), "{block}");
+        assert!(block.contains("- [completed] Read the file"), "{block}");
+        assert!(block.contains("- [in_progress] Edit it"), "{block}");
+        assert!(block.contains("- [pending] Run the tests"), "{block}");
+        assert!(
+            block.contains("mark a step completed the moment its work is done"),
+            "the block says to keep it current: {block}"
+        );
+        assert!(
+            block.contains("update it before the final answer"),
+            "the block names the final-answer moment: {block}"
+        );
+        assert!(is_plan_context_text(&block));
+    }
+
+    /// A plan longer than the block budget keeps its first steps and says how
+    /// many it left out; the block never becomes a request of its own.
+    #[test]
+    fn the_plan_block_is_bounded() {
+        let items: Vec<PlanItem> = (0..100)
+            .map(|n| PlanItem {
+                text: format!("step {n} {}", "x".repeat(200)),
+                status: PlanStatus::Pending,
+            })
+            .collect();
+        let block = render_plan(&items).expect("a block");
+        assert!(
+            block.chars().count() <= PLAN_CONTEXT_CHARS + 200,
+            "{}",
+            block.chars().count()
+        );
+        assert!(block.contains("more step(s)"), "{block}");
+    }
+
     /// The time-context states the sampled instant with its zone, the zone
     /// rule and the elapsed span; a first turn says unavailable.
     #[test]
@@ -949,6 +1074,74 @@ mod tests {
             session.messages()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The plan block is a live projection: the next turn's plan replaces the
+    /// previous row instead of stacking, and a turn with no plan drops it.
+    #[test]
+    fn a_new_plan_block_replaces_the_previous_one() {
+        use crate::context_assembly::{
+            AssemblySnapshot, ContextBlock, ContextSource, SourceVersions,
+        };
+        let provider = std::sync::Arc::new(agent::agent::agentic::LlmProvider::new());
+        let agent = Agent::new(agent::AgentConfig::default(), provider);
+        let plan_block = |text: &str| ContextBlock {
+            source: ContextSource::Plan,
+            trust: ContextSource::Plan.trust(),
+            text: text.to_string(),
+            token_estimate: 3,
+            provenance: Some("plan".to_string()),
+        };
+        let count = |agent: &Agent| {
+            agent
+                .session()
+                .messages()
+                .iter()
+                .filter(|message| message_text(message).is_some_and(is_plan_context_text))
+                .count()
+        };
+
+        let first = AssemblySnapshot::build(
+            vec![plan_block(&format!(
+                "{PLAN_CONTEXT_PREAMBLE}\n- [in_progress] one"
+            ))],
+            SourceVersions::default(),
+            None,
+        );
+        crate::context::inject_snapshot(&agent, &first);
+        assert_eq!(count(&agent), 1);
+
+        let second = AssemblySnapshot::build(
+            vec![plan_block(&format!(
+                "{PLAN_CONTEXT_PREAMBLE}\n- [completed] one"
+            ))],
+            SourceVersions::default(),
+            None,
+        );
+        crate::context::inject_snapshot(&agent, &second);
+        assert_eq!(count(&agent), 1, "one plan row, not a growing stack");
+        assert!(
+            agent
+                .session()
+                .messages()
+                .iter()
+                .filter_map(message_text)
+                .any(|row| row.contains("[completed] one")),
+            "the newest plan is the row the model reads"
+        );
+
+        // A turn whose plan was cleared keeps the runtime block but drops the
+        // stale plan row.
+        let runtime = ContextBlock {
+            source: ContextSource::HostRuntime,
+            trust: ContextSource::HostRuntime.trust(),
+            text: "runtime".to_string(),
+            token_estimate: 1,
+            provenance: Some("runtime-context".to_string()),
+        };
+        let cleared = AssemblySnapshot::build(vec![runtime], SourceVersions::default(), None);
+        crate::context::inject_snapshot(&agent, &cleared);
+        assert_eq!(count(&agent), 0, "a cleared plan leaves no stale row");
     }
 
     /// Extension instructions are active for one turn only: the next turn's

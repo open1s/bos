@@ -128,7 +128,8 @@ impl Tool for PlanTool {
          `{text, status}` with status `pending`, `in_progress`, or `completed` — \
          every call overwrites the previous plan. While work remains, keep at \
          most one item `in_progress`. Mark each item `completed` as soon as it \
-         is done, and pass an empty list when the plan no longer applies."
+         is done, pass the updated list before you give the final answer, and \
+         pass an empty list when the plan no longer applies."
             .to_string()
     }
 

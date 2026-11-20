@@ -31,7 +31,7 @@ pub enum FileCategory {
 }
 
 /// Language or format inferred from a recognized file name or extension.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum LanguageId {
     /// Rust.
     Rust,

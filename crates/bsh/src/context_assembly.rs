@@ -27,6 +27,8 @@ pub(crate) enum ContextSource {
     RetrievedMemory,
     /// Capability / per-tool guidance.
     ToolGuidance,
+    /// The live working plan the model maintains with `update_plan`.
+    Plan,
     /// An extension-provided prompt or workspace context, active only for a
     /// relevant turn (issue #436). Always data, never host policy.
     Extension,
@@ -59,7 +61,8 @@ impl ContextSource {
             | ContextSource::UserInput => Trust::UntrustedData,
             ContextSource::HostRuntime
             | ContextSource::TimeContext
-            | ContextSource::ToolGuidance => Trust::HostAuthority,
+            | ContextSource::ToolGuidance
+            | ContextSource::Plan => Trust::HostAuthority,
             ContextSource::Extension => Trust::UntrustedData,
         }
     }
@@ -86,6 +89,7 @@ impl ContextSource {
             ContextSource::WorkspaceInstructions => "workspace-instructions",
             ContextSource::RetrievedMemory => "retrieved-memory",
             ContextSource::ToolGuidance => "tool-guidance",
+            ContextSource::Plan => "plan",
             ContextSource::Extension => "extension",
             ContextSource::UserInput => "user-input",
         }
@@ -664,6 +668,7 @@ impl AssemblySnapshot {
                 ContextSource::HostRuntime
                     | ContextSource::TimeContext
                     | ContextSource::WorkspaceInstructions
+                    | ContextSource::Plan
                     | ContextSource::Extension
             )
         })

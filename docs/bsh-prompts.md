@@ -89,6 +89,17 @@ cap (`MAX_READ_RESULT_BYTES`) so the shell-sized workspace cap cannot cut a
 page a second time - a second cut would leave `next_offset` pointing past text
 the model never saw.
 
+The working plan rides beside the runtime snapshot. `update_plan` is whole-list
+replacement and the panel renders the store, but the model's only copy used to
+be its own older tool row - after a compaction or a long turn the plan still
+said `pending` while the work was done. `ContextSource::Plan` now carries the
+store into every request (`render_plan`): one line per step with its status, a
+rule to mark a step completed when its work is done and to update the list
+before the final answer, and a 2,000-character bound. The newest block
+supersedes the previous row, so a child continuation never stacks plan
+snapshots. The plan tool's description and `TOOL_PLAN` name the same
+final-answer moment.
+
 ## 3. What the reference harnesses do
 
 ### Codex: intent as a completion contract

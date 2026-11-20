@@ -8268,6 +8268,10 @@ mod tests {
         assert!(prompt.contains(agent::WORKFLOW_GUIDANCE));
         assert!(prompt.contains(crate::prompts::HARNESS_CONTEXT));
         assert!(
+            prompt.contains(agent::prompts::TOOL_PLAN),
+            "the plan rule reaches the request"
+        );
+        assert!(
             prompt.contains("A question ends without an edit"),
             "the question/change decision reaches the request"
         );

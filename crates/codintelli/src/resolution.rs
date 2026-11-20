@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Kind of declaration represented in the candidate symbol catalog.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SymbolKind {
     /// A module declaration.
     Module,
