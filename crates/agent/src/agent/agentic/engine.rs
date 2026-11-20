@@ -279,6 +279,9 @@ impl Agent {
             // the MODEL's session, not only what the UI displays; zero keeps
             // the engine default.
             .tool_result_cap(self.config.tool_output_cap)
+            // A tool whose own paging bounds it keeps that bound; every other
+            // tool keeps the generic cap.
+            .tool_result_caps(self.tool_output_caps.clone())
             .model(self.config.model.clone())
             .app(app);
         // A zero budget is "no budget": the loop ends when the model stops

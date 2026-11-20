@@ -81,6 +81,14 @@ compact harness execution footer (`COMPLETE_PERSONA_CONTRACT`). It is the
 reader's explicit switch - General's persona row and the composer's permission
 menu toggle it - and the composer badge names the mode (section 9).
 
+The file-read page is a product constant, not a prompt hint: `read_file` and
+`read_files` raise a `limit` below 4096 lines to 4096 (and default to it),
+because one page should carry the region one round trip is worth. A page is
+bounded at 1 MiB as well, and the two read tools carry their own engine result
+cap (`MAX_READ_RESULT_BYTES`) so the shell-sized workspace cap cannot cut a
+page a second time - a second cut would leave `next_offset` pointing past text
+the model never saw.
+
 ## 3. What the reference harnesses do
 
 ### Codex: intent as a completion contract

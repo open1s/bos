@@ -229,6 +229,12 @@ pub struct ReActEngine<A: ReActApp> {
     /// engine default; a host with a workspace-level tool-output setting passes
     /// that limit so the session the model reads obeys the cap its UI does.
     tool_result_cap: usize,
+    /// Per-tool overrides of [`Self::tool_result_cap`], by registered name.
+    ///
+    /// A tool that pages its own payload is bounded already; the generic cap
+    /// must not cut that page AGAIN, because the page's continuation would then
+    /// skip the text the second cut removed.
+    tool_result_caps: std::collections::HashMap<String, usize>,
     /// The step guard, when the caller asks for one. `None` is the harness
     /// contract: a turn ends when the MODEL stops asking for tools, and a
     /// healthy run must not be cut off by a number. The bound exists for
@@ -265,6 +271,7 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     max_steps: Option<usize>,
     context_budget: usize,
     tool_result_cap: usize,
+    tool_result_caps: std::collections::HashMap<String, usize>,
     parallel_tool_calls: bool,
     telemetry: Telemetry,
     resilience: Option<ReActResilience>,
@@ -487,6 +494,17 @@ struct SchemaReveal {
 }
 
 impl<A: ReActApp> ReActEngine<A> {
+    /// The result cap one tool's envelope is rendered under.
+    ///
+    /// A host names a tool whose own paging already bounds it; every other tool
+    /// keeps the turn's generic cap.
+    fn result_cap_for(&self, tool: &str) -> usize {
+        self.tool_result_caps
+            .get(tool)
+            .copied()
+            .unwrap_or(self.tool_result_cap)
+    }
+
     /// Start configuring an engine.
     pub fn builder() -> ReActEngineBuilder<A> {
         ReActEngineBuilder::new()
@@ -957,8 +975,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                 // One envelope for the whole result, capped
                                 // with the same ceiling the streaming loop
                                 // applies, before anything reaches the session.
-                                let result_text =
-                                    render_tool_result(&observed, &result, self.tool_result_cap);
+                                let result_text = render_tool_result(
+                                    &observed,
+                                    &result,
+                                    self.result_cap_for(&observed),
+                                );
                                 trace.note_tool_result(result.is_ok());
 
                                 if let Ok(ret) = &result {
@@ -1238,8 +1259,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                 // One envelope for the whole result, capped
                                 // with the same ceiling the streaming loop
                                 // applies, before anything reaches the session.
-                                let result_text =
-                                    render_tool_result(&observed, &result, self.tool_result_cap);
+                                let result_text = render_tool_result(
+                                    &observed,
+                                    &result,
+                                    self.result_cap_for(&observed),
+                                );
                                 trace.note_tool_result(result.is_ok());
 
                                 if let Ok(ret) = &result {
@@ -1680,7 +1704,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             // The same envelope the batch paths use, so a
                             // streamed turn and a collected one read alike.
                             let result_text =
-                                render_tool_result(&observed, &result, self.tool_result_cap);
+                                render_tool_result(&observed, &result, self.result_cap_for(&observed));
                             trace.note_tool_result(result.is_ok());
 
                             // A failed call is the one line the log was

@@ -29,9 +29,9 @@ pub(crate) const GREP: &str = "Use the grep tool — not shell grep or rg — to
 ///
 /// Use the batch variant when several known files need inspection, avoiding
 /// repeated tool-call envelopes while retaining a bounded aggregate result.
-pub(crate) const READ_FILE: &str = "Use the read_file tool — not shell commands like cat — to inspect one text file. Call it with only path to start at line 1; offset is optional and 1-based, and limit caps the window. After a partial read, a path-only call continues from the previous next, so pass offset=1 when you deliberately want to re-read from the start. The result carries next={offset} while more lines remain.";
+pub(crate) const READ_FILE: &str = "Use the read_file tool — not shell commands like cat — to inspect one text file. Call it with only path to start at line 1; offset is optional and 1-based, and limit caps the window at a minimum of 4096 lines: a smaller value is raised to 4096, because one page should carry the whole region a round trip is worth. After a partial read, a path-only call continues from the previous next, so pass offset=1 when you deliberately want to re-read from the start. The result carries next={offset} while more lines remain.";
 
-pub(crate) const READ_FILES: &str = "When you need to inspect several known files, use read_files once instead of making repeated read_file calls. It accepts up to 10 distinct paths, applies offset and limit to each file, and caps combined returned content at 1 MiB; inspect each file's truncated or error field.";
+pub(crate) const READ_FILES: &str = "When you need to inspect several known files, use read_files once instead of making repeated read_file calls. It accepts up to 10 distinct paths, applies offset and limit to each file (limit is at least 4096 lines; a smaller value is raised), and caps combined returned content at 1 MiB; inspect each file's truncated or error field.";
 
 /// The reference's `write` guidance, with BSH's tool name and no policy claim.
 ///

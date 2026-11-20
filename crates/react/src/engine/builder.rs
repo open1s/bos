@@ -12,6 +12,8 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             context_budget: 0,
             // The engine default applies until a host passes its own cap.
             tool_result_cap: TOOL_RESULT_CAP,
+            // No per-tool override until a host names one.
+            tool_result_caps: std::collections::HashMap::new(),
             parallel_tool_calls: false,
             telemetry: Telemetry::new(),
             resilience: None,
@@ -84,6 +86,28 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
     /// reads obeys the same cap its UI does instead of an engine constant.
     pub fn tool_result_cap(mut self, cap: usize) -> Self {
         self.tool_result_cap = if cap == 0 { TOOL_RESULT_CAP } else { cap };
+        self
+    }
+
+    /// Override the result cap for one tool, keyed by the name it registers.
+    ///
+    /// A tool that bounds its own payload (a line-paged file reader) must not
+    /// be cut again by the generic cap: a second cut would leave its
+    /// continuation pointing past text the model never saw.
+    pub fn tool_result_cap_for(mut self, tool: impl Into<String>, cap: usize) -> Self {
+        if cap > 0 {
+            self.tool_result_caps.insert(tool.into(), cap);
+        }
+        self
+    }
+
+    /// Apply a map of per-tool overrides; zero entries keep the generic cap.
+    pub fn tool_result_caps(mut self, caps: std::collections::HashMap<String, usize>) -> Self {
+        for (tool, cap) in caps {
+            if cap > 0 {
+                self.tool_result_caps.insert(tool, cap);
+            }
+        }
         self
     }
 
@@ -197,6 +221,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             max_steps: self.max_steps,
             context_budget: self.context_budget,
             tool_result_cap: self.tool_result_cap,
+            tool_result_caps: self.tool_result_caps,
             parallel_tool_calls: self.parallel_tool_calls,
             telemetry: self.telemetry,
             llm_timeout_secs: self.llm_timeout_secs,

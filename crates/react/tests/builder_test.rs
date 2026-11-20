@@ -368,3 +368,111 @@ fn test_react_with_request() {
     let model = received_model.lock().unwrap();
     assert_eq!(model.as_ref().unwrap(), "custom-model");
 }
+
+/// A tool that names its own result cap keeps its payload whole; the generic
+/// cap still cuts every other tool. This is the seam the paged file readers
+/// rely on: a page they already bounded must not be cut a second time.
+#[test]
+fn a_per_tool_result_cap_keeps_its_payload_whole() {
+    struct CapturingLlm {
+        calls: Arc<Mutex<usize>>,
+        seen: Arc<Mutex<String>>,
+    }
+
+    #[async_trait]
+    impl LlmClient<LlmSession, LlmContext> for CapturingLlm {
+        async fn complete(
+            &self,
+            _persona: Option<String>,
+            _request: LlmRequest,
+            session: &mut LlmSession,
+            _context: &mut LlmContext,
+        ) -> LlmResponseResult {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                Ok(make_tool_call_response("big", serde_json::json!({}), "1"))
+            } else {
+                // The tool result has been appended to the session by now.
+                *self.seen.lock().unwrap() = format!("{:?}", session.history);
+                Ok(make_text_response("done".to_string(), true))
+            }
+        }
+
+        async fn stream_complete(
+            &self,
+            _persona: Option<String>,
+            _request: LlmRequest,
+            _session: &mut LlmSession,
+            _context: &mut LlmContext,
+        ) -> Result<TokenStream, LlmError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    fn run(per_tool: Option<usize>) -> String {
+        let payload = "x".repeat(20_000);
+        let tool_payload = payload.clone();
+        let llm = CapturingLlm {
+            calls: Arc::new(Mutex::new(0)),
+            seen: Arc::new(Mutex::new(String::new())),
+        };
+        let seen = Arc::clone(&llm.seen);
+        let mut builder = ReActEngineBuilder::<TestApp>::new()
+            .llm(Box::new(llm))
+            .tool_result_cap(1024)
+            .with_tool(ToolVariant::Sync(Box::new(FnTool {
+                name: "big".to_string(),
+                description: "Returns a large payload".to_string(),
+                f: Box::new(move |_: &Value| Value::String(tool_payload.clone())),
+            })))
+            .max_steps(3);
+        if let Some(cap) = per_tool {
+            builder = builder.tool_result_cap_for("big", cap);
+        }
+        let mut engine = builder.build().expect("the engine");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut session = LlmSession::default();
+        let mut context = LlmContext::default();
+        rt.block_on(async {
+            engine
+                .react(
+                    None,
+                    LlmRequest::new("test-model"),
+                    &mut session,
+                    &mut context,
+                )
+                .await
+        })
+        .expect("the run");
+        seen.lock().unwrap().clone()
+    }
+
+    let generic = run(None);
+    assert!(
+        generic.contains("bytes omitted"),
+        "the generic cap cuts the result: {generic}"
+    );
+    assert!(
+        !generic.contains(&"x".repeat(20_000)),
+        "the generic cap does not carry the whole payload"
+    );
+
+    let per_tool = run(Some(64 * 1024));
+    assert!(
+        per_tool.contains(&"x".repeat(20_000)),
+        "the per-tool cap carries the whole payload: {per_tool}"
+    );
+    assert!(
+        !per_tool.contains("bytes omitted"),
+        "the per-tool cap does not cut the payload: {per_tool}"
+    );
+}

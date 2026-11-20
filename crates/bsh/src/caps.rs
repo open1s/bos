@@ -1943,6 +1943,12 @@ fn build_agent_for_session_inner(
     {
         crate::compositions::record(&path, snapshot);
     }
+    // The read tools bound their own page (a 4096-line floor and a byte
+    // ceiling). The generic tool-output cap is sized for a shell dump; applied
+    // here it would cut the page a second time, and next_offset would point
+    // past text the model never saw. The page's own bound is the whole bound.
+    agent.set_tool_output_cap("read_file", MAX_READ_RESULT_BYTES);
+    agent.set_tool_output_cap("read_files", MAX_READ_RESULT_BYTES);
     let mut built = BuiltAgent {
         agent: Arc::new(agent),
         snapshot,
@@ -2701,6 +2707,12 @@ pub(crate) struct SubagentContext {
     /// A spawn used to pay that read per child; the cell now keeps the first
     /// render for the life of the build.
     child_context: std::sync::OnceLock<crate::context::TurnContext>,
+    /// Per-tool result caps the parent build carries.
+    ///
+    /// A child inherits them: a paged read is bounded by its own window, and a
+    /// child that fell back to the generic shell cap would have its pages cut
+    /// a second time, with next_offset skipping the cut text.
+    tool_output_caps: Vec<(String, usize)>,
     /// The parent's parsed skills, inherited by the child.
     ///
     /// A child is a build of the same turn, so it reads the same catalogue the
@@ -2767,6 +2779,7 @@ impl SubagentContext {
             runtime,
             context_budget: agent.context_budget(),
             child_context: std::sync::OnceLock::new(),
+            tool_output_caps: agent.tool_output_caps(),
             // The model-facing set, not the pre-extension set: a child must
             // inherit the package skills the parent turn actually carries.
             skills: agent.all_skills(),
@@ -2937,6 +2950,11 @@ impl SubagentContext {
             config.system_prompt
         );
         let mut child = Agent::from_config(config).with_context_budget(self.context_budget);
+        // The parent's per-tool caps travel with the tools: a paged read in a
+        // child is bounded by its own window, not by the shell-sized cap.
+        for (tool, bytes) in &self.tool_output_caps {
+            child.set_tool_output_cap(tool.clone(), *bytes);
+        }
         crate::extension::hooks::install_agent_hooks(&mut child);
         // The same skills the parent turn carries: a delegated prompt can name
         // one (the `/name` gesture), and the child's own catalogue and
@@ -4153,8 +4171,33 @@ const MAX_BATCH_READ_BYTES: usize = 1024 * 1024;
 /// rather than stalling the turn.
 pub(crate) const MAX_EDIT_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The most bytes one windowed read returns.
-const MAX_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+/// The fewest lines one read page may return.
+///
+/// A page is what one round trip buys. 4096 lines is a whole module or a
+/// multi-thousand-line log; a smaller page turns one inspection into several
+/// calls, so a request below this is raised to it instead of honoured.
+const MIN_READ_LINES: usize = 4096;
+
+/// The page a read uses when the caller does not name one.
+const DEFAULT_READ_LINES: usize = MIN_READ_LINES;
+
+/// The most bytes one read page returns.
+///
+/// The line floor alone is not a size bound: 4096 minified lines can be
+/// megabytes. A page that hits this reports next_offset like any other cut,
+/// so the model continues with one call. One MiB keeps a normal 4096-line
+/// page whole (about 256 bytes a line) and still refuses the multi-megabyte
+/// single line that would otherwise flood the request.
+const MAX_READ_PAGE_BYTES: usize = 1024 * 1024;
+
+/// The engine result cap a read page may use.
+///
+/// The generic tool-output setting (16 KiB by default) is sized for a shell
+/// dump; applied to a page that already bounds itself it cuts the page a
+/// second time, and the continuation then points past text the model never
+/// saw. JSON escaping can double a page of quotes and backslashes, so the cap
+/// leaves room for that and for the envelope's own fields.
+const MAX_READ_RESULT_BYTES: usize = MAX_READ_PAGE_BYTES.saturating_mul(2) + 64 * 1024;
 
 /// The entries one `list_dir` call collects before it stops reading.
 const MAX_LIST_ENTRIES: usize = 10_000;
@@ -4240,14 +4283,6 @@ fn open_regular(target: &Path) -> Result<(fs::File, fs::Metadata), ToolError> {
     Ok((file, meta))
 }
 
-/// Refuse a file past the read ceiling, naming the way to read it anyway.
-fn read_ceiling(target: &Path, size: u64) -> ToolError {
-    ToolError::Failed(format!(
-        "{} is {size} bytes, past the {MAX_READ_BYTES} byte read ceiling; pass offset (1-based line) and limit to read a window",
-        target.display()
-    ))
-}
-
 /// Decode bytes as the file's text, refusing binary content up front.
 ///
 /// The classification scans the head first, because a PNG or an object file is
@@ -4280,31 +4315,6 @@ fn binary(target: &Path, at: usize) -> ToolError {
     ))
 }
 
-/// Read the whole file, bounded by the read ceiling.
-fn read_whole(target: &Path) -> Result<ReadOutcome, ToolError> {
-    let (file, meta) = open_regular(target)?;
-    if meta.len() > MAX_READ_BYTES as u64 {
-        return Err(read_ceiling(target, meta.len()));
-    }
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    file.take(MAX_READ_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| failed(target, &error))?;
-    if bytes.len() > MAX_READ_BYTES {
-        return Err(read_ceiling(target, bytes.len() as u64));
-    }
-    let content = utf8_text(target, bytes, 0)?;
-    let total_lines = content.lines().count();
-    Ok(ReadOutcome {
-        content,
-        truncated: false,
-        past_end: false,
-        start_line: 1,
-        end_line: total_lines,
-        total_lines: Some(total_lines),
-    })
-}
-
 /// Read one line window without loading the rest of the file.
 fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome, ToolError> {
     let (file, meta) = open_regular(target)?;
@@ -4333,7 +4343,7 @@ fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome
             break;
         }
         if index >= offset {
-            if kept < limit && out.len() + line.len() <= MAX_WINDOW_BYTES {
+            if kept < limit && out.len() + line.len() <= MAX_READ_PAGE_BYTES {
                 if kept == 0 {
                     base = consumed;
                 }
@@ -4343,9 +4353,9 @@ fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome
                 // A window that cannot return even its first line must say so:
                 // an empty page whose next offset is the same line would be an infinite
                 // retry loop for the model.
-                if kept == 0 && out.len() + line.len() > MAX_WINDOW_BYTES {
+                if kept == 0 && out.len() + line.len() > MAX_READ_PAGE_BYTES {
                     return Err(ToolError::Failed(format!(
-                        "line {index} is {} bytes, past the {MAX_WINDOW_BYTES} byte read window; read from an earlier offset",
+                        "line {index} is {} bytes, past the {MAX_READ_PAGE_BYTES} byte read page; read it with a shell slice (sed or cut) instead, or an earlier offset when the file has more than this line",
                         line.len()
                     )));
                 }
@@ -4553,8 +4563,8 @@ fn not_found_message(target: &Path, content: &str, old: &str) -> String {
         let start = line.saturating_sub(3).max(1);
         message.push_str(&format!(
             "; its first line matches line {line}, so check the rest of the block exactly. \
-             Re-read that region with {{\"path\":\"{}\",\"offset\":{},\"limit\":20}} and copy \
-             old_string verbatim",
+             Re-read that region with {{\"path\":\"{}\",\"offset\":{}}} (a page is at
+             least 4096 lines) and copy old_string verbatim",
             target.display(),
             start
         ));
@@ -5028,13 +5038,13 @@ pub(crate) fn read_file_tool(
     let cursor: ReadCursor = Arc::new(Mutex::new(HashMap::new()));
     FunctionTool::new(
         "read_file",
-        "Read a UTF-8 text file. With only path it starts at line 1; after a partial read the same call continues from next_offset, so pass offset=1 to restart. limit bounds the window. Paths are workspace-relative or absolute inside the workspace; ignored paths are refused. Returns start_line, end_line, total_lines and next_offset: the line to read next, or null when done.",
+        "Read a UTF-8 text file. With only path it starts at line 1; after a partial read the same call continues from next_offset, so pass offset=1 to restart. limit bounds the window and is at least 4096 lines: a smaller value is raised, because a page is what one round trip buys. Paths are workspace-relative or absolute inside the workspace; ignored paths are refused. Returns start_line, end_line, total_lines and next_offset: the line to read next, or null when done.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path of the UTF-8 text file to read, relative to the workspace or absolute inside the allowed workspace." },
                 "offset": { "type": "integer", "minimum": 1, "description": "Optional 1-based starting line; defaults to 1 (the first line is 1, not 0). Pass the previous result's next_offset to continue." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Optional maximum lines from offset; a cut window returns next_offset." }
+                "limit": { "type": "integer", "minimum": 1, "description": "Maximum lines from offset. The minimum page is 4096 lines: a smaller value is raised to 4096, so ask for 4096 or more. A cut window returns next_offset." }
             },
             "required": ["path"],
             "additionalProperties": false
@@ -5042,7 +5052,11 @@ pub(crate) fn read_file_tool(
         move |args| {
             let raw = arg_str(args, "path")?;
             let explicit_offset = arg_positive(args, "offset")?;
-            let limit = arg_positive(args, "limit")?;
+            // A page is at least the floor: a smaller request would spend a
+            // round trip on a window the next call has to extend anyway.
+            let limit = arg_positive(args, "limit")?
+                .unwrap_or(DEFAULT_READ_LINES)
+                .max(MIN_READ_LINES);
             let target =
                 resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
             refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &target)?;
@@ -5083,7 +5097,7 @@ pub(crate) fn read_file_tool(
                     }
                 }
             };
-            let read = read_window(&target, offset, limit.unwrap_or(usize::MAX))?;
+            let read = read_window(&target, offset, limit)?;
             let ReadOutcome {
                 content,
                 truncated,
@@ -5178,7 +5192,7 @@ pub(crate) fn read_files_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "read_files",
-        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next_offset: the line to read next, or null when done. Combined content is capped at 1 MiB; inspect each entry's error field.",
+        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next_offset: the line to read next, or null when done. Each file's page is at least 4096 lines (a smaller limit is raised). Combined content is capped at 1 MiB; inspect each entry's error field.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -5202,7 +5216,7 @@ pub(crate) fn read_files_tool(
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional maximum lines per file; a cut file returns next_offset."
+                    "description": "Maximum lines per file. The minimum page is 4096 lines: a smaller value is raised to 4096, so ask for 4096 or more. A cut file returns next_offset."
                 }
             },
             "required": ["paths"],
@@ -5219,7 +5233,11 @@ pub(crate) fn read_files_tool(
                 )));
             }
             let offset = arg_positive(args, "offset")?;
-            let limit = arg_positive(args, "limit")?;
+            // The same floor as read_file: one batch page per file is what a
+            // caller gets back for the round trip.
+            let limit = arg_positive(args, "limit")?
+                .unwrap_or(DEFAULT_READ_LINES)
+                .max(MIN_READ_LINES);
             // Resolve every path first, then refuse a duplicate target as a
             // REQUEST error. Reported per file it read as a failed read, but a
             // duplicate is not a file outcome: the caller named one target
@@ -5306,12 +5324,7 @@ pub(crate) fn read_files_tool(
                         }));
                     }
 
-                    let read = match (offset, limit) {
-                        (None, None) => read_whole(&target)?,
-                        (offset, limit) => {
-                            read_window(&target, offset.unwrap_or(1), limit.unwrap_or(usize::MAX))?
-                        }
-                    };
+                    let read = read_window(&target, offset.unwrap_or(1), limit)?;
                     let ReadOutcome {
                         content,
                         truncated: file_truncated,
@@ -11604,6 +11617,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "a complete read says there is no next line"
         );
 
+        // A request below the 4096-line floor is raised to it: the window
+        // runs to the end of this 100-line file instead of stopping at 12.
         let window = registry
             .execute(
                 "read_file",
@@ -11614,18 +11629,19 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 }),
             )
             .expect("a window reads");
-        assert_eq!(window["content"], "line 10\nline 11\nline 12\n");
+        let tail_body: String = (10..=100).map(|n| format!("line {n}\n")).collect();
+        assert_eq!(window["content"], tail_body);
         assert_eq!(window["start_line"], 10);
-        assert_eq!(window["end_line"], 12);
+        assert_eq!(window["end_line"], 100);
         assert_eq!(window["total_lines"], 100);
-        assert_eq!(window["status"], "partial");
+        assert_eq!(window["status"], "ok");
         assert!(
             window.get("next").is_none(),
             "next_offset is the one continuation field on a read"
         );
-        assert_eq!(
-            window["next_offset"], 13,
-            "the explicit number to pass as offset"
+        assert!(
+            window["next_offset"].is_null(),
+            "the raised window consumed the file"
         );
 
         // The last page reaches EOF, so it can report the exact file length and
@@ -11683,6 +11699,118 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(empty["hint"], "the file is empty");
     }
 
+    /// A read page is at the 4096-line floor: a smaller limit is raised, the
+    /// default is the floor, and a larger request is honoured. The next page
+    /// continues where the floor stopped.
+    #[test]
+    fn a_read_page_is_at_least_4096_lines() {
+        let root = scratch("read-page-floor");
+        let body: String = (1..=5_000).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("long.txt"), &body).expect("long");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let default_page = registry
+            .execute("read_file", &serde_json::json!({ "path": "long.txt" }))
+            .expect("the default page");
+        assert_eq!(default_page["start_line"], 1);
+        assert_eq!(default_page["end_line"], 4096, "{default_page}");
+        assert_eq!(default_page["next_offset"], 4097);
+        assert_eq!(default_page["status"], "partial");
+
+        // offset=1 is a deliberate re-read; a path-only call would continue
+        // from the cursor the default page left.
+        let raised = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": "long.txt", "offset": 1, "limit": 1 }),
+            )
+            .expect("a small limit is raised");
+        assert_eq!(raised["end_line"], 4096, "limit 1 reads a whole page");
+        assert_eq!(raised["next_offset"], 4097);
+
+        let large = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": "long.txt", "offset": 1, "limit": 8192 }),
+            )
+            .expect("a large limit is honoured");
+        assert_eq!(large["end_line"], 5000);
+        assert!(large["next_offset"].is_null());
+
+        let second = registry
+            .execute(
+                "read_file",
+                &serde_json::json!({ "path": "long.txt", "offset": 4097 }),
+            )
+            .expect("the next page");
+        assert_eq!(second["start_line"], 4097);
+        assert_eq!(second["end_line"], 5000);
+
+        let batch = registry
+            .execute(
+                "read_files",
+                &serde_json::json!({ "paths": ["long.txt"], "offset": 1, "limit": 1 }),
+            )
+            .expect("the batch page");
+        assert_eq!(batch["files"][0]["end_line"], 4096, "{batch}");
+        assert_eq!(batch["files"][0]["next_offset"], 4097);
+    }
+
+    /// The read tools carry their own result cap, so the shell-sized workspace
+    /// cap does not cut a page the tool already bounded. Every other tool keeps
+    /// the workspace cap.
+    #[test]
+    fn the_read_tools_carry_their_own_result_cap() {
+        let root = scratch("read-result-cap");
+        let built = build(&confined(&root));
+        assert_eq!(
+            built.agent.tool_output_cap_for("read_file"),
+            crate::caps::MAX_READ_RESULT_BYTES
+        );
+        assert_eq!(
+            built.agent.tool_output_cap_for("read_files"),
+            crate::caps::MAX_READ_RESULT_BYTES
+        );
+        assert_eq!(
+            built.agent.tool_output_cap_for("bash"),
+            built.effective.tool_output_cap,
+            "every other tool keeps the workspace cap"
+        );
+    }
+
+    /// A child build inherits the read tools' own result cap, so a paged read
+    /// inside a subagent is bounded by its window rather than the shell cap.
+    #[test]
+    fn a_child_build_inherits_the_read_result_cap() {
+        let root = scratch("read-cap-child");
+        let built = build(&confined(&root));
+        let context = crate::caps::SubagentContext::new(
+            built.agent.as_ref(),
+            "session",
+            "session",
+            1,
+            std::sync::Arc::new(crate::subagent::SubagentRegistry::default()),
+            built.policy.clone(),
+            built.effective.preset_id.clone(),
+            root.to_string_lossy().to_string(),
+            crate::context::RuntimeFacts::from_effective(&built.effective),
+            crate::caps::SubagentTools {
+                message: true,
+                interrupt: true,
+            },
+        );
+        let child = context.child("child-1");
+        assert_eq!(
+            child.tool_output_cap_for("read_file"),
+            crate::caps::MAX_READ_RESULT_BYTES
+        );
+        assert_eq!(
+            child.tool_output_cap_for("read_files"),
+            crate::caps::MAX_READ_RESULT_BYTES
+        );
+    }
+
     /// The common call needs only the path: offset defaults to line 1, so a
     /// model that says which file to read is not refused for omitting a
     /// continuation detail.
@@ -11705,7 +11833,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     #[test]
     fn read_file_path_only_continues_after_a_partial_window() {
         let root = scratch("read-offset-continue");
-        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").expect("a");
+        // Longer than one page, so the first read is genuinely partial.
+        let body: String = (1..=5_000).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("a.txt"), &body).expect("a");
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
 
@@ -11715,16 +11845,17 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 &serde_json::json!({ "path": "a.txt", "limit": 1 }),
             )
             .expect("the first window");
-        assert_eq!(first["content"], "one\n");
-        assert_eq!(first["next_offset"], 2);
+        assert_eq!(first["end_line"], 4096);
+        assert_eq!(first["next_offset"], 4097);
         assert!(first.get("next").is_none(), "no duplicate next object");
 
         let continued = registry
             .execute("read_file", &serde_json::json!({ "path": "a.txt" }))
             .expect("the path-only call continues");
-        assert_eq!(continued["start_line"], 2);
+        assert_eq!(continued["start_line"], 4097);
         assert_eq!(continued["continued"], true);
-        assert_eq!(continued["content"], "two\nthree\n");
+        let tail: String = (4097..=5_000).map(|n| format!("line {n}\n")).collect();
+        assert_eq!(continued["content"], tail);
 
         let reread = registry
             .execute(
@@ -11733,7 +11864,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("offset=1 re-reads from the start");
         assert_eq!(reread["start_line"], 1);
-        assert_eq!(reread["content"], "one\n");
+        assert_eq!(reread["end_line"], 4096);
 
         // A changed file invalidates the cursor: the next path-only call is a
         // fresh read, not a continuation into bytes that no longer exist.
@@ -11751,7 +11882,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     #[test]
     fn read_file_offsets_are_one_based() {
         let root = scratch("read-offset-base");
-        std::fs::write(root.join("a.txt"), "first\nsecond\n").expect("a");
+        let body: String = (1..=4_100).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("a.txt"), &body).expect("a");
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
 
@@ -11760,10 +11892,16 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 "read_file",
                 &serde_json::json!({ "path": "a.txt", "offset": 1, "limit": 1 }),
             )
-            .expect("offset 1 reads the first line");
-        assert_eq!(first["content"], "first\n");
+            .expect("offset 1 reads the first page");
+        assert!(
+            first["content"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("line 1\n")
+        );
         assert_eq!(first["start_line"], 1);
-        assert_eq!(first["next_offset"], 2);
+        assert_eq!(first["end_line"], 4096);
+        assert_eq!(first["next_offset"], 4097);
         assert!(first.get("next").is_none(), "no duplicate next object");
 
         let zero = registry
@@ -11902,7 +12040,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     #[test]
     fn read_files_reports_next_offset_for_each_cut_file() {
         let root = scratch("read-files-next-offset");
-        let body: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        let body: String = (1..=4_100).map(|n| format!("line {n}\n")).collect();
         std::fs::write(root.join("a.txt"), &body).expect("a");
         // b.txt fits its window exactly, so it has nothing to continue.
         std::fs::write(root.join("b.txt"), "one\ntwo\nthree\nfour\n").expect("b");
@@ -11918,12 +12056,12 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .expect("the batch reads");
         assert_eq!(result["files"][0]["status"], "partial");
         assert_eq!(result["files"][0]["start_line"], 2);
-        assert_eq!(result["files"][0]["end_line"], 4);
-        assert_eq!(result["files"][0]["next_offset"], 5);
+        assert_eq!(result["files"][0]["end_line"], 4097);
+        assert_eq!(result["files"][0]["next_offset"], 4098);
         assert!(result["files"][0].get("next").is_none());
         let hint = result["files"][0]["hint"].as_str().unwrap_or_default();
         assert!(
-            hint.contains("read_files") && hint.contains("offset=5"),
+            hint.contains("read_files") && hint.contains("offset=4098"),
             "the cut entry says which file tool and line to continue with: {result}"
         );
         assert!(
@@ -11942,7 +12080,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     #[test]
     fn next_offset_names_the_line_to_continue_from() {
         let root = scratch("read-next-offset");
-        let body: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        let body: String = (1..=5_000).map(|n| format!("line {n}\n")).collect();
         std::fs::write(root.join("a.txt"), &body).expect("a");
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
@@ -11953,12 +12091,12 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 &serde_json::json!({"path": "a.txt", "offset": 1, "limit": 3}),
             )
             .expect("the first window");
-        assert_eq!(first["next_offset"], 4);
+        assert_eq!(first["next_offset"], 4097);
         assert!(
             first["hint"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("next_offset=4"),
+                .contains("next_offset=4097"),
             "the hint names the field and the line: {first}"
         );
         assert!(
@@ -11979,9 +12117,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 }),
             )
             .expect("the returned number continues the read as offset");
-        assert_eq!(continued["start_line"], 4);
-        assert_eq!(continued["end_line"], 6);
-        assert_eq!(continued["next_offset"], 7);
+        assert_eq!(continued["start_line"], 4097);
+        assert_eq!(continued["end_line"], 5000);
+        assert!(continued["next_offset"].is_null());
 
         let batch = registry
             .execute(
@@ -11990,8 +12128,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("the batch continues at the same line");
         assert_eq!(batch["files"][0]["start_line"], 7);
-        assert_eq!(batch["files"][0]["end_line"], 9);
-        assert_eq!(batch["files"][0]["next_offset"], 10);
+        assert_eq!(batch["files"][0]["end_line"], 4102);
+        assert_eq!(batch["files"][0]["next_offset"], 4103);
     }
 
     /// A binary file and a directory are refused by name instead of being

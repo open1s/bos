@@ -383,6 +383,15 @@ pub struct Agent {
     /// archived: a host sets it from its own context resolution.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     context_budget: usize,
+    /// Per-tool overrides of the generic tool-result cap, by tool name.
+    ///
+    /// A file reader that pages by lines and bytes is bounded already; cutting
+    /// its page again with the shell-sized cap would drop the middle of the
+    /// page while its continuation pointed past the end, so the model would
+    /// silently skip text. The host names the tools whose own bound is the
+    /// real one.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    tool_output_caps: std::collections::HashMap<String, usize>,
     /// What the host classified the current turn as asking for.
     ///
     /// Interior mutability because the runner holds the built agent as an
@@ -557,6 +566,7 @@ impl Agent {
         Self {
             config,
             context_budget: 0,
+            tool_output_caps: std::collections::HashMap::new(),
             action_intent: std::sync::Mutex::new(None),
             capability_correlation: Arc::new(std::sync::Mutex::new(
                 CapabilityCorrelation::default(),
@@ -955,6 +965,42 @@ impl Agent {
     /// The send-side history ceiling this agent applies mid-turn; 0 is off.
     pub fn context_budget(&self) -> usize {
         self.context_budget
+    }
+
+    /// Give one tool its own result cap, in bytes, instead of the generic one.
+    ///
+    /// For a tool that already bounds its own payload by lines and bytes (the
+    /// paged file readers), the generic cap would cut that page a second time
+    /// and the page's continuation would skip the cut text. A host names such
+    /// tools here so their own window is the whole bound.
+    pub fn set_tool_output_cap(&mut self, tool: impl Into<String>, bytes: usize) {
+        if bytes > 0 {
+            self.tool_output_caps.insert(tool.into(), bytes);
+            self.engine_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+        }
+    }
+
+    /// Every per-tool result cap this agent carries, by tool name.
+    ///
+    /// A child build copies the parent's map, so a paged reader keeps its own
+    /// bound one level down instead of falling back to the shell-sized cap.
+    pub fn tool_output_caps(&self) -> Vec<(String, usize)> {
+        self.tool_output_caps
+            .iter()
+            .map(|(tool, bytes)| (tool.clone(), *bytes))
+            .collect()
+    }
+
+    /// The result cap that applies to one tool: its override, else the generic
+    /// cap (0 means the engine default).
+    pub fn tool_output_cap_for(&self, tool: &str) -> usize {
+        self.tool_output_caps
+            .get(tool)
+            .copied()
+            .unwrap_or(self.config.tool_output_cap)
     }
 
     /// Cap the tool definitions one request's initial array carries.
@@ -2637,6 +2683,7 @@ impl Clone for Agent {
         Self {
             config: self.config.clone(),
             context_budget: self.context_budget,
+            tool_output_caps: self.tool_output_caps.clone(),
             action_intent: std::sync::Mutex::new(self.classified_action_intent()),
             capability_correlation: Arc::clone(&self.capability_correlation),
             initial_tool_scope: self.initial_tool_scope.clone(),
