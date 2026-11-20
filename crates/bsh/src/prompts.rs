@@ -272,7 +272,10 @@ pub(crate) fn goal_pursuit(goal: &agent::goal::Goal, read: bool, settle: bool) -
          message: keep working until the WHOLE objective is achieved, not just the current step. \
          The goal is at round {rounds} of {max_rounds}.\n\
          - The checkpoint, the working plan and the durable goal are the record of what is already \
-         done; inspect the workspace only for what the next step needs or what may have changed.\n",
+         done; inspect the workspace only for what the next step needs or what may have changed.\n\
+         - A goal round lands code: make the smallest working change early, then verify it. Endless \
+         inspection is not progress; if a concrete condition stops the change, report it with \
+         update_goal blocked instead of opening another file.\n",
         rounds = goal.rounds,
         max_rounds = goal.max_rounds,
     );
