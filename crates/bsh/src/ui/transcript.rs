@@ -468,6 +468,12 @@ fn meaningful(text: &str) -> bool {
 /// whole object; anything else falls back to the first string value, and then
 /// to the raw arguments. Newlines collapse and long values clip, because this
 /// line is a summary and the body holds the whole thing.
+/// Whether one step row starts open: the mode's default, XOR the reader's own
+/// toggle. The folded modes default closed, so only a click opens a step; the
+/// fully-expanded mode defaults open, and a click is its exception.
+fn step_is_open(default_open: bool, toggled: bool) -> bool {
+    default_open != toggled
+}
 pub(crate) fn tool_summary(args: &str) -> String {
     const KEYS: [&str; 7] = [
         "command",
@@ -2414,7 +2420,7 @@ impl Shell {
             for (index, message) in session.messages.iter().enumerate() {
                 for (tool_index, tool) in message.tools.iter().enumerate() {
                     rows.push(
-                        self.tool_row(index, tool_index, tool, false, &chrome, cx)
+                        self.tool_row(index, tool_index, tool, &chrome, cx)
                             .into_any_element(),
                     );
                 }
@@ -2465,7 +2471,7 @@ impl Shell {
             at: None,
         };
         // A trace row is history: one summary line, opened on a click.
-        self.tool_row(usize::MAX - index, 0, &tool, true, chrome, cx)
+        self.tool_row(usize::MAX - index, 0, &tool, chrome, cx)
     }
 
     /// The stored pictures of one user row, above its optional text bubble.
@@ -3290,7 +3296,6 @@ impl Shell {
         &self,
         index: usize,
         message: &ChatMessage,
-        settled: bool,
         chrome: &RowChrome<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -3395,11 +3400,10 @@ impl Shell {
             .flex_col()
             .gap(px(6.0));
         for (tool_index, tool) in message.tools.iter().enumerate() {
-            // A settled turn keeps its steps folded: the group is the reader's
-            // first door, the step's own chevron the second. A LIVE group hands
-            // the steps the same rule the flat path used, so the streaming
-            // bodies still open while the turn works.
-            body = body.child(self.tool_row(index, tool_index, tool, settled, chrome, cx));
+            // Every step starts folded: the group is the reader's first door,
+            // the step's own chevron the second. Nothing opens on the model's
+            // behalf, live or settled.
+            body = body.child(self.tool_row(index, tool_index, tool, chrome, cx));
         }
         div()
             .w_full()
@@ -4301,17 +4305,10 @@ impl Shell {
         if !message.tools.is_empty() {
             let grouped = chrome.policy.step_grouping == StepGrouping::Collapsed;
             if grouped {
-                column = column.child(self.process_group(index, message, turn.settled, chrome, cx));
+                column = column.child(self.process_group(index, message, chrome, cx));
             } else {
                 for (tool_index, tool) in message.tools.iter().enumerate() {
-                    column = column.child(self.tool_row(
-                        index,
-                        tool_index,
-                        tool,
-                        turn.settled,
-                        chrome,
-                        cx,
-                    ));
+                    column = column.child(self.tool_row(index, tool_index, tool, chrome, cx));
                 }
             }
         }
@@ -4391,23 +4388,10 @@ impl Shell {
                     if grouped {
                         if !grouped_drawn {
                             grouped_drawn = true;
-                            column = column.child(self.process_group(
-                                index,
-                                message,
-                                turn.settled,
-                                chrome,
-                                cx,
-                            ));
+                            column = column.child(self.process_group(index, message, chrome, cx));
                         }
                     } else {
-                        column = column.child(self.tool_row(
-                            index,
-                            tool_index,
-                            tool,
-                            turn.settled,
-                            chrome,
-                            cx,
-                        ));
+                        column = column.child(self.tool_row(index, tool_index, tool, chrome, cx));
                     }
                 }
             }
@@ -5207,23 +5191,20 @@ impl Shell {
         message_index: usize,
         tool_index: usize,
         tool: &ToolEvent,
-        folded: bool,
         chrome: &RowChrome<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        // `liveProcessDetail` governs the RUNNING turn: its steps stay open while
-        // it works. A settled turn folds its process the way the reference's
-        // `stepGrouping: collapsed` does - one summary line per step, opened on a
-        // click - which is the shape a reader scans a finished trace in. Reading
-        // the flag the other way round opened every body of every settled turn,
-        // which is what made a long transcript a wall of arguments.
-        // 完全展开 (`stepGrouping: none`) is the one mode whose DEFAULT is open:
-        // every body shows until the reader closes it, so the toggle's stored
-        // state reads as the reader's EXCEPTION to the mode's default rather
-        // than a plain open flag - which is why the default XORs in.
+        // A step starts closed and opens only on the reader's click: a running
+        // turn must not force every body open, because a stream of long
+        // arguments is a wall, not detail. 完全展开 (`stepGrouping: none`) is the
+        // one mode whose DEFAULT is open, so the toggle's stored state reads as
+        // the reader's EXCEPTION to the mode's default - which is why the
+        // default XORs in.
         let default_open = chrome.policy.step_grouping == StepGrouping::None;
-        let open = default_open != self.state.tool_open(message_index, tool_index)
-            || (!folded && chrome.policy.live_process_detail);
+        let open = step_is_open(
+            default_open,
+            self.state.tool_open(message_index, tool_index),
+        );
         let lang = self.state.lang;
         let size = theme::small_size_at(chrome.content_size);
         let name = tool.name.clone();
@@ -5831,6 +5812,22 @@ mod tests {
     /// Between two lengths inside one window step, the later tail EXTENDS the
     /// earlier one: that is what lets the kit append-parse instead of
     /// re-parsing the window on every delta.
+    /// The default transcript mode starts every step closed; only the reader's
+    /// toggle opens one. The fully-expanded mode keeps its open default.
+    #[test]
+    fn a_step_starts_closed_unless_the_mode_opens_it() {
+        assert!(
+            !super::step_is_open(false, false),
+            "a folded mode starts closed"
+        );
+        assert!(super::step_is_open(false, true), "a click opens it");
+        assert!(super::step_is_open(true, false), "完全展开 starts open");
+        assert!(
+            !super::step_is_open(true, true),
+            "a click closes it in that mode"
+        );
+    }
+
     #[test]
     fn the_window_extends_within_a_step_and_slides_between_steps() {
         let body: String = (0..30_000).map(|i| format!("word{i} ")).collect();
