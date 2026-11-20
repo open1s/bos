@@ -43,6 +43,12 @@
 //! (`"network": "policy-gated"` when a turn gate is installed, `"direct"`
 //! otherwise), so a reader or a model never has to infer it.
 
+#![allow(dead_code)]
+// The model-facing tool surface below (`attach`, `Tools`, the `web_*` helpers)
+// is retired: the pane keeps the browser and its engine, but no browser tool is
+// attached to an agent any more. The surface is kept until the pane's move to
+// the script bridge is finished; removing it now would entangle that refactor.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 

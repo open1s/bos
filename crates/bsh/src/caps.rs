@@ -925,6 +925,14 @@ fn build_agent_for_session_inner(
     // BSH does not read the ambient BOS config: the settings files are the
     // whole truth for this shell. The model's declared protocol arrives through
     // the settings instead, so the pane and the wire agree by construction.
+    // A goal round is a bounded push at one objective, not an open-ended
+    // research session. Without a ceiling a round ran 3,713 steps and 30M
+    // prompt tokens in one turn without landing a change (measured); 120 steps
+    // is far more than a round needs and far less than a runaway. Ordinary
+    // turns keep the engine's "no ceiling" contract.
+    if goal.is_some() {
+        config.max_steps = 120;
+    }
     config.api_mode = eff.api_mode.clone();
     // Search is a LOCAL tool here (see `crate::web`), so the framework's hosted
     // `web_search` object stays withdrawn: it is a Responses-only capability and
@@ -1789,7 +1797,8 @@ fn build_agent_for_session_inner(
         preset.clone(),
         "browser",
     )));
-    crate::browser::attach(&mut agent, crate::browser::Tools { browser });
+    // The pane keeps the handle and its egress gate; the model no longer gets
+    // the browser tool family (`crate::browser::attach` is retired).
 
     // The local web-search tool. It asks the SAME policy the browser and the
     // shell ask, and it is offered only when the reader (or the preset) wants
@@ -6732,73 +6741,25 @@ mod tests {
     /// Serialises the tests that share the process-wide schedule queue.
     static SCHEDULE_QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// The browser's tools are reachable without being advertised. A pane the
-    /// model cannot drive is a picture, so the nine names must be on the agent
-    /// a turn runs - as the registry behind `find_tool`, not as nine schemas in
-    /// every request.
+    /// The browser tool family is retired: no `browser_*` name is registered
+    /// or advertised, so `find_tool` cannot offer one. The pane keeps its
+    /// handle; only the model's surface is gone.
     #[test]
-    fn a_build_offers_the_browser_tools() {
+    fn a_build_carries_no_browser_tools() {
         let built = build_agent(
             &Settings::default(),
             &Vault::disabled(),
             &SessionChoice::default(),
             &crate::mcp::McpPool::default(),
         );
-        let registry = built.agent.registry().expect("a tool registry");
-        let names = registry.async_tool_names();
-        let advertised: Vec<String> = built
-            .agent
-            .model_tools()
-            .into_iter()
-            .map(|tool| tool.name)
+        let names = built.agent.registry().expect("registry").async_tool_names();
+        let browser: Vec<&String> = names
+            .iter()
+            .filter(|name| name.starts_with("browser_"))
             .collect();
         assert!(
-            advertised.iter().any(|name| name == "find_tool"),
-            "the search replaces the family: {advertised:?}"
-        );
-        for tool in [
-            "browser_open",
-            "browser_snapshot",
-            "browser_click",
-            "browser_type",
-            "browser_press",
-            "browser_back",
-            "browser_forward",
-            "browser_reload",
-            "browser_close",
-        ] {
-            assert!(
-                names.iter().any(|name| name == tool),
-                "{tool} is registered and callable: {names:?}"
-            );
-            assert!(
-                !advertised.iter().any(|name| name == tool),
-                "{tool} is withheld from the request: {advertised:?}"
-            );
-        }
-    }
-
-    /// The prompt rule for a missing tool is carried by every BSH build.
-    ///
-    /// "When the tool you need is not among them, call find_tool" is written
-    /// by `Agent::system_prompt_for` only when the build really withholds a
-    /// tool (the paragraph itself is pinned by the agent crate's discovery
-    /// tests). BSH stays on that side of the gate on every build: the browser
-    /// family is registered and withheld, so `find_tool` replaces it even on
-    /// a fresh install with no MCP server, extension or federation peer. Losing
-    /// that would silently drop the way back to a withheld tool, because the
-    /// prompt would have nothing true to say.
-    #[test]
-    fn every_build_carries_the_tool_search() {
-        let built = build_agent(
-            &Settings::default(),
-            &Vault::disabled(),
-            &SessionChoice::default(),
-            &crate::mcp::McpPool::default(),
-        );
-        assert!(
-            built.agent.has_deferred_tools(),
-            "a build withholds at least the browser family"
+            browser.is_empty(),
+            "no browser tool is registered: {browser:?}"
         );
         let advertised: Vec<String> = built
             .agent
@@ -6807,8 +6768,8 @@ mod tests {
             .map(|tool| tool.name)
             .collect();
         assert!(
-            advertised.iter().any(|name| name == "find_tool"),
-            "the discovery block's precondition: {advertised:?}"
+            !advertised.iter().any(|name| name.starts_with("browser_")),
+            "no browser tool is advertised: {advertised:?}"
         );
     }
 
@@ -10070,6 +10031,11 @@ mod tests {
         assert_eq!(
             store.snapshot().map(|goal| goal.objective),
             Some("ship it".to_string())
+        );
+        assert_eq!(
+            built.agent.config().max_steps,
+            120,
+            "a goal round is bounded; an ordinary turn is not"
         );
         let prompt = &built.agent.config().system_prompt;
         assert!(prompt.contains("## Pursuing a goal"), "{prompt}");

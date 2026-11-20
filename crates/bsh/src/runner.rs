@@ -335,7 +335,16 @@ impl Runner {
             // answered with prose only) and reports it on the turn outcome; it
             // is never serialized to the provider.
             let text = input.as_text().unwrap_or_default().to_string();
-            let mut intent = crate::intent::classify(&text);
+            // A goal round is work by definition. The lexical classifier reads
+            // its framing (the objective and the round instruction) as an
+            // explanation, which switched the action contract OFF and let a
+            // round run thousands of steps without ever nudging the model to
+            // write; the wrapper is the one input whose intent is known.
+            let mut intent = if text.trim_start().starts_with("<goal_round>") {
+                ActionIntent::Action
+            } else {
+                crate::intent::classify(&text)
+            };
             // The lexical classifier is fast but has no semantics; an
             // unclassified message gets one semantic second opinion from the
             // configured model (bounded, cached, and abandoned on any error).
@@ -1642,6 +1651,51 @@ mod tests {
         assert!(
             !names.iter().any(|name| name == "federation_search"),
             "the specialist stays out of the initial array: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A goal round is work by definition. The lexical classifier read its
+    /// framing as an explanation, which switched the action contract off and
+    /// let a round run thousands of steps without a nudge.
+    #[test]
+    fn a_goal_round_is_classified_as_action() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut provider = agent::agent::agentic::LlmProvider::new();
+        provider.register_vendor("mock".to_string(), Box::new(AdmissionCapturingLlm(seen)));
+        let agent = Arc::new(agent::Agent::new(
+            agent::AgentConfig {
+                model: "mock-model".to_string(),
+                ..Default::default()
+            },
+            Arc::new(provider),
+        ));
+        let root = workspace("goal-intent");
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        let mut runner = Runner::new();
+        let rx = runner.spawn(
+            "goal-intent",
+            agent.clone(),
+            react::llm::Content::Text(crate::state::goal_round_input("ship it", 1, 256)),
+            Vec::new(),
+            facts,
+            None,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
+            None,
+        );
+        drain(rx);
+        assert_eq!(
+            agent.action_intent(),
+            ActionIntent::Action,
+            "the goal wrapper is known to be work"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
