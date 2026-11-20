@@ -237,6 +237,48 @@ pub(crate) const PLAN_DIRECTIVE: &str = "[Plan mode] Inspect what the task needs
 /// becoming a speculative debugging detour.
 pub(crate) const HARNESS_CONTEXT: &str = "## Working inside BSH\n\nYou run inside BSH, the BOS desktop app. A workspace is one folder; a session is one conversation in it; the reader sees your steps, plans and diffs in the same window. The .bsh/ directory holds BSH's own settings, policies and history and is on the deny list: do not read, list or edit it, and do not treat a refusal there as a task to work around. The reader can also exclude workspace paths in .bsh/.ignore; a file tool that refuses one has made the same kind of decision.\n\n- The conversation carries the intent; the workspace carries the evidence. Use the workspace to ground an answer, never to invent a request.\n- An attached image is evidence of what the reader sees, not a task on its own. When a short message points at a control in a screenshot, ask one direct question before acting: is this a bug report about the app, or a request to change code? Do not pick an unrelated tool or skill and start debugging it.\n- An open workspace is context, not an instruction. A greeting, thanks or plain question stays ordinary conversation; work on the code only when the message or the conversation asks for it. When a terse request's referent or goal is genuinely unclear, ask one direct question before acting.\n- A message sent while a turn runs is queued for the next turn, except an answer to your ask_user question, which is steered into the live turn at once. Treat a steered answer as the reader's direct reply; do not restart work the reader has already seen.\n- The Stop button ends the turn on purpose. A stopped turn is a decision, not a failure to retry: do not reopen the same work unless the reader asks.\n- Load a skill only when its stated use matches the request. Being the only installed skill is not a reason to load it.";
 
+/// The standing rule a session that is pursuing a goal carries.
+///
+/// A `<goal_round>` prompt names the objective on every automatic round, but an
+/// ordinary message in the same session reads as a standalone request: the
+/// model answered it and lost the durable objective it was serving. This
+/// paragraph makes the goal part of the standing prompt while the goal is
+/// open, and states the two things the loop depends on - keep working until
+/// the whole objective is achieved, and settle it through the goal tool
+/// instead of leaving it to the round cap.
+///
+/// A tool is named only when the build mounts it: a preset or a reader switch
+/// can withdraw `get_goal` or `update_goal`, and the prompt must not name what
+/// the request does not carry.
+pub(crate) fn goal_pursuit(goal: &agent::goal::Goal, read: bool, settle: bool) -> String {
+    let objective = serde_json::to_string(&goal.objective)
+        .unwrap_or_else(|_| format!("\"{}\"", goal.objective.replace('"', "\\\"")));
+    let mut out = format!(
+        "## Pursuing a goal\n\
+         This session is pursuing a goal: {objective}. It is a durable objective, not one \
+         message: keep working until the WHOLE objective is achieved, not just the current step. \
+         The goal is at round {rounds} of {max_rounds}.\n\
+         - Treat the workspace, the tool results and the durable goal as authoritative; inspect \
+         them instead of assuming the last round's narration is still current.\n",
+        rounds = goal.rounds,
+        max_rounds = goal.max_rounds,
+    );
+    if read {
+        out.push_str(
+            "- Read the durable goal with `get_goal` when you need its phase, round or blocker.\n",
+        );
+    }
+    if settle {
+        out.push_str(
+            "- Before claiming completion, gather evidence for the whole objective, then call \
+             `update_goal` with action \"complete\"; that stops the automatic rounds.\n\
+             - Call `update_goal` with action \"blocked\" only when a concrete condition stops \
+             progress, and name that condition.\n",
+        );
+    }
+    out
+}
+
 /// Append guidance for every tool the agent actually carries.
 ///
 /// Registration is the gate: a preset that removes the shell removes the bash
@@ -354,6 +396,24 @@ mod tests {
         assert!(PLAN_DIRECTIVE.contains("if one decision is genuinely the reader's"));
         assert!(PLAN_DIRECTIVE.contains("with the default you would pick"));
         assert!(!PLAN_DIRECTIVE.contains("exit_plan_mode"));
+    }
+
+    /// The goal paragraph quotes the objective and names only the goal tools
+    /// the build actually mounts.
+    #[test]
+    fn the_goal_paragraph_names_the_objective_and_the_settle_rule() {
+        let goal = agent::goal::Goal::new("ship it", Some(8)).expect("a goal");
+        let full = goal_pursuit(&goal, true, true);
+        assert!(full.contains("\"ship it\""), "{full}");
+        assert!(full.contains("`get_goal`"), "{full}");
+        assert!(full.contains("`update_goal`"), "{full}");
+        assert!(
+            full.contains("until the WHOLE objective is achieved"),
+            "{full}"
+        );
+        let tools_off = goal_pursuit(&goal, false, false);
+        assert!(!tools_off.contains("`get_goal`"), "{tools_off}");
+        assert!(!tools_off.contains("`update_goal`"), "{tools_off}");
     }
 
     /// The parallel preset must read the intent before it batches, or it

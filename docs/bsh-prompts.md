@@ -100,6 +100,18 @@ supersedes the previous row, so a child continuation never stacks plan
 snapshots. The plan tool's description and `TOOL_PLAN` name the same
 final-answer moment.
 
+An open goal is standing prompt text, not only a round input. A `<goal_round>`
+message names the objective on each automatic round, but an ordinary message in
+the same session read as a standalone request, so the model answered it without
+the durable objective it was serving. `prompts::goal_pursuit` now appends a
+"Pursuing a goal" section while the goal is active: the quoted objective, the
+round against the cap, the rule to keep working until the WHOLE objective is
+achieved (not just the current step), and the settle rule - gather evidence,
+then `update_goal` action `complete`; `blocked` only for a concrete condition.
+It names `get_goal`/`update_goal` only when the build mounts that tool and
+calls `require_tool` for each name, so the paragraph and the request array
+cannot disagree. A paused, blocked or completed goal adds nothing.
+
 ## 3. What the reference harnesses do
 
 ### Codex: intent as a completion contract

@@ -1352,6 +1352,21 @@ fn build_agent_for_session_inner(
     // pane lists the tools the built agent carries, the surviving row vanished
     // too. The store is attached whenever EITHER tool is present, because
     // settling a recorded transition needs it.
+    // The goal paragraph names the tools this build actually mounts, so it is
+    // rendered before the goal is moved into the store and appended after the
+    // tool guidance (the last thing the model reads).
+    let goal_prompt = goal
+        .as_ref()
+        .filter(|goal| goal.state.is_open())
+        .map(|goal| {
+            let read = !off_goal_tool("get_goal");
+            let settle = !off_goal_tool("update_goal");
+            (
+                crate::prompts::goal_pursuit(goal, read, settle),
+                read,
+                settle,
+            )
+        });
     let mut goal_store = None;
     if let Some(goal) = goal {
         let store = GoalStore::new(goal);
@@ -1846,6 +1861,20 @@ fn build_agent_for_session_inner(
     // subagent) and before the meter prices the request, so the two cannot
     // disagree.
     crate::prompts::append_tool_guidance(&mut agent);
+    // A goal outlives the message being answered: the paragraph above names
+    // the objective on every turn of the session, not only in a goal round.
+    if let Some((goal_prompt, read, settle)) = goal_prompt {
+        agent.append_system_prompt(&goal_prompt);
+        // The paragraph names these tools, so the request must carry them: a
+        // schema budget that withheld one would leave a rule for a tool the
+        // model cannot call. Same rule as append_tool_guidance.
+        if read {
+            agent.require_tool("get_goal");
+        }
+        if settle {
+            agent.require_tool("update_goal");
+        }
+    }
 
     // The initial tool array is scoped by the turn's intent (issue #435):
     // a conversation carries only find_tool, a work turn carries the workspace
@@ -10051,6 +10080,27 @@ mod tests {
             store.snapshot().map(|goal| goal.objective),
             Some("ship it".to_string())
         );
+        let prompt = &built.agent.config().system_prompt;
+        assert!(prompt.contains("## Pursuing a goal"), "{prompt}");
+        assert!(prompt.contains("\"ship it\""), "{prompt}");
+        assert!(prompt.contains("`update_goal`"), "{prompt}");
+        assert!(
+            prompt.contains("until the WHOLE objective is achieved"),
+            "the rule says to keep going: {prompt}"
+        );
+        assert!(
+            built
+                .agent
+                .required_tools()
+                .iter()
+                .any(|name| name == "get_goal")
+                && built
+                    .agent
+                    .required_tools()
+                    .iter()
+                    .any(|name| name == "update_goal"),
+            "the named goal tools stay in the request"
+        );
 
         // No goal, no tools: a goal-less session cannot see a dormant surface.
         let built = build(&settings);
@@ -10058,6 +10108,43 @@ mod tests {
         assert!(!names.iter().any(|name| name == "get_goal"), "{names:?}");
         assert!(!names.iter().any(|name| name == "update_goal"), "{names:?}");
         assert!(built.goal.is_none());
+        assert!(
+            !built
+                .agent
+                .config()
+                .system_prompt
+                .contains("## Pursuing a goal"),
+            "a goal-less build carries no goal rule"
+        );
+    }
+
+    /// A settled goal is history, not a standing directive: only an open goal
+    /// adds the pursuit paragraph.
+    #[test]
+    fn a_settled_goal_adds_no_pursuit_paragraph() {
+        use std::sync::Arc;
+        let settings = bare();
+        let mut goal = agent::goal::Goal::new("ship it", Some(8)).expect("a goal");
+        goal.state = agent::goal::GoalState::Completed;
+        let built = crate::caps::build_agent_for_session_with_subagents_and_jobs(
+            &settings,
+            &Vault::disabled(),
+            &SessionChoice::default(),
+            &crate::mcp::McpPool::default(),
+            "session",
+            "session",
+            Arc::new(crate::subagent::SubagentRegistry::default()),
+            Arc::new(agent::jobs::JobRegistry::new()),
+            Arc::new(crate::browser::BrowserHandle::new()),
+            Some(goal),
+        );
+        assert!(
+            !built
+                .agent
+                .config()
+                .system_prompt
+                .contains("## Pursuing a goal")
+        );
     }
 
     /// The two goal tools answer to their own switch. Unchecking one used to
