@@ -5,7 +5,7 @@
 //! right now). A subagent-tier task is represented by its run, not twice.
 
 use crate::extension::tasks::{Task, TaskStatus, Tier};
-use crate::subagent::{SubagentRun, SubagentStatus};
+use crate::subagent::{SubagentHeader, SubagentStatus};
 
 /// What a node is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,7 +141,7 @@ pub(crate) fn layout(
     main_title: &str,
     main_status: GraphStatus,
     tasks: &[Task],
-    runs: &[SubagentRun],
+    runs: &[SubagentHeader],
     max_width: Option<f32>,
 ) -> Graph {
     layout_with_peers(
@@ -161,7 +161,7 @@ pub(crate) fn layout_with_peers(
     main_title: &str,
     main_status: GraphStatus,
     tasks: &[Task],
-    runs: &[SubagentRun],
+    runs: &[SubagentHeader],
     peers: &[PeerNode],
     max_width: Option<f32>,
 ) -> Graph {
@@ -179,7 +179,7 @@ pub(crate) fn layout_with_peers(
         steps: 0,
     });
 
-    let mut children: Vec<&SubagentRun> =
+    let mut children: Vec<&SubagentHeader> =
         runs.iter().filter(|run| run.session == session).collect();
     children.sort_by(|left, right| {
         (left.depth, left.started_at, &left.id).cmp(&(right.depth, right.started_at, &right.id))
@@ -248,7 +248,7 @@ pub(crate) fn layout_with_peers(
             y: 0.0,
             depth: run.depth,
             note: Some(run.prompt.clone()),
-            steps: run.transcript.len(),
+            steps: run.steps,
         });
         graph.edges.push((parent, index));
     }
@@ -409,10 +409,10 @@ fn place(graph: &mut Graph) {
 mod tests {
     use super::*;
     use crate::extension::tasks::{Attempt, Origin, Trigger};
-    use crate::subagent::SubagentRun;
+    use crate::subagent::SubagentHeader;
 
-    fn run(id: &str, session: &str, depth: usize, title: &str) -> SubagentRun {
-        SubagentRun {
+    fn run(id: &str, session: &str, depth: usize, title: &str) -> SubagentHeader {
+        SubagentHeader {
             id: id.to_string(),
             session: session.to_string(),
             parent: session.to_string(),
@@ -425,11 +425,11 @@ mod tests {
             estimated_tokens: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
-            result: None,
-            error: None,
             revision: 0,
-            transcript: Vec::new(),
-            pending: Vec::new(),
+            pending: 0,
+            steps: 0,
+            result_hint: None,
+            error: None,
         }
     }
 
@@ -496,7 +496,7 @@ mod tests {
     /// colliding: odd rows sit half a column right and lower.
     #[test]
     fn a_wide_tree_wraps_into_staggered_rows() {
-        let runs: Vec<SubagentRun> = (0..6)
+        let runs: Vec<SubagentHeader> = (0..6)
             .map(|index| run(&format!("sub-{index}"), "ses-1", 1, "child"))
             .collect();
         let graph = layout(

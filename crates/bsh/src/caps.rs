@@ -2691,6 +2691,13 @@ pub(crate) struct SubagentContext {
     runtime: crate::context::RuntimeFacts,
     /// The parent's mid-turn history ceiling, inherited by the child.
     context_budget: usize,
+    /// The child turn's injected context, rendered once per parent build.
+    ///
+    /// Every child of one turn carries the same runtime snapshot and the same
+    /// workspace instructions, and rendering them reads AGENTS.md from disk.
+    /// A spawn used to pay that read per child; the cell now keeps the first
+    /// render for the life of the build.
+    child_context: std::sync::OnceLock<crate::context::TurnContext>,
     /// The parent's parsed skills, inherited by the child.
     ///
     /// A child is a build of the same turn, so it reads the same catalogue the
@@ -2756,6 +2763,7 @@ impl SubagentContext {
             root: root.into(),
             runtime,
             context_budget: agent.context_budget(),
+            child_context: std::sync::OnceLock::new(),
             // The model-facing set, not the pre-extension set: a child must
             // inherit the package skills the parent turn actually carries.
             skills: agent.all_skills(),
@@ -2823,7 +2831,10 @@ impl SubagentContext {
             ));
         };
         let child = self.child(&id);
-        let turn_context = crate::context::TurnContext::from_facts(&self.runtime, true);
+        let turn_context = self
+            .child_context
+            .get_or_init(|| crate::context::TurnContext::from_facts(&self.runtime, true))
+            .clone();
         let registry = self.registry.clone();
         let task_id = id.clone();
         let task_title = title.clone();
@@ -3218,10 +3229,11 @@ fn attach_subagent_result_tool(
                     .unwrap_or(0)
                     .min(SUBAGENT_RESULT_WAIT_CAP_SECS);
                 if id.is_empty() {
+                    // A listing needs status and usage, not the transcript: one
+                    // header per run, filtered under the lock.
                     let runs: Vec<serde_json::Value> = registry
-                        .snapshot()
+                        .headers_for(&session)
                         .iter()
-                        .filter(|run| run.session == session)
                         .map(|run| {
                             let status = run.status.as_str();
                             let elapsed = run.elapsed_ms();

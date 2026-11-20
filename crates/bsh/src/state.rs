@@ -450,6 +450,9 @@ pub(crate) struct SubagentView {
     pub(crate) parent_title: String,
     /// The child transcript presented as a Session.
     pub(crate) session: Session,
+    /// The registry revision the Session was built from, so an unchanged tick
+    /// does not rebuild it.
+    pub(crate) revision: u64,
 }
 
 /// Rebuild the in-memory run registry from the child Sessions already on disk.
@@ -2143,14 +2146,16 @@ impl AppState {
     pub(crate) fn is_streaming(&self, id: &str) -> bool {
         if self.subagent.is_some() && self.active_id.as_deref() == Some(id) {
             return self
-                .subagent_view_run()
+                .subagent_view_header()
                 .is_some_and(|run| run.status.is_running());
         }
+        // One lock and one lookup: this runs on the send path, per queue
+        // check, and per render, so cloning the registry's rows here made a
+        // boolean cost a transcript copy.
         if self
             .subagents
-            .snapshot()
-            .iter()
-            .any(|run| run.id == id && run.status.is_running())
+            .status(id)
+            .is_some_and(|status| status.is_running())
         {
             return true;
         }
@@ -2428,22 +2433,29 @@ impl AppState {
     /// The subagent runs the header lists for the active conversation, newest
     /// last. A run belongs to the session that spawned it; switching sessions
     /// leaves it in the registry but out of this lineage.
-    pub(crate) fn subagent_runs(&self) -> Vec<crate::subagent::SubagentRun> {
-        let parent = self.active_id.as_deref();
-        self.subagents
-            .snapshot()
-            .into_iter()
-            .filter(|run| parent.is_none_or(|id| run.session == id))
-            .collect()
+    pub(crate) fn subagent_headers(&self) -> Vec<crate::subagent::SubagentHeader> {
+        match self.active_id.as_deref() {
+            Some(id) => self.subagents.headers_for(id),
+            None => self.subagents.headers(),
+        }
     }
 
-    /// The selected child's registry row.
+    /// The selected child's cheap row - title, status and usage only.
+    ///
+    /// The header renders this several times a frame; it must not clone the
+    /// child's transcript to learn a title.
+    pub(crate) fn subagent_view_header(&self) -> Option<crate::subagent::SubagentHeader> {
+        let id = self.subagent.as_ref()?.id.as_str();
+        self.subagents.header(id)
+    }
+
+    /// The selected child's full registry row, transcript included.
+    ///
+    /// Only the preview rebuild needs this, and it runs on the child clock (or
+    /// when the view opens), never on the render path.
     pub(crate) fn subagent_view_run(&self) -> Option<crate::subagent::SubagentRun> {
         let id = self.subagent.as_ref()?.id.as_str();
-        self.subagents
-            .snapshot()
-            .into_iter()
-            .find(|run| run.id == id)
+        self.subagents.run(id)
     }
 
     /// Assemble the Session model shown for one child run.
@@ -2475,12 +2487,7 @@ impl AppState {
 
     /// Switch the chat/trajectory view model to one child run.
     pub(crate) fn show_subagent(&mut self, id: &str) {
-        let run = self
-            .subagents
-            .snapshot()
-            .into_iter()
-            .find(|run| run.id == id);
-        let Some(run) = run else {
+        let Some(run) = self.subagents.run(id) else {
             return;
         };
         let parent_title = self
@@ -2493,17 +2500,36 @@ impl AppState {
             id: id.to_string(),
             parent_title,
             session: self.subagent_session(&run),
+            revision: run.revision,
         });
     }
 
     /// Rebuild the Session model after a child turn appends or finishes.
+    ///
+    /// The run's revision is the change signal: the child clock calls this ten
+    /// times a second while a view is open, and most of those ticks carry no
+    /// new token. Rebuilding the whole preview Session on an unchanged revision
+    /// copied the transcript for nothing.
     pub(crate) fn refresh_subagent_preview(&mut self) {
+        // The header's revision is the change signal, read before any
+        // transcript is cloned: a tick that carries no new token (most of them)
+        // must not copy the child's history to discover that.
+        let Some(header) = self.subagent_view_header() else {
+            return;
+        };
+        let Some(current) = self.subagent.as_ref() else {
+            return;
+        };
+        if current.revision == header.revision {
+            return;
+        }
         let Some(run) = self.subagent_view_run() else {
             return;
         };
         let session = self.subagent_session(&run);
         if let Some(subagent) = &mut self.subagent {
             subagent.session = session;
+            subagent.revision = run.revision;
         }
     }
 
@@ -2522,22 +2548,32 @@ impl AppState {
     /// Write every changed child run as a normal Session: JSON document plus
     /// the same Parquet transcript log a parent conversation uses.
     pub(crate) fn persist_subagents(&mut self) {
-        let runs = self.subagents.snapshot();
-        for run in &runs {
+        // Only the cheap rows are read here: this runs on the one-second jobs
+        // clock for the whole life of the app, and cloning every child
+        // transcript each second was the cost that made an idle window copy
+        // history it never wrote.
+        let headers = self.subagents.headers();
+        for header in &headers {
             // The log is append-only; a partial in-place row cannot update
             // an in-place row, so only a settled child is written.
-            if run.status.is_running() {
+            if header.status.is_running() {
                 continue;
             }
-            let signature = (run.status, run.revision, run.finished_at);
-            if self.persisted_subagents.get(&run.id) == Some(&signature) {
+            let signature = (header.status, header.revision, header.finished_at);
+            if self.persisted_subagents.get(&header.id) == Some(&signature) {
                 continue;
             }
-            self.save_subagent(run);
-            self.persisted_subagents.insert(run.id.clone(), signature);
+            // The one run that actually changed is the only transcript cloned,
+            // and only at the save.
+            let Some(run) = self.subagents.run(&header.id) else {
+                continue;
+            };
+            self.save_subagent(&run);
+            self.persisted_subagents
+                .insert(header.id.clone(), signature);
         }
         self.persisted_subagents
-            .retain(|id, _| runs.iter().any(|run| &run.id == id));
+            .retain(|id, _| headers.iter().any(|header| &header.id == id));
     }
 
     fn save_subagent(&mut self, run: &crate::subagent::SubagentRun) {

@@ -4205,10 +4205,16 @@ impl Shell {
     /// prompt after saying why. Retrying it on every tick would spam the notice
     /// line and never make progress.
     pub(crate) fn drain_subagent_prompts(&mut self, cx: &mut Context<Self>) {
-        for run in self.state.subagents.snapshot() {
-            if run.status.is_running() || run.pending.is_empty() {
+        // The cheap rows answer "anything waiting?" without cloning a
+        // transcript; only a run that actually has a prompt to start pays for
+        // its full row.
+        for header in self.state.subagents.headers() {
+            if header.status.is_running() || header.pending == 0 {
                 continue;
             }
+            let Some(run) = self.state.subagents.run(&header.id) else {
+                continue;
+            };
             let eff = self.state.effective_in(&run.session);
             let policy = crate::caps::policy_for_effective(&self.state.settings, &eff);
             if let Err(refusal) = crate::caps::check_spawn(
@@ -6671,11 +6677,10 @@ impl Shell {
             self.refresh_jobs_snapshot();
             self.prune_job_output_cache();
         }
-        let subagents = self
-            .state
-            .subagent_runs()
-            .iter()
-            .any(|run| run.status.is_running());
+        // One lock and a count: this runs on the one-second jobs clock, and
+        // cloning every child row to answer a boolean was the cost the cheap
+        // counter removes.
+        let subagents = self.state.subagents.running_count() > 0;
         if self.state.subagent.is_some() {
             self.state.refresh_subagent_preview();
         }

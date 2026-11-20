@@ -225,6 +225,10 @@ impl SubagentRun {
     }
 
     /// Total tokens the child reported.
+    ///
+    /// Test-only now: every reader takes it from the header, which never
+    /// clones the transcript this row carries.
+    #[cfg(test)]
     pub(crate) fn total_tokens(&self) -> u64 {
         self.prompt_tokens.saturating_add(self.completion_tokens)
     }
@@ -233,6 +237,101 @@ impl SubagentRun {
     pub(crate) fn elapsed_ms(&self) -> u64 {
         let end = self.finished_at.unwrap_or_else(now_ms);
         end.saturating_sub(self.started_at)
+    }
+}
+
+/// One run as the selector, the task graph and the persistence check need it.
+///
+/// Deliberately EXCLUDES the transcript. These rows are read on every frame
+/// (the header chip and its menu) and again on each clock tick (the child
+/// clock, the one-second jobs clock), and a transcript can hold every tool
+/// output a child produced. Cloning that per frame and per tick was the cost
+/// this type removes: a header is a fixed handful of small fields, so a reader
+/// pays for what it displays, not for history it never looks at.
+#[derive(Clone, Debug)]
+pub(crate) struct SubagentHeader {
+    /// Stable run id.
+    pub(crate) id: String,
+    /// The root conversation the run belongs to.
+    pub(crate) session: String,
+    /// The run id of the direct parent, or the session id at the root.
+    pub(crate) parent: String,
+    /// How deep below the session root this run sits.
+    pub(crate) depth: usize,
+    /// The short description the model supplied.
+    pub(crate) title: String,
+    /// The task text handed to the child, clipped to a menu hint.
+    ///
+    /// The full prompt is on the run, and on the child's first row in its
+    /// view; a header is cloned several times per frame, so it carries only
+    /// what the selector shows.
+    pub(crate) prompt: String,
+    /// Lifecycle state.
+    pub(crate) status: SubagentStatus,
+    /// Epoch milliseconds when the child started.
+    pub(crate) started_at: u64,
+    /// Epoch milliseconds when the child finished, when it has.
+    pub(crate) finished_at: Option<u64>,
+    /// A rough token estimate shown while the child has not reported usage.
+    pub(crate) estimated_tokens: u64,
+    /// Prompt tokens the child reported.
+    pub(crate) prompt_tokens: u64,
+    /// Completion tokens the child reported.
+    pub(crate) completion_tokens: u64,
+    /// Monotonic counter for live updates; a view rebuilds only when it moves.
+    pub(crate) revision: u64,
+    /// How many prompts wait behind the current turn.
+    pub(crate) pending: usize,
+    /// Transcript rows the run has recorded, for the task graph's step count.
+    pub(crate) steps: usize,
+    /// The final answer clipped to the menu's hint length, when one exists.
+    pub(crate) result_hint: Option<String>,
+    /// The failure text, when it failed.
+    pub(crate) error: Option<String>,
+}
+
+impl SubagentHeader {
+    /// Total tokens the child reported.
+    pub(crate) fn total_tokens(&self) -> u64 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
+
+    /// Milliseconds the run has taken, saturating at zero.
+    pub(crate) fn elapsed_ms(&self) -> u64 {
+        let end = self.finished_at.unwrap_or_else(now_ms);
+        end.saturating_sub(self.started_at)
+    }
+}
+
+impl SubagentRun {
+    /// The cheap view of this run.
+    pub(crate) fn header(&self) -> SubagentHeader {
+        // The menu hints with at most this many characters; clipping here is
+        // what keeps a long final answer or prompt out of every frame's clone.
+        const HINT_CHARS: usize = 200;
+        const PROMPT_HINT_CHARS: usize = 400;
+        SubagentHeader {
+            id: self.id.clone(),
+            session: self.session.clone(),
+            parent: self.parent.clone(),
+            depth: self.depth,
+            title: self.title.clone(),
+            prompt: self.prompt.chars().take(PROMPT_HINT_CHARS).collect(),
+            status: self.status,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            estimated_tokens: self.estimated_tokens,
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            revision: self.revision,
+            pending: self.pending.len(),
+            steps: self.transcript.len(),
+            result_hint: self
+                .result
+                .as_deref()
+                .map(|text| text.chars().take(HINT_CHARS).collect()),
+            error: self.error.clone(),
+        }
     }
 }
 
@@ -351,14 +450,6 @@ impl SubagentRegistry {
             .map(|run| run.status)
     }
 
-    /// Every run, oldest first.
-    pub(crate) fn runs(&self) -> Vec<SubagentRun> {
-        self.runs
-            .lock()
-            .map(|runs| runs.clone())
-            .unwrap_or_default()
-    }
-
     /// One run's current snapshot, when it exists.
     pub(crate) fn run(&self, id: &str) -> Option<SubagentRun> {
         self.runs
@@ -367,6 +458,40 @@ impl SubagentRegistry {
             .iter()
             .find(|run| run.id == id)
             .cloned()
+    }
+
+    /// Every run as the cheap view, oldest first.
+    pub(crate) fn headers(&self) -> Vec<SubagentHeader> {
+        self.runs
+            .lock()
+            .map(|runs| runs.iter().map(SubagentRun::header).collect())
+            .unwrap_or_default()
+    }
+
+    /// The cheap view of every run belonging to one conversation.
+    ///
+    /// The filter runs under the lock, before any clone, so a session switch
+    /// pays for its own lineage and not for every child the app ever ran.
+    pub(crate) fn headers_for(&self, session: &str) -> Vec<SubagentHeader> {
+        self.runs
+            .lock()
+            .map(|runs| {
+                runs.iter()
+                    .filter(|run| run.session == session)
+                    .map(SubagentRun::header)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The cheap view of one run.
+    pub(crate) fn header(&self, id: &str) -> Option<SubagentHeader> {
+        self.runs
+            .lock()
+            .ok()?
+            .iter()
+            .find(|run| run.id == id)
+            .map(SubagentRun::header)
     }
 
     /// Mark one run done with its final answer and token usage.
@@ -668,6 +793,10 @@ impl SubagentRegistry {
     }
 
     /// A snapshot in start order.
+    ///
+    /// Test-only: the app reads `headers()` (cheap) or one run by id, never
+    /// every transcript at once.
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<SubagentRun> {
         self.runs
             .lock()
@@ -735,6 +864,75 @@ mod tests {
             registry.try_begin("s", "s", 1, 0, "C", "c", 1).is_some(),
             "a finished run frees its slot"
         );
+    }
+
+    /// The render path reads a header, never the transcript: the header keeps
+    /// what the menu draws and clips the final answer to its hint length.
+    #[test]
+    fn a_header_carries_the_menu_fields_without_the_transcript() {
+        let registry = SubagentRegistry::default();
+        let prompt = "look at the files ".repeat(200);
+        let id = registry.begin("s", "s", 1, 7, "Inspect", &prompt);
+        registry.append_text(&id, &"x".repeat(500));
+        registry.append_tool_call(&id, "read_file", "{\"path\":\"a\"}");
+        registry.append_tool_result(&id, &"y".repeat(4_000));
+        registry.finish(
+            &id,
+            "z".repeat(1_000),
+            (10, 20),
+            vec![SubagentMessage {
+                role: "assistant".to_string(),
+                content: "done".to_string(),
+                tool: None,
+            }],
+        );
+        let header = registry.header(&id).expect("the header");
+        assert_eq!(header.title, "Inspect");
+        assert_eq!(header.status, SubagentStatus::Done);
+        assert_eq!(header.total_tokens(), 30);
+        assert_eq!(
+            header
+                .result_hint
+                .as_deref()
+                .map(|text| text.chars().count()),
+            Some(200),
+            "the hint is clipped, not the full answer"
+        );
+        assert_eq!(header.steps, 1, "the graph's step count survives");
+        assert!(
+            header.prompt.chars().count() <= 400,
+            "the header carries a prompt hint, not the whole prompt"
+        );
+        assert_eq!(
+            registry.run(&id).expect("the run").prompt,
+            prompt,
+            "the full prompt stays on the run itself"
+        );
+    }
+
+    /// The session filter runs before any clone: only this lineage's rows come
+    /// back, so a session switch never pays for every child the app has run.
+    #[test]
+    fn headers_for_filters_to_one_conversation() {
+        let registry = SubagentRegistry::default();
+        let a = registry.begin("a", "a", 1, 0, "A", "a");
+        let _b = registry.begin("b", "b", 1, 0, "B", "b");
+        let rows = registry.headers_for("a");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, a);
+        assert!(registry.header("missing").is_none());
+    }
+
+    /// A queued prompt is a count on the header, never its text: the drain
+    /// reads the cheap rows first and pays for a full row only when it starts
+    /// one.
+    #[test]
+    fn a_header_counts_the_pending_prompts() {
+        let registry = SubagentRegistry::default();
+        let id = registry.begin("s", "s", 1, 0, "Inspect", "look");
+        assert!(registry.queue_followup(&id, "one more thing"));
+        assert!(registry.queue_followup(&id, "and this"));
+        assert_eq!(registry.header(&id).expect("the header").pending, 2);
     }
 
     #[test]

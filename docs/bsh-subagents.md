@@ -18,6 +18,11 @@ The child receives:
   `max_steps` exists only as an optional runaway guard for embedders that ask
   for one; BSH never sets it.
 
+A build's child context (runtime snapshot, time context and workspace
+instructions) is rendered once and shared by every child that build spawns, so
+a batch of delegations reads the workspace instructions once, not once per
+child.
+
 A child at depth 0 or 1 receives the subagent tool again, giving the bounded DSH
 lineage tree: session root, children, and grandchildren. Depth 2 is the leaf.
 At most three children run at once across the tree; the slot is reserved under
@@ -29,7 +34,7 @@ The subagent tool does NOT wait for the child. It returns immediately with a
 `subagent_id` and `status: "running"`, and the child is detached on the runner's
 Tokio runtime, so the parent turn keeps working while it runs. Collect the
 answer with the `subagent_result` tool: pass the id (and optionally
-`wait_seconds`, up to 60) or omit it to list this session's runs. A collected
+`wait_seconds`, up to 300) or omit it to list this session's runs. A collected
 result is bounded to 16,000 characters; the full result and the child
 transcript stay in the run registry and the subagent menu.
 
@@ -103,6 +108,16 @@ crates/bsh/src/subagent.rs holds the shared registry. Each run records:
 
 The header reads only the runs belonging to the active session. A run remains in
 the registry after its parent switches away.
+
+The registry exposes two views. `SubagentRun` is the full row, transcript
+included; it is read when a child view opens, when a queued prompt starts (only
+for the run that actually has one), and when a settled run is saved.
+`SubagentHeader` is the render view: the same identity, status, timing and
+usage without the transcript, with the final answer and the task prompt clipped
+to the menu's hint lengths. The header chip and its menu, the task graph, `is_streaming`, the child
+clock and the one-second persistence sweep read headers only, so a frame or a
+tick never copies a child's history to draw a count. The open preview caches the
+revision it was built at and rebuilds only when the revision moves.
 
 ## Persistence
 

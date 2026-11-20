@@ -261,7 +261,6 @@ impl Shell {
         // Measured: the reference draws its hero inside the composer stack
         // while the session is blank, centres that stack in the scroll body,
         // and leaves the transcript itself empty.
-        let subagent = self.state.subagent_view_run();
         let hero = self.state.hero_phase();
         // The selected child is a transient Session, so Chat and Trajectory use
         // exactly the renderers the main conversation uses.
@@ -400,7 +399,7 @@ impl Shell {
                                 // composer stack, 64px narrower than the card
                                 // and centred over it, with the stack's own gap.
                                 .gap(px(theme::COMPOSER_STACK_GAP))
-                                .when(subagent.is_none(), |stack| {
+                                .when(self.state.subagent.is_none(), |stack| {
                                     stack
                                         .when_some(self.todo_panel(cx), |stack, panel| {
                                             stack.child(
@@ -492,7 +491,7 @@ impl Shell {
     fn title_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self
             .state
-            .subagent_view_run()
+            .subagent_view_header()
             .map(|run| run.title)
             .or_else(|| {
                 self.state
@@ -500,7 +499,7 @@ impl Shell {
                     .map(|session| session.title.clone())
             })
             .unwrap_or_default();
-        let child_run = self.state.subagent_view_run();
+        let child_run = self.state.subagent_view_header();
         let lang = self.state.lang;
         let parent_title = self.state.subagent_parent_title().unwrap_or_default();
         div()
@@ -768,11 +767,11 @@ impl Shell {
     /// The selector wording: the selected child's title, or the collection
     /// count while the parent conversation is showing.
     pub(crate) fn subagent_chip_label(&self) -> Option<String> {
-        let runs = self.state.subagent_runs();
+        let runs = self.state.subagent_headers();
         if runs.is_empty() {
             return None;
         }
-        if let Some(current) = self.state.subagent_view_run() {
+        if let Some(current) = self.state.subagent_view_header() {
             return Some(current.title);
         }
         let count = runs.len();
@@ -790,7 +789,7 @@ impl Shell {
     /// current run and whose 336px menu lists the child runs with a
     /// token/duration metrics column.
     fn subagent_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let runs = self.state.subagent_runs();
+        let runs = self.state.subagent_headers();
         if runs.is_empty() {
             return None;
         }
@@ -850,7 +849,7 @@ impl Shell {
                     .subagent
                     .as_ref()
                     .map(|subagent| subagent.id.clone());
-                let runs = shell.read(cx).state.subagent_runs();
+                let runs = shell.read(cx).state.subagent_headers();
                 for (index, run) in runs.into_iter().enumerate() {
                     let id = run.id.clone();
                     let title = run.title.clone();
@@ -867,7 +866,7 @@ impl Shell {
                     };
                     let result_label = lang.tr("subagents.result");
                     let result_hint = run
-                        .result
+                        .result_hint
                         .as_deref()
                         .map(|text| {
                             let clipped: String = text.chars().take(200).collect();

@@ -3258,7 +3258,7 @@ impl Shell {
         } else {
             GraphStatus::Done
         };
-        let runs = self.state.subagents.runs();
+        let runs = self.state.subagents.headers();
         let workspace = self.task_workspace_root();
         let tasks = {
             use crate::extension::tasks::TasksStore as _;
@@ -3500,7 +3500,7 @@ impl Shell {
         } else {
             crate::ui::task_graph::GraphStatus::Done
         };
-        let runs = self.state.subagents.runs();
+        let runs = self.state.subagents.headers();
         // Tasks live beside the session's own workspace, the same root the
         // task tools wrote them to. The cache is refreshed on tab open and at
         // turn end, never per frame.
