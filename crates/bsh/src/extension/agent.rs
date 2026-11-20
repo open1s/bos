@@ -1151,11 +1151,6 @@ pub(crate) fn install_with_lease(
         .iter()
         .map(|command| contributed.extension.qualify(&command.id))
         .collect();
-    let command_descriptions: Vec<String> = contributed
-        .commands
-        .iter()
-        .map(|command| command.description.clone())
-        .collect();
     let mut tool_names: Vec<String> = Vec::new();
     for descriptor in &contributed.tools {
         tool_names.push(contributed.extension.qualify(&descriptor.id));
@@ -1171,7 +1166,6 @@ pub(crate) fn install_with_lease(
             "Extension prompt",
             prompt,
             &commands,
-            &command_descriptions,
             &tool_names,
             &mut prompt_budget,
         ) {
@@ -1192,7 +1186,6 @@ pub(crate) fn install_with_lease(
             "Extension context",
             context,
             &commands,
-            &command_descriptions,
             &tool_names,
             &mut prompt_budget,
         ) {
@@ -1264,7 +1257,6 @@ fn append_prompt(
     heading: &str,
     contribution: &ferris_sdk::host_runtime::declarative::TextContribution,
     commands: &[String],
-    command_descriptions: &[String],
     tools: &[String],
     budget: &mut usize,
 ) -> Option<ConditionalPrompt> {
@@ -1329,12 +1321,8 @@ fn append_prompt(
         scope: contribution.scope.clone(),
         triggers: contribution_triggers(
             extension.as_str(),
-            name,
             &contribution.description,
             contribution.id.as_str(),
-            commands,
-            command_descriptions,
-            tools,
         ),
         commands: commands.to_vec(),
         tools: tools.to_vec(),
@@ -1344,25 +1332,24 @@ fn append_prompt(
 }
 
 /// Lowercase task terms that make an extension contribution relevant.
-pub(crate) fn contribution_triggers(
-    owner: &str,
-    name: &str,
-    description: &str,
-    id: &str,
-    commands: &[String],
-    command_descriptions: &[String],
-    tools: &[String],
-) -> Vec<String> {
-    // Raw declared terms only. Stopping, plural folding and relevance scoring
-    // live in one place - the activation selector - so no domain vocabulary is
-    // maintained here.
+pub(crate) fn contribution_triggers(owner: &str, description: &str, id: &str) -> Vec<String> {
+    // Raw terms declared BY THIS CONTRIBUTION, plus the owning package id.
+    //
+    // The extension's display name, whole description, and every command and
+    // tool are deliberately absent. Folding that package-wide vocabulary into
+    // each contribution made a generic word in the package description
+    // ("design", "index") activate every guide and context the package ships:
+    // the task "Elasticsearch API 的设计 ... Index Lifecycle" carried the
+    // Extension DevKit's guide and workspace context into an unrelated
+    // code-search design brief. A command activates by being INVOKED (the
+    // selector reads the prompt's own commands) and a tool by being NAMED
+    // (the selector reads the prompt's own tools), so neither needs to be a
+    // lexical trigger here.
+    //
+    // Stopping, plural folding and relevance scoring live in one place - the
+    // activation selector - so no domain vocabulary is maintained here.
     let mut terms = std::collections::BTreeSet::new();
-    for source in [owner, name, description, id]
-        .into_iter()
-        .chain(commands.iter().map(String::as_str))
-        .chain(command_descriptions.iter().map(String::as_str))
-        .chain(tools.iter().map(String::as_str))
-    {
+    for source in [owner, description, id] {
         for token in source.split(|character: char| !character.is_ascii_alphanumeric()) {
             let token = token.to_ascii_lowercase();
             if token.chars().count() >= 3 {

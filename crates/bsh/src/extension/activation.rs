@@ -441,6 +441,62 @@ mod tests {
         )
     }
 
+    /// The brief that exposed the defect: an unrelated code-search design
+    /// plan. The DevKit's PACKAGE description shares "design" and "index" with
+    /// it, which used to activate the guide and the workspace context. The
+    /// contribution's own terms must not inherit that vocabulary.
+    #[test]
+    fn a_generic_engineering_brief_does_not_activate_the_devkit() {
+        let task = "第一，优先借鉴 zg 的 Engine 架构。BSH 面向 Agent 执行任务，代码库理解、工具调用、跨文件分析和证据定位都很重要。zg 的 Tree-sitter、符号索引、关系查询和混合检索值得重点研究。第二，借鉴 XERJ 的数据接入和通用搜索能力。特别是 Autoindex、字段识别、通用数据查询、Hybrid Search 和 Elasticsearch 兼容 API 的设计。不要把 BSH 的检索能力局限在代码库。统一：1. Document / Chunk / Symbol / Memory 的数据模型。2. Index Lifecycle 和增量更新协议。3. Tenant / User / Session / Workspace 的权限边界。4. Retrieval Query Plan 和结果融合接口。5. Evidence Provenance：每个结果都能回溯到准确文件、版本、位置和来源。6. Context Assembly：按任务意图、可信度和 Token Budget 组装给 LLM 的上下文。";
+        let task_tokens = tokenize(task);
+        assert!(task_tokens.contains("design"), "the brief names 设计");
+        assert!(task_tokens.contains("index"), "the brief names Index");
+
+        // The package description is what the old trigger builder folded into
+        // every contribution; it does hit both task terms.
+        let package = "Design and ship BSH extensions from inside BSH: a \
+            domain-first blueprint, a validating scaffold, a manifest compiler, \
+            a review with stable rule ids, a dry run of every declared tool, \
+            deterministic archives and a Git market index editor.";
+        let package_tokens = tokenize(package);
+        assert!(package_tokens.contains("design") && package_tokens.contains("index"));
+
+        // The contribution's OWN description does not.
+        let triggers = crate::extension::agent::contribution_triggers(
+            "com.open1s.extdev",
+            "Extension DevKit instruction",
+            "extdev-guide",
+        );
+        assert!(
+            !triggers.contains(&"design".to_string()) && !triggers.contains(&"index".to_string()),
+            "the package description is not this contribution's vocabulary: {triggers:?}"
+        );
+
+        let mut guide = prompt(
+            "com.open1s.extdev",
+            "Extension DevKit",
+            "extdev-guide",
+            "How to build extensions",
+        );
+        guide.triggers = triggers;
+        guide.commands.clear();
+        // The admitted capabilities are the qualified names; the local aliases
+        // the record also lists are not admitted, so naming "design" in prose
+        // is not naming a capability.
+        guide.tools = vec![
+            "extdev__design".to_string(),
+            "design".to_string(),
+            "extdev__validate".to_string(),
+            "validate".to_string(),
+        ];
+        let admitted = vec!["extdev__design".to_string(), "extdev__validate".to_string()];
+        let plan = activate(&[guide], task, &admitted);
+        assert!(
+            plan.is_empty(),
+            "the DevKit must not ride an unrelated brief: {plan:?}"
+        );
+    }
+
     #[test]
     fn a_greeting_activates_nothing() {
         let plan = activate(&[devkit()], "hello 8888", &[]);
