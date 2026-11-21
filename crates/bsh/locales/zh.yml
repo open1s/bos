@@ -1297,6 +1297,7 @@
 "audit.showMoreCalls": "再显示 {count} 次调用"
 "audit.page": "第 {page} / {pages} 页"
 "audit.empty": "此会话暂无已审计的工具调用。"
+"audit.building": "正在生成此会话的审计…"
 "audit.preview": "预览"
 "audit.showFull": "显示全文"
 "audit.hideFull": "隐藏全文"

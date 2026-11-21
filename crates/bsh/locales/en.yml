@@ -1303,6 +1303,7 @@
 "audit.showMoreCalls": "Show {count} more calls"
 "audit.page": "Page {page} of {pages}"
 "audit.empty": "No audited tool calls in this session yet."
+"audit.building": "Building the audit of this session…"
 "audit.preview": "Preview"
 "audit.showFull": "Show full text"
 "audit.hideFull": "Hide full text"

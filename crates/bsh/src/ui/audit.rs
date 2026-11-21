@@ -93,7 +93,15 @@ pub(crate) struct AuditCache {
     /// every repaint; typing one word made the cost follow the history.
     filter: Option<FlatFilterKey>,
     filtered: std::rc::Rc<Vec<usize>>,
+    /// The key a background build is running for, so a page never starts the
+    /// same build twice and can draw a loading frame while it waits.
+    building: Option<AuditKey>,
 }
+
+/// Above this many calls a settled audit page is built on the background
+/// executor instead of inside the frame. Small pages are cheaper to build than
+/// to schedule; a page this size is what used to stall the UI thread.
+const AUDIT_ASYNC_EVENTS: usize = 800;
 
 /// The summary strip's four counts, derived once per model build.
 #[derive(Clone, Copy, Default)]
@@ -187,13 +195,11 @@ impl Shell {
     /// The denial snapshot is the policy pane's own source of truth, so the two
     /// surfaces cannot disagree about what was refused. The live MCP namespaces
     /// let a namespaced tool classify as MCP rather than Other.
-    pub(crate) fn audit_view(&self) -> std::rc::Rc<AuditView> {
-        let Some(session) = self.state.active_session() else {
-            return std::rc::Rc::new(AuditView::default());
-        };
+    /// The shape of the audit page for the session on screen.
+    fn audit_key(&self, session: &crate::model::Session) -> AuditKey {
         let mcp = self.mcp_namespaces();
         let last = session.messages.last();
-        let key = AuditKey {
+        AuditKey {
             session: session.id.clone(),
             messages: session.messages.len(),
             last_tools: last.map_or(0, |message| message.tools.len()),
@@ -233,41 +239,131 @@ impl Shell {
                 .as_ref()
                 .map_or(0, |audit| audit.denials_total),
             policy: self.audit_policy(),
-            mcp: mcp.clone(),
+            mcp,
             lang: self.state.lang,
+        }
+    }
+
+    /// Build the page into `cache` from the session's window and denial ring.
+    fn build_audit_into(
+        &self,
+        cache: &mut AuditCache,
+        session: &crate::model::Session,
+        key: &AuditKey,
+    ) {
+        let denials = self.blocking_denials();
+        let view = AuditView::build(session, &denials, &key.mcp).with_policy(key.policy.clone());
+        let rows = Self::flat_events(&view, key.lang);
+        cache.stats = Self::stats_of(&rows);
+        cache.flat = std::rc::Rc::new(rows);
+        cache.key = Some(key.clone());
+        cache.view = std::rc::Rc::new(view);
+    }
+
+    /// The summary strip's counts for a row list.
+    fn stats_of(rows: &[FlatEvent]) -> FlatStats {
+        FlatStats {
+            total: rows.len(),
+            succeeded: rows.iter().filter(|event| event.ok).count(),
+            denied: rows.iter().filter(|event| event.denied).count(),
+            failed: rows
+                .iter()
+                .filter(|event| !event.ok && !event.denied)
+                .count(),
+        }
+    }
+
+    /// The page's view model, built here and now.
+    pub(crate) fn audit_view(&self) -> std::rc::Rc<AuditView> {
+        let Some(session) = self.state.active_session() else {
+            return std::rc::Rc::new(AuditView::default());
         };
-        // While a turn streams, the key changes on every tool event: the page
-        // used to rebuild the whole model (a JSON parse per stored output and
-        // a clone of every row) once per event, so opening Audit during a long
-        // turn cost the turn's length. Keep the snapshot it already has and
-        // rebuild once the stream settles; the first open still builds.
+        let key = self.audit_key(session);
+        // A live stream changes the key on every event; the sync path (tests,
+        // export, a jump) also keeps its snapshot until the turn settles.
         let streaming = self.state.is_streaming(&session.id);
         let mut cache = self.audit_cache.borrow_mut();
-        let stale = cache.key.as_ref() != Some(&key) && !(streaming && cache.key.is_some());
-        if stale {
-            // ADVISORY refusals are refusals the reader was TOLD about, not ones
-            // that stopped a call: the Audit tab counts what was blocked, while
-            // the Policy pane lists the advisory ring on its own. Mixing them
-            // here would make "refusals" mean two different things on one page.
-            let denials = self.blocking_denials();
-            let view = AuditView::build(session, &denials, &mcp).with_policy(self.audit_policy());
-            let rows = Self::flat_events(&view, key.lang);
-            cache.stats = FlatStats {
-                total: rows.len(),
-                succeeded: rows.iter().filter(|event| event.ok).count(),
-                denied: rows.iter().filter(|event| event.denied).count(),
-                failed: rows
-                    .iter()
-                    .filter(|event| !event.ok && !event.denied)
-                    .count(),
-            };
-            cache.flat = std::rc::Rc::new(rows);
-            cache.key = Some(key);
-            cache.view = std::rc::Rc::new(view);
+        if cache.key.as_ref() != Some(&key) && !(streaming && cache.key.is_some()) {
+            self.build_audit_into(&mut cache, session, &key);
         }
         cache.view.clone()
     }
 
+    /// The page's view model for a frame.
+    ///
+    /// Small pages build here; a large settled page builds on the background
+    /// executor and the frame keeps drawing the stale (or empty) model until it
+    /// lands. A live stream is not audited per event: its key changes on every
+    /// tool result, and the page rebuilds once it settles.
+    pub(crate) fn audit_view_cached(&self, cx: &mut Context<Self>) -> std::rc::Rc<AuditView> {
+        let Some(session) = self.state.active_session() else {
+            return std::rc::Rc::new(AuditView::default());
+        };
+        let key = self.audit_key(session);
+        {
+            let cache = self.audit_cache.borrow();
+            if cache.key.as_ref() == Some(&key) || cache.building.is_some() {
+                return cache.view.clone();
+            }
+        }
+        let streaming = self.state.is_streaming(&session.id);
+        let events: usize = session
+            .messages
+            .iter()
+            .map(|message| message.tools.len())
+            .sum();
+        if streaming || events <= AUDIT_ASYNC_EVENTS {
+            let mut cache = self.audit_cache.borrow_mut();
+            if !streaming && cache.key.as_ref() != Some(&key) {
+                self.build_audit_into(&mut cache, session, &key);
+            }
+            return cache.view.clone();
+        }
+        // A large, settled page: build the same pure model off the UI thread.
+        // `building` stops a second spawn for the same key while it runs.
+        let denials = self.blocking_denials();
+        let snapshot = session.clone();
+        let mcp = key.mcp.clone();
+        let policy = key.policy.clone();
+        let lang = key.lang;
+        let build_key = key.clone();
+        self.audit_cache.borrow_mut().building = Some(key);
+        cx.spawn(async move |this, cx| {
+            let built = cx
+                .background_executor()
+                .spawn(async move {
+                    let view = AuditView::build(&snapshot, &denials, &mcp).with_policy(policy);
+                    let rows = Shell::flat_events(&view, lang);
+                    let stats = Shell::stats_of(&rows);
+                    (view, rows, stats)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.install_audit(build_key, built);
+                cx.notify();
+            });
+        })
+        .detach();
+        self.audit_cache.borrow().view.clone()
+    }
+
+    /// Install a background build if it still describes the session on screen.
+    fn install_audit(&mut self, key: AuditKey, built: (AuditView, Vec<FlatEvent>, FlatStats)) {
+        let current = self
+            .state
+            .active_session()
+            .map(|session| self.audit_key(session));
+        let mut cache = self.audit_cache.borrow_mut();
+        if current.as_ref() == Some(&key) {
+            cache.view = std::rc::Rc::new(built.0);
+            cache.flat = std::rc::Rc::new(built.1);
+            cache.stats = built.2;
+            cache.key = Some(key.clone());
+        }
+        if cache.building.as_ref() == Some(&key) {
+            cache.building = None;
+        }
+    }
     /// The flat table's rows, derived with (and cached beside) the view model.
     ///
     /// `audit_view` reconciles the cache, so this is a pointer clone in the frame
@@ -685,7 +781,7 @@ impl Shell {
                 .child(txt(lang.tr("empty.none"), 12.0, theme::muted()))
                 .into_any_element();
         };
-        let view = self.audit_view();
+        let view = self.audit_view_cached(cx);
         // The rows are the cached model's: filtering borrows them, so a repaint
         // of an unchanged page copies no event, no target and no preview.
         let all = self.audit_flat();
@@ -908,13 +1004,22 @@ impl Shell {
         let view_top = -f32::from(self.audit_scroll.offset().y);
         let mut table_rows: Vec<AnyElement> = Vec::new();
         if filtered.is_empty() {
+            let building = self.audit_cache.borrow().building.is_some();
             table_rows.push(
                 div()
                     .h(px(120.0))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(txt(lang.tr("audit.empty"), 11.5, theme::muted()))
+                    .child(txt(
+                        lang.tr(if building {
+                            "audit.building"
+                        } else {
+                            "audit.empty"
+                        }),
+                        11.5,
+                        theme::muted(),
+                    ))
                     .into_any_element(),
             );
         } else {
@@ -2682,7 +2787,7 @@ impl Shell {
                 ))
                 .into_any_element();
         };
-        let view = self.audit_view();
+        let view = self.audit_view_cached(cx);
         let query = self.audit_query.clone();
         let category = self.audit_category;
         let filtering = !query.trim().is_empty();
@@ -3237,6 +3342,37 @@ mod tests {
             builds_before,
             "a streamed event leaves the page alone"
         );
+    }
+
+    /// A page above the async threshold builds on the background executor:
+    /// the first frame shows the loading state, and the model lands without
+    /// another synchronous build on the UI thread.
+    #[gpui::test]
+    fn a_large_audit_page_builds_off_the_frame(cx: &mut TestAppContext) {
+        let (shell, cx) = boot(cx, "audit-async", 900);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let builds_after_first = crate::audit::audit_builds();
+        assert!(
+            cx.debug_bounds("audit-turn-1").is_none(),
+            "the first frame paints before the background build lands"
+        );
+        for _ in 0..80 {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            if cx.debug_bounds("audit-turn-1").is_some() {
+                break;
+            }
+        }
+        assert!(
+            cx.debug_bounds("audit-turn-1").is_some(),
+            "the background build installs the page"
+        );
+        assert_eq!(
+            crate::audit::audit_builds(),
+            builds_after_first + 1,
+            "the large page built exactly once, off the frame"
+        );
+        let _ = shell;
     }
 
     /// A long audit page paints a window, and its view model survives a repaint.
