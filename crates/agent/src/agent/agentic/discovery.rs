@@ -341,7 +341,7 @@ enum Lookup {
     /// Withheld from the request, with its description and schema.
     Withheld(String, Value),
     /// Registered, but already in the model's own tool list.
-    Advertised,
+    Advertised(String, Value),
     /// Not registered at all.
     Missing,
 }
@@ -381,6 +381,54 @@ impl Catalogue<'_> {
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out.dedup_by(|a, b| a.name == b.name);
+        out
+    }
+
+
+    /// Advertised tools that answer the query.
+    ///
+    /// These are already in the model's array, so they are NOT withheld and
+    /// must not be reported as newly discovered. A short matching list still
+    /// helps when the model asks for a capability by intent (for example
+    /// "codel" or "search"): it gets the real direct name and schema instead
+    /// of an empty result.
+    fn advertised_matches(&self, query: &str, limit: usize) -> Vec<ToolEntry> {
+        let mut out: Vec<ToolEntry> = Vec::new();
+        for registry in [self.registry, self.live].into_iter().flatten() {
+            for (name, tool) in registry.iter() {
+                if self.is_withheld(name, tool.deferred(), registry.is_mcp_tool(name)) {
+                    continue;
+                }
+                let entry = ToolEntry {
+                    name: name.clone(),
+                    description: tool.description(),
+                    schema: tool.json_schema(),
+                    metadata: tool.metadata().cloned().unwrap_or_default(),
+                };
+                if score(query, &entry) > 0 {
+                    out.push(entry);
+                }
+            }
+            for name in registry.async_tool_names() {
+                if let Some(tool) = registry.get_async(&name) {
+                    if self.is_withheld(&name, tool.deferred(), registry.is_mcp_tool(&name)) {
+                        continue;
+                    }
+                    let entry = ToolEntry {
+                        name: name.clone(),
+                        description: tool.description(),
+                        schema: tool.json_schema(),
+                        metadata: tool.metadata().cloned().unwrap_or_default(),
+                    };
+                    if score(query, &entry) > 0 {
+                        out.push(entry);
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| score(query, b).cmp(&score(query, a)).then(a.name.cmp(&b.name)));
+        out.dedup_by(|a, b| a.name == b.name);
+        out.truncate(limit);
         out
     }
 
@@ -457,7 +505,7 @@ impl Catalogue<'_> {
                 return if self.is_withheld(name, deferred, registry.is_mcp_tool(name)) {
                     Lookup::Withheld(description, schema)
                 } else {
-                    Lookup::Advertised
+                    Lookup::Advertised(description, schema)
                 };
             }
         }
@@ -514,9 +562,12 @@ fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
                     "Call {name} directly with arguments matching parameters; it is now in your tool list."
                 ),
             }),
-            Lookup::Advertised => json!({
-                "error": format!(
-                    "'{name}' is already in your tool list - call it directly."
+            Lookup::Advertised(description, schema) => json!({
+                "name": name,
+                "description": description,
+                "parameters": schema,
+                "hint": format!(
+                    "'{name}' is already in your tool list - call it directly with these arguments."
                 ),
             }),
             Lookup::Missing => {
@@ -616,12 +667,28 @@ fn search(catalogue: &Catalogue<'_>, args: &Value) -> Value {
         .take(FIND_NAMES)
         .collect();
 
+    let advertised = catalogue.advertised_matches(query, limit.min(3));
     let mut result = json!({
         "total": entries.len(),
         "tools": described,
         "other_names": names_only,
         "hint": "Call the reported tools directly by name with args matching parameters. Call find_tool with {name: \"<tool>\"} for the full schema of any name in other_names.",
     });
+    if !advertised.is_empty() {
+        result["advertised"] = Value::Array(
+            advertised
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "name": entry.name,
+                        "description": clip(&entry.description, FIND_DESCRIPTION_CHARS),
+                        "parameters": entry.schema,
+                        "hint": "Already in your tool list; call it directly.",
+                    })
+                })
+                .collect(),
+        );
+    }
     if result.to_string().len() > FIND_BUDGET + FIND_BUDGET / 2
         && let Some(object) = result.as_object_mut()
     {
@@ -1174,6 +1241,14 @@ mod tests {
             )))
             .unwrap();
         registry.mark_mcp_tool("github_search");
+        registry
+            .register(Arc::new(FunctionTool::new(
+                "codel",
+                "Code intelligence: search, inspect and analyze symbols in the workspace.",
+                json!({"type": "object", "properties": {}}),
+                |_| Ok(json!({})),
+            )))
+            .unwrap();
         let catalogue = Catalogue {
             registry: Some(&registry),
             live: None,
@@ -1194,12 +1269,21 @@ mod tests {
         assert_eq!(result["total"], 1, "only withheld tools are searchable");
 
         let exact = search(&catalogue, &json!({"name": "read_file"}));
+        assert_eq!(exact["name"], "read_file", "{exact}");
         assert!(
-            exact["error"]
+            exact["hint"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("already in your tool list"),
             "naming a direct tool says so: {exact}"
+        );
+
+        let codel = search(&catalogue, &json!({"query": "codel"}));
+        assert!(
+            codel["advertised"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "codel")),
+            "an advertised codel still answers an intent search: {codel}"
         );
     }
 

@@ -15,7 +15,8 @@ use agent::tools::ToolMetadata;
 /// built-in this host composes.
 pub(crate) fn builtin_metadata(name: &str) -> Option<ToolMetadata> {
     let metadata = match name {
-        "bash" => ToolMetadata::new()
+        "codel" => read_only("fs.read:workspace"),
+        "bash" | "run_code" => ToolMetadata::new()
             .with_version("1.0.0")
             .with_risk("high")
             .with_side_effects(["process", "write", "network"])
@@ -166,6 +167,8 @@ mod tests {
     fn every_declared_builtin_names_a_version_and_a_risk() {
         for name in [
             "bash",
+            "run_code",
+            "codel",
             "glob",
             "grep",
             "read_file",

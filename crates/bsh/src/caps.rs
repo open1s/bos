@@ -897,11 +897,11 @@ fn build_agent_for_session_inner(
         // the provider whole and came back as an error the UI called a useless
         // summary.
         compaction_input_tokens: compaction_input_tokens(&eff),
-        // No cut: the reader asked for the whole result, and the view no
-        // longer truncates either. The engine's `usize::MAX` cap keeps every
-        // tool result whole; context pressure is the reader's Stop button and
-        // the provider's own window, not a silent mid-result cut.
-        tool_output_cap: usize::MAX,
+        // One result may not consume the whole window. The engine caps the
+        // envelope it sends the model and hands the uncapped envelope to the
+        // WorkspaceSpill hook, so the full output stays readable under
+        // .bsh-spill instead of being lost or flooding the next step.
+        tool_output_cap: 64 * 1024,
         // A slow provider is not a failed one. This one number bounds a request
         // at both layers the reader can see: the engine's per-call ceiling and
         // the vendor's idle-socket guard. Inheriting the framework's 60s
@@ -957,6 +957,9 @@ fn build_agent_for_session_inner(
     // policy data and the shell cwd must carry the same spelling of the root or
     // a symlinked workspace would look outside itself.
     let root = workspace_root(&eff).map(|path| path.canonicalize().unwrap_or(path));
+    if let Some(root) = &root {
+        agent = agent.with_tool_spill(Arc::new(WorkspaceSpill::new(root.clone(), session)));
+    }
     // A turn with file or shell tools and NO root can only refuse every path,
     // which the model reads as "the workspace is unreadable". A fresh install
     // or a settings tree that names no workspace is exactly this state, so say
@@ -1035,6 +1038,7 @@ fn build_agent_for_session_inner(
     // are intersected here; registration below only consumes the result.
     let gates = tool_gates_for(&permission, preset_tools, &policy, session);
 
+    let run_code_registry: Arc<Mutex<Option<Arc<ToolRegistry>>>> = Arc::new(Mutex::new(None));
     if eff.bash_enabled && !off_bundle("shell") {
         let mut shell_tools: Vec<Arc<dyn agent::tools::Tool>> = Vec::new();
         if gates.bash && !off_tool("bash") {
@@ -1092,6 +1096,13 @@ fn build_agent_for_session_inner(
             // permission decision made here.
             let bash: Arc<dyn agent::tools::Tool> = Arc::new(bash);
             crate::extension::commands::install_command_tool(session, Arc::clone(&bash));
+            let run_code = Arc::new(RunCodeTool {
+                bash: Arc::clone(&bash),
+                root: root.clone(),
+                session: session.to_owned(),
+                registry: Arc::clone(&run_code_registry),
+            });
+            shell_tools.push(Arc::new(DeclaredTool::new(run_code, declare("run_code"))));
             shell_tools.push(Arc::new(DeclaredTool::new(bash, declare("bash"))));
         }
         // The job tools share the shell bundle but each has its own gate: a
@@ -1506,6 +1517,30 @@ fn build_agent_for_session_inner(
             .iter()
             .map(|activation| activation.info.clone()),
     );
+    // The memory extension's package names are namespaced for the extension
+    // platform. Register the short model-facing names as well: remember,
+    // recall and forget are core tools, not package trivia.
+    for (qualified, short) in [
+        ("memory-tools__memory_remember", "remember"),
+        ("memory-tools__memory_recall", "recall"),
+        ("memory-tools__memory_forget", "forget"),
+    ] {
+        let tool = agent
+            .live_tools()
+            .read()
+            .ok()
+            .and_then(|registry| registry.get_async(qualified));
+        if let Some(tool) = tool {
+            let alias: Arc<dyn react::tool::registry::AsyncTool> = Arc::new(ShortAsyncTool {
+                name: short.to_string(),
+                inner: tool,
+            });
+            if let Err(error) = agent.try_add_async_tool(alias) {
+                log::warn!("memory alias {short} was not registered: {error}");
+            }
+        }
+    }
+
     // Hooks are installed after the extension platform has applied its
     // packages: the decision is "is a hook-attached package live for THIS
     // build", and a package installed in this build is live now.
@@ -1581,6 +1616,24 @@ fn build_agent_for_session_inner(
         if let Err(error) = agent.add_mcp_tool(&tool.namespace, &tool.name, tool.adapter.clone()) {
             log::warn!("MCP tool '{}' was not registered: {error}", tool.name);
         }
+    }
+
+    // The codel server is the shell's code-intelligence path. It is linked
+    // into this build through codel-mcp's library, so the tool is registered
+    // even when no MCP server is configured; the graph is built on first use
+    // and cached for this workspace.
+    let codel = Arc::new(CodelTool {
+        metadata: crate::tool_metadata::builtin_metadata("codel")
+            .expect("codel built-in metadata"),
+        root: root.clone(),
+        workspace: Arc::new(Mutex::new(None)),
+    });
+    if let Err(error) = agent.try_add_async_tool(codel) {
+        log::warn!("codel built-in tool was not registered: {error}");
+    }
+
+    if let Some(registry) = agent.registry() {
+        *run_code_registry.lock().expect("run_code registry") = Some(Arc::clone(registry));
     }
 
     // Skills come from the ENABLED sources the resolution already scanned, and
@@ -2372,7 +2425,9 @@ pub(crate) fn workspace_tool_scope() -> react::tool::admission::InitialToolScope
         [
             "ask_user",
             "bash",
+            "codel",
             "edit_file",
+            "forget",
             "glob",
             "grep",
             "job_kill",
@@ -2382,6 +2437,9 @@ pub(crate) fn workspace_tool_scope() -> react::tool::admission::InitialToolScope
             "mcp",
             "read_file",
             "read_files",
+            "recall",
+            "remember",
+            "run_code",
             "sed",
             "apply_patch",
             "subagent",
@@ -4192,17 +4250,17 @@ pub(crate) const MAX_EDIT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The fewest lines one read page may return.
 ///
-/// A page is what one round trip buys. 4096 lines is a whole module or a
+/// A page is what one round trip buys. 2048 lines is a whole module or a
 /// multi-thousand-line log; a smaller page turns one inspection into several
 /// calls, so a request below this is raised to it instead of honoured.
-const MIN_READ_LINES: usize = 4096;
+const MIN_READ_LINES: usize = 2048;
 
 /// The page a read uses when the caller does not name one.
 const DEFAULT_READ_LINES: usize = MIN_READ_LINES;
 
 /// The most bytes one read page returns.
 ///
-/// The line floor alone is not a size bound: 4096 minified lines can be
+/// The line floor alone is not a size bound: 2048 minified lines can be
 /// megabytes. A page that hits this reports next_offset like any other cut,
 /// so the model continues with one call. One MiB keeps a normal 4096-line
 /// page whole (about 256 bytes a line) and still refuses the multi-megabyte
@@ -4588,7 +4646,7 @@ fn not_found_message(target: &Path, content: &str, old: &str) -> String {
         message.push_str(&format!(
             "; its first line matches line {line}, so check the rest of the block exactly. \
              Re-read that region with {{\"path\":\"{}\",\"offset\":{}}} (a page is at
-             least 4096 lines) and copy old_string verbatim",
+             least 2048 lines) and copy old_string verbatim",
             target.display(),
             start
         ));
@@ -5048,6 +5106,696 @@ pub(crate) fn grep_tool(
 /// Per-tool read cursor: resolved path -> (length, mtime nanos, next line).
 type ReadCursor = Arc<Mutex<HashMap<PathBuf, (u64, u64, usize)>>>;
 
+/// A short model-facing alias for an extension async tool.
+struct ShortAsyncTool {
+    name: String,
+    inner: Arc<dyn react::tool::registry::AsyncTool>,
+}
+
+#[async_trait::async_trait]
+impl react::tool::registry::AsyncTool for ShortAsyncTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> String {
+        self.inner.description()
+    }
+
+    fn category(&self) -> String {
+        self.inner.category()
+    }
+
+    async fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        self.inner.run(input).await
+    }
+
+    async fn run_with_call_id(
+        &self,
+        input: &serde_json::Value,
+        call_id: &str,
+    ) -> Result<serde_json::Value, ToolError> {
+        self.inner.run_with_call_id(input, call_id).await
+    }
+
+    fn metadata(&self) -> Option<&ToolMetadata> {
+        self.inner.metadata()
+    }
+
+    fn json_schema(&self) -> serde_json::Value {
+        self.inner.json_schema()
+    }
+
+    fn to_openai_definition(&self) -> react::tool::ToolDefinition {
+        let mut definition = self.inner.to_openai_definition();
+        definition.function.name = self.name.clone();
+        definition
+    }
+
+    fn is_skill(&self) -> bool {
+        self.inner.is_skill()
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.inner.supports_streaming()
+    }
+}
+
+/// The built-in codel tool: in-process indexing and graph queries.
+///
+/// This is linked into BSH through the codel-mcp library. No server is spawned
+/// and no workspace root is accepted from the caller: the tool belongs to one
+/// workspace build.
+struct CodelTool {
+    metadata: ToolMetadata,
+    root: Option<PathBuf>,
+    workspace: Arc<Mutex<Option<Arc<codel_mcp::workspace::WorkspaceGraph>>>>,
+}
+
+impl CodelTool {
+    fn workspace(&self) -> Result<Arc<codel_mcp::workspace::WorkspaceGraph>, ToolError> {
+        let root = self
+            .root
+            .as_ref()
+            .ok_or_else(|| ToolError::Failed("codel needs an open workspace".to_string()))?;
+        if let Some(graph) = self.workspace.lock().expect("codel cache").as_ref() {
+            return Ok(Arc::clone(graph));
+        }
+        let id_path = root.join(".codel/workspace-id");
+        let workspace_id = std::fs::read_to_string(&id_path)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| {
+                let id = codel_mcp::codel::WorkspaceId::new();
+                if let Some(parent) = id_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&id_path, id.to_string());
+                id
+            });
+        let host = codel_mcp::workspace::HostContext {
+            workspace_id,
+            root: Some(root.clone()),
+            store_root: Some(root.join(".codel/store")),
+        };
+        let graph = codel_mcp::workspace::load_workspace(&host, root, None)
+            .map_err(|error| ToolError::Failed(format!("codel index failed: {error}")))?;
+        let graph = Arc::new(graph);
+        *self.workspace.lock().expect("codel cache") = Some(Arc::clone(&graph));
+        Ok(graph)
+    }
+}
+
+#[async_trait::async_trait]
+impl react::tool::registry::AsyncTool for CodelTool {
+    fn name(&self) -> &str {
+        "codel"
+    }
+
+    fn description(&self) -> String {
+        "Code intelligence over the active workspace. action=search first; action=inspect before editing; action=analyze after. No root argument is needed.".to_string()
+    }
+
+    fn category(&self) -> String {
+        "code".to_string()
+    }
+
+    fn metadata(&self) -> Option<&ToolMetadata> {
+        Some(&self.metadata)
+    }
+
+    async fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        let action = input
+            .get("action")
+            .and_then(|value| value.as_str())
+            .unwrap_or("search");
+        if action == "help" {
+            return Ok(serde_json::json!({
+                "actions": ["search", "inspect", "analyze", "ast_query", "workspace", "help"],
+                "example": {"action": "search", "query": "quick_sort"}
+            }));
+        }
+        let workspace = self.workspace()?;
+        let graph = &workspace.graph;
+        let root = workspace.descriptor.canonical_root();
+        match action {
+            "search" => {
+                let query = input
+                    .get("query")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| ToolError::InvalidInput("query is required".to_string()))?;
+                let limit = input
+                    .get("limit")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(20)
+                    .clamp(1, 100) as usize;
+                let answer = graph.query_budgeted(
+                    query,
+                    limit,
+                    codel_mcp::codel::graph::AnswerBudget::new(4_000),
+                );
+                let hits = answer
+                    .value
+                    .iter()
+                    .map(|hit| {
+                        let mut value = serde_json::json!(hit);
+                        if let Some(context) = codel_mcp::context::enrich(&hit.node, root) {
+                            value["context"] = context;
+                        }
+                        if let Some(ty) = workspace.symbol_types.get(hit.node.id.as_str()) {
+                            value["type"] = serde_json::json!(ty);
+                        }
+                        value["selector"] =
+                            serde_json::json!(format!("{}#{}", hit.node.path.display(), hit.node.name));
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::json!({
+                    "workspaceId": graph.workspace_id().to_string(),
+                    "root": root.display().to_string(),
+                    "hits": hits,
+                    "estimatedTokens": answer.estimated_tokens,
+                    "truncated": answer.truncated,
+                }))
+            }
+            "inspect" => {
+                let node = input
+                    .get("node")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| ToolError::InvalidInput("node is required".to_string()))?;
+                let limit = input
+                    .get("limit")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(50)
+                    .clamp(1, 200) as usize;
+                let id = resolve_codel_node(graph, node)
+                    .map_err(ToolError::InvalidInput)?;
+                let answer = graph
+                    .explain_budgeted(
+                        &id,
+                        limit,
+                        codel_mcp::codel::graph::AnswerBudget::new(6_000),
+                    )
+                    .ok_or_else(|| ToolError::Failed(format!("node disappeared: {id}")))?;
+                let mut value = serde_json::json!(answer.value);
+                if let Some(context) = codel_mcp::context::enrich(&answer.value.node, root) {
+                    value["context"] = context;
+                }
+                Ok(value)
+            }
+            "analyze" => {
+                let analysis = input
+                    .get("analysis")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("affected");
+                match analysis {
+                    "cycles" => Ok(codel_mcp::diagnostics::cycles(graph, &[], 50)),
+                    "dead_code" => Ok(codel_mcp::diagnostics::dead_code(graph, 100)),
+                    _ => {
+                        let mut changed = input
+                            .get("changed")
+                            .and_then(|value| value.as_array())
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(|value| value.as_str().map(str::to_owned))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        if changed.is_empty()
+                            && let Some(node) = input.get("node").and_then(|value| value.as_str())
+                        {
+                            let id = resolve_codel_node(graph, node)
+                                .map_err(ToolError::InvalidInput)?;
+                            if let Some(found) = graph.node(&id) {
+                                changed.push(found.path.display().to_string());
+                            }
+                        }
+                        if changed.is_empty() {
+                            return Err(ToolError::InvalidInput(
+                                "changed or node is required for analyze".to_string(),
+                            ));
+                        }
+                        let depth = input
+                            .get("max_depth")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(4)
+                            .clamp(1, 16) as usize;
+                        Ok(codel_mcp::diagnostics::impact(graph, &changed, depth, 200))
+                    }
+                }
+            }
+            "ast_query" => {
+                let path = input
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| ToolError::InvalidInput("path is required".to_string()))?;
+                let path = codel_mcp::ast::safe_relative(path)
+                    .ok_or_else(|| ToolError::InvalidInput("path must be workspace-relative".to_string()))?;
+                let preset = input
+                    .get("preset")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("functions");
+                let captures = input
+                    .get("captures")
+                    .and_then(|value| value.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let max = input
+                    .get("max")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(50)
+                    .clamp(1, 500) as usize;
+                match input.get("query").and_then(|value| value.as_str()) {
+                    Some(query) => codel_mcp::ast::query(root, &path, query, &captures, max)
+                        .map_err(ToolError::Failed),
+                    None => codel_mcp::ast::query_preset(root, &path, preset, &captures, max)
+                        .map_err(ToolError::Failed),
+                }
+            }
+            "workspace" => Ok(serde_json::json!({
+                "workspaceId": graph.workspace_id().to_string(),
+                "root": root.display().to_string(),
+                "workspace": workspace.descriptor.canonical_root().display().to_string(),
+                "nodes": graph.nodes().count(),
+                "edges": graph.edges().len(),
+                "loadedFromStore": workspace.loaded_from_store,
+                "parsedFiles": workspace.parsed_files,
+            })),
+            other => Err(ToolError::InvalidInput(format!(
+                "unknown codel action '{other}'; use search, inspect, analyze, ast_query, workspace or help"
+            ))),
+        }
+    }
+
+    fn json_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["search", "inspect", "analyze", "ast_query", "workspace", "help"], "default": "search"},
+                "query": {"type": "string", "description": "Name/path words for search or a tree-sitter query for ast_query."},
+                "node": {"type": "string", "description": "Node id or path#name for inspect/analyze."},
+                "analysis": {"type": "string", "description": "affected, cycles or dead_code."},
+                "changed": {"type": "array", "items": {"type": "string"}},
+                "path": {"type": "string", "description": "Workspace-relative file for ast_query."},
+                "preset": {"type": "string", "description": "functions, classes, methods, calls, imports."},
+                "limit": {"type": "integer", "minimum": 1},
+                "max_depth": {"type": "integer", "minimum": 1}
+            },
+            "required": ["action"],
+            "additionalProperties": true
+        })
+    }
+
+    fn to_openai_definition(&self) -> react::tool::ToolDefinition {
+        let schema = self.json_schema();
+        let parameters = serde_json::from_value::<react::tool::ToolParameters>(schema).unwrap_or(
+            react::tool::ToolParameters {
+                param_type: "object".to_string(),
+                properties: None,
+                required: None,
+            },
+        );
+        react::tool::ToolDefinition::new(self.name(), self.description())
+            .with_parameters(parameters)
+    }
+}
+
+fn resolve_codel_node(
+    graph: &codel_mcp::codel::graph::CodeGraph,
+    value: &str,
+) -> Result<codel_mcp::codel::graph::NodeId, String> {
+    if let Some(node) = graph.nodes().find(|node| node.id.as_str() == value) {
+        return Ok(node.id.clone());
+    }
+    if value.starts_with("symbol:") {
+        let prefix = format!("{value}:");
+        let matches = graph
+            .nodes()
+            .filter(|node| node.id.as_str().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        return match matches.as_slice() {
+            [node] => Ok(node.id.clone()),
+            [] => Err(format!("no node matches '{value}'")),
+            _ => Err(codel_ambiguous(value, &matches)),
+        };
+    }
+    let (path_filter, name) = value
+        .rsplit_once('#')
+        .map_or((None, value), |(path, name)| (Some(path), name));
+    let exact = graph
+        .nodes()
+        .filter(|node| node.name == name && codel_path_matches(node, path_filter))
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [node] => return Ok(node.id.clone()),
+        [] => {}
+        _ => return Err(codel_ambiguous(value, &exact)),
+    }
+    let hits = graph
+        .query(name, 100)
+        .into_iter()
+        .filter(|hit| codel_path_matches(&hit.node, path_filter))
+        .map(|hit| hit.node)
+        .collect::<Vec<_>>();
+    match hits.as_slice() {
+        [] => Err(format!("no node matches '{value}'; use search or path#name")),
+        [node] => Ok(node.id.clone()),
+        _ => Err(codel_ambiguous(value, &hits.iter().collect::<Vec<_>>())),
+    }
+}
+
+fn codel_path_matches(
+    node: &codel_mcp::codel::graph::GraphNode,
+    filter: Option<&str>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let path = node.path.to_string_lossy().replace('\\', "/");
+    let filter = filter.replace('\\', "/");
+    path == filter || path.ends_with(&filter) || filter.ends_with(&path) || path.contains(&filter)
+}
+
+fn codel_ambiguous(value: &str, nodes: &[&codel_mcp::codel::graph::GraphNode]) -> String {
+    format!(
+        "'{value}' is ambiguous: {}",
+        nodes
+            .iter()
+            .take(8)
+            .map(|node| format!("{} ({})", node.name, node.id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Preserves a tool result the model cap cut, under the workspace.
+///
+/// The spill lives outside the model's context but inside the workspace, so
+/// `read_file` can retrieve it with the same policy checks as any other file.
+struct WorkspaceSpill {
+    root: PathBuf,
+    session: String,
+}
+
+impl WorkspaceSpill {
+    fn new(root: PathBuf, session: &str) -> Self {
+        Self {
+            root,
+            session: session.to_owned(),
+        }
+    }
+}
+
+impl react::engine::ToolSpill for WorkspaceSpill {
+    fn spill(&self, tool: &str, full: &str) -> Option<String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let safe = |value: &str| {
+            value
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        };
+        let session = if self.session.is_empty() {
+            "session".to_owned()
+        } else {
+            safe(&self.session)
+        };
+        let tool = safe(tool);
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let relative = PathBuf::from(".bsh-spill")
+            .join(session)
+            .join(format!("{tool}-{sequence}.json"));
+        let path = self.root.join(&relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        std::fs::write(&path, full).ok()?;
+        Some(relative.to_string_lossy().into_owned())
+    }
+}
+
+const BSH_HELPER: &str = r#"import json
+import os
+import socket
+
+
+def call(tool, arguments=None, **kwargs):
+    payload = dict(arguments or {})
+    payload.update(kwargs)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(os.environ["BSH_TOOL_SOCKET"])
+    sock.sendall((json.dumps({"tool": tool, "arguments": payload}) + "\n").encode())
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    sock.close()
+    result = json.loads(data)
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error", "tool failed"))
+    return result.get("data")
+
+
+def read_file(path, **kwargs):
+    return call("read_file", {"path": path, **kwargs})
+
+
+def read_files(paths, **kwargs):
+    return call("read_files", {"paths": paths, **kwargs})
+
+
+def grep(pattern, **kwargs):
+    return call("grep", {"pattern": pattern, **kwargs})
+
+
+def glob(pattern, **kwargs):
+    return call("glob", {"pattern": pattern, **kwargs})
+
+
+def list_dir(path=".", **kwargs):
+    return call("list_dir", {"path": path, **kwargs})
+
+
+def bash(command, **kwargs):
+    return call("bash", {"command": command, **kwargs})
+
+
+def write_file(path, content, **kwargs):
+    return call("write_file", {"path": path, "content": content, **kwargs})
+
+
+def edit_file(path, old_string, new_string, **kwargs):
+    return call("edit_file", {"path": path, "old_string": old_string, "new_string": new_string, **kwargs})
+
+
+def apply_patch(patch, **kwargs):
+    return call("apply_patch", {"patch": patch, **kwargs})
+
+
+def codel(action, **kwargs):
+    return call("codel", {"action": action, **kwargs})
+
+
+def remember(content, **kwargs):
+    return call("remember", {"content": content, **kwargs})
+
+
+def recall(query, **kwargs):
+    return call("recall", {"query": query, **kwargs})
+
+
+def forget(id, **kwargs):
+    return call("forget", {"id": id, **kwargs})
+"#;
+
+/// Programmatic code execution over the workspace.
+///
+/// This is the batch seam: one Python program can read, filter and compare
+/// many files before the model sees a result. It runs through the same bash
+/// policy and sandbox as `bash`; the script is written under the workspace and
+/// removed after the call.
+struct RunCodeTool {
+    bash: Arc<dyn agent::tools::Tool>,
+    root: Option<PathBuf>,
+    session: String,
+    registry: Arc<Mutex<Option<Arc<ToolRegistry>>>>,
+}
+
+impl agent::tools::Tool for RunCodeTool {
+    fn name(&self) -> &str {
+        "run_code"
+    }
+
+    fn description(&self) -> String {
+        "Run one Python program over the workspace. Use it to batch reads, greps and filtering into one step; print only the compact result the next step needs.".to_string()
+    }
+
+    fn json_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": { "type": "string", "description": "Python source. It runs inside the workspace; print only the evidence you need." },
+                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Optional timeout; defaults to the shell timeout." }
+            },
+            "required": ["code"],
+            "additionalProperties": false
+        })
+    }
+
+    fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        let code = input
+            .get("code")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ToolError::Failed("missing string argument 'code'".to_string()))?;
+        let root = self.root.as_ref().ok_or_else(|| {
+            ToolError::Failed("run_code needs an open workspace root".to_string())
+        })?;
+        let safe_session = self
+            .session
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let directory = root.join(".bsh-run").join(safe_session);
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let script = directory.join(format!("code-{sequence}.py"));
+        let helper = directory.join("bsh.py");
+
+        #[cfg(unix)]
+        let broker = {
+            let registry = self
+                .registry
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            registry.map(|registry| -> Result<_, ToolError> {
+                use std::os::unix::net::UnixListener;
+                let socket_path = directory.join(format!("tools-{sequence}.sock"));
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path)
+                    .map_err(|error| ToolError::Failed(error.to_string()))?;
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|error| ToolError::Failed(error.to_string()))?;
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop_thread = Arc::clone(&stop);
+                let handle = std::thread::spawn(move || {
+                    while !stop_thread.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                let mut reader =
+                                    BufReader::new(stream.try_clone().expect("broker stream"));
+                                let mut line = String::new();
+                                if reader.read_line(&mut line).is_err() {
+                                    continue;
+                                }
+                                let request: serde_json::Value =
+                                    serde_json::from_str(&line).unwrap_or_default();
+                                let tool = request
+                                    .get("tool")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_default();
+                                let arguments = request
+                                    .get("arguments")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                let response = if tool == "run_code" {
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "error": "run_code cannot call itself"
+                                    })
+                                } else {
+                                    match registry.execute(tool, &arguments) {
+                                        Ok(data) => serde_json::json!({"ok": true, "data": data}),
+                                        Err(error) => serde_json::json!({
+                                            "ok": false,
+                                            "error": error.to_string()
+                                        }),
+                                    }
+                                };
+                                let mut writer = stream;
+                                let _ = writer.write_all(
+                                    format!("{}\n", response).as_bytes(),
+                                );
+                                let _ = writer.flush();
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+                Ok((socket_path, stop, handle))
+            })
+            .transpose()?
+        };
+
+        let mut source = String::new();
+        #[cfg(unix)]
+        if let Some((socket_path, _, _)) = &broker {
+            source.push_str(&format!(
+                r#"import os
+os.environ["BSH_TOOL_SOCKET"] = {}
+import bsh as _bsh
+globals()["bsh"] = _bsh
+"#,
+                serde_json::to_string(&socket_path.to_string_lossy().to_string())
+                    .expect("socket path")
+            ));
+        }
+        source.push_str(code);
+        std::fs::write(&script, source).map_err(|error| ToolError::Failed(error.to_string()))?;
+        #[cfg(unix)]
+        if broker.is_some() {
+            std::fs::write(&helper, BSH_HELPER).map_err(|error| ToolError::Failed(error.to_string()))?;
+        }
+        let relative = script
+            .strip_prefix(root)
+            .unwrap_or(&script)
+            .to_string_lossy()
+            .into_owned();
+        let mut command = serde_json::json!({ "command": format!("python3 {relative}") });
+        if let Some(timeout) = input.get("timeout_secs") {
+            command["timeout_secs"] = timeout.clone();
+        }
+        let result = self.bash.run(&command);
+        #[cfg(unix)]
+        if let Some((socket_path, stop, handle)) = broker {
+            stop.store(true, Ordering::Relaxed);
+            let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+            let _ = handle.join();
+            let _ = std::fs::remove_file(&socket_path);
+        }
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&helper);
+        result
+    }
+}
+
 /// read_file - read a UTF-8 file inside the workspace.
 pub(crate) fn read_file_tool(
     root: Option<PathBuf>,
@@ -5063,13 +5811,13 @@ pub(crate) fn read_file_tool(
     let cursor: ReadCursor = Arc::new(Mutex::new(HashMap::new()));
     FunctionTool::new(
         "read_file",
-        "Read a UTF-8 text file. With only path it starts at line 1; after a partial read the same call continues from next_offset, so pass offset=1 to restart. limit bounds the window and is at least 4096 lines: a smaller value is raised, because a page is what one round trip buys. Paths are workspace-relative or absolute inside the workspace; ignored paths are refused. Returns start_line, end_line, total_lines and next_offset: the line to read next, or null when done.",
+        "Read a UTF-8 text file. With only path it starts at line 1; after a partial read the same call continues from next_offset, so pass offset=1 to restart. limit bounds the window and is at least 2048 lines: a smaller value is raised, because a page is what one round trip buys. Paths are workspace-relative or absolute inside the workspace; ignored paths are refused. Returns start_line, end_line, total_lines and next_offset: the line to read next, or null when done.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path of the UTF-8 text file to read, relative to the workspace or absolute inside the allowed workspace." },
                 "offset": { "type": "integer", "minimum": 1, "description": "Optional 1-based starting line; defaults to 1 (the first line is 1, not 0). Pass the previous result's next_offset to continue." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Maximum lines from offset. The minimum page is 4096 lines: a smaller value is raised to 4096, so ask for 4096 or more. A cut window returns next_offset." }
+                "limit": { "type": "integer", "minimum": 1, "description": "Maximum lines from offset. The minimum page is 2048 lines: a smaller value is raised to 2048, so ask for 2048 or more. A cut window returns next_offset." }
             },
             "required": ["path"],
             "additionalProperties": false
@@ -5218,7 +5966,7 @@ pub(crate) fn read_files_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "read_files",
-        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next_offset: the line to read next, or null when done. Each file's page is at least 4096 lines (a smaller limit is raised). Combined content is capped at 1 MiB; inspect each entry's error field.",
+        "Read up to 10 UTF-8 files in one call; each is permission-checked and returns its own start_line, end_line, total_lines and next_offset: the line to read next, or null when done. Each file's page is at least 2048 lines (a smaller limit is raised). Combined content is capped at 1 MiB; inspect each entry's error field.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -5242,7 +5990,7 @@ pub(crate) fn read_files_tool(
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum lines per file. The minimum page is 4096 lines: a smaller value is raised to 4096, so ask for 4096 or more. A cut file returns next_offset."
+                    "description": "Maximum lines per file. The minimum page is 2048 lines: a smaller value is raised to 2048, so ask for 2048 or more. A cut file returns next_offset."
                 }
             },
             "required": ["paths"],
@@ -8283,7 +9031,7 @@ mod tests {
 
     /// The system prompt rides on EVERY step of EVERY turn, so its size is a
     /// per-request cost, not a wording preference. A change that doubles it is a
-    /// performance bug: measured at 9,191 bytes with the full tool roster, and
+    /// performance bug: measured with the full tool roster; codel and run_code add capability-gated bytes, and
     /// the skill catalogue is deliberately NOT part of it (the vendor ranks that
     /// against the request instead). The headroom below the cap is kept for
     /// capability-gated rules, not for prose.
@@ -8292,7 +9040,7 @@ mod tests {
         let built = build(&bare());
         let prompt = &built.agent.config().system_prompt;
         assert!(
-            prompt.len() < 12_000,
+            prompt.len() < 15_000,
             "the system prompt rides on every step: {} bytes",
             prompt.len()
         );
@@ -8401,6 +9149,8 @@ mod tests {
             "read_file",
             "glob",
             "grep",
+            "codel",
+            "run_code",
             "update_plan",
             "find_tool",
         ] {
@@ -9523,14 +10273,14 @@ mod tests {
         assert_eq!(build(&smaller).agent.config().max_tokens, Some(2048));
     }
 
-    /// No tool result is cut: the build hands the engine an unbounded cap, and
-    /// the retired workspace key no longer changes it.
+    /// Large results are capped for the model and spilled under the workspace;
+    /// the retired workspace key no longer changes the cap.
     #[test]
-    fn no_tool_result_is_cut() {
+    fn large_tool_results_are_capped_for_the_model() {
         let mut settings = bare();
         settings.workspace.agent.tool_output_cap = 256;
         let built = build(&settings);
-        assert_eq!(built.agent.config().tool_output_cap, usize::MAX);
+        assert_eq!(built.agent.config().tool_output_cap, 64 * 1024);
     }
 
     /// A selected preset narrows the tools the agent is built with, so the
@@ -9976,6 +10726,7 @@ mod tests {
                 "present_surface".to_string(),
                 "read_file".to_string(),
                 "read_files".to_string(),
+                "run_code".to_string(),
                 "schedule_create".to_string(),
                 "schedule_delete".to_string(),
                 "schedule_edit".to_string(),
@@ -10830,7 +11581,7 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
     /// cannot see until it asks.
     #[test]
     fn the_tool_array_stays_inside_its_wire_budget() {
-        const WIRE_BUDGET_CHARS: usize = 18_000;
+        const WIRE_BUDGET_CHARS: usize = 23_000;
         let built = build(&bare());
         let registry = built
             .agent
@@ -11680,7 +12431,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "a complete read says there is no next line"
         );
 
-        // A request below the 4096-line floor is raised to it: the window
+        // A request below the 2048-line floor is raised to it: the window
         // runs to the end of this 100-line file instead of stopping at 12.
         let window = registry
             .execute(
@@ -11762,11 +12513,11 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         assert_eq!(empty["hint"], "the file is empty");
     }
 
-    /// A read page is at the 4096-line floor: a smaller limit is raised, the
+    /// A read page is at the 2048-line floor: a smaller limit is raised, the
     /// default is the floor, and a larger request is honoured. The next page
     /// continues where the floor stopped.
     #[test]
-    fn a_read_page_is_at_least_4096_lines() {
+    fn a_read_page_is_at_least_2048_lines() {
         let root = scratch("read-page-floor");
         let body: String = (1..=5_000).map(|n| format!("line {n}\n")).collect();
         std::fs::write(root.join("long.txt"), &body).expect("long");
@@ -11777,8 +12528,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .execute("read_file", &serde_json::json!({ "path": "long.txt" }))
             .expect("the default page");
         assert_eq!(default_page["start_line"], 1);
-        assert_eq!(default_page["end_line"], 4096, "{default_page}");
-        assert_eq!(default_page["next_offset"], 4097);
+        assert_eq!(default_page["end_line"], 2048, "{default_page}");
+        assert_eq!(default_page["next_offset"], 2049);
         assert_eq!(default_page["status"], "partial");
 
         // offset=1 is a deliberate re-read; a path-only call would continue
@@ -11789,8 +12540,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 &serde_json::json!({ "path": "long.txt", "offset": 1, "limit": 1 }),
             )
             .expect("a small limit is raised");
-        assert_eq!(raised["end_line"], 4096, "limit 1 reads a whole page");
-        assert_eq!(raised["next_offset"], 4097);
+        assert_eq!(raised["end_line"], 2048, "limit 1 reads a whole page");
+        assert_eq!(raised["next_offset"], 2049);
 
         let large = registry
             .execute(
@@ -11804,11 +12555,11 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         let second = registry
             .execute(
                 "read_file",
-                &serde_json::json!({ "path": "long.txt", "offset": 4097 }),
+                &serde_json::json!({ "path": "long.txt", "offset": 2049 }),
             )
             .expect("the next page");
-        assert_eq!(second["start_line"], 4097);
-        assert_eq!(second["end_line"], 5000);
+        assert_eq!(second["start_line"], 2049);
+        assert_eq!(second["end_line"], 4096);
 
         let batch = registry
             .execute(
@@ -11816,8 +12567,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 &serde_json::json!({ "paths": ["long.txt"], "offset": 1, "limit": 1 }),
             )
             .expect("the batch page");
-        assert_eq!(batch["files"][0]["end_line"], 4096, "{batch}");
-        assert_eq!(batch["files"][0]["next_offset"], 4097);
+        assert_eq!(batch["files"][0]["end_line"], 2048, "{batch}");
+        assert_eq!(batch["files"][0]["next_offset"], 2049);
     }
 
     /// The common call needs only the path: offset defaults to line 1, so a
@@ -11854,16 +12605,17 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 &serde_json::json!({ "path": "a.txt", "limit": 1 }),
             )
             .expect("the first window");
-        assert_eq!(first["end_line"], 4096);
-        assert_eq!(first["next_offset"], 4097);
+        assert_eq!(first["end_line"], 2048);
+        assert_eq!(first["next_offset"], 2049);
         assert!(first.get("next").is_none(), "no duplicate next object");
 
         let continued = registry
             .execute("read_file", &serde_json::json!({ "path": "a.txt" }))
             .expect("the path-only call continues");
-        assert_eq!(continued["start_line"], 4097);
+        assert_eq!(continued["start_line"], 2049);
         assert_eq!(continued["continued"], true);
-        let tail: String = (4097..=5_000).map(|n| format!("line {n}\n")).collect();
+        assert_eq!(continued["next_offset"], 4097);
+        let tail: String = (2049..=4096).map(|n| format!("line {n}\n")).collect();
         assert_eq!(continued["content"], tail);
 
         let reread = registry
@@ -11873,7 +12625,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("offset=1 re-reads from the start");
         assert_eq!(reread["start_line"], 1);
-        assert_eq!(reread["end_line"], 4096);
+        assert_eq!(reread["end_line"], 2048);
 
         // A changed file invalidates the cursor: the next path-only call is a
         // fresh read, not a continuation into bytes that no longer exist.
@@ -11909,8 +12661,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 .starts_with("line 1\n")
         );
         assert_eq!(first["start_line"], 1);
-        assert_eq!(first["end_line"], 4096);
-        assert_eq!(first["next_offset"], 4097);
+        assert_eq!(first["end_line"], 2048);
+        assert_eq!(first["next_offset"], 2049);
         assert!(first.get("next").is_none(), "no duplicate next object");
 
         let zero = registry
@@ -11998,7 +12750,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     #[test]
     fn read_files_obeys_the_combined_output_budget() {
         let root = scratch("read-files-budget");
-        let budget = read_page_bytes(65_536);
+        let budget = read_page_bytes(131_072);
         let body = "x".repeat(budget / 2 + 128);
         std::fs::write(root.join("a.txt"), &body).expect("a");
         std::fs::write(root.join("b.txt"), &body).expect("b");
@@ -12066,12 +12818,12 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .expect("the batch reads");
         assert_eq!(result["files"][0]["status"], "partial");
         assert_eq!(result["files"][0]["start_line"], 2);
-        assert_eq!(result["files"][0]["end_line"], 4097);
-        assert_eq!(result["files"][0]["next_offset"], 4098);
+        assert_eq!(result["files"][0]["end_line"], 2049);
+        assert_eq!(result["files"][0]["next_offset"], 2050);
         assert!(result["files"][0].get("next").is_none());
         let hint = result["files"][0]["hint"].as_str().unwrap_or_default();
         assert!(
-            hint.contains("read_files") && hint.contains("offset=4098"),
+            hint.contains("read_files") && hint.contains("offset=2050"),
             "the cut entry says which file tool and line to continue with: {result}"
         );
         assert!(
@@ -12101,12 +12853,12 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 &serde_json::json!({"path": "a.txt", "offset": 1, "limit": 3}),
             )
             .expect("the first window");
-        assert_eq!(first["next_offset"], 4097);
+        assert_eq!(first["next_offset"], 2049);
         assert!(
             first["hint"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("next_offset=4097"),
+                .contains("next_offset=2049"),
             "the hint names the field and the line: {first}"
         );
         assert!(
@@ -12127,9 +12879,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 }),
             )
             .expect("the returned number continues the read as offset");
-        assert_eq!(continued["start_line"], 4097);
-        assert_eq!(continued["end_line"], 5000);
-        assert!(continued["next_offset"].is_null());
+        assert_eq!(continued["start_line"], 2049);
+        assert_eq!(continued["end_line"], 4096);
+        assert_eq!(continued["next_offset"], 4097);
 
         let batch = registry
             .execute(
@@ -12138,8 +12890,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect("the batch continues at the same line");
         assert_eq!(batch["files"][0]["start_line"], 7);
-        assert_eq!(batch["files"][0]["end_line"], 4102);
-        assert_eq!(batch["files"][0]["next_offset"], 4103);
+        assert_eq!(batch["files"][0]["end_line"], 2054);
+        assert_eq!(batch["files"][0]["next_offset"], 2055);
     }
 
     /// A binary file and a directory are refused by name instead of being
@@ -17079,4 +17831,89 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
         }
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[tokio::test]
+    async fn codel_tool_is_scoped_to_its_workspace() {
+        use std::sync::{Arc, Mutex};
+        use super::CodelTool;
+        use react::tool::registry::AsyncTool as _;
+
+        let root = scratch("codel-scope");
+        std::fs::write(root.join("a.py"), "def quick_sort(items):
+    return sorted(items)
+")
+            .expect("source");
+        let tool = CodelTool {
+            metadata: crate::tool_metadata::builtin_metadata("codel").expect("metadata"),
+            root: Some(root.clone()),
+            workspace: Arc::new(Mutex::new(None)),
+        };
+        let result = tool
+            .run(&serde_json::json!({
+                "action": "search",
+                "query": "quick_sort",
+                "root": "/workspace/two"
+            }))
+            .await
+            .expect("codel search");
+        assert_eq!(
+            result["root"].as_str(),
+            Some(root.canonicalize().expect("canonical").to_string_lossy().as_ref())
+        );
+        assert!(
+            result["hits"]
+                .as_array()
+                .is_some_and(|hits| hits.iter().any(|hit| hit["node"]["name"] == "quick_sort")),
+            "{result}"
+        );
+    }
+    #[test]
+    fn run_code_calls_builtin_tools_through_the_broker() {
+        let root = scratch("run-code-broker");
+        std::fs::write(root.join("a.txt"), "broker-visible
+").expect("a");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let result = registry
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "print(bsh.read_file('a.txt')['content'])"
+                }),
+            )
+            .expect("run_code");
+        let stdout = result["stdout"].as_str().unwrap_or_default();
+        assert!(stdout.contains("broker-visible"), "{result}");
+    }
+
+    #[test]
+    fn memory_tools_have_short_model_names() {
+        let built = build(&bare());
+        let names: Vec<String> = built
+            .agent
+            .model_tools()
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        for short in ["remember", "recall", "forget"] {
+            assert!(
+                names.iter().any(|name| name == short),
+                "{short} is a core memory tool: {names:?}"
+            );
+        }
+    }
+
+
+    #[test]
+    fn codel_is_a_builtin_model_tool() {
+        let built = build(&bare());
+        let tools = built.agent.model_tools();
+        assert!(
+            tools.iter().any(|tool| tool.name == "codel"),
+            "codel is registered as a built-in: {:?}",
+            tools.iter().map(|tool| &tool.name).collect::<Vec<_>>()
+        );
+    }
+
 }

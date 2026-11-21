@@ -7,6 +7,10 @@ authors = ["BrickOS Team"]
 license = "MIT OR Apache-2.0"
 description = "MCP stdio server exposing codel graph queries"
 
+[lib]
+name = "codel_mcp"
+path = "src/lib.rs"
+
 [dependencies]
 codel = { path = "../codel" }
 notify = "9.0.0"

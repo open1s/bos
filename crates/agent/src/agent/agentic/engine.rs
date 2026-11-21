@@ -284,6 +284,9 @@ impl Agent {
             .tool_result_caps(self.tool_output_caps.clone())
             .model(self.config.model.clone())
             .app(app);
+        if let Some(spill) = &self.tool_spill {
+            builder = builder.tool_spill(spill.clone());
+        }
         // A zero budget is "no budget": the loop ends when the model stops
         // asking for tools. The shell runs this way so a long, healthy turn is
         // never cut off by a number; an embedder that wants a runaway guard

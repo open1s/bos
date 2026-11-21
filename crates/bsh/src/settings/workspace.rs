@@ -202,8 +202,10 @@ impl Default for AgentSection {
             // compaction trigger is computed, so a 32k budget with a 12.8k cap
             // left only ~19k usable and compacted in the middle of a research
             // turn (measured: 86 items folded, 85 s of summarizer). The shipped
-            // ceiling has to pay for the reply it reserves.
-            context_budget: 65536,
+            // ceiling has to pay for the reply it reserves. 128k keeps a
+            // codebase-sized working set (call paths, types, tests and earlier
+            // evidence) alive instead of compacting at half the model window.
+            context_budget: 131072,
             verify_command: None,
             max_steps: 0,
             // An hour, not the framework's 60s: a slow provider must be

@@ -104,6 +104,9 @@ fn cut_short(max_tokens: Option<u32>, completion_tokens: Option<u32>) -> bool {
 /// one directed retry to turn that reply into a first tool call; the note names
 /// what a first step looks like and keeps the honest escape for a genuine
 /// blocker.
+pub const ACTION_FIRST_NOTE: &str = "This is an ACTION turn. Your first output must be a tool call, not analysis, a plan, a promise or a question. Inspect the relevant code, run the failing command, or make the edit now; then refine from the tool result.";
+
+/// What the model is told when an ACTION turn closes without a tool call.
 pub const ACTION_NOTE: &str = "This request asks for work in the workspace, and no tool has run this turn. Do not answer with instructions, a plan or a promise. Call the tools now - inspect the relevant files, run the failing command, make the change - then report what you did and what you verified. If you genuinely cannot act, say what blocks you; never claim work you did not do.";
 
 /// What the model is told when every tool call of an ACTION turn failed.
@@ -152,6 +155,16 @@ impl RepeatedFailure {
 /// ask for again with a narrower call.
 const TOOL_RESULT_CAP: usize = crate::tool::result::DEFAULT_RESULT_CAP;
 
+/// Host hook that preserves a tool result the model cap cut.
+///
+/// The engine passes the FULL, uncapped envelope; the host writes it somewhere
+/// the model can read later and returns the path. Returning `None` leaves the
+/// capped envelope unchanged.
+pub trait ToolSpill: Send + Sync {
+    /// Persist one full tool result and return a model-readable path.
+    fn spill(&self, tool: &str, full: &str) -> Option<String>;
+}
+
 /// Render one tool result as the shared envelope, capped for the model.
 ///
 /// Every result the engine hands the model goes through here: a success keeps
@@ -159,10 +172,30 @@ const TOOL_RESULT_CAP: usize = crate::tool::result::DEFAULT_RESULT_CAP;
 /// result the tool itself called partial or pending keeps its continuation.
 /// The envelope is what makes the next iteration's verdict independent of
 /// whether a message happens to contain the words "Error:".
-fn render_tool_result(tool: &str, result: &Result<Value, ReactError>, cap: usize) -> String {
-    match result {
-        Ok(value) => ToolResult::from_value(tool, value.clone()).to_text(cap),
-        Err(error) => ToolResult::from_error(tool, &error.as_tool_error()).to_text(cap),
+fn render_tool_result(
+    tool: &str,
+    result: &Result<Value, ReactError>,
+    cap: usize,
+    spill: Option<&dyn ToolSpill>,
+) -> String {
+    let envelope = match result {
+        Ok(value) => ToolResult::from_value(tool, value.clone()),
+        Err(error) => ToolResult::from_error(tool, &error.as_tool_error()),
+    };
+    let full = envelope.to_text(usize::MAX);
+    if cap == usize::MAX || full.len() <= cap {
+        return full;
+    }
+    let capped = envelope.to_text(cap);
+    let Some(path) = spill.and_then(|hook| hook.spill(tool, &full)) else {
+        return capped;
+    };
+    match serde_json::from_str::<Value>(&capped) {
+        Ok(Value::Object(mut object)) => {
+            object.insert("spill".to_string(), Value::String(path));
+            Value::Object(object).to_string()
+        }
+        _ => capped,
     }
 }
 
@@ -235,6 +268,8 @@ pub struct ReActEngine<A: ReActApp> {
     /// must not cut that page AGAIN, because the page's continuation would then
     /// skip the text the second cut removed.
     tool_result_caps: std::collections::HashMap<String, usize>,
+    /// Optional host hook for preserving results the cap cut.
+    tool_spill: Option<Arc<dyn ToolSpill>>,
     /// The step guard, when the caller asks for one. `None` is the harness
     /// contract: a turn ends when the MODEL stops asking for tools, and a
     /// healthy run must not be cut off by a number. The bound exists for
@@ -272,6 +307,7 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     context_budget: usize,
     tool_result_cap: usize,
     tool_result_caps: std::collections::HashMap<String, usize>,
+    tool_spill: Option<Arc<dyn ToolSpill>>,
     parallel_tool_calls: bool,
     telemetry: Telemetry,
     resilience: Option<ReActResilience>,
@@ -673,6 +709,11 @@ impl<A: ReActApp> ReActEngine<A> {
         // turn before it is accepted as an answer.
         let mut trace = TurnTrace::new(request.intent, &*context);
         'turn: loop {
+            if steps == 0 && request.intent == ActionIntent::Action {
+                request
+                    .host_guidance
+                    .push(HostGuidance::new("action-first", ACTION_FIRST_NOTE));
+            }
             if self.max_steps.is_some_and(|bound| steps >= bound) {
                 if closing {
                     break;
@@ -979,6 +1020,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                     &observed,
                                     &result,
                                     self.result_cap_for(&observed),
+                                    self.tool_spill.as_deref(),
                                 );
                                 trace.note_tool_result(result.is_ok());
 
@@ -1263,6 +1305,7 @@ impl<A: ReActApp> ReActEngine<A> {
                                     &observed,
                                     &result,
                                     self.result_cap_for(&observed),
+                                    self.tool_spill.as_deref(),
                                 );
                                 trace.note_tool_result(result.is_ok());
 
@@ -1703,8 +1746,12 @@ impl<A: ReActApp> ReActEngine<A> {
                             }
                             // The same envelope the batch paths use, so a
                             // streamed turn and a collected one read alike.
-                            let result_text =
-                                render_tool_result(&observed, &result, self.result_cap_for(&observed));
+                            let result_text = render_tool_result(
+                                &observed,
+                                &result,
+                                self.result_cap_for(&observed),
+                                self.tool_spill.as_deref(),
+                            );
                             trace.note_tool_result(result.is_ok());
 
                             // A failed call is the one line the log was
@@ -2077,5 +2124,35 @@ mod repeat_guard_tests {
             guard.note("bash", result);
         }
         assert!(!guard.note("read_file", result));
+    }
+    #[test]
+    fn a_capped_result_names_its_spill() {
+        use std::sync::{Arc, Mutex};
+
+        struct Capture(Arc<Mutex<Option<String>>>);
+        impl super::ToolSpill for Capture {
+            fn spill(&self, _tool: &str, full: &str) -> Option<String> {
+                *self.0.lock().expect("lock") = Some(full.to_owned());
+                Some(".bsh-spill/test.json".to_owned())
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let text = super::render_tool_result(
+            "read_file",
+            &Ok(serde_json::json!({ "content": "x".repeat(4_000) })),
+            256,
+            Some(&Capture(captured.clone())),
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["spill"], ".bsh-spill/test.json");
+        assert!(value["truncated"].as_bool().unwrap_or(false));
+        assert!(
+            captured
+                .lock()
+                .expect("lock")
+                .as_ref()
+                .is_some_and(|full| full.len() > 4_000)
+        );
     }
 }

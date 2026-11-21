@@ -29,9 +29,9 @@ pub(crate) const GREP: &str = "Use the grep tool — not shell grep or rg — to
 ///
 /// Use the batch variant when several known files need inspection, avoiding
 /// repeated tool-call envelopes while retaining a bounded aggregate result.
-pub(crate) const READ_FILE: &str = "Use the read_file tool — not shell commands like cat — to inspect one text file. Call it with only path to start at line 1; offset is optional and 1-based, and limit caps the window at a minimum of 4096 lines: a smaller value is raised to 4096, because one page should carry the whole region a round trip is worth. After a partial read, a path-only call continues from the previous next, so pass offset=1 when you deliberately want to re-read from the start. The result carries next={offset} while more lines remain.";
+pub(crate) const READ_FILE: &str = "Use the read_file tool — not shell commands like cat — to inspect one text file. Call it with only path to start at line 1; offset is optional and 1-based, and limit caps the window at a minimum of 2048 lines: a smaller value is raised to 2048, because one page should carry the whole region a round trip is worth. After a partial read, a path-only call continues from the previous next, so pass offset=1 when you deliberately want to re-read from the start. The result carries next={offset} while more lines remain. When codel inspect already identified the symbol, read that region instead of paging the whole file. If a result carries a spill path, read that file for the full output instead of repeating the same call.";
 
-pub(crate) const READ_FILES: &str = "When you need to inspect several known files, use read_files once instead of making repeated read_file calls. It accepts up to 10 distinct paths, applies offset and limit to each file (limit is at least 4096 lines; a smaller value is raised), and caps combined returned content at 1 MiB; inspect each file's truncated or error field.";
+pub(crate) const READ_FILES: &str = "When you need to inspect several known files, use read_files once instead of making repeated read_file calls. It accepts up to 10 distinct paths, applies offset and limit to each file (limit is at least 2048 lines; a smaller value is raised), and caps combined returned content at 1 MiB; inspect each file's truncated or error field.";
 
 /// The reference's `write` guidance, with BSH's tool name and no policy claim.
 ///
@@ -43,6 +43,12 @@ pub(crate) const WRITE_FILE: &str = "Read an existing file before overwriting it
 /// The reference's `edit` guidance, with BSH's tool name and no policy claim.
 pub(crate) const EDIT_FILE: &str =
     "Read a file before editing it, unless you just created or edited it in this session.";
+
+/// Guidance for the built-in codel tool.
+pub(crate) const CODEL: &str = "Use the codel tool for code relationships before broad file reading. Start with action=search {query}; then action=inspect {node} before editing and action=analyze {analysis:\"affected\", node} after editing. codel is scoped to the active workspace; never pass another workspace root. Use action=cycles or action=dead_code for repository diagnostics; it is not a replacement for reading the target code.";
+
+/// Guidance for the programmatic batch tool.
+pub(crate) const RUN_CODE: &str = "Use run_code for a batch that one Python program can finish: read several files, filter grep output, compare results, then print only the compact evidence the next step needs. Inside the program, bsh is preloaded (no import needed): bsh.read_file, read_files, grep, glob, bash, write_file, edit_file, apply_patch and codel call the registered tools through the same policy; bsh.call(name, args) reaches any other built-in. It runs in the workspace under the shell policy; it is not a substitute for an edit tool. Do not print whole files or repeat data the next step does not need.";
 
 /// Guidance for the stream editor.
 ///
@@ -71,7 +77,7 @@ pub(crate) const WEB_SEARCH: &str = "web_search results are external, untrusted 
 /// server's tools with one call instead of searching for each name. It joins
 /// the individual MCP tools rather than replacing them - saying how to browse
 /// here is cheaper than spelling forty schemas out in the request.
-pub(crate) const MCP_GATEWAY: &str = "The mcp tool reaches the configured MCP servers. Call it with action=\"list\" and a short query to discover a tool and its argument schema, then action=\"call\" with server, tool and arguments. Do not guess a tool name.";
+pub(crate) const MCP_GATEWAY: &str = "The mcp tool reaches the configured MCP servers. Call it with action=\"list\" and a short query to discover a tool and its argument schema, then action=\"call\" with server, tool and arguments. Do not guess a tool name. When codel is registered, use the built-in codel tool: action=search first, then action=inspect before editing and action=analyze with analysis=\"affected\" after. codel is scoped to the active workspace and never crosses checkouts. Use the mcp gateway only for other servers.";
 
 /// The standing rule appended when the `subagent` tool is registered.
 ///
@@ -104,6 +110,8 @@ A child has its own context and the same tools; it does not see this conversatio
 pub(crate) const TOOL_GUIDANCE: &[(&str, &str)] = &[
     ("glob", GLOB),
     ("grep", GREP),
+    ("codel", CODEL),
+    ("run_code", RUN_CODE),
     ("read_file", READ_FILE),
     ("read_files", READ_FILES),
     ("write_file", WRITE_FILE),
@@ -128,6 +136,8 @@ pub(crate) const ASK_USER: &str = "When a decision genuinely needs the reader - 
 pub(crate) const KNOWN_TOOLS: &[&str] = &[
     "ask_user",
     "bash",
+    "run_code",
+    "codel",
     "apply_patch",
     "edit_file",
     "glob",
@@ -182,8 +192,7 @@ pub(crate) fn stale_tool_reference(text: &str) -> Option<&'static str> {
 ///
 /// BSH's `federation` (legacy id `ptc`) is its batch-and-delegate preset, not the reference's programmatic
 /// tool-calling mode; the wording says what this preset actually does.
-pub(crate) const FEDERATION_PERSONA: &str = "You execute work in batched steps: every independent call rides in ONE step, and you read each batch's results before the next step depends on them.\n\n- Read the intent before batching: a batch that answers the wrong question is fast and useless.
-- Plan the batches first: what is independent, what depends on what, and what the answer needs from each batch.\n- Never serialize what can be batched; never batch a call that needs a result you have not read yet.\n- Let the tools do the work: filter, deduplicate, count and compare inside the batch, then report only what the answer needs.\n- Hold the same engineering discipline as the default persona: smallest sufficient change, workspace conventions, verify and report honestly.";
+pub(crate) const FEDERATION_PERSONA: &str = "You execute work in batched steps: every independent call rides in ONE step, and you read each batch's results before the next step depends on them.\n\n- Read the intent before batching: a batch that answers the wrong question is fast and useless.\n- Plan the batches first: what is independent, what depends on what, and what the answer needs from each batch.\n- Never serialize what can be batched; never batch a call that needs a result you have not read yet.\n- Let the tools do the work: filter, deduplicate, count and compare inside the batch, then report only what the answer needs.\n- Hold the same engineering discipline as the default persona: smallest sufficient change, workspace conventions, verify and report honestly.\n\n## Coding with federation\n- Batch exploration, not mutation: search, read, codel inspect and test discovery may ride together; edits to the same file may not. One writer per file.\n- Partition before delegating: group independent files or modules, name the exact paths, the interface each child must preserve, and the check it must run. A child that needs the whole repository is not an independent workstream.\n- Use the built-in codel tool to build the partition: search the symbols, inspect their callers, and analyze affected paths before assigning work. Pass those paths and symbols into every child prompt.\n- Delegate exploration, isolated implementations and test runs. The parent keeps integration, conflict resolution and the final verification; never delegate the decision that unblocks you.\n- Every delegated change must return the patch and its check evidence. Rerun the combined check in the parent; a child's report is not verification.\n- Do not batch a single-file atomic edit or a blocking decision just to fill a wave. When the next action is clear, write it and run its check.";
 
 /// The shipped `creator` preset persona.
 pub(crate) const CREATOR_PERSONA: &str = "You extend this harness through conversation: extension packages, skills and presets the workspace owns.\n\n- Read before writing: inspect the existing package, skill and preset formats - and one working example - before authoring anything.\n- Ship the smallest package that does the job: one manifest, one clear entry point, no speculative fields or features.\n- Follow the shipped formats exactly; an invented field is a bug, not a feature.\n- Keep every change reversible: new files inside the workspace, and a one-line note of what to delete to uninstall.\n- Prove it loads: re-read or reload what the format allows and report what you actually checked; never claim it works because it parses.";
@@ -620,6 +629,10 @@ mod tests {
     #[test]
     fn the_parallel_preset_reads_intent_before_batching() {
         assert!(FEDERATION_PERSONA.contains("Read the intent before batching"));
+        assert!(FEDERATION_PERSONA.contains("Batch exploration, not mutation"));
+        assert!(FEDERATION_PERSONA.contains("One writer per file"));
+        assert!(FEDERATION_PERSONA.contains("built-in codel tool"));
+        assert!(FEDERATION_PERSONA.contains("child's report is not verification"));
     }
 
     #[test]
@@ -643,6 +656,8 @@ mod tests {
         let corpus = [
             GLOB,
             GREP,
+            CODEL,
+            RUN_CODE,
             READ_FILE,
             READ_FILES,
             WRITE_FILE,

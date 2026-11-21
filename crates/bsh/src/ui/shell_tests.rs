@@ -15551,8 +15551,8 @@ fn the_context_meter_opens_the_measured_breakdown_panel(cx: &mut TestAppContext)
     );
     assert_eq!(
         cx.update(|_, cx| shell.read(cx).state.context_percent()),
-        Some(25),
-        "16384 of the 65536 budget reads 25%"
+        Some(13),
+        "16384 of the 131072 budget reads 13%"
     );
     cx.simulate_click(trigger.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));

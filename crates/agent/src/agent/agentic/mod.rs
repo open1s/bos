@@ -549,6 +549,9 @@ pub struct Agent {
     /// step; shared with the engine's app so the step can drain it.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     steers: Arc<SteerMailbox>,
+    /// Optional host hook preserving results the context cap cut.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    tool_spill: Option<Arc<dyn react::engine::ToolSpill>>,
 }
 
 impl Agent {
@@ -624,6 +627,7 @@ impl Agent {
             last_stream_tool_calls: std::sync::Mutex::new(0),
             last_stream_tool_time: std::sync::Mutex::new(std::time::Duration::ZERO),
             steers: Arc::new(SteerMailbox::new()),
+            tool_spill: None,
         }
     }
 
@@ -951,6 +955,13 @@ impl Agent {
         *slot = react::telemetry::TokenUsage::default();
         Some(usage)
     }
+    /// Install a host hook that preserves results cut by the model cap.
+    #[must_use]
+    pub fn with_tool_spill(mut self, spill: Arc<dyn react::engine::ToolSpill>) -> Self {
+        self.tool_spill = Some(spill);
+        self
+    }
+
     /// Set the send-side history ceiling for mid-turn compaction.
     ///
     /// Zero disables it. The host passes the same resolved window it prices a
@@ -2736,6 +2747,7 @@ impl Clone for Agent {
             // mailbox: sharing one would let a clone take (or withdraw) the
             // other's mid-turn messages.
             steers: Arc::new(SteerMailbox::new()),
+            tool_spill: self.tool_spill.clone(),
         }
     }
 }

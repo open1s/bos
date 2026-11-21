@@ -16,6 +16,7 @@ name = "bsh"
 path = "src/main.rs"
 
 [dependencies]
+codel-mcp = { path = "../codel-mcp" }
 ferris-sdk = { path = "../ferris-sdk", features = ["host-runtime"] }
 federation = { path = "../federation" }
 bus = { path = "../bus" }

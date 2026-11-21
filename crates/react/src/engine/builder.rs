@@ -14,6 +14,7 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             tool_result_cap: TOOL_RESULT_CAP,
             // No per-tool override until a host names one.
             tool_result_caps: std::collections::HashMap::new(),
+            tool_spill: None,
             parallel_tool_calls: false,
             telemetry: Telemetry::new(),
             resilience: None,
@@ -86,6 +87,12 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
     /// reads obeys the same cap its UI does instead of an engine constant.
     pub fn tool_result_cap(mut self, cap: usize) -> Self {
         self.tool_result_cap = if cap == 0 { TOOL_RESULT_CAP } else { cap };
+        self
+    }
+
+    /// Install a host hook that preserves results cut by the model cap.
+    pub fn tool_spill(mut self, spill: Arc<dyn ToolSpill>) -> Self {
+        self.tool_spill = Some(spill);
         self
     }
 
@@ -222,6 +229,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             context_budget: self.context_budget,
             tool_result_cap: self.tool_result_cap,
             tool_result_caps: self.tool_result_caps,
+            tool_spill: self.tool_spill,
             parallel_tool_calls: self.parallel_tool_calls,
             telemetry: self.telemetry,
             llm_timeout_secs: self.llm_timeout_secs,

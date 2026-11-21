@@ -1396,6 +1396,7 @@ dependencies = [
  "base64 0.23.1",
  "bus",
  "chacha20poly1305",
+ "codel-mcp",
  "config",
  "conpty",
  "dirs 7.0.0",
