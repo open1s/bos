@@ -1,0 +1,22 @@
+[package]
+name = "codel-mcp"
+version = "4.1.21"
+edition = "2024"
+rust-version = "1.97"
+authors = ["BrickOS Team"]
+license = "MIT OR Apache-2.0"
+description = "MCP stdio server exposing codel graph queries"
+
+[dependencies]
+codel = { path = "../codel" }
+notify = "9.0.0"
+sha2 = "0.11.1"
+tree-sitter = "=0.26.13"
+serde_json = "1.0.154"
+
+[dev-dependencies]
+scip = "=0.10.0"
+tempfile = "3"
+
+[lints.rust]
+linker_messages = "allow"

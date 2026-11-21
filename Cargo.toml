@@ -19,7 +19,8 @@ members = [
     "crates/ferris-bindings",
     "crates/ferris-smoke",
     "crates/bsh",
-    "crates/codintelli"
+    "crates/codel",
+    "crates/codel-mcp"
 ]
 resolver = "2"
 

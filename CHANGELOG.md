@@ -163,7 +163,7 @@
 ## v4.1.18 (2026-11-17)
 
 - **Release-gate fixes.** Federation capability tests now pass the required
-  `read_file` offset; the stale `codintelli` query-limit doc links no longer
+  `read_file` offset; the stale `codel` query-limit doc links no longer
   fail the docs build; and Extension prompt activation no longer fires merely
   because an extension tool is admitted - the task must name the capability, so
   an unrelated research turn does not carry the Extension DevKit workflow.
@@ -269,7 +269,7 @@
   retry as an authorized deduplicated compensating protocol, runtime task
   verification, session restore, and a long-horizon/restart/crash corpus
   (#416-#433).
-- **codintelli resource limits.** Query and native parse paths now enforce the
+- **codel resource limits.** Query and native parse paths now enforce the
   shared scan budget and cancellation contract (#398-#403).
 
 ## v4.1.14 (2026-11-16)
@@ -288,7 +288,7 @@
   checked before the content type, the SSE response is selected by request id
   (notifications and multi-line events included), and `MCP-Protocol-Version`
   is sent.
-- **The workspace resolves again.** codintelli's Tree-sitter pin follows BSH's
+- **The workspace resolves again.** codel's Tree-sitter pin follows BSH's
   (`0.26.13`), removing the `links = "tree-sitter"` conflict that blocked a
   whole-workspace build.
 
@@ -308,13 +308,13 @@
   `process`/`mcp` children and the Cordis bridge inherit the PATH BSH built,
   so a package that runs `jj`, a Homebrew `git` or a version-managed tool
   finds it even when BSH itself was started from Finder.
-- **codintelli, the host-independent code-intelligence engine, lands as a
+- **codel, the host-independent code-intelligence engine, lands as a
   compiling, documented workspace crate.** It confines every read to a
   host-supplied workspace, bounds scans with one shared budget, parses Rust with
   upstream Tree-sitter, and exposes native `ParsedDocument`s with a versioned
   Tree-sitter query registry and bounded, cancellable query execution (TS-02).
   It stores no custom AST and never executes project code; the architecture and
-  TS-02 design documents live in `crates/codintelli/`.
+  TS-02 design documents live in `crates/codel/`.
 
 ## v4.1.12 (2026-11-16)
 
