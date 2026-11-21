@@ -171,7 +171,11 @@ const THINK_STREAM_WINDOW: usize = 4 * 1024;
 ///
 /// A step is a laid-out row even when folded; a group can hold thousands of
 /// them, so the page bounds a frame's work regardless of the run's length.
-const PROCESS_STEP_PAGE: usize = 40;
+const PROCESS_STEP_PAGE: usize = 12;
+
+/// Rows one message timeline draws before its "show more" page. A thinking or
+/// content segment is a row even when the tool calls are grouped.
+const TIMELINE_ROW_PAGE: usize = 12;
 
 /// The text a live reasoning body paints: the newest window of the thought.
 ///
@@ -4377,9 +4381,21 @@ impl Shell {
         let mut reasoning_at = 0usize;
         let mut content_at = 0usize;
         let mut grouped_drawn = false;
+        // A turn's timeline can hold one part per step, so a thousand-step run
+        // drew a thousand reasoning rows in one frame even when its tool rows
+        // were grouped. Bound the rows here as the process body is bounded:
+        // one page at a time, with an explicit way to extend it.
+        let extra = self.timeline_more.get(&index).copied().unwrap_or(0);
+        let limit = TIMELINE_ROW_PAGE + extra;
+        let mut drawn = 0usize;
+        let mut skipped = 0usize;
         for (part, segment) in message.parts.iter().enumerate() {
             match *segment {
                 TurnPart::Thinking(bytes) => {
+                    if drawn >= limit {
+                        skipped += 1;
+                        continue;
+                    }
                     let start = reasoning_at.min(message.reasoning.len());
                     let end = (reasoning_at + bytes).min(message.reasoning.len());
                     reasoning_at = end;
@@ -4395,8 +4411,13 @@ impl Shell {
                         chrome,
                         cx,
                     ));
+                    drawn += 1;
                 }
                 TurnPart::Content(bytes) => {
+                    if drawn >= limit {
+                        skipped += 1;
+                        continue;
+                    }
                     let start = content_at.min(message.text.len());
                     let end = (content_at + bytes).min(message.text.len());
                     content_at = end;
@@ -4417,6 +4438,7 @@ impl Shell {
                                 cx,
                             )),
                     );
+                    drawn += 1;
                 }
                 TurnPart::Tool(tool_index) => {
                     let Some(tool) = message.tools.get(tool_index) else {
@@ -4426,12 +4448,41 @@ impl Shell {
                         if !grouped_drawn {
                             grouped_drawn = true;
                             column = column.child(self.process_group(index, message, chrome, cx));
+                            drawn += 1;
                         }
+                    } else if drawn >= limit {
+                        skipped += 1;
                     } else {
                         column = column.child(self.tool_row(index, tool_index, tool, chrome, cx));
+                        drawn += 1;
                     }
                 }
             }
+        }
+        if skipped > 0 {
+            let page = skipped.min(TIMELINE_ROW_PAGE);
+            let label = crate::i18n::tr_args(
+                self.state.lang,
+                "transcript.moreSteps",
+                &[("count", page.to_string())],
+            );
+            column = column.child(
+                div()
+                    .id(SharedString::from(format!("timeline-more-{index}")))
+                    .debug_selector(move || format!("timeline-more-{index}"))
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .rounded(px(6.0))
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(label, 11.0, theme::muted()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        *this.timeline_more.entry(index).or_default() += TIMELINE_ROW_PAGE;
+                        cx.notify();
+                    })),
+            );
         }
         // The running line, while the turn works and no text has landed yet.
         if message.text.is_empty() && message.error.is_none() && turn.writing && !turn.settled {

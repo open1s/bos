@@ -747,6 +747,11 @@ pub(crate) struct Shell {
     /// A group can hold thousands of calls, and every step is a laid-out row:
     /// drawing them all made one frame cost the length of the run.
     pub(crate) process_more: std::collections::HashMap<usize, usize>,
+    /// Extra timeline rows an open turn shows beyond the first page (per
+    /// message), for the same reason `process_more` exists.
+    pub(crate) timeline_more: std::collections::HashMap<usize, usize>,
+    /// When the task-resume scan last ran; it parses task files on the UI thread.
+    task_resume_checked: Option<std::time::Instant>,
     /// The compaction markers the reader has expanded, by record index.
     ///
     /// Scoped like the reasoning disclosures: a session switch closes them,
@@ -2363,6 +2368,8 @@ impl Shell {
             question_progress: std::collections::HashMap::new(),
             process_open: std::collections::HashSet::new(),
             process_more: std::collections::HashMap::new(),
+            timeline_more: std::collections::HashMap::new(),
+            task_resume_checked: None,
             compaction_open: std::collections::HashSet::new(),
             chat_last_offset: 0.0,
             traj_last_offset: 0.0,
@@ -2696,7 +2703,16 @@ impl Shell {
                         // schedule: an accepted delegation is claimed by this tick.
                         this.settle_observed_tasks();
                         this.check_peer_delegation_cancels();
-                        this.check_task_resumes(cx);
+                        // Parsing every workspace's task files is a disk +
+                        // serde walk on the UI thread; a resume that waits a
+                        // few more seconds is cheap, a hitch every 5s is not.
+                        let due = this.task_resume_checked.is_none_or(|last| {
+                            last.elapsed() >= std::time::Duration::from_secs(30)
+                        });
+                        if due {
+                            this.task_resume_checked = Some(std::time::Instant::now());
+                            this.check_task_resumes(cx);
+                        }
                         this.check_peer_tasks(cx);
                         this.check_peer_delegations(cx);
                         this.check_peer_task_deadlines();
@@ -7934,6 +7950,7 @@ impl Render for Shell {
             self.question_progress.clear();
             self.process_open.clear();
             self.process_more.clear();
+            self.timeline_more.clear();
             self.image_lightbox = None;
             self.compaction_open.clear();
             // The audit's folds name turn and call positions in the transcript
