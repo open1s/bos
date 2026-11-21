@@ -30724,6 +30724,24 @@ fn a_model_recorded_completion_stops_the_goal_loop(cx: &mut TestAppContext) {
         let id = state.active_id.clone().expect("an active session");
         state.set_goal(&id, Some("ship the palette"));
         state.begin_goal_turn_in(&id).expect("a goal round");
+        if let Some(message) = state
+            .store
+            .session_mut(&id)
+            .and_then(|session| session.messages.last_mut())
+        {
+            for (name, args) in [
+                ("apply_patch", "{}"),
+                ("bash", "{\"command\":\"cargo test\"}"),
+            ] {
+                message.tools.push(ToolEvent {
+                    name: name.to_string(),
+                    args: args.to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+            }
+        }
         // What spawn_turn attaches for the tools: the goal after the round
         // advanced, wrapped in the store the model writes through.
         let goal = state.goal(&id).expect("the seeded goal");
@@ -30758,6 +30776,36 @@ fn a_model_recorded_completion_stops_the_goal_loop(cx: &mut TestAppContext) {
     );
     let next = cx.update(|_, cx| shell.update(cx, |this, _cx| this.state.begin_goal_turn_in(&id)));
     assert!(next.is_none(), "a completed goal starts no round");
+}
+
+/// A goal round that changed no file is a research round, not progress: the
+/// loop blocks the goal instead of asking for the same read again.
+#[gpui::test]
+fn a_goal_round_without_a_change_blocks_instead_of_looping(cx: &mut TestAppContext) {
+    use agent::goal::GoalState;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("goal-no-progress", 2);
+        let id = state.active_id.clone().expect("an active session");
+        state.set_goal(&id, Some("ship the palette"));
+        state.begin_goal_turn_in(&id).expect("a goal round");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx
+        .update(|_, cx| shell.read(cx).state.active_id.clone())
+        .expect("the active session");
+    let (tx, rx) = async_channel::unbounded();
+    cx.update(|_, cx| shell.update(cx, |this, cx| this.pump_for_test(id.clone(), rx, cx)));
+    tx.try_send(crate::runner::AgentEvent::Done)
+        .expect("the terminal event");
+    cx.run_until_parked();
+    let goal = cx
+        .update(|_, cx| shell.read(cx).state.goal(&id))
+        .expect("the goal");
+    assert_eq!(goal.state, GoalState::Blocked, "no change blocks the round");
+    assert!(!goal.activation.is_armed(), "and the loop stops");
 }
 
 /// A goal created while a turn is already running arms, but opens no second

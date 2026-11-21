@@ -1175,6 +1175,7 @@ fn build_agent_for_session_inner(
                     policy.clone(),
                     session.to_string(),
                     preset.clone(),
+                    read_page_bytes(eff.context_budget),
                 )),
                 declare("read_file"),
             )));
@@ -1187,6 +1188,7 @@ fn build_agent_for_session_inner(
                     policy.clone(),
                     session.to_string(),
                     preset.clone(),
+                    MAX_READ_PAGE_BYTES,
                 )),
                 declare("read_files"),
             )));
@@ -4210,6 +4212,15 @@ const DEFAULT_READ_LINES: usize = MIN_READ_LINES;
 /// single line that would otherwise flood the request.
 const MAX_READ_PAGE_BYTES: usize = 1024 * 1024;
 
+/// Bytes one read page may carry for a given context window.
+///
+/// A page is a fifth of the window (the engine's own 4-bytes-a-token
+/// estimate), so one read cannot force a compaction on its own. The floor
+/// keeps a small window useful; the ceiling is the old absolute page cap.
+pub(crate) fn read_page_bytes(context_budget: usize) -> usize {
+    (context_budget.saturating_mul(4) / 5).clamp(48 * 1024, MAX_READ_PAGE_BYTES)
+}
+
 /// The entries one `list_dir` call collects before it stops reading.
 const MAX_LIST_ENTRIES: usize = 10_000;
 
@@ -4327,7 +4338,12 @@ fn binary(target: &Path, at: usize) -> ToolError {
 }
 
 /// Read one line window without loading the rest of the file.
-fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome, ToolError> {
+fn read_window(
+    target: &Path,
+    offset: usize,
+    limit: usize,
+    page_bytes: usize,
+) -> Result<ReadOutcome, ToolError> {
     let (file, meta) = open_regular(target)?;
     // A file inside the read ceiling is scanned to EOF so the model gets an
     // exact total, not a guess. A larger file stops at the window and reports
@@ -4354,7 +4370,7 @@ fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome
             break;
         }
         if index >= offset {
-            if kept < limit && out.len() + line.len() <= MAX_READ_PAGE_BYTES {
+            if kept < limit && out.len() + line.len() <= page_bytes {
                 if kept == 0 {
                     base = consumed;
                 }
@@ -4364,9 +4380,9 @@ fn read_window(target: &Path, offset: usize, limit: usize) -> Result<ReadOutcome
                 // A window that cannot return even its first line must say so:
                 // an empty page whose next offset is the same line would be an infinite
                 // retry loop for the model.
-                if kept == 0 && out.len() + line.len() > MAX_READ_PAGE_BYTES {
+                if kept == 0 && out.len() + line.len() > page_bytes {
                     return Err(ToolError::Failed(format!(
-                        "line {index} is {} bytes, past the {MAX_READ_PAGE_BYTES} byte read page; read it with a shell slice (sed or cut) instead, or an earlier offset when the file has more than this line",
+                        "line {index} is {} bytes, past the {page_bytes} byte read page; read it with a shell slice (sed or cut) instead, or an earlier offset when the file has more than this line",
                         line.len()
                     )));
                 }
@@ -5042,6 +5058,7 @@ pub(crate) fn read_file_tool(
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
+    page_bytes: usize,
 ) -> FunctionTool {
     // Per-tool read cursor: a path-only call after a partial read continues
     // where the previous window ended instead of returning the same lines. The
@@ -5108,7 +5125,7 @@ pub(crate) fn read_file_tool(
                     }
                 }
             };
-            let read = read_window(&target, offset, limit)?;
+            let read = read_window(&target, offset, limit, page_bytes)?;
             let ReadOutcome {
                 content,
                 truncated,
@@ -5200,6 +5217,7 @@ pub(crate) fn read_files_tool(
     policy: Arc<PolicySet>,
     session: String,
     preset: String,
+    page_bytes: usize,
 ) -> FunctionTool {
     FunctionTool::new(
         "read_files",
@@ -5335,7 +5353,7 @@ pub(crate) fn read_files_tool(
                         }));
                     }
 
-                    let read = read_window(&target, offset.unwrap_or(1), limit)?;
+                    let read = read_window(&target, offset.unwrap_or(1), limit, page_bytes)?;
                     let ReadOutcome {
                         content,
                         truncated: file_truncated,

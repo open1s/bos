@@ -154,6 +154,8 @@
 "goal.clear": "清除目标"
 "goal.cleared": "目标已清除。"
 "goal.disarmedOnError": "本轮失败，目标已停止续行"
+"goal.verificationMissing": "未标记完成：本轮必须先修改文件并运行项目检查。"
+"goal.noProgress": "本轮没有产生文件修改；目标已阻塞，而不是继续空转。"
 "context.compacted": "较早的对话已压缩：{count} 条消息已移出上下文，仍保留在记录中。"
 "input.send": "发送消息"
 "input.stop": "停止生成"

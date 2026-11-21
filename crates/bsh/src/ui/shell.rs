@@ -6088,7 +6088,22 @@ impl Shell {
                         if failed {
                             shell.disarm_goal_on_error(&session_id, cx);
                         } else {
-                            shell.continue_goal(&session_id, cx);
+                            // A goal round that changed no file is a research
+                            // round, not progress: block it instead of asking
+                            // the model to read the same files again.
+                            let open = shell.state.goal(&session_id).is_some_and(|goal| {
+                                goal.state.is_open() && goal.activation.is_armed()
+                            });
+                            if shell.state.was_goal_round(&session_id)
+                                && open
+                                && !shell.state.round_edits(&session_id)
+                            {
+                                let why = crate::i18n::tr(shell.state.lang, "goal.noProgress");
+                                shell.state.block_goal(&session_id, "no-progress", &why);
+                                shell.state.notice(why);
+                            } else {
+                                shell.continue_goal(&session_id, cx);
+                            }
                         }
                     }
                     shell.frame_notify(

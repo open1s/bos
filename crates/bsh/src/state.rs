@@ -118,6 +118,37 @@ fn tail_bytes(session: &Session, tail: usize) -> usize {
 }
 
 /// Close a turn's measured span, when it has a start and no end yet.
+/// A tool that changes a workspace file.
+fn is_edit_tool(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file" | "apply_patch" | "sed")
+}
+
+/// Whether a bash call's command is the project's own check.
+fn command_is_check(args: &str) -> bool {
+    let command = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("command")
+                .and_then(|cmd| cmd.as_str())
+                .map(str::to_lowercase)
+        })
+        .unwrap_or_default();
+    [
+        "cargo check",
+        "cargo test",
+        "cargo clippy",
+        "npm test",
+        "npm run test",
+        "pytest",
+        "go test",
+        "make test",
+        "just test",
+    ]
+    .iter()
+    .any(|check| command.contains(check))
+}
+
 fn settle_ms(message: &mut ChatMessage, at: u64) {
     let Some(start) = message.timing().and_then(|timing| timing.start) else {
         return;
@@ -616,6 +647,9 @@ pub(crate) struct AppState {
     pub(crate) collapsed: BTreeSet<String>,
     /// Session id to the instant its stream started.
     pub(crate) streams: HashMap<String, u64>,
+    /// Sessions whose current turn is a goal round (set by the round opener,
+    /// cleared by a manual turn), for the no-progress gate.
+    goal_rounds: std::collections::HashSet<String>,
     /// The global row each running turn's mutable tail starts at.
     ///
     /// The log cannot update a row in place, so a turn that streams for
@@ -1037,6 +1071,7 @@ impl AppState {
             active_id: None,
             collapsed: BTreeSet::new(),
             streams: HashMap::new(),
+            goal_rounds: std::collections::HashSet::new(),
             inflight_tails: HashMap::new(),
             journaled_at: HashMap::new(),
             turn_seen: HashMap::new(),
@@ -2830,6 +2865,7 @@ impl AppState {
         };
         self.inflight_tails.insert(id.clone(), tail);
         self.streams.insert(id.clone(), now());
+        self.goal_rounds.remove(&id);
         self.turn_seen.insert(id.clone(), std::time::Instant::now());
         self.turn_started = Some(std::time::Instant::now());
         self.checkpoint_turn(&id, true);
@@ -2883,6 +2919,7 @@ impl AppState {
         }
         self.inflight_tails.insert(session_id.to_string(), tail);
         self.streams.insert(session_id.to_string(), now());
+        self.goal_rounds.insert(session_id.to_string());
         self.turn_seen
             .insert(session_id.to_string(), std::time::Instant::now());
         self.turn_started = Some(std::time::Instant::now());
@@ -3308,6 +3345,17 @@ impl AppState {
     pub(crate) fn settle_goal(&mut self, id: &str) -> Option<GoalSettle> {
         let store = self.goals.remove(id)?;
         let settle = store.take_settle()?;
+        // A completion is only honest with a change AND its check in the same
+        // round; otherwise the goal blocks with the missing evidence named.
+        let settle = match settle {
+            GoalSettle::Complete if !self.round_edits(id) || !self.round_verified(id) => {
+                GoalSettle::Blocked {
+                    code: "verification".to_string(),
+                    message: crate::i18n::tr(self.lang, "goal.verificationMissing"),
+                }
+            }
+            other => other,
+        };
         // Fence the settlement by the identity/revision the round started
         // under. Pause, edit, clear or resume while the round was running
         // bumps the durable revision (or replaces the identity), so a late
@@ -4344,6 +4392,46 @@ impl AppState {
     ///
     /// Only NEW rows are walked, so the cost follows one turn, not the whole
     /// log; the result is saved with the session and read by the Audit tab.
+    /// Whether this session's current turn is a goal round.
+    pub(crate) fn was_goal_round(&self, id: &str) -> bool {
+        self.goal_rounds.contains(id)
+    }
+
+    /// Whether the round's last assistant row made a successful file edit.
+    pub(crate) fn round_edits(&self, id: &str) -> bool {
+        self.round_tools(id).is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                is_edit_tool(&tool.name)
+                    && tool
+                        .output
+                        .as_deref()
+                        .is_some_and(|output| !react::tool::ToolResult::text_is_error(output))
+            })
+        })
+    }
+
+    /// Whether the round ran the project's check successfully.
+    pub(crate) fn round_verified(&self, id: &str) -> bool {
+        self.round_tools(id).is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.name == "bash"
+                    && tool
+                        .output
+                        .as_deref()
+                        .is_some_and(|output| !react::tool::ToolResult::text_is_error(output))
+                    && command_is_check(&tool.args)
+            })
+        })
+    }
+
+    fn round_tools(&self, id: &str) -> Option<&Vec<crate::model::ToolEvent>> {
+        self.store
+            .session(id)
+            .and_then(|session| session.messages.last())
+            .filter(|message| message.role == Role::Assistant)
+            .map(|message| &message.tools)
+    }
+
     fn record_audit(&mut self, id: &str) {
         let Some(session) = self.store.session_mut(id) else {
             return;
@@ -7140,6 +7228,36 @@ mod tests {
             Ok(super::GoalChange::Created)
         );
         // The store is seeded from the goal at spawn, after the round advanced.
+        // The completion gate needs this round's change and check.
+        if let Some(session) = state.store.session_mut(&id)
+            && session
+                .messages
+                .last()
+                .is_none_or(|message| message.role != crate::model::Role::Assistant)
+        {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+        }
+        if let Some(message) = state
+            .store
+            .session_mut(&id)
+            .and_then(|session| session.messages.last_mut())
+        {
+            for (name, output) in [("apply_patch", "ok"), ("bash", "ok")] {
+                message.tools.push(crate::model::ToolEvent {
+                    name: name.to_string(),
+                    args: if name == "bash" {
+                        "{\"command\":\"cargo test\"}".to_string()
+                    } else {
+                        "{}".to_string()
+                    },
+                    output: Some(output.to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+            }
+        }
         let goal = state.goal(&id).expect("the goal");
         let store = GoalStore::new(goal);
         state.attach_goal(&id, store.clone());
@@ -7161,6 +7279,42 @@ mod tests {
             state.settle_goal(&id).is_none(),
             "the turn's store is settled away, so one turn settles once"
         );
+    }
+
+    /// A completion without the round's check is not accepted: the goal
+    /// blocks with the missing evidence instead of trusting the claim.
+    #[test]
+    fn a_completion_without_a_check_blocks_with_the_missing_evidence() {
+        use agent::goal::GoalState;
+        use agent::tools::{GoalSettle, GoalStore};
+        let (mut state, id) = goal_state("complete-no-check");
+        state.create_goal(&id, "ship it").expect("the goal");
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "apply_patch".to_string(),
+                    args: "{}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        let goal = state.goal(&id).expect("the goal");
+        let store = GoalStore::new(goal);
+        state.attach_goal(&id, store.clone());
+        assert!(store.complete());
+        assert!(
+            matches!(state.settle_goal(&id), Some(GoalSettle::Blocked { .. })),
+            "the completion was replaced by a blocker"
+        );
+        assert_eq!(state.goal(&id).expect("the goal").state, GoalState::Blocked);
     }
 
     /// A model blocker is recorded with the stable model-reported code, and an

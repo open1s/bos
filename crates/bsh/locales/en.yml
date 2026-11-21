@@ -154,6 +154,8 @@
 "goal.clear": "Clear goal"
 "goal.cleared": "Goal cleared."
 "goal.disarmedOnError": "The goal was disarmed after a failed round"
+"goal.verificationMissing": "The goal was not marked complete: the round must change a file and run the project's check first."
+"goal.noProgress": "The round made no file change; the goal is blocked instead of continuing."
 "context.compacted": "Earlier conversation compacted: {count} messages were moved out of the context and are still in the transcript."
 "input.send": "Send message"
 "input.stop": "Stop generating"

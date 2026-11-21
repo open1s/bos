@@ -226,10 +226,9 @@ pub(crate) const COMPLETE_PERSONA_CONTRACT: &str = "\n\n## Execution contract (h
 /// makes the deliverable and the investigation budget explicit: read what the
 /// change needs, then write.
 pub(crate) const CODING_CONTRACT: &str = "## Writing code\n\
-    - A coding request's deliverable is the file change, not a description. Inspect only what it needs, then edit: stop once you can write the first line.\n\
-    - Read the same file or area twice without editing and you have enough: make the smallest correct change now; the project's check finds the rest.\n\
-    - Create with write_file, change with edit_file or apply_patch, then run the project's check and fix what it reports.\n\
-    - When the request asks for a change, never end the turn with only prose. Keep the loop short: read, edit, verify, report. A plan is not a substitute for the edit.";
+    - The deliverable is the file change. Read only what it needs, then apply_patch the smallest correct change; write_file is for a new file only.\n\
+    - One read of an area is enough. A second read without an edit means start writing now; the project's check finds the rest.\n\
+    - After the edit run the project's check and fix what it reports. Never end a coding turn with prose only, and never change a file through bash.";
 
 /// The plan-mode directive carried in front of a turn's own text.
 ///
@@ -332,9 +331,15 @@ fn file_tool_contract(names: &[String]) -> Option<String> {
     if names.iter().any(|name| name == "grep") {
         lines.push("- Search contents with grep, not a shell `grep`, `rg` or `ag`.".to_string());
     }
-    if let Some(tools) = carried(names, &["edit_file", "apply_patch"]) {
+    if names.iter().any(|name| name == "apply_patch") {
+        lines.push(
+            "- Modify existing files with apply_patch only; do not change a file with `sed -i`, \
+             `perl -i`, `python -c` or a bash heredoc."
+                .to_string(),
+        );
+    } else if let Some(tools) = carried(names, &["edit_file"]) {
         lines.push(format!(
-            "- Change known text with {tools}, not `sed -i`, `perl -i` or a `python -c` rewrite."
+            "- Change known text with {tools}, not a shell rewrite."
         ));
     }
     if names.iter().any(|name| name == "sed") {
@@ -483,9 +488,10 @@ mod tests {
     #[test]
     fn the_coding_contract_asks_for_the_edit() {
         assert!(CODING_CONTRACT.contains("## Writing code"));
-        assert!(CODING_CONTRACT.contains("the file change, not a description"));
-        assert!(CODING_CONTRACT.contains("Read the same file or area twice"));
-        assert!(CODING_CONTRACT.contains("never end the turn with only prose"));
+        assert!(CODING_CONTRACT.contains("deliverable is the file change"));
+        assert!(CODING_CONTRACT.contains("apply_patch the smallest correct change"));
+        assert!(CODING_CONTRACT.contains("run the project's check"));
+        assert!(CODING_CONTRACT.contains("Never end a coding turn with prose only"));
         assert!(COMPLETE_PERSONA_CONTRACT.contains("ends with the edit and its check"));
     }
 
