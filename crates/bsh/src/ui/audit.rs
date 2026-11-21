@@ -236,8 +236,15 @@ impl Shell {
             mcp: mcp.clone(),
             lang: self.state.lang,
         };
+        // While a turn streams, the key changes on every tool event: the page
+        // used to rebuild the whole model (a JSON parse per stored output and
+        // a clone of every row) once per event, so opening Audit during a long
+        // turn cost the turn's length. Keep the snapshot it already has and
+        // rebuild once the stream settles; the first open still builds.
+        let streaming = self.state.is_streaming(&session.id);
         let mut cache = self.audit_cache.borrow_mut();
-        if cache.key.as_ref() != Some(&key) {
+        let stale = cache.key.as_ref() != Some(&key) && !(streaming && cache.key.is_some());
+        if stale {
             // ADVISORY refusals are refusals the reader was TOLD about, not ones
             // that stopped a call: the Audit tab counts what was blocked, while
             // the Policy pane lists the advisory ring on its own. Mixing them
@@ -3201,6 +3208,35 @@ mod tests {
         }
         frames.sort_by(|a, b| a.partial_cmp(b).expect("finite frame times"));
         frames[frames.len() / 2]
+    }
+
+    /// A streamed event changes the audit key, but the page must not rebuild
+    /// its model per event: that made opening Audit during a long turn cost
+    /// the turn's length. The snapshot stays until the stream settles.
+    #[gpui::test]
+    fn a_streaming_turn_does_not_rebuild_the_audit_page(cx: &mut TestAppContext) {
+        let (shell, cx) = boot(cx, "audit-streaming", 4);
+        let _ = cx.update(|_, cx| shell.read(cx).audit_view().turns.len());
+        let builds_before = crate::audit::audit_builds();
+        cx.update(|_, cx| {
+            shell.update(cx, |shell, _| {
+                let id = shell.state.active_id.clone().expect("a session");
+                let _ = shell.state.begin_turn_in(&id, "work");
+                shell.state.apply_event(
+                    &id,
+                    crate::runner::AgentEvent::ToolCall {
+                        name: "read_file".to_string(),
+                        args: "{}".to_string(),
+                    },
+                );
+            })
+        });
+        let _ = cx.update(|_, cx| shell.read(cx).audit_view().turns.len());
+        assert_eq!(
+            crate::audit::audit_builds(),
+            builds_before,
+            "a streamed event leaves the page alone"
+        );
     }
 
     /// A long audit page paints a window, and its view model survives a repaint.

@@ -975,7 +975,16 @@ fn confinement_of(
     Option<String>,
     Option<String>,
 ) {
-    let Some(value) = output.and_then(crate::tool_output::payload) else {
+    // Parsing a stored envelope is the expensive part of building the audit
+    // page, and it runs for every call: with thousands of calls whose outputs
+    // are large, one open (and, while a turn streams, one event) paid a JSON
+    // parse of the whole row. These four fields are the ONLY reason this
+    // function parses at all, and their keys appear verbatim in the envelope,
+    // so an output without them cannot answer and needs no parse.
+    let Some(value) = output
+        .filter(|text| text.contains("\"sandbox\"") || text.contains("\"network\""))
+        .and_then(crate::tool_output::payload)
+    else {
         return (None, None, None, None);
     };
     let field = |key: &str| {
