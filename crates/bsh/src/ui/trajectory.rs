@@ -539,6 +539,9 @@ pub(crate) fn collapse_turns(
 /// every call, and a long session paid it on the UI thread.
 const TRAJ_ASYNC_EVENTS: usize = 800;
 
+/// Steps the run view draws per page.
+const TRAJ_RUN_PAGE: usize = 12;
+
 /// The facts that decide what the flattened log contains.
 ///
 /// Every field is something `events_for` READS, so a frame that changes none of
@@ -1193,6 +1196,11 @@ impl Shell {
         self.traj_events.borrow_mut().frame(self)
     }
 
+    /// The log, flattening a large one off the UI thread when it is cold.
+    pub(crate) fn traj_log_cached(&self, cx: &mut Context<Self>) -> std::rc::Rc<Vec<Event>> {
+        self.traj_events.borrow_mut().get_cached(self, cx)
+    }
+
     /// The log and the rows this frame draws, flattening a large log on the
     /// background executor instead of inside the frame.
     pub(crate) fn traj_frame_cached(&self, cx: &mut Context<Self>) -> TrajFrame {
@@ -1343,7 +1351,7 @@ impl Shell {
     /// a vertical step timeline, and the selected step's inspector.
     fn render_trajectory_runs(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;
-        let events = self.traj_log();
+        let events = self.traj_log_cached(cx);
         if events.is_empty() {
             return div()
                 .debug_selector(|| "trajectory".to_string())
@@ -1627,8 +1635,17 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(10.0));
-        for (index, event) in &run_events {
+        // A run can hold thousands of steps; the list draws one page so the
+        // frame follows the viewport, not the run's length.
+        let pages = run_events.len().div_ceil(TRAJ_RUN_PAGE).max(1);
+        let page = self.traj_run_page.min(pages - 1);
+        let start = page * TRAJ_RUN_PAGE;
+        let end = (start + TRAJ_RUN_PAGE).min(run_events.len());
+        for (index, event) in run_events.iter().take(end).skip(start) {
             timeline = timeline.child(self.traj_run_step(*index, event, live, cx));
+        }
+        if pages > 1 {
+            timeline = timeline.child(self.traj_run_pager(page, pages, cx));
         }
         if live {
             timeline = timeline.child(self.traj_run_waiting());
@@ -3273,6 +3290,67 @@ impl Shell {
             top += traj_row_height(folded.is_some());
         }
         None
+    }
+
+    /// First / previous / next / last for the run's step list.
+    fn traj_run_pager(&self, page: usize, pages: usize, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(24.0))
+            .child(self.traj_run_page_button(
+                "traj-run-first",
+                lang.tr("transcript.pageFirst"),
+                0,
+                cx,
+            ))
+            .child(self.traj_run_page_button(
+                "traj-run-prev",
+                lang.tr("transcript.pagePrev"),
+                page.saturating_sub(1),
+                cx,
+            ))
+            .child(txt(format!("{}/{}", page + 1, pages), 10.5, theme::faint()))
+            .child(self.traj_run_page_button(
+                "traj-run-next",
+                lang.tr("transcript.pageNext"),
+                (page + 1).min(pages - 1),
+                cx,
+            ))
+            .child(self.traj_run_page_button(
+                "traj-run-last",
+                lang.tr("transcript.pageLast"),
+                pages - 1,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn traj_run_page_button(
+        &self,
+        id: &'static str,
+        label: String,
+        page: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || id.to_string())
+            .h(px(22.0))
+            .px(px(6.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(txt(label, 10.5, theme::muted()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.traj_run_page = page;
+                cx.notify();
+            }))
     }
 
     /// The whole tab.

@@ -513,6 +513,8 @@ pub(crate) struct Shell {
     /// The selected trajectory event (an index into the rendered log).
     /// Whether Trajectory opens on the run/step design instead of the timeline.
     pub(crate) traj_runs: bool,
+    /// The run view's step page. A run can hold thousands of steps.
+    pub(crate) traj_run_page: usize,
     /// The run (turn) the run view is showing; none follows the newest.
     pub(crate) traj_run: Option<usize>,
     pub(crate) traj_select: Option<usize>,
@@ -2246,6 +2248,7 @@ impl Shell {
             traj_calls_collapsed: false,
             traj_summary_hover: false,
             traj_runs: true,
+            traj_run_page: 0,
             traj_run: None,
             traj_select: None,
             traj_tab: 0,
@@ -2748,6 +2751,17 @@ impl Shell {
         // Opening the restored session is the one moment a legacy log is
         // checked; the rewrite itself runs on the background executor.
         shell.maybe_compact_history(cx);
+        // A debug-only launch seam for the frame trace: measure a tab without
+        // clicking it. Release builds ignore it entirely.
+        #[cfg(debug_assertions)]
+        if let Ok(tab) = std::env::var("BSH_TAB") {
+            shell.state.tab = match tab.as_str() {
+                "trajectory" => crate::state::Tab::Trajectory,
+                "review" => crate::state::Tab::Review,
+                "audit" => crate::state::Tab::Audit,
+                _ => crate::state::Tab::Chat,
+            };
+        }
         shell
     }
 
