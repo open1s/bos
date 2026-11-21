@@ -209,6 +209,8 @@ pub(crate) struct SettingsInputs {
     pub(crate) retries: Entity<InputState>,
     shell_timeout: Entity<InputState>,
     max_tokens: Entity<InputState>,
+    /// The project's own verification command, empty when it has none.
+    verify_command: Entity<InputState>,
     /// The local web-search endpoint (the Search API base).
     pub(crate) web_search_base: Entity<InputState>,
     /// Results one search asks for.
@@ -228,6 +230,7 @@ impl SettingsInputs {
             retries: cx.new(|cx| InputState::new(window, cx)),
             shell_timeout: cx.new(|cx| InputState::new(window, cx)),
             max_tokens: cx.new(|cx| InputState::new(window, cx)),
+            verify_command: cx.new(|cx| InputState::new(window, cx)),
             web_search_base: cx.new(|cx| InputState::new(window, cx)),
             web_search_results: cx.new(|cx| InputState::new(window, cx)),
             web_search_key: cx.new(|cx| {
@@ -280,6 +283,17 @@ impl SettingsInputs {
             cx,
         );
         set(
+            &self.verify_command,
+            settings
+                .workspace
+                .agent
+                .verify_command
+                .clone()
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
+        set(
             &self.max_tokens,
             effective
                 .max_tokens
@@ -309,6 +323,8 @@ impl SettingsInputs {
         if let Some(parsed) = parse_capacity(&budget) {
             settings.workspace.agent.context_budget = parsed;
         }
+        let verify = self.verify_command.read(cx).value().trim().to_string();
+        settings.workspace.agent.verify_command = (!verify.is_empty()).then_some(verify);
         let llm_timeout = self.llm_timeout.read(cx).value().trim().to_string();
         if let Ok(parsed) = llm_timeout.parse::<u64>() {
             settings.workspace.agent.llm_timeout_secs = parsed.max(1);
@@ -974,6 +990,8 @@ enum Field {
     Budget,
     /// The cap on completion tokens per turn.
     MaxTokens,
+    /// The project's own verification command.
+    VerifyCommand,
     /// The local web-search endpoint.
     WebSearchBase,
     /// Results one search asks for.
@@ -1001,6 +1019,7 @@ impl Field {
                 .max_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_default(),
+            Field::VerifyCommand => default.workspace.agent.verify_command.unwrap_or_default(),
             Field::WebSearchBase => default.global.web_search.base_url.clone(),
             Field::WebSearchResults => default.global.web_search.results_per_search.to_string(),
         }
@@ -7885,6 +7904,13 @@ impl Shell {
                 Some("settings.retriesHint"),
                 &self.settings_inputs.retries,
                 Field::Retries,
+                cx,
+            ),
+            self.input_row(
+                "settings.verifyCommand",
+                Some("settings.verifyCommandHint"),
+                &self.settings_inputs.verify_command,
+                Field::VerifyCommand,
                 cx,
             ),
             {

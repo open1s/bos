@@ -468,6 +468,8 @@
 "settings.temperatureHint": "Sampling temperature for every request. Leave blank for the engine default (0.7); 0 is greedy decoding."
 "settings.retriesTitle": "Retry attempts"
 "settings.retriesHint": "Transient provider failures are retried this many times before the turn gives up. 0 disables retries."
+"settings.verifyCommand": "Verify command"
+"settings.verifyCommandHint": "The command that proves a change when it is not a known test/lint runner; a successful run counts as the round's check. Empty uses the built-in detection."
 "settings.shellTimeout": "Command timeout (seconds)"
 "settings.overridden": "Overridden"
 "settings.reset": "Reset to default"

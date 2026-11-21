@@ -463,6 +463,8 @@
 "settings.temperatureHint": "每次请求的采样温度。留空使用引擎默认值（0.7）；0 表示贪心解码。"
 "settings.retriesTitle": "失败重试次数"
 "settings.retriesHint": "瞬时的提供商失败在放弃本轮前重试的次数。0 表示不重试。"
+"settings.verifyCommand": "验证命令"
+"settings.verifyCommandHint": "当项目的检查不是常见 test/lint 命令时，用它来证明改动；成功运行即视为本轮检查。留空使用内置识别。"
 "settings.shellTimeout": "命令超时（秒）"
 "settings.overridden": "已覆盖"
 "settings.reset": "恢复默认"

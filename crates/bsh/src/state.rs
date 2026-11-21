@@ -228,24 +228,123 @@ fn command_is_check(args: &str, custom: Option<&str>) -> bool {
 /// workspace; counting it as "no change" would block an honest round.
 fn command_is_edit(args: &str) -> bool {
     let command = command_of(args);
-    [
+    if command.is_empty() {
+        return false;
+    }
+    let explicit = [
         "sed -i",
         "perl -i",
         "tee ",
-        " > ",
-        ">>",
         "cat >",
         "<<",
         "git apply",
+        "git checkout --",
+        "git restore",
+        "git reset --hard",
         "patch ",
         "mv ",
         "cp ",
         "rm ",
         "touch ",
         "mkdir ",
+        "truncate ",
+        "ln ",
+        "install ",
+        "cargo fmt",
+        "rustfmt",
+        "gofmt -w",
+        "prettier --write",
+        "prettier -w",
+        "eslint --fix",
+        "black ",
+        "isort ",
+        "clang-format -i",
+        "dprint fmt",
+        "ruff format",
+        "deno fmt",
+    ];
+    if explicit.iter().any(|mark| command.contains(mark)) {
+        return true;
+    }
+    // A language one-liner writes without any shell marker; name the calls
+    // that write, not the whole interpreter (an import-heavy reader must not
+    // count).
+    let python_writes = [
+        "write_text",
+        "write_bytes",
+        "os.remove",
+        "os.rename",
+        "os.replace",
+        "shutil.",
+        "subprocess",
+        "os.system",
+        "json.dump",
+        "toml.dump",
+        "yaml.dump",
     ]
     .iter()
-    .any(|mark| command.contains(mark))
+    .any(|write| command.contains(write));
+    // `open(...)` alone can read; a write mode literal in the same one-liner is
+    // what makes it an edit.
+    let python_open_write = command.contains("open(")
+        && ["'w'", "\"w\"", "'a'", "\"a\"", "'x'", "\"x\"", "'+'"]
+            .iter()
+            .any(|mode| command.contains(mode));
+    if command.contains("python") && (python_writes || python_open_write) {
+        return true;
+    }
+    if (command.contains("node") || command.contains("bun") || command.contains("deno"))
+        && [
+            "writefile",
+            "writefilesync",
+            "appendfile",
+            "unlink",
+            "rename",
+            "mkdir",
+            "rmdir",
+            "copyfile",
+            "shelljs",
+        ]
+        .iter()
+        .any(|write| command.contains(write))
+    {
+        return true;
+    }
+    redirect_writes_workspace(&command)
+}
+
+/// Whether a shell redirect names a workspace file rather than a log, a
+/// temporary file or the null device. `cargo test > /tmp/log` is the check, not
+/// an edit; `cargo test > out.txt` wrote a file.
+fn redirect_writes_workspace(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if !matches!(
+            *token,
+            ">" | ">>" | "1>" | "1>>" | "2>" | "2>>" | "&>" | "&>>"
+        ) {
+            continue;
+        }
+        let Some(target) = tokens.get(index + 1) else {
+            continue;
+        };
+        let target = target.trim_matches('"').trim_matches('\'');
+        if target.starts_with("/dev/")
+            || target.starts_with("/tmp/")
+            || target.starts_with("$TMPDIR")
+            || target.eq_ignore_ascii_case("nul")
+            || matches!(
+                std::path::Path::new(target)
+                    .extension()
+                    .and_then(|ext| ext.to_str()),
+                Some("log" | "jsonl" | "out" | "err" | "tmp")
+            )
+        {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 fn settle_ms(message: &mut ChatMessage, at: u64) {
@@ -7551,6 +7650,41 @@ mod tests {
             Some(GoalSettle::Complete),
             "the later check covers the earlier edit"
         );
+    }
+
+    /// A write hidden in a language one-liner is still a change; a redirect
+    /// to a log or /tmp is not.
+    #[test]
+    fn a_language_one_liner_counts_as_a_write_and_a_log_redirect_does_not() {
+        let (mut state, id) = goal_state("bash-language-write");
+        let commands = [
+            "python3 -c \"open('x','w').write('y')\"",
+            "cargo test > /tmp/check.log",
+            "cargo test > out.txt",
+        ];
+        for command in commands {
+            if let Some(session) = state.store.session_mut(&id) {
+                session
+                    .messages
+                    .push(crate::model::ChatMessage::assistant());
+                let args = serde_json::json!({ "command": command }).to_string();
+                session.messages.last_mut().expect("the reply").tools.push(
+                    crate::model::ToolEvent {
+                        name: "bash".to_string(),
+                        args,
+                        output: Some("ok".to_string()),
+                        ms: Some(1),
+                        at: Some(1),
+                    },
+                );
+            }
+            let edits = state.round_edits(&id);
+            if command.contains("/tmp/") {
+                assert!(!edits, "a log redirect is not an edit: {command}");
+            } else {
+                assert!(edits, "this command changed a file: {command}");
+            }
+        }
     }
 
     /// A model blocker is recorded with the stable model-reported code, and an
