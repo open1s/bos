@@ -30543,6 +30543,10 @@ fn the_goal_strip_follows_phase_and_activation(cx: &mut TestAppContext) {
         cx.debug_bounds("goal-resume").is_none(),
         "a blocked bar offers edit and clear, not resume"
     );
+    assert!(
+        cx.debug_bounds("goal-restart").is_some(),
+        "a blocked goal can be restarted without editing its objective"
+    );
     assert!(cx.debug_bounds("goal-edit").is_some());
     // Clear removes the goal, which removes the strip.
     let clear = cx.debug_bounds("goal-clear").expect("the clear verb");

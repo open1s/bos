@@ -1748,6 +1748,16 @@ impl Shell {
                     .into_any_element(),
             );
         }
+        // A blocked goal is not finished: restarting clears the blocker and
+        // arms the next round, so the reader does not have to edit the
+        // objective to get out of the blocked state.
+        if goal.state == GoalState::Blocked {
+            actions.push(
+                action("goal-restart", IconName::Play, lang.tr("goal.restart"))
+                    .on_click(cx.listener(|this, _event, _window, cx| this.resume_active_goal(cx)))
+                    .into_any_element(),
+            );
+        }
         actions.push(
             action("goal-edit", IconName::Pencil, lang.tr("goal.edit"))
                 .on_click(cx.listener(|this, _event, window, cx| {

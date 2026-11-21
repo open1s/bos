@@ -118,6 +118,14 @@ fn tail_bytes(session: &Session, tail: usize) -> usize {
 }
 
 /// Close a turn's measured span, when it has a start and no end yet.
+/// The plan step a session is on, and whether it has been checked since it
+/// became current.
+#[derive(Default)]
+struct PlanWatch {
+    step: Option<String>,
+    checked: bool,
+}
+
 /// What a goal's rounds have done since its last change.
 #[derive(Default, Clone, Copy)]
 struct GoalProgress {
@@ -193,13 +201,30 @@ fn turn_evidence(tools: &[crate::model::ToolEvent], checked: bool) -> TurnEviden
 /// close a step that may span turns.
 fn plan_step_match(text: &str, evidence: &TurnEvidence) -> u8 {
     let lower = text.to_lowercase();
+    let generic = [
+        "lib", "main", "mod", "index", "test", "tests", "utils", "types", "config", "common",
+        "error", "errors",
+    ];
     let path_hit = evidence.paths.iter().any(|path| {
         let path = path.to_lowercase();
         if lower.contains(&path) {
             return true;
         }
         let base = path.rsplit('/').next().unwrap_or(&path);
-        base.len() > 2 && lower.contains(base)
+        if base.len() > 2 && lower.contains(base) {
+            return true;
+        }
+        // "break the parser" names parser.rs by its stem; a generic stem such
+        // as lib or main would match almost every workspace, so those do not.
+        let stem = std::path::Path::new(&path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        stem.len() >= 4
+            && !generic.contains(&stem)
+            && lower
+                .split_whitespace()
+                .any(|token| token.trim_matches(|c: char| !c.is_alphanumeric()) == stem)
     });
     let check_word = ["test", "tests", "check", "verify", "lint", "clippy"]
         .iter()
@@ -222,12 +247,10 @@ fn plan_step_match(text: &str, evidence: &TurnEvidence) -> u8 {
     if check_word {
         return if evidence.checked { 2 } else { 0 };
     }
-    if evidence.edited && !broad {
-        return 1;
-    }
-    if evidence.edited && evidence.checked && broad {
-        return 1;
-    }
+    // A specific step closes on an edit only when the edit NAMES it (a path or
+    // stem above); "some edit happened" is not evidence that this step ended,
+    // and a step can span turns. A broad step needs its check.
+    let _ = broad;
     0
 }
 
@@ -955,6 +978,9 @@ pub(crate) struct AppState {
     /// What the goal's rounds have done since its last change: a change must be
     /// followed by a check, in this round or a later one, before completion.
     goal_progress: HashMap<String, GoalProgress>,
+    /// The in-progress plan step and whether any check has run since it became
+    /// current. A check in an earlier turn still covers the step it was run for.
+    plan_watch: HashMap<String, PlanWatch>,
     /// The global row each running turn's mutable tail starts at.
     ///
     /// The log cannot update a row in place, so a turn that streams for
@@ -1378,6 +1404,7 @@ impl AppState {
             streams: HashMap::new(),
             goal_rounds: std::collections::HashSet::new(),
             goal_progress: HashMap::new(),
+            plan_watch: HashMap::new(),
             inflight_tails: HashMap::new(),
             journaled_at: HashMap::new(),
             turn_seen: HashMap::new(),
@@ -4662,6 +4689,10 @@ impl AppState {
             if self.was_goal_round(id) {
                 self.record_goal_progress(id);
             }
+            // A check counts for the step it ran under even when the turn
+            // itself was stopped or failed; only closing the step waits for a
+            // Done turn.
+            self.remember_plan_check(id);
             if completed {
                 self.reconcile_plan(id);
             }
@@ -4740,6 +4771,29 @@ impl AppState {
     /// `update_plan` leaves its in-progress step stale; the host closes that
     /// step and advances the next pending one, so the next turn's plan block
     /// does not describe finished work as running.
+    /// Remember that the current plan step has been checked, even on a turn
+    /// that did not complete; the reconciler may close the step on a later
+    /// Done turn.
+    fn remember_plan_check(&mut self, id: &str) {
+        let Some(store) = self.plans.get(id) else {
+            return;
+        };
+        let current = store
+            .items()
+            .iter()
+            .find(|item| item.status == PlanStatus::InProgress)
+            .map(|item| item.text.clone());
+        let verified = self.round_verified(id);
+        let watch = self.plan_watch.entry(id.to_string()).or_default();
+        if watch.step != current {
+            watch.step = current;
+            watch.checked = false;
+        }
+        if verified {
+            watch.checked = true;
+        }
+    }
+
     fn reconcile_plan(&mut self, id: &str) {
         let Some(store) = self.plans.get(id) else {
             return;
@@ -4754,24 +4808,44 @@ impl AppState {
                     .as_deref()
                     .is_some_and(|output| !react::tool::ToolResult::text_is_error(output))
         });
-        let evidence = turn_evidence(tools, self.round_verified(id));
-        if !evidence.edited && !evidence.checked {
-            return;
-        }
         let mut items = store.items();
         if items.is_empty() {
+            return;
+        }
+        let verified = self.round_verified(id);
+        let mut evidence = turn_evidence(tools, verified);
+        // The check belongs to the step that was current when it ran, not only
+        // to the turn that ended: remember it across turns until the step
+        // changes.
+        let current = items
+            .iter()
+            .find(|item| item.status == PlanStatus::InProgress)
+            .map(|item| item.text.clone());
+        let watch = self.plan_watch.entry(id.to_string()).or_default();
+        if watch.step != current {
+            watch.step = current;
+            watch.checked = false;
+        }
+        if evidence.checked {
+            watch.checked = true;
+        }
+        if watch.checked {
+            evidence.checked = true;
+        }
+        if !evidence.edited && !evidence.checked {
             return;
         }
         // A step is closed only by evidence that NAMES it: the turn edited the
         // path the step mentions, ran the check it asks for, or is a specific
         // (non-broad) step this turn worked. A broad "implement …" step needs
         // its check, so a first edit no longer closes a multi-turn step.
-        let threshold = if model_updated { 2 } else { 1 };
+        // Only a named match closes a step. A stale explicit update is
+        // overridden by that evidence; weak evidence never overrides it.
+        let _ = model_updated;
         let mut closed = false;
         let mut changed = false;
         for item in &mut items {
-            if item.status == PlanStatus::InProgress
-                && plan_step_match(&item.text, &evidence) >= threshold
+            if item.status == PlanStatus::InProgress && plan_step_match(&item.text, &evidence) == 2
             {
                 item.status = PlanStatus::Completed;
                 closed = true;
@@ -4801,8 +4875,17 @@ impl AppState {
             next.status = PlanStatus::InProgress;
             changed = true;
         }
+        let next = items
+            .iter()
+            .find(|item| item.status == PlanStatus::InProgress)
+            .map(|item| item.text.clone());
         if changed {
             store.replace(items);
+        }
+        let watch = self.plan_watch.entry(id.to_string()).or_default();
+        if watch.step != next {
+            watch.step = next;
+            watch.checked = false;
         }
     }
 
@@ -7879,7 +7962,7 @@ mod tests {
         let store = PlanStore::new();
         store.replace(vec![
             PlanItem {
-                text: "Edit the file".to_string(),
+                text: "Edit src/lib.rs".to_string(),
                 status: PlanStatus::InProgress,
             },
             PlanItem {
@@ -7899,7 +7982,7 @@ mod tests {
                 .tools
                 .push(crate::model::ToolEvent {
                     name: "apply_patch".to_string(),
-                    args: "{}".to_string(),
+                    args: "{\"path\":\"src/lib.rs\"}".to_string(),
                     output: Some("ok".to_string()),
                     ms: Some(1),
                     at: Some(1),
@@ -8074,6 +8157,131 @@ mod tests {
             store.items()[0].status,
             PlanStatus::Completed,
             "the named path is stronger than a stale update"
+        );
+    }
+
+    /// A step names a file by its stem, not only by its path: 'break the
+    /// parser' closes when parser.rs was edited.
+    #[test]
+    fn a_step_naming_a_file_by_stem_matches_its_edit() {
+        use crate::model::{PlanItem, PlanStatus, PlanStore};
+        let (mut state, id) = goal_state("plan-stem");
+        let store = PlanStore::new();
+        store.replace(vec![PlanItem {
+            text: "Break the parser".to_string(),
+            status: PlanStatus::InProgress,
+        }]);
+        state.attach_plan(&id, store.clone());
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "apply_patch".to_string(),
+                    args: "{\"path\":\"src/parser.rs\"}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        state.reconcile_plan(&id);
+        assert_eq!(
+            store.items()[0].status,
+            PlanStatus::Completed,
+            "the stem names the edited file"
+        );
+    }
+
+    /// A specific step with no named evidence does not close on a different
+    /// file's edit; it may span turns.
+    #[test]
+    fn a_specific_step_without_named_evidence_waits() {
+        use crate::model::{PlanItem, PlanStatus, PlanStore};
+        let (mut state, id) = goal_state("plan-specific");
+        let store = PlanStore::new();
+        store.replace(vec![PlanItem {
+            text: "Rename foo".to_string(),
+            status: PlanStatus::InProgress,
+        }]);
+        state.attach_plan(&id, store.clone());
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "apply_patch".to_string(),
+                    args: "{\"path\":\"src/bar.rs\"}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        state.reconcile_plan(&id);
+        assert_eq!(
+            store.items()[0].status,
+            PlanStatus::InProgress,
+            "an unrelated edit is not evidence for this step"
+        );
+    }
+
+    /// A check that ran under a stopped turn still covers its step: the next
+    /// Done turn may close it without re-running the check.
+    #[test]
+    fn a_check_from_a_stopped_turn_still_closes_its_step() {
+        use crate::model::{PlanItem, PlanStatus, PlanStore};
+        let (mut state, id) = goal_state("plan-stopped-check");
+        let store = PlanStore::new();
+        store.replace(vec![PlanItem {
+            text: "Run the tests".to_string(),
+            status: PlanStatus::InProgress,
+        }]);
+        state.attach_plan(&id, store.clone());
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{\"command\":\"cargo test\"}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        // The stopped turn's terminal remembers the check but does not close.
+        state.remember_plan_check(&id);
+        // The next Done turn edits something else only.
+        if let Some(session) = state.store.session_mut(&id) {
+            let message = session.messages.last_mut().expect("the reply");
+            message.tools.clear();
+            message.tools.push(crate::model::ToolEvent {
+                name: "write_file".to_string(),
+                args: "{\"path\":\"src/other.rs\"}".to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(1),
+                at: Some(1),
+            });
+        }
+        state.reconcile_plan(&id);
+        assert_eq!(
+            store.items()[0].status,
+            PlanStatus::Completed,
+            "the earlier check still covers the step"
         );
     }
 
