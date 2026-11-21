@@ -62,6 +62,61 @@ fn note_first_output(message: &mut ChatMessage, at: u64) {
 /// the path every token takes.
 const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(1_000);
 
+/// The journal size at which the write interval starts growing.
+///
+/// Above this a checkpoint is no longer a small append of a few hundred bytes:
+/// the whole in-flight row is serialized (twice - once for its checksum, once
+/// for the payload), so a structural event every second kept the UI thread
+/// inside `serde_json` for the entire turn. Measured on a 7.5 MB in-flight row:
+/// 1374 of 1374 main-thread samples in `checkpoint_turn`.
+const CHECKPOINT_LARGE_BYTES: usize = 256 * 1024;
+
+/// How often a large journal is written.
+const CHECKPOINT_LARGE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The size at which the in-flight row is no longer journaled mid-turn.
+///
+/// Writing it means serializing it twice on the UI thread; at this size that
+/// is the hang, not a safety net. The turn's terminal save still writes the
+/// final state, so a crash loses this turn's journal - not the settled log and
+/// not the workspace.
+const CHECKPOINT_HUGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// The checkpoint interval a journal of `bytes` earns.
+fn checkpoint_interval(bytes: usize) -> std::time::Duration {
+    if bytes >= CHECKPOINT_LARGE_BYTES {
+        CHECKPOINT_LARGE_EVERY
+    } else {
+        CHECKPOINT_EVERY
+    }
+}
+
+/// The bytes a checkpoint of `tail` onward would serialize, without serializing
+/// them. Text and tool payloads dominate; the rest is bookkeeping.
+fn tail_bytes(session: &Session, tail: usize) -> usize {
+    let start = tail.saturating_sub(session.loaded_from);
+    session
+        .messages
+        .get(start..)
+        .map(|rows| {
+            rows.iter()
+                .map(|message| {
+                    message.text.len()
+                        + message.reasoning.len()
+                        + message.images.iter().map(String::len).sum::<usize>()
+                        + message
+                            .tools
+                            .iter()
+                            .map(|tool| {
+                                tool.args.len() + tool.output.as_deref().map_or(0, str::len)
+                            })
+                            .sum::<usize>()
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// Close a turn's measured span, when it has a start and no end yet.
 fn settle_ms(message: &mut ChatMessage, at: u64) {
     let Some(start) = message.timing().and_then(|timing| timing.start) else {
@@ -4332,10 +4387,28 @@ impl AppState {
             return;
         }
         let now = std::time::Instant::now();
-        if !force
-            && let Some(last) = self.journaled_at.get(id)
-            && now.duration_since(*last) < CHECKPOINT_EVERY
-        {
+        let bytes = self
+            .store
+            .session(id)
+            .map(|session| tail_bytes(session, tail))
+            .unwrap_or(0);
+        // A multi-megabyte in-flight row is written at the terminal save, not
+        // on the event path: the serialization is what occupied the UI thread
+        // (measured: 1374/1374 samples in this function, 606 of them in the
+        // checksum's own copy of the same rows).
+        if bytes >= CHECKPOINT_HUGE_BYTES {
+            return;
+        }
+        let interval = checkpoint_interval(bytes);
+        // A structural event earns an immediate write only while the journal is
+        // small. At a multi-megabyte tail the serialization itself is the cost,
+        // so even a forced write obeys the interval; the terminal save still
+        // writes the last state.
+        let too_soon = self
+            .journaled_at
+            .get(id)
+            .is_some_and(|last| now.duration_since(*last) < interval);
+        if too_soon && (!force || bytes >= CHECKPOINT_LARGE_BYTES) {
             return;
         }
         if let Some(session) = self.store.session(id)
@@ -7679,6 +7752,26 @@ mod tests {
             "the goal record is not part of the compacted history"
         );
         assert!(state.goal_can_advance(&id));
+    }
+
+    /// The checkpoint interval scales with the in-flight row: a small journal
+    /// is written every second, a multi-megabyte one rarely enough that its
+    /// serialization never occupies the input path for a whole turn.
+    #[test]
+    fn a_large_journal_is_checkpointed_less_often() {
+        assert_eq!(super::checkpoint_interval(0), super::CHECKPOINT_EVERY);
+        assert_eq!(
+            super::checkpoint_interval(super::CHECKPOINT_LARGE_BYTES - 1),
+            super::CHECKPOINT_EVERY
+        );
+        assert_eq!(
+            super::checkpoint_interval(super::CHECKPOINT_LARGE_BYTES),
+            super::CHECKPOINT_LARGE_EVERY
+        );
+        assert_eq!(
+            super::checkpoint_interval(super::CHECKPOINT_HUGE_BYTES - 1),
+            super::CHECKPOINT_LARGE_EVERY
+        );
     }
 
     /// The next request opens on the checkpoint the summarizer stored, framed
