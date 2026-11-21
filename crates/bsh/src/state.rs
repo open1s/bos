@@ -127,6 +127,110 @@ struct GoalProgress {
     verified: bool,
 }
 
+/// What one finished turn did, for matching plan steps to it.
+struct TurnEvidence {
+    /// Paths the turn named in an edit or a shell command.
+    paths: Vec<String>,
+    /// The turn's project check passed.
+    checked: bool,
+    /// The turn changed a file at all.
+    edited: bool,
+}
+
+/// Collect the evidence a turn left for the plan reconciler.
+fn turn_evidence(tools: &[crate::model::ToolEvent], checked: bool) -> TurnEvidence {
+    let mut paths: Vec<String> = Vec::new();
+    let mut edited = false;
+    for tool in tools {
+        let ok = tool
+            .output
+            .as_deref()
+            .is_some_and(|output| !react::tool::ToolResult::text_is_error(output));
+        if !ok {
+            continue;
+        }
+        if is_edit_tool(&tool.name) || (tool.name == "bash" && command_is_edit(&tool.args)) {
+            edited = true;
+        }
+        if is_edit_tool(&tool.name) || tool.name == "bash" {
+            let args = tool.args.to_lowercase();
+            for token in args.split(|c: char| {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '"' | '\'' | '{' | '}' | '[' | ']' | ',' | ':' | ';' | '(' | ')'
+                    )
+            }) {
+                let token = token.trim_start_matches('-');
+                if token.is_empty() {
+                    continue;
+                }
+                let path_like = token.contains('/')
+                    || [
+                        ".rs", ".toml", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".md", ".json",
+                        ".css", ".html", ".sh", ".yml", ".yaml",
+                    ]
+                    .iter()
+                    .any(|ext| token.ends_with(ext));
+                if path_like && !paths.iter().any(|known| known == token) {
+                    paths.push(token.to_string());
+                }
+            }
+        }
+    }
+    TurnEvidence {
+        paths,
+        checked,
+        edited,
+    }
+}
+
+/// How strongly a turn's evidence names this plan step.
+///
+/// 2 is a named match (the step's path was edited, or the check it asks for
+/// ran); 1 is a specific edit step this turn worked; 0 is no evidence. A broad
+/// step ("implement …", "refactor …") needs its check: an edit alone must not
+/// close a step that may span turns.
+fn plan_step_match(text: &str, evidence: &TurnEvidence) -> u8 {
+    let lower = text.to_lowercase();
+    let path_hit = evidence.paths.iter().any(|path| {
+        let path = path.to_lowercase();
+        if lower.contains(&path) {
+            return true;
+        }
+        let base = path.rsplit('/').next().unwrap_or(&path);
+        base.len() > 2 && lower.contains(base)
+    });
+    let check_word = ["test", "tests", "check", "verify", "lint", "clippy"]
+        .iter()
+        .any(|word| lower.split_whitespace().any(|token| token.contains(word)));
+    let broad = [
+        "implement",
+        "refactor",
+        "rewrite",
+        "migrate",
+        "integrate",
+        "feature",
+        "support",
+        "redesign",
+    ]
+    .iter()
+    .any(|word| lower.contains(word));
+    if path_hit && evidence.edited {
+        return 2;
+    }
+    if check_word {
+        return if evidence.checked { 2 } else { 0 };
+    }
+    if evidence.edited && !broad {
+        return 1;
+    }
+    if evidence.edited && evidence.checked && broad {
+        return 1;
+    }
+    0
+}
+
 /// A tool that changes a workspace file.
 fn is_edit_tool(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file" | "apply_patch" | "sed")
@@ -4650,23 +4754,46 @@ impl AppState {
                     .as_deref()
                     .is_some_and(|output| !react::tool::ToolResult::text_is_error(output))
         });
-        if model_updated || !(self.round_edits(id) || self.round_verified(id)) {
+        let evidence = turn_evidence(tools, self.round_verified(id));
+        if !evidence.edited && !evidence.checked {
             return;
         }
         let mut items = store.items();
         if items.is_empty() {
             return;
         }
-        let mut changed = false;
+        // A step is closed only by evidence that NAMES it: the turn edited the
+        // path the step mentions, ran the check it asks for, or is a specific
+        // (non-broad) step this turn worked. A broad "implement …" step needs
+        // its check, so a first edit no longer closes a multi-turn step.
+        let threshold = if model_updated { 2 } else { 1 };
         let mut closed = false;
+        let mut changed = false;
         for item in &mut items {
-            if item.status == PlanStatus::InProgress {
+            if item.status == PlanStatus::InProgress
+                && plan_step_match(&item.text, &evidence) >= threshold
+            {
                 item.status = PlanStatus::Completed;
-                changed = true;
                 closed = true;
+                changed = true;
+            }
+        }
+        if !closed {
+            // No step was in progress: only a STRONG match may claim a pending
+            // one (a named path or the check it asks for), never a guess.
+            let at = items.iter().position(|item| {
+                item.status == PlanStatus::Pending && plan_step_match(&item.text, &evidence) == 2
+            });
+            if let Some(at) = at {
+                items[at].status = PlanStatus::Completed;
+                closed = true;
+                changed = true;
             }
         }
         if closed
+            && !items
+                .iter()
+                .any(|item| item.status == PlanStatus::InProgress)
             && let Some(next) = items
                 .iter_mut()
                 .find(|item| item.status == PlanStatus::Pending)
@@ -7824,6 +7951,129 @@ mod tests {
             store.items()[0].status,
             PlanStatus::InProgress,
             "the model's own plan is left alone"
+        );
+    }
+
+    /// A broad step does not close on its first edit; it closes on its check.
+    #[test]
+    fn a_broad_plan_step_waits_for_its_check() {
+        use crate::model::{PlanItem, PlanStatus, PlanStore};
+        let (mut state, id) = goal_state("plan-broad");
+        let store = PlanStore::new();
+        store.replace(vec![PlanItem {
+            text: "Implement the palette".to_string(),
+            status: PlanStatus::InProgress,
+        }]);
+        state.attach_plan(&id, store.clone());
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "apply_patch".to_string(),
+                    args: "{\"path\":\"src/lib.rs\"}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        state.reconcile_plan(&id);
+        assert_eq!(
+            store.items()[0].status,
+            PlanStatus::InProgress,
+            "an edit alone does not close a broad step"
+        );
+    }
+
+    /// With no step in progress, a pending step the turn's evidence NAMES is
+    /// closed; the reconciler does not guess an unrelated one.
+    #[test]
+    fn a_named_pending_step_is_closed_by_its_check() {
+        use crate::model::{PlanItem, PlanStatus, PlanStore};
+        let (mut state, id) = goal_state("plan-pending-check");
+        let store = PlanStore::new();
+        store.replace(vec![
+            PlanItem {
+                text: "Update the docs".to_string(),
+                status: PlanStatus::Pending,
+            },
+            PlanItem {
+                text: "Run the tests".to_string(),
+                status: PlanStatus::Pending,
+            },
+        ]);
+        state.attach_plan(&id, store.clone());
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{\"command\":\"cargo test\"}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        state.reconcile_plan(&id);
+        let items = store.items();
+        assert_eq!(
+            items[1].status,
+            PlanStatus::Completed,
+            "the named check step closes"
+        );
+        assert_ne!(
+            items[0].status,
+            PlanStatus::Completed,
+            "the unrelated step is untouched"
+        );
+    }
+
+    /// Even when the model did update the plan, a step whose path this turn
+    /// edited is closed: the update left it stale.
+    #[test]
+    fn an_explicit_update_still_closes_a_step_with_named_path_evidence() {
+        use crate::model::{PlanItem, PlanStatus, PlanStore};
+        let (mut state, id) = goal_state("plan-stale-update");
+        let store = PlanStore::new();
+        store.replace(vec![PlanItem {
+            text: "Edit src/lib.rs".to_string(),
+            status: PlanStatus::InProgress,
+        }]);
+        state.attach_plan(&id, store.clone());
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            let message = session.messages.last_mut().expect("the reply");
+            for (name, args) in [
+                ("apply_patch", "{\"path\":\"src/lib.rs\"}"),
+                ("update_plan", "{}"),
+            ] {
+                message.tools.push(crate::model::ToolEvent {
+                    name: name.to_string(),
+                    args: args.to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+            }
+        }
+        state.reconcile_plan(&id);
+        assert_eq!(
+            store.items()[0].status,
+            PlanStatus::Completed,
+            "the named path is stronger than a stale update"
         );
     }
 
