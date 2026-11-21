@@ -605,6 +605,9 @@ pub(crate) struct AppState {
     pub(crate) store: Store,
     /// Persisted settings.
     pub(crate) settings: Settings,
+    /// A switch changed a persisted preference; write it on the next tick
+    /// instead of inside the click.
+    settings_dirty: bool,
     /// Interface language.
     pub(crate) lang: Lang,
     /// The selected session.
@@ -1027,6 +1030,7 @@ impl AppState {
         let mut state = Self {
             store,
             settings,
+            settings_dirty: false,
             lang,
             sort: crate::store::SessionSort::default(),
 
@@ -1516,7 +1520,22 @@ impl AppState {
                 self.settings.global.general.active_workspace = workspace;
                 self.refresh_egress_allowlist();
             }
-            let _ = self.settings.save_global();
+            // Writing the whole settings file inside the click cost 32 of the
+            // 34ms a switch took (measured). Persist on the next tick instead:
+            // a crash within a few seconds reopens the previous chat, which is
+            // exactly what it showed before the click.
+            self.settings_dirty = true;
+        }
+    }
+
+    /// Write the debounced settings change, if any.
+    pub(crate) fn flush_settings(&mut self) {
+        if !self.settings_dirty {
+            return;
+        }
+        self.settings_dirty = false;
+        if let Err(error) = self.settings.save_global() {
+            log::warn!("settings could not be saved: {error}");
         }
     }
 

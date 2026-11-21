@@ -2723,6 +2723,9 @@ impl Shell {
                         // A 24/7 window must not stay "running" on a dead
                         // task's stale marker; the watchdog ends it.
                         this.expire_stalled_turns(cx);
+                        // A chat/workspace switch only marks the settings
+                        // dirty; one write per tick replaces one per click.
+                        this.state.flush_settings();
                     })
                     .is_err()
                 {

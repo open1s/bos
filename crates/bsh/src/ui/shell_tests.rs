@@ -35094,15 +35094,17 @@ fn switching_between_sessions_is_not_a_stall(cx: &mut TestAppContext) {
         .expect("another session");
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let mut times: Vec<f64> = Vec::new();
+    let mut selects: Vec<f64> = Vec::new();
     for _ in 0..3 {
         for id in [&large, &other] {
             let started = std::time::Instant::now();
             cx.update(|window, cx| shell.update(cx, |this, cx| this.open_session(id, window, cx)));
+            selects.push(started.elapsed().as_secs_f64() * 1e3);
             cx.update(|window, cx| window.draw(cx).clear(cx));
             times.push(started.elapsed().as_secs_f64() * 1e3);
         }
     }
-    eprintln!("SWITCH {times:?}");
+    eprintln!("SELECT {selects:?} TOTAL {times:?}");
     assert!(
         times.iter().all(|ms| *ms < 150.0),
         "a switch stalled: {times:?}"
