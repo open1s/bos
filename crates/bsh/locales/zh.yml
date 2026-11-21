@@ -99,6 +99,7 @@
 "goal.objectiveTooLong": "目标内容为 {actual} 个字符，上限为 {limit} 个字符。请缩短后重试。"
 "turn.retry": "重试"
 "turn.actionMissed": "本轮操作请求没有成功的工具调用（共 {calls} 次，失败 {failures} 次），请先核对对话记录再采信答复。"
+"turn.stalled": "回合已停止响应，已结束；请重新发送消息。"
 "input.completePersona": "完整人设"
 "input.completePersonaDesc": "替代运行身份、工作流与工具指引"
 "input.completePersonaNeedsPrompt": "请先填写人设"

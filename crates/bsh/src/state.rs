@@ -621,6 +621,11 @@ pub(crate) struct AppState {
     inflight_tails: HashMap<String, usize>,
     /// When each running turn last wrote that journal.
     journaled_at: HashMap<String, std::time::Instant>,
+    /// When each running turn last produced an event. A runner that dies
+    /// without a terminal event would otherwise leave the UI "running"
+    /// forever; the stall watchdog ends it once every legitimate timeout has
+    /// passed.
+    turn_seen: HashMap<String, std::time::Instant>,
     /// The live background-job roster, shared by the shell tools and the header.
     ///
     /// It is created once per app rather than per turn, so a job a previous
@@ -1030,6 +1035,7 @@ impl AppState {
             streams: HashMap::new(),
             inflight_tails: HashMap::new(),
             journaled_at: HashMap::new(),
+            turn_seen: HashMap::new(),
             jobs: Arc::new(agent::jobs::JobRegistry::new()),
             plans: HashMap::new(),
             review_runtimes: HashMap::new(),
@@ -2335,6 +2341,7 @@ impl AppState {
             return false;
         }
         self.streams.remove(id);
+        self.turn_seen.remove(id);
         self.inflight_tails.remove(id);
         self.journaled_at.remove(id);
         if self.streams.is_empty() {
@@ -2364,6 +2371,7 @@ impl AppState {
             );
         }
         self.streams.remove(id);
+        self.turn_seen.remove(id);
         // The task is aborted before it can report a withdrawal, so the rows
         // it never answered for are put back here: an aborted turn never
         // delivered them, and the next turn is seeded from the store.
@@ -2803,6 +2811,7 @@ impl AppState {
         };
         self.inflight_tails.insert(id.clone(), tail);
         self.streams.insert(id.clone(), now());
+        self.turn_seen.insert(id.clone(), std::time::Instant::now());
         self.turn_started = Some(std::time::Instant::now());
         self.checkpoint_turn(&id, true);
         Some((transcript, budget))
@@ -2855,6 +2864,8 @@ impl AppState {
         }
         self.inflight_tails.insert(session_id.to_string(), tail);
         self.streams.insert(session_id.to_string(), now());
+        self.turn_seen
+            .insert(session_id.to_string(), std::time::Instant::now());
         self.turn_started = Some(std::time::Instant::now());
         self.checkpoint_turn(session_id, true);
         Some((transcript, budget))
@@ -4014,6 +4025,15 @@ impl AppState {
     }
 
     pub(crate) fn apply_event(&mut self, id: &str, event: AgentEvent) {
+        // The stall watchdog reads this clock. `get_mut` keeps token deltas
+        // allocation-free: the entry exists from the moment the turn opened.
+        let seen = std::time::Instant::now();
+        match self.turn_seen.get_mut(id) {
+            Some(last) => *last = seen,
+            None => {
+                self.turn_seen.insert(id.to_string(), seen);
+            }
+        }
         // An automatic compaction lands BEFORE the turn's first token: the
         // runner summarizes the over-threshold window and reports the span it
         // removed. The boundary and the marker are installed here, so the
@@ -4258,6 +4278,7 @@ impl AppState {
         }
         if terminal {
             self.streams.remove(id);
+            self.turn_seen.remove(id);
             self.inflight_tails.remove(id);
             self.journaled_at.remove(id);
             // The turn is over: nothing may steer it any more, and a steering
@@ -4379,6 +4400,41 @@ impl AppState {
     /// events - a tool call, its result - whose loss is a whole step rather
     /// than a second of text; ordinary deltas are throttled by
     /// [`CHECKPOINT_EVERY`].
+    /// End turns whose runner has gone silent longer than every timeout it
+    /// could legitimately be inside, so a dead task cannot leave a 24/7 window
+    /// showing "running" forever. Returns the sessions it ended.
+    #[must_use]
+    pub(crate) fn expire_stalled_turns(&mut self, now: std::time::Instant) -> Vec<String> {
+        let ids: Vec<String> = self.streams.keys().cloned().collect();
+        let mut ended = Vec::new();
+        for id in ids {
+            let timeout = {
+                let effective = self.effective_in(&id);
+                std::time::Duration::from_secs(
+                    effective
+                        .llm_timeout_secs
+                        .saturating_add(effective.shell_timeout_secs)
+                        .saturating_add(120),
+                )
+            };
+            // A stream with no seen stamp is a phantom (a turn that never
+            // reached its first event); it counts as stalled once the tick
+            // looks at it.
+            let silent = self
+                .turn_seen
+                .get(&id)
+                .is_none_or(|seen| now.duration_since(*seen) >= timeout);
+            if !silent {
+                continue;
+            }
+            let why = crate::i18n::tr(self.lang, "turn.stalled");
+            self.apply_event(&id, crate::runner::AgentEvent::Error(why.clone()));
+            self.notice(why);
+            ended.push(id);
+        }
+        ended
+    }
+
     fn checkpoint_turn(&mut self, id: &str, force: bool) {
         let Some(tail) = self.inflight_tails.get(id).copied() else {
             return;
@@ -4442,6 +4498,7 @@ impl AppState {
     pub(crate) fn archive_session(&mut self, id: &str) {
         self.runner.stop(id);
         self.streams.remove(id);
+        self.turn_seen.remove(id);
         self.steer_mailboxes.remove(id);
         self.turn_extension_activations.remove(id);
         self.turn_agents.remove(id);
@@ -7774,6 +7831,31 @@ mod tests {
         );
     }
 
+    /// A dead runner must not leave a 24/7 window "running" forever: once
+    /// every timeout a live turn could be inside has passed, the watchdog ends
+    /// it and marks the placeholder with the reason.
+    #[test]
+    fn a_silent_turn_is_ended_by_the_watchdog() {
+        let (mut state, id) = goal_state("stall-watch");
+        let _ = state.begin_turn_in(&id, "work").expect("a turn");
+        assert!(state.is_streaming(&id));
+        let now = std::time::Instant::now();
+        assert!(
+            state.expire_stalled_turns(now).is_empty(),
+            "a fresh turn is not stalled"
+        );
+        state.turn_seen.insert(
+            id.clone(),
+            now - std::time::Duration::from_secs(60 * 60 * 24),
+        );
+        assert_eq!(state.expire_stalled_turns(now), vec![id.clone()]);
+        assert!(!state.is_streaming(&id), "the stream marker is released");
+        let session = state.store.session(&id).expect("the session");
+        assert!(
+            session.messages.last().expect("the row").error.is_some(),
+            "the placeholder carries the reason"
+        );
+    }
     /// The next request opens on the checkpoint the summarizer stored, framed
     /// exactly the way the compaction contract frames it.
     #[test]

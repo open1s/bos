@@ -99,6 +99,7 @@
 "goal.objectiveTooLong": "The goal objective is {actual} characters; the limit is {limit}. Shorten it and try again."
 "turn.retry": "Retry"
 "turn.actionMissed": "This action request ended without a successful tool call ({calls} calls, {failures} failed). Check the transcript before trusting the answer."
+"turn.stalled": "The turn stopped responding and was ended. Send the message again."
 "input.completePersona": "Complete persona"
 "input.completePersonaDesc": "Replaces the harness identity, workflow and tool guidance"
 "input.completePersonaNeedsPrompt": "Write a persona first"

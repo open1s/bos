@@ -2696,6 +2696,9 @@ impl Shell {
                         this.check_peer_delegations(cx);
                         this.check_peer_task_deadlines();
                         this.refresh_peer_mirrors();
+                        // A 24/7 window must not stay "running" on a dead
+                        // task's stale marker; the watchdog ends it.
+                        this.expire_stalled_turns(cx);
                     })
                     .is_err()
                 {
@@ -4004,6 +4007,23 @@ impl Shell {
     ///
     /// Exactly the condition the composer's placeholder states, so the promise
     /// and the key agree: a running turn with a message waiting behind it.
+    /// End turns whose runner went silent past every timeout it could be in.
+    ///
+    /// A 24/7 window must not sit on a dead task's stale "running" marker. The
+    /// watchdog folds an Error into the session (which clears the stream and
+    /// marks the placeholder), disarms a goal round that can never finish, and
+    /// drains whatever waited behind it.
+    pub(crate) fn expire_stalled_turns(&mut self, cx: &mut Context<Self>) {
+        let ended = self.state.expire_stalled_turns(std::time::Instant::now());
+        for id in &ended {
+            self.state.disarm_goal(id);
+            self.drain_inbox(id, cx);
+        }
+        if !ended.is_empty() {
+            cx.notify();
+        }
+    }
+
     pub(crate) fn queued_steerable(&self) -> bool {
         self.state.subagent.is_none()
             && self
