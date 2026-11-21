@@ -96,9 +96,6 @@ pub(crate) struct AuditCache {
     /// The key a background build is running for, so a page never starts the
     /// same build twice and can draw a loading frame while it waits.
     building: Option<AuditKey>,
-    /// The key whose cache file has already been consulted. A miss must not
-    /// re-read and re-parse the file on every frame while the build runs.
-    disk_checked: Option<AuditKey>,
 }
 
 /// Above this many calls a settled audit page is built on the background
@@ -118,6 +115,20 @@ struct AuditDisk {
     view: AuditView,
     flat: Vec<FlatEvent>,
     stats: FlatStats,
+}
+
+/// Read a built page from disk if its fingerprint matches. Free function so
+/// the whole read runs on the background executor, never on a frame.
+fn read_audit_disk(
+    path: &std::path::Path,
+    fingerprint: &str,
+) -> Option<(AuditView, Vec<FlatEvent>, FlatStats)> {
+    let bytes = std::fs::read(path).ok()?;
+    let disk: AuditDisk = serde_json::from_slice(&bytes).ok()?;
+    if disk.fingerprint != fingerprint {
+        return None;
+    }
+    Some((disk.view, disk.flat, disk.stats))
 }
 
 /// The summary strip's four counts, derived once per model build.
@@ -327,23 +338,6 @@ impl Shell {
         // A previously built page is the fast path: reading its cache costs a
         // parse, not a walk of every stored output. During a stream the key
         // changes per event, so the disk is not touched until it settles.
-        let disk_unchecked = {
-            let cache = self.audit_cache.borrow();
-            cache.disk_checked.as_ref() != Some(&key)
-        };
-        if !streaming
-            && disk_unchecked
-            && let Some((view, flat, stats)) = self.read_audit_disk(session, &key)
-        {
-            self.audit_cache.borrow_mut().disk_checked = Some(key.clone());
-            let mut cache = self.audit_cache.borrow_mut();
-            cache.view = std::rc::Rc::new(view);
-            cache.flat = std::rc::Rc::new(flat);
-            cache.stats = stats;
-            cache.key = Some(key);
-            return cache.view.clone();
-        }
-        self.audit_cache.borrow_mut().disk_checked = Some(key.clone());
         let events: usize = session
             .messages
             .iter()
@@ -371,20 +365,6 @@ impl Shell {
         format!("{key:?}")
     }
 
-    /// Read a previously built page when it still describes this session.
-    fn read_audit_disk(
-        &self,
-        session: &crate::model::Session,
-        key: &AuditKey,
-    ) -> Option<(AuditView, Vec<FlatEvent>, FlatStats)> {
-        let bytes = std::fs::read(self.audit_cache_path(session)).ok()?;
-        let disk: AuditDisk = serde_json::from_slice(&bytes).ok()?;
-        if disk.fingerprint != Self::audit_fingerprint(key) {
-            return None;
-        }
-        Some((disk.view, disk.flat, disk.stats))
-    }
-
     /// Build the page off the UI thread and persist it before installing.
     fn spawn_audit_build(
         &self,
@@ -405,6 +385,11 @@ impl Shell {
             let built = cx
                 .background_executor()
                 .spawn(async move {
+                    // A persisted page costs a parse, not a rebuild; try it in
+                    // the background before walking the log again.
+                    if let Some(built) = read_audit_disk(&path, &fingerprint) {
+                        return built;
+                    }
                     let view = AuditView::build(&snapshot, &denials, &mcp).with_policy(policy);
                     let rows = Shell::flat_events(&view, lang);
                     let stats = Shell::stats_of(&rows);
@@ -3536,7 +3521,13 @@ mod tests {
                 *shell.audit_cache.borrow_mut() = super::AuditCache::default();
             })
         });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for _ in 0..40 {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            if cx.debug_bounds("audit-turn-1").is_some() {
+                break;
+            }
+        }
         assert!(
             cx.debug_bounds("audit-turn-1").is_some(),
             "the persisted page installs"
