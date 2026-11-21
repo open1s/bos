@@ -96,12 +96,23 @@ pub(crate) struct AuditCache {
     /// The key a background build is running for, so a page never starts the
     /// same build twice and can draw a loading frame while it waits.
     building: Option<AuditKey>,
+    /// When a live refresh last ran, so a stream refreshes on a clock rather
+    /// than once per event.
+    refreshed_at: Option<std::time::Instant>,
 }
 
 /// Above this many calls a settled audit page is built on the background
 /// executor instead of inside the frame. Small pages are cheaper to build than
 /// to schedule; a page this size is what used to stall the UI thread.
 const AUDIT_ASYNC_EVENTS: usize = 800;
+
+/// How often a live turn refreshes the audit page. Chat and trajectory update
+/// per event; the audit model is a full walk, so it follows on a slower clock
+/// instead of being frozen until the turn settles (which is what it did).
+#[cfg(not(test))]
+const AUDIT_LIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(test)]
+const AUDIT_LIVE_EVERY: std::time::Duration = std::time::Duration::ZERO;
 
 /// The audit model as it sits on disk beside the session's history pages.
 ///
@@ -343,14 +354,32 @@ impl Shell {
             .iter()
             .map(|message| message.tools.len())
             .sum();
-        if streaming || events <= AUDIT_ASYNC_EVENTS {
+        if streaming {
+            // A live turn refreshes the page on a clock: the model is a full
+            // walk, so per event would cost the turn, and never would leave the
+            // page frozen while chat and trajectory moved.
+            let due = self
+                .audit_cache
+                .borrow()
+                .refreshed_at
+                .is_none_or(|at| at.elapsed() >= AUDIT_LIVE_EVERY);
+            let stale = {
+                let cache = self.audit_cache.borrow();
+                cache.key.as_ref() != Some(&key) && cache.building.is_none()
+            };
+            if due && stale {
+                self.spawn_audit_build(session, key, cx, false);
+            }
+            return self.audit_cache.borrow().view.clone();
+        }
+        if events <= AUDIT_ASYNC_EVENTS {
             let mut cache = self.audit_cache.borrow_mut();
-            if !streaming && cache.key.as_ref() != Some(&key) {
+            if cache.key.as_ref() != Some(&key) {
                 self.build_audit_into(&mut cache, session, &key);
             }
             return cache.view.clone();
         }
-        self.spawn_audit_build(session, key, cx);
+        self.spawn_audit_build(session, key, cx, true);
         self.audit_cache.borrow().view.clone()
     }
 
@@ -371,6 +400,7 @@ impl Shell {
         session: &crate::model::Session,
         key: AuditKey,
         cx: &mut Context<Self>,
+        persist: bool,
     ) {
         let denials = self.blocking_denials();
         let snapshot = session.clone();
@@ -380,14 +410,19 @@ impl Shell {
         let build_key = key.clone();
         let path = self.audit_cache_path(session);
         let fingerprint = Self::audit_fingerprint(&key);
-        self.audit_cache.borrow_mut().building = Some(key);
+        {
+            let mut cache = self.audit_cache.borrow_mut();
+            cache.building = Some(key);
+            cache.refreshed_at = Some(std::time::Instant::now());
+        }
         cx.spawn(async move |this, cx| {
             let built = cx
                 .background_executor()
                 .spawn(async move {
                     // A persisted page costs a parse, not a rebuild; try it in
-                    // the background before walking the log again.
-                    if let Some(built) = read_audit_disk(&path, &fingerprint) {
+                    // the background before walking the log again. A live
+                    // refresh skips the disk entirely.
+                    if persist && let Some(built) = read_audit_disk(&path, &fingerprint) {
                         return built;
                     }
                     let view = AuditView::build(&snapshot, &denials, &mcp).with_policy(policy);
@@ -399,7 +434,7 @@ impl Shell {
                         flat: rows.clone(),
                         stats,
                     };
-                    if let Ok(bytes) = serde_json::to_vec(&disk) {
+                    if persist && let Ok(bytes) = serde_json::to_vec(&disk) {
                         if let Some(dir) = path.parent() {
                             let _ = std::fs::create_dir_all(dir);
                         }
@@ -432,7 +467,7 @@ impl Shell {
                 return;
             }
         }
-        self.spawn_audit_build(session, key, cx);
+        self.spawn_audit_build(session, key, cx, true);
     }
     /// Install a background build if it still describes the session on screen.
     fn install_audit(&mut self, key: AuditKey, built: (AuditView, Vec<FlatEvent>, FlatStats)) {
@@ -471,7 +506,7 @@ impl Shell {
         let Some(session) = self.state.active_session() else {
             return self.audit_stats();
         };
-        if session.audit.upto == 0 {
+        if session.audit.upto == 0 || self.state.is_streaming(&session.id) {
             return self.audit_stats();
         }
         let model = self.audit_stats();
@@ -3632,6 +3667,58 @@ mod tests {
         }
         let back = cx.update(|_, cx| shell.read(cx).audit_scroll.offset().y);
         assert_eq!(back, gpui_kit::px(0.0), "the first page returns to the top");
+    }
+
+    /// A live turn moves chat and trajectory; the audit page follows on its
+    /// refresh clock instead of staying frozen until the turn settles.
+    #[gpui::test]
+    fn a_live_turn_refreshes_the_audit_page(cx: &mut TestAppContext) {
+        let (shell, cx) = boot(cx, "audit-live", 4);
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.audit_table = true;
+                this.state.tab = Tab::Audit;
+                cx.notify();
+            })
+        });
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let id = cx.update(|_, cx| shell.read(cx).state.active_id.clone().expect("a session"));
+        let before = cx.update(|_, cx| shell.read(cx).audit_cache.borrow().flat.len());
+        cx.update(|_, cx| {
+            shell.update(cx, |this, _| {
+                let _ = this.state.begin_turn_in(&id, "work");
+                this.state.apply_event(
+                    &id,
+                    crate::runner::AgentEvent::ToolCall {
+                        name: "read_file".to_string(),
+                        args: "{}".to_string(),
+                    },
+                );
+                this.state.apply_event(
+                    &id,
+                    crate::runner::AgentEvent::ToolResult {
+                        name: "read_file".to_string(),
+                        output: "ok".to_string(),
+                        ms: 1,
+                    },
+                );
+            })
+        });
+        for _ in 0..60 {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let now = cx.update(|_, cx| shell.read(cx).audit_cache.borrow().flat.len());
+            if now > before {
+                break;
+            }
+        }
+        let after = cx.update(|_, cx| shell.read(cx).audit_cache.borrow().flat.len());
+        assert!(
+            after > before,
+            "the live page caught up: {before} -> {after}"
+        );
     }
 
     /// A long audit page paints a window, and its view model survives a repaint.
