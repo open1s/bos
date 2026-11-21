@@ -4294,6 +4294,9 @@ impl AppState {
             // same ceiling, but a session that only streams never pages. Done
             // before the save, so the file carries the bounded window too.
             self.trim_settled_window(id);
+            // Persist the audit counters before the session is written: the
+            // Audit tab reads them instead of walking the log.
+            self.record_audit(id);
             if let Some(session) = self.store.session(id) {
                 let _ = self.store.save(session);
             }
@@ -4315,6 +4318,47 @@ impl AppState {
         }
         self.store
             .trim_front(id, crate::store::WINDOW * crate::theme::WINDOWS_KEPT)
+    }
+
+    /// Fold the rows added since the last settled turn into the session's
+    /// persisted audit counters.
+    ///
+    /// Only NEW rows are walked, so the cost follows one turn, not the whole
+    /// log; the result is saved with the session and read by the Audit tab.
+    fn record_audit(&mut self, id: &str) {
+        let Some(session) = self.store.session_mut(id) else {
+            return;
+        };
+        let start = session
+            .audit
+            .upto
+            .saturating_sub(session.loaded_from)
+            .min(session.messages.len());
+        let mut turns = 0u64;
+        let mut calls = 0u64;
+        let mut ok = 0u64;
+        let mut failed = 0u64;
+        for (offset, message) in session.messages[start..].iter().enumerate() {
+            let first_of_log = session.audit.upto == 0 && offset == 0;
+            if first_of_log || (message.role == Role::User && !message.steering) {
+                turns += 1;
+            }
+            for tool in &message.tools {
+                calls += 1;
+                if let Some(output) = tool.output.as_deref() {
+                    if react::tool::ToolResult::text_is_error(output) {
+                        failed += 1;
+                    } else {
+                        ok += 1;
+                    }
+                }
+            }
+        }
+        session.audit.turns += turns;
+        session.audit.calls += calls;
+        session.audit.ok += ok;
+        session.audit.failed += failed;
+        session.audit.upto = session.loaded_from + session.messages.len();
     }
 
     /// Record the skill blocks a prompt's turn carried, for the transcript.
@@ -7811,6 +7855,49 @@ mod tests {
         assert!(state.goal_can_advance(&id));
     }
 
+    /// The persisted audit counters fold one settled turn at a time, so the
+    /// Audit tab reads totals instead of walking the log.
+    #[test]
+    fn audit_counters_fold_each_turn_once() {
+        use crate::model::{ChatMessage, ToolEvent};
+        let (mut state, id) = goal_state("audit-counters");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages.clear();
+        }
+        {
+            let session = state.store.session_mut(&id).expect("the session");
+            session.messages.push(ChatMessage::user("one"));
+            session.messages.push(ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        state.record_audit(&id);
+        {
+            let session = state.store.session(&id).expect("the session");
+            assert_eq!(session.audit.turns, 1);
+            assert_eq!(session.audit.calls, 1);
+            assert_eq!(session.audit.ok, 1);
+        }
+        {
+            let session = state.store.session_mut(&id).expect("the session");
+            session.messages.push(ChatMessage::user("two"));
+            session.messages.push(ChatMessage::assistant());
+        }
+        state.record_audit(&id);
+        let session = state.store.session(&id).expect("the session");
+        assert_eq!(session.audit.turns, 2, "only the new turn was folded");
+        assert_eq!(session.audit.calls, 1, "the old call was not recounted");
+    }
     /// The checkpoint interval scales with the in-flight row: a small journal
     /// is written every second, a multi-megabyte one rarely enough that its
     /// serialization never occupies the input path for a whole turn.

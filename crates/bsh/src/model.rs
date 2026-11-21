@@ -627,6 +627,27 @@ pub(crate) struct SubagentMeta {
     pub(crate) error: Option<String>,
 }
 
+/// Audit counters over the WHOLE log, including rows the loaded window has
+/// paged out.
+///
+/// The Audit tab used to derive its summary by walking the loaded messages;
+/// after paging, that walk sees only the window and disagrees with the log.
+/// These counters are updated at each settled turn over the rows added since
+/// `upto`, so opening the tab reads a number instead of recomputing it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SessionAudit {
+    /// Global row index (loaded_from + local) the counters have reached.
+    pub(crate) upto: usize,
+    /// Turn-opening rows counted.
+    pub(crate) turns: u64,
+    /// Tool calls counted.
+    pub(crate) calls: u64,
+    /// Calls that completed without an error.
+    pub(crate) ok: u64,
+    /// Calls whose stored output is an error.
+    pub(crate) failed: u64,
+}
+
 /// One chat session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Session {
@@ -686,6 +707,10 @@ pub(crate) struct Session {
     /// The session goal.
     #[serde(default)]
     pub(crate) goal: Option<Goal>,
+    /// Audit counters over the whole log, including paged-out rows.
+    #[serde(default)]
+    pub(crate) audit: SessionAudit,
+
     /// Whether this conversation is in plan mode.
     ///
     /// A SESSION fact, not a global preference: it changes what the next turn
@@ -777,6 +802,7 @@ impl Session {
             plan: Vec::new(),
             goal: None,
             plan_mode: false,
+            audit: SessionAudit::default(),
             compacted: 0,
             feedback: None,
             pinned: false,

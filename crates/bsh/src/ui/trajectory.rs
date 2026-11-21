@@ -2110,6 +2110,11 @@ impl Shell {
         } else {
             "\u{229f}"
         };
+        let older = self
+            .state
+            .active_session()
+            .and_then(|session| session.paged_from)
+            .is_some_and(|floor| floor > 0);
         let button = |id: &'static str, label: String, on: bool, glyph: &'static str| {
             let tip = label.clone();
             div()
@@ -2201,6 +2206,24 @@ impl Shell {
                     ),
             )
             .child(div().flex_1())
+            .when(older, |row| {
+                row.child(
+                    div()
+                        .id("traj-older")
+                        .debug_selector(|| "traj-older".to_string())
+                        .h(px(24.0))
+                        .px(px(9.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::hover())))
+                        .child(txt(lang.tr("traj.loadOlder"), 11.0, theme::muted()))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.request_older_page(cx);
+                        })),
+                )
+            })
             .child(
                 div()
                     .id("traj-runs-toggle")

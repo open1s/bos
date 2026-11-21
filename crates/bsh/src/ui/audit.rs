@@ -377,6 +377,25 @@ impl Shell {
         self.audit_cache.borrow().stats
     }
 
+    /// The summary counts the header prints: the session's persisted counters
+    /// when they exist, so showing the totals never walks the log; the cached
+    /// model's ring-derived denial count is added on top.
+    fn audit_summary_stats(&self) -> FlatStats {
+        let Some(session) = self.state.active_session() else {
+            return self.audit_stats();
+        };
+        if session.audit.upto == 0 {
+            return self.audit_stats();
+        }
+        let model = self.audit_stats();
+        FlatStats {
+            total: session.audit.turns as usize + session.audit.calls as usize + model.denied,
+            succeeded: session.audit.turns as usize + session.audit.ok as usize,
+            denied: model.denied,
+            failed: session.audit.failed as usize,
+        }
+    }
+
     /// The row indices the current search, category, result and range admit.
     ///
     /// The scan runs once per filter change, not once per repaint: a reader who
@@ -785,7 +804,11 @@ impl Shell {
         // The rows are the cached model's: filtering borrows them, so a repaint
         // of an unchanged page copies no event, no target and no preview.
         let all = self.audit_flat();
-        let stats = self.audit_stats();
+        // The persisted counters cover the WHOLE log, including rows the
+        // loaded window paged out; they are folded once per settled turn. A
+        // session written before the counters existed (or a test session) has
+        // `upto == 0`, and the cached model is the only truth it has.
+        let stats = self.audit_summary_stats();
         let total = stats.total;
         let succeeded = stats.succeeded;
         let denied = stats.denied;
@@ -1110,16 +1133,33 @@ impl Shell {
                     .flex_col()
                     .children(table_rows),
             )
-            .child(
+            .child({
+                let older = self
+                    .state
+                    .active_session()
+                    .and_then(|session| session.paged_from)
+                    .is_some_and(|floor| floor > 0);
                 div()
                     .h(px(32.0))
                     .px(px(14.0))
                     .flex()
                     .items_center()
+                    .gap(px(10.0))
                     .border_t_1()
                     .border_color(rgb(theme::border_soft()))
-                    .child(txt(lang.tr("audit.partialNote"), 10.0, theme::faint())),
-            );
+                    .child(txt(lang.tr("audit.partialNote"), 10.0, theme::faint()).flex_1())
+                    .when(older, |row| {
+                        row.child(
+                            div()
+                                .id("audit-older")
+                                .cursor_pointer()
+                                .child(txt(lang.tr("audit.loadOlder"), 10.0, theme::accent()))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.request_older_page(cx);
+                                })),
+                        )
+                    })
+            });
 
         let inspector = if let Some(index) = selected {
             let event = &all[filtered[index]];
