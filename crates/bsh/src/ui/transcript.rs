@@ -177,6 +177,11 @@ const PROCESS_STEP_PAGE: usize = 12;
 /// content segment is a row even when the tool calls are grouped.
 const TIMELINE_ROW_PAGE: usize = 12;
 
+/// A page value that means "stay on the last page". Set when a message is
+/// live, so a streaming turn keeps showing its newest rows and does not jump
+/// back to the first page when it settles.
+const FOLLOW_END: usize = usize::MAX;
+
 /// One drawn row of a message's timeline, planned before any element is built.
 enum TimelineSlot {
     Thinking {
@@ -3323,6 +3328,7 @@ impl Shell {
         &self,
         index: usize,
         message: &ChatMessage,
+        live_turn: bool,
         chrome: &RowChrome<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -3432,12 +3438,16 @@ impl Shell {
         // bar jumps to the first or the last page in one click.
         let total = message.tools.len();
         let pages = total.div_ceil(PROCESS_STEP_PAGE).max(1);
-        let page = self
-            .process_page
-            .get(&index)
-            .copied()
-            .unwrap_or(0)
-            .min(pages - 1);
+        let stored = self.process_page.borrow().get(&index).copied();
+        let page = match stored {
+            Some(FOLLOW_END) => pages - 1,
+            Some(page) => page.min(pages - 1),
+            None if live_turn => {
+                self.process_page.borrow_mut().insert(index, FOLLOW_END);
+                pages - 1
+            }
+            None => 0,
+        };
         let start = page * PROCESS_STEP_PAGE;
         let end = (start + PROCESS_STEP_PAGE).min(total);
         for (tool_index, tool) in message.tools.iter().enumerate().take(end).skip(start) {
@@ -4349,7 +4359,13 @@ impl Shell {
         if !message.tools.is_empty() {
             let grouped = chrome.policy.step_grouping == StepGrouping::Collapsed;
             if grouped {
-                column = column.child(self.process_group(index, message, chrome, cx));
+                column = column.child(self.process_group(
+                    index,
+                    message,
+                    turn.writing && !turn.settled,
+                    chrome,
+                    cx,
+                ));
             } else {
                 for (tool_index, tool) in message.tools.iter().enumerate() {
                     column = column.child(self.tool_row(index, tool_index, tool, chrome, cx));
@@ -4430,12 +4446,16 @@ impl Shell {
         // work follows the page, never the run.
         let total = slots.len();
         let pages = total.div_ceil(TIMELINE_ROW_PAGE).max(1);
-        let page = self
-            .timeline_page
-            .get(&index)
-            .copied()
-            .unwrap_or(0)
-            .min(pages - 1);
+        let stored = self.timeline_page.borrow().get(&index).copied();
+        let page = match stored {
+            Some(FOLLOW_END) => pages - 1,
+            Some(page) => page.min(pages - 1),
+            None if turn.writing && !turn.settled => {
+                self.timeline_page.borrow_mut().insert(index, FOLLOW_END);
+                pages - 1
+            }
+            None => 0,
+        };
         let start = page * TIMELINE_ROW_PAGE;
         let end = (start + TIMELINE_ROW_PAGE).min(total);
         for slot in &slots[start..end] {
@@ -4472,7 +4492,13 @@ impl Shell {
                     );
                 }
                 TimelineSlot::Group => {
-                    column = column.child(self.process_group(index, message, chrome, cx));
+                    column = column.child(self.process_group(
+                        index,
+                        message,
+                        turn.writing && !turn.settled,
+                        chrome,
+                        cx,
+                    ));
                 }
                 TimelineSlot::Tool(tool_index) => {
                     if let Some(tool) = message.tools.get(*tool_index) {
@@ -4548,7 +4574,7 @@ impl Shell {
                     if timeline { "timeline" } else { "process" }
                 ),
                 lang.tr("transcript.pageLast"),
-                pages - 1,
+                FOLLOW_END,
                 index,
                 timeline,
                 cx,
@@ -4579,9 +4605,9 @@ impl Shell {
             .child(txt(label, 10.5, theme::muted()))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 if timeline {
-                    this.timeline_page.insert(index, page);
+                    this.timeline_page.borrow_mut().insert(index, page);
                 } else {
-                    this.process_page.insert(index, page);
+                    this.process_page.borrow_mut().insert(index, page);
                 }
                 cx.notify();
             }))

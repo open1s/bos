@@ -35199,13 +35199,13 @@ fn a_single_message_with_thousands_of_calls_keeps_each_tab_smooth(cx: &mut TestA
         .debug_bounds("process-last-1")
         .expect("the open group has a last-page control");
     cx.simulate_click(last.center(), Modifiers::default());
-    let page = cx.update(|_, cx| shell.read(cx).process_page.get(&1).copied());
-    assert_eq!(page, Some((3000usize).div_ceil(12) - 1), "last page");
+    let page = cx.update(|_, cx| shell.read(cx).process_page.borrow().get(&1).copied());
+    assert_eq!(page, Some(usize::MAX), "the last control follows the end");
     let first = cx
         .debug_bounds("process-first-1")
         .expect("the open group has a first-page control");
     cx.simulate_click(first.center(), Modifiers::default());
-    let page = cx.update(|_, cx| shell.read(cx).process_page.get(&1).copied());
+    let page = cx.update(|_, cx| shell.read(cx).process_page.borrow().get(&1).copied());
     assert_eq!(page, Some(0), "back to the first page");
 }
 
