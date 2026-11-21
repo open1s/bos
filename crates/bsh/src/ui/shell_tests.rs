@@ -19132,6 +19132,7 @@ fn deleting_a_session_removes_its_file_and_selects_another(cx: &mut TestAppConte
     cx.update(|_, cx| {
         shell.update(cx, |this, cx| this.delete_session(&doomed, cx));
     });
+    cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
     let (still_there, selected, on_disk) = cx.update(|_, cx| {
@@ -39068,4 +39069,43 @@ fn the_memory_pane_searches_and_supersedes(cx: &mut TestAppContext) {
         "the predecessor is kept as history: {statuses:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui::test]
+fn deleting_a_workspace_is_parked_asynchronously(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("workspace-delete-async");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let id = cx.update(|_, cx| {
+        shell.read(cx).state.settings.global.workspaces[0]
+            .id
+            .clone()
+    });
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| this.delete_workspace(&id, cx));
+    });
+    cx.run_until_parked();
+    let (gone, parked) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell
+                .state
+                .settings
+                .global
+                .workspaces
+                .iter()
+                .all(|workspace| workspace.id != id),
+            shell.state.trash().iter().any(|entry| {
+                entry.kind() == Some(crate::trash::Kind::Workspace)
+                    && entry.envelope.workspace == id
+            }),
+        )
+    });
+    assert!(gone, "the workspace row is gone");
+    assert!(parked, "and its record is in the bin");
 }

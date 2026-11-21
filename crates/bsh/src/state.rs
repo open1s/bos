@@ -956,6 +956,20 @@ pub(crate) struct FederationPeerView {
 }
 
 /// Everything the shell renders from.
+/// Everything a background workspace park needs.
+pub(crate) struct PreparedWorkspace {
+    pub(crate) record: crate::settings::global::WorkspaceRef,
+    pub(crate) trash_dir: std::path::PathBuf,
+}
+
+/// Everything a background session park needs, detached from AppState.
+pub(crate) struct PreparedSession {
+    pub(crate) session: crate::model::Session,
+    pub(crate) workspace_name: String,
+    pub(crate) trash_dir: std::path::PathBuf,
+    pub(crate) log_from: std::path::PathBuf,
+}
+
 pub(crate) struct AppState {
     /// Persisted sessions.
     pub(crate) store: Store,
@@ -2047,30 +2061,44 @@ impl AppState {
     /// that becomes active rather than deleted: a row leaving a list must not
     /// take a transcript with it. Deleting the last one leaves none, which the
     /// sidebar and the hero both handle as "no workspace".
+    #[cfg(test)]
     pub(crate) fn delete_workspace(&mut self, id: &str) -> bool {
-        // Park the record first, for the same reason a chat is parked first: a
-        // delete nobody can undo is a delete nobody dares to use.
-        let Some(record) = self
+        let Some(prepared) = self.prepare_delete_workspace(id) else {
+            return false;
+        };
+        if crate::trash::park_workspace(
+            &prepared.record,
+            &prepared.record.name,
+            &prepared.trash_dir,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        self.finish_delete_workspace(&prepared.record)
+    }
+
+    /// Collect the record and bin path before a background park.
+    pub(crate) fn prepare_delete_workspace(&self, id: &str) -> Option<PreparedWorkspace> {
+        let record = self
             .settings
             .global
             .workspaces
             .iter()
             .find(|workspace| workspace.id == id)
-            .cloned()
-        else {
-            return false;
-        };
-        if self
-            .stash(
-                crate::trash::Kind::Workspace,
-                &record.name,
-                &record.id,
-                &record,
-            )
-            .is_none()
-        {
-            return false;
-        }
+            .cloned()?;
+        Some(PreparedWorkspace {
+            trash_dir: self.settings.trash_dir(),
+            record,
+        })
+    }
+
+    /// Apply the registry and store changes after the park succeeded.
+    pub(crate) fn finish_delete_workspace(
+        &mut self,
+        record: &crate::settings::global::WorkspaceRef,
+    ) -> bool {
+        let id = record.id.as_str();
         let before = self.settings.global.workspaces.len();
         self.settings
             .global
@@ -2090,20 +2118,14 @@ impl AppState {
             self.settings.global.general.active_workspace.clone()
         };
         self.settings.global.general.active_workspace = next.clone();
-        // The store's copy of the registry is a CACHE, so it is re-read here:
-        // without it the deleted workspace's chats still read as owned and the
-        // orphan sweep below moves nothing.
         self.sync_store_roots();
         if !next.is_empty() {
-            // The deleted workspace's sessions are unregistered now, which is
-            // exactly the orphan case the store already knows how to move.
             self.store.rehome_orphans(&next);
         }
         let _ = self.settings.save();
         self.refresh_mcp();
         true
     }
-
     /// Create a chat in the named workspace and select it.
     ///
     /// Different from [`AppState::set_workspace`]: that one MOVES the chat under
@@ -2138,19 +2160,37 @@ impl AppState {
     }
 
     /// Delete a chat, parking it in the recycle bin first.
+    #[cfg(test)]
     ///
     /// The parking write comes BEFORE the removal: if the envelope cannot be
     /// written the delete does not happen, because losing the copy is worse than
     /// refusing the delete. The selection then moves to the next chat in the list,
     /// or to none when that was the last one.
     pub(crate) fn delete_session(&mut self, id: &str) -> bool {
-        if self.store.session(id).is_none() {
+        let Some(prepared) = self.prepare_delete_session(id) else {
+            return false;
+        };
+        if crate::trash::park_session(
+            &prepared.session,
+            &prepared.workspace_name,
+            &prepared.trash_dir,
+            &prepared.log_from,
+        )
+        .is_err()
+        {
             return false;
         }
+        self.finish_delete_session(&prepared.session)
+    }
 
-        // Stop a live turn before taking the recovery snapshot. Calling stop on
-        // an idle session would incorrectly mark its last empty assistant row
-        // as cancelled, so the idle path only releases runtime handles.
+    /// Stop the turn and collect everything a background park needs.
+    ///
+    /// The in-memory removal is deliberately NOT done here: a failed park must
+    /// leave the session intact.
+    pub(crate) fn prepare_delete_session(&mut self, id: &str) -> Option<PreparedSession> {
+        if self.store.session(id).is_none() {
+            return None;
+        }
         if self.streams.contains_key(id) {
             self.stop(id);
         } else {
@@ -2163,42 +2203,36 @@ impl AppState {
         if self.streams.is_empty() {
             self.turn_started = None;
         }
+        let session = self.store.session(id)?.clone();
+        let workspace_name = self
+            .settings
+            .global
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == session.workspace)
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| session.workspace.clone());
+        let trash_dir = self.settings.trash_dir();
+        let log_from = crate::history::History::dir_for(&self.store.dir_for_id(id), id);
+        Some(PreparedSession {
+            session,
+            workspace_name,
+            trash_dir,
+            log_from,
+        })
+    }
 
-        // The snapshot must include the stopped turn's final transcript state.
-        // If parking fails, the session remains in the store (but a live turn
-        // has already been stopped); preserving data takes priority over
-        // pretending the deletion succeeded.
-        let Some(session) = self.store.session(id).cloned() else {
-            return false;
-        };
-        if self
-            .stash(
-                crate::trash::Kind::Session,
-                &session.title,
-                &session.workspace,
-                &session,
-            )
-            .is_none()
-        {
+    /// Apply the in-memory half of a delete after the park succeeded.
+    pub(crate) fn finish_delete_session(&mut self, session: &crate::model::Session) -> bool {
+        if !self.store.remove(&session.id) {
             return false;
         }
-        if !self.store.remove(id) {
-            return false;
-        }
-
-        // stop() restores undelivered steering rows for an ordinary stop. A
-        // deleted session has nowhere to receive them, so discard those rows
-        // only AFTER parking and removing the session. If parking fails, the
-        // still-live session keeps its queued messages.
+        let id = session.id.as_str();
         self.inbox.remove(id);
         self.steering.retain(|_, steering| steering.session != id);
-
         self.plans.remove(id);
         self.goals.remove(id);
         self.turn_policy_generation.remove(id);
-        // A manual compaction owns its admission flag until its async completion
-        // callback runs stop_compacting(); it is not safe to clear that flag
-        // while its task is still executing.
         crate::extension::publish(
             crate::extension::topics::SESSION_DELETED,
             serde_json::json!({ "session": id, "title": session.title }),
@@ -2215,87 +2249,6 @@ impl AppState {
         }
         true
     }
-
-    /// Write one item's envelope into the bin.
-    fn stash<T: serde::Serialize>(
-        &self,
-        kind: crate::trash::Kind,
-        name: &str,
-        workspace: &str,
-        payload: &T,
-    ) -> Option<std::path::PathBuf> {
-        let payload = serde_json::to_value(payload).ok()?;
-        let workspace_name = self
-            .settings
-            .global
-            .workspaces
-            .iter()
-            .find(|record| record.id == workspace)
-            .map(|record| record.name.clone())
-            .unwrap_or_else(|| workspace.to_string());
-        // The id keys both the envelope and the log beside it, so a restore can
-        // find the pages without trusting a path recorded earlier.
-        let id = payload
-            .get("id")
-            .and_then(|id| id.as_str())
-            .unwrap_or("item")
-            .to_string();
-        let deleted_at = now();
-        let envelope = crate::trash::Envelope {
-            kind: kind.key().to_string(),
-            deleted_at,
-            workspace: workspace.to_string(),
-            workspace_name,
-            name: name.to_string(),
-            // Include the millisecond clock in the parked directory name: a
-            // restored session may be deleted again while an older copy remains
-            // in the bin, and the earlier recovery point must never be replaced.
-            log: match kind {
-                crate::trash::Kind::Session => format!("log-{id}-{}", now_ms()),
-                crate::trash::Kind::Workspace => String::new(),
-            },
-            payload,
-        };
-        let dir = self.settings.trash_dir();
-        let parked_log = if kind == crate::trash::Kind::Session {
-            let from = crate::history::History::dir_for(&self.store.dir_for_id(&id), &id);
-            let into = crate::trash::log_dir(&dir, &envelope);
-            let had_log = from.exists();
-            if let Err(error) = crate::trash::park_log(&dir, &from, &envelope) {
-                log::warn!(
-                    "session {id}: could not park history ({}): {error}",
-                    from.display()
-                );
-                return None;
-            }
-            had_log.then_some((from, into))
-        } else {
-            None
-        };
-
-        match crate::trash::stash(&dir, &envelope) {
-            Ok(path) => Some(path),
-            Err(error) => {
-                // The original session is still present. If writing its
-                // envelope failed after the history move, put the pages back
-                // before refusing the delete.
-                if let Some((from, parked)) = parked_log {
-                    if let Some(parent) = from.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if let Err(rollback) = std::fs::rename(&parked, &from) {
-                        log::error!(
-                            "session {id}: trash write failed ({error}); history rollback failed ({}): {rollback}",
-                            from.display()
-                        );
-                    }
-                }
-                log::warn!("session {id}: could not write trash envelope: {error}");
-                None
-            }
-        }
-    }
-
     /// Everything in the bin, newest first.
     pub(crate) fn trash(&self) -> Vec<crate::trash::Entry> {
         crate::trash::entries(&self.settings.trash_dir())
@@ -2381,6 +2334,7 @@ impl AppState {
     /// Only that one directory: a purge removes bsh own state (annotations, the
     /// terminal policy, the trace index) and never the workspace files. An empty
     /// or unknown root removes nothing.
+    #[cfg(test)]
     fn remove_workspace_state(root: &std::path::Path) {
         if root.as_os_str().is_empty() {
             return;
@@ -2391,6 +2345,22 @@ impl AppState {
         }
     }
 
+    /// Resolve the background half of a permanent delete.
+    pub(crate) fn prepare_purge(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<(crate::trash::Entry, Option<std::path::PathBuf>)> {
+        let entry = crate::trash::entries(&self.settings.trash_dir())
+            .into_iter()
+            .find(|entry| entry.path == path)?;
+        let session_dir =
+            serde_json::from_value::<crate::model::Session>(entry.envelope.payload.clone())
+                .ok()
+                .map(|session| self.store.dir_for_workspace(&session.workspace));
+        Some((entry, session_dir))
+    }
+
+    #[cfg(test)]
     pub(crate) fn purge_trashed(&mut self, path: &std::path::Path) -> bool {
         // A parked session's Parquet log outlives its document: the bin holds the
         // document, the pages never moved. Purging has to take them too, or every

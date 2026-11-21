@@ -7412,27 +7412,68 @@ impl Shell {
 
     /// Remove a workspace from the list, rehoming its chats.
     pub(crate) fn delete_workspace(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.state.delete_workspace(id) {
-            // The file pane's paths belonged to the deleted root.
-            self.refile_workspace(cx);
-        }
-        cx.notify();
+        let Some(prepared) = self.state.prepare_delete_workspace(id) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let record = prepared.record.clone();
+            let trash_dir = prepared.trash_dir.clone();
+            let parked = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::trash::park_workspace(&record, &record.name, &trash_dir).is_ok()
+                })
+                .await;
+            let _ = this.update(cx, |shell, cx| {
+                if parked {
+                    shell.state.finish_delete_workspace(&prepared.record);
+                    // The file pane's paths belonged to the deleted root.
+                    shell.refile_workspace(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Delete a chat, out of the menu that asked for it.
     ///
-    /// The row goes, the file goes with it (a list row leaving must not let a
-    /// transcript come back on the next launch), and any rename field on that
-    /// row is put away first so it cannot commit into a chat that no longer
-    /// exists.
+    /// The park moves the transcript on a background executor; the row is only
+    /// removed after that succeeds, so a failed park leaves the chat intact.
     pub(crate) fn delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.renaming_session.as_deref() == Some(id) {
             self.renaming_session = None;
         }
-        self.state.delete_session(id);
-        cx.notify();
+        let Some(prepared) = self.state.prepare_delete_session(id) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let prepared = prepared;
+            let parked_session = prepared.session.clone();
+            let workspace_name = prepared.workspace_name.clone();
+            let trash_dir = prepared.trash_dir.clone();
+            let log_from = prepared.log_from.clone();
+            let parked = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::trash::park_session(
+                        &parked_session,
+                        &workspace_name,
+                        &trash_dir,
+                        &log_from,
+                    )
+                    .is_ok()
+                })
+                .await;
+            let _ = this.update(cx, |shell, cx| {
+                if parked {
+                    shell.state.finish_delete_session(&prepared.session);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
-
     /// Open a chat in a named workspace from its own row.
     pub(crate) fn new_session_in_workspace(&mut self, id: &str, cx: &mut Context<Self>) {
         self.record_workspace_recent(id);

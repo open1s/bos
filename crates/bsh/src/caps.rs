@@ -5548,6 +5548,58 @@ impl react::engine::ToolSpill for WorkspaceSpill {
     }
 }
 
+const BSH_RUNNER: &str = r#"import ast
+import json
+import sys
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+    code_path, result_path = sys.argv[1], sys.argv[2]
+    with open(code_path, encoding="utf-8-sig") as source_file:
+        source = source_file.read()
+    try:
+        tree = ast.parse(source, filename=code_path, mode="exec")
+    except SyntaxError as error:
+        # Typographic math (O(n²), x³) is valid in comments and strings but
+        # Python identifiers cannot carry superscripts. If the parser rejected
+        # the character, retry with the ASCII digit: the UTF-8 source stays the
+        # same length and the line mapping is preserved.
+        superscripts = str.maketrans({"⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9"})
+        if "invalid character" not in str(error) or source == source.translate(superscripts):
+            raise
+        source = source.translate(superscripts)
+        tree = ast.parse(source, filename=code_path, mode="exec")
+    namespace = {"__name__": "__main__", "__file__": code_path}
+    has_result = bool(tree.body) and isinstance(tree.body[-1], ast.Expr)
+    if has_result:
+        prefix = ast.Module(body=tree.body[:-1], type_ignores=[])
+        ast.fix_missing_locations(prefix)
+        exec(compile(prefix, code_path, "exec"), namespace)
+        expression = ast.Expression(tree.body[-1].value)
+        ast.fix_missing_locations(expression)
+        value = eval(compile(expression, code_path, "eval"), namespace)
+    else:
+        exec(compile(tree, code_path, "exec"), namespace)
+        value = None
+    # A print/expression call returning None is not a completion value. Keep
+    # the key absent instead of rendering a literal null after the logs.
+    if has_result and value is None:
+        has_result = False
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        print(f"run_code result is not lossless JSON: {error}", file=sys.stderr)
+        sys.exit(3)
+    with open(result_path, "w", encoding="utf-8") as result_file:
+        json.dump({"has_result": has_result, "value": value}, result_file, ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
 const BSH_HELPER: &str = r#"import json
 import os
 import socket
@@ -5572,6 +5624,10 @@ def call(tool, arguments=None, **kwargs):
     if not result.get("ok"):
         raise RuntimeError(result.get("error", "tool failed"))
     return result.get("data")
+
+
+def schema(tool):
+    return call("__schema__", {"name": tool})
 
 
 def read_file(path, **kwargs):
@@ -5653,6 +5709,8 @@ impl agent::tools::Tool for RunCodeTool {
             "type": "object",
             "properties": {
                 "code": { "type": "string", "description": "Python source. It runs inside the workspace; print only the evidence you need." },
+                "description": { "type": "string", "description": "Short summary of this program for the transcript." },
+                "capture_output": { "type": "boolean", "description": "When no final expression produces a result, use captured stdout as the result; valid JSON becomes a structured value." },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Optional timeout; defaults to the shell timeout." }
             },
             "required": ["code"],
@@ -5727,6 +5785,38 @@ impl agent::tools::Tool for RunCodeTool {
                                             "ok": false,
                                             "error": "run_code cannot call itself"
                                         })
+                                    } else if tool == "__schema__" {
+                                        let name = arguments
+                                            .get("name")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or_default();
+                                        let schema = registry
+                                            .get(name)
+                                            .map(|tool| {
+                                                serde_json::json!({
+                                                    "name": name,
+                                                    "description": tool.description(),
+                                                    "parameters": tool.json_schema(),
+                                                })
+                                            })
+                                            .or_else(|| {
+                                                registry.get_async(name).map(|tool| {
+                                                    serde_json::json!({
+                                                        "name": name,
+                                                        "description": tool.description(),
+                                                        "parameters": tool.json_schema(),
+                                                    })
+                                                })
+                                            });
+                                        match schema {
+                                            Some(schema) => {
+                                                serde_json::json!({"ok": true, "data": schema})
+                                            }
+                                            None => serde_json::json!({
+                                                "ok": false,
+                                                "error": format!("no tool named '{name}'")
+                                            }),
+                                        }
                                     } else {
                                         match registry.execute(tool, &arguments) {
                                             Ok(data) => {
@@ -5774,12 +5864,28 @@ globals()["bsh"] = _bsh
             std::fs::write(&helper, BSH_HELPER)
                 .map_err(|error| ToolError::Failed(error.to_string()))?;
         }
+        let runner = directory.join("runner.py");
+        let result_file = directory.join(format!("result-{sequence}.json"));
+        std::fs::write(&runner, BSH_RUNNER)
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
         let relative = script
             .strip_prefix(root)
             .unwrap_or(&script)
             .to_string_lossy()
             .into_owned();
-        let mut command = serde_json::json!({ "command": format!("python3 {relative}") });
+        let runner_relative = runner
+            .strip_prefix(root)
+            .unwrap_or(&runner)
+            .to_string_lossy()
+            .into_owned();
+        let result_relative = result_file
+            .strip_prefix(root)
+            .unwrap_or(&result_file)
+            .to_string_lossy()
+            .into_owned();
+        let mut command = serde_json::json!({
+            "command": format!("python3 {runner_relative} {relative} {result_relative}")
+        });
         if let Some(timeout) = input.get("timeout_secs") {
             command["timeout_secs"] = timeout.clone();
         }
@@ -5791,9 +5897,85 @@ globals()["bsh"] = _bsh
             let _ = handle.join();
             let _ = std::fs::remove_file(&socket_path);
         }
+        let result = result?;
+        let stdout = result["stdout"].as_str().unwrap_or_default();
+        let stderr = result["stderr"].as_str().unwrap_or_default();
+        let success = result["success"].as_bool().unwrap_or(false);
+        let timeout = result["timed_out"].as_bool().unwrap_or(false);
+        let logs = stdout
+            .lines()
+            .chain(stderr.lines())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !success {
+            let kind = if timeout {
+                "timeout"
+            } else if result["exit_code"].as_i64() == Some(3) {
+                "invalid-output"
+            } else {
+                "exception"
+            };
+            let detail = stderr.trim();
+            let captured = if logs.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "
+Captured output:
+{}",
+                    logs.join(
+                        "
+"
+                    )
+                )
+            };
+            let _ = std::fs::remove_file(&script);
+            let _ = std::fs::remove_file(&runner);
+            let _ = std::fs::remove_file(&result_file);
+            let _ = std::fs::remove_file(&helper);
+            return Err(ToolError::Failed(format!(
+                "code run failed ({kind}): {detail}{captured}"
+            )));
+        }
+        let payload = match std::fs::read(&result_file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        {
+            Some(payload) => payload,
+            None => {
+                let _ = std::fs::remove_file(&script);
+                let _ = std::fs::remove_file(&runner);
+                let _ = std::fs::remove_file(&result_file);
+                let _ = std::fs::remove_file(&helper);
+                return Err(ToolError::Failed(
+                    "code run failed (invalid-output): the program produced no result envelope"
+                        .to_string(),
+                ));
+            }
+        };
+        let mut output = serde_json::json!({ "logs": logs });
+        if payload["has_result"].as_bool().unwrap_or(false) {
+            output["result"] = payload["value"].clone();
+        }
+        if input
+            .get("capture_output")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            && output.get("result").is_none_or(serde_json::Value::is_null)
+        {
+            let captured = stdout.trim_end();
+            if !captured.is_empty() {
+                // Capture is for USING the value, not only printing it: JSON
+                // stdout becomes a Python object; anything else stays text.
+                output["result"] =
+                    serde_json::from_str(captured).unwrap_or_else(|_| serde_json::json!(captured));
+            }
+        }
         let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&runner);
+        let _ = std::fs::remove_file(&result_file);
         let _ = std::fs::remove_file(&helper);
-        result
+        Ok(output)
     }
 }
 
@@ -9041,7 +9223,7 @@ mod tests {
         let built = build(&bare());
         let prompt = &built.agent.config().system_prompt;
         assert!(
-            prompt.len() < 15_200,
+            prompt.len() < 16_000,
             "the system prompt rides on every step: {} bytes",
             prompt.len()
         );
@@ -17896,8 +18078,16 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
                 }),
             )
             .expect("run_code");
-        let stdout = result["stdout"].as_str().unwrap_or_default();
-        assert!(stdout.contains("broker-visible"), "{result}");
+        let logs = result["logs"].as_array().expect("logs");
+        let text = logs
+            .iter()
+            .filter_map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(text.contains("broker-visible"), "{result}");
     }
 
     #[test]
@@ -17926,5 +18116,144 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
             "codel is registered as a built-in: {:?}",
             tools.iter().map(|tool| &tool.name).collect::<Vec<_>>()
         );
+    }
+    #[test]
+    fn run_code_returns_logs_and_a_completion_value() {
+        let root = scratch("run-code-result");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let result = registry
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "print('one')
+print('two')
+{'count': 2, 'ok': True}"
+                }),
+            )
+            .expect("run_code");
+        assert_eq!(
+            result["logs"],
+            serde_json::json!(["one", "two"]),
+            "{result}"
+        );
+        assert_eq!(
+            result["result"],
+            serde_json::json!({"count": 2, "ok": true}),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn run_code_failures_are_tool_errors() {
+        let root = scratch("run-code-failure");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let error = registry
+            .execute(
+                "run_code",
+                &serde_json::json!({"code": "raise ValueError('boom')"}),
+            )
+            .expect_err("a program failure is a tool error");
+        let text = error.to_string();
+        assert!(text.contains("code run failed (exception)"), "{text}");
+        assert!(text.contains("boom"), "{text}");
+    }
+    #[test]
+    fn run_code_exposes_tool_schemas() {
+        let root = scratch("run-code-schema");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let result = registry
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "schema = bsh.schema('grep')
+assert schema['name'] == 'grep'
+schema['parameters']"
+                }),
+            )
+            .expect("run_code");
+        assert_eq!(
+            result["result"]["required"],
+            serde_json::json!(["pattern"]),
+            "{result}"
+        );
+    }
+    #[test]
+    fn run_code_can_capture_printed_output_as_the_result() {
+        let root = scratch("run-code-capture");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let result = registry
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "print('{\"count\": 2}')",
+                    "capture_output": true
+                }),
+            )
+            .expect("run_code");
+        assert_eq!(
+            result["result"],
+            serde_json::json!({"count": 2}),
+            "{result}"
+        );
+    }
+    #[test]
+    fn run_code_accepts_typographic_superscripts() {
+        let root = scratch("run-code-superscript");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let result = registry
+            .execute(
+                "run_code",
+                &serde_json::json!({"code": "n² = 4
+n²"}),
+            )
+            .expect("run_code");
+        assert_eq!(result["result"], 4, "{result}");
+    }
+
+    #[test]
+    fn run_code_accepts_non_ascii() {
+        let root = scratch("run-code-unicode");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let result = registry
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "print('你好²')\n'结果²'"
+                }),
+            )
+            .expect("run_code");
+        assert_eq!(result["logs"], serde_json::json!(["你好²"]), "{result}");
+        assert_eq!(result["result"], "结果²", "{result}");
+    }
+    #[test]
+    fn run_code_omits_a_null_completion_value() {
+        let root = scratch("run-code-no-result");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let result = registry
+            .execute("run_code", &serde_json::json!({"code": "print('done')"}))
+            .expect("run_code");
+        assert_eq!(result["logs"], serde_json::json!(["done"]), "{result}");
+        assert!(result.get("result").is_none(), "no null result: {result}");
     }
 }

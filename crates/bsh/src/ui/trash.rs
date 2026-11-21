@@ -35,13 +35,29 @@ impl Shell {
         cx.notify();
     }
 
-    /// Delete a parked item for good, then re-read the bin.
+    /// Delete a parked item for good. The filesystem work runs in the
+    /// background; the row leaves immediately and the bin is re-read when the
+    /// removal settles.
     pub(crate) fn purge_trashed(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
-        self.state.purge_trashed(path);
-        self.trash_entries = self.state.trash();
+        let Some((entry, session_dir)) = self.state.prepare_purge(path) else {
+            return;
+        };
+        self.trash_entries
+            .retain(|candidate| candidate.path != path);
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .spawn(async move {
+                    crate::trash::purge_entry(&entry, session_dir.as_deref());
+                })
+                .await;
+            let _ = this.update(cx, |shell, cx| {
+                shell.trash_entries = shell.state.trash();
+                cx.notify();
+            });
+        })
+        .detach();
     }
-
     /// The bin overlay.
     pub(crate) fn render_trash(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.state.lang;

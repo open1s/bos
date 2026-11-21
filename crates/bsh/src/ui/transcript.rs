@@ -632,6 +632,7 @@ fn quoted_span(text: &str) -> Option<(String, &str)> {
 pub(crate) fn code_lang(name: &str, args: &str) -> Option<&'static str> {
     match name {
         "bash" | "run_command" | "terminal" => Some("bash"),
+        "run_code" => Some("python"),
         "write_file" | "edit_file" | "apply_patch" | "sed" | "read_file" => {
             let path = json_field(args, "path")
                 .or_else(|| json_field(args, "file_path"))
@@ -658,6 +659,18 @@ pub(crate) fn code_lang(name: &str, args: &str) -> Option<&'static str> {
             })
         }
         _ => None,
+    }
+}
+
+/// The input a step's body shows: a command as the command itself, a
+/// run_code step as its Python source, anything else as its raw arguments.
+fn tool_input_text(name: &str, args: &str) -> String {
+    match name {
+        "bash" | "run_command" | "terminal" => {
+            json_field(args, "command").unwrap_or_else(|| args.to_string())
+        }
+        "run_code" => json_field_exact(args, "code").unwrap_or_else(|| args.to_string()),
+        _ => args.to_string(),
     }
 }
 
@@ -691,6 +704,35 @@ pub(crate) fn format_bytes(bytes: usize) -> String {
 /// failing command keeps its stderr in the same body - the red tone is the
 /// row's own signal, and the body does not hide why it failed.
 pub(crate) fn output_body(lang: Lang, output: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(output) {
+        let payload = value
+            .get("data")
+            .filter(|data| data.get("logs").is_some())
+            .unwrap_or(&value);
+        if let Some(logs) = payload.get("logs").and_then(serde_json::Value::as_array) {
+            let mut parts: Vec<String> = logs
+                .iter()
+                .filter_map(|line| line.as_str().map(str::to_string))
+                .collect();
+            if let Some(result) = payload.get("result") {
+                let rendered = match result {
+                    serde_json::Value::String(text) => text.clone(),
+                    _ => serde_json::to_string_pretty(result).unwrap_or_default(),
+                };
+                if !rendered.is_empty() {
+                    parts.push(rendered);
+                }
+            }
+            return if parts.is_empty() {
+                "(run_code completed with no output)".to_string()
+            } else {
+                parts.join(
+                    "
+",
+                )
+            };
+        }
+    }
     let stdout = json_field_exact(output, "stdout");
     let stderr = json_field_exact(output, "stderr");
     if stdout.is_none() && stderr.is_none() {
@@ -5698,11 +5740,7 @@ impl Shell {
             } else if !args.is_empty() {
                 // A command step carries its command in the arguments, so the
                 // body shows that rather than the JSON envelope around it.
-                let in_text = if lang_key == Some("bash") {
-                    json_field(&args, "command").unwrap_or_else(|| args.clone())
-                } else {
-                    args.clone()
-                };
+                let in_text = tool_input_text(&name, &args);
                 row = row.child(self.step_block(
                     StepBody {
                         slot: BodySlot::Step {
@@ -5812,8 +5850,6 @@ impl Shell {
             }
             .style(chrome.style.clone())
             .text_size(px(theme::CHIP_SIZE))
-            .max_h(px(theme::TOOL_BODY_MAX))
-            .overflow_hidden()
             .into_any_element(),
             None => selectable_txt(
                 (
@@ -5830,8 +5866,6 @@ impl Shell {
                 step_message as u64 * 1024 + 8 + step_tool as u64 * 2 + u64::from(!is_input),
             )
             .line_height(px(theme::stat_line_at(chrome.content_size)))
-            .max_h(px(theme::TOOL_BODY_MAX))
-            .overflow_hidden()
             .into_any_element(),
         };
         // The body itself is either a markdown `TextView` (a fenced payload) or
@@ -5846,7 +5880,21 @@ impl Shell {
                         if is_input { "in" } else { "out" }
                     )
                 })
-                .child(body),
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "step-scroll-{step_message}-{step_tool}-{is_input}"
+                        )))
+                        .max_h(px(theme::TOOL_BODY_MAX))
+                        .overflow_y_scroll()
+                        // The wheel belongs to this box while it scrolls. Without
+                        // stopping here the transcript scroller also receives the
+                        // delta and moves the whole conversation under the pointer.
+                        .on_scroll(cx.listener(|_this, _event, _window, cx| {
+                            cx.stop_propagation();
+                        }))
+                        .child(body),
+                ),
         );
         block.into_any_element()
     }
@@ -5896,8 +5944,8 @@ fn inject_kind_key(kind: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        output_body, process_summary, single_fit, think_stream_tail, think_summary_live,
-        timeline_is_consistent, turn_changes,
+        code_lang, output_body, process_summary, single_fit, think_stream_tail, think_summary_live,
+        timeline_is_consistent, tool_input_text, turn_changes,
     };
     use crate::i18n::Lang;
     use crate::model::{ChatMessage, ToolEvent, TurnPart};
@@ -6210,5 +6258,34 @@ mod tests {
         assert_eq!(single_fit(40, 1000), (40.0, 160.0));
         assert_eq!(single_fit(100, 10), (40.0, 10.0));
         assert_eq!(single_fit(10, 10), (10.0, 10.0));
+    }
+    #[test]
+    fn run_code_input_is_python_source_not_json() {
+        let args = r#"{"code":"def show(p):\n    print(p)\n"}"#;
+        assert_eq!(code_lang("run_code", args), Some("python"));
+        assert_eq!(
+            tool_input_text("run_code", args),
+            "def show(p):\n    print(p)\n"
+        );
+    }
+    #[test]
+    fn run_code_output_renders_logs_and_result() {
+        let output = r#"{"logs":["one","two"],"result":{"count":2}}"#;
+        assert_eq!(
+            output_body(Lang::En, output),
+            "one\ntwo\n{\n  \"count\": 2\n}"
+        );
+    }
+    #[test]
+    fn run_code_output_unwraps_the_tool_envelope() {
+        let output = r#"{"status":"success","summary":"run_code completed","data":{"logs":["one"],"result":{"count":2}}}"#;
+        assert!(
+            output_body(Lang::En, output).starts_with(
+                "one
+{"
+            ),
+            "{}",
+            output_body(Lang::En, output)
+        );
     }
 }

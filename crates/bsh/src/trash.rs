@@ -133,6 +133,98 @@ pub(crate) fn stash(dir: &Path, envelope: &Envelope) -> std::io::Result<PathBuf>
     unreachable!("the envelope filename suffix space is exhausted")
 }
 
+/// Park one session document and its history, returning the envelope path.
+///
+/// This function owns only filesystem work: the caller may run it on a
+/// background executor and apply the in-memory removal after it succeeds.
+pub(crate) fn park_session(
+    session: &crate::model::Session,
+    workspace_name: &str,
+    dir: &Path,
+    log_from: &Path,
+) -> std::io::Result<PathBuf> {
+    let payload = serde_json::to_value(session)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let envelope = Envelope {
+        kind: Kind::Session.key().to_string(),
+        deleted_at: stamp,
+        workspace: session.workspace.clone(),
+        workspace_name: workspace_name.to_string(),
+        name: session.title.clone(),
+        log: format!("log-{}-{millis}", session.id),
+        payload,
+    };
+    let parked = log_dir(dir, &envelope);
+    let had_log = log_from.exists();
+    if let Err(error) = park_log(dir, log_from, &envelope) {
+        return Err(error);
+    }
+    match stash(dir, &envelope) {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            if had_log && let Some(parent) = log_from.parent() {
+                let _ = std::fs::create_dir_all(parent);
+                let _ = std::fs::rename(&parked, log_from);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Park one workspace record, returning the envelope path.
+pub(crate) fn park_workspace(
+    record: &crate::settings::global::WorkspaceRef,
+    name: &str,
+    dir: &Path,
+) -> std::io::Result<PathBuf> {
+    let payload = serde_json::to_value(record)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let envelope = Envelope {
+        kind: Kind::Workspace.key().to_string(),
+        deleted_at: stamp,
+        workspace: record.id.clone(),
+        workspace_name: name.to_string(),
+        name: name.to_string(),
+        log: String::new(),
+        payload,
+    };
+    stash(dir, &envelope)
+}
+
+/// Delete one parked item from disk.
+///
+/// The bin is already gone from the caller's point of view; this function only
+/// removes the pages and workspace state. It is safe to run on a background
+/// executor because it touches no in-memory state.
+pub(crate) fn purge_entry(entry: &Entry, session_dir: Option<&Path>) {
+    if let Some(session) =
+        serde_json::from_value::<crate::model::Session>(entry.envelope.payload.clone()).ok()
+        && let Some(session_dir) = session_dir
+    {
+        let dir = crate::history::History::dir_for(session_dir, &session.id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    if let Ok(workspace) = serde_json::from_value::<crate::settings::global::WorkspaceRef>(
+        entry.envelope.payload.clone(),
+    ) {
+        let root = Path::new(&workspace.root);
+        if !root.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(root.join(".bsh"));
+        }
+    }
+    purge(&entry.path);
+}
+
 /// The directory a parked item's log lives in, inside the bin.
 pub(crate) fn log_dir(dir: &Path, envelope: &Envelope) -> PathBuf {
     dir.join(&envelope.log)

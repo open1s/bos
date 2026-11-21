@@ -48,7 +48,24 @@ pub(crate) const EDIT_FILE: &str =
 pub(crate) const CODEL: &str = "Use the codel tool for code relationships before broad file reading. Start with action=search {query}; then action=inspect {node} before editing and action=analyze {analysis:\"affected\", node} after editing. codel is scoped to the active workspace; never pass another workspace root. Use action=cycles or action=dead_code for repository diagnostics; it is not a replacement for reading the target code.";
 
 /// Guidance for the programmatic batch tool.
-pub(crate) const RUN_CODE: &str = "run_code is a first-class execution tool, available directly wherever bash is: use it as the DEFAULT whenever a task needs more than one read, search, or command. Do not serialize individual read_file, grep, or bash calls that one Python program can batch. Inside run_code, bsh is preloaded (no import needed): use bsh.codel for symbol relationships, bsh.grep/glob/read_file for evidence, and bsh.bash for commands; bsh.call(name, args) reaches any other built-in through the same policy. Print only the compact evidence the next step needs, never whole files or repeated data. Use a dedicated tool only for a single narrow call, an edit, or when the next action truly depends on that exact result. Prefer bsh.grep, bsh.read_file, bsh.glob and bsh.codel over bsh.bash for structured evidence; bsh.bash returns shell text. bsh.call takes a dict (or a JSON string) and returns already-decoded Python objects, so never json.loads a bsh.* result.";
+pub(crate) const RUN_CODE: &str = "run_code is a first-class execution tool, available directly wherever bash is: use it as the DEFAULT whenever a task needs more than one read, search, or command. Do not serialize individual read_file, grep, or bash calls that one Python program can batch. Print only logs; put the completion value in a final expression, and include a short description. Never print whole files or repeated data. Use a dedicated tool only for a single narrow call, an edit, or when the next action truly depends on that exact result.
+
+Script API (bsh is preloaded; no import needed):
+- bsh.read_file(path, offset=1, limit=2048)
+- bsh.read_files(paths, offset=1, limit=2048)
+- bsh.grep(pattern, path='.', include=None, limit=50, context=0, case_insensitive=False)
+- bsh.glob(pattern, path='.', limit=1000)
+- bsh.list_dir(path='.')
+- bsh.bash(command)
+- bsh.write_file(path, content)
+- bsh.edit_file(path, old_string, new_string)
+- bsh.apply_patch(patch)
+- bsh.codel(action, query=None, node=None, analysis=None, path=None, preset=None)\n  actions: search, inspect, analyze, ast_query, workspace, help
+- bsh.remember(content, kind='note')
+- bsh.recall(query, limit=10)
+- bsh.forget(id)
+- bsh.schema(tool) -> {name, description, parameters} for any registered tool\n- bsh.call(tool, arguments) for any other registered built-in
+All bsh.* calls return already-decoded Python objects; never json.loads them. bsh.bash returns shell text; prefer bsh.grep/read_file/glob/codel for structured evidence. codel is scoped to this workspace; do not pass a root. Use a final expression for result, print() only for logs. Pass capture_output=true only when the program prints its result instead of ending with an expression; valid JSON stdout becomes the result value, other output becomes a string.";
 
 /// Guidance for the stream editor.
 ///
