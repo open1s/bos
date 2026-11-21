@@ -534,6 +534,11 @@ pub(crate) fn collapse_turns(
     }
     out
 }
+/// Above this many calls a settled log is flattened on the background
+/// executor instead of inside the frame: the walk visits every message and
+/// every call, and a long session paid it on the UI thread.
+const TRAJ_ASYNC_EVENTS: usize = 800;
+
 /// The facts that decide what the flattened log contains.
 ///
 /// Every field is something `events_for` READS, so a frame that changes none of
@@ -598,6 +603,9 @@ pub(crate) struct EventsCache {
     events: std::rc::Rc<Vec<Event>>,
     /// The rows the view draws from `events`.
     plan: PlanCache,
+    /// The key a background flatten is running for, so a large log is built
+    /// once and the frame can keep drawing the previous one meanwhile.
+    building: Option<EventsKey>,
 }
 
 /// The facts that decide which rows a log draws: the log itself, the search, the
@@ -667,9 +675,69 @@ impl EventsCache {
         self.events.clone()
     }
 
-    /// The log, its visible rows and its fold plan for this frame.
+    /// The log, its visible rows and its fold plan for this frame (sync).
     fn frame(&mut self, shell: &Shell) -> TrajFrame {
         let events = self.get(shell);
+        self.plan_rows(shell, events)
+    }
+
+    /// The log this frame draws, off the UI thread when it is large.
+    fn get_cached(&mut self, shell: &Shell, cx: &mut Context<Shell>) -> std::rc::Rc<Vec<Event>> {
+        let Some(key) = EventsKey::of(shell) else {
+            self.key = None;
+            self.events = std::rc::Rc::new(Vec::new());
+            return self.events.clone();
+        };
+        if self.key.as_ref() == Some(&key) || self.building.is_some() {
+            return self.events.clone();
+        }
+        let streaming = key.streaming;
+        let calls: usize = shell
+            .state
+            .active_session()
+            .map(|session| session.messages.iter().map(|m| m.tools.len()).sum())
+            .unwrap_or(0);
+        if streaming || calls <= TRAJ_ASYNC_EVENTS {
+            let built = shell
+                .state
+                .active_session()
+                .map(|session| events_for(session, streaming, key.lang))
+                .unwrap_or_default();
+            self.key = Some(key);
+            self.events = std::rc::Rc::new(built);
+            return self.events.clone();
+        }
+        // A large, settled log: flatten it off the UI thread. The frame keeps
+        // drawing the previous log (its plan rows stay consistent with it).
+        let Some(session) = shell.state.active_session() else {
+            return self.events.clone();
+        };
+        let snapshot = session.clone();
+        let lang = key.lang;
+        let build_key = key.clone();
+        self.building = Some(key);
+        cx.spawn(async move |this, cx| {
+            let built = cx
+                .background_executor()
+                .spawn(async move { events_for(&snapshot, streaming, lang) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.install_traj_events(build_key, built);
+                cx.notify();
+            });
+        })
+        .detach();
+        self.events.clone()
+    }
+
+    /// The log, its visible rows and its fold plan for this frame (cached).
+    fn frame_cached(&mut self, shell: &Shell, cx: &mut Context<Shell>) -> TrajFrame {
+        let events = self.get_cached(shell, cx);
+        self.plan_rows(shell, events)
+    }
+
+    /// The rows the search and the fold switches draw from `events`.
+    fn plan_rows(&mut self, shell: &Shell, events: std::rc::Rc<Vec<Event>>) -> TrajFrame {
         let key = PlanKey {
             log: events.clone(),
             query: shell.traj_query.clone(),
@@ -1123,6 +1191,26 @@ impl Shell {
     /// change instead of once per repaint.
     pub(crate) fn traj_frame(&self) -> TrajFrame {
         self.traj_events.borrow_mut().frame(self)
+    }
+
+    /// The log and the rows this frame draws, flattening a large log on the
+    /// background executor instead of inside the frame.
+    pub(crate) fn traj_frame_cached(&self, cx: &mut Context<Self>) -> TrajFrame {
+        self.traj_events.borrow_mut().frame_cached(self, cx)
+    }
+
+    /// Install a background flatten if it still describes the session.
+    fn install_traj_events(&mut self, key: EventsKey, events: Vec<Event>) {
+        let mut cache = self.traj_events.borrow_mut();
+        let current = EventsKey::of(self);
+        if current.as_ref() == Some(&key) {
+            cache.events = std::rc::Rc::new(events);
+            cache.key = Some(key.clone());
+            cache.plan.key = None;
+        }
+        if cache.building.as_ref() == Some(&key) {
+            cache.building = None;
+        }
     }
 
     /// Open a chat row's file in the right panel's editor.
@@ -3172,7 +3260,7 @@ impl Shell {
         // The log, its visible rows and its fold plan are cached together: the
         // frame pays for what the viewport shows, not for re-filtering and
         // re-folding the whole history on every repaint.
-        let frame = self.traj_frame();
+        let frame = self.traj_frame_cached(cx);
         let events = &frame.events;
         let detail = self
             .traj_select
