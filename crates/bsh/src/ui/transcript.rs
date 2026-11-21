@@ -177,6 +177,23 @@ const PROCESS_STEP_PAGE: usize = 12;
 /// content segment is a row even when the tool calls are grouped.
 const TIMELINE_ROW_PAGE: usize = 12;
 
+/// One drawn row of a message's timeline, planned before any element is built.
+enum TimelineSlot {
+    Thinking {
+        part: usize,
+        start: usize,
+        end: usize,
+        live: bool,
+    },
+    Content {
+        part: usize,
+        start: usize,
+        end: usize,
+    },
+    Group,
+    Tool(usize),
+}
+
 /// The text a live reasoning body paints: the newest window of the thought.
 ///
 /// Returns `None` when the body already fits, so a short thought paints its
@@ -3411,40 +3428,26 @@ impl Shell {
             .gap(px(6.0));
         // A process group can hold thousands of calls. Every step is a laid-out
         // row even while folded, so an open group drew the whole run in one
-        // frame (measured: 280 ms for 3,715 steps). Draw one page and let the
-        // reader extend it; each page is bounded work.
-        let extra = self.process_more.get(&index).copied().unwrap_or(0);
-        let shown = message.tools.len().min(PROCESS_STEP_PAGE + extra);
-        for (tool_index, tool) in message.tools.iter().enumerate().take(shown) {
+        // frame (measured: 280 ms for 3,715 steps). One page is drawn, and the
+        // bar jumps to the first or the last page in one click.
+        let total = message.tools.len();
+        let pages = total.div_ceil(PROCESS_STEP_PAGE).max(1);
+        let page = self
+            .process_page
+            .get(&index)
+            .copied()
+            .unwrap_or(0)
+            .min(pages - 1);
+        let start = page * PROCESS_STEP_PAGE;
+        let end = (start + PROCESS_STEP_PAGE).min(total);
+        for (tool_index, tool) in message.tools.iter().enumerate().take(end).skip(start) {
             // Every step starts folded: the group is the reader's first door,
             // the step's own chevron the second. Nothing opens on the model's
             // behalf, live or settled.
             body = body.child(self.tool_row(index, tool_index, tool, chrome, cx));
         }
-        if shown < message.tools.len() {
-            let page = (message.tools.len() - shown).min(PROCESS_STEP_PAGE);
-            let label = crate::i18n::tr_args(
-                self.state.lang,
-                "transcript.moreSteps",
-                &[("count", page.to_string())],
-            );
-            body = body.child(
-                div()
-                    .id(SharedString::from(format!("process-more-{index}")))
-                    .debug_selector(move || format!("process-more-{index}"))
-                    .h(px(24.0))
-                    .px(px(8.0))
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .rounded(px(6.0))
-                    .hover(|style| style.bg(rgb(theme::hover())))
-                    .child(txt(label, 11.0, theme::muted()))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        *this.process_more.entry(index).or_default() += PROCESS_STEP_PAGE;
-                        cx.notify();
-                    })),
-            );
+        if pages > 1 {
+            body = body.child(self.page_bar(index, page, pages, false, cx));
         }
         div()
             .w_full()
@@ -4373,57 +4376,86 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Div {
         // A running turn keeps its steps ungrouped while the live-process
-        // setting asks for that (the reference's own `liveProcessDetail`); a
+        // setting asks for that (the reference's own liveProcessDetail); a
         // compact mode folds them even while it runs, and a settled turn always
         // follows the step-grouping policy.
         let grouped = chrome.policy.step_grouping == StepGrouping::Collapsed
             && (!turn.writing || !chrome.policy.live_process_detail);
         let mut reasoning_at = 0usize;
         let mut content_at = 0usize;
-        let mut grouped_drawn = false;
-        // A turn's timeline can hold one part per step, so a thousand-step run
-        // drew a thousand reasoning rows in one frame even when its tool rows
-        // were grouped. Bound the rows here as the process body is bounded:
-        // one page at a time, with an explicit way to extend it.
-        let extra = self.timeline_more.get(&index).copied().unwrap_or(0);
-        let limit = TIMELINE_ROW_PAGE + extra;
-        let mut drawn = 0usize;
-        let mut skipped = 0usize;
+        let mut slots: Vec<TimelineSlot> = Vec::new();
+        let mut group_added = false;
         for (part, segment) in message.parts.iter().enumerate() {
             match *segment {
                 TurnPart::Thinking(bytes) => {
-                    if drawn >= limit {
-                        skipped += 1;
-                        continue;
-                    }
                     let start = reasoning_at.min(message.reasoning.len());
                     let end = (reasoning_at + bytes).min(message.reasoning.len());
                     reasoning_at = end;
                     if start == end {
                         continue;
                     }
-                    let live = turn.writing && part + 1 == message.parts.len();
-                    column = column.child(self.think_row(
-                        index,
+                    slots.push(TimelineSlot::Thinking {
                         part,
-                        &message.reasoning[start..end],
-                        live,
-                        chrome,
-                        cx,
-                    ));
-                    drawn += 1;
+                        start,
+                        end,
+                        live: turn.writing && part + 1 == message.parts.len(),
+                    });
                 }
                 TurnPart::Content(bytes) => {
-                    if drawn >= limit {
-                        skipped += 1;
-                        continue;
-                    }
                     let start = content_at.min(message.text.len());
                     let end = (content_at + bytes).min(message.text.len());
                     content_at = end;
                     if start == end {
                         continue;
                     }
+                    slots.push(TimelineSlot::Content { part, start, end });
+                }
+                TurnPart::Tool(tool_index) => {
+                    if message.tools.get(tool_index).is_none() {
+                        continue;
+                    }
+                    if grouped {
+                        if !group_added {
+                            group_added = true;
+                            slots.push(TimelineSlot::Group);
+                        }
+                    } else {
+                        slots.push(TimelineSlot::Tool(tool_index));
+                    }
+                }
+            }
+        }
+        // A turn's timeline can hold one part per step. One page is drawn, and
+        // the bar reaches the first or the last page in one click: the frame's
+        // work follows the page, never the run.
+        let total = slots.len();
+        let pages = total.div_ceil(TIMELINE_ROW_PAGE).max(1);
+        let page = self
+            .timeline_page
+            .get(&index)
+            .copied()
+            .unwrap_or(0)
+            .min(pages - 1);
+        let start = page * TIMELINE_ROW_PAGE;
+        let end = (start + TIMELINE_ROW_PAGE).min(total);
+        for slot in &slots[start..end] {
+            match slot {
+                TimelineSlot::Thinking {
+                    part,
+                    start,
+                    end,
+                    live,
+                } => {
+                    column = column.child(self.think_row(
+                        index,
+                        *part,
+                        &message.reasoning[*start..*end],
+                        *live,
+                        chrome,
+                        cx,
+                    ));
+                }
+                TimelineSlot::Content { part, start, end } => {
                     column = column.child(
                         div()
                             .debug_selector({
@@ -4432,63 +4464,127 @@ impl Shell {
                             })
                             .w_full()
                             .child(self.body_view(
-                                BodySlot::Segment(BODY, index, part),
-                                &message.text[start..end],
+                                BodySlot::Segment(BODY, index, *part),
+                                &message.text[*start..*end],
                                 chrome,
                                 cx,
                             )),
                     );
-                    drawn += 1;
                 }
-                TurnPart::Tool(tool_index) => {
-                    let Some(tool) = message.tools.get(tool_index) else {
-                        continue;
-                    };
-                    if grouped {
-                        if !grouped_drawn {
-                            grouped_drawn = true;
-                            column = column.child(self.process_group(index, message, chrome, cx));
-                            drawn += 1;
-                        }
-                    } else if drawn >= limit {
-                        skipped += 1;
-                    } else {
-                        column = column.child(self.tool_row(index, tool_index, tool, chrome, cx));
-                        drawn += 1;
+                TimelineSlot::Group => {
+                    column = column.child(self.process_group(index, message, chrome, cx));
+                }
+                TimelineSlot::Tool(tool_index) => {
+                    if let Some(tool) = message.tools.get(*tool_index) {
+                        column = column.child(self.tool_row(index, *tool_index, tool, chrome, cx));
                     }
                 }
             }
         }
-        if skipped > 0 {
-            let page = skipped.min(TIMELINE_ROW_PAGE);
-            let label = crate::i18n::tr_args(
-                self.state.lang,
-                "transcript.moreSteps",
-                &[("count", page.to_string())],
-            );
-            column = column.child(
-                div()
-                    .id(SharedString::from(format!("timeline-more-{index}")))
-                    .debug_selector(move || format!("timeline-more-{index}"))
-                    .h(px(24.0))
-                    .px(px(8.0))
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .rounded(px(6.0))
-                    .hover(|style| style.bg(rgb(theme::hover())))
-                    .child(txt(label, 11.0, theme::muted()))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        *this.timeline_more.entry(index).or_default() += TIMELINE_ROW_PAGE;
-                        cx.notify();
-                    })),
-            );
+        if pages > 1 {
+            column = column.child(self.page_bar(index, page, pages, true, cx));
         }
         // The running line, while the turn works and no text has landed yet.
         if message.text.is_empty() && message.error.is_none() && turn.writing && !turn.settled {
             column = column.child(self.running_line());
         }
         column
+    }
+
+    /// First / previous / next / last, with the page the reader is on.
+    fn page_bar(
+        &self,
+        index: usize,
+        page: usize,
+        pages: usize,
+        timeline: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lang = self.state.lang;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(24.0))
+            .px(px(8.0))
+            .child(self.page_button(
+                format!(
+                    "{}-first-{index}",
+                    if timeline { "timeline" } else { "process" }
+                ),
+                lang.tr("transcript.pageFirst"),
+                0,
+                index,
+                timeline,
+                cx,
+            ))
+            .child(self.page_button(
+                format!(
+                    "{}-prev-{index}",
+                    if timeline { "timeline" } else { "process" }
+                ),
+                lang.tr("transcript.pagePrev"),
+                page.saturating_sub(1),
+                index,
+                timeline,
+                cx,
+            ))
+            .child(txt(format!("{}/{}", page + 1, pages), 10.5, theme::faint()))
+            .child(self.page_button(
+                format!(
+                    "{}-next-{index}",
+                    if timeline { "timeline" } else { "process" }
+                ),
+                lang.tr("transcript.pageNext"),
+                (page + 1).min(pages - 1),
+                index,
+                timeline,
+                cx,
+            ))
+            .child(self.page_button(
+                format!(
+                    "{}-last-{index}",
+                    if timeline { "timeline" } else { "process" }
+                ),
+                lang.tr("transcript.pageLast"),
+                pages - 1,
+                index,
+                timeline,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn page_button(
+        &self,
+        id: String,
+        label: String,
+        page: usize,
+        index: usize,
+        timeline: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selector = id.clone();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || selector.clone())
+            .h(px(22.0))
+            .px(px(6.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::hover())))
+            .child(txt(label, 10.5, theme::muted()))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if timeline {
+                    this.timeline_page.insert(index, page);
+                } else {
+                    this.process_page.insert(index, page);
+                }
+                cx.notify();
+            }))
     }
 
     /// The reference's live "Running · 12s" line.

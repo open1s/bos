@@ -746,10 +746,10 @@ pub(crate) struct Shell {
     /// How many extra steps an open process group shows beyond the first page.
     /// A group can hold thousands of calls, and every step is a laid-out row:
     /// drawing them all made one frame cost the length of the run.
-    pub(crate) process_more: std::collections::HashMap<usize, usize>,
+    pub(crate) process_page: std::collections::HashMap<usize, usize>,
     /// Extra timeline rows an open turn shows beyond the first page (per
-    /// message), for the same reason `process_more` exists.
-    pub(crate) timeline_more: std::collections::HashMap<usize, usize>,
+    /// message), for the same reason `process_page` exists.
+    pub(crate) timeline_page: std::collections::HashMap<usize, usize>,
     /// When the task-resume scan last ran; it parses task files on the UI thread.
     task_resume_checked: Option<std::time::Instant>,
     /// The compaction markers the reader has expanded, by record index.
@@ -2367,8 +2367,8 @@ impl Shell {
             inject_open: std::collections::HashSet::new(),
             question_progress: std::collections::HashMap::new(),
             process_open: std::collections::HashSet::new(),
-            process_more: std::collections::HashMap::new(),
-            timeline_more: std::collections::HashMap::new(),
+            process_page: std::collections::HashMap::new(),
+            timeline_page: std::collections::HashMap::new(),
             task_resume_checked: None,
             compaction_open: std::collections::HashSet::new(),
             chat_last_offset: 0.0,
@@ -7949,8 +7949,8 @@ impl Render for Shell {
             self.inject_open.clear();
             self.question_progress.clear();
             self.process_open.clear();
-            self.process_more.clear();
-            self.timeline_more.clear();
+            self.process_page.clear();
+            self.timeline_page.clear();
             self.image_lightbox = None;
             self.compaction_open.clear();
             // The audit's folds name turn and call positions in the transcript

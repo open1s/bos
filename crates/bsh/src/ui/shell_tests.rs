@@ -35079,8 +35079,8 @@ fn a_single_message_with_thousands_of_calls_keeps_each_tab_smooth(cx: &mut TestA
     }
     let chat = median(cx, 10);
     assert!(
-        cx.debug_bounds("process-more-1").is_some(),
-        "the open group pages its remaining steps"
+        cx.debug_bounds("process-first-1").is_some(),
+        "the open group pages its steps"
     );
     let mut readings = vec![("chat", chat)];
     for (tab, name) in [
@@ -35108,6 +35108,26 @@ fn a_single_message_with_thousands_of_calls_keeps_each_tab_smooth(cx: &mut TestA
             "{name} painted a {ms:.2}ms frame with 3,000 calls in the log"
         );
     }
+    // Go to end / go first are one click, not a hundred "next page" clicks.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.state.tab = Tab::Chat;
+            cx.notify();
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let last = cx
+        .debug_bounds("process-last-1")
+        .expect("the open group has a last-page control");
+    cx.simulate_click(last.center(), Modifiers::default());
+    let page = cx.update(|_, cx| shell.read(cx).process_page.get(&1).copied());
+    assert_eq!(page, Some((3000usize).div_ceil(12) - 1), "last page");
+    let first = cx
+        .debug_bounds("process-first-1")
+        .expect("the open group has a first-page control");
+    cx.simulate_click(first.center(), Modifiers::default());
+    let page = cx.update(|_, cx| shell.read(cx).process_page.get(&1).copied());
+    assert_eq!(page, Some(0), "back to the first page");
 }
 
 /// The frame trace is off unless asked for, and when it is asked for it writes
