@@ -801,6 +801,10 @@ impl Shell {
     /// The flat table's row height: exact for the same reason. The row draws its
     /// separator inside this box, so the measurement is the constant.
     pub(crate) const FLAT_ROW_H: f32 = 46.0;
+
+    /// Rows a page control jumps in the event table. The table stays windowed;
+    /// a page is a jump of this many rows, not a different render mode.
+    const AUDIT_PAGE_ROWS: usize = 20;
     /// The width the flat table's own columns need before its detail card
     /// stops being parked beside it.
     ///
@@ -1226,14 +1230,65 @@ impl Shell {
                     .active_session()
                     .and_then(|session| session.paged_from)
                     .is_some_and(|floor| floor > 0);
-                div()
+                let rows = filtered.len();
+                let pages = rows.div_ceil(Self::AUDIT_PAGE_ROWS).max(1);
+                let stride = Self::AUDIT_PAGE_ROWS as f32 * Self::FLAT_ROW_H;
+                let view = f32::from(self.audit_scroll.bounds().size.height);
+                let current = ((-f32::from(self.audit_scroll.offset().y)) / stride)
+                    .round()
+                    .max(0.0) as usize;
+                let current = current.min(pages - 1);
+                let target = |page: usize| {
+                    (page as f32 * stride).min((rows as f32 * Self::FLAT_ROW_H - view).max(0.0))
+                };
+                let button = |id: &'static str, label: String, page: usize| {
+                    let to = target(page);
+                    let selector = id.to_string();
+                    div()
+                        .id(SharedString::from(id))
+                        .debug_selector(move || selector.clone())
+                        .h(px(22.0))
+                        .px(px(6.0))
+                        .rounded(px(6.0))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::hover())))
+                        .child(txt(label, 10.5, theme::muted()))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.audit_scroll.set_offset(point(px(0.0), px(-to)));
+                            cx.notify();
+                        }))
+                };
+                let mut footer = div()
                     .h(px(32.0))
                     .px(px(14.0))
                     .flex()
                     .items_center()
                     .gap(px(10.0))
                     .border_t_1()
-                    .border_color(rgb(theme::border_soft()))
+                    .border_color(rgb(theme::border_soft()));
+                if pages > 1 {
+                    footer = footer
+                        .child(button("audit-first", lang.tr("paging.first"), 0))
+                        .child(button(
+                            "audit-prev",
+                            lang.tr("paging.prev"),
+                            current.saturating_sub(1),
+                        ))
+                        .child(txt(
+                            format!("{}/{}", current + 1, pages),
+                            10.5,
+                            theme::faint(),
+                        ))
+                        .child(button(
+                            "audit-next",
+                            lang.tr("paging.next"),
+                            (current + 1).min(pages - 1),
+                        ))
+                        .child(button("audit-last", lang.tr("paging.last"), pages - 1));
+                }
+                footer
                     .child(txt(lang.tr("audit.partialNote"), 10.0, theme::faint()).flex_1())
                     .when(older, |row| {
                         row.child(
@@ -3537,6 +3592,46 @@ mod tests {
             builds,
             "reading the cache did not rebuild the model"
         );
+    }
+
+    /// The event table jumps a page at a time; the first and last controls
+    /// reach either end in one click. The list itself stays windowed, so the
+    /// page is a scroll jump, not another render mode.
+    #[gpui::test]
+    fn the_audit_table_pages_to_first_and_last(cx: &mut TestAppContext) {
+        let (shell, cx) = boot(cx, "audit-pages", 400);
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.audit_table = true;
+                this.state.tab = Tab::Audit;
+                cx.notify();
+            })
+        });
+        for _ in 0..6 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let first = cx
+            .debug_bounds("audit-first")
+            .expect("the table has a first-page control");
+        let last = cx
+            .debug_bounds("audit-last")
+            .expect("the table has a last-page control");
+        let before = cx.update(|_, cx| shell.read(cx).audit_scroll.offset().y);
+        cx.simulate_click(last.center(), gpui_kit::Modifiers::default());
+        for _ in 0..3 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let after = cx.update(|_, cx| shell.read(cx).audit_scroll.offset().y);
+        assert!(
+            after < before,
+            "the last page scrolled down: {after:?} vs {before:?}"
+        );
+        cx.simulate_click(first.center(), gpui_kit::Modifiers::default());
+        for _ in 0..3 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let back = cx.update(|_, cx| shell.read(cx).audit_scroll.offset().y);
+        assert_eq!(back, gpui_kit::px(0.0), "the first page returns to the top");
     }
 
     /// A long audit page paints a window, and its view model survives a repaint.
