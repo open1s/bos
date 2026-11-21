@@ -6024,6 +6024,9 @@ impl Shell {
                             }),
                         );
                         shell.state.finish_plan(&session_id);
+                        // Build and persist the Audit page now, so opening the
+                        // tab reads its cache instead of showing a loading row.
+                        shell.prewarm_audit(&session_id, cx);
                         // A turn can create tasks; the pane's cache is stale
                         // until the next open, so refresh it with the turn.
                         shell.right.tasks.borrow_mut().take();

@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{ChatMessage, Role, Session};
 use agent::policy::PolicyAuditEntry;
@@ -44,7 +44,7 @@ pub(crate) const PREVIEW_SCAN: usize = 4_096;
 pub(crate) const TARGET_LIMIT: usize = 96;
 
 /// What a tool call was allowed to touch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AuditCategory {
     /// A file read (read_file, list_dir).
@@ -144,7 +144,7 @@ impl AuditCategory {
 }
 
 /// How a call ended, as the stored record can tell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AuditOutcome {
     /// The call returned without the engine's error marker.
@@ -171,7 +171,7 @@ impl AuditOutcome {
 /// The preview is bounded and redacted. The full record is NOT stored here: the
 /// reader opens the call and [full_text] reads it from the session, so a
 /// megabyte of output never becomes a megabyte of view model.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AuditCall {
     /// The tool name the model called.
     pub(crate) tool: String,
@@ -314,7 +314,7 @@ impl AuditCall {
 ///
 /// A refusal is a decision, not a call: the tool never ran, which is why the
 /// row says so instead of styling it as a failed invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuditRefusal {
     /// When the policy decided, epoch milliseconds.
     pub(crate) at_ms: u64,
@@ -334,7 +334,7 @@ pub(crate) struct AuditRefusal {
 }
 
 /// One turn and everything it did.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AuditTurn {
     /// 1-based turn number, the same ordinal the rail uses.
     pub(crate) index: usize,
@@ -351,7 +351,7 @@ pub(crate) struct AuditTurn {
 }
 
 /// The deterministic summary the page and its export print.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuditTotals {
     /// Number of turns.
     pub(crate) turns: usize,
@@ -382,7 +382,7 @@ pub(crate) struct AuditTotals {
 /// The policy ring counts allows instead of storing them: a turn makes
 /// thousands, and only the denials are individually interesting. The page says
 /// so rather than pretending it lists them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuditAllows {
     /// Every allowed decision.
     pub(crate) total: u64,
@@ -404,7 +404,7 @@ pub(crate) struct AuditAllows {
 /// WHICH action against WHICH target under WHICH permission, and this block says
 /// which evaluator produced those decisions, how many were allowed and denied,
 /// and whether the set is in its failure mode.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuditPolicy {
     /// The effective permission the policy applies right now.
     pub(crate) permission: String,
@@ -463,7 +463,7 @@ impl AuditPolicy {
 }
 
 /// The whole page: totals computed once, and one row per turn.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct AuditView {
     /// Session-wide figures.
     pub(crate) totals: AuditTotals,

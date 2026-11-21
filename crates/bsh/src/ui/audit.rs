@@ -45,7 +45,7 @@ use crate::theme;
 /// page prints, and the namespaces that classify a tool. Messages are
 /// append-only and only the newest one mutates while a turn streams, so the
 /// session's shape is its message count plus that tail.
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct AuditKey {
     session: String,
     messages: usize,
@@ -96,6 +96,9 @@ pub(crate) struct AuditCache {
     /// The key a background build is running for, so a page never starts the
     /// same build twice and can draw a loading frame while it waits.
     building: Option<AuditKey>,
+    /// The key whose cache file has already been consulted. A miss must not
+    /// re-read and re-parse the file on every frame while the build runs.
+    disk_checked: Option<AuditKey>,
 }
 
 /// Above this many calls a settled audit page is built on the background
@@ -103,8 +106,22 @@ pub(crate) struct AuditCache {
 /// to schedule; a page this size is what used to stall the UI thread.
 const AUDIT_ASYNC_EVENTS: usize = 800;
 
+/// The audit model as it sits on disk beside the session's history pages.
+///
+/// The model is what the tab draws; rebuilding it parses every stored output
+/// (for its envelope fields) and clones every row. Persisting it means a
+/// launch opens the page with a read of its own cache, not a rebuild; the
+/// settled-turn prewarm writes the next one before it is asked for.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AuditDisk {
+    fingerprint: String,
+    view: AuditView,
+    flat: Vec<FlatEvent>,
+    stats: FlatStats,
+}
+
 /// The summary strip's four counts, derived once per model build.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 struct FlatStats {
     total: usize,
     succeeded: usize,
@@ -146,7 +163,7 @@ impl FlatFilterKey {
 /// One flat event the table shows, built from the audit view's turns,
 /// calls and refusals. The row is owned so sorting and filtering never touch
 /// the view model.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct FlatEvent {
     ordinal: usize,
     turn: usize,
@@ -162,7 +179,7 @@ struct FlatEvent {
     preview: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum FlatKind {
     Session,
     Call(AuditCategory),
@@ -307,6 +324,26 @@ impl Shell {
             }
         }
         let streaming = self.state.is_streaming(&session.id);
+        // A previously built page is the fast path: reading its cache costs a
+        // parse, not a walk of every stored output. During a stream the key
+        // changes per event, so the disk is not touched until it settles.
+        let disk_unchecked = {
+            let cache = self.audit_cache.borrow();
+            cache.disk_checked.as_ref() != Some(&key)
+        };
+        if !streaming
+            && disk_unchecked
+            && let Some((view, flat, stats)) = self.read_audit_disk(session, &key)
+        {
+            self.audit_cache.borrow_mut().disk_checked = Some(key.clone());
+            let mut cache = self.audit_cache.borrow_mut();
+            cache.view = std::rc::Rc::new(view);
+            cache.flat = std::rc::Rc::new(flat);
+            cache.stats = stats;
+            cache.key = Some(key);
+            return cache.view.clone();
+        }
+        self.audit_cache.borrow_mut().disk_checked = Some(key.clone());
         let events: usize = session
             .messages
             .iter()
@@ -319,14 +356,50 @@ impl Shell {
             }
             return cache.view.clone();
         }
-        // A large, settled page: build the same pure model off the UI thread.
-        // `building` stops a second spawn for the same key while it runs.
+        self.spawn_audit_build(session, key, cx);
+        self.audit_cache.borrow().view.clone()
+    }
+
+    /// The file the built page is kept in, beside the session's history pages.
+    fn audit_cache_path(&self, session: &crate::model::Session) -> std::path::PathBuf {
+        crate::history::History::dir_for(&self.state.store.dir_for_id(&session.id), &session.id)
+            .join("audit-cache.json")
+    }
+
+    /// The identity of a built page: every key field that changes the page.
+    fn audit_fingerprint(key: &AuditKey) -> String {
+        format!("{key:?}")
+    }
+
+    /// Read a previously built page when it still describes this session.
+    fn read_audit_disk(
+        &self,
+        session: &crate::model::Session,
+        key: &AuditKey,
+    ) -> Option<(AuditView, Vec<FlatEvent>, FlatStats)> {
+        let bytes = std::fs::read(self.audit_cache_path(session)).ok()?;
+        let disk: AuditDisk = serde_json::from_slice(&bytes).ok()?;
+        if disk.fingerprint != Self::audit_fingerprint(key) {
+            return None;
+        }
+        Some((disk.view, disk.flat, disk.stats))
+    }
+
+    /// Build the page off the UI thread and persist it before installing.
+    fn spawn_audit_build(
+        &self,
+        session: &crate::model::Session,
+        key: AuditKey,
+        cx: &mut Context<Self>,
+    ) {
         let denials = self.blocking_denials();
         let snapshot = session.clone();
         let mcp = key.mcp.clone();
         let policy = key.policy.clone();
         let lang = key.lang;
         let build_key = key.clone();
+        let path = self.audit_cache_path(session);
+        let fingerprint = Self::audit_fingerprint(&key);
         self.audit_cache.borrow_mut().building = Some(key);
         cx.spawn(async move |this, cx| {
             let built = cx
@@ -335,6 +408,18 @@ impl Shell {
                     let view = AuditView::build(&snapshot, &denials, &mcp).with_policy(policy);
                     let rows = Shell::flat_events(&view, lang);
                     let stats = Shell::stats_of(&rows);
+                    let disk = AuditDisk {
+                        fingerprint,
+                        view: view.clone(),
+                        flat: rows.clone(),
+                        stats,
+                    };
+                    if let Ok(bytes) = serde_json::to_vec(&disk) {
+                        if let Some(dir) = path.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        let _ = std::fs::write(&path, bytes);
+                    }
                     (view, rows, stats)
                 })
                 .await;
@@ -344,9 +429,26 @@ impl Shell {
             });
         })
         .detach();
-        self.audit_cache.borrow().view.clone()
     }
 
+    /// Build the next page before the tab asks for it, at a settled turn.
+    ///
+    /// The build runs on the background executor and writes its cache file, so
+    /// the next open (this launch or the next) reads that file instead of
+    /// showing the loading row.
+    pub(crate) fn prewarm_audit(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(session) = self.state.store.session(id) else {
+            return;
+        };
+        let key = self.audit_key(session);
+        {
+            let cache = self.audit_cache.borrow();
+            if cache.key.as_ref() == Some(&key) || cache.building.is_some() {
+                return;
+            }
+        }
+        self.spawn_audit_build(session, key, cx);
+    }
     /// Install a background build if it still describes the session on screen.
     fn install_audit(&mut self, key: AuditKey, built: (AuditView, Vec<FlatEvent>, FlatStats)) {
         let current = self
@@ -3413,6 +3515,37 @@ mod tests {
             "the large page built exactly once, off the frame"
         );
         let _ = shell;
+    }
+
+    /// A built page is persisted beside the session and read back without
+    /// rebuilding, which is what removes the loading row on a later open.
+    #[gpui::test]
+    fn a_built_audit_page_is_read_from_disk(cx: &mut TestAppContext) {
+        let (shell, cx) = boot(cx, "audit-disk", 900);
+        for _ in 0..80 {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            if cx.debug_bounds("audit-turn-1").is_some() {
+                break;
+            }
+        }
+        assert!(cx.debug_bounds("audit-turn-1").is_some());
+        let builds = crate::audit::audit_builds();
+        cx.update(|_, cx| {
+            shell.update(cx, |shell, _| {
+                *shell.audit_cache.borrow_mut() = super::AuditCache::default();
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.debug_bounds("audit-turn-1").is_some(),
+            "the persisted page installs"
+        );
+        assert_eq!(
+            crate::audit::audit_builds(),
+            builds,
+            "reading the cache did not rebuild the model"
+        );
     }
 
     /// A long audit page paints a window, and its view model survives a repaint.
