@@ -218,6 +218,8 @@ pub(crate) struct Effective {
     pub(crate) skills: std::sync::Arc<Vec<resolve::DiscoveredSkill>>,
     /// Send-side token ceiling.
     pub(crate) context_budget: usize,
+    /// The project's own verification command, when it has one.
+    pub(crate) verify_command: Option<String>,
     /// Seconds one LLM request may wait before the loop gives up on it.
     pub(crate) llm_timeout_secs: u64,
     /// Retries after the first attempt when a provider failure is transient.
@@ -1014,6 +1016,7 @@ impl Settings {
             skill_sources: resolution.skill_sources.clone(),
             skills: resolution.skills.clone(),
             context_budget: resolution.context_budget,
+            verify_command: resolution.verify_command.clone(),
             llm_timeout_secs: resolution.llm_timeout_secs,
             llm_max_retries: resolution.llm_max_retries,
             shell_timeout_secs: resolution.shell_timeout_secs,

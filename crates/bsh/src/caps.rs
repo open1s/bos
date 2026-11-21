@@ -1188,7 +1188,7 @@ fn build_agent_for_session_inner(
                     policy.clone(),
                     session.to_string(),
                     preset.clone(),
-                    MAX_READ_PAGE_BYTES,
+                    read_page_bytes(eff.context_budget),
                 )),
                 declare("read_files"),
             )));
@@ -4183,9 +4183,6 @@ const MAX_PATCH_EDITS: usize = 20;
 /// Maximum combined old/new text accepted by one patch request.
 const MAX_PATCH_INPUT_BYTES: usize = 1024 * 1024;
 
-/// Maximum combined content returned by one batch read.
-const MAX_BATCH_READ_BYTES: usize = 1024 * 1024;
-
 /// The largest file `edit_file` rewrites, in bytes.
 ///
 /// An edit needs the whole file in memory to prove the match is unique, and sed
@@ -5303,7 +5300,7 @@ pub(crate) fn read_files_tool(
             }
             let rules = ignore_rules(root.as_deref());
             let mut results = Vec::with_capacity(targets.len());
-            let mut remaining = MAX_BATCH_READ_BYTES;
+            let mut remaining = page_bytes;
             let mut total_bytes = 0usize;
             let mut truncated = false;
 
@@ -5457,7 +5454,7 @@ pub(crate) fn read_files_tool(
                 "returned": returned,
                 "failed": failed,
                 "bytes": total_bytes,
-                "max_bytes": MAX_BATCH_READ_BYTES
+                "max_bytes": page_bytes
             });
             // The envelope prefers a tool-supplied summary. "partial" alone
             // does not say whether the call was cut or some files failed.
@@ -6742,10 +6739,10 @@ fn open_memory(
 #[cfg(test)]
 mod tests {
     use super::{
-        BuiltAgent, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, MAX_BATCH_READ_BYTES, READ_ONLY,
-        WORKSPACE_WRITE, WorkspaceEgress, agent_messages, allows_writes, build_agent, check_spawn,
-        compactable_span, egress_allowlist_path, is_confined, offers_local_web_search,
-        plugin_provider_node, read_egress_rules, refresh_plugin_providers, sandbox_spec_for,
+        BuiltAgent, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
+        WorkspaceEgress, agent_messages, allows_writes, build_agent, check_spawn, compactable_span,
+        egress_allowlist_path, is_confined, offers_local_web_search, plugin_provider_node,
+        read_egress_rules, read_page_bytes, refresh_plugin_providers, sandbox_spec_for,
         surfaced_capabilities, tool_gates_for, web_search_config, with_bridge_pool,
         workspace_tool_scope, write_file_tool,
     };
@@ -12001,7 +11998,8 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     #[test]
     fn read_files_obeys_the_combined_output_budget() {
         let root = scratch("read-files-budget");
-        let body = "x".repeat(MAX_BATCH_READ_BYTES / 2 + 128);
+        let budget = read_page_bytes(65_536);
+        let body = "x".repeat(budget / 2 + 128);
         std::fs::write(root.join("a.txt"), &body).expect("a");
         std::fs::write(root.join("b.txt"), &body).expect("b");
         std::fs::write(root.join("c.txt"), "c\n").expect("c");
@@ -12015,11 +12013,11 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 &serde_json::json!({"paths": ["a.txt", "b.txt", "c.txt"]}),
             )
             .expect("bounded batch read");
-        assert_eq!(result["bytes"], MAX_BATCH_READ_BYTES);
+        assert_eq!(result["bytes"], budget);
         assert_eq!(
             result["files"][0]["bytes"].as_u64().unwrap()
                 + result["files"][1]["bytes"].as_u64().unwrap(),
-            MAX_BATCH_READ_BYTES as u64
+            budget as u64
         );
         assert_eq!(result["status"], "partial");
         // The batch cut b.txt in the middle of its one long line. The

@@ -133,6 +133,11 @@ pub(crate) struct AgentSection {
     pub(crate) max_tokens: Option<u32>,
     /// Send-side token ceiling; 0 disables compaction.
     pub(crate) context_budget: usize,
+    /// The command that verifies a change, when the project's check is not one
+    /// of the known runners. A successful run of exactly this command counts
+    /// as the round's check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verify_command: Option<String>,
     /// The old ReAct step ceiling.
     ///
     /// Read so a settings file written before the bound was removed still
@@ -199,6 +204,7 @@ impl Default for AgentSection {
             // turn (measured: 86 items folded, 85 s of summarizer). The shipped
             // ceiling has to pay for the reply it reserves.
             context_budget: 65536,
+            verify_command: None,
             max_steps: 0,
             // An hour, not the framework's 60s: a slow provider must be
             // waited out, and Stop is the reader's own cutoff.

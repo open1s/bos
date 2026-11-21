@@ -514,6 +514,8 @@ pub(crate) struct Resolution {
     pub(crate) skills: std::sync::Arc<Vec<DiscoveredSkill>>,
     /// Send-side token ceiling; 0 disables compaction.
     pub(crate) context_budget: usize,
+    /// The project's own verification command, when it has one.
+    pub(crate) verify_command: Option<String>,
     /// Seconds one LLM request may wait before the loop gives up on it.
     pub(crate) llm_timeout_secs: u64,
     /// Retries after the first attempt when a provider failure is transient.
@@ -733,6 +735,7 @@ pub(crate) fn resolve_with_catalogue(
         skill_sources,
         skills,
         context_budget: workspace.agent.context_budget,
+        verify_command: workspace.agent.verify_command.clone(),
         llm_timeout_secs: workspace.agent.llm_timeout_secs,
         llm_max_retries: workspace.agent.llm_max_retries,
         shell_timeout_secs: workspace.agent.shell_timeout_secs,

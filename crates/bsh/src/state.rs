@@ -118,14 +118,24 @@ fn tail_bytes(session: &Session, tail: usize) -> usize {
 }
 
 /// Close a turn's measured span, when it has a start and no end yet.
+/// What a goal's rounds have done since its last change.
+#[derive(Default, Clone, Copy)]
+struct GoalProgress {
+    /// A file changed at some point and no later check has covered it.
+    changed: bool,
+    /// A check ran after the latest change.
+    verified: bool,
+}
+
 /// A tool that changes a workspace file.
 fn is_edit_tool(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file" | "apply_patch" | "sed")
 }
 
-/// Whether a bash call's command is the project's own check.
-fn command_is_check(args: &str) -> bool {
-    let command = serde_json::from_str::<serde_json::Value>(args)
+/// The command a bash call ran, lowered, or empty when its arguments do not
+/// parse.
+fn command_of(args: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(args)
         .ok()
         .and_then(|value| {
             value
@@ -133,20 +143,109 @@ fn command_is_check(args: &str) -> bool {
                 .and_then(|cmd| cmd.as_str())
                 .map(str::to_lowercase)
         })
-        .unwrap_or_default();
-    [
-        "cargo check",
-        "cargo test",
-        "cargo clippy",
-        "npm test",
-        "npm run test",
+        .unwrap_or_default()
+}
+
+/// Whether a bash call's command is the project's own check.
+///
+/// The match is by RUNNER, not by one fixed sentence: `cargo nextest`, a
+/// workspace script, `npm run lint`, `just check` are all checks. A project
+/// whose command is none of them names it in `verify_command`, which matches
+/// exactly.
+fn command_is_check(args: &str, custom: Option<&str>) -> bool {
+    let command = command_of(args);
+    if command.is_empty() {
+        return false;
+    }
+    if let Some(custom) = custom.map(str::trim).filter(|custom| !custom.is_empty())
+        && command.contains(&custom.to_lowercase())
+    {
+        return true;
+    }
+    let verb = |word: &str| {
+        command
+            .split_whitespace()
+            .any(|token| token == word || token.starts_with(&format!("{word}:")))
+    };
+    let runners = [
+        "cargo",
+        "npm",
+        "pnpm",
+        "yarn",
+        "bun",
+        "deno",
+        "go",
         "pytest",
-        "go test",
-        "make test",
-        "just test",
+        "python",
+        "uv",
+        "make",
+        "just",
+        "task",
+        "mvn",
+        "gradle",
+        "./gradlew",
+        "dotnet",
+        "swift",
+        "xcodebuild",
+        "ctest",
+        "meson",
+        "bazel",
+        "hatch",
+        "tox",
+        "nox",
+        "phpunit",
+        "rspec",
+        "mix",
+    ];
+    let starts_with_runner = runners
+        .iter()
+        .any(|runner| command.trim_start().starts_with(runner));
+    let check_word = verb("test")
+        || verb("tests")
+        || verb("check")
+        || verb("lint")
+        || verb("clippy")
+        || verb("verify")
+        || verb("nextest")
+        || verb("pytest");
+    if starts_with_runner && check_word {
+        return true;
+    }
+    // A project script: `./scripts/check.sh`, `bash tools/verify`, `make` with
+    // no word still runs the project's default target and counts.
+    let first = command.split_whitespace().next().unwrap_or_default();
+    let script = first.contains("test")
+        || first.contains("check")
+        || first.contains("verify")
+        || first.contains("lint");
+    let bare_runner = matches!(command.trim(), "make" | "just" | "ctest" | "pytest");
+    script || bare_runner
+}
+
+/// Whether a bash call's command writes a workspace file.
+///
+/// The prompt forbids this path, but a round that used it still CHANGED the
+/// workspace; counting it as "no change" would block an honest round.
+fn command_is_edit(args: &str) -> bool {
+    let command = command_of(args);
+    [
+        "sed -i",
+        "perl -i",
+        "tee ",
+        " > ",
+        ">>",
+        "cat >",
+        "<<",
+        "git apply",
+        "patch ",
+        "mv ",
+        "cp ",
+        "rm ",
+        "touch ",
+        "mkdir ",
     ]
     .iter()
-    .any(|check| command.contains(check))
+    .any(|mark| command.contains(mark))
 }
 
 fn settle_ms(message: &mut ChatMessage, at: u64) {
@@ -650,6 +749,9 @@ pub(crate) struct AppState {
     /// Sessions whose current turn is a goal round (set by the round opener,
     /// cleared by a manual turn), for the no-progress gate.
     goal_rounds: std::collections::HashSet<String>,
+    /// What the goal's rounds have done since its last change: a change must be
+    /// followed by a check, in this round or a later one, before completion.
+    goal_progress: HashMap<String, GoalProgress>,
     /// The global row each running turn's mutable tail starts at.
     ///
     /// The log cannot update a row in place, so a turn that streams for
@@ -1072,6 +1174,7 @@ impl AppState {
             collapsed: BTreeSet::new(),
             streams: HashMap::new(),
             goal_rounds: std::collections::HashSet::new(),
+            goal_progress: HashMap::new(),
             inflight_tails: HashMap::new(),
             journaled_at: HashMap::new(),
             turn_seen: HashMap::new(),
@@ -3133,6 +3236,7 @@ impl AppState {
         // Validate BEFORE the session is borrowed mutably: a refusal must not
         // leave a half-mutated session behind.
         let objective = goal_objective(objective)?;
+        self.goal_progress.remove(id);
         let replaced = {
             let Some(session) = self.store.session_mut(id) else {
                 return Err(GoalRefusal::Missing);
@@ -3345,10 +3449,13 @@ impl AppState {
     pub(crate) fn settle_goal(&mut self, id: &str) -> Option<GoalSettle> {
         let store = self.goals.remove(id)?;
         let settle = store.take_settle()?;
-        // A completion is only honest with a change AND its check in the same
-        // round; otherwise the goal blocks with the missing evidence named.
+        // A completion is only honest when the goal's latest change was
+        // followed by a check - in this round or a later one; otherwise the
+        // goal blocks with the missing evidence named.
+        self.record_goal_progress(id);
+        let progress = self.goal_progress.get(id).copied().unwrap_or_default();
         let settle = match settle {
-            GoalSettle::Complete if !self.round_edits(id) || !self.round_verified(id) => {
+            GoalSettle::Complete if !(progress.changed && progress.verified) => {
                 GoalSettle::Blocked {
                     code: "verification".to_string(),
                     message: crate::i18n::tr(self.lang, "goal.verificationMissing"),
@@ -3380,6 +3487,7 @@ impl AppState {
         };
         if changed {
             self.save_session(id);
+            self.goal_progress.remove(id);
         }
         Some(settle)
     }
@@ -3392,6 +3500,7 @@ impl AppState {
     /// completion, blocker or failure callback is discarded rather than
     /// applied to the replacement.
     pub(crate) fn clear_goal(&mut self, id: &str) -> bool {
+        self.goal_progress.remove(id);
         let Some(session) = self.store.session_mut(id) else {
             return false;
         };
@@ -4344,6 +4453,9 @@ impl AppState {
             }
         }
         if terminal {
+            if self.was_goal_round(id) {
+                self.record_goal_progress(id);
+            }
             self.streams.remove(id);
             self.turn_seen.remove(id);
             self.inflight_tails.remove(id);
@@ -4401,13 +4513,29 @@ impl AppState {
     pub(crate) fn round_edits(&self, id: &str) -> bool {
         self.round_tools(id).is_some_and(|tools| {
             tools.iter().any(|tool| {
-                is_edit_tool(&tool.name)
+                let changes = is_edit_tool(&tool.name)
+                    || (tool.name == "bash" && command_is_edit(&tool.args));
+                changes
                     && tool
                         .output
                         .as_deref()
                         .is_some_and(|output| !react::tool::ToolResult::text_is_error(output))
             })
         })
+    }
+
+    /// Fold this round's change and check into the goal's progress.
+    fn record_goal_progress(&mut self, id: &str) {
+        let edits = self.round_edits(id);
+        let verified = self.round_verified(id);
+        let progress = self.goal_progress.entry(id.to_string()).or_default();
+        if edits {
+            progress.changed = true;
+            progress.verified = false;
+        }
+        if verified {
+            progress.verified = true;
+        }
     }
 
     /// Whether the round ran the project's check successfully.
@@ -4419,7 +4547,7 @@ impl AppState {
                         .output
                         .as_deref()
                         .is_some_and(|output| !react::tool::ToolResult::text_is_error(output))
-                    && command_is_check(&tool.args)
+                    && command_is_check(&tool.args, self.effective_in(id).verify_command.as_deref())
             })
         })
     }
@@ -7315,6 +7443,114 @@ mod tests {
             "the completion was replaced by a blocker"
         );
         assert_eq!(state.goal(&id).expect("the goal").state, GoalState::Blocked);
+    }
+
+    /// A project whose check is not one of the known runners names it; a
+    /// successful run of exactly that command counts.
+    #[test]
+    fn a_custom_verify_command_counts_as_the_check() {
+        let (mut state, id) = goal_state("custom-verify");
+        state.settings.workspace.agent.verify_command = Some("./ci.sh".to_string());
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{\"command\":\"./ci.sh\"}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        assert!(
+            state.round_verified(&id),
+            "the configured command is the check"
+        );
+    }
+
+    /// A write through bash still changed the workspace; it is not \"no
+    /// change\" for the round gate.
+    #[test]
+    fn a_bash_write_counts_as_a_change() {
+        let (mut state, id) = goal_state("bash-write");
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{\"command\":\"sed -i 's/a/b/' src/lib.rs\"}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        assert!(state.round_edits(&id), "a bash write changed a file");
+    }
+
+    /// An edit in one round and its check in the next still completes: the
+    /// requirement is a check after the latest change, not both in one round.
+    #[test]
+    fn a_check_in_a_later_round_completes_the_goal() {
+        use agent::tools::{GoalSettle, GoalStore};
+        let (mut state, id) = goal_state("cross-round");
+        state.create_goal(&id, "ship it").expect("the goal");
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "apply_patch".to_string(),
+                    args: "{}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        state.record_goal_progress(&id);
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{\"command\":\"cargo test\"}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        state.record_goal_progress(&id);
+        let goal = state.goal(&id).expect("the goal");
+        let store = GoalStore::new(goal);
+        state.attach_goal(&id, store.clone());
+        assert!(store.complete());
+        assert_eq!(
+            state.settle_goal(&id),
+            Some(GoalSettle::Complete),
+            "the later check covers the earlier edit"
+        );
     }
 
     /// A model blocker is recorded with the stable model-reported code, and an
