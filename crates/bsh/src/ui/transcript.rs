@@ -167,6 +167,12 @@ fn single_fit(width: u32, height: u32) -> (f32, f32) {
 /// parses only the new tail) and slides once per step.
 const THINK_STREAM_WINDOW: usize = 4 * 1024;
 
+/// Steps an open process group draws before its first "show more" page.
+///
+/// A step is a laid-out row even when folded; a group can hold thousands of
+/// them, so the page bounds a frame's work regardless of the run's length.
+const PROCESS_STEP_PAGE: usize = 40;
+
 /// The text a live reasoning body paints: the newest window of the thought.
 ///
 /// Returns `None` when the body already fits, so a short thought paints its
@@ -3399,11 +3405,42 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(6.0));
-        for (tool_index, tool) in message.tools.iter().enumerate() {
+        // A process group can hold thousands of calls. Every step is a laid-out
+        // row even while folded, so an open group drew the whole run in one
+        // frame (measured: 280 ms for 3,715 steps). Draw one page and let the
+        // reader extend it; each page is bounded work.
+        let extra = self.process_more.get(&index).copied().unwrap_or(0);
+        let shown = message.tools.len().min(PROCESS_STEP_PAGE + extra);
+        for (tool_index, tool) in message.tools.iter().enumerate().take(shown) {
             // Every step starts folded: the group is the reader's first door,
             // the step's own chevron the second. Nothing opens on the model's
             // behalf, live or settled.
             body = body.child(self.tool_row(index, tool_index, tool, chrome, cx));
+        }
+        if shown < message.tools.len() {
+            let page = (message.tools.len() - shown).min(PROCESS_STEP_PAGE);
+            let label = crate::i18n::tr_args(
+                self.state.lang,
+                "transcript.moreSteps",
+                &[("count", page.to_string())],
+            );
+            body = body.child(
+                div()
+                    .id(SharedString::from(format!("process-more-{index}")))
+                    .debug_selector(move || format!("process-more-{index}"))
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .rounded(px(6.0))
+                    .hover(|style| style.bg(rgb(theme::hover())))
+                    .child(txt(label, 11.0, theme::muted()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        *this.process_more.entry(index).or_default() += PROCESS_STEP_PAGE;
+                        cx.notify();
+                    })),
+            );
         }
         div()
             .w_full()

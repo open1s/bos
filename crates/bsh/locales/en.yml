@@ -604,6 +604,7 @@
 "msg.process.joinTwo": "{first} and {second}"
 "msg.process.comma": ", "
 "msg.process.more": "{title}, etc."
+"transcript.moreSteps": "Show {count} more steps"
 "msg.processLive.read": "Reading files"
 "msg.processLive.write": "Writing files"
 "msg.processLive.edit": "Editing files"

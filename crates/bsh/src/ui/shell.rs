@@ -743,6 +743,10 @@ pub(crate) struct Shell {
     /// index. Collapsed is the default; a click is the only way in, and a
     /// session switch closes them with the reasoning disclosures.
     pub(crate) process_open: std::collections::HashSet<usize>,
+    /// How many extra steps an open process group shows beyond the first page.
+    /// A group can hold thousands of calls, and every step is a laid-out row:
+    /// drawing them all made one frame cost the length of the run.
+    pub(crate) process_more: std::collections::HashMap<usize, usize>,
     /// The compaction markers the reader has expanded, by record index.
     ///
     /// Scoped like the reasoning disclosures: a session switch closes them,
@@ -2358,6 +2362,7 @@ impl Shell {
             inject_open: std::collections::HashSet::new(),
             question_progress: std::collections::HashMap::new(),
             process_open: std::collections::HashSet::new(),
+            process_more: std::collections::HashMap::new(),
             compaction_open: std::collections::HashSet::new(),
             chat_last_offset: 0.0,
             traj_last_offset: 0.0,
@@ -7928,6 +7933,7 @@ impl Render for Shell {
             self.inject_open.clear();
             self.question_progress.clear();
             self.process_open.clear();
+            self.process_more.clear();
             self.image_lightbox = None;
             self.compaction_open.clear();
             // The audit's folds name turn and call positions in the transcript

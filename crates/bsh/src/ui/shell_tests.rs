@@ -35032,6 +35032,84 @@ fn a_real_stream_paints_its_reasoning_and_ends_cleanly(cx: &mut TestAppContext) 
     );
 }
 
+/// A single assistant row holding thousands of calls must not make a tab's
+/// frame follow the log: this is the session shape a long goal round leaves
+/// behind.
+#[gpui::test]
+fn a_single_message_with_thousands_of_calls_keeps_each_tab_smooth(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("many-calls", 1);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id)
+            && let Some(message) = session.messages.last_mut()
+        {
+            for call in 0..3000 {
+                message.tools.push(ToolEvent {
+                    name: "bash".to_string(),
+                    args: "{\"command\":\"cargo test\"}".to_string(),
+                    output: Some(format!("line {call} of output")),
+                    ms: Some(1),
+                    at: Some(1_700_000_000_000 + call as u64),
+                });
+            }
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // The group is the expensive state: an OPEN process body lays out its steps.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            this.process_open.insert(1);
+        })
+    });
+    fn median(cx: &mut VisualTestContext, frames: usize) -> f64 {
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let mut times: Vec<f64> = Vec::new();
+        for _ in 0..frames {
+            let started = std::time::Instant::now();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            times.push(started.elapsed().as_secs_f64() * 1e3);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        times[times.len() / 2]
+    }
+    let chat = median(cx, 10);
+    assert!(
+        cx.debug_bounds("process-more-1").is_some(),
+        "the open group pages its remaining steps"
+    );
+    let mut readings = vec![("chat", chat)];
+    for (tab, name) in [
+        (Tab::Trajectory, "trajectory"),
+        (Tab::Audit, "audit"),
+        (Tab::Review, "review"),
+    ] {
+        cx.update(|_, cx| {
+            shell.update(cx, |this, cx| {
+                this.state.tab = tab;
+                cx.notify();
+            })
+        });
+        // Let the async model land before measuring steady-state frames.
+        for _ in 0..60 {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        readings.push((name, median(cx, 10)));
+    }
+    for (name, ms) in &readings {
+        eprintln!("TAB {name} {ms:.2}ms");
+        assert!(
+            *ms < 20.0,
+            "{name} painted a {ms:.2}ms frame with 3,000 calls in the log"
+        );
+    }
+}
+
 /// The frame trace is off unless asked for, and when it is asked for it writes
 /// exactly one bounded line per painted frame with the documented keys.
 #[gpui::test]

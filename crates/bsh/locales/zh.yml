@@ -599,6 +599,7 @@
 "msg.process.joinTwo": "{first}并{second}"
 "msg.process.comma": "，"
 "msg.process.more": "{title}等"
+"transcript.moreSteps": "再显示 {count} 个步骤"
 "msg.processLive.read": "正在读取文件"
 "msg.processLive.write": "正在写入文件"
 "msg.processLive.edit": "正在编辑文件"
