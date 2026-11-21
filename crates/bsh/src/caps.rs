@@ -1623,8 +1623,7 @@ fn build_agent_for_session_inner(
     // even when no MCP server is configured; the graph is built on first use
     // and cached for this workspace.
     let codel = Arc::new(CodelTool {
-        metadata: crate::tool_metadata::builtin_metadata("codel")
-            .expect("codel built-in metadata"),
+        metadata: crate::tool_metadata::builtin_metadata("codel").expect("codel built-in metadata"),
         root: root.clone(),
         workspace: Arc::new(Mutex::new(None)),
     });
@@ -5265,8 +5264,11 @@ impl react::tool::registry::AsyncTool for CodelTool {
                         if let Some(ty) = workspace.symbol_types.get(hit.node.id.as_str()) {
                             value["type"] = serde_json::json!(ty);
                         }
-                        value["selector"] =
-                            serde_json::json!(format!("{}#{}", hit.node.path.display(), hit.node.name));
+                        value["selector"] = serde_json::json!(format!(
+                            "{}#{}",
+                            hit.node.path.display(),
+                            hit.node.name
+                        ));
                         value
                     })
                     .collect::<Vec<_>>();
@@ -5288,8 +5290,7 @@ impl react::tool::registry::AsyncTool for CodelTool {
                     .and_then(|value| value.as_u64())
                     .unwrap_or(50)
                     .clamp(1, 200) as usize;
-                let id = resolve_codel_node(graph, node)
-                    .map_err(ToolError::InvalidInput)?;
+                let id = resolve_codel_node(graph, node).map_err(ToolError::InvalidInput)?;
                 let answer = graph
                     .explain_budgeted(
                         &id,
@@ -5325,8 +5326,8 @@ impl react::tool::registry::AsyncTool for CodelTool {
                         if changed.is_empty()
                             && let Some(node) = input.get("node").and_then(|value| value.as_str())
                         {
-                            let id = resolve_codel_node(graph, node)
-                                .map_err(ToolError::InvalidInput)?;
+                            let id =
+                                resolve_codel_node(graph, node).map_err(ToolError::InvalidInput)?;
                             if let Some(found) = graph.node(&id) {
                                 changed.push(found.path.display().to_string());
                             }
@@ -5350,8 +5351,9 @@ impl react::tool::registry::AsyncTool for CodelTool {
                     .get("path")
                     .and_then(|value| value.as_str())
                     .ok_or_else(|| ToolError::InvalidInput("path is required".to_string()))?;
-                let path = codel_mcp::ast::safe_relative(path)
-                    .ok_or_else(|| ToolError::InvalidInput("path must be workspace-relative".to_string()))?;
+                let path = codel_mcp::ast::safe_relative(path).ok_or_else(|| {
+                    ToolError::InvalidInput("path must be workspace-relative".to_string())
+                })?;
                 let preset = input
                     .get("preset")
                     .and_then(|value| value.as_str())
@@ -5464,16 +5466,15 @@ fn resolve_codel_node(
         .map(|hit| hit.node)
         .collect::<Vec<_>>();
     match hits.as_slice() {
-        [] => Err(format!("no node matches '{value}'; use search or path#name")),
+        [] => Err(format!(
+            "no node matches '{value}'; use search or path#name"
+        )),
         [node] => Ok(node.id.clone()),
         _ => Err(codel_ambiguous(value, &hits.iter().collect::<Vec<_>>())),
     }
 }
 
-fn codel_path_matches(
-    node: &codel_mcp::codel::graph::GraphNode,
-    filter: Option<&str>,
-) -> bool {
+fn codel_path_matches(node: &codel_mcp::codel::graph::GraphNode, filter: Option<&str>) -> bool {
     let Some(filter) = filter else {
         return true;
     };
@@ -5686,72 +5687,69 @@ impl agent::tools::Tool for RunCodeTool {
 
         #[cfg(unix)]
         let broker = {
-            let registry = self
-                .registry
-                .lock()
-                .ok()
-                .and_then(|slot| slot.clone());
-            registry.map(|registry| -> Result<_, ToolError> {
-                use std::os::unix::net::UnixListener;
-                let socket_path = directory.join(format!("tools-{sequence}.sock"));
-                let _ = std::fs::remove_file(&socket_path);
-                let listener = UnixListener::bind(&socket_path)
-                    .map_err(|error| ToolError::Failed(error.to_string()))?;
-                listener
-                    .set_nonblocking(true)
-                    .map_err(|error| ToolError::Failed(error.to_string()))?;
-                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let stop_thread = Arc::clone(&stop);
-                let handle = std::thread::spawn(move || {
-                    while !stop_thread.load(Ordering::Relaxed) {
-                        match listener.accept() {
-                            Ok((stream, _)) => {
-                                let mut reader =
-                                    BufReader::new(stream.try_clone().expect("broker stream"));
-                                let mut line = String::new();
-                                if reader.read_line(&mut line).is_err() {
-                                    continue;
-                                }
-                                let request: serde_json::Value =
-                                    serde_json::from_str(&line).unwrap_or_default();
-                                let tool = request
-                                    .get("tool")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or_default();
-                                let arguments = request
-                                    .get("arguments")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null);
-                                let response = if tool == "run_code" {
-                                    serde_json::json!({
-                                        "ok": false,
-                                        "error": "run_code cannot call itself"
-                                    })
-                                } else {
-                                    match registry.execute(tool, &arguments) {
-                                        Ok(data) => serde_json::json!({"ok": true, "data": data}),
-                                        Err(error) => serde_json::json!({
-                                            "ok": false,
-                                            "error": error.to_string()
-                                        }),
+            let registry = self.registry.lock().ok().and_then(|slot| slot.clone());
+            registry
+                .map(|registry| -> Result<_, ToolError> {
+                    use std::os::unix::net::UnixListener;
+                    let socket_path = directory.join(format!("tools-{sequence}.sock"));
+                    let _ = std::fs::remove_file(&socket_path);
+                    let listener = UnixListener::bind(&socket_path)
+                        .map_err(|error| ToolError::Failed(error.to_string()))?;
+                    listener
+                        .set_nonblocking(true)
+                        .map_err(|error| ToolError::Failed(error.to_string()))?;
+                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let stop_thread = Arc::clone(&stop);
+                    let handle = std::thread::spawn(move || {
+                        while !stop_thread.load(Ordering::Relaxed) {
+                            match listener.accept() {
+                                Ok((stream, _)) => {
+                                    let mut reader =
+                                        BufReader::new(stream.try_clone().expect("broker stream"));
+                                    let mut line = String::new();
+                                    if reader.read_line(&mut line).is_err() {
+                                        continue;
                                     }
-                                };
-                                let mut writer = stream;
-                                let _ = writer.write_all(
-                                    format!("{}\n", response).as_bytes(),
-                                );
-                                let _ = writer.flush();
+                                    let request: serde_json::Value =
+                                        serde_json::from_str(&line).unwrap_or_default();
+                                    let tool = request
+                                        .get("tool")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default();
+                                    let arguments = request
+                                        .get("arguments")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    let response = if tool == "run_code" {
+                                        serde_json::json!({
+                                            "ok": false,
+                                            "error": "run_code cannot call itself"
+                                        })
+                                    } else {
+                                        match registry.execute(tool, &arguments) {
+                                            Ok(data) => {
+                                                serde_json::json!({"ok": true, "data": data})
+                                            }
+                                            Err(error) => serde_json::json!({
+                                                "ok": false,
+                                                "error": error.to_string()
+                                            }),
+                                        }
+                                    };
+                                    let mut writer = stream;
+                                    let _ = writer.write_all(format!("{}\n", response).as_bytes());
+                                    let _ = writer.flush();
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                }
+                                Err(_) => break,
                             }
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                std::thread::sleep(std::time::Duration::from_millis(5));
-                            }
-                            Err(_) => break,
                         }
-                    }
-                });
-                Ok((socket_path, stop, handle))
-            })
-            .transpose()?
+                    });
+                    Ok((socket_path, stop, handle))
+                })
+                .transpose()?
         };
 
         let mut source = String::new();
@@ -5771,7 +5769,8 @@ globals()["bsh"] = _bsh
         std::fs::write(&script, source).map_err(|error| ToolError::Failed(error.to_string()))?;
         #[cfg(unix)]
         if broker.is_some() {
-            std::fs::write(&helper, BSH_HELPER).map_err(|error| ToolError::Failed(error.to_string()))?;
+            std::fs::write(&helper, BSH_HELPER)
+                .map_err(|error| ToolError::Failed(error.to_string()))?;
         }
         let relative = script
             .strip_prefix(root)
@@ -17833,15 +17832,18 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
     }
     #[tokio::test]
     async fn codel_tool_is_scoped_to_its_workspace() {
-        use std::sync::{Arc, Mutex};
         use super::CodelTool;
         use react::tool::registry::AsyncTool as _;
+        use std::sync::{Arc, Mutex};
 
         let root = scratch("codel-scope");
-        std::fs::write(root.join("a.py"), "def quick_sort(items):
+        std::fs::write(
+            root.join("a.py"),
+            "def quick_sort(items):
     return sorted(items)
-")
-            .expect("source");
+",
+        )
+        .expect("source");
         let tool = CodelTool {
             metadata: crate::tool_metadata::builtin_metadata("codel").expect("metadata"),
             root: Some(root.clone()),
@@ -17857,7 +17859,12 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
             .expect("codel search");
         assert_eq!(
             result["root"].as_str(),
-            Some(root.canonicalize().expect("canonical").to_string_lossy().as_ref())
+            Some(
+                root.canonicalize()
+                    .expect("canonical")
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
         assert!(
             result["hits"]
@@ -17869,8 +17876,12 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
     #[test]
     fn run_code_calls_builtin_tools_through_the_broker() {
         let root = scratch("run-code-broker");
-        std::fs::write(root.join("a.txt"), "broker-visible
-").expect("a");
+        std::fs::write(
+            root.join("a.txt"),
+            "broker-visible
+",
+        )
+        .expect("a");
         let mut settings = confined(&root);
         settings.workspace.agent.permission = FULL_ACCESS.to_string();
         let built = build(&settings);
@@ -17904,7 +17915,6 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
         }
     }
 
-
     #[test]
     fn codel_is_a_builtin_model_tool() {
         let built = build(&bare());
@@ -17915,5 +17925,4 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
             tools.iter().map(|tool| &tool.name).collect::<Vec<_>>()
         );
     }
-
 }

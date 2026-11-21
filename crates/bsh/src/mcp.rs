@@ -1523,5 +1523,4 @@ verdict := {"allow": false, "rule": "no-mcp-spawn", "reason": "mcp spawns are re
             .expect_err("an unknown tool is refused");
         assert!(error.to_string().contains("action=list"), "{error}");
     }
-
 }

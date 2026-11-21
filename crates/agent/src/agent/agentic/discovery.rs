@@ -384,7 +384,6 @@ impl Catalogue<'_> {
         out
     }
 
-
     /// Advertised tools that answer the query.
     ///
     /// These are already in the model's array, so they are NOT withheld and
@@ -426,7 +425,11 @@ impl Catalogue<'_> {
                 }
             }
         }
-        out.sort_by(|a, b| score(query, b).cmp(&score(query, a)).then(a.name.cmp(&b.name)));
+        out.sort_by(|a, b| {
+            score(query, b)
+                .cmp(&score(query, a))
+                .then(a.name.cmp(&b.name))
+        });
         out.dedup_by(|a, b| a.name == b.name);
         out.truncate(limit);
         out
