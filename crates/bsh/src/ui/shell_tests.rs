@@ -35032,6 +35032,83 @@ fn a_real_stream_paints_its_reasoning_and_ends_cleanly(cx: &mut TestAppContext) 
     );
 }
 
+/// Switching chats in the left pane must not stall the frame: a cold session
+/// rehydrates from its history page, and a workspace move rewrites settings.
+#[gpui::test]
+fn switching_between_sessions_is_not_a_stall(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("switch-ms", 1);
+        let large = state.new_session().expect("a large session");
+        if let Some(session) = state.store.session_mut(&large) {
+            session.messages.push(ChatMessage::user("work"));
+            session.messages.push(ChatMessage::assistant());
+            for call in 0..3000 {
+                session
+                    .messages
+                    .last_mut()
+                    .expect("the reply")
+                    .tools
+                    .push(ToolEvent {
+                        name: "bash".to_string(),
+                        args: "{}".to_string(),
+                        output: Some(format!("line {call}")),
+                        ms: Some(1),
+                        at: Some(1_700_000_000_000 + call as u64),
+                    });
+            }
+        }
+        let _small = state.new_session().expect("a small session");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let ids: Vec<String> = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .state
+            .store
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect()
+    });
+    let large = ids
+        .iter()
+        .max_by_key(|id| {
+            cx.update(|_, cx| {
+                shell
+                    .read(cx)
+                    .state
+                    .store
+                    .session(id)
+                    .map_or(0, |session| session.messages.len())
+            })
+        })
+        .cloned()
+        .expect("a session");
+    let other = ids
+        .iter()
+        .find(|id| **id != large)
+        .cloned()
+        .expect("another session");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let mut times: Vec<f64> = Vec::new();
+    for _ in 0..3 {
+        for id in [&large, &other] {
+            let started = std::time::Instant::now();
+            cx.update(|window, cx| shell.update(cx, |this, cx| this.open_session(id, window, cx)));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            times.push(started.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    eprintln!("SWITCH {times:?}");
+    assert!(
+        times.iter().all(|ms| *ms < 150.0),
+        "a switch stalled: {times:?}"
+    );
+}
+
 /// A single assistant row holding thousands of calls must not make a tab's
 /// frame follow the log: this is the session shape a long goal round leaves
 /// behind.
