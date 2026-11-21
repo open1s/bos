@@ -24,30 +24,61 @@ pub fn tool_definitions() -> Value {
     json!({
         "tools": [
             {
-                "name": "codel_search",
-                "description": "START HERE: find declarations by name/path, or run a Tree-sitter structural query with mode=ast. Example: {\"query\":\"quick_sort\"}.",
+                "name": "help",
+                "description": "ALWAYS CALL THIS FIRST. Returns the workspace rules, the 7-tool surface, and copy-paste workflows.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Name/path words, or a Tree-sitter query when mode=ast."},
-                        "mode": {"type": "string", "enum": ["name", "ast"], "default": "name"},
-                        "path": {"type": "string", "description": "Workspace-relative file for mode=ast."},
-                        "captures": {"type": "array", "items": {"type": "string"}},
-                        "max": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
-                        "token_budget": {"type": "integer", "minimum": 1, "maximum": 32000, "default": 2000},
-                        "root": {"type": "string", "description": "Optional root path; omit for active."},
-                        "workspace": {"type": "string", "description": "Workspace id, label, or root; omit for active."},
-                        "roots": {"type": "array", "items": {"type": "string"}},
-                        "all_roots": {"type": "boolean", "default": false}
+                        "topic": {"type": "string", "enum": ["overview", "search", "inspect", "analyze", "workspace", "scip"], "default": "overview"}
                     },
-                    "required": ["query"],
                     "additionalProperties": false
                 }
             },
             {
-                "name": "codel_inspect",
-                "description": "After codel_search, inspect one node. view=explain (default) returns edges/context; tree, ast, and compare are alternatives.",
+                "name": "search",
+                "description": "Find declarations by name or path words. For structural AST queries use ast_query.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Identifier, symbol name, or path words."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                        "token_budget": {"type": "integer", "minimum": 1, "maximum": 32000, "default": 2000},
+                        "root": {"type": "string", "description": "REQUIRED absolute workspace root path."},
+                        "workspace": {"type": "string", "description": "Workspace id, label, or root; omit for active."},
+                        "roots": {"type": "array", "items": {"type": "string"}},
+                        "all_roots": {"type": "boolean", "default": false}
+                    },
+                    "required": ["query", "root"],
+                    "additionalProperties": false,
+                    "examples": [{"query": "quick_sort", "root": "/abs/workspace"}]
+                }
+            },
+            {
+                "name": "ast_query",
+                "description": "Run a Tree-sitter structural query. Use preset for language-aware patterns, or query for custom syntax; search for names.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file path."},
+                        "preset": {"type": "string", "enum": ["functions", "classes", "methods", "calls", "imports"], "default": "functions"},
+                        "query": {"type": "string", "description": "Optional custom Tree-sitter query; overrides preset."},
+                        "captures": {"type": "array", "items": {"type": "string"}},
+                        "max": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+                        "root": {"type": "string", "description": "REQUIRED absolute workspace root path."},
+                        "workspace": {"type": "string", "description": "Workspace id, label, or root; omit for active."}
+                    },
+                    "required": ["path", "root"],
+                    "additionalProperties": false,
+                    "examples": [{
+                        "path": "quicksort/quicksort.py",
+                        "preset": "functions",
+                        "root": "/abs/workspace"
+                    }]
+                }
+            },
+            {
+                "name": "inspect",
+                "description": "After search, inspect one node. view=explain (default) returns edges/context; tree, ast, and compare are alternatives.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -57,14 +88,15 @@ pub fn tool_definitions() -> Value {
                         "left": {"type": "string"},
                         "right": {"type": "string"},
                         "depth": {"type": "integer", "minimum": 0, "maximum": 16, "default": 4},
-                        "root": {"type": "string", "description": "Optional root path; omit for active."},
+                        "root": {"type": "string", "description": "REQUIRED absolute workspace root path."},
                         "workspace": {"type": "string", "description": "Workspace id, label, or root; omit for active."}
                     },
+                    "required": ["root"],
                     "additionalProperties": false
                 }
             },
             {
-                "name": "codel_analyze",
+                "name": "analyze",
                 "description": "Graph analysis over an existing node or changed files. analysis=affected (default), path, impact, cycles, dead_code, god_nodes.",
                 "inputSchema": {
                     "type": "object",
@@ -81,20 +113,21 @@ pub fn tool_definitions() -> Value {
                         "max": {"type": "integer", "minimum": 1, "maximum": 500},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
                         "token_budget": {"type": "integer", "minimum": 1, "maximum": 32000, "default": 2000},
-                        "root": {"type": "string", "description": "Optional root path; omit for active."},
+                        "root": {"type": "string", "description": "REQUIRED absolute workspace root path."},
                         "workspace": {"type": "string", "description": "Workspace id, label, or root; omit for active."}
                     },
+                    "required": ["root"],
                     "additionalProperties": false
                 }
             },
             {
-                "name": "codel_workspace",
+                "name": "workspace",
                 "description": "Workspace lifecycle: help, status, list, set, use, refresh, SCIP import, benchmark. Call action=help first if unsure how to start.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["help", "status", "identity", "list", "set", "use", "refresh", "scip_import", "benchmark"], "default": "status"},
-                        "root": {"type": "string", "description": "Optional root path; omit for active."},
+                        "root": {"type": "string", "description": "Required for status/refresh/set/use/scip_import/benchmark; omit only for list/help/identity."},
                         "workspace": {"type": "string", "description": "Workspace id, label, or root; omit for active."},
                         "index": {"type": "string", "description": "SCIP file or directory for action=scip_import."}
                     },
@@ -102,17 +135,18 @@ pub fn tool_definitions() -> Value {
                 }
             },
             {
-                "name": "codel_export",
+                "name": "export",
                 "description": "Export the graph as Markdown, JSON, wiki, Obsidian, HTML, SVG, GraphML, Cypher, or callflow.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "format": {"type": "string"},
                         "node": {"type": "string"},
-                        "root": {"type": "string", "description": "Optional root path; omit for active."},
+                        "root": {"type": "string", "description": "REQUIRED absolute workspace root path."},
                         "workspace": {"type": "string", "description": "Workspace id, label, or root; omit for active."},
                         "token_budget": {"type": "integer", "minimum": 1, "maximum": 32000, "default": 2000}
                     },
+                    "required": ["root"],
                     "additionalProperties": false
                 }
             }

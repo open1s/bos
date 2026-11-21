@@ -1,6 +1,6 @@
 //! Minimal MCP stdio server over the codel candidate graph.
 //!
-//! The server speaks newline-delimited JSON-RPC, exposes five tools, and indexes
+//! The server speaks newline-delimited JSON-RPC, exposes six tools, and indexes
 //! one workspace lazily on the first tool call. Workspace identity comes from
 //! the host context; the root comes from host context or MCP roots and is always
 //! re-canonicalized by WorkspaceDescriptor.
@@ -224,7 +224,7 @@ impl<W: Write> McpServer<W> {
                     "name": "codel-mcp",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                "instructions": "Start with codel_search {query}. Every response includes workspace {workspaceId,label,root}; omit root/workspace to use the active workspace, or pass a workspace id from codel_workspace action=list. Then use codel_inspect {view: explain|tree|ast|compare, node}. Use codel_analyze for affected/path/impact/cycles/dead_code/god_nodes. Use codel_workspace {action: help} for examples, or action=refresh after edits.",
+                "instructions": "ALWAYS call help first. Then ALWAYS pass the absolute workspace root as root on search, ast_query, inspect, analyze, and export. Use workspace action=list to discover roots; only list/help/identity may omit root. Every response echoes workspace {workspaceId,label,root}.",
             }),
         ))
     }
@@ -286,6 +286,10 @@ impl<W: Write> McpServer<W> {
     }
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<Value, String> {
+        #[cfg(not(test))]
+        if !is_public_tool(name) {
+            return Err(format!("unknown tool: {name}"));
+        }
         let mut result = self.call_tool_inner(name, arguments)?;
         if let (Some(object), Ok(workspace)) = (result.as_object_mut(), self.workspace_identity()) {
             object.entry("workspace").or_insert_with(|| workspace);
@@ -295,18 +299,27 @@ impl<W: Write> McpServer<W> {
 
     fn call_tool_inner(&mut self, name: &str, arguments: &Value) -> Result<Value, String> {
         match name {
-            "codel_search" => {
-                let mode = arguments
-                    .get("mode")
+            "help" => {
+                let topic = arguments
+                    .get("topic")
                     .and_then(Value::as_str)
-                    .unwrap_or("name");
-                if mode != "ast" {
-                    return self.call_tool("codel_query", arguments);
-                }
+                    .unwrap_or("overview");
+                Ok(tool_help(topic))
+            }
+            "search" => {
+                require_root(arguments)?;
+                self.call_tool_inner("query", arguments)
+            }
+            "ast_query" => {
+                require_root(arguments)?;
                 let path = required_str(arguments, "path")?;
                 let path = crate::ast::safe_relative(path)
                     .ok_or_else(|| "path must be workspace-relative".to_owned())?;
-                let query = required_str(arguments, "query")?;
+                let query = arguments.get("query").and_then(Value::as_str);
+                let preset = arguments
+                    .get("preset")
+                    .and_then(Value::as_str)
+                    .unwrap_or("functions");
                 let captures = arguments
                     .get("captures")
                     .and_then(Value::as_array)
@@ -320,65 +333,80 @@ impl<W: Write> McpServer<W> {
                     .unwrap_or_default();
                 let max = optional_usize(arguments, "max", 50)?.clamp(1, 500);
                 let workspace = self.workspace_arg(arguments)?;
-                crate::ast::query(
-                    workspace.descriptor.canonical_root(),
-                    &path,
-                    query,
-                    &captures,
-                    max,
-                )
+                if let Some(query) = query {
+                    crate::ast::query(
+                        workspace.descriptor.canonical_root(),
+                        &path,
+                        query,
+                        &captures,
+                        max,
+                    )
+                } else {
+                    crate::ast::query_preset(
+                        workspace.descriptor.canonical_root(),
+                        &path,
+                        preset,
+                        &captures,
+                        max,
+                    )
+                }
             }
-            "codel_inspect" => {
+            "inspect" => {
+                require_root(arguments)?;
                 let view = arguments
                     .get("view")
                     .and_then(Value::as_str)
                     .unwrap_or("explain");
                 let legacy = match view {
-                    "tree" => "codel_tree",
-                    "ast" => "codel_ast",
-                    "compare" => "codel_compare",
-                    _ => "codel_explain",
+                    "tree" => "tree",
+                    "ast" => "ast",
+                    "compare" => "compare",
+                    _ => "explain",
                 };
-                self.call_tool(legacy, arguments)
+                self.call_tool_inner(legacy, arguments)
             }
-            "codel_analyze" => {
+            "analyze" => {
+                require_root(arguments)?;
                 let analysis = arguments
                     .get("analysis")
                     .and_then(Value::as_str)
                     .unwrap_or("affected");
                 let legacy = match analysis {
-                    "path" => "codel_path",
-                    "impact" => "codel_impact",
-                    "cycles" => "codel_cycles",
-                    "dead_code" => "codel_dead_code",
-                    "god_nodes" => "codel_god_nodes",
-                    _ => "codel_affected",
+                    "path" => "path",
+                    "impact" => "impact",
+                    "cycles" => "cycles",
+                    "dead_code" => "dead_code",
+                    "god_nodes" => "god_nodes",
+                    _ => "affected",
                 };
-                self.call_tool(legacy, arguments)
+                self.call_tool_inner(legacy, arguments)
             }
-            "codel_workspace" => {
+            "workspace" => {
                 let action = arguments
                     .get("action")
                     .and_then(Value::as_str)
                     .unwrap_or("status");
                 if action == "help" {
-                    return Ok(tool_help());
+                    return Ok(tool_help("overview"));
                 }
                 if action == "identity" {
                     return self.workspace_identity();
                 }
+                if action != "list" {
+                    require_root(arguments)?;
+                }
                 let legacy = match action {
-                    "list" => "codel_workspaces",
-                    "set" => "codel_set_workspace",
-                    "use" => "codel_use_workspace",
-                    "refresh" => "codel_refresh",
-                    "scip_import" => "codel_scip_import",
-                    "benchmark" => "codel_benchmark",
-                    _ => "codel_status",
+                    "list" => "workspaces",
+                    "set" => "set_workspace",
+                    "use" => "use_workspace",
+                    "refresh" => "refresh",
+                    "scip_import" => "scip_import",
+                    "benchmark" => "benchmark",
+                    _ => "status",
                 };
-                self.call_tool(legacy, arguments)
+                self.call_tool_inner(legacy, arguments)
             }
-            "codel_query" => {
+            "query" => {
                 let query = required_str(arguments, "query")?;
                 let limit = optional_usize(arguments, "limit", 20)?;
                 let token_budget =
@@ -408,6 +436,8 @@ impl<W: Write> McpServer<W> {
                         if let Some(ty) = workspace.symbol_types.get(hit.node.id.as_str()) {
                             value["type"] = json!(ty);
                         }
+                        value["selector"] =
+                            json!(format!("{}#{}", hit.node.path.display(), hit.node.name));
                         value
                     })
                     .collect::<Vec<_>>();
@@ -419,7 +449,7 @@ impl<W: Write> McpServer<W> {
                     "truncated": answer.truncated,
                 }))
             }
-            "codel_explain" => {
+            "explain" => {
                 let node = required_str(arguments, "node")?;
                 let limit = optional_usize(arguments, "limit", 50)?;
                 let token_budget =
@@ -446,7 +476,7 @@ impl<W: Write> McpServer<W> {
                     "truncated": answer.truncated,
                 }))
             }
-            "codel_impact" => {
+            "impact" => {
                 let mut changed = arguments
                     .get("changed")
                     .and_then(Value::as_array)
@@ -485,7 +515,7 @@ impl<W: Write> McpServer<W> {
                     max_nodes,
                 ))
             }
-            "codel_cycles" => {
+            "cycles" => {
                 let max = optional_usize(arguments, "max", 20)?.clamp(1, 100);
                 let kinds = parse_kinds(arguments)?.unwrap_or_else(|| {
                     vec![EdgeKind::Calls, EdgeKind::Imports, EdgeKind::ReferencesType]
@@ -493,12 +523,12 @@ impl<W: Write> McpServer<W> {
                 let workspace = self.workspace_arg(arguments)?;
                 Ok(crate::diagnostics::cycles(&workspace.graph, &kinds, max))
             }
-            "codel_dead_code" => {
+            "dead_code" => {
                 let max = optional_usize(arguments, "max", 50)?.clamp(1, 500);
                 let workspace = self.workspace_arg(arguments)?;
                 Ok(crate::diagnostics::dead_code(&workspace.graph, max))
             }
-            "codel_compare" => {
+            "compare" => {
                 let left = required_str(arguments, "left")?;
                 let right = required_str(arguments, "right")?;
                 let workspace = self.workspace_arg(arguments)?;
@@ -523,7 +553,7 @@ impl<W: Write> McpServer<W> {
                     "right": side(&right).ok_or_else(|| "right node disappeared".to_owned())?,
                 }))
             }
-            "codel_query_ast" => {
+            "query_ast" => {
                 let path = required_str(arguments, "path")?;
                 let path = crate::ast::safe_relative(path)
                     .ok_or_else(|| "path must be workspace-relative".to_owned())?;
@@ -549,7 +579,7 @@ impl<W: Write> McpServer<W> {
                     max,
                 )
             }
-            "codel_ast" => {
+            "ast" => {
                 let path = required_str(arguments, "path")?;
                 let path = crate::ast::safe_relative(path)
                     .ok_or_else(|| "path must be workspace-relative".to_owned())?;
@@ -557,7 +587,7 @@ impl<W: Write> McpServer<W> {
                 let workspace = self.workspace_arg(arguments)?;
                 crate::ast::parse(workspace.descriptor.canonical_root(), &path, depth)
             }
-            "codel_tree" => {
+            "tree" => {
                 let node = required_str(arguments, "node")?;
                 let depth = optional_usize(arguments, "depth", 4)?.clamp(1, 8);
                 let workspace = self.workspace_arg(arguments)?;
@@ -570,7 +600,7 @@ impl<W: Write> McpServer<W> {
                 );
                 Ok(json!({"tree": tree}))
             }
-            "codel_path" => {
+            "path" => {
                 let from = required_str(arguments, "from")?;
                 let to = required_str(arguments, "to")?;
                 let max_depth = optional_usize(arguments, "max_depth", 8)?;
@@ -603,7 +633,7 @@ impl<W: Write> McpServer<W> {
                     },
                 )
             }
-            "codel_affected" => {
+            "affected" => {
                 let node = required_str(arguments, "node")?;
                 let max_depth = optional_usize(arguments, "max_depth", 2)?;
                 let token_budget =
@@ -627,7 +657,8 @@ impl<W: Write> McpServer<W> {
                     "estimatedTokens": answer.estimated_tokens,
                 }))
             }
-            "codel_export" => {
+            "export" => {
+                require_root(arguments)?;
                 let format = arguments
                     .get("format")
                     .and_then(Value::as_str)
@@ -658,14 +689,14 @@ impl<W: Write> McpServer<W> {
                     Ok(json!({"format": format, "documents": documents}))
                 }
             }
-            "codel_benchmark" => {
+            "benchmark" => {
                 let workspace = self.workspace_arg(arguments)?;
                 Ok(json!({
                     "rawBytes": workspace.raw_bytes,
                     "benchmark": workspace.graph.benchmark(workspace.raw_bytes),
                 }))
             }
-            "codel_scip_import" => {
+            "scip_import" => {
                 let index = required_str(arguments, "index")?;
                 let workspace = self.workspace_arg(arguments)?;
                 let root = workspace.descriptor.canonical_root().to_path_buf();
@@ -695,7 +726,7 @@ impl<W: Write> McpServer<W> {
                     "reload": true,
                 }))
             }
-            "codel_god_nodes" => {
+            "god_nodes" => {
                 let limit = optional_usize(arguments, "limit", 10)?;
                 let token_budget =
                     optional_usize(arguments, "token_budget", DEFAULT_ANSWER_TOKENS)?;
@@ -709,16 +740,16 @@ impl<W: Write> McpServer<W> {
                     "truncated": answer.truncated,
                 }))
             }
-            "codel_use_workspace" => {
+            "use_workspace" => {
                 let root = required_str(arguments, "root")?;
                 self.use_workspace(root)
             }
-            "codel_workspaces" => self.list_workspaces(),
-            "codel_set_workspace" => {
+            "workspaces" => self.list_workspaces(),
+            "set_workspace" => {
                 let root = required_str(arguments, "root")?;
                 self.set_workspace(root)
             }
-            "codel_refresh" => {
+            "refresh" => {
                 let previous = self.workspace.as_ref().map(|workspace| {
                     (
                         workspace
@@ -792,7 +823,7 @@ impl<W: Write> McpServer<W> {
                     "failedFiles": workspace.failed_files,
                 }))
             }
-            "codel_status" => {
+            "status" => {
                 let workspace = self.workspace_arg(arguments)?;
                 let coverage = workspace.graph.coverage();
                 Ok(json!({
@@ -997,7 +1028,7 @@ impl<W: Write> McpServer<W> {
             host
         } else {
             return Err(format!(
-                "unknown workspace root {}; call codel_set_workspace first",
+                "unknown workspace root {}; call set_workspace first",
                 canonical.display()
             ));
         };
@@ -1025,19 +1056,28 @@ impl<W: Write> McpServer<W> {
             .as_ref()
             .and_then(|host| host.root.as_deref())
             .map(|root| canonical_key(root).display().to_string());
+        let active_workspace_id = self.host.as_ref().map(|host| host.workspace_id.to_string());
         let workspaces: Vec<Value> = self
             .workspaces
             .iter()
             .map(|(root, host)| {
                 json!({
                     "workspaceId": host.workspace_id.to_string(),
+                    "label": root
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_else(|| root.to_str().unwrap_or("workspace")),
                     "root": root.display().to_string(),
                     "storeRoot": host.store_root.as_ref().map(|path| path.display().to_string()),
                     "active": active.as_deref() == Some(root.to_string_lossy().as_ref()),
                 })
             })
             .collect();
-        Ok(json!({"active": active, "workspaces": workspaces}))
+        Ok(json!({
+            "active": active,
+            "activeWorkspaceId": active_workspace_id,
+            "workspaces": workspaces,
+        }))
     }
 
     fn activate(&mut self, host: HostContext, source: &'static str) {
@@ -1193,6 +1233,21 @@ fn required_str<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> 
         .ok_or_else(|| format!("missing string argument '{key}'"))
 }
 
+fn is_public_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "help" | "search" | "ast_query" | "inspect" | "analyze" | "workspace" | "export"
+    )
+}
+
+fn require_root(arguments: &Value) -> Result<&str, String> {
+    arguments
+        .get("root")
+        .and_then(Value::as_str)
+        .filter(|root| !root.is_empty())
+        .ok_or_else(|| "missing required absolute workspace root 'root'".to_owned())
+}
+
 fn optional_usize(arguments: &Value, key: &str, default: usize) -> Result<usize, String> {
     match arguments.get(key) {
         None | Some(Value::Null) => Ok(default),
@@ -1222,41 +1277,68 @@ fn containment_tree(graph: &CodeGraph, id: &NodeId, depth: usize, root: &Path) -
     Some(value)
 }
 
-fn tool_help() -> Value {
+fn tool_help(topic: &str) -> Value {
     json!({
-        "start": "If you are unsure, call codel_workspace with action=help.",
+        "tool": "help",
+        "topic": topic,
+        "start": "Call help first. Then follow: search -> inspect -> analyze.",
+        "workspace": {
+            "rule": "ALWAYS pass the absolute workspace root as root. Every response echoes workspace {workspaceId,label,root}.",
+            "discover": {"name": "workspace", "arguments": {"action": "list"}},
+            "select": "Use the root path from action=list. Only list/help/identity may omit root."
+        },
+        "nodes": {
+            "rule": "Inspect/analyze accept a node id from search, or path#name when names are ambiguous."
+        },
+        "tools": [
+            {"name": "help", "use": "Read this usage flow."},
+            {"name": "search", "use": "Find declarations by name or path words."},
+            {"name": "ast_query", "use": "Language-aware preset (functions/classes/methods/calls/imports), or a custom Tree-sitter query."},
+            {"name": "inspect", "use": "view=explain|tree|ast|compare for one node."},
+            {"name": "analyze", "use": "analysis=affected|path|impact|cycles|dead_code|god_nodes."},
+            {"name": "workspace", "use": "action=list|status|set|use|refresh|scip_import|benchmark."},
+            {"name": "export", "use": "Export the graph."}
+        ],
         "workflows": [
             {
                 "goal": "Find a function or file",
-                "call": {"name": "codel_search", "arguments": {"query": "quick_sort"}}
+                "call": {"name": "search", "arguments": {"query": "quick_sort", "root": "/abs/workspace"}}
             },
             {
                 "goal": "See how a symbol is implemented and used",
-                "call": {"name": "codel_inspect", "arguments": {"view": "explain", "node": "quick_sort"}}
+                "call": {"name": "inspect", "arguments": {"view": "explain", "node": "quick_sort", "root": "/abs/workspace"}}
             },
             {
                 "goal": "See containment/tree structure",
-                "call": {"name": "codel_inspect", "arguments": {"view": "tree", "node": "quick_sort", "depth": 3}}
+                "call": {"name": "inspect", "arguments": {"view": "tree", "node": "quick_sort", "depth": 3, "root": "/abs/workspace"}}
             },
             {
                 "goal": "Find a structural pattern",
-                "call": {"name": "codel_search", "arguments": {"mode": "ast", "path": "src/lib.rs", "query": "(function_item name: (identifier) @name)"}}
+                "call": {"name": "ast_query", "arguments": {"path": "quicksort/quicksort.py", "preset": "functions", "root": "/abs/workspace"}}
             },
             {
                 "goal": "Find callers/dependents",
-                "call": {"name": "codel_analyze", "arguments": {"analysis": "affected", "node": "quick_sort"}}
+                "call": {"name": "analyze", "arguments": {"analysis": "affected", "node": "quick_sort", "root": "/abs/workspace"}}
             },
             {
                 "goal": "Assess impact of changed files",
-                "call": {"name": "codel_analyze", "arguments": {"analysis": "impact", "changed": ["src/sort.rs"]}}
+                "call": {"name": "analyze", "arguments": {"analysis": "impact", "changed": ["src/sort.rs"], "root": "/abs/workspace"}}
+            },
+            {
+                "goal": "Find cycles or dead code",
+                "call": {"name": "analyze", "arguments": {"analysis": "cycles", "root": "/abs/workspace"}}
             },
             {
                 "goal": "Refresh after edits",
-                "call": {"name": "codel_workspace", "arguments": {"action": "refresh"}}
+                "call": {"name": "workspace", "arguments": {"action": "refresh", "root": "/abs/workspace"}}
             },
             {
                 "goal": "Import SCIP",
-                "call": {"name": "codel_workspace", "arguments": {"action": "scip_import", "index": "index.scip"}}
+                "call": {"name": "workspace", "arguments": {"action": "scip_import", "index": "index.scip", "root": "/abs/workspace"}}
+            },
+            {
+                "goal": "Inspect another workspace",
+                "call": {"name": "workspace", "arguments": {"action": "list"}}
             }
         ]
     })
@@ -1294,18 +1376,68 @@ fn resolve_node(graph: &CodeGraph, value: &str) -> Result<NodeId, String> {
     if let Some(node) = graph.nodes().find(|node| node.id.as_str() == value) {
         return Ok(node.id.clone());
     }
-    let hits = graph.query(value, 2);
-    match hits.as_slice() {
-        [] => Err(format!("no node matches '{value}'")),
-        [hit] => Ok(hit.node.id.clone()),
-        _ => Err(format!(
-            "'{value}' is ambiguous: {}",
-            hits.iter()
-                .map(|hit| format!("{} ({})", hit.node.name, hit.node.id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+
+    // Accept a byte-range symbol id whose ":kind" suffix was omitted.
+    if value.starts_with("symbol:") {
+        let prefix = format!("{value}:");
+        let matches = graph
+            .nodes()
+            .filter(|node| node.id.as_str().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [node] => return Ok(node.id.clone()),
+            [] => {}
+            _ => return Err(ambiguous(value, &matches)),
+        }
     }
+
+    let (path_filter, name) = value
+        .rsplit_once('#')
+        .map_or((None, value), |(path, name)| (Some(path), name));
+    let exact = graph
+        .nodes()
+        .filter(|node| node.name == name && path_matches(node, path_filter))
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [node] => return Ok(node.id.clone()),
+        [] => {}
+        _ => return Err(ambiguous(value, &exact)),
+    }
+
+    let hits = graph
+        .query(name, 100)
+        .into_iter()
+        .filter(|hit| path_matches(&hit.node, path_filter))
+        .map(|hit| hit.node)
+        .collect::<Vec<_>>();
+    match hits.as_slice() {
+        [] => Err(format!(
+            "no node matches '{value}'; use search to get a node id, or path#name (e.g. quicksort/quicksort.py#quick_sort)"
+        )),
+        [node] => Ok(node.id.clone()),
+        _ => Err(ambiguous(value, &hits.iter().collect::<Vec<_>>())),
+    }
+}
+
+fn path_matches(node: &codel::graph::GraphNode, filter: Option<&str>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let path = node.path.to_string_lossy().replace('\\', "/");
+    let filter = filter.replace('\\', "/");
+    path == filter || path.ends_with(&filter) || filter.ends_with(&path) || path.contains(&filter)
+}
+
+fn ambiguous(value: &str, nodes: &[&codel::graph::GraphNode]) -> String {
+    format!(
+        "'{value}' is ambiguous: {}; use one of those ids, or path#name (e.g. quicksort/quicksort.py#quick_sort)",
+        nodes
+            .iter()
+            .take(8)
+            .map(|node| format!("{} ({})", node.name, node.id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn status_label(status: Option<SourceIndexStatus>) -> &'static str {
@@ -1393,7 +1525,7 @@ mod tests {
         assert!(
             response["result"]["instructions"]
                 .as_str()
-                .is_some_and(|text| text.contains("codel_search")),
+                .is_some_and(|text| text.contains("help")),
             "{response}"
         );
 
@@ -1407,12 +1539,14 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("tool name"))
             .collect();
-        assert_eq!(names.len(), 5);
-        assert!(names.contains(&"codel_search"));
-        assert!(names.contains(&"codel_inspect"));
-        assert!(names.contains(&"codel_analyze"));
-        assert!(names.contains(&"codel_workspace"));
-        assert!(names.contains(&"codel_export"));
+        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"help"));
+        assert!(names.contains(&"ast_query"));
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"inspect"));
+        assert!(names.contains(&"analyze"));
+        assert!(names.contains(&"workspace"));
+        assert!(names.contains(&"export"));
     }
 
     #[test]
@@ -1438,7 +1572,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "codel_query", "arguments": {"query": "beta"}},
+                "params": {"name": "query", "arguments": {"query": "beta"}},
             }))
             .expect("query");
         let query = tool_text(&last_value(&server));
@@ -1456,7 +1590,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "codel_affected", "arguments": {"node": "beta"}},
+                "params": {"name": "affected", "arguments": {"node": "beta"}},
             }))
             .expect("affected");
         let affected = tool_text(&last_value(&server));
@@ -1474,7 +1608,7 @@ mod tests {
                 "id": 4,
                 "method": "tools/call",
                 "params": {
-                    "name": "codel_tree",
+                    "name": "tree",
                     "arguments": {"node": "alpha", "depth": 2}
                 },
             }))
@@ -1487,7 +1621,7 @@ mod tests {
                 "id": 5,
                 "method": "tools/call",
                 "params": {
-                    "name": "codel_ast",
+                    "name": "ast",
                     "arguments": {"path": "src/lib.rs", "depth": 3}
                 },
             }))
@@ -1505,7 +1639,7 @@ mod tests {
                 "id": 6,
                 "method": "tools/call",
                 "params": {
-                    "name": "codel_compare",
+                    "name": "compare",
                     "arguments": {"left": "alpha", "right": "beta"}
                 },
             }))
@@ -1520,7 +1654,7 @@ mod tests {
                 "id": 8,
                 "method": "tools/call",
                 "params": {
-                    "name": "codel_query_ast",
+                    "name": "query_ast",
                     "arguments": {
                         "path": "src/lib.rs",
                         "query": "(function_item name: (identifier) @name)"
@@ -1540,7 +1674,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 9,
                 "method": "tools/call",
-                "params": {"name": "codel_cycles", "arguments": {}},
+                "params": {"name": "cycles", "arguments": {}},
             }))
             .expect("cycles");
         assert_eq!(tool_text(&last_value(&server))["count"], 0);
@@ -1549,7 +1683,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 10,
                 "method": "tools/call",
-                "params": {"name": "codel_dead_code", "arguments": {}},
+                "params": {"name": "dead_code", "arguments": {}},
             }))
             .expect("dead code");
         let dead = tool_text(&last_value(&server));
@@ -1565,7 +1699,7 @@ mod tests {
                 "id": 11,
                 "method": "tools/call",
                 "params": {
-                    "name": "codel_impact",
+                    "name": "impact",
                     "arguments": {"changed": ["src/lib.rs"]}
                 },
             }))
@@ -1583,7 +1717,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "tools/call",
-                "params": {"name": "codel_path", "arguments": {"from": "alpha", "to": "beta"}},
+                "params": {"name": "path", "arguments": {"from": "alpha", "to": "beta"}},
             }))
             .expect("path");
         let path = tool_text(&last_value(&server));
@@ -1595,7 +1729,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 5,
                 "method": "tools/call",
-                "params": {"name": "codel_status", "arguments": {}},
+                "params": {"name": "status", "arguments": {}},
             }))
             .expect("status");
         let status = tool_text(&last_value(&server));
@@ -1646,7 +1780,7 @@ fn beta() {}
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "codel_query", "arguments": {"query": "beta"}},
+                "params": {"name": "query", "arguments": {"query": "beta"}},
             }))
             .expect("first query");
         let query = tool_text(&last_value(&first));
@@ -1665,7 +1799,7 @@ fn beta() {}
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "codel_status", "arguments": {}},
+                "params": {"name": "status", "arguments": {}},
             }))
             .expect("status");
         let status = tool_text(&last_value(&second));
@@ -1676,7 +1810,7 @@ fn beta() {}
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "codel_query", "arguments": {"query": "gamma"}},
+                "params": {"name": "query", "arguments": {"query": "gamma"}},
             }))
             .expect("query");
         let query = tool_text(&last_value(&second));
@@ -1695,7 +1829,7 @@ fn beta() {}
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "tools/call",
-                "params": {"name": "codel_status", "arguments": {}},
+                "params": {"name": "status", "arguments": {}},
             }))
             .expect("refresh status");
         let status = tool_text(&last_value(&third));
@@ -1705,7 +1839,7 @@ fn beta() {}
                 "jsonrpc": "2.0",
                 "id": 5,
                 "method": "tools/call",
-                "params": {"name": "codel_query", "arguments": {"query": "gamma"}},
+                "params": {"name": "query", "arguments": {"query": "gamma"}},
             }))
             .expect("refresh query");
         let query = tool_text(&last_value(&third));
@@ -1743,7 +1877,7 @@ function helper() {}
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "codel_query", "arguments": {"query": "helper"}},
+                "params": {"name": "query", "arguments": {"query": "helper"}},
             }))
             .expect("query");
         let query = tool_text(&last_value(&server));
@@ -1760,7 +1894,7 @@ function helper() {}
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "codel_affected", "arguments": {"node": "helper"}},
+                "params": {"name": "affected", "arguments": {"node": "helper"}},
             }))
             .expect("affected");
         let affected = tool_text(&last_value(&server));
@@ -1797,7 +1931,7 @@ class Foo { value: Bar; }
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "codel_affected", "arguments": {"node": "Bar", "kinds": ["references_type", "contains"]}},
+                "params": {"name": "affected", "arguments": {"node": "Bar", "kinds": ["references_type", "contains"]}},
             }))
             .expect("affected");
         let affected = tool_text(&last_value(&server));
@@ -1841,7 +1975,7 @@ def helper():
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "codel_query", "arguments": {"query": "helper"}},
+                "params": {"name": "query", "arguments": {"query": "helper"}},
             }))
             .expect("query");
         let query = tool_text(&last_value(&server));
@@ -1858,7 +1992,7 @@ def helper():
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "codel_affected", "arguments": {"node": "Base"}},
+                "params": {"name": "affected", "arguments": {"node": "Base"}},
             }))
             .expect("affected");
         let affected = tool_text(&last_value(&server));
@@ -1896,7 +2030,7 @@ fn beta() {}
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "codel_export", "arguments": {"format": "markdown"}},
+                "params": {"name": "export", "arguments": {"format": "markdown", "root": directory.path().display().to_string()}},
             }))
             .expect("export");
         let export = tool_text(&last_value(&server));
@@ -1912,7 +2046,7 @@ fn beta() {}
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "codel_benchmark", "arguments": {}},
+                "params": {"name": "benchmark", "arguments": {}},
             }))
             .expect("benchmark");
         let benchmark = tool_text(&last_value(&server));
@@ -2011,10 +2145,7 @@ fn beta() {}
         server.set_workspace(second_root).expect("active");
 
         let alpha = server
-            .call_tool(
-                "codel_query",
-                &json!({"query": "alpha", "root": first_root}),
-            )
+            .call_tool("query", &json!({"query": "alpha", "root": first_root}))
             .expect("alpha query");
         assert!(
             alpha["hits"]
@@ -2024,7 +2155,7 @@ fn beta() {}
                 .any(|hit| hit["node"]["name"] == "alpha")
         );
         let beta = server
-            .call_tool("codel_query", &json!({"query": "beta"}))
+            .call_tool("query", &json!({"query": "beta"}))
             .expect("beta query");
         assert!(
             beta["hits"]
@@ -2060,7 +2191,7 @@ fn beta() {}
 
         let result = server
             .call_tool(
-                "codel_query",
+                "query",
                 &json!({
                     "query": "alpha",
                     "roots": [first_root, second_root],
@@ -2138,7 +2269,7 @@ fn beta() {}
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "codel_scip_import",
+                    "name": "scip_import",
                     "arguments": {"index": index_path.display().to_string()}
                 },
             }))
@@ -2151,7 +2282,7 @@ fn beta() {}
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "codel_affected",
+                    "name": "affected",
                     "arguments": {"node": "value", "kinds": ["accesses"]}
                 },
             }))
@@ -2172,7 +2303,7 @@ fn beta() {}
                 "id": 4,
                 "method": "tools/call",
                 "params": {
-                    "name": "codel_explain",
+                    "name": "explain",
                     "arguments": {"node": "value"}
                 },
             }))
@@ -2210,7 +2341,7 @@ fn beta() {}
                 "id": 7,
                 "method": "tools/call",
                 "params": {
-                    "name": "codel_explain",
+                    "name": "explain",
                     "arguments": {"node": "value"}
                 },
             }))
@@ -2249,7 +2380,7 @@ fn beta() {}
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "codel_query", "arguments": {"query": "alpha"}},
+                "params": {"name": "query", "arguments": {"query": "alpha"}},
             }))
             .expect("query");
         assert_eq!(
@@ -2269,7 +2400,7 @@ fn gamma() {}
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "codel_refresh", "arguments": {}},
+                "params": {"name": "refresh", "arguments": {}},
             }))
             .expect("refresh");
         assert_eq!(tool_text(&last_value(&server))["refreshed"], true);
@@ -2279,7 +2410,7 @@ fn gamma() {}
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "tools/call",
-                "params": {"name": "codel_query", "arguments": {"query": "gamma"}},
+                "params": {"name": "query", "arguments": {"query": "gamma"}},
             }))
             .expect("query after refresh");
         assert_eq!(
@@ -2307,20 +2438,35 @@ fn beta() {}
             None,
         );
 
+        let root = directory.path().display().to_string();
         for (id, name, arguments) in [
-            (2, "codel_search", json!({"query": "beta"})),
+            (2, "help", json!({})),
+            (12, "search", json!({"query": "beta", "root": root.clone()})),
+            (
+                13,
+                "ast_query",
+                json!({
+                    "path": "src/lib.rs",
+                    "query": "(function_item name: (identifier) @name)",
+                    "root": root.clone()
+                }),
+            ),
             (
                 3,
-                "codel_inspect",
-                json!({"view": "explain", "node": "beta"}),
+                "inspect",
+                json!({"view": "explain", "node": "beta", "root": root.clone()}),
             ),
             (
                 4,
-                "codel_analyze",
-                json!({"analysis": "affected", "node": "beta"}),
+                "analyze",
+                json!({"analysis": "affected", "node": "beta", "root": root.clone()}),
             ),
-            (5, "codel_workspace", json!({"action": "status"})),
-            (6, "codel_workspace", json!({"action": "help"})),
+            (
+                5,
+                "workspace",
+                json!({"action": "status", "root": root.clone()}),
+            ),
+            (6, "workspace", json!({"action": "help"})),
         ] {
             server
                 .handle(json!({
@@ -2343,12 +2489,168 @@ fn beta() {}
                 "id": 7,
                 "method": "tools/call",
                 "params": {
-                    "name": "codel_search",
-                    "arguments": {"query": "beta", "workspace": workspace_id}
+                    "name": "search",
+                    "arguments": {"query": "beta", "root": root.clone(), "workspace": workspace_id}
                 },
             }))
             .expect("workspace selector");
         let selected = tool_text(&last_value(&server));
         assert_eq!(selected["workspace"]["workspaceId"], workspace_id);
+        server
+            .handle(json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace",
+                    "arguments": {"action": "list"}
+                },
+            }))
+            .expect("workspace list");
+        let listed = tool_text(&last_value(&server));
+        assert_eq!(listed["activeWorkspaceId"], workspace_id);
+        assert!(
+            listed["workspaces"]
+                .as_array()
+                .is_some_and(|workspaces| workspaces.iter().any(|workspace| {
+                    workspace["label"]
+                        .as_str()
+                        .is_some_and(|label| !label.is_empty())
+                })),
+            "{listed}"
+        );
+    }
+    #[test]
+    fn legacy_tool_names_are_not_public() {
+        for name in [
+            "help",
+            "search",
+            "inspect",
+            "analyze",
+            "workspace",
+            "export",
+        ] {
+            assert!(is_public_tool(name));
+        }
+        for name in [
+            "query", "explain", "tree", "ast", "path", "affected", "status", "refresh",
+        ] {
+            assert!(!is_public_tool(name));
+        }
+    }
+    #[test]
+    fn path_name_and_symbol_prefix_disambiguate_duplicate_names() {
+        let directory = tempdir().expect("temp dir");
+        fs::create_dir_all(directory.path().join("src")).expect("src dir");
+        fs::write(
+            directory.path().join("src/a.rs"),
+            b"fn quick_sort() {}
+",
+        )
+        .expect("a");
+        fs::write(
+            directory.path().join("src/b.rs"),
+            b"fn quick_sort() {}
+",
+        )
+        .expect("b");
+        let root = directory.path().display().to_string();
+        let mut server = McpServer::new(Vec::new());
+        initialize(
+            &mut server,
+            Some(&WorkspaceId::new().to_string()),
+            Some(&root),
+            None,
+        );
+        server
+            .handle(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "search",
+                    "arguments": {"query": "quick_sort", "root": root}
+                }
+            }))
+            .expect("search");
+        let hits = tool_text(&last_value(&server));
+        let matches = hits["hits"].as_array().expect("hits");
+        assert_eq!(matches.len(), 2);
+        let selector = matches[0]["selector"].as_str().expect("selector");
+        assert!(selector.ends_with("#quick_sort"));
+        let id = matches[0]["node"]["id"].as_str().expect("id");
+        let prefix = id.rsplit_once(':').map_or(id, |(prefix, _)| prefix);
+
+        for node in [selector, prefix] {
+            server
+                .handle(json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "inspect",
+                        "arguments": {"view": "explain", "node": node, "root": root}
+                    }
+                }))
+                .expect("inspect");
+            assert!(
+                tool_text(&last_value(&server))["explanation"]["node"]["name"] == "quick_sort",
+                "{node}"
+            );
+        }
+    }
+    #[test]
+    fn ast_query_presets_are_language_aware() {
+        let directory = tempdir().expect("temp dir");
+        fs::write(
+            directory.path().join("quick.py"),
+            b"def quick_sort(items):
+    return items
+",
+        )
+        .expect("python");
+        let root = directory.path().display().to_string();
+        let mut server = McpServer::new(Vec::new());
+        initialize(
+            &mut server,
+            Some(&WorkspaceId::new().to_string()),
+            Some(&root),
+            None,
+        );
+        server
+            .handle(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "ast_query",
+                    "arguments": {"path": "quick.py", "preset": "functions", "root": root}
+                }
+            }))
+            .expect("preset");
+        let preset = tool_text(&last_value(&server));
+        assert_eq!(preset["preset"], "functions");
+        assert!(
+            preset["matches"]
+                .as_array()
+                .is_some_and(|matches| !matches.is_empty()),
+            "{preset}"
+        );
+
+        let error = server
+            .call_tool_inner(
+                "ast_query",
+                &json!({
+                    "path": "quick.py",
+                    "query": "(function_item name: (identifier) @name)",
+                    "root": root
+                }),
+            )
+            .expect_err("rust query on python");
+        assert!(
+            error.contains("invalid Tree-sitter query for Python"),
+            "{error}"
+        );
+        assert!(error.contains("preset="), "{error}");
     }
 }

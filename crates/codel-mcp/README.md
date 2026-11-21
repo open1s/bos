@@ -32,17 +32,19 @@ only when both match, so restart/refresh preserves enrichment.
 
 | Tool | Answers |
 |---|---|
-| `codel_search` | Find declarations (`mode=name`) or run a Tree-sitter query (`mode=ast`) |
-| `codel_inspect` | `view=explain` (edges/context), `tree`, `ast`, or `compare` |
-| `codel_analyze` | `analysis=affected\|path\|impact\|cycles\|dead_code\|god_nodes` |
-| `codel_workspace` | `action=status\|identity\|list\|set\|use\|refresh\|scip_import\|benchmark` |
-| `codel_export` | Markdown, JSON, wiki, Obsidian, HTML, SVG, GraphML, Neo4j Cypher, callflow |
+| `help` | **Call first.** Workspace rules, tool surface, and copy-paste workflows |
+| `search` | Find declarations by name or path words |
+| `ast_query` | Language-aware preset (`functions/classes/methods/calls/imports`) or custom Tree-sitter query |
+| `inspect` | `view=explain` (edges/context), `tree`, `ast`, or `compare` |
+| `analyze` | `analysis=affected\|path\|impact\|cycles\|dead_code\|god_nodes` |
+| `workspace` | `action=status\|identity\|list\|set\|use\|refresh\|scip_import\|benchmark` |
+| `export` | Markdown, JSON, wiki, Obsidian, HTML, SVG, GraphML, Neo4j Cypher, callflow |
 
-Start with `codel_search`. If unsure, call
-`codel_workspace` with `{"action":"help"}`; it returns copy-paste workflows.
+Start with `help`; it returns the workspace rules, tool surface, and
+copy-paste workflows. `workspace` also accepts `{"action":"help"}`.
 The server also sends an `instructions` field in `initialize`. Legacy names
-(`codel_query`, `codel_explain`, `codel_path`, ...) still dispatch for
-compatibility, but are not advertised in `tools/list`.
+(`query`, `explain`, `path`, ...) are rejected; only the seven
+tools above are accepted and advertised.
 
 Every tool response carries a `workspace` object:
 
@@ -57,16 +59,23 @@ Every tool response carries a `workspace` object:
 }
 ```
 
-Omit `root`/`workspace` to use the active workspace. To operate on another
-workspace, pass its id from `codel_workspace action=list`, its label, or its
-root. `codel_search` also accepts `roots` or `all_roots: true` and tags every
-hit with its own root/workspace id.
+Always pass the absolute workspace root as `root` on `search`,
+`inspect`, `analyze`, and `export`. Only
+`workspace` actions `list`, `help`, and `identity` may omit it.
+Use `workspace action=list` to discover roots, ids, and labels.
+`search` also accepts `roots` or `all_roots: true` and tags every hit
+with its own root/workspace id.
+
+`ast_query` defaults to `preset:"functions"`; invalid custom queries report the
+detected language and suggest presets. Every search hit includes a `selector` of the form `path#name`; pass it to
+`inspect`/`analyze` when a bare name is ambiguous. A full symbol id and a
+byte-range id with the `:kind` suffix omitted are also accepted.
 
 Every edge is labelled `extracted`, `inferred`, or `ambiguous`, and keeps the
-source range and resolver state that produced it. `codel_search` and
-`codel_inspect` attach a bounded snippet, documentation block, and
+source range and resolver state that produced it. `search` and
+`inspect` attach a bounded snippet, documentation block, and
 line/byte/complexity metrics. `--watch` keeps answers current; an LLM can call
-`codel_workspace` with `action=refresh` for an immediate rebuild and deltas.
+`workspace` with `action=refresh` for an immediate rebuild and deltas.
 
 ## Workspace identity
 
@@ -114,23 +123,23 @@ CODEL_STORE_ROOT=/path/to/codel-store \
 codel-mcp
 ```
 
-To let the LLM discover the active workspace, call `codel_workspace`; it
+To let the LLM discover the active workspace, call `workspace`; it
 returns `workspaceId`, `root`, `storeRoot`, `source`, and `rootSource`.
 `rootSource` is `host`, `tool`, `env`, `mcp-roots`, or `cwd`. If it says
 `cwd`, the server had no host root or MCP roots and used its own launch
-directory; set `CODEL_ROOT`, call `codel_set_workspace`, or send a
-root. `codel_status` returns the same id after indexing.
+directory; set `CODEL_ROOT`, call `set_workspace`, or send a
+root. `status` returns the same id after indexing.
 
 To switch from the LLM:
 
 ```json
-{"name":"codel_set_workspace","arguments":{"root":"/abs/path/to/workspace"}}
+{"name":"set_workspace","arguments":{"root":"/abs/path/to/workspace"}}
 ```
 
 The root is canonicalized, its `.codel/workspace-id` is read or created,
 the previous graph is dropped, and the next tool call indexes the new root. The
-root remains known, so `codel_use_workspace` can switch back without
-recreating the id. Repeated `codel_set_workspace` calls build a workspace
+root remains known, so `use_workspace` can switch back without
+recreating the id. Repeated `set_workspace` calls build a workspace
 list; each root keeps its own id and store.
 
 The initialize host context overrides the environment. If neither is supplied,
@@ -183,9 +192,9 @@ ws=$(uuidgen | tr 'A-Z' 'a-z')
 {
   printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"_meta":{"codel":{"workspaceId":"%s","root":"%s"}}}}\n' "$ws" "$tmp"
   printf '{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
-  printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codel_query","arguments":{"query":"beta"}}}\n'
+  printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"query":"beta"}}}\n'
 } | cargo run -q -p codel-mcp
 ```
 
-The second response contains a `codel_query` result whose first hit is
+The second response contains a `query` result whose first hit is
 `beta`.

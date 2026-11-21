@@ -59,7 +59,14 @@ pub fn query(
     use tree_sitter::{Query, QueryCursor, StreamingIterator};
 
     let (language, source, tree) = parse_file(root, relative)?;
-    let query = Query::new(&language, query_text).map_err(|error| error.to_string())?;
+    let language_id = classify_path(relative).language;
+    let language_name =
+        language_id.map_or_else(|| "unknown".to_owned(), |language| format!("{language:?}"));
+    let query = Query::new(&language, query_text).map_err(|error| {
+        format!(
+            "invalid Tree-sitter query for {language_name}: {error}; use preset=functions|classes|methods|calls|imports"
+        )
+    })?;
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source.as_slice());
@@ -95,7 +102,75 @@ pub fn query(
             }
         }
     }
-    Ok(json!({"path": relative.display().to_string(), "matches": output}))
+    Ok(json!({
+        "path": relative.display().to_string(),
+        "language": language_name,
+        "matches": output,
+    }))
+}
+
+/// Run a language-aware preset query.
+///
+/// # Errors
+///
+/// Returns a message when the language has no preset or the query fails.
+pub fn query_preset(
+    root: &Path,
+    relative: &Path,
+    preset: &str,
+    captures: &[String],
+    max: usize,
+) -> Result<Value, String> {
+    let language = classify_path(relative)
+        .language
+        .ok_or_else(|| format!("no language for {}", relative.display()))?;
+    let query_text = preset_query(language, preset).ok_or_else(|| {
+        format!(
+            "preset '{preset}' is not supported for {language:?}; use an explicit Tree-sitter query"
+        )
+    })?;
+    let mut value = query(root, relative, query_text, captures, max)?;
+    value["preset"] = json!(preset);
+    Ok(value)
+}
+
+fn preset_query(language: codel::classification::LanguageId, preset: &str) -> Option<&'static str> {
+    use codel::classification::LanguageId;
+    let query = match (language, preset) {
+        (LanguageId::Python, "functions") => "(function_definition name: (identifier) @name)",
+        (LanguageId::Python, "classes") => "(class_definition name: (identifier) @name)",
+        (LanguageId::Python, "calls") => "(call function: (identifier) @name)",
+        (LanguageId::Python, "imports") => "(import_statement name: (dotted_name) @name)",
+        (LanguageId::Rust, "functions" | "methods") => "(function_item name: (identifier) @name)",
+        (LanguageId::Rust, "classes") => "(struct_item name: (type_identifier) @name)",
+        (LanguageId::Rust, "calls") => "(call_expression function: (identifier) @name)",
+        (LanguageId::Rust, "imports") => "(use_declaration argument: (_) @name)",
+        (LanguageId::TypeScript | LanguageId::JavaScript, "functions") => {
+            "(function_declaration name: (identifier) @name)"
+        }
+        (LanguageId::TypeScript | LanguageId::JavaScript, "classes") => {
+            "(class_declaration name: (identifier) @name)"
+        }
+        (LanguageId::TypeScript | LanguageId::JavaScript, "methods") => {
+            "(method_definition name: (property_identifier) @name)"
+        }
+        (LanguageId::TypeScript | LanguageId::JavaScript, "calls") => {
+            "(call_expression function: (identifier) @name)"
+        }
+        (LanguageId::TypeScript | LanguageId::JavaScript, "imports") => {
+            "(import_statement source: (string) @name)"
+        }
+        (LanguageId::Java, "functions" | "methods") => {
+            "(method_declaration name: (identifier) @name)"
+        }
+        (LanguageId::Java, "classes") => "(class_declaration name: (identifier) @name)",
+        (LanguageId::Java, "calls") => "(method_invocation name: (identifier) @name)",
+        (LanguageId::Go, "functions") => "(function_declaration name: (identifier) @name)",
+        (LanguageId::Go, "methods") => "(method_declaration name: (field_identifier) @name)",
+        (LanguageId::Go, "calls") => "(call_expression function: (identifier) @name)",
+        _ => return None,
+    };
+    Some(query)
 }
 
 fn parse_file(
