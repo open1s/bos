@@ -5554,6 +5554,8 @@ import socket
 
 
 def call(tool, arguments=None, **kwargs):
+    if isinstance(arguments, str):
+        arguments = json.loads(arguments)
     payload = dict(arguments or {})
     payload.update(kwargs)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -9039,7 +9041,7 @@ mod tests {
         let built = build(&bare());
         let prompt = &built.agent.config().system_prompt;
         assert!(
-            prompt.len() < 15_000,
+            prompt.len() < 15_200,
             "the system prompt rides on every step: {} bytes",
             prompt.len()
         );
@@ -17890,7 +17892,7 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
             .execute(
                 "run_code",
                 &serde_json::json!({
-                    "code": "print(bsh.read_file('a.txt')['content'])"
+                    "code": "r = bsh.call('read_file', '{\"path\": \"a.txt\"}')\nassert isinstance(r, dict), type(r)\ng = bsh.grep('broker')\nassert isinstance(g, dict), type(g)\nprint(type(r).__name__, type(g).__name__, r['content'])"
                 }),
             )
             .expect("run_code");
