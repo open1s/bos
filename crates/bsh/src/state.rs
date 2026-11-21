@@ -16,7 +16,7 @@ use agent::tools::{GoalSettle, GoalStore};
 use crate::i18n::Lang;
 use crate::model::{
     ChatMessage, CompactCommand, CompactOutcome, CompactionReport, MessageMeta, MessageUsage,
-    PlanItem, PlanStore, Role, Session, SkillInvocation, ToolEvent,
+    PlanItem, PlanStatus, PlanStore, Role, Session, SkillInvocation, ToolEvent,
 };
 use crate::review::domain::{Change, Decision, FileDiff, Review, ReviewSnapshot};
 use crate::review::store::{ReviewRuntime, ReviewStore};
@@ -4300,6 +4300,9 @@ impl AppState {
     }
 
     pub(crate) fn apply_event(&mut self, id: &str, event: AgentEvent) {
+        // A stopped or failed turn is not evidence that the step finished, so
+        // only a Done turn reconciles the plan.
+        let completed = matches!(event, AgentEvent::Done);
         // The stall watchdog reads this clock. `get_mut` keeps token deltas
         // allocation-free: the entry exists from the moment the turn opened.
         let seen = std::time::Instant::now();
@@ -4555,6 +4558,9 @@ impl AppState {
             if self.was_goal_round(id) {
                 self.record_goal_progress(id);
             }
+            if completed {
+                self.reconcile_plan(id);
+            }
             self.streams.remove(id);
             self.turn_seen.remove(id);
             self.inflight_tails.remove(id);
@@ -4624,6 +4630,55 @@ impl AppState {
     }
 
     /// Fold this round's change and check into the goal's progress.
+    /// Mark the step this turn finished as completed when the model forgot.
+    ///
+    /// A turn that changed a file or ran the check and never called
+    /// `update_plan` leaves its in-progress step stale; the host closes that
+    /// step and advances the next pending one, so the next turn's plan block
+    /// does not describe finished work as running.
+    fn reconcile_plan(&mut self, id: &str) {
+        let Some(store) = self.plans.get(id) else {
+            return;
+        };
+        let Some(tools) = self.round_tools(id) else {
+            return;
+        };
+        let model_updated = tools.iter().any(|tool| {
+            tool.name == "update_plan"
+                && tool
+                    .output
+                    .as_deref()
+                    .is_some_and(|output| !react::tool::ToolResult::text_is_error(output))
+        });
+        if model_updated || !(self.round_edits(id) || self.round_verified(id)) {
+            return;
+        }
+        let mut items = store.items();
+        if items.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        let mut closed = false;
+        for item in &mut items {
+            if item.status == PlanStatus::InProgress {
+                item.status = PlanStatus::Completed;
+                changed = true;
+                closed = true;
+            }
+        }
+        if closed
+            && let Some(next) = items
+                .iter_mut()
+                .find(|item| item.status == PlanStatus::Pending)
+        {
+            next.status = PlanStatus::InProgress;
+            changed = true;
+        }
+        if changed {
+            store.replace(items);
+        }
+    }
+
     fn record_goal_progress(&mut self, id: &str) {
         let edits = self.round_edits(id);
         let verified = self.round_verified(id);
@@ -7685,6 +7740,91 @@ mod tests {
                 assert!(edits, "this command changed a file: {command}");
             }
         }
+    }
+
+    /// A turn that finished work without calling `update_plan` still closes
+    /// the step it was on; the next turn's plan block must not show finished
+    /// work as running.
+    #[test]
+    fn a_finished_step_is_completed_when_the_model_forgot() {
+        use crate::model::{PlanItem, PlanStatus, PlanStore};
+        let (mut state, id) = goal_state("plan-reconcile");
+        let store = PlanStore::new();
+        store.replace(vec![
+            PlanItem {
+                text: "Edit the file".to_string(),
+                status: PlanStatus::InProgress,
+            },
+            PlanItem {
+                text: "Run the tests".to_string(),
+                status: PlanStatus::Pending,
+            },
+        ]);
+        state.attach_plan(&id, store.clone());
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            session
+                .messages
+                .last_mut()
+                .expect("the reply")
+                .tools
+                .push(crate::model::ToolEvent {
+                    name: "apply_patch".to_string(),
+                    args: "{}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+        }
+        state.reconcile_plan(&id);
+        let items = store.items();
+        assert_eq!(
+            items[0].status,
+            PlanStatus::Completed,
+            "the finished step closes"
+        );
+        assert_eq!(
+            items[1].status,
+            PlanStatus::InProgress,
+            "the next step starts"
+        );
+    }
+
+    /// A model that did update the plan keeps its own choice: the host only
+    /// fills the gap when the call is missing.
+    #[test]
+    fn an_update_plan_call_is_respected_by_the_reconciler() {
+        use crate::model::{PlanItem, PlanStatus, PlanStore};
+        let (mut state, id) = goal_state("plan-reconcile-respect");
+        let store = PlanStore::new();
+        store.replace(vec![PlanItem {
+            text: "Edit the file".to_string(),
+            status: PlanStatus::InProgress,
+        }]);
+        state.attach_plan(&id, store.clone());
+        if let Some(session) = state.store.session_mut(&id) {
+            session
+                .messages
+                .push(crate::model::ChatMessage::assistant());
+            let message = session.messages.last_mut().expect("the reply");
+            for name in ["apply_patch", "update_plan"] {
+                message.tools.push(crate::model::ToolEvent {
+                    name: name.to_string(),
+                    args: "{}".to_string(),
+                    output: Some("ok".to_string()),
+                    ms: Some(1),
+                    at: Some(1),
+                });
+            }
+        }
+        state.reconcile_plan(&id);
+        assert_eq!(
+            store.items()[0].status,
+            PlanStatus::InProgress,
+            "the model's own plan is left alone"
+        );
     }
 
     /// A model blocker is recorded with the stable model-reported code, and an
