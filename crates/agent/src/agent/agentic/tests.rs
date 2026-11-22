@@ -5226,12 +5226,16 @@ async fn compact_now_classifies_a_missing_credential() {
 /// compaction still lands.
 #[tokio::test]
 async fn compact_now_bounds_a_span_larger_than_the_request_budget() {
-    const BUDGET: usize = 1_500;
+    // The budget must leave room for the request's fixed overhead - the
+    // system prompt and the compaction instruction together price at roughly
+    // 1900 tokens - otherwise the digest budget collapses to zero and the
+    // span is sent unbounded, which is the opposite of what this test pins.
+    const BUDGET: usize = 4_000;
     let (agent, seen) = agent_with_script(Ok("brief checkpoint".to_string()), BUDGET);
     {
         let mut session = agent.session();
         for index in 0..8 {
-            let body = format!("old {index} {} tail{index}", "x".repeat(2_000));
+            let body = format!("old {index} {} tail{index}", "x".repeat(3_000));
             if index % 2 == 0 {
                 session.add_user(body);
             } else {
