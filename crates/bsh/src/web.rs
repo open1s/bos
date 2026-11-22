@@ -303,9 +303,11 @@ pub(crate) fn attach(agent: &mut Agent, tools: Tools) {
             },
         )
     };
-    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
-        Arc::new(search),
-        crate::tool_metadata::declared("web_search"),
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(
+            Arc::new(search),
+            crate::tool_metadata::declared("web_search"),
+        ),
     ))) {
         log::warn!("web search tool was not registered: {error}");
     }

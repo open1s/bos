@@ -28,6 +28,31 @@ pub(crate) fn payload(output: &str) -> Option<Value> {
     })
 }
 
+/// The one-line outcome a surface shows for a stored result.
+///
+/// The envelope's summary is authoritative when a row was written with one.
+/// A row written after the model-facing projection carries no summary, so the
+/// payload's own summary (the batch file tools report one) or the verdict word
+/// is the line - never the JSON document's opening bytes.
+pub(crate) fn outcome(output: &str) -> Option<String> {
+    if let Some(line) = summary(output) {
+        return Some(line);
+    }
+    let value: Value = serde_json::from_str(output).ok()?;
+    let object = value.as_object()?;
+    let status = object.get("status")?.as_str()?;
+    if let Some(text) = object
+        .get("data")
+        .and_then(|data| data.get("summary"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    Some(status.to_string())
+}
+
 /// The envelope's one-sentence summary of a stored result.
 ///
 /// A row written before the envelope has no summary; the caller falls back to
@@ -99,5 +124,18 @@ mod tests {
         assert_eq!(summary(&envelope).as_deref(), Some("read_file completed"));
         assert!(summary(r#"{"content":"x","summary":"user data"}"#).is_none());
         assert!(summary("not json").is_none());
+    }
+
+    #[test]
+    fn a_projected_row_reads_as_its_verdict_or_its_payload_summary() {
+        let projected = r#"{"status":"success","data":{"content":"x"}}"#;
+        assert_eq!(outcome(projected).as_deref(), Some("success"));
+        let batch = r#"{"status":"partial","data":{"summary":"read 2 of 3 files; 1 failed"}}"#;
+        assert_eq!(
+            outcome(batch).as_deref(),
+            Some("read 2 of 3 files; 1 failed")
+        );
+        let envelope = r#"{"status":"success","summary":"bash completed","data":{}}"#;
+        assert_eq!(outcome(envelope).as_deref(), Some("bash completed"));
     }
 }

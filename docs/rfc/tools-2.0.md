@@ -1,7 +1,10 @@
 # BSH Tools 2.0 — Agent Capability Interface
 
 Status: **Phase 0 audit complete; Phase 1 core contract implemented** (result
-envelope + error semantics, wired through the runtime seam).
+envelope + error semantics, wired through the runtime seam); **Phase 2 model
+projection implemented** (§4.5). The per-call full-payload sidecar that keeps
+audit/UI at full fidelity once a projection drops audit keys is the one
+remaining piece of Phase 2 and is tracked in §6.
 
 This document is the code-backed record for
 [issue #447](https://github.com/open1s/bos/issues/447). It traces the tool
@@ -163,6 +166,62 @@ marker inside the budget, `truncated` is set, and the document stays valid
 JSON. A cap too small to hold a minimal envelope yields the minimal envelope:
 valid JSON is never traded for a byte bound.
 
+### 4.5 The model document and the tool view
+
+The envelope in §4.1 is the runtime verdict. It is not what the model reads.
+After Phase 2 the engine renders one *model document* per call
+(`ToolResult::to_model_text` in `crates/react/src/tool/result.rs`):
+
+~~~json
+{"status": "success", "data": {"stdout": "hi\n"}}
+~~~
+
+~~~json
+{"status": "error", "error": {"code": "timeout", "message": "…", "retryable": false, "indeterminate": true}}
+~~~
+
+Rules:
+
+- `status` is the only verdict; it is present on every document, so the
+  repeat-failure guard and `text_is_error` keep working on text alone.
+- A success or partial result carries `data`; a failure carries `error` and
+  no `data`, so a failure can never be mistaken for a payload.
+- `summary` is deliberately absent — it is derivable from the tool name and
+  the status. `ToolResult` still holds it for the UI, which reads
+  `tool_output::outcome` (payload summary, else the verdict word).
+- `continuation` appears only when the tool reported one, and `truncated`
+  only when a report was cut. The model document never repeats the payload's
+  own `tool`/`status` echo.
+- The document is capped exactly like the envelope; a cut report keeps both
+  ends, stays valid JSON, and still names a spill path.
+
+**The view.** What sits under `data` is the tool's declared projection, not
+its raw payload. `react::tool::registry::Tool::model_view` defaults to the
+payload itself, so every family the host does not own (MCP, extensions,
+Ferris capabilities, federation peers) is unchanged. BSH declares one view per
+built-in in `crates/bsh/src/tool_view.rs` and installs it through a
+`ViewedTool`/`ViewedAsyncTool` adapter at the registration seams. A view is
+data, not code: `Field { path, name, keep }` selects dot-paths and
+`Keep` decides elision per field (`Always`, `NonEmpty`, `True`,
+`NonZero`, `Not(sentinel)`). Nothing is synthesized; an absent path emits
+nothing, so a view can never invent a fact.
+
+Three consequences are deliberate:
+
+- Host state (cwd, timeouts, sandbox mode/enforcement, empty stderr, false
+  flags, echoed arguments) is not model data. It stays in the runtime
+  `ToolResult`.
+- Two audit facts (`sandbox`, `network`) are read from the stored payload by
+  `bsh::audit::confinement_of`. The shell views do not carry them to the
+  model, so the audit's confinement columns are empty for new shell/codel rows
+  until the per-call sidecar (§6.1) gives audit the full payload back. That is
+  a deliberate, tracked loss inside this stacked change, not an oversight.
+- The catalogue gate and golden snapshots in `tool_view.rs` fail when a
+  built-in loses its view or a projection grows a field.
+
+Measured: `bash` `echo hi` with a real foreground payload is 124 bytes
+unprojected and 45 bytes projected.
+
 ## 5. Compatibility and consumers
 
 Consumers of the old shapes were identified before migration and updated:
@@ -199,17 +258,31 @@ Not changed on purpose:
 
 ### Measured cost
 
-The success envelope adds two short fields (`status`, `summary`) and nests the
-payload under `data`. For a typical file result this is roughly 10–15 tokens
-per call. The failure envelope replaces the previous free-form `Error: …`
-string and adds the class and advice, roughly 20 tokens. No benchmark of
+The runtime envelope adds `status`, `summary` and a `data` nesting. The
+model document (§4.5) is smaller than that and smaller than the pre-envelope
+text for the built-ins: `bash` `echo hi` measured **124 bytes unprojected,
+45 bytes projected** (124 → 45), and a projected `read_file` page drops the
+echoed path vocabulary the payload repeats. The failure document adds the
+error class and its two recovery flags, roughly 20 tokens. No benchmark of
 model-level accuracy exists yet (FR-14).
 
 ## 6. Remaining work
 
 Priority order, with the evidence that it is still missing:
 
-1. **FR-03/FR-07 producers.** Give the task, browser, scheduling and federation
+1. **Full-payload sidecar (§4.5).** The model document is projected, so the
+   stored text no longer holds fields a projection elides. `bsh::audit`
+   derives `sandbox`/`network` from the stored payload, so the shell views
+   keep those two keys today. The planned fix is one structured sidecar per
+   call on the stored tool record (full `ToolResult`), read by audit and the
+   UI ahead of the legacy text parse. Until it lands, a view must not drop a
+   key a reader needs.
+2. **Async built-in coverage in the runtime seam.** All 48 names declare a
+   view; the 34 synchronous built-ins are wrapped at the bundle hand-off and
+   the async ones are wrapped at each `try_add_async_tool` site. A future
+   registration path must call `tool_view::wrap`/`wrap_async` or the view is
+   declared but not applied (the gate test cannot see the wiring).
+3. **FR-03/FR-07 producers.** Give the task, browser, scheduling and federation
    tools a `summary` and, where meaningful, a `continuation`. The envelope can
    only preserve what a tool supplies.
 2. **FR-06 idempotency.** Add an idempotency declaration to `ToolMetadata`

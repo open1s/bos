@@ -175,6 +175,7 @@ pub trait ToolSpill: Send + Sync {
 fn render_tool_result(
     tool: &str,
     result: &Result<Value, ReactError>,
+    projected: Option<Value>,
     cap: usize,
     spill: Option<&dyn ToolSpill>,
 ) -> String {
@@ -182,20 +183,20 @@ fn render_tool_result(
         Ok(value) => ToolResult::from_value(tool, value.clone()),
         Err(error) => ToolResult::from_error(tool, &error.as_tool_error()),
     };
-    let full = envelope.to_text(usize::MAX);
-    if cap == usize::MAX || full.len() <= cap {
-        return full;
+    let (text, cut) = envelope.to_model_text_cut(projected, cap);
+    if !cut {
+        return text;
     }
-    let capped = envelope.to_text(cap);
+    let full = envelope.to_text(usize::MAX);
     let Some(path) = spill.and_then(|hook| hook.spill(tool, &full)) else {
-        return capped;
+        return text;
     };
-    match serde_json::from_str::<Value>(&capped) {
+    match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(mut object)) => {
             object.insert("spill".to_string(), Value::String(path));
             Value::Object(object).to_string()
         }
-        _ => capped,
+        _ => text,
     }
 }
 
@@ -539,6 +540,17 @@ impl<A: ReActApp> ReActEngine<A> {
             .get(tool)
             .copied()
             .unwrap_or(self.tool_result_cap)
+    }
+
+    /// The projection of one result the model may read.
+    ///
+    /// A failure has no payload to project; a success goes through the tool's
+    /// declared \`model_view\`, which defaults to the payload itself.
+    fn model_payload(&self, tool: &str, result: &Result<Value, ReactError>) -> Option<Value> {
+        result
+            .as_ref()
+            .ok()
+            .map(|value| self.tools.model_view(tool, value))
     }
 
     /// Start configuring an engine.
@@ -1016,9 +1028,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                 // One envelope for the whole result, capped
                                 // with the same ceiling the streaming loop
                                 // applies, before anything reaches the session.
+                                let projected = self.model_payload(&observed, &result);
                                 let result_text = render_tool_result(
                                     &observed,
                                     &result,
+                                    projected,
                                     self.result_cap_for(&observed),
                                     self.tool_spill.as_deref(),
                                 );
@@ -1301,9 +1315,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                 // One envelope for the whole result, capped
                                 // with the same ceiling the streaming loop
                                 // applies, before anything reaches the session.
+                                let projected = self.model_payload(&observed, &result);
                                 let result_text = render_tool_result(
                                     &observed,
                                     &result,
+                                    projected,
                                     self.result_cap_for(&observed),
                                     self.tool_spill.as_deref(),
                                 );
@@ -1746,9 +1762,11 @@ impl<A: ReActApp> ReActEngine<A> {
                             }
                             // The same envelope the batch paths use, so a
                             // streamed turn and a collected one read alike.
+                            let projected = self.model_payload(&observed, &result);
                             let result_text = render_tool_result(
                                 &observed,
                                 &result,
+                                projected,
                                 self.result_cap_for(&observed),
                                 self.tool_spill.as_deref(),
                             );
@@ -2139,6 +2157,7 @@ mod repeat_guard_tests {
         let text = super::render_tool_result(
             "read_file",
             &Ok(serde_json::json!({ "content": "x".repeat(4_000) })),
+            None,
             256,
             Some(&Capture(captured.clone())),
         );

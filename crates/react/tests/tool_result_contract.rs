@@ -208,7 +208,7 @@ fn run_turn() -> Vec<(String, Value)> {
 }
 
 #[test]
-fn the_engine_records_one_envelope_for_every_outcome() {
+fn the_engine_records_one_model_document_for_every_outcome() {
     let results = run_turn();
     assert_eq!(results.len(), 4, "one result per call");
     let by_id = |id: &str| {
@@ -219,20 +219,23 @@ fn the_engine_records_one_envelope_for_every_outcome() {
             .unwrap_or_else(|| panic!("{id} was recorded"))
     };
 
-    // Success keeps the tool's payload, untouched, under data.
+    // Success is the verdict and the payload, with no derivable sentence.
     let ok = by_id("call-ok");
     assert_eq!(ok["status"], "success");
-    assert_eq!(ok["summary"], "ok_tool completed");
+    assert!(
+        ok.get("summary").is_none(),
+        "the model is not sent a sentence it can derive"
+    );
     assert_eq!(ok["data"]["content"], "the file body");
     assert!(ok.get("error").is_none());
 
-    // A failure is a class, not a prefix.
+    // A failure is a class, not a prefix, and carries no payload.
     let timeout = by_id("call-timeout");
     assert_eq!(timeout["status"], "error");
     assert_eq!(timeout["error"]["code"], "timeout");
     assert_eq!(timeout["error"]["retryable"], false);
     assert_eq!(timeout["error"]["indeterminate"], true);
-    assert!(timeout["data"].is_null());
+    assert!(timeout.get("data").is_none(), "a failure has no payload");
 
     // Partial is not failure, and the continuation is exact.
     let partial = by_id("call-partial");

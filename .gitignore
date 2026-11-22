@@ -122,6 +122,8 @@ $RECYCLE.BIN/
 .bsh/*
 .bsh_run/
 .bsh_run/*
+.bsh-spill/
+.bsh-spill/*
 .bsh/settings/
 .codel/
 .codel/*

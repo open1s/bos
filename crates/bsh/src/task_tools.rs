@@ -131,9 +131,9 @@ fn attach_create(agent: &mut Agent, context: TaskToolsContext) {
     );
     let metadata = crate::tool_metadata::builtin_metadata("task_create")
         .expect("task_create metadata is declared");
-    if let Err(error) =
-        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
-    {
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), metadata),
+    ))) {
         log::warn!("task_create tool was not registered: {error}");
     }
 }
@@ -170,9 +170,9 @@ fn attach_join(agent: &mut Agent, context: TaskToolsContext) {
     );
     let metadata = crate::tool_metadata::builtin_metadata("task_join")
         .expect("task_join metadata is declared");
-    if let Err(error) =
-        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
-    {
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), metadata),
+    ))) {
         log::warn!("task_join tool was not registered: {error}");
     }
 }
@@ -284,9 +284,9 @@ fn attach_retry(agent: &mut Agent, context: TaskToolsContext) {
     );
     let metadata = crate::tool_metadata::builtin_metadata("task_retry")
         .expect("task_retry metadata is declared");
-    if let Err(error) =
-        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
-    {
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), metadata),
+    ))) {
         log::warn!("task_retry tool was not registered: {error}");
     }
 }
@@ -498,9 +498,9 @@ fn attach_status(agent: &mut Agent, context: TaskToolsContext) {
     );
     let metadata = crate::tool_metadata::builtin_metadata("task_status")
         .expect("task_status metadata is declared");
-    if let Err(error) =
-        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
-    {
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), metadata),
+    ))) {
         log::warn!("task_status tool was not registered: {error}");
     }
 }
@@ -532,9 +532,9 @@ fn attach_list(agent: &mut Agent, context: TaskToolsContext) {
     );
     let metadata = crate::tool_metadata::builtin_metadata("task_list")
         .expect("task_list metadata is declared");
-    if let Err(error) =
-        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
-    {
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), metadata),
+    ))) {
         log::warn!("task_list tool was not registered: {error}");
     }
 }
@@ -1306,9 +1306,9 @@ fn attach_graph(agent: &mut Agent, context: TaskToolsContext) {
     );
     let metadata = crate::tool_metadata::builtin_metadata("task_graph")
         .expect("task_graph metadata is declared");
-    if let Err(error) =
-        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
-    {
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), metadata),
+    ))) {
         log::warn!("task_graph tool was not registered: {error}");
     }
 }
@@ -1452,9 +1452,9 @@ fn attach_cancel(agent: &mut Agent, context: TaskToolsContext) {
     );
     let metadata = crate::tool_metadata::builtin_metadata("task_cancel")
         .expect("task_cancel metadata is declared");
-    if let Err(error) =
-        agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(Arc::new(tool), metadata)))
-    {
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), metadata),
+    ))) {
         log::warn!("task_cancel tool was not registered: {error}");
     }
 }

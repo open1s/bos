@@ -987,10 +987,11 @@ pub(crate) fn events_for(session: &Session, streaming: bool, lang: Lang) -> Vec<
             });
             let outcome = match tool.output.as_deref().map(str::trim) {
                 Some(output) if !output.is_empty() => {
-                    // The envelope's summary is the outcome in one line; an
-                    // older row has none, so its payload's first line is used.
+                    // The envelope's summary is the outcome in one line; a
+                    // projected row carries none, so the payload's own summary
+                    // or the verdict word is used instead of the JSON head.
                     let line =
-                        crate::tool_output::summary(output).unwrap_or_else(|| first_line(output));
+                        crate::tool_output::outcome(output).unwrap_or_else(|| first_line(output));
                     clip(line.as_str(), 72)
                 }
                 _ => lang.tr("traj.noOutput"),

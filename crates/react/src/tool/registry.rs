@@ -25,6 +25,15 @@ pub trait Tool: Send + Sync {
     fn json_schema(&self) -> Value {
         serde_json::json!({})
     }
+    /// The part of a result payload the model may read.
+    ///
+    /// The runtime, the audit log and the UI keep the full payload; the model
+    /// is sent only what can change its next call. The default is the payload
+    /// itself, which is the safe answer for a tool this crate does not own:
+    /// an undeclared tool must not lose data on the way to the model.
+    fn model_view(&self, payload: &Value) -> Value {
+        payload.clone()
+    }
     /// Render this tool as an OpenAI tool definition.
     fn to_openai_definition(&self) -> ToolDefinition {
         ToolDefinition::new(self.name(), self.description())
@@ -85,6 +94,13 @@ pub trait AsyncTool: Send + Sync {
     /// JSON schema for the tool arguments.
     fn json_schema(&self) -> Value {
         serde_json::json!({})
+    }
+    /// The part of a result payload the model may read.
+    ///
+    /// See [`Tool::model_view`]: the default is the payload itself, so an
+    /// undeclared tool keeps its current behavior.
+    fn model_view(&self, payload: &Value) -> Value {
+        payload.clone()
     }
     /// Render this tool as an OpenAI tool definition.
     fn to_openai_definition(&self) -> ToolDefinition {
@@ -201,6 +217,14 @@ impl ToolVariant {
         match self {
             Self::Sync(tool) => tool.is_cancelable(),
             Self::Async(tool) => tool.is_cancelable(),
+        }
+    }
+
+    /// The model-facing projection of one result payload.
+    pub fn model_view(&self, payload: &Value) -> Value {
+        match self {
+            Self::Sync(tool) => tool.model_view(payload),
+            Self::Async(tool) => tool.model_view(payload),
         }
     }
 
@@ -331,6 +355,17 @@ impl ToolRegistry {
         self.tools
             .get(name)
             .and_then(|tool| tool.metadata().cloned())
+    }
+
+    /// The model-facing projection of one result payload.
+    ///
+    /// An unregistered name projects to the payload unchanged: a result the
+    /// engine cannot attribute must not lose data on the way to the model.
+    pub fn model_view(&self, name: &str, payload: &Value) -> Value {
+        match self.tools.get(name) {
+            Some(tool) => tool.model_view(payload),
+            None => payload.clone(),
+        }
     }
 
     /// Names of every registered tool.

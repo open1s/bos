@@ -70,6 +70,7 @@ pub(crate) mod terminal_windows;
 pub(crate) mod theme;
 pub(crate) mod tool_metadata;
 pub(crate) mod tool_output;
+pub(crate) mod tool_view;
 pub(crate) mod trash;
 pub(crate) mod ui;
 pub(crate) mod vault;

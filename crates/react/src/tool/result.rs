@@ -334,6 +334,108 @@ impl ToolResult {
         })
     }
 
+    /// The document a model reads for this result.
+    ///
+    /// The runtime keeps the full payload; this is the projection the model
+    /// sees. It carries the verdict and the tool's model-facing fields, and
+    /// nothing that repeats them:
+    ///
+    /// - success and partial: `{"status", "data"}`, plus `continuation`
+    ///   when the result is incomplete and `truncated` when the report was
+    ///   cut;
+    /// - failure: `{"status", "error"}` with the class, the message and the
+    ///   two recovery flags. There is no `data`, so a failure can never be
+    ///   mistaken for a payload.
+    ///
+    /// `summary` is deliberately absent: it is derived from the tool name and
+    /// the status, so it adds no fact. The runtime keeps it for the UI.
+    ///
+    /// The document is always valid JSON and never exceeds `cap` bytes unless
+    /// even the minimal document would.
+    pub fn to_model_text(&self, projected: Option<Value>, cap: usize) -> String {
+        self.to_model_text_cut(projected, cap).0
+    }
+
+    /// [`Self::to_model_text`] plus whether this call cut the report.
+    ///
+    /// The engine needs the flag: a cut report stays inside the cap, so size
+    /// alone no longer tells it that the full result must be preserved and
+    /// named.
+    pub(crate) fn to_model_text_cut(&self, projected: Option<Value>, cap: usize) -> (String, bool) {
+        let cap = if cap == 0 { DEFAULT_RESULT_CAP } else { cap };
+        let mut object = Map::new();
+        object.insert(
+            "status".to_string(),
+            Value::String(self.status.as_str().to_string()),
+        );
+        if self.status.is_error() {
+            object.insert(
+                "error".to_string(),
+                model_error(self.error.as_ref(), &self.summary),
+            );
+        } else {
+            object.insert(
+                "data".to_string(),
+                projected.unwrap_or_else(|| self.data.clone()),
+            );
+        }
+        if let Some(continuation) = &self.continuation {
+            let mut next = Map::new();
+            next.insert("tool".to_string(), Value::String(continuation.tool.clone()));
+            next.insert("args".to_string(), continuation.args.clone());
+            if let Some(reason) = &continuation.reason {
+                next.insert("reason".to_string(), Value::String(reason.clone()));
+            }
+            object.insert("continuation".to_string(), Value::Object(next));
+        }
+        if self.truncated {
+            object.insert("truncated".to_string(), Value::Bool(true));
+        }
+
+        let text = Value::Object(object.clone()).to_string();
+        if text.len() <= cap {
+            return (text, false);
+        }
+
+        // The payload is too large: cut it while keeping both ends, the same
+        // way the stored envelope is cut.
+        let mut reduced = object;
+        if let Some(data) = reduced.get("data") {
+            let raw = data.to_string();
+            let budget = cap.saturating_sub(256).max(64);
+            reduced.insert("data".to_string(), Value::String(cap_text(&raw, budget)));
+        }
+        reduced.insert("truncated".to_string(), Value::Bool(true));
+        let text = Value::Object(reduced).to_string();
+        if text.len() <= cap {
+            return (text, true);
+        }
+
+        // Even the reduced document is too large. Keep a valid, minimal one
+        // rather than handing the model a cut-off document.
+        let mut minimal = Map::new();
+        minimal.insert(
+            "status".to_string(),
+            Value::String(self.status.as_str().to_string()),
+        );
+        match self.error.as_ref() {
+            Some(error) => {
+                let mut detail = Map::new();
+                detail.insert("code".to_string(), Value::String(error.code.clone()));
+                detail.insert(
+                    "message".to_string(),
+                    Value::String(cap_text(&error.message, 160)),
+                );
+                minimal.insert("error".to_string(), Value::Object(detail));
+            }
+            None => {
+                minimal.insert("data".to_string(), Value::Null);
+            }
+        }
+        minimal.insert("truncated".to_string(), Value::Bool(true));
+        (Value::Object(minimal).to_string(), true)
+    }
+
     /// Whether serialized result text reports a failure.
     ///
     /// The envelope is authoritative; the legacy `Error: ` prefix and a
@@ -352,6 +454,33 @@ impl ToolResult {
         }
         text.starts_with("Error:") || text.contains("\"success\":false")
     }
+}
+
+/// The failure document a model reads.
+///
+/// `missing` is left out because `invalid_input` plus a `field` already says
+/// which argument was wrong and that it was absent; the two recovery flags are
+/// kept because they decide retry versus report.
+fn model_error(error: Option<&ToolErrorInfo>, summary: &str) -> Value {
+    let (code, message, retryable, indeterminate, field) = match error {
+        Some(error) => (
+            error.code.as_str(),
+            error.message.as_str(),
+            error.retryable,
+            error.indeterminate,
+            error.field.as_deref(),
+        ),
+        None => ("internal", summary, false, true, None),
+    };
+    let mut object = Map::new();
+    object.insert("code".to_string(), Value::String(code.to_string()));
+    object.insert("message".to_string(), Value::String(message.to_string()));
+    object.insert("retryable".to_string(), Value::Bool(retryable));
+    object.insert("indeterminate".to_string(), Value::Bool(indeterminate));
+    if let Some(field) = field {
+        object.insert("field".to_string(), Value::String(field.to_string()));
+    }
+    Value::Object(object)
 }
 
 fn default_summary(tool: &str, status: ToolStatus, error: Option<&ToolErrorInfo>) -> String {
@@ -736,5 +865,83 @@ mod tests {
         let text = ToolResult::from_value("t", json!({"content": "x".repeat(5_000)})).to_text(16);
         assert!(text.len() <= 512, "{}", text.len());
         parse(&text);
+    }
+
+    #[test]
+    fn a_model_result_is_the_verdict_and_the_projection_only() {
+        let projected = json!({"stdout": "hi\n"});
+        let text = ToolResult::from_value("bash", json!({"stdout": "hi\n", "cwd": "/tmp"}))
+            .to_model_text(Some(projected), 0);
+        let value = parse(&text);
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["data"]["stdout"], "hi\n");
+        assert!(value.get("summary").is_none(), "no derivable sentence");
+        assert!(value.get("tool").is_none(), "no echo of the tool name");
+        assert!(value.get("error").is_none());
+        assert!(value.get("continuation").is_none());
+        assert!(value.get("truncated").is_none(), "nothing was cut");
+    }
+
+    #[test]
+    fn a_model_result_without_a_projection_sends_the_payload() {
+        let text = ToolResult::from_value("custom", json!({"a": 1, "b": 2})).to_model_text(None, 0);
+        let value = parse(&text);
+        assert_eq!(value["data"]["a"], 1);
+        assert_eq!(value["data"]["b"], 2);
+    }
+
+    #[test]
+    fn a_model_failure_keeps_the_recovery_flags_and_no_payload() {
+        let result = ToolResult::from_error(
+            "bash",
+            &ToolError::InvalidField {
+                field: "command".to_string(),
+                message: "the command is required".to_string(),
+                missing: true,
+            },
+        );
+        let text = result.to_model_text(None, 0);
+        let value = parse(&text);
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["error"]["code"], "invalid_input");
+        assert_eq!(value["error"]["field"], "command");
+        assert_eq!(value["error"]["retryable"], false);
+        assert_eq!(value["error"]["indeterminate"], false);
+        assert!(value.get("data").is_none(), "a failure carries no payload");
+        assert!(
+            value["error"].get("missing").is_none(),
+            "derivable from code"
+        );
+    }
+
+    #[test]
+    fn a_model_result_states_a_continuation_only_when_there_is_one() {
+        let partial = ToolResult::from_value(
+            "grep",
+            json!({"matches": [], "truncated": true, "next": {"offset": 20}}),
+        );
+        let value = parse(&partial.to_model_text(None, 0));
+        assert_eq!(value["status"], "partial");
+        assert_eq!(value["continuation"]["args"]["offset"], 20);
+        assert_eq!(value["truncated"], true);
+
+        let complete = ToolResult::from_value("grep", json!({"matches": []}));
+        let value = parse(&complete.to_model_text(None, 0));
+        assert!(value.get("continuation").is_none());
+    }
+
+    #[test]
+    fn an_oversized_model_result_is_cut_and_stays_parseable() {
+        let result = ToolResult::from_value("read_file", json!({"content": "x".repeat(4_000)}));
+        let text = result.to_model_text(None, 256);
+        assert!(text.len() <= 256, "bounded: {} bytes", text.len());
+        let value = parse(&text);
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["truncated"], true);
+        let data = value["data"].as_str().unwrap_or_default();
+        assert!(
+            data.contains("truncated") || data.contains("omitted"),
+            "the cut names itself: {data}"
+        );
     }
 }

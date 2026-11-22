@@ -1494,7 +1494,11 @@ fn build_agent_for_session_inner(
         plugins::install(bundles, &settings.workspace.disabled.extensions);
     for name in registry.tool_names() {
         if let Some(tool) = registry.tool(&name) {
-            agent.add_tool(tool);
+            // The model reads a projection of a built-in's payload; the
+            // runtime, the audit and the UI keep the whole one. This loop runs
+            // before extensions and MCP are installed, so only built-ins are
+            // wrapped here.
+            agent.add_tool(crate::tool_view::wrap(tool));
         }
     }
 
@@ -1627,7 +1631,7 @@ fn build_agent_for_session_inner(
         root: root.clone(),
         workspace: Arc::new(Mutex::new(None)),
     });
-    if let Err(error) = agent.try_add_async_tool(codel) {
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(codel)) {
         log::warn!("codel built-in tool was not registered: {error}");
     }
 
@@ -3288,9 +3292,8 @@ pub(crate) fn attach_subagent_tool(agent: &mut Agent, context: Arc<SubagentConte
             }
         },
     );
-    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
-        Arc::new(tool),
-        declare("subagent"),
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), declare("subagent")),
     ))) {
         warn!("subagent tool was not registered: {error}");
         return;
@@ -3413,9 +3416,8 @@ fn attach_subagent_result_tool(
             }
         },
     );
-    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
-        Arc::new(tool),
-        declare("subagent_result"),
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), declare("subagent_result")),
     ))) {
         warn!("subagent_result tool was not registered: {error}");
     }
@@ -3528,9 +3530,8 @@ fn attach_subagent_message_tool(agent: &mut Agent, context: Arc<SubagentContext>
             }
         },
     );
-    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
-        Arc::new(tool),
-        declare("send_message"),
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), declare("send_message")),
     ))) {
         warn!("send_message tool was not registered: {error}");
     }
@@ -3638,9 +3639,8 @@ fn attach_subagent_interrupt_tool(agent: &mut Agent, context: Arc<SubagentContex
             }
         },
     );
-    if let Err(error) = agent.try_add_async_tool(Arc::new(DeclaredAsyncTool::new(
-        Arc::new(tool),
-        declare("interrupt_agent"),
+    if let Err(error) = agent.try_add_async_tool(crate::tool_view::wrap_async(Arc::new(
+        DeclaredAsyncTool::new(Arc::new(tool), declare("interrupt_agent")),
     ))) {
         warn!("interrupt_agent tool was not registered: {error}");
     }
