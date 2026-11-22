@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v4.1.23 (2026-11-22)
 
 - **A fresh workspace samples for coding.** With no `temperature` and no reply
   cap configured, every request now sends BSH's coding defaults - temperature
