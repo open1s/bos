@@ -7035,22 +7035,7 @@ impl Shell {
                                     .on_click(cx.listener(|this, _event, _window, cx| {
                                         this.files.changed_only = !this.files.changed_only;
                                         if this.files.changed_only {
-                                            let mut dirs: Vec<PathBuf> = this
-                                                .files
-                                                .vcs
-                                                .files
-                                                .keys()
-                                                .flat_map(|path| path.ancestors().skip(1))
-                                                .filter(|dir| !dir.as_os_str().is_empty())
-                                                .map(Path::to_path_buf)
-                                                .collect();
-                                            dirs.sort();
-                                            dirs.dedup();
-                                            for dir in dirs {
-                                                if !this.files.expanded.contains(&dir) {
-                                                    this.files.expanded.push(dir);
-                                                }
-                                            }
+                                            this.expand_changed_dirs();
                                         }
                                         this.refresh_files(cx);
                                     })),
@@ -10675,6 +10660,9 @@ impl Shell {
         self.files.expanded.clear();
         self.files.children.clear();
         self.files.roots.clear();
+        self.files.vcs_rollups.clear();
+        self.files.vcs = crate::vcs::VcsStatus::default();
+        self.files.changed_only = false;
         self.files.error = None;
         self.files.renaming = None;
         self.files.deleting = None;
@@ -10826,10 +10814,40 @@ impl Shell {
         .detach();
     }
 
+    /// Expand every existing directory that contains a visible change.
+    /// Returns whether the expansion changed, so a status landing can trigger
+    /// one listing refresh without starting a status loop.
+    pub(crate) fn expand_changed_dirs(&mut self) -> bool {
+        let Some(root) = self.state.workspace_root() else {
+            return false;
+        };
+        let mut dirs: Vec<PathBuf> = self
+            .files
+            .vcs
+            .files
+            .keys()
+            .flat_map(|path| path.ancestors().skip(1))
+            .filter(|dir| !dir.as_os_str().is_empty() && root.join(dir).is_dir())
+            .map(Path::to_path_buf)
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        let mut changed = false;
+        for dir in dirs {
+            if !self.files.expanded.contains(&dir) {
+                self.files.expanded.push(dir);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Read working-copy status off the UI thread and publish it to the tree.
     pub(crate) fn refresh_vcs_status(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.state.workspace_root() else {
             self.files.vcs = crate::vcs::VcsStatus::default();
+            self.files.vcs_rollups.clear();
+            self.files.changed_only = false;
             cx.notify();
             return;
         };
@@ -10848,12 +10866,18 @@ impl Shell {
                     return;
                 }
                 if next.error.is_none() {
+                    if next.files.is_empty() {
+                        this.files.changed_only = false;
+                    }
                     this.files.vcs = next;
                 } else {
                     this.files.vcs.kind = next.kind;
                     this.files.vcs.error = next.error;
                 }
                 this.files.rebuild_vcs_rollups();
+                if this.files.changed_only && this.expand_changed_dirs() {
+                    this.refresh_files(cx);
+                }
                 cx.notify();
             });
         })
@@ -10866,29 +10890,7 @@ impl Shell {
     /// after a mutation, never on a keystroke - the listings between those
     /// points come from `children`.
     pub(crate) fn refresh_files(&mut self, cx: &mut Context<Self>) {
-        if self.files.changed_only {
-            let mut dirs: Vec<PathBuf> = self
-                .files
-                .vcs
-                .files
-                .keys()
-                .flat_map(|path| path.ancestors().skip(1))
-                .filter(|dir| !dir.as_os_str().is_empty())
-                .map(Path::to_path_buf)
-                .collect();
-            dirs.sort();
-            dirs.dedup();
-            for dir in dirs {
-                if self
-                    .state
-                    .workspace_root()
-                    .is_some_and(|root| root.join(&dir).is_dir())
-                    && !self.files.expanded.contains(&dir)
-                {
-                    self.files.expanded.push(dir);
-                }
-            }
-        }
+        self.expand_changed_dirs();
         let Some(root) = self.state.workspace_root() else {
             self.files.roots.clear();
             self.files.children.clear();
