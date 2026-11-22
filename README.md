@@ -39,7 +39,7 @@
 
 ---
 
-> **Release 4.1.1** — tool and skill discovery in the prompt, a workspace ignore
+> **Release 4.1.22** — tool and skill discovery in the prompt, a workspace ignore
 > file every file tool honours, and rendered file previews. See the
 > [changelog](CHANGELOG.md) for the full set.
 

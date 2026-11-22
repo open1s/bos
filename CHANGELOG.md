@@ -14,6 +14,10 @@
   request byte. A regression test pins registration, the MCP mark the search
   classifies by, and the empty advertised array.
 
+## v4.1.22 (2026-11-22)
+
+- Release v4.1.22.
+
 ## v4.1.21 (2026-11-19)
 
 - Release v4.1.21.
