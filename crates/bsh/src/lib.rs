@@ -73,6 +73,7 @@ pub(crate) mod tool_output;
 pub(crate) mod trash;
 pub(crate) mod ui;
 pub(crate) mod vault;
+pub(crate) mod vcs;
 /// The local web-search tool: the model's own search client.
 pub(crate) mod web;
 pub(crate) mod workspace_ignore;

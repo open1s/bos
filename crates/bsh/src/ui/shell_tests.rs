@@ -39109,3 +39109,145 @@ fn deleting_a_workspace_is_parked_asynchronously(cx: &mut TestAppContext) {
     assert!(gone, "the workspace row is gone");
     assert!(parked, "and its record is in the bin");
 }
+
+#[gpui::test]
+fn the_file_tree_shows_vcs_badges_and_deleted_ghosts(cx: &mut TestAppContext) {
+    use std::path::PathBuf;
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_workspace_tree("vcs-badges");
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.files.roots = vec![
+                crate::files::Row {
+                    name: "src".to_string(),
+                    dir: true,
+                    size: 0,
+                },
+                crate::files::Row {
+                    name: "docs".to_string(),
+                    dir: true,
+                    size: 0,
+                },
+            ];
+            this.files.expanded = vec![PathBuf::from("src"), PathBuf::from("docs")];
+            this.files.children.insert(
+                PathBuf::from("src"),
+                vec![crate::files::Row {
+                    name: "lib.rs".to_string(),
+                    dir: false,
+                    size: 4,
+                }],
+            );
+            this.files
+                .children
+                .insert(PathBuf::from("docs"), Vec::new());
+            this.files.vcs = crate::vcs::VcsStatus {
+                kind: Some(crate::vcs::VcsKind::Git),
+                files: [
+                    (
+                        PathBuf::from("src/lib.rs"),
+                        crate::vcs::FileStatus::Modified,
+                    ),
+                    (
+                        PathBuf::from("docs/old.md"),
+                        crate::vcs::FileStatus::Deleted,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                error: None,
+            };
+            this.files.rebuild_vcs_rollups();
+            this.files.changed_only = true;
+            this.sync_files_watch(cx);
+            assert!(this.files.watch.is_some(), "watch starts with Files");
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("vcs-lib.rs").is_some(), "file badge");
+    assert!(
+        cx.debug_bounds("vcs-old.md").is_some(),
+        "deleted ghost badge"
+    );
+    assert!(
+        cx.debug_bounds("files-changed").is_some(),
+        "Changed control"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.show_right_tab(crate::ui::right_panel::RightTab::Diff, cx);
+            assert!(this.files.watch.is_none(), "watch stops off Files");
+        });
+    });
+}
+
+#[gpui::test]
+fn the_files_pane_loads_git_status(cx: &mut TestAppContext) {
+    use std::path::Path;
+    init_test_app(cx);
+    let root = std::env::temp_dir().join(format!("bsh-vcs-ui-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).expect("root");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "fn a() {}
+",
+    )
+    .expect("file");
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "bsh@example.com"],
+        vec!["config", "user.name", "BSH"],
+        vec!["add", "."],
+        vec!["commit", "-qm", "one"],
+    ] {
+        let status = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(&args)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "fn a() { 1; }
+",
+    )
+    .expect("modify");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store("vcs-status-ui"));
+        state.settings.global.general.active_workspace = "vcs-status-ui".to_string();
+        state
+            .settings
+            .global
+            .workspaces
+            .push(crate::settings::global::WorkspaceRef {
+                id: "vcs-status-ui".to_string(),
+                name: "vcs-status-ui".to_string(),
+                root: root.to_string_lossy().to_string(),
+                created_at: 0,
+                updated_at: 0,
+            });
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|_, cx| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.refresh_files(cx);
+        });
+    });
+    cx.run_until_parked();
+    let status = cx.update(|_, cx| shell.read(cx).files.vcs.get(Path::new("src/lib.rs")));
+    assert_eq!(status, Some(crate::vcs::FileStatus::Modified));
+}

@@ -1121,6 +1121,7 @@
 "right.notBuilt": "该面板尚未实现。"
 "right.files.noWorkspace": "请选择一个工作区以浏览其中的文件。"
 "right.files.empty": "该文件夹为空。"
+"right.files.changed": "已更改"
 "right.files.new": "新建文件"
 "right.files.newPlaceholder": "新文件名"
 "right.files.renamePlaceholder": "新名称"

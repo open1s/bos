@@ -2188,9 +2188,7 @@ impl AppState {
     /// The in-memory removal is deliberately NOT done here: a failed park must
     /// leave the session intact.
     pub(crate) fn prepare_delete_session(&mut self, id: &str) -> Option<PreparedSession> {
-        if self.store.session(id).is_none() {
-            return None;
-        }
+        self.store.session(id)?;
         if self.streams.contains_key(id) {
             self.stop(id);
         } else {

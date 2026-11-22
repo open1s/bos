@@ -42,6 +42,7 @@ use crate::model::Role;
 use crate::terminal::KeyOutcome;
 use crate::theme;
 use gpui_libghostty::TerminalOptions;
+use notify::Watcher as _;
 
 // Save the file the panel is showing, bound to cmd-s.
 //
@@ -843,11 +844,94 @@ pub(crate) struct FilesPane {
     pub(crate) thread_quote: Option<(PathBuf, usize, String)>,
     /// The note being typed into the drawer's field.
     pub(crate) note_text: Entity<TextareaState>,
+    /// The last working-copy VCS status for this workspace tree.
+    pub(crate) vcs: crate::vcs::VcsStatus,
+    /// Folder rollups keyed by directory, rebuilt from the status snapshot.
+    pub(crate) vcs_rollups: std::collections::BTreeMap<PathBuf, (usize, crate::vcs::FileStatus)>,
+    /// Whether the Changed-only filter is on.
+    pub(crate) changed_only: bool,
+    /// The watcher while the tree surface is visible, and the root it watches.
+    pub(crate) watch: Option<notify::RecommendedWatcher>,
+    pub(crate) watch_root: Option<PathBuf>,
+    pub(crate) watch_generation: u64,
+    /// Latest requested VCS read, so an older subprocess cannot overwrite it.
+    pub(crate) vcs_generation: u64,
     /// The tree's scroll position, so its window can follow the reader.
     ///
     /// A workspace with a fully expanded tree built one row element per visible
     /// entry on every repaint, however little of it the column could show.
     pub(crate) scroll: ScrollHandle,
+}
+
+pub(crate) fn vcs_visible(rel: &Path) -> bool {
+    rel.components().all(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        !matches!(name.as_ref(), ".bsh" | ".bsh-run" | ".codel" | ".bos")
+    })
+}
+
+impl FilesPane {
+    /// A file's badge, after internal and hidden filtering.
+    /// Rebuild the folder rollups once per status/hidden change, never per row.
+    pub(crate) fn rebuild_vcs_rollups(&mut self) {
+        let mut rollups: std::collections::BTreeMap<PathBuf, (usize, crate::vcs::FileStatus)> =
+            std::collections::BTreeMap::new();
+        for path in self.vcs.files.keys() {
+            if self.visible_status(path).is_none() {
+                continue;
+            }
+            let status = self.vcs.files[path];
+            for ancestor in path.ancestors().skip(1) {
+                let entry = rollups.entry(ancestor.to_path_buf()).or_insert((0, status));
+                entry.0 += 1;
+                if status.severity() > entry.1.severity() {
+                    entry.1 = status;
+                }
+            }
+        }
+        self.vcs_rollups = rollups;
+    }
+
+    pub(crate) fn visible_status(&self, rel: &Path) -> Option<crate::vcs::FileStatus> {
+        if !vcs_visible(rel) {
+            return None;
+        }
+        if !self.hidden
+            && rel
+                .components()
+                .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+        {
+            return None;
+        }
+        self.vcs.get(rel)
+    }
+
+    /// A directory's rollup after the same visibility rules.
+    pub(crate) fn folder_badge(&self, rel: &Path) -> Option<(usize, crate::vcs::FileStatus)> {
+        self.vcs_rollups.get(rel).copied()
+    }
+
+    /// Whether a row survives the Changed-only filter.
+    pub(crate) fn changed_or_contains(&self, rel: &Path, dir: bool) -> bool {
+        if !self.changed_only {
+            return true;
+        }
+        if dir {
+            self.folder_badge(rel).is_some()
+        } else {
+            self.visible_status(rel).is_some()
+        }
+    }
+}
+
+fn vcs_color(status: crate::vcs::FileStatus) -> u32 {
+    match status {
+        crate::vcs::FileStatus::Added => theme::success(),
+        crate::vcs::FileStatus::Deleted | crate::vcs::FileStatus::Conflicted => theme::error(),
+        crate::vcs::FileStatus::Renamed => theme::accent(),
+        crate::vcs::FileStatus::Modified => theme::warn(),
+        crate::vcs::FileStatus::Unknown => theme::faint(),
+    }
 }
 
 /// One file open in the editor area, as the tab strip carries it.
@@ -936,6 +1020,13 @@ impl FilesPane {
             focus_note: None,
             thread_quote: None,
             note_text,
+            vcs: crate::vcs::VcsStatus::default(),
+            vcs_rollups: std::collections::BTreeMap::new(),
+            changed_only: false,
+            watch: None,
+            watch_root: None,
+            watch_generation: 0,
+            vcs_generation: 0,
             scroll: ScrollHandle::new(),
         }
     }
@@ -6913,6 +7004,59 @@ impl Shell {
                             .text_ellipsis()
                             .whitespace_nowrap(),
                     )
+                    .when_some(
+                        self.files.folder_badge(Path::new("")),
+                        |bar, (count, status)| {
+                            bar.child(
+                                div()
+                                    .id("files-changed")
+                                    .debug_selector(|| String::from("files-changed"))
+                                    .px(px(6.0))
+                                    .h(px(22.0))
+                                    .rounded(px(6.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .cursor_pointer()
+                                    .when(self.files.changed_only, |chip| {
+                                        chip.bg(rgb(theme::hover()))
+                                    })
+                                    .hover(|chip| chip.bg(rgb(theme::hover())))
+                                    .child(txt(
+                                        self.state.lang.tr("right.files.changed"),
+                                        theme::CHIP_SIZE,
+                                        vcs_color(status),
+                                    ))
+                                    .child(txt(
+                                        count.to_string(),
+                                        theme::CHIP_SIZE,
+                                        vcs_color(status),
+                                    ))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.files.changed_only = !this.files.changed_only;
+                                        if this.files.changed_only {
+                                            let mut dirs: Vec<PathBuf> = this
+                                                .files
+                                                .vcs
+                                                .files
+                                                .keys()
+                                                .flat_map(|path| path.ancestors().skip(1))
+                                                .filter(|dir| !dir.as_os_str().is_empty())
+                                                .map(Path::to_path_buf)
+                                                .collect();
+                                            dirs.sort();
+                                            dirs.dedup();
+                                            for dir in dirs {
+                                                if !this.files.expanded.contains(&dir) {
+                                                    this.files.expanded.push(dir);
+                                                }
+                                            }
+                                        }
+                                        this.refresh_files(cx);
+                                    })),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .id("files-refresh")
@@ -6955,6 +7099,7 @@ impl Shell {
                             ))
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.files.hidden = !this.files.hidden;
+                                this.files.rebuild_vcs_rollups();
                                 this.refresh_files(cx);
                             })),
                     ),
@@ -7122,6 +7267,9 @@ impl Shell {
         stack.reverse();
         while let Some((row, parent, depth)) = stack.pop() {
             let rel = parent.join(&row.name);
+            if self.files.changed_only && !self.files.changed_or_contains(&rel, row.dir) {
+                continue;
+            }
             entries.push((row, rel.clone(), depth));
             if row.dir {
                 let expanded = self.files.expanded.iter().any(|p| p == &rel);
@@ -7131,6 +7279,49 @@ impl Shell {
                     }
                 }
             }
+        }
+        // Deleted files have no filesystem row; keep them visible under the
+        // nearest directory that still exists. Their row is a ghost: the badge
+        // opens the diff, and the row cannot be opened as a document.
+        let existing: std::collections::HashSet<&Path> =
+            entries.iter().map(|(_, rel, _)| rel.as_path()).collect();
+        let mut ghosts: Vec<(PathBuf, usize)> = self
+            .files
+            .vcs
+            .files
+            .iter()
+            .filter(|(path, status)| {
+                **status == crate::vcs::FileStatus::Deleted
+                    && self.files.visible_status(path).is_some()
+                    && !existing.contains(path.as_path())
+            })
+            .filter_map(|(path, _)| {
+                let parent = path.parent()?;
+                let depth = if parent.as_os_str().is_empty() {
+                    Some(0)
+                } else {
+                    entries
+                        .iter()
+                        .find(|(_, rel, _)| rel == parent)
+                        .map(|(_, _, depth)| depth + 1)
+                };
+                depth.map(|depth| (path.clone(), depth))
+            })
+            .collect();
+        ghosts.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut ghost_rows: Vec<files::Row> = ghosts
+            .iter()
+            .map(|(path, _)| files::Row {
+                name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string_lossy().to_string()),
+                dir: false,
+                size: 0,
+            })
+            .collect();
+        for ((path, depth), row) in ghosts.iter().zip(ghost_rows.iter_mut()) {
+            entries.push((row, path.clone(), *depth));
         }
         // Every row is exactly FILES_ROW_H tall, so the tree paints the band
         // around the viewport and stands the rest in two spacers: a fully
@@ -7245,6 +7436,8 @@ impl Shell {
         let renaming = self.files.renaming.as_deref() == Some(rel);
         let expanded = self.files.expanded.iter().any(|p| p == rel);
         let glyph = file_glyph(row);
+        let file_status = (!dir).then(|| self.files.visible_status(rel)).flatten();
+        let folder_badge = dir.then(|| self.files.folder_badge(rel)).flatten();
         let shell = cx.entity();
         div()
             .debug_selector(|| debug_id.to_string())
@@ -7290,6 +7483,39 @@ impl Shell {
             )
             // The size is what a reader scans for, so it holds the row's right
             // edge until an action fades over it.
+            .when_some(folder_badge, |row, (count, status)| {
+                row.child(
+                    txt(count.to_string(), theme::CHIP_SIZE, vcs_color(status))
+                        .flex_none()
+                        .mr(px(4.0)),
+                )
+            })
+            .when_some(file_status, |row, status| {
+                let shell = shell.clone();
+                let rel = rel_click.clone();
+                row.child(
+                    div()
+                        .id(SharedString::from(format!("vcs-{rel_key}")))
+                        .debug_selector(|| format!("vcs-{}", name))
+                        .px(px(3.0))
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::hover())))
+                        .child(txt(status.letter(), theme::CHIP_SIZE, vcs_color(status)))
+                        .tooltip({
+                            let tip = format!("{} — click to view diff", status.label());
+                            move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
+                        })
+                        .on_click({
+                            let shell = shell.clone();
+                            let rel = rel.clone();
+                            move |_event, _window, cx| {
+                                cx.stop_propagation();
+                                shell.update(cx, |this, cx| this.open_working_diff(&rel, cx));
+                            }
+                        }),
+                )
+            })
             .child(
                 txt(size_label(size, dir), theme::CHIP_SIZE, theme::faint())
                     .flex_none()
@@ -7388,6 +7614,8 @@ impl Shell {
             .on_click(cx.listener(move |this, _event, window, cx| {
                 if dir {
                     this.toggle_dir(&rel_toggle, cx);
+                } else if file_status == Some(crate::vcs::FileStatus::Deleted) {
+                    this.open_working_diff(&rel_click, cx);
                 } else {
                     this.open_file(&rel_click, window, cx);
                 }
@@ -9039,6 +9267,10 @@ impl Shell {
     pub(crate) fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.right.open = !self.right.open;
         if self.right.open {
+            if self.right.tab == Some(RightTab::Files) {
+                self.refresh_vcs_status(cx);
+            }
+            self.sync_files_watch(cx);
             // Reopening on the terminal has to bring the native surface back:
             // a tab switch hid it, and nothing else paints it again.
             if self.right.tab == Some(RightTab::Terminal) {
@@ -9046,6 +9278,7 @@ impl Shell {
             }
         } else {
             self.hide_terminal_view(cx);
+            self.sync_files_watch(cx);
         }
         cx.notify();
     }
@@ -9100,6 +9333,10 @@ impl Shell {
         if tab == RightTab::Memory {
             self.memory_load(cx);
         }
+        if tab == RightTab::Files {
+            self.refresh_vcs_status(cx);
+        }
+        self.sync_files_watch(cx);
     }
 
     /// Bring one already-open tab to the front.
@@ -9342,6 +9579,10 @@ impl Shell {
         if tab == RightTab::Files && self.files.roots.is_empty() && self.files.tabs.is_empty() {
             self.refresh_files(cx);
         }
+        if tab == RightTab::Files {
+            self.refresh_vcs_status(cx);
+        }
+        self.sync_files_watch(cx);
         if tab == RightTab::Browser {
             self.browser_prewarm(cx);
         }
@@ -10421,6 +10662,10 @@ impl Shell {
     /// cached tree goes with them, and the pane re-lists whatever workspace is
     /// active now. The extension tabs carry a workspace too, and follow it.
     pub(crate) fn refile_workspace(&mut self, cx: &mut Context<Self>) {
+        self.files.watch = None;
+        self.files.watch_root = None;
+        self.files.watch_generation = self.files.watch_generation.wrapping_add(1);
+        self.sync_files_watch(cx);
         self.refile_extension_tabs(cx);
         // The mounted-panel cache (Extensions pane and launcher tiles) follows
         // the same switch, so every path that refiles also refreshes it.
@@ -10514,12 +10759,136 @@ impl Shell {
         cx.notify();
     }
 
+    /// Start or stop the workspace watcher with the Files surface.
+    pub(crate) fn sync_files_watch(&mut self, cx: &mut Context<Self>) {
+        let wanted = self.right.open
+            && self.right.tab == Some(RightTab::Files)
+            && self.right.active_extension.is_none();
+        let Some(root) = self.state.workspace_root().filter(|_| wanted) else {
+            if self.files.watch.is_some() || self.files.watch_root.is_some() {
+                self.files.watch_generation = self.files.watch_generation.wrapping_add(1);
+            }
+            self.files.watch = None;
+            self.files.watch_root = None;
+            return;
+        };
+        if self.files.watch_root.as_deref() == Some(root.as_path()) {
+            return;
+        }
+        self.files.watch = None;
+        self.files.watch_root = None;
+        let (tx, rx) = async_channel::unbounded();
+        let Ok(mut watcher) =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                let Ok(event) = event else {
+                    return;
+                };
+                let relevant = event.paths.iter().any(|path| {
+                    let text = path.to_string_lossy();
+                    !text.contains("/.bsh/")
+                        && !text.contains("/.bsh-run/")
+                        && !text.contains("/.codel/")
+                        && !text.contains("/.bos/")
+                        && !text.contains("/target/")
+                        && !text.contains("/node_modules/")
+                });
+                if relevant {
+                    let _ = tx.send_blocking(());
+                }
+            })
+        else {
+            return;
+        };
+        if watcher
+            .watch(&root, notify::RecursiveMode::Recursive)
+            .is_err()
+        {
+            return;
+        }
+        self.files.watch = Some(watcher);
+        self.files.watch_root = Some(root);
+        self.files.watch_generation = self.files.watch_generation.wrapping_add(1);
+        let generation = self.files.watch_generation;
+        cx.spawn(async move |this, cx| {
+            while rx.recv().await.is_ok() {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                while rx.try_recv().is_ok() {}
+                let _ = this.update(cx, |this, cx| {
+                    if this.files.watch_generation != generation {
+                        return;
+                    }
+                    this.refresh_files(cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Read working-copy status off the UI thread and publish it to the tree.
+    pub(crate) fn refresh_vcs_status(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.state.workspace_root() else {
+            self.files.vcs = crate::vcs::VcsStatus::default();
+            cx.notify();
+            return;
+        };
+        let task_root = root.clone();
+        self.files.vcs_generation = self.files.vcs_generation.wrapping_add(1);
+        let generation = self.files.vcs_generation;
+        let loading = cx
+            .background_executor()
+            .spawn(async move { crate::vcs::status(&root) });
+        cx.spawn(async move |this, cx| {
+            let next = loading.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.state.workspace_root().as_deref() != Some(task_root.as_path())
+                    || this.files.vcs_generation != generation
+                {
+                    return;
+                }
+                if next.error.is_none() {
+                    this.files.vcs = next;
+                } else {
+                    this.files.vcs.kind = next.kind;
+                    this.files.vcs.error = next.error;
+                }
+                this.files.rebuild_vcs_rollups();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Re-list the workspace root and every directory the reader expanded.
     ///
     /// A tree with N branches costs N walks, but only on an explicit refresh or
     /// after a mutation, never on a keystroke - the listings between those
     /// points come from `children`.
     pub(crate) fn refresh_files(&mut self, cx: &mut Context<Self>) {
+        if self.files.changed_only {
+            let mut dirs: Vec<PathBuf> = self
+                .files
+                .vcs
+                .files
+                .keys()
+                .flat_map(|path| path.ancestors().skip(1))
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            for dir in dirs {
+                if self
+                    .state
+                    .workspace_root()
+                    .is_some_and(|root| root.join(&dir).is_dir())
+                    && !self.files.expanded.contains(&dir)
+                {
+                    self.files.expanded.push(dir);
+                }
+            }
+        }
         let Some(root) = self.state.workspace_root() else {
             self.files.roots.clear();
             self.files.children.clear();
@@ -10552,6 +10921,7 @@ impl Shell {
                 Err(error) => self.files.error = Some(io_msg(&error)),
             }
         }
+        self.refresh_vcs_status(cx);
         cx.notify();
     }
 
@@ -11920,6 +12290,32 @@ impl Shell {
                 Err(diff_pane::LoadFailure::Io(error)) => {
                     this.diff_refused_text(io_msg(&error), cx);
                 }
+            });
+        })
+        .detach();
+    }
+
+    /// Open one path's working-copy comparison against the same baseline the
+    /// tree badges use.
+    pub(crate) fn open_working_diff(&mut self, rel: &Path, cx: &mut Context<Self>) {
+        let Some(root) = self.state.workspace_root() else {
+            self.diff_refused("right.files.noWorkspace", cx);
+            return;
+        };
+        self.show_right_tab(RightTab::Diff, cx);
+        self.right.diff.error = None;
+        self.right.diff.turn = None;
+        cx.notify();
+        let label = rel.to_string_lossy().to_string();
+        let rel = rel.to_path_buf();
+        let loading = cx
+            .background_executor()
+            .spawn(async move { crate::vcs::diff(&root, &rel) });
+        cx.spawn(async move |this, cx| {
+            let patch = loading.await;
+            let _ = this.update(cx, |this, cx| match patch {
+                Ok(patch) => this.open_diff_text(&label, &patch, cx),
+                Err(error) => this.diff_refused_text(error, cx),
             });
         })
         .detach();

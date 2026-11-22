@@ -5,7 +5,6 @@ schema_version = 0
 [agent]
 system_prompt = ""
 complete = true
-temperature = 0.7
 reasoning_effort = "medium"
 permission = "danger-full-access"
 bash_enabled = true

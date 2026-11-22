@@ -1127,6 +1127,7 @@
 "right.notBuilt": "This pane is not built yet."
 "right.files.noWorkspace": "Pick a workspace to browse its files."
 "right.files.empty": "This folder is empty."
+"right.files.changed": "Changed"
 "right.files.new": "New file"
 "right.files.newPlaceholder": "New file name"
 "right.files.renamePlaceholder": "New name"

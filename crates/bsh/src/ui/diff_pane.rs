@@ -373,9 +373,12 @@ pub(crate) fn read_for(root: &Path, rel: &Path) -> Result<Loaded, LoadFailure> {
     if bytes.len() as u64 > crate::files::MAX_OPEN_BYTES {
         return Err(LoadFailure::Key("diff.oversized"));
     }
-    let git = git_diff(root, rel);
-    // Only ask git about tracking when it had no diff to give: one subprocess
-    // answers the common case.
+    // The VCS provider is the one source of truth: jj when the checkout has
+    // one, git otherwise. The legacy git helpers remain as a fallback for a
+    // scratch workspace where the provider has nothing to say.
+    let git = crate::vcs::diff(root, rel)
+        .ok()
+        .or_else(|| git_diff(root, rel));
     let untracked = git.is_none() && git_untracked(root, rel);
     Ok(Loaded {
         bytes,

@@ -163,9 +163,7 @@ pub(crate) fn park_session(
     };
     let parked = log_dir(dir, &envelope);
     let had_log = log_from.exists();
-    if let Err(error) = park_log(dir, log_from, &envelope) {
-        return Err(error);
-    }
+    park_log(dir, log_from, &envelope)?;
     match stash(dir, &envelope) {
         Ok(path) => Ok(path),
         Err(error) => {

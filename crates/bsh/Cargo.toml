@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 codel-mcp = { path = "../codel-mcp" }
+notify = "9.0.0"
 ferris-sdk = { path = "../ferris-sdk", features = ["host-runtime"] }
 federation = { path = "../federation" }
 bus = { path = "../bus" }
