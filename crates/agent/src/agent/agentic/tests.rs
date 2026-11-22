@@ -4428,6 +4428,30 @@ fn the_provider_request_describes_the_exact_call() {
     assert_eq!(described.api_mode, react::llm::ApiMode::Chat);
 }
 
+/// The configured sampling numbers are the ones the typed request describes.
+///
+/// The adapter serializes this snapshot, so a value that stops here is a value
+/// the model never sees: the whole point of setting a temperature or an output
+/// cap is that every request carries it.
+#[test]
+fn the_provider_request_carries_the_configured_sampling() {
+    let agent = Agent::new(
+        AgentConfig {
+            temperature: 0.3,
+            max_tokens: Some(4096),
+            ..AgentConfig::default()
+        },
+        Arc::new(LlmProvider::new()),
+    );
+    let history = agent.session().messages().to_vec();
+    let input = react::llm::Content::text("hi");
+    let described = agent
+        .describe_provider_request("system", &[], &history, &input, None)
+        .expect("a typed request");
+    assert_eq!(described.temperature, Some(0.3));
+    assert_eq!(described.max_tokens, Some(4096));
+}
+
 /// Ordinary-language constraints, decisions, open tasks, conflicts and
 /// tool-verified results must be covered; a paraphrase is accepted, an omission
 /// is rejected (issue #429).

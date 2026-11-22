@@ -153,6 +153,24 @@ impl TranscriptPolicy {
     }
 }
 
+/// The sampling temperature a coding turn gets when the reader configured none.
+///
+/// Coding wants the same edit from the same prompt, and the framework's chat
+/// default of 0.7 is what let two runs of one change differ. 0.2 keeps a little
+/// variation - enough to leave a repeated tool call - while making a patch
+/// reproducible. It is a DEFAULT, not a floor: the pane's field wins.
+pub(crate) const CODING_TEMPERATURE: f32 = 0.2;
+
+/// The reply cap a coding turn gets when neither the reader nor the model
+/// declared one.
+///
+/// 16,800 tokens is what a whole-file edit needs in ONE reply, which is the
+/// unit a coding turn works in. The cap is also the send-side window's reply
+/// reservation, so the shipped 32k window still leaves about 46% of itself
+/// (14,944 tokens) for the code being read; a longer reply is continued at the
+/// cap - the engine asks for the rest - rather than lost.
+pub(crate) const CODING_MAX_TOKENS: u32 = 16800;
+
 /// The concrete values a build uses once workspace overrides are applied.
 #[derive(Debug, Clone)]
 pub(crate) struct Effective {
@@ -187,11 +205,12 @@ pub(crate) struct Effective {
     /// tool guidance are suppressed, and the persona text is sent alone. False
     /// is the default slot composition.
     pub(crate) persona_complete: bool,
-    /// Sampling temperature.
+    /// Sampling temperature in force: the reader's, or the coding default.
     pub(crate) temperature: f32,
     /// Reasoning effort.
     pub(crate) reasoning_effort: Option<String>,
-    /// Completion cap.
+    /// Completion cap in force: the reader's, the model's, or the coding
+    /// default. Never absent, so the request always names one.
     pub(crate) max_tokens: Option<u32>,
     /// Register the shell tool.
     pub(crate) bash_enabled: bool,
@@ -1005,9 +1024,14 @@ impl Settings {
             api_key_vault: connection.and_then(|c| c.api_key_vault.clone()),
             system_prompt: resolution.system_prompt,
             persona_complete: resolution.persona_complete,
-            temperature: resolution.temperature.unwrap_or(0.7),
+            // The coding defaults are what a fresh workspace sends: an
+            // unconfigured temperature is not "whatever the engine likes".
+            temperature: resolution.temperature.unwrap_or(CODING_TEMPERATURE),
             reasoning_effort: resolution.reasoning_effort,
-            max_tokens: resolution.max_tokens,
+            // The reader's cap, else the model's, else the coding default. A
+            // request always names one, so the truncation guard can compare
+            // the reply against the number the wire actually carried.
+            max_tokens: Some(resolution.max_tokens.unwrap_or(CODING_MAX_TOKENS)),
             bash_enabled: resolution.bash_enabled,
             file_tools_enabled: resolution.file_tools_enabled,
             web_tools_enabled: resolution.web_tools_enabled,
@@ -1225,6 +1249,7 @@ mod tests {
     use super::global::{self, GlobalSettings, ModelEntry};
     use super::mcp::{McpRefusal, McpScope, McpServer, McpTransport};
     use super::workspace::WorkspaceSettings;
+    use super::{CODING_MAX_TOKENS, CODING_TEMPERATURE};
 
     /// The reference font-size default and the appearance default, both on the
     /// global tier because neither is a workspace fact.
@@ -1254,13 +1279,27 @@ mod tests {
         );
         assert_eq!(
             settings.effective().temperature,
-            0.7,
-            "no stored temperature inherits the engine's own default"
+            CODING_TEMPERATURE,
+            "no stored temperature takes the coding default, not the chat 0.7"
+        );
+        assert_eq!(
+            settings.effective().max_tokens,
+            Some(CODING_MAX_TOKENS),
+            "and an unconfigured reply cap is the coding default"
+        );
+        assert_eq!(
+            CODING_TEMPERATURE, 0.2,
+            "low enough for a reproducible edit"
+        );
+        assert_eq!(
+            CODING_MAX_TOKENS, 16_800,
+            "and one whole-file edit fits a single reply"
         );
 
         settings.workspace.agent.llm_timeout_secs = 900;
         settings.workspace.agent.llm_max_retries = 1;
         settings.workspace.agent.temperature = Some(0.3);
+        settings.workspace.agent.max_tokens = Some(4_096);
         let resolved = settings.effective();
         assert_eq!(
             resolved.llm_timeout_secs, 900,
@@ -1268,6 +1307,11 @@ mod tests {
         );
         assert_eq!(resolved.llm_max_retries, 1, "and so does the retry budget");
         assert_eq!(resolved.temperature, 0.3, "and the sampling temperature");
+        assert_eq!(
+            resolved.max_tokens,
+            Some(4_096),
+            "and the reader's reply cap, over the coding default"
+        );
     }
 
     /// A turn runs in the workspace its CHAT belongs to, not in whichever

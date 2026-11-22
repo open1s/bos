@@ -660,9 +660,10 @@ impl OpenAiVendor {
             },
         );
 
-        let max_tokens = req
-            .max_tokens
-            .unwrap_or(crate::llm::vendor::DEFAULT_COMPLETION_CAP);
+        // A zero is "the reader named no cap", not a cap of zero: the vendor
+        // substitutes its own default so the wire never carries a value no
+        // endpoint accepts, and the engine reads the same number back.
+        let max_tokens = crate::llm::vendor::effective_completion_cap(req.max_tokens);
         let parallel_tool_calls = tools.as_ref().map(|_| self.parallel_tool_calls);
         // "Off" reaches the engine as `ReasoningEffort::None`. Each vendor
         // disables it with its own field; an adapter with no off switch omits
@@ -680,7 +681,9 @@ impl OpenAiVendor {
             model: req.model.clone(),
             messages,
             tools,
-            temperature: req.temperature,
+            // 0.0..=2.0 is what the OpenAI-compatible wires accept; a larger or
+            // non-finite value fails the whole request instead of sampling.
+            temperature: crate::llm::vendor::sampling_temperature(req.temperature, 2.0),
             top_p: req.top_p,
             top_k: req.top_k,
             max_tokens: Some(max_tokens),
@@ -1442,6 +1445,49 @@ mod tests {
         let wire = serde_json::to_value(vendor.convert_request(None, &req, &session, &bare))
             .expect("serialize");
         assert!(wire.get("parallel_tool_calls").is_none());
+    }
+
+    /// The two numbers the reader set reach the chat wire: the temperature
+    /// verbatim and the output cap as `max_tokens`. A request that dropped them
+    /// would answer with the provider's own defaults, which is exactly what a
+    /// reader who set them did not ask for.
+    #[test]
+    fn the_reader_sampling_reaches_the_chat_wire() {
+        let session = LlmSession::new();
+        let context = LlmContext::default();
+        let mut request = LlmRequest::new("m");
+        request.temperature = Some(0.25);
+        request.max_tokens = Some(2048);
+        let wire = OpenAiVendor::wire_preview(&request, &session, &context);
+        assert_eq!(wire["temperature"], 0.25);
+        assert_eq!(wire["max_tokens"], 2048);
+    }
+
+    /// `0` is the field's "no cap" spelling, not a cap of zero, and a
+    /// temperature no provider accepts is bounded or omitted rather than sent.
+    #[test]
+    fn an_unset_or_impossible_sampling_value_is_normalized_on_the_wire() {
+        let session = LlmSession::new();
+        let context = LlmContext::default();
+        let mut request = LlmRequest::new("m");
+        request.max_tokens = Some(0);
+        let wire = OpenAiVendor::wire_preview(&request, &session, &context);
+        assert_eq!(
+            wire["max_tokens"],
+            crate::llm::vendor::DEFAULT_COMPLETION_CAP,
+            "a zero cap means the engine default, not a rejected request"
+        );
+
+        request.temperature = Some(3.0);
+        let wire = OpenAiVendor::wire_preview(&request, &session, &context);
+        assert_eq!(wire["temperature"], 2.0, "the accepted ceiling");
+
+        request.temperature = Some(f32::NAN);
+        let wire = OpenAiVendor::wire_preview(&request, &session, &context);
+        assert!(
+            wire.get("temperature").is_none(),
+            "a non-finite temperature cannot be serialized, so it is omitted"
+        );
     }
 
     #[test]

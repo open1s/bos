@@ -228,14 +228,14 @@ schema_version = 1
 [agent]
 system_prompt = "…"
 complete = false               # true: system_prompt IS the whole system prompt
-temperature = 0.3              # ABSENT means inherit. 0.0 is a real value.
+temperature = 0.3              # ABSENT uses the coding default (0.2). 0.0 is a real value.
 reasoning_effort = "high"      # absent inherits; the model node may declare one
 permission = "workspace-write" # read-only | workspace-write | danger-full-access
 bash_enabled = true
 file_tools_enabled = true
 parallel_tool_calls = false
 memory_enabled = true
-max_tokens = 4096              # absent leaves it to the engine
+max_tokens = 4096              # absent takes the model's cap, else the coding default (16800)
 context_budget = 32768
 llm_timeout_secs = 3600        # one model request: the engine's ceiling AND the wire guard
 llm_max_retries = 3            # retries after the first attempt on a transient failure
@@ -343,6 +343,32 @@ log alone. An id nothing defines **refuses the turn** instead of falling back.
 absent in the workspace inherits. Every one is `Option<T>`, so absence is
 genuinely distinguishable from a value. The old `0.0`-and-`""` sentinel scheme
 is gone.
+
+**Sampling reaches the wire.** `temperature` and `max_tokens` are resolved once
+and carried on every request. An unconfigured workspace sends the CODING
+defaults - temperature `0.2` and a reply cap of `16,800` - rather than the
+framework's chat `0.7` and an implicit 12.8k: coding wants the same edit from
+the same prompt, and the cap leaves about 46% of the shipped 32k window
+(14,944 tokens) for the code being read. Precedence for the cap is the reader's value,
+then a model leaf's declared cap, then the coding default; the temperature has
+only the reader's value and the default.
+
+Three normalizations make a stored preference a request a provider accepts
+rather than a failed turn: a non-finite temperature (`nan`) is no opinion and
+resolves as absent; a temperature above the provider's range is bounded at the
+adapter (2.0 for the OpenAI-compatible wires, 1.0 for Anthropic Messages, which
+also omits it while extended thinking is on); and a `max_tokens` of `0` is not a
+cap, because no endpoint accepts one - it reads as "unset" and the next level
+(model cap, then coding default) takes over.
+
+**A value that cannot be read refuses the save.** Save commits the document
+atomically: a temperature outside 0 to 2 or a cap that is not a count stops the
+commit, keeps the draft, and shows the reason in the dialog footer - instead of
+leaving the stored number in force while the field displays the new text. Counts
+accept the digit grouping the docs use (`12,800`), and `0` in the cap field means
+"no cap of my own". A save triggered by a panel control (the diff-mode toggle, a
+launcher switch) does not read the dialog's fields at all, so text abandoned by
+closing the dialog can never take effect later.
 
 **MCP servers** are LISTS, merged: the global list is the machine's, the
 workspace's is the project's; a workspace entry with the same name wins. An

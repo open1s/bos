@@ -111,6 +111,39 @@ pub(crate) fn stream_error(e: reqwest::Error) -> crate::llm::LlmError {
 /// private literal in the vendor made that comparison impossible.
 pub const DEFAULT_COMPLETION_CAP: u32 = 12_800;
 
+/// The cap a request names, after the spellings that mean "no cap" are removed.
+///
+/// `None` leaves the vendor's own default in charge, and so does `0`: no
+/// provider accepts `max_tokens: 0`, so sending it turns "the reader named no
+/// cap" into a rejected request. The engine normalizes the same way through
+/// [`effective_completion_cap`], which is what makes a streamed reply that
+/// stopped at the cap recognizable.
+pub fn named_completion_cap(max_tokens: Option<u32>) -> Option<u32> {
+    max_tokens.filter(|cap| *cap > 0)
+}
+
+/// The completion cap a request actually carries: the named one, or the default.
+///
+/// The engine has to read the same number the vendor sends, because a stream
+/// carries no `finish_reason`: a reply that stopped at the cap is recognized by
+/// comparing its completion count with this value.
+pub fn effective_completion_cap(max_tokens: Option<u32>) -> u32 {
+    named_completion_cap(max_tokens).unwrap_or(DEFAULT_COMPLETION_CAP)
+}
+
+/// A sampling temperature bounded to a provider's accepted range.
+///
+/// A non-finite value cannot be serialized onto the wire at all (JSON has no
+/// NaN or infinity), and a provider rejects one outside its own range, so the
+/// reader's number is bounded to what the endpoint accepts instead of failing
+/// the whole request. `max` is the provider's documented ceiling: 2.0 for the
+/// OpenAI-compatible wires, 1.0 for Anthropic Messages.
+pub fn sampling_temperature(temperature: Option<f32>, max: f32) -> Option<f32> {
+    temperature
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, max))
+}
+
 /// Whether full wire bodies are opted into the log.
 ///
 /// The full payload of every request and response used to ride the log for

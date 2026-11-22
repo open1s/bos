@@ -1838,9 +1838,7 @@ impl<A: ReActApp> ReActEngine<A> {
                 // than reported as the answer. The cap is the one the request
                 // actually carried, which is not always the engine's own field:
                 // the vendor supplies the default.
-                let cap = request
-                    .max_tokens
-                    .unwrap_or(crate::llm::vendor::DEFAULT_COMPLETION_CAP);
+                let cap = crate::llm::vendor::effective_completion_cap(request.max_tokens);
                 if cut_short(Some(cap), step_completion)
                     && !closing
                     && !saw_tool_call

@@ -91,6 +91,13 @@ fn parse_capacity(text: &str) -> Option<usize> {
         'm' | 'M' => (&trimmed[..trimmed.len() - 1], 1024 * 1024),
         _ => (trimmed, 1),
     };
+    // A count copied from the docs or a log carries digit grouping ("12,800").
+    // Grouping is punctuation, not a value, so it is dropped before the parse;
+    // anything else that is not a number stays a refusal.
+    let digits: String = digits
+        .chars()
+        .filter(|character| *character != ',' && *character != '_')
+        .collect();
     digits.trim().parse::<usize>().ok()?.checked_mul(scale)
 }
 
@@ -208,7 +215,8 @@ pub(crate) struct SettingsInputs {
     /// Retries after the first attempt on a transient provider failure.
     pub(crate) retries: Entity<InputState>,
     shell_timeout: Entity<InputState>,
-    max_tokens: Entity<InputState>,
+    /// The cap on completion tokens per turn; empty means no cap of our own.
+    pub(crate) max_tokens: Entity<InputState>,
     /// The project's own verification command, empty when it has none.
     verify_command: Entity<InputState>,
     /// The local web-search endpoint (the Search API base).
@@ -258,7 +266,7 @@ impl SettingsInputs {
             cx,
         );
         // The STORED value, not the resolved one: a blank field means "the
-        // engine's default", which is a different fact from 0.7 copied in.
+        // coding default", which is a different fact from 0.2 copied in.
         set(
             &self.temperature,
             settings
@@ -293,9 +301,15 @@ impl SettingsInputs {
             window,
             cx,
         );
+        // The STORED value, like the temperature above: blank means "no cap
+        // of my own", which is what lets the model's declared cap (and then
+        // the coding default) decide. Showing the resolved number here would
+        // copy the model's own cap into this workspace on the next save.
         set(
             &self.max_tokens,
-            effective
+            settings
+                .workspace
+                .agent
                 .max_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_default(),
@@ -317,7 +331,15 @@ impl SettingsInputs {
     }
 
     /// Write the fields back into the draft.
-    pub(crate) fn read(&self, settings: &mut Settings, cx: &App) {
+    ///
+    /// The two sampling fields REFUSE text they cannot read rather than
+    /// silently keeping the old number: the returned keys are the reasons, in
+    /// field order, and an empty list is a save that read every field. The
+    /// caller stops the commit on the first one and shows it, so "I changed the
+    /// temperature and nothing happened" cannot again be the reader's only
+    /// clue.
+    pub(crate) fn read(&self, settings: &mut Settings, cx: &App) -> Vec<&'static str> {
+        let mut refused = Vec::new();
         settings.workspace.agent.system_prompt = self.system_prompt.read(cx).value().to_string();
         let budget = self.budget.read(cx).value().trim().to_string();
         if let Some(parsed) = parse_capacity(&budget) {
@@ -332,8 +354,17 @@ impl SettingsInputs {
         let temperature = self.temperature.read(cx).value().trim().to_string();
         if temperature.is_empty() {
             settings.workspace.agent.temperature = None;
-        } else if let Ok(parsed) = temperature.parse::<f32>() {
-            settings.workspace.agent.temperature = Some(parsed.clamp(0.0, 2.0));
+        } else {
+            // "NaN" parses as a float but cannot be serialized onto the wire,
+            // and a number outside 0 to 2 is not a sampling value the engine
+            // honours, so neither is stored and neither is silently clamped:
+            // the save says what the field needs.
+            match temperature.parse::<f32>() {
+                Ok(parsed) if parsed.is_finite() && (0.0..=2.0).contains(&parsed) => {
+                    settings.workspace.agent.temperature = Some(parsed);
+                }
+                _ => refused.push("settings.temperatureInvalid"),
+            }
         }
         let retries = self.retries.read(cx).value().trim().to_string();
         if let Ok(parsed) = retries.parse::<u32>() {
@@ -348,8 +379,19 @@ impl SettingsInputs {
         let tokens = self.max_tokens.read(cx).value().trim().to_string();
         if tokens.is_empty() {
             settings.workspace.agent.max_tokens = None;
-        } else if let Some(parsed) = parse_capacity(&tokens) {
-            settings.workspace.agent.max_tokens = Some(parsed.min(u32::MAX as usize) as u32);
+        } else {
+            match parse_capacity(&tokens) {
+                // Zero is not an output cap. Storing "none" is the same fact
+                // the request will carry; storing 0 would reach an endpoint as
+                // `max_tokens: 0`, which every provider rejects.
+                Some(0) => settings.workspace.agent.max_tokens = None,
+                Some(parsed) if parsed <= u32::MAX as usize => {
+                    settings.workspace.agent.max_tokens = Some(parsed as u32);
+                }
+                // A count too large for the wire is as unreadable as a word:
+                // clamping it would send a value the reader never typed.
+                _ => refused.push("settings.maxOutputTokensInvalid"),
+            }
         }
         let base = self.web_search_base.read(cx).value().trim().to_string();
         settings.global.web_search.base_url = if base.is_empty() {
@@ -365,6 +407,7 @@ impl SettingsInputs {
             settings.global.web_search.results_per_search =
                 parsed.clamp(1, crate::web::MAX_RESULTS);
         }
+        refused
     }
 }
 
@@ -7899,6 +7942,16 @@ impl Shell {
                 Field::Temperature,
                 cx,
             ),
+            // The reply cap sits with the sampling number it is read beside:
+            // both describe one request's answer. Blank means "no cap of my
+            // own", so the model's declared cap, then the engine's, decides.
+            self.input_row(
+                "settings.maxOutputTokens",
+                Some("settings.maxOutputTokensHint"),
+                &self.settings_inputs.max_tokens,
+                Field::MaxTokens,
+                cx,
+            ),
             self.input_row(
                 "settings.retriesTitle",
                 Some("settings.retriesHint"),
@@ -7964,11 +8017,11 @@ impl Shell {
             },
         ];
         // The persona contract shapes the request, so it sits with the numbers
-        // above it and the switches follow. It also keeps the primary behaviour
-        // control above the pane's fold at the reference window size: the
-        // request fields and their hint lines pushed it out of the viewport,
-        // where its switch was still laid out but no longer reachable without
-        // scrolling.
+        // above it and the switches follow. It takes the slot right after the
+        // reply cap, before the retry budget, so the primary behaviour control
+        // stays above the pane's fold at the reference window size: the request
+        // fields and their hint lines put it 33px past the visible box when it
+        // sat below the retries row, where a click was silently a no-op.
         rows.splice(3..3, self.persona_help_rows(cx));
         ("settings.agent-loop", "settings.agentLoopHint", rows)
     }
@@ -13853,26 +13906,20 @@ impl Shell {
     }
 
     /// Context: the send-side ceiling.
+    ///
+    /// The reply's own cap lives with the sampling number in the Agent loop
+    /// pane: it bounds one answer, not the window history is folded into.
     fn section_context(
         &self,
         cx: &mut Context<Shell>,
     ) -> (&'static str, &'static str, Vec<AnyElement>) {
-        let rows = vec![
-            self.input_row(
-                "settings.budget",
-                None,
-                &self.settings_inputs.budget,
-                Field::Budget,
-                cx,
-            ),
-            self.input_row(
-                "settings.maxOutputTokens",
-                None,
-                &self.settings_inputs.max_tokens,
-                Field::MaxTokens,
-                cx,
-            ),
-        ];
+        let rows = vec![self.input_row(
+            "settings.budget",
+            None,
+            &self.settings_inputs.budget,
+            Field::Budget,
+            cx,
+        )];
         ("settings.context", "settings.contextHint", rows)
     }
 

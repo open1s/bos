@@ -4070,11 +4070,12 @@ impl AppState {
         // The reference reserves the reply before it decides: `W - O - B`.
         // bsh used to compare against the whole window, so a 32k workspace
         // ceiling let a 31k prompt through even though the request also asked
-        // for up to 12.8k output tokens.
+        // for a reply cap - the coding default (16.8k) when nothing was
+        // configured, and whatever the reader set when something was.
         let output_reserve = effective
             .max_tokens
             .map(|tokens| tokens as usize)
-            .unwrap_or(12_800);
+            .unwrap_or(crate::settings::CODING_MAX_TOKENS as usize);
         let ceiling = budget
             .saturating_sub(output_reserve.saturating_add(1_024))
             .min(budget / 5 * 4)

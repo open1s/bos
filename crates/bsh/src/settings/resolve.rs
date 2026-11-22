@@ -82,6 +82,12 @@ pub(crate) struct Connection {
     pub(crate) api_mode: Option<String>,
     /// Declared input types; none is undeclared, which reads as permissive.
     pub(crate) input_types: Option<Vec<String>>,
+    /// The model's own output cap, when its leaf declares one.
+    ///
+    /// A package or a hand-written leaf states what the model can emit; the
+    /// workspace says what the reader wants here. Keeping it on the connection
+    /// is what lets the resolution fold the two without a second lookup.
+    pub(crate) max_tokens: Option<u32>,
 }
 
 /// Why a turn cannot be sent.
@@ -472,9 +478,10 @@ pub(crate) struct Resolution {
     pub(crate) system_prompt: String,
     /// Reasoning effort, after the workspace's own override.
     pub(crate) reasoning_effort: Option<String>,
-    /// Sampling temperature; none leaves it to the engine.
+    /// Sampling temperature; none takes the coding default.
     pub(crate) temperature: Option<f32>,
-    /// Completion cap; none leaves it to the engine.
+    /// Completion cap; none takes the model's declared cap, then the coding
+    /// default.
     pub(crate) max_tokens: Option<u32>,
     /// Run one turn's tool calls concurrently.
     pub(crate) parallel_tool_calls: bool,
@@ -631,11 +638,17 @@ pub(crate) fn resolve_with_catalogue(
     };
 
     // The model node describes the model; the workspace says what it wants here.
-    let declared_effort = match &model {
-        ModelChoice::Found { reference, .. } => global
-            .lookup(reference)
-            .and_then(|(_, leaf)| leaf.reasoning_effort.clone()),
-        _ => None,
+    let (declared_effort, declared_cap) = match &model {
+        ModelChoice::Found {
+            reference,
+            connection,
+        } => (
+            global
+                .lookup(reference)
+                .and_then(|(_, leaf)| leaf.reasoning_effort.clone()),
+            connection.max_tokens.filter(|cap| *cap > 0),
+        ),
+        _ => (None, None),
     };
 
     // One permission resolution for this fold. The chip, the policy data and
@@ -719,8 +732,21 @@ pub(crate) fn resolve_with_catalogue(
         system_prompt: workspace.agent.system_prompt.clone(),
         persona_complete,
         reasoning_effort: workspace.agent.reasoning_effort.clone().or(declared_effort),
-        temperature: workspace.agent.temperature,
-        max_tokens: workspace.agent.max_tokens,
+        // A non-finite temperature cannot be serialized onto the wire at all,
+        // so "NaN" reads as "no opinion" rather than failing every request.
+        temperature: workspace
+            .agent
+            .temperature
+            .filter(|value| value.is_finite()),
+        // The reader's own cap wins; a model that declares one supplies it when
+        // the workspace names none. A zero is not a cap - no provider accepts
+        // "max_tokens: 0" - so it reads as unset at both levels instead of
+        // reaching the wire as a rejected request.
+        max_tokens: workspace
+            .agent
+            .max_tokens
+            .filter(|cap| *cap > 0)
+            .or(declared_cap),
         parallel_tool_calls: workspace.agent.parallel_tool_calls,
         permission,
         sandbox,
@@ -1068,6 +1094,7 @@ fn choose_model(global: &GlobalSettings, session_model: Option<&ModelRef>) -> Mo
                     .clone()
                     .or_else(|| global.family_protocol_of(&reference.provider).into()),
                 input_types: leaf.input_types.clone(),
+                max_tokens: leaf.max_tokens,
             },
         },
         None => ModelChoice::Missing { reference },
@@ -1341,6 +1368,72 @@ mcp_servers = [
             "0.0 is greedy decoding, which is why it is not an absence"
         );
         assert_eq!(r.max_tokens, None, "an absent cap stays absent");
+    }
+
+    /// A leaf that declares its own output cap is describing the model, so an
+    /// absent workspace cap takes that number instead of the coding default.
+    /// The reader's own value still wins: it is an instruction about THIS
+    /// project, not a fact about the model.
+    #[test]
+    fn a_declared_output_cap_fills_an_absent_workspace_cap() {
+        let mut g = global();
+        g.providers
+            .get_mut("nvidia")
+            .expect("the fixture provider")
+            .models
+            .get_mut("glm")
+            .expect("the fixture model")
+            .max_tokens = Some(8192);
+
+        let r = resolve(&g, &workspace(), Some(&entry()), &choice("nvidia", "glm"));
+        assert_eq!(
+            r.max_tokens,
+            Some(8192),
+            "the model's own cap is what an absent workspace cap resolves to"
+        );
+
+        let wanted = WorkspaceSettings::from_toml("[agent]\nmax_tokens = 2048\n").expect("parses");
+        let r = resolve(&g, &wanted, Some(&entry()), &choice("nvidia", "glm"));
+        assert_eq!(
+            r.max_tokens,
+            Some(2048),
+            "the project's own number beats the model's note"
+        );
+    }
+
+    /// Zero is not an output cap: no provider accepts `max_tokens: 0`, so the
+    /// field's zero reads as "unset" at both levels rather than reaching the
+    /// wire as a rejected request.
+    #[test]
+    fn a_zero_output_cap_is_not_a_cap() {
+        let zero = WorkspaceSettings::from_toml("[agent]\nmax_tokens = 0\n").expect("parses");
+        let r = resolve(&global(), &zero, Some(&entry()), &choice("nvidia", "glm"));
+        assert_eq!(r.max_tokens, None, "an absent cap, not a cap of zero");
+
+        let mut g = global();
+        g.providers
+            .get_mut("nvidia")
+            .expect("the fixture provider")
+            .models
+            .get_mut("glm")
+            .expect("the fixture model")
+            .max_tokens = Some(8192);
+        let r = resolve(&g, &zero, Some(&entry()), &choice("nvidia", "glm"));
+        assert_eq!(
+            r.max_tokens,
+            Some(8192),
+            "a zero in the workspace does not hide the model's own cap"
+        );
+    }
+
+    /// A temperature that is not a finite number is no sampling value at all:
+    /// it cannot be serialized onto the wire, so it resolves as "no opinion"
+    /// and the coding default is used instead.
+    #[test]
+    fn a_non_finite_temperature_is_no_opinion() {
+        let broken = WorkspaceSettings::from_toml("[agent]\ntemperature = nan\n").expect("parses");
+        let r = resolve(&global(), &broken, Some(&entry()), &choice("nvidia", "glm"));
+        assert_eq!(r.temperature, None);
     }
 
     #[test]

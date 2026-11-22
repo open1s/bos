@@ -788,6 +788,14 @@ pub(crate) struct FilesPane {
     /// The directories the reader has expanded, relative to the root, in the
     /// order they were opened so the chevrons never reshuffle under a hand.
     pub(crate) expanded: Vec<PathBuf>,
+    /// The directories the reader explicitly closed, relative to the root.
+    ///
+    /// A directory that contains a change is expanded automatically so the
+    /// reader can see it, and a watcher refresh re-runs that expansion for
+    /// every event. Without a record of the reader's own collapse, a folder
+    /// WITH changes could never be closed: the next event reopened it. These
+    /// marks are the reader's intent and win over every automatic expansion.
+    pub(crate) collapsed: Vec<PathBuf>,
     /// Each expanded directory's listing, cached so a keystroke never walks
     /// the filesystem and a failed listing still shows what was there.
     pub(crate) children: HashMap<PathBuf, Vec<files::Row>>,
@@ -1003,6 +1011,7 @@ impl FilesPane {
         Self {
             roots: Vec::new(),
             expanded: Vec::new(),
+            collapsed: Vec::new(),
             children: HashMap::new(),
             error: None,
             hidden: false,
@@ -7035,6 +7044,12 @@ impl Shell {
                                     .on_click(cx.listener(|this, _event, _window, cx| {
                                         this.files.changed_only = !this.files.changed_only;
                                         if this.files.changed_only {
+                                            // Asking to see changes is an explicit
+                                            // request: it overrides a collapse for the
+                                            // folders that hold one, so the filter
+                                            // cannot hide the rows it exists to show.
+                                            // A later collapse is remembered again.
+                                            this.files.collapsed.clear();
                                             this.expand_changed_dirs();
                                         }
                                         this.refresh_files(cx);
@@ -10658,6 +10673,7 @@ impl Shell {
         self.files.tabs.clear();
         self.files.active = None;
         self.files.expanded.clear();
+        self.files.collapsed.clear();
         self.files.children.clear();
         self.files.roots.clear();
         self.files.vcs_rollups.clear();
@@ -10817,6 +10833,10 @@ impl Shell {
     /// Expand every existing directory that contains a visible change.
     /// Returns whether the expansion changed, so a status landing can trigger
     /// one listing refresh without starting a status loop.
+    ///
+    /// A directory the reader closed is skipped: watcher refreshes and status
+    /// landings run this on every event, and reopening a closed branch each
+    /// time is what made a folder with changes impossible to collapse.
     pub(crate) fn expand_changed_dirs(&mut self) -> bool {
         let Some(root) = self.state.workspace_root() else {
             return false;
@@ -10834,6 +10854,9 @@ impl Shell {
         dirs.dedup();
         let mut changed = false;
         for dir in dirs {
+            if self.files.collapsed.contains(&dir) {
+                continue;
+            }
             if !self.files.expanded.contains(&dir) {
                 self.files.expanded.push(dir);
                 changed = true;
@@ -10895,6 +10918,7 @@ impl Shell {
             self.files.roots.clear();
             self.files.children.clear();
             self.files.expanded.clear();
+            self.files.collapsed.clear();
             self.files.notes = crate::notes::Notes::default();
             self.files.error = None;
             cx.notify();
@@ -10954,8 +10978,18 @@ impl Shell {
     pub(crate) fn toggle_dir(&mut self, rel: &Path, cx: &mut Context<Self>) {
         if let Some(index) = self.files.expanded.iter().position(|p| p == rel) {
             self.files.expanded.remove(index);
+            // Record the reader's own decision, so an automatic expansion on
+            // a later change does not reopen the branch under their hand.
+            if !self.files.collapsed.iter().any(|p| p == rel) {
+                self.files.collapsed.push(rel.to_path_buf());
+            }
             cx.notify();
             return;
+        }
+        // Reopening clears the mark: from here on an automatic expansion may
+        // touch this branch again.
+        if let Some(index) = self.files.collapsed.iter().position(|p| p == rel) {
+            self.files.collapsed.remove(index);
         }
         let already_listed = self.files.children.contains_key(rel);
         if !already_listed {

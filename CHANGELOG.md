@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+- **A fresh workspace samples for coding.** With no `temperature` and no reply
+  cap configured, every request now sends BSH's coding defaults - temperature
+  `0.2` and `max_tokens: 16800` - instead of the framework's chat `0.7` (which
+  let two runs of one edit differ) and the vendor's implicit 12.8k (which
+  reserved more of the window than the code being read could spare; 16,800 keeps
+  about 46% of the shipped 32k window for the prompt). Precedence is
+  unchanged: the reader's values win, then a model leaf's declared cap, then the
+  coding default. Both pane hints and the settings spec now name those numbers,
+  and a build test pins the config a fresh workspace produces.
+
+- **A folder that holds a change still collapses (Files pane).** The tree opens
+  a directory that contains a change so the reader can see it, and every watcher
+  refresh re-ran that expansion from the status snapshot - so a folder with
+  changes reopened on the next event and could not be closed at all in a busy
+  workspace. Directories the reader closes are now remembered and skipped by the
+  automatic expansion; a fresh press of the Changed filter still reveals them
+  (that press is an explicit request for the rows), and reopening a branch by
+  hand clears its mark. A regression test drives a real git working copy, closes
+  the changed folder, refreshes the way the watcher does, and pairs the
+  assertion with the Changed filter reopening it, so the test cannot pass by
+  expansion being dead.
+
+- **The sampling settings reach the wire, and only with values a provider
+  accepts.** `temperature` and `max_tokens` are resolved once and carried on
+  every request, but three paths could send something else. A model leaf that
+  declared its own `max_tokens` was stored and never used, so the request fell
+  back to the engine's 12,800 default (a package's "this model emits at most N"
+  was dead data); the workspace's value now wins, the leaf's value fills an
+  absent workspace cap, and the engine's default is last. A stored `0` was sent
+  verbatim as `max_tokens: 0`, which every endpoint rejects, and was also
+  invisible to the truncation guard; `0` now reads as "unset" at the settings
+  field, in resolution, and in all three adapters, so the request carries the
+  default the engine compares against. A non-finite `temperature` (`nan`
+  parses as a float) could not be serialized at all and failed the whole
+  request; it now resolves as "no opinion", and an out-of-range value is bounded
+  where the wire requires it (2.0 for OpenAI-compatible, 1.0 for Anthropic
+  Messages, which omits it entirely while extended thinking is on). The pane
+  follows the same grouping: `Max output tokens` now sits beside `Temperature`
+  in the Agent loop pane (it was under Context), and the complete-persona
+  switch keeps the slot above the retry budget so it stays reachable at the
+  reference window size. Tests pin the settings -> agent config -> typed
+  request -> wire chain, and the field's pane.
+
+- **The sampling pane fields take effect, or say why not.** Save now commits the
+  typed `Temperature` and `Max output tokens` into the settings the next turn is
+  built from, and a test drives that whole path (field -> committed document ->
+  the agent's config). Two ways a value could silently fail to take effect are
+  closed. A value the field cannot read - a word, a temperature outside 0 to 2,
+  a count too large for the wire - now refuses the save with the reason shown in
+  the dialog, instead of keeping the stored number while the field displayed
+  the new text. And a save from a panel control (the diff-mode toggle, a
+  launcher switch) no longer reads the dialog's fields, so text abandoned by
+  closing the dialog can never be committed later. Counts accept digit grouping
+  (`12,800`), matching the docs' own spelling.
+
 - **A large MCP roster stays discoverable through `find_tool`.** Above the
   gateway threshold (12 tools) the build registered only the `mcp` gateway, so
   the per-server tools were in no catalogue at all: a search for the server or

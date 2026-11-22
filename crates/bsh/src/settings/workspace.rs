@@ -93,7 +93,7 @@ pub(crate) struct AgentSection {
     /// default, because the slot composition is what keeps a workspace prompt
     /// from silently dropping the agent's operating rules.
     pub(crate) complete: bool,
-    /// Sampling temperature; absent inherits the engine's default.
+    /// Sampling temperature; absent uses the coding default (0.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) temperature: Option<f32>,
     /// Reasoning effort; absent inherits the engine's default.
@@ -128,7 +128,8 @@ pub(crate) struct AgentSection {
     /// independent of this switch.
     #[serde(default)]
     pub(crate) memory_capture: bool,
-    /// Completion cap; absent leaves it to the engine.
+    /// Completion cap; absent takes the model's declared cap, then the coding
+    /// default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
     /// Send-side token ceiling; 0 disables compaction.
@@ -317,10 +318,11 @@ extensions = ["plan"]
 
     /// The shipped agent defaults have to pay for the reply they reserve.
     ///
-    /// The compaction trigger is `budget - output_reserve - headroom`, so a
-    /// 32k ceiling with a 12.8k cap left only ~19k usable and compacted in the
-    /// middle of a research turn. A default that cannot hold its own reserve is
-    /// a defect, not a preference.
+    /// The compaction trigger is `budget - output_reserve - headroom`, so the
+    /// reply reservation must leave the prompt a real share of the window. The
+    /// coding default (16,800 with no cap configured) leaves about 46% of the
+    /// shipped 32k ceiling; a cap that consumed the window would be a defect,
+    /// not a preference.
     #[test]
     fn the_shipped_agent_defaults_leave_room_for_the_reply() {
         let agent = AgentSection::default();
@@ -328,12 +330,17 @@ extensions = ["plan"]
             agent.parallel_tool_calls,
             "a batch the prompt asks for must run concurrently"
         );
-        let reserve = agent.max_tokens.unwrap_or(12_800) as usize;
+        let reserve = agent
+            .max_tokens
+            .unwrap_or(crate::settings::CODING_MAX_TOKENS) as usize;
+        // The send-side ceiling is `budget - reserve - headroom`, the same
+        // arithmetic state.rs::compaction_retain applies; it must keep at least
+        // two fifths of the window for the prompt.
+        let prompt_room = agent.context_budget.saturating_sub(reserve + 1_024);
         assert!(
-            agent.context_budget > reserve * 2,
-            "the ceiling ({} tokens) must be more than twice the reply reserve ({} tokens)",
-            agent.context_budget,
-            reserve
+            prompt_room * 5 >= agent.context_budget * 2,
+            "the prompt keeps at least two fifths of the window: {prompt_room} of {} tokens",
+            agent.context_budget
         );
     }
 

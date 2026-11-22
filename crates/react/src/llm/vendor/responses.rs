@@ -687,9 +687,11 @@ pub fn build_request(
         instructions,
         input,
         tools,
-        temperature: req.temperature,
+        // A non-finite or out-of-range temperature would fail the whole body,
+        // and a zero cap would make "no cap named" an invalid request.
+        temperature: crate::llm::vendor::sampling_temperature(req.temperature, 2.0),
         top_p: req.top_p,
-        max_output_tokens: req.max_tokens,
+        max_output_tokens: crate::llm::vendor::named_completion_cap(req.max_tokens),
         reasoning: req.reasoning_effort.and_then(|effort| {
             // OpenAI's Responses effort has no portable "off" value; omit the
             // block there. DeepSeek accepts `none` and uses it to disable
@@ -1502,6 +1504,47 @@ mod tests {
             }
             other => panic!("expected a reasoning item, got {other:?}"),
         }
+    }
+
+    /// The Responses wire carries the same two numbers the reader set, under
+    /// its own field names, and never a zero cap or a non-finite temperature.
+    #[test]
+    fn the_responses_wire_carries_the_reader_sampling() {
+        let req = LlmRequest {
+            model: "gpt-5".to_string(),
+            input: Content::text("hi"),
+            temperature: Some(0.4),
+            max_tokens: Some(512),
+            ..LlmRequest::new("gpt-5")
+        };
+        let built = build_request(
+            None,
+            &req,
+            &LlmSession::new(),
+            &LlmContext::default(),
+            false,
+            true,
+            true,
+        );
+        assert_eq!(built.temperature, Some(0.4));
+        assert_eq!(built.max_output_tokens, Some(512));
+
+        let zero = LlmRequest {
+            temperature: Some(f32::NAN),
+            max_tokens: Some(0),
+            ..req
+        };
+        let built = build_request(
+            None,
+            &zero,
+            &LlmSession::new(),
+            &LlmContext::default(),
+            false,
+            true,
+            true,
+        );
+        assert_eq!(built.temperature, None);
+        assert_eq!(built.max_output_tokens, None);
     }
 
     #[test]

@@ -3302,13 +3302,27 @@ impl Shell {
     /// the field values - never from `Settings::default()`, which would wipe
     /// every pane the fields do not cover.
     pub(crate) fn save_settings(&mut self, cx: &mut Context<Self>) {
-        let mut draft = self
-            .state
-            .draft
-            .clone()
-            .unwrap_or_else(|| self.state.settings.clone());
-        self.settings_inputs.read(&mut draft, cx);
-        self.state.draft = Some(draft);
+        // The dialog's fields are the draft's source of truth only while a
+        // draft exists. A save from a panel control (the diff-mode toggle, a
+        // launcher switch) runs with no dialog open and has already written the
+        // committed tree itself, so the inputs must not be read: that would
+        // resurrect text from a visit the reader cancelled - or let abandoned
+        // text refuse a save it has nothing to do with.
+        let dialog_open = self.state.draft.is_some();
+        if let Some(mut draft) = self.state.draft.clone() {
+            let refused = self.settings_inputs.read(&mut draft, cx);
+            self.state.draft = Some(draft);
+            // A field the save could not read stops the commit and says why.
+            // The draft is kept, so the reader fixes that one field and presses
+            // Save again; committing the rest while the typed number
+            // disappeared is exactly what made "I set it and nothing changed"
+            // invisible.
+            if let Some(&key) = refused.first() {
+                self.toast_settings(crate::i18n::tr(self.state.lang, key).to_string(), true, cx);
+                cx.notify();
+                return;
+            }
+        }
         match self.state.commit_settings() {
             Ok(()) => {
                 self.preset_editor = None;
@@ -3337,6 +3351,13 @@ impl Shell {
                 );
             }
             Err(error) => {
+                // A panel control's refused write leaves no draft behind: with
+                // no dialog open there is nothing for the fields to feed, and a
+                // draft a refused write restored would make the NEXT panel save
+                // read a cancelled visit's text.
+                if !dialog_open {
+                    self.state.draft = None;
+                }
                 // The inline error beside the developer-tools row and the
                 // footer confirmation say the same thing, so a file that could
                 // not be written is visible where the reader was looking. The

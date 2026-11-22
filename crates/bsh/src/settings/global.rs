@@ -1141,7 +1141,8 @@ pub(crate) struct ModelEntry {
     /// Display name. Absent shows the model id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<String>,
-    /// Output cap for this model. Absent leaves it to the engine.
+    /// Output cap for this model. Absent leaves the workspace's value - and
+    /// then the coding default - in charge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
     /// The wire protocol; absent uses the engine's own default.

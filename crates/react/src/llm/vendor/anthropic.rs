@@ -456,7 +456,10 @@ impl AnthropicVendor {
                 }
             }
         });
-        let mut max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        // The Messages API requires a positive cap, so a zero reads as "no cap
+        // named" and gets this vendor's default instead of a rejected body.
+        let mut max_tokens = crate::llm::vendor::named_completion_cap(request.max_tokens)
+            .unwrap_or(DEFAULT_MAX_TOKENS);
         if let Some(budget_tokens) = thinking
             .as_ref()
             .and_then(|thinking| thinking.budget_tokens)
@@ -476,10 +479,13 @@ impl AnthropicVendor {
                 Some(system_parts.join("\n"))
             },
             messages,
+            // Messages accepts 0.0..=1.0 only, and extended thinking requires
+            // the provider's default, so the reader's number is either bounded
+            // to the accepted range or omitted.
             temperature: if thinking_on {
                 None
             } else {
-                request.temperature
+                crate::llm::vendor::sampling_temperature(request.temperature, 1.0)
             },
             top_p: if thinking_on { None } else { request.top_p },
             tools: if tools.is_empty() { None } else { Some(tools) },
@@ -1010,6 +1016,31 @@ mod tests {
         let capped = vendor.build_request(&None, &request(Some(64)), &(), &());
         assert_eq!(capped.max_tokens, 64);
         assert!(capped.system.is_none());
+    }
+
+    /// Messages accepts a temperature of 0.0..=1.0. A reader's larger number is
+    /// bounded to the ceiling instead of producing a body the endpoint refuses,
+    /// and a name that is not a number at all is omitted.
+    #[test]
+    fn a_temperature_is_bounded_to_the_messages_range() {
+        let vendor = vendor();
+        let mut hot = request(Some(512));
+        hot.temperature = Some(1.5);
+        let body = vendor.build_request(&None, &hot, &(), &());
+        assert_eq!(body.temperature, Some(1.0), "clamped to the accepted range");
+
+        let mut broken = request(Some(512));
+        broken.temperature = Some(f32::NAN);
+        let body = vendor.build_request(&None, &broken, &(), &());
+        assert_eq!(body.temperature, None, "a non-finite value is omitted");
+    }
+
+    /// A zero cap is "no cap named": the body carries this vendor's default
+    /// rather than the `max_tokens: 0` Messages rejects.
+    #[test]
+    fn a_zero_cap_falls_back_to_the_vendor_default() {
+        let body = vendor().build_request(&None, &request(Some(0)), &(), &());
+        assert_eq!(body.max_tokens, DEFAULT_MAX_TOKENS);
     }
 
     #[test]

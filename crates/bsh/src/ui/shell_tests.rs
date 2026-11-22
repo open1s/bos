@@ -4152,7 +4152,7 @@ fn the_agent_loop_pane_draws_its_switches(cx: &mut TestAppContext) {
         inputs
             .0
             .update(cx, |state, cx| state.set_value("1800", window, cx));
-        // Cleared means "the engine's default", not a copied-in 0.7.
+        // Cleared means "the coding default", not a copied-in 0.2.
         inputs
             .1
             .update(cx, |state, cx| state.set_value("", window, cx));
@@ -4161,7 +4161,8 @@ fn the_agent_loop_pane_draws_its_switches(cx: &mut TestAppContext) {
             .update(cx, |state, cx| state.set_value("2", window, cx));
         let shell = shell.read(cx);
         let mut draft = shell.state.draft().clone();
-        shell.settings_inputs.read(&mut draft, cx);
+        let refused = shell.settings_inputs.read(&mut draft, cx);
+        assert!(refused.is_empty(), "the pane's own values are readable");
         (
             draft.workspace.agent.llm_timeout_secs,
             draft.workspace.agent.temperature,
@@ -4171,6 +4172,251 @@ fn the_agent_loop_pane_draws_its_switches(cx: &mut TestAppContext) {
     assert_eq!(wait, 1800, "the field writes the workspace's wait");
     assert_eq!(temperature, None, "a cleared temperature inherits again");
     assert_eq!(retries, 2, "and the retry budget is written");
+}
+
+/// The Agent loop pane's output cap is a real field beside the temperature: it
+/// loads the STORED value (blank means "no cap of my own", so the model's
+/// declared cap or the coding default decides), writes a positive count, and
+/// treats `0` as no cap rather than storing a number every provider rejects.
+#[gpui::test]
+fn the_agent_loop_pane_loads_and_writes_the_output_cap(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("agent-loop-cap", 1);
+        state.settings.workspace.agent.max_tokens = Some(2048);
+        state.settings.workspace.agent.temperature = Some(0.4);
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let cap = cx
+        .debug_bounds("field-settings.maxOutputTokens")
+        .expect("the output cap is a field in this pane");
+    let temperature = cx
+        .debug_bounds("field-settings.temperatureTitle")
+        .expect("the temperature is a field in this pane");
+    let retries = cx
+        .debug_bounds("field-settings.retriesTitle")
+        .expect("the retry budget is a field in this pane");
+    assert!(
+        temperature.origin.y < cap.origin.y && cap.origin.y < retries.origin.y,
+        "the cap is drawn right after the temperature: \n{cap:?}\n{temperature:?}\n{retries:?}"
+    );
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let field = cx.update(|_, cx| shell.read(cx).settings_inputs.max_tokens.clone());
+    assert_eq!(
+        cx.update(|_, cx| field.read(cx).value().to_string()),
+        "2048",
+        "the field loads the STORED cap, not the resolved one"
+    );
+    let zero = cx.update(|window, cx| {
+        field.update(cx, |state, cx| state.set_value("0", window, cx));
+        let shell = shell.read(cx);
+        let mut draft = shell.state.draft().clone();
+        let refused = shell.settings_inputs.read(&mut draft, cx);
+        assert!(refused.is_empty(), "0 is a defined value, not a refusal");
+        draft.workspace.agent.max_tokens
+    });
+    assert_eq!(zero, None, "zero is not an output cap");
+    let scaled = cx.update(|window, cx| {
+        field.update(cx, |state, cx| state.set_value("8K", window, cx));
+        let shell = shell.read(cx);
+        let mut draft = shell.state.draft().clone();
+        let refused = shell.settings_inputs.read(&mut draft, cx);
+        assert!(refused.is_empty(), "8K is a count");
+        draft.workspace.agent.max_tokens
+    });
+    assert_eq!(scaled, Some(8192), "a count lands as a count");
+}
+
+/// Saving the two sampling fields is what the NEXT turn is built from: the
+/// typed numbers land in the committed settings and on the agent's config, which
+/// every request then carries.
+///
+/// This is the whole reader-facing promise of the pane. A field that only wrote
+/// the draft, or a build that read a stale tree, would leave the model sampling
+/// exactly as before while every layer below looked correct in isolation.
+#[gpui::test]
+fn the_sampling_fields_take_effect_on_the_built_agent(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let state = state_with_turns("sampling-effective", 1);
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let (temperature, cap) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.settings_inputs.temperature.clone(),
+            shell.settings_inputs.max_tokens.clone(),
+        )
+    });
+    cx.update(|window, cx| {
+        temperature.update(cx, |state, cx| state.set_value("0.25", window, cx));
+        cap.update(cx, |state, cx| state.set_value("2048", window, cx));
+        shell.update(cx, |shell, cx| shell.save_settings(cx));
+    });
+    let settings = cx.update(|_, cx| shell.read(cx).state.settings.clone());
+    assert_eq!(
+        settings.workspace.agent.temperature,
+        Some(0.25),
+        "the typed temperature is the committed workspace value"
+    );
+    assert_eq!(
+        settings.workspace.agent.max_tokens,
+        Some(2048),
+        "and so is the typed reply cap"
+    );
+    let built = crate::caps::build_agent(
+        &settings,
+        &crate::vault::Vault::disabled(),
+        &crate::settings::resolve::SessionChoice::default(),
+        &crate::mcp::McpPool::default(),
+    );
+    let config = built.agent.config();
+    assert_eq!(
+        config.temperature, 0.25,
+        "the next turn's agent samples at the saved number"
+    );
+    assert_eq!(
+        config.max_tokens,
+        Some(2048),
+        "and the next request carries the saved cap"
+    );
+}
+
+/// A value the two sampling fields cannot read refuses the save and says why.
+///
+/// This is the other half of "it takes effect": a save that silently kept the
+/// old number while the field showed the new text left the reader with no way
+/// to tell a working setting from an ignored one.
+#[gpui::test]
+fn an_unreadable_sampling_value_refuses_the_save(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("sampling-refused", 1);
+        state.settings.workspace.agent.temperature = Some(0.4);
+        state.settings.workspace.agent.max_tokens = Some(2048);
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let (temperature, cap) = cx.update(|_, cx| {
+        let shell = shell.read(cx);
+        (
+            shell.settings_inputs.temperature.clone(),
+            shell.settings_inputs.max_tokens.clone(),
+        )
+    });
+    let save = |_window: &mut Window, cx: &mut gpui_kit::App| {
+        shell.update(cx, |shell, cx| shell.save_settings(cx));
+        let shell = shell.read(cx);
+        (
+            shell.state.settings.workspace.agent.temperature,
+            shell.state.settings.workspace.agent.max_tokens,
+            shell
+                .settings_toast
+                .as_ref()
+                .map(|toast| (toast.text.clone(), toast.failed)),
+        )
+    };
+
+    // A word is not a temperature: the commit is refused and the value the
+    // model samples with is still the stored one.
+    let (kept, _, toast) = cx.update(|window, cx| {
+        temperature.update(cx, |state, cx| state.set_value("hot", window, cx));
+        save(window, cx)
+    });
+    assert_eq!(kept, Some(0.4), "the committed temperature is unchanged");
+    let (text, failed) = toast.expect("the refusal is shown");
+    assert!(
+        failed,
+        "the refusal is an error, not a confirmation: {text}"
+    );
+    assert!(
+        text.contains("0 and 2"),
+        "the reason names the accepted range: {text}"
+    );
+
+    // Out of range is refused too: a clamp would send a number nobody typed.
+    let (kept, _, toast) = cx.update(|window, cx| {
+        temperature.update(cx, |state, cx| state.set_value("2.5", window, cx));
+        save(window, cx)
+    });
+    assert_eq!(kept, Some(0.4), "2.5 is outside the engine's range");
+    assert!(toast.is_some_and(|(_, failed)| failed));
+
+    // A cap that is not a count is refused, and the committed cap stays.
+    let (_, kept_cap, toast) = cx.update(|window, cx| {
+        temperature.update(cx, |state, cx| state.set_value("0.4", window, cx));
+        cap.update(cx, |state, cx| state.set_value("lots", window, cx));
+        save(window, cx)
+    });
+    assert_eq!(kept_cap, Some(2048), "the committed cap is unchanged");
+    let (text, failed) = toast.expect("the cap refusal is shown");
+    assert!(failed);
+    assert!(
+        text.contains("positive count"),
+        "the reason names what a cap is: {text}"
+    );
+
+    // Grouped digits are a count, not a word: the docs write "12,800", and a
+    // reader pasting it must get the cap they meant.
+    let (kept, kept_cap, toast) = cx.update(|window, cx| {
+        temperature.update(cx, |state, cx| state.set_value("0.3", window, cx));
+        cap.update(cx, |state, cx| state.set_value("12,800", window, cx));
+        save(window, cx)
+    });
+    assert_eq!(kept, Some(0.3), "a readable temperature commits");
+    assert_eq!(kept_cap, Some(12_800), "a grouped count commits");
+    assert!(
+        !toast.expect("the save confirms").1,
+        "a successful save confirms rather than refuses"
+    );
+}
+
+/// A cancelled visit's text never takes effect later.
+///
+/// The dialog's fields feed a save while its draft exists and not after: a
+/// panel control that saves on its own (the diff-mode toggle, a launcher
+/// switch) must not resurrect a number the reader abandoned by closing the
+/// dialog, and the committed sampling values must survive that save intact.
+#[gpui::test]
+fn a_cancelled_sampling_edit_never_takes_effect(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("sampling-cancelled", 1);
+        state.settings.workspace.agent.temperature = Some(0.4);
+        state.settings.workspace.agent.max_tokens = Some(2048);
+        let shell =
+            cx.new(|cx| Shell::build_for_test(window, section_index("agent-loop"), state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    let temperature = cx.update(|_, cx| shell.read(cx).settings_inputs.temperature.clone());
+    // The reader types a number, then closes the dialog without saving.
+    cx.update(|window, cx| {
+        temperature.update(cx, |state, cx| state.set_value("1.5", window, cx));
+        shell.update(cx, |shell, cx| shell.cancel_settings(cx));
+    });
+    // A panel control saves on its own later.
+    cx.update(|_, cx| shell.update(cx, |shell, cx| shell.save_settings(cx)));
+    let (saved, cap) = cx.update(|_, cx| {
+        let settings = &shell.read(cx).state.settings;
+        (
+            settings.workspace.agent.temperature,
+            settings.workspace.agent.max_tokens,
+        )
+    });
+    assert_eq!(saved, Some(0.4), "the abandoned 1.5 never became a setting");
+    assert_eq!(cap, Some(2048), "and the committed cap is untouched");
 }
 
 /// The Web search pane draws the controls the local tool reads, and its switch
@@ -39250,4 +39496,136 @@ fn the_files_pane_loads_git_status(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let status = cx.update(|_, cx| shell.read(cx).files.vcs.get(Path::new("src/lib.rs")));
     assert_eq!(status, Some(crate::vcs::FileStatus::Modified));
+}
+
+/// A folder that holds a change still collapses, and stays collapsed.
+///
+/// The tree opens a directory that contains a change so the reader can see it,
+/// and the watcher re-runs that expansion after every event. Without a record
+/// of the reader's own collapse, the branch reopened on the next event, so a
+/// folder WITH changes could not be closed at all. The Changed filter is the
+/// deliberate expansion: switching it on reveals those rows again.
+#[gpui::test]
+fn a_changed_folder_still_collapses_and_stays_collapsed(cx: &mut TestAppContext) {
+    use std::path::Path;
+    init_test_app(cx);
+    let root = std::env::temp_dir().join(format!("bsh-vcs-collapse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).expect("root");
+    std::fs::write(root.join("src/lib.rs"), "fn a() {}\n").expect("file");
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "bsh@example.com"],
+        vec!["config", "user.name", "BSH"],
+        vec!["add", "."],
+        vec!["commit", "-qm", "one"],
+    ] {
+        let status = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(&args)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
+    std::fs::write(root.join("src/lib.rs"), "fn a() { 1; }\n").expect("modify");
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store("vcs-collapse-ui"));
+        state.settings.global.general.active_workspace = "vcs-collapse-ui".to_string();
+        state
+            .settings
+            .global
+            .workspaces
+            .push(crate::settings::global::WorkspaceRef {
+                id: "vcs-collapse-ui".to_string(),
+                name: "vcs-collapse-ui".to_string(),
+                root: root.to_string_lossy().to_string(),
+                created_at: 0,
+                updated_at: 0,
+            });
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    // One Files-surface refresh, as a watcher event and the pane's own reload
+    // both perform it.
+    let refresh = |cx: &mut VisualTestContext| {
+        shell.update(cx, |this, cx| {
+            this.right.open = true;
+            this.right.tab = Some(crate::ui::right_panel::RightTab::Files);
+            this.refresh_files(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    let src_open = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            shell
+                .read(cx)
+                .files
+                .expanded
+                .iter()
+                .any(|rel| rel == Path::new("src"))
+        })
+    };
+
+    // The first refresh lists before the status is back; the second runs with
+    // the changed file known, which is the frame that opens its folder.
+    refresh(cx);
+    refresh(cx);
+    assert!(
+        src_open(cx),
+        "a folder with a change opens so the change is visible"
+    );
+    assert!(
+        cx.debug_bounds("file-row-lib.rs").is_some(),
+        "and its changed file renders under it"
+    );
+
+    // The reader closes it.
+    let src = cx.debug_bounds("file-row-src").expect("the src row");
+    cx.simulate_click(src.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(!src_open(cx), "the press closes the branch");
+    assert!(
+        cx.debug_bounds("file-row-lib.rs").is_none(),
+        "and its children go with it"
+    );
+
+    // This refresh is what reopened it before: the status is known, the
+    // automatic expansion runs, and the reader's collapse must still win.
+    refresh(cx);
+    refresh(cx);
+    assert!(
+        !src_open(cx),
+        "a refresh does not reopen a branch the reader closed"
+    );
+    assert!(cx.debug_bounds("file-row-lib.rs").is_none());
+
+    // The Changed filter is the deliberate expansion: asking to see changes
+    // overrules the marks for the folders that hold one.
+    let chip = cx
+        .debug_bounds("files-changed")
+        .expect("the Changed control");
+    cx.simulate_click(chip.center(), Modifiers::default());
+    refresh(cx);
+    assert!(
+        cx.update(|_, cx| shell.read(cx).files.changed_only),
+        "the filter is on"
+    );
+    assert!(
+        src_open(cx),
+        "asking for changes opens the folder that has one"
+    );
+    assert!(cx.debug_bounds("file-row-lib.rs").is_some());
+
+    // And a collapse made under the filter sticks on the next status landing.
+    let src = cx.debug_bounds("file-row-src").expect("the src row");
+    cx.simulate_click(src.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    refresh(cx);
+    assert!(
+        !src_open(cx),
+        "the filter does not reopen it on the next status"
+    );
+    assert!(cx.debug_bounds("file-row-lib.rs").is_none());
 }

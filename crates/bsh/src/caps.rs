@@ -10456,6 +10456,65 @@ mod tests {
         assert_eq!(build(&smaller).agent.config().max_tokens, Some(2048));
     }
 
+    /// A model leaf's declared output cap is the model's own contract, so an
+    /// absent workspace cap sends it. This is the seam a package's
+    /// `max_tokens` travels: declared in the provider tree, honored on the
+    /// request, with the reader's own value still in charge when it exists.
+    ///
+    /// The paired values are all different - the model's 4,096, the reader's
+    /// 2,048 and the coding default of 8,192 - so no assertion can be satisfied
+    /// by the wrong layer winning.
+    #[test]
+    fn a_model_declared_output_cap_reaches_the_agent_config() {
+        let mut settings = bare();
+        settings.global.add_provider(
+            "p",
+            "",
+            "https://p.example",
+            &[ModelEntry {
+                max_tokens: Some(4096),
+                ..ModelEntry::named("m")
+            }],
+        );
+        let choice = SessionChoice {
+            model: Some(crate::settings::global::ModelRef {
+                provider: "p".to_string(),
+                model: "m".to_string(),
+            }),
+            preset: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_for(&settings, &choice).agent.config().max_tokens,
+            Some(4096),
+            "the model's declared cap is what the request carries"
+        );
+
+        settings.workspace.agent.max_tokens = Some(2048);
+        assert_eq!(
+            build_for(&settings, &choice).agent.config().max_tokens,
+            Some(2048),
+            "and the reader's own value wins"
+        );
+    }
+
+    /// An unconfigured temperature and cap are the coding defaults, not the
+    /// chat ones: the built agent samples low and names a reply cap.
+    #[test]
+    fn an_unconfigured_sampling_uses_the_coding_defaults() {
+        let config = build(&bare()).agent.config().clone();
+        assert_eq!(
+            config.temperature,
+            crate::settings::CODING_TEMPERATURE,
+            "an unconfigured turn samples at the coding temperature"
+        );
+        assert_eq!(
+            config.max_tokens,
+            Some(crate::settings::CODING_MAX_TOKENS),
+            "and names the coding reply cap on the wire"
+        );
+    }
+
     /// Large results are capped for the model and spilled under the workspace;
     /// the retired workspace key no longer changes the cap.
     #[test]
