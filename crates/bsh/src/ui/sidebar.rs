@@ -1341,7 +1341,6 @@ impl Shell {
                     .ghost()
                     .compact()
                     .label(lang.tr("side.local"))
-                    .flex_1()
                     .dropdown_menu_with_anchor(Anchor::TopLeft, {
                         let lang_shell = shell.clone();
                         let theme_shell = shell.clone();
@@ -1388,6 +1387,12 @@ impl Shell {
                         }
                     }),
             )
+            // The row's flexible cell. The account menu's trigger is wrapped by
+            // the kit's popover, so a `flex_1` on the Button cannot claim the
+            // row's free width - the wrapper, not the button, is the flex item.
+            // This spacer holds that width, which parks the gear and the bin on
+            // the pane's trailing edge instead of letting them trail the label.
+            .child(div().flex_1())
             .child(self.sidebar_icon_button(
                 "side-settings",
                 icon(IconName::Settings, 15.0, theme::muted()),

@@ -5,6 +5,7 @@ schema_version = 0
 [agent]
 system_prompt = ""
 complete = true
+temperature = 0.2
 reasoning_effort = "medium"
 permission = "danger-full-access"
 bash_enabled = true
@@ -13,6 +14,7 @@ web_tools_enabled = true
 parallel_tool_calls = true
 memory_enabled = true
 memory_capture = true
+max_tokens = 65536
 context_budget = 65536
 llm_timeout_secs = 3600
 llm_max_retries = 3

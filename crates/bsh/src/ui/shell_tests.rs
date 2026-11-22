@@ -39629,3 +39629,32 @@ fn a_changed_folder_still_collapses_and_stays_collapsed(cx: &mut TestAppContext)
     );
     assert!(cx.debug_bounds("file-row-lib.rs").is_none());
 }
+
+/// The bin is the account row's last control, and "last" means the pane's own
+/// trailing edge rather than the end of the account name.
+///
+/// The row used to put `flex_1` on the account menu, but the menu's trigger is
+/// wrapped by the kit's popover, so the button never grew and the gear and bin
+/// trailed the label. A dragged-out sidebar leaves a wide gap behind them,
+/// which is where the old layout is easiest to see.
+#[gpui::test]
+fn the_bin_sits_on_the_sidebar_right_edge(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (_harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = AppState::with_store(scratch_store("account-edge"));
+        state.settings.global.general.sidebar_width = Some(331.0);
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let row = cx.debug_bounds("account-row").expect("the account row");
+    let bin = cx.debug_bounds("side-trash").expect("the bin");
+    // The row pads 6 a side, so its trailing edge is the last pixel the bin may
+    // paint. A half pixel absorbs GPUI snapping the box to a device pixel.
+    let inset = f32::from(row.origin.x + row.size.width - (bin.origin.x + bin.size.width));
+    assert!(
+        (inset - 6.0).abs() <= 0.5,
+        "the bin sits on the pane's trailing edge: bin {bin:?}, row {row:?}"
+    );
+}
