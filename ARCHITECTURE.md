@@ -9,6 +9,17 @@ This document explains the platform through three architecture visuals, then def
 
 ---
 
+
+## Multi-Interface Runtime (GUI / TUI / Web / Mobile)
+
+BSH's target client architecture uses one standalone Runtime Host and a shared, transport-independent Application Contract. Desktop GUI, TUI, CLI, browser/PWA and native iOS/Android clients are peers; clients never own Agent execution.
+
+- [Multi-Interface Architecture](docs/bsh-multi-interface-architecture.md) — system boundaries, mobile lifecycle, security, deployment stages and acceptance gates.
+- [Multi-Interface Runtime RFC](docs/rfc/multi-interface-runtime.md) — Host, Application Contract, Journal, IPC, Web, Mobile, identity, security and delivery requirements.
+- [Architecture diagram](docs/assets/diagrams/bsh-multi-interface.svg)
+
+The first target is Personal Local-First BSH. Remote access and hosted multi-user operation are staged separately. Mobile background execution is not assumed: the Host continues work while the mobile client is suspended, and push notifications are advisory only.
+
 ## 0. BSH goal, product intent and architecture directives
 
 ### 0.1 Product goal

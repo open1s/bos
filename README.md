@@ -134,6 +134,10 @@ A coordinating workspace can delegate bounded research or engineering tasks to s
   **Roadmap status:** the distributed scenario illustrates the BSH Federation target architecture. Node enrollment, discovery, remote capability invocation and cross-node delegation are being developed in stages; this is not a claim that the complete workflow is currently available.
 </blockquote>
 
+### Multi-Interface Runtime (GUI / TUI / Web / Mobile)
+
+BSH is evolving toward one standalone Runtime Host with independent desktop, terminal, browser and native mobile clients. See the [Multi-Interface Architecture](docs/bsh-multi-interface-architecture.md), [Runtime RFC](docs/rfc/multi-interface-runtime.md) and [architecture diagram](docs/assets/diagrams/bsh-multi-interface.svg). This is a target architecture; implementation is staged and the documents distinguish current evidence from future requirements.
+
 ## Architecture
 
 BOS separates the shared execution foundation, local composition and cross-node collaboration.
