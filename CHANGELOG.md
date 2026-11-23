@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **Turn-local reasoning reaches every provider.** Every OpenAI-compatible
+  chat endpoint - the built-in families, NVIDIA NIM and custom gateways - now
+  replays the live turn's `reasoning_content` on the assistant row, including
+  on the row that carries its tool call. Previously the generic adapter (and
+  NVIDIA) asked for no replay, so a model's reasoning was dropped even though
+  the engine still held it for the live turn. DeepSeek keeps its `thinking`
+  off switch, OpenRouter its structured `reasoning` / `reasoning_details`,
+  Anthropic its signed thinking and Responses its reasoning item. A custom
+  gateway that uses `reasoning` or `reasoning_details` instead of
+  `reasoning_content` is replayed in its own field: the generic client learns
+  the dialect from the gateway's response rather than forcing one. The engine
+  still clears every earlier turn, so no chain of thought crosses a turn, and
+  an endpoint whose schema rejects the field can opt out with
+  `ReasoningReplay::None`; the generic default has no portable off field, so an
+  explicit Off only omits the effort there instead of sending DeepSeek's
+  `thinking` switch to an endpoint that never understood it.
+
 ## v4.1.25 (2026-11-23)
 
 - **An all-uppercase query no longer slips through the description fallback.**

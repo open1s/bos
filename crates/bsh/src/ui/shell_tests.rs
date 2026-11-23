@@ -30,7 +30,7 @@ use crate::state::{AppState, Overlay, Tab};
 use crate::store::Store;
 use crate::ui::right_panel::{FileTab, RightTab};
 use crate::ui::settings::{load_provider_into_form, section_index};
-use crate::ui::shell::Shell;
+use crate::ui::shell::{BodySlot, Shell};
 use crate::ui::todo_panel::progress;
 use gpui_kit::component::ActiveTheme as _;
 
@@ -39968,5 +39968,389 @@ fn the_bin_sits_on_the_sidebar_right_edge(cx: &mut TestAppContext) {
     assert!(
         (inset - 6.0).abs() <= 0.5,
         "the bin sits on the pane's trailing edge: bin {bin:?}, row {row:?}"
+    );
+}
+
+/// One wheel event over a debug-selected frame, where a real pointer would sit.
+///
+/// The platform delivers a wheel as an event carrying a position, and GPUI
+/// hit-tests that position upward: this is the same seam
+/// the_chat_scrolls_smoothly_with_the_wheel uses, lifted into a helper because
+/// four tests wheel over a body rather than over the transcript.
+fn wheel_over(cx: &mut VisualTestContext, what: &'static str, dy: f32) {
+    let at = cx
+        .debug_bounds(what)
+        .unwrap_or_else(|| panic!("wheel_over: {what} is not on screen"))
+        .center();
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
+                position: at,
+                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(dy))),
+                modifiers: Modifiers::default(),
+                touch_phase: gpui_kit::TouchPhase::Moved,
+                source: gpui_kit::ScrollSource::Pointer,
+            }),
+            cx,
+        );
+    });
+}
+
+/// Pump frames until the eased scrollers have settled.
+///
+/// The ease covers a fixed fraction of the distance left per frame, so a handful
+/// of frames reach the target; the bound matches draw_until's, because a wheel
+/// that never settles is a defect rather than something to wait out.
+fn settle_ease(cx: &mut VisualTestContext) {
+    for _ in 0..40 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+}
+
+/// A body's live offset (negative) and its scroll range (positive).
+fn body_offset(cx: &mut VisualTestContext, shell: &Entity<Shell>, slot: BodySlot) -> (f32, f32) {
+    cx.update(|_, cx| {
+        let handle = shell.read(cx).body_scroll(slot);
+        (
+            f32::from(handle.offset().y),
+            f32::from(handle.max_offset().y),
+        )
+    })
+}
+
+/// The transcript's live offset.
+fn chat_offset(cx: &mut VisualTestContext, shell: &Entity<Shell>) -> f32 {
+    cx.update(|_, cx| f32::from(shell.read(cx).transcript_scroll.offset().y))
+}
+
+/// The wheel comes OUT of a tool body into the transcript at either end.
+///
+/// A step body used to stop the wheel unconditionally, so a notch at its top or
+/// its end did nothing at all and the conversation under the pointer could not be
+/// reached without moving the pointer off the box. The body now keeps the wheel
+/// only while it has room, and the surplus carries into the transcript in the
+/// same event.
+#[gpui::test]
+fn a_tool_body_at_its_end_passes_the_wheel_to_the_chat(cx: &mut TestAppContext) {
+    const BODY: BodySlot = BodySlot::Step {
+        message: 23,
+        tool: 0,
+        out: true,
+    };
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("chain-step", 12);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            let mut reply = ChatMessage::assistant();
+            reply.text = "the reply".to_string();
+            reply.parts = vec![
+                crate::model::TurnPart::Content(9),
+                crate::model::TurnPart::Tool(0),
+            ];
+            reply.tools.push(ToolEvent {
+                name: "run_command".to_string(),
+                args: "{\"command\":\"ls\"}".to_string(),
+                output: Some(
+                    (1..=40)
+                        .map(|line| format!("line {line} of the output"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                ms: Some(4),
+                at: None,
+            });
+            session.messages[23] = reply;
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        shell.update(cx, |this, cx| {
+            this.state.settings.global.general.transcript_view = "verbose".to_string();
+            cx.notify();
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    draw_until(cx, "the long step body renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("step-body-23-0-out").is_some()
+    });
+    settle_ease(cx);
+
+    let (top, max) = body_offset(cx, &shell, BODY);
+    assert_eq!(top, 0.0, "the body opens at its top");
+    assert!(max > 100.0, "the body is bounded and overflows: max={max}");
+
+    // Upwards: the body is already at its top, so the whole notch chains.
+    let chat_before = chat_offset(cx, &shell);
+    assert!(
+        chat_before < -100.0,
+        "the chat opens at its tail: {chat_before}"
+    );
+    wheel_over(cx, "step-body-23-0-out", 120.0);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let (body_after_up, _) = body_offset(cx, &shell, BODY);
+    let chat_first = chat_offset(cx, &shell);
+    assert_eq!(body_after_up, 0.0, "the body had no room upwards");
+    assert!(
+        chat_first > chat_before,
+        "the surplus moved the chat: {chat_before} -> {chat_first}"
+    );
+    assert!(
+        chat_first < chat_before + 120.0,
+        "and it eases instead of snapping: {chat_first}"
+    );
+    settle_ease(cx);
+    let chat_settled = chat_offset(cx, &shell);
+    assert!(
+        (chat_settled - (chat_before + 120.0)).abs() < 1.0,
+        "the whole notch lands: {chat_before} -> {chat_settled}"
+    );
+
+    // Downwards: put the body at its end and leave the chat a little room below
+    // it, so both sides of the split are observable.
+    shell.update(cx, |this, _| {
+        this.following_tail = false;
+        this.body_scroll(BODY)
+            .set_offset(gpui_kit::point(px(0.0), px(-max)));
+        let chat_max = f32::from(this.transcript_scroll.max_offset().y);
+        this.transcript_scroll
+            .set_offset(gpui_kit::point(px(0.0), px(-chat_max + 60.0)));
+    });
+    settle_ease(cx);
+    let (at_end, max_now) = body_offset(cx, &shell, BODY);
+    assert!(
+        (at_end + max_now).abs() < 1.0,
+        "the body sits at its end: {at_end} of {max_now}"
+    );
+    let chat_before = chat_offset(cx, &shell);
+    wheel_over(cx, "step-body-23-0-out", -40.0);
+    settle_ease(cx);
+    let (body_after_down, _) = body_offset(cx, &shell, BODY);
+    let chat_after = chat_offset(cx, &shell);
+    assert!(
+        (body_after_down + max_now).abs() < 1.0,
+        "the body stays at its end: {body_after_down}"
+    );
+    assert!(
+        (chat_after - (chat_before - 40.0)).abs() < 1.0,
+        "the surplus carries down: {chat_before} -> {chat_after}"
+    );
+}
+
+/// A body shorter than its cap has no room, so the wheel goes straight through.
+///
+/// The old listener stopped the wheel even when the box could not move, which
+/// made every short tool output a dead spot in the transcript.
+#[gpui::test]
+fn a_tool_body_too_short_for_its_cap_does_not_trap_the_wheel(cx: &mut TestAppContext) {
+    const BODY: BodySlot = BodySlot::Step {
+        message: 23,
+        tool: 0,
+        out: true,
+    };
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("chain-short", 12);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            let mut reply = ChatMessage::assistant();
+            reply.text = "the reply".to_string();
+            reply.parts = vec![
+                crate::model::TurnPart::Content(9),
+                crate::model::TurnPart::Tool(0),
+            ];
+            reply.tools.push(ToolEvent {
+                name: "run_command".to_string(),
+                args: "{\"command\":\"true\"}".to_string(),
+                output: Some("ok".to_string()),
+                ms: Some(4),
+                at: None,
+            });
+            session.messages[23] = reply;
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        shell.update(cx, |this, cx| {
+            this.state.settings.global.general.transcript_view = "verbose".to_string();
+            cx.notify();
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    draw_until(cx, "the short step body renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("step-body-23-0-out").is_some()
+    });
+    settle_ease(cx);
+
+    let (at, max) = body_offset(cx, &shell, BODY);
+    assert_eq!(
+        max, 0.0,
+        "the body fits inside its cap, so it cannot scroll"
+    );
+    assert_eq!(at, 0.0, "and it sits at its top");
+
+    let chat_before = chat_offset(cx, &shell);
+    wheel_over(cx, "step-body-23-0-out", 120.0);
+    settle_ease(cx);
+    let (body_after, _) = body_offset(cx, &shell, BODY);
+    let chat_after = chat_offset(cx, &shell);
+    assert_eq!(body_after, 0.0, "the body never moves");
+    assert!(
+        (chat_after - (chat_before + 120.0)).abs() < 1.0,
+        "the whole notch reached the chat: {chat_before} -> {chat_after}"
+    );
+}
+
+/// A scrollable injection body takes the wheel and leaves the chat where it was.
+///
+/// Injections had no wheel handler, so one notch moved the injection body AND the
+/// whole conversation under the pointer: the same event scrolled two scrollers.
+#[gpui::test]
+fn an_injection_body_scrolls_without_moving_the_chat(cx: &mut TestAppContext) {
+    const INJECT: BodySlot = BodySlot::Inject {
+        message: 22,
+        source: 0,
+    };
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("chain-inject", 12);
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            let content: String = (1..=30)
+                .map(|line| format!("injected line {line} of the context\n"))
+                .collect();
+            session.messages[22]
+                .injections
+                .push(crate::model::ContextInjection {
+                    kind: "persona".to_string(),
+                    content,
+                    source: "AGENTS.md".to_string(),
+                });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        shell.update(cx, |this, cx| {
+            this.inject_open.insert((22, 0));
+            cx.notify();
+        });
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    draw_until(cx, "the injection row renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("inject-row-22-0").is_some()
+    });
+    // The session-change hook clears the per-session disclosures on the FIRST
+    // frame, so a disclosure opened before it is gone; open it after the row it
+    // belongs to exists.
+    shell.update(cx, |this, cx| {
+        this.inject_open.insert((22, 0));
+        cx.notify();
+    });
+    draw_until(cx, "the injection body renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("inject-body-22-0").is_some()
+    });
+    settle_ease(cx);
+
+    let (top, max) = body_offset(cx, &shell, INJECT);
+    assert_eq!(top, 0.0, "the injection opens at its top");
+    assert!(max > 60.0, "the injection overflows its cap: max={max}");
+
+    // Give the transcript room below the tail, so "the chat did not move" is a
+    // real assertion rather than a clamped no-op.
+    shell.update(cx, |this, _| {
+        this.following_tail = false;
+        let chat_max = f32::from(this.transcript_scroll.max_offset().y);
+        this.transcript_scroll
+            .set_offset(gpui_kit::point(px(0.0), px(-chat_max + 60.0)));
+    });
+    settle_ease(cx);
+    let chat_before = chat_offset(cx, &shell);
+    wheel_over(cx, "inject-body-22-0", -40.0);
+    settle_ease(cx);
+    let (body_after, _) = body_offset(cx, &shell, INJECT);
+    let chat_after = chat_offset(cx, &shell);
+    assert!(
+        (body_after + 40.0).abs() < 1.0,
+        "the injection took the notch: {body_after}"
+    );
+    assert!(
+        (chat_after - chat_before).abs() < 1.0,
+        "and the chat stayed put: {chat_before} -> {chat_after}"
+    );
+}
+
+/// The hover diff card is CONTAINED: its wheel never reaches the chat.
+///
+/// The card is drawn in the transcript's relative frame, beside the scroller
+/// rather than inside it, so a wheel over it cannot bubble to the transcript.
+/// That is a structural fact, not a handler, which is exactly why it is pinned:
+/// moving the overlay inside the scroller would silently start scrolling the
+/// conversation under a card that explains one of its rows.
+#[gpui::test]
+fn the_chat_diff_preview_contains_the_wheel(cx: &mut TestAppContext) {
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("preview-contain", 12);
+        let root = state.workspace_root().expect("a workspace root");
+        let old: String = (1..=20).map(|line| format!("old {line}\n")).collect();
+        let new: String = (1..=20).map(|line| format!("new {line}\n")).collect();
+        std::fs::write(root.join("big.rs"), format!("{new}{old}")).expect("the file");
+        let old = old.replace('\n', "\\n");
+        let new = new.replace('\n', "\\n");
+        let id = state.active_id.clone().expect("an active session");
+        if let Some(session) = state.store.session_mut(&id) {
+            session.messages[23].tools.push(ToolEvent {
+                name: "edit_file".to_string(),
+                args: format!(r#"{{"path":"big.rs","old_string":"{old}","new_string":"{new}"}}"#),
+                output: Some("ok".to_string()),
+                ms: Some(4),
+                at: None,
+            });
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    draw_until(cx, "the changed-files card renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("changes-card-23").is_some()
+    });
+    let header = cx
+        .debug_bounds("changes-header-23")
+        .expect("the card header");
+    cx.simulate_mouse_move(
+        header.center(),
+        None::<gpui_kit::MouseButton>,
+        Modifiers::default(),
+    );
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_millis(600));
+    cx.run_until_parked();
+    draw_until(cx, "the long preview opens", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("changes-preview-body").is_some()
+    });
+    let rows = cx.update(|_, cx| {
+        shell
+            .read(cx)
+            .changes_preview
+            .as_ref()
+            .map_or(0, |(_, _, _, rows)| rows.len())
+    });
+    assert!(rows > 10, "the preview has more rows than fit: {rows}");
+    let preview_max =
+        cx.update(|_, cx| f32::from(shell.read(cx).changes_preview_scroll.max_offset().y));
+    assert!(
+        preview_max > 120.0,
+        "the card body overflows: {preview_max}"
+    );
+
+    let chat_before = chat_offset(cx, &shell);
+    assert!(chat_before < -100.0, "the chat has room above its tail");
+    wheel_over(cx, "changes-preview-body", 120.0);
+    settle_ease(cx);
+    let chat_after = chat_offset(cx, &shell);
+    assert!(
+        (chat_after - chat_before).abs() < 1.0,
+        "the card does not scroll the chat: {chat_before} -> {chat_after}"
     );
 }

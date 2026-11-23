@@ -1,6 +1,7 @@
 //! The OpenAI vendor and its OpenAI-compatible HTTP client.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use crate::{
     llm::vendor::openaicompatible::{
@@ -25,18 +26,57 @@ use crate::llm::{
 /// How a Chat Completions provider expects reasoning to be replayed inside
 /// the turn that produced it.
 ///
-/// The wire differs by vendor: OpenAI's own chat API has no field for it,
-/// DeepSeek reads `reasoning_content` back, and OpenRouter preserves the
-/// structured `reasoning` / `reasoning_details` pair its models emit.
+/// The wire differs by vendor: the OpenAI-compatible default sends
+/// `reasoning_content` (DeepSeek, NVIDIA NIM and custom gateways all read it
+/// back), OpenAI's own chat API emits no reasoning field so it never sees one,
+/// and OpenRouter preserves the structured `reasoning` / `reasoning_details`
+/// pair its models emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReasoningReplay {
-    /// Do not send reasoning on the chat wire.
+    /// Do not send reasoning on the chat wire; the explicit opt-out for a
+    /// provider whose schema rejects the field.
     #[default]
     None,
     /// Send the plain text as `reasoning_content`.
     Content,
     /// Send `reasoning` plus the structured `reasoning_details`.
     Details,
+}
+
+/// The endpoint emits `reasoning_content`.
+const OBSERVED_CONTENT: u8 = 1;
+/// The endpoint emits `reasoning` / `reasoning_details`.
+const OBSERVED_DETAILS: u8 = 2;
+
+/// Record the dialect an endpoint has emitted.
+///
+/// `fetch_max` keeps the richer dialect: a later `reasoning_content` chunk does
+/// not downgrade an endpoint that has already shown `reasoning_details`.
+fn remember_reasoning_field(slot: &AtomicU8, replay: ReasoningReplay) {
+    let level = match replay {
+        ReasoningReplay::None => return,
+        ReasoningReplay::Content => OBSERVED_CONTENT,
+        ReasoningReplay::Details => OBSERVED_DETAILS,
+    };
+    slot.fetch_max(level, AtomicOrdering::Relaxed);
+}
+
+/// The field a Chat Completions provider reads as an explicit "reasoning off"
+/// switch.
+///
+/// Replay and the off switch are separate provider facts. DeepSeek's
+/// `reasoning_content` and its `thinking` switch belong to one API, but another
+/// endpoint may read `reasoning_content` back without understanding that
+/// switch, so a vendor enables the two independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ReasoningOff {
+    /// The vendor has no portable off field; an explicit off just omits effort.
+    #[default]
+    None,
+    /// Send `thinking: {"type": "disabled"}`.
+    Thinking,
+    /// Send `reasoning: {"enabled": false}`.
+    Reasoning,
 }
 
 /// An OpenAI-compatible vendor client.
@@ -54,6 +94,14 @@ pub struct OpenAiVendor {
     parallel_tool_calls: bool,
     /// How this vendor replays reasoning within a turn.
     reasoning_replay: ReasoningReplay,
+    /// Which field, if any, turns reasoning off for this vendor.
+    reasoning_off: ReasoningOff,
+    /// Whether `reasoning_replay` is fixed by the vendor identity. When it is
+    /// not, the adapter follows the field the endpoint actually emitted, which
+    /// is what makes an arbitrary custom gateway work.
+    fixed_reasoning_replay: bool,
+    /// The reasoning dialect the endpoint has emitted, shared by clones.
+    observed_reasoning_replay: Arc<AtomicU8>,
 }
 
 impl Clone for OpenAiVendor {
@@ -65,6 +113,9 @@ impl Clone for OpenAiVendor {
             api_key: Arc::clone(&self.api_key),
             parallel_tool_calls: self.parallel_tool_calls,
             reasoning_replay: self.reasoning_replay,
+            reasoning_off: self.reasoning_off,
+            fixed_reasoning_replay: self.fixed_reasoning_replay,
+            observed_reasoning_replay: Arc::clone(&self.observed_reasoning_replay),
         }
     }
 }
@@ -280,7 +331,15 @@ impl OpenAiVendor {
             model,
             api_key: Arc::new(api_key),
             parallel_tool_calls: true,
-            reasoning_replay: ReasoningReplay::None,
+            // Every OpenAI-compatible chat endpoint treats reasoning as
+            // turn-local: the engine clears earlier turns, and a vendor that
+            // never emits a reasoning field never sees this one on the wire.
+            // A provider with a stricter schema opts out explicitly with
+            // `with_reasoning_replay(ReasoningReplay::None)`.
+            reasoning_replay: ReasoningReplay::Content,
+            reasoning_off: ReasoningOff::None,
+            fixed_reasoning_replay: false,
+            observed_reasoning_replay: Arc::new(AtomicU8::new(OBSERVED_CONTENT)),
         }
     }
 
@@ -338,6 +397,29 @@ impl OpenAiVendor {
         self.endpoint.contains("api.openai.com") || self.endpoint.contains("openai.azure.com")
     }
 
+    /// The reasoning dialect this request serializes.
+    ///
+    /// A known vendor fixes it (DeepSeek content, OpenRouter details, or None
+    /// for an explicit opt-out). The generic OpenAI-compatible client follows
+    /// what the endpoint emitted, so a custom gateway that streams
+    /// `reasoning` rather than `reasoning_content` gets its own dialect back;
+    /// before the first reasoning chunk it defaults to `reasoning_content`.
+    fn chat_reasoning_replay(&self) -> ReasoningReplay {
+        if self.fixed_reasoning_replay {
+            return self.reasoning_replay;
+        }
+        match self.observed_reasoning_replay.load(AtomicOrdering::Relaxed) {
+            OBSERVED_CONTENT => ReasoningReplay::Content,
+            OBSERVED_DETAILS => ReasoningReplay::Details,
+            _ => ReasoningReplay::None,
+        }
+    }
+
+    /// Remember that this endpoint used one reasoning dialect.
+    fn observe_reasoning(&self, replay: ReasoningReplay) {
+        remember_reasoning_field(&self.observed_reasoning_replay, replay);
+    }
+
     /// Allow (or forbid) several tool calls in one provider response.
     pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
         self.parallel_tool_calls = parallel;
@@ -347,9 +429,19 @@ impl OpenAiVendor {
     /// Choose how this vendor replays reasoning inside the turn that produced
     /// it. Cross-turn replay is never allowed; the engine clears reasoning at
     /// the start of every turn.
+    ///
+    /// The matching provider off switch follows the replay dialect: DeepSeek's
+    /// `reasoning_content` comes with `thinking`, OpenRouter's structured
+    /// reasoning with `reasoning`.
     #[must_use]
     pub fn with_reasoning_replay(mut self, replay: ReasoningReplay) -> Self {
         self.reasoning_replay = replay;
+        self.fixed_reasoning_replay = true;
+        self.reasoning_off = match replay {
+            ReasoningReplay::None => ReasoningOff::None,
+            ReasoningReplay::Content => ReasoningOff::Thinking,
+            ReasoningReplay::Details => ReasoningOff::Reasoning,
+        };
         self
     }
 
@@ -388,6 +480,21 @@ impl OpenAiVendor {
         OpenAiVendorBuilder::new()
     }
 
+    /// The wire payload this configured vendor builds for `request`.
+    ///
+    /// `wire_preview` always builds a default vendor, so a test that has to
+    /// observe a non-default replay policy goes through this instance.
+    #[cfg(test)]
+    pub(crate) fn request_preview<S: ReactSession, C: ReactContext>(
+        &self,
+        request: &LlmRequest,
+        session: &S,
+        context: &C,
+    ) -> serde_json::Value {
+        serde_json::to_value(self.convert_request(None, request, session, context))
+            .unwrap_or_default()
+    }
+
     fn convert_request(
         &self,
         persona: Option<String>,
@@ -412,7 +519,7 @@ impl OpenAiVendor {
         // read as a second user instruction (issue #434), and so providers that
         // accept only a leading system message keep working.
         let mut history_system = String::new();
-        let replay_chat = self.reasoning_replay;
+        let replay_chat = self.chat_reasoning_replay();
         let mut pending_text: Option<String> = None;
         let mut pending_reasoning: Option<(String, Option<ReasoningState>)> = None;
         {
@@ -672,9 +779,9 @@ impl OpenAiVendor {
         let reasoning_effort = req
             .reasoning_effort
             .filter(|effort| *effort != crate::llm::ReasoningEffort::None);
-        let thinking = (explicit_off && self.reasoning_replay == ReasoningReplay::Content)
+        let thinking = (explicit_off && self.reasoning_off == ReasoningOff::Thinking)
             .then(|| serde_json::json!({ "type": "disabled" }));
-        let reasoning = (explicit_off && self.reasoning_replay == ReasoningReplay::Details)
+        let reasoning = (explicit_off && self.reasoning_off == ReasoningOff::Reasoning)
             .then(|| serde_json::json!({ "enabled": false }));
 
         OpenAiRequest {
@@ -904,6 +1011,30 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
             }
         }
 
+        // A custom gateway may speak OpenRouter's dialect rather than
+        // DeepSeek's. Remember which field it used so the next request of this
+        // turn replays the reasoning in the same one.
+        if !self.fixed_reasoning_replay {
+            for choice in &body.choices {
+                let message = &choice.message;
+                if message.reasoning_details().is_some()
+                    || message
+                        .extra
+                        .get("reasoning")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                {
+                    self.observe_reasoning(ReasoningReplay::Details);
+                } else if message
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+                {
+                    self.observe_reasoning(ReasoningReplay::Content);
+                }
+            }
+        }
+
         let resp = LlmResponse::OpenAI(body);
 
         if log::log_enabled!(log::Level::Info) {
@@ -1041,6 +1172,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
         let (tx, rx) = mpsc::channel(32);
         let on_chunk = context.on_chunk_callback();
         let started = std::time::Instant::now();
+        // The streaming task learns the endpoint's reasoning dialect; clones of
+        // this vendor share the slot, so the next request of the turn sees it.
+        let observed_reasoning = Arc::clone(&self.observed_reasoning_replay);
 
         tokio::spawn(async move {
             let mut first_token: Option<std::time::Duration> = None;
@@ -1076,6 +1210,41 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                         if let Some(chats) = extractor.push(&text) {
                             for chat in chats {
                                 for choice in chat.choices {
+                                    // A custom gateway may speak either
+                                    // dialect. Remember the field it chose so
+                                    // the next step replays the reasoning the
+                                    // same way; details win over plain content.
+                                    if choice
+                                        .delta
+                                        .reasoning_details
+                                        .as_ref()
+                                        .is_some_and(|details| !details.is_null())
+                                    {
+                                        remember_reasoning_field(
+                                            &observed_reasoning,
+                                            ReasoningReplay::Details,
+                                        );
+                                    } else if choice
+                                        .delta
+                                        .reasoning_content
+                                        .as_deref()
+                                        .is_some_and(|text| !text.is_empty())
+                                    {
+                                        remember_reasoning_field(
+                                            &observed_reasoning,
+                                            ReasoningReplay::Content,
+                                        );
+                                    } else if choice
+                                        .delta
+                                        .reasoning
+                                        .as_deref()
+                                        .is_some_and(|text| !text.is_empty())
+                                    {
+                                        remember_reasoning_field(
+                                            &observed_reasoning,
+                                            ReasoningReplay::Details,
+                                        );
+                                    }
                                     let reasoning = choice
                                         .delta
                                         .reasoning_content
@@ -1355,6 +1524,17 @@ impl OpenAiClient {
     /// Allow (or forbid) several tool calls in one provider response.
     pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
         self.inner = self.inner.with_parallel_tool_calls(parallel);
+        self
+    }
+
+    /// Choose how this client replays the live turn's reasoning.
+    ///
+    /// The default is `ReasoningReplay::Content`; a custom gateway whose schema
+    /// rejects `reasoning_content` opts out with `ReasoningReplay::None`.
+    /// Cross-turn replay is never allowed: the engine clears earlier turns.
+    #[must_use]
+    pub fn with_reasoning_replay(mut self, replay: ReasoningReplay) -> Self {
+        self.inner = self.inner.with_reasoning_replay(replay);
         self
     }
 
@@ -1805,6 +1985,80 @@ mod tests {
         (addr, captured)
     }
 
+    /// A local chat endpoint: captures every request body and answers with one
+    /// fixed body under `content_type` (JSON for a completion, SSE for a
+    /// stream).
+    async fn spawn_chat_mock(
+        body: String,
+        content_type: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let sink = Arc::clone(&sink);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = socket.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                    let mut len = 0usize;
+                    for line in head.lines() {
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            len = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    while buf.len() < head_end + len {
+                        let Ok(n) = socket.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    sink.lock()
+                        .expect("lock")
+                        .push(String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned());
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (addr, captured)
+    }
+
     /// A local endpoint that answers every request with 404, capturing the
     /// path so a test can assert the error names it.
     async fn spawn_404_mock() -> (
@@ -1995,8 +2249,12 @@ mod tests {
         }
     }
 
+    /// Every OpenAI-compatible chat endpoint gets the turn's reasoning back by
+    /// default: DeepSeek, NVIDIA NIM and custom gateways all read
+    /// `reasoning_content`, and the engine only ever hands the adapter the
+    /// live turn's blocks.
     #[test]
-    fn chat_completions_does_not_replay_reasoning_by_default() {
+    fn chat_completions_replays_the_turns_reasoning_content_by_default() {
         use crate::llm::{Content, LlmContext, LlmMessage, LlmRequest, LlmSession};
         let vendor = OpenAiVendor::new(
             "https://api.example.com".to_string(),
@@ -2020,15 +2278,264 @@ mod tests {
         };
         let built =
             vendor.convert_request(None, &request, &LlmSession::new(), &LlmContext::default());
-        let serialized = serde_json::to_string(&built.messages).expect("serializes");
-        assert!(
-            !serialized.contains("private chain"),
-            "reasoning must not be replayed on the chat wire: {serialized}"
+        let assistant = built
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("an assistant row");
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("private chain")
+        );
+        assert_eq!(
+            assistant.content,
+            Some(serde_json::Value::String("answer".to_string())),
+            "the visible answer stays on the same row"
         );
         assert_eq!(
             built.messages.len(),
             4,
-            "system plus the three non-reasoning rows"
+            "system plus user, assistant and user"
+        );
+
+        // A provider whose schema rejects the field opts out explicitly.
+        let strict = vendor
+            .clone()
+            .with_reasoning_replay(super::ReasoningReplay::None);
+        let built =
+            strict.convert_request(None, &request, &LlmSession::new(), &LlmContext::default());
+        let serialized = serde_json::to_string(&built.messages).expect("serializes");
+        assert!(
+            !serialized.contains("private chain"),
+            "an explicit opt-out keeps the field off the wire: {serialized}"
+        );
+    }
+
+    /// The custom-provider path (the default arm of vendor selection) uses the
+    /// same adapter, so a gateway that is neither a built-in family nor a
+    /// known vendor still replays the live turn's reasoning.
+    #[test]
+    fn a_custom_openai_compatible_client_replays_the_turns_reasoning() {
+        use crate::llm::{Content, LlmContext, LlmMessage, LlmRequest, LlmSession};
+        let client = super::OpenAiClient::new(
+            "https://gateway.example/v1".to_string(),
+            "acme/chat".to_string(),
+            "k".to_string(),
+        );
+        let request = LlmRequest {
+            model: "acme/chat".to_string(),
+            input: Content::text("continue"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                messages: vec![
+                    LlmMessage::user("run it"),
+                    LlmMessage::assistant_reasoning("custom thought"),
+                    LlmMessage::assistant_tool_call("call-1", "echo", serde_json::json!({})),
+                ],
+                input: Content::text("continue"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let wire =
+            client
+                .inner
+                .request_preview(&request, &LlmSession::new(), &LlmContext::default());
+        let assistant = wire["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("an assistant row");
+        assert_eq!(
+            assistant["reasoning_content"], "custom thought",
+            "a custom gateway replays its own turn's reasoning: {wire}"
+        );
+        assert_eq!(assistant["tool_calls"][0]["id"], "call-1");
+    }
+
+    /// A custom gateway may use OpenRouter's `reasoning` field instead of
+    /// `reasoning_content`. Once the endpoint has shown that dialect, the next
+    /// request of the turn replays it in the same field.
+    #[test]
+    fn a_custom_gateway_that_uses_the_reasoning_field_replays_that_field() {
+        use crate::llm::{Content, LlmContext, LlmMessage, LlmRequest, LlmSession};
+        let vendor = OpenAiVendor::new(
+            "https://gateway.example/v1".to_string(),
+            "acme/chat".to_string(),
+            "k".to_string(),
+        );
+        vendor.observe_reasoning(super::ReasoningReplay::Details);
+        let request = LlmRequest {
+            model: "acme/chat".to_string(),
+            input: Content::text("continue"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                messages: vec![
+                    LlmMessage::user("run it"),
+                    LlmMessage::assistant_reasoning("gateway thought"),
+                    LlmMessage::assistant_tool_call("call-1", "echo", serde_json::json!({})),
+                ],
+                input: Content::text("continue"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let wire = vendor.request_preview(&request, &LlmSession::new(), &LlmContext::default());
+        let assistant = wire["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("an assistant row");
+        assert_eq!(
+            assistant["reasoning"], "gateway thought",
+            "the endpoint's own field is replayed: {wire}"
+        );
+        assert!(
+            assistant.get("reasoning_content").is_none(),
+            "the other dialect is not invented: {wire}"
+        );
+    }
+
+    /// Build the second step of a turn after a custom gateway produced reasoning.
+    fn custom_reasoning_follow_up() -> crate::llm::LlmRequest {
+        use crate::llm::{Content, LlmMessage, LlmRequest};
+        LlmRequest {
+            model: "acme/chat".to_string(),
+            input: Content::text("continue"),
+            provider_request: Some(crate::llm::ProviderRequest {
+                messages: vec![
+                    LlmMessage::user("run it"),
+                    LlmMessage::assistant_reasoning("gateway thought"),
+                    LlmMessage::assistant_tool_call("call-1", "echo", serde_json::json!({})),
+                ],
+                input: Content::text("continue"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The dialect is learned from a non-streaming response, not configured: a
+    /// custom gateway that answers with `reasoning` gets `reasoning` back.
+    #[tokio::test]
+    async fn a_custom_gateway_learns_the_reasoning_field_from_a_completion() {
+        use crate::llm::{Content, LlmContext, LlmRequest, LlmSession};
+        let response = serde_json::json!({
+            "id": "chat-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "acme/chat",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning": "gateway thought"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })
+        .to_string();
+        let (addr, captured) = spawn_chat_mock(response, "application/json").await;
+        let vendor = OpenAiVendor::new(
+            format!("http://{addr}"),
+            "acme/chat".to_string(),
+            "k".to_string(),
+        );
+        let first = LlmRequest {
+            model: "acme/chat".to_string(),
+            input: Content::text("first"),
+            ..Default::default()
+        };
+        vendor
+            .complete(
+                None,
+                first,
+                &mut LlmSession::new(),
+                &mut LlmContext::default(),
+            )
+            .await
+            .expect("the mock answers");
+        assert_eq!(captured.lock().expect("lock").len(), 1);
+
+        let wire = vendor.request_preview(
+            &custom_reasoning_follow_up(),
+            &LlmSession::new(),
+            &LlmContext::default(),
+        );
+        let assistant = wire["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("an assistant row");
+        assert_eq!(
+            assistant["reasoning"], "gateway thought",
+            "the reply's own field is replayed: {wire}"
+        );
+        assert!(
+            assistant.get("reasoning_content").is_none(),
+            "the other dialect is not invented: {wire}"
+        );
+    }
+
+    /// The same learning on the streaming path, which is the one the captured
+    /// traffic used: a `delta.reasoning` chunk selects the `reasoning` dialect
+    /// for the next step.
+    #[tokio::test]
+    async fn a_custom_gateway_learns_the_reasoning_field_from_a_stream() {
+        use crate::llm::{Content, LlmContext, LlmRequest, LlmSession};
+        use futures::StreamExt;
+        let sse = concat!(
+            r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"acme/chat","choices":[{"index":0,"delta":{"reasoning":"gateway thought"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"acme/chat","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (addr, _) = spawn_chat_mock(sse.to_string(), "text/event-stream").await;
+        let vendor = OpenAiVendor::new(
+            format!("http://{addr}"),
+            "acme/chat".to_string(),
+            "k".to_string(),
+        );
+        let first = LlmRequest {
+            model: "acme/chat".to_string(),
+            input: Content::text("first"),
+            ..Default::default()
+        };
+        let mut stream = vendor
+            .stream_complete(
+                None,
+                first,
+                &mut LlmSession::new(),
+                &mut LlmContext::default(),
+            )
+            .await
+            .expect("the mock streams");
+        while let Some(item) = stream.next().await {
+            item.expect("a stream item");
+        }
+
+        let wire = vendor.request_preview(
+            &custom_reasoning_follow_up(),
+            &LlmSession::new(),
+            &LlmContext::default(),
+        );
+        let assistant = wire["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("an assistant row");
+        assert_eq!(
+            assistant["reasoning"], "gateway thought",
+            "the streamed field is replayed: {wire}"
+        );
+        assert!(
+            assistant.get("reasoning_content").is_none(),
+            "the other dialect is not invented: {wire}"
         );
     }
 

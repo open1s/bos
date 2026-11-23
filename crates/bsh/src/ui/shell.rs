@@ -90,6 +90,14 @@ pub(crate) enum BodySlot {
     /// One segment of a turn's timeline: the kind tag, the message row, and the
     /// part index within it.
     Segment(u8, usize, usize),
+    /// One auto-injection body: the message row and the injection's index within
+    /// it, because a row can carry several sources and each scrolls alone.
+    Inject {
+        /// The message row the injection sits in.
+        message: usize,
+        /// The injection's index within that row.
+        source: usize,
+    },
 }
 
 /// The parsed markdown bodies still in use: text, the frame that last drew it,
@@ -102,6 +110,27 @@ type BodyStates = std::collections::BTreeMap<BodySlot, (String, u64, Entity<Text
 /// paging never reparse, small enough that a long chat cannot accumulate a
 /// parsed copy of every message it ever showed.
 const BODY_STATES_MAX: usize = 48;
+
+/// One open body's eased scroll.
+///
+/// The transcript owns its offset through `chat_smooth` and `chat_last_offset`;
+/// a body needs the same three facts per slot, so it can clamp against its own
+/// `max_offset` and hand the surplus to the transcript.
+pub(crate) struct BodyScroll {
+    /// The body's scroller: the range it can move in, and where it paints.
+    handle: ScrollHandle,
+    /// Where its offset is heading.
+    smooth: super::smooth::Smooth,
+    /// The offset the last frame painted. GPUI applies a wheel delta before the
+    /// listener runs, so the handler measures that jump against this to take it
+    /// back and ease from where the text actually is.
+    last: f32,
+    /// The frame that last drew this body, for the cache's age.
+    seen: u64,
+}
+
+/// The open bodies' eased scrolls, by the slot each body is painted in.
+type BodyScrolls = std::collections::BTreeMap<BodySlot, BodyScroll>;
 
 /// Whether a pointer gesture travelled far enough to be a SELECTION drag.
 ///
@@ -699,6 +728,12 @@ pub(crate) struct Shell {
     /// Keyed by (kind, content hash) and capped by age: two bodies with the same
     /// text share one parse, and a body that scrolls away is evicted.
     pub(crate) body_states: std::cell::RefCell<BodyStates>,
+    /// The open bodies' eased scrolls, by the same slot the body cache uses.
+    ///
+    /// Separate from `body_states` because a plain-text body never creates a
+    /// parsed state, and because a scroll must outlive a frame in which the
+    /// body was culled: the slot, not the paint, is its identity.
+    pub(crate) body_scrolls: std::cell::RefCell<BodyScrolls>,
     /// The optional per-frame diagnostic, opened once at assembly when the
     /// owner asked for it with BSH_FRAME_TRACE. None on every ordinary launch,
     /// so the render path only matches the option.
@@ -2394,6 +2429,7 @@ impl Shell {
             ),
             image_lightbox: None,
             body_states: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            body_scrolls: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             frame_trace: super::frame_trace::FrameTrace::from_env(),
             frame_no: 0,
             elapsed_painted: None,
@@ -4633,6 +4669,10 @@ impl Shell {
                         let text = lang.tr("slash.nothingToCompact");
                         this.state.finish_compact_command(&id, text.clone(), false);
                     }
+                    // A landed checkpoint rewrites the message rows in place, and
+                    // a body's slot names a row: the offsets that were right for
+                    // the old shape would paint the new rows where those were.
+                    this.clear_body_scrolls();
                 } else {
                     this.state.finish_compact_command(&id, text.clone(), error);
                 }
@@ -7364,7 +7404,85 @@ impl Shell {
                 animating = animating || self.traj_smooth.animating();
             }
         }
+        // Bodies ease the same way, and clamp their own targets: a re-wrapped
+        // body or a shorter output lowers `max`, and a target left outside the
+        // range would never settle, so the ease would ask for frames forever.
+        {
+            let mut scrolls = self.body_scrolls.borrow_mut();
+            for entry in scrolls.values_mut() {
+                let max = f32::from(entry.handle.max_offset().y);
+                if let Some(target) = entry.smooth.target() {
+                    let clamped = target.clamp(-max, 0.0);
+                    if (clamped - target).abs() > 0.5 {
+                        entry.smooth.aim(clamped);
+                    }
+                }
+                let current = f32::from(entry.handle.offset().y);
+                if let Some(next) = entry.smooth.step(current) {
+                    entry
+                        .handle
+                        .set_offset(point(px(0.0), px(next.clamp(-max, 0.0))));
+                }
+                // A body GPUI itself clamped (content that shrank) must not keep
+                // an offset outside the range either.
+                let painted = f32::from(entry.handle.offset().y);
+                let clamped = painted.clamp(-max, 0.0);
+                if (clamped - painted).abs() > 0.5 {
+                    entry.handle.set_offset(point(px(0.0), px(clamped)));
+                }
+                // Record where it was painted: a wheel's own jump is measured
+                // against this so the ease starts from the text, not from the
+                // scroller's one-step jump.
+                entry.last = f32::from(entry.handle.offset().y);
+                animating = animating || entry.smooth.animating();
+            }
+        }
         animating
+    }
+
+    /// Take a wheel delta aimed at a chat body: the body moves what fits and the
+    /// transcript takes the surplus in the same event.
+    ///
+    /// GPUI applies the scroller's own delta before a listener runs, so that jump
+    /// is taken back first and the body eases from where it was painted. The split
+    /// is computed against the body's TARGET, not the painted offset: an ease in
+    /// flight has already booked its room, and a fast wheel must chain instead of
+    /// being absorbed into the animation - which is what strands the wheel at a
+    /// body's end.
+    pub(crate) fn scroll_body(&mut self, slot: BodySlot, dy: f32, cx: &mut Context<Self>) {
+        if dy == 0.0 {
+            return;
+        }
+        let outcome = {
+            let mut scrolls = self.body_scrolls.borrow_mut();
+            scrolls.get_mut(&slot).map(|entry| {
+                // The scroller already moved by the event's own delta; put it back
+                // so the ease continues from the frame that was painted.
+                let max = f32::from(entry.handle.max_offset().y);
+                let current = f32::from(entry.handle.offset().y);
+                if (current - entry.last).abs() > 0.5 {
+                    entry.handle.set_offset(point(px(0.0), px(entry.last)));
+                }
+                let target = entry.smooth.target().unwrap_or(entry.last);
+                let (next, surplus) = super::smooth::split_wheel(target, dy, max);
+                entry.smooth.aim(next);
+                surplus
+            })
+        };
+        // No entry means the body never painted, so it has no range to clamp
+        // against and the whole delta belongs to the transcript.
+        let Some(surplus) = outcome else {
+            self.wheel_chat(dy, cx);
+            return;
+        };
+        if surplus == 0.0 {
+            // The body took all of it: only its ease needs a frame.
+            cx.notify();
+        } else {
+            // The body ran out of room (or was already out): the transcript takes
+            // the rest of THIS event.
+            self.wheel_chat(surplus, cx);
+        }
     }
 
     /// Take a wheel delta meant for the chat transcript.
@@ -7686,6 +7804,52 @@ impl Shell {
         }
         state
     }
+
+    /// The eased scroll for one painted body, reused across frames.
+    ///
+    /// Created on first paint: the wheel handler needs a `ScrollHandle` to clamp
+    /// against, and a body that never rendered can never be wheeled. The entry is
+    /// stamped so the body cache's own age rule evicts it, and the session-change
+    /// hook drops the whole map outright.
+    pub(crate) fn body_scroll(&self, slot: BodySlot) -> ScrollHandle {
+        let frame = self.frame_no;
+        let mut scrolls = self.body_scrolls.borrow_mut();
+        if let Some(entry) = scrolls.get_mut(&slot) {
+            entry.seen = frame;
+            return entry.handle.clone();
+        }
+        let handle = ScrollHandle::new();
+        scrolls.insert(
+            slot,
+            BodyScroll {
+                handle: handle.clone(),
+                smooth: super::smooth::Smooth::default(),
+                last: 0.0,
+                seen: frame,
+            },
+        );
+        if scrolls.len() > BODY_STATES_MAX {
+            let oldest = scrolls
+                .iter()
+                .filter(|(_, entry)| entry.seen != frame)
+                .min_by_key(|(_, entry)| entry.seen)
+                .map(|(slot, _)| *slot);
+            if let Some(oldest) = oldest {
+                scrolls.remove(&oldest);
+            }
+        }
+        handle
+    }
+
+    /// Drop every body's scroll state.
+    ///
+    /// `BodySlot` names a row, not a body: a new session's step 3 is not the old
+    /// one's, and a landed checkpoint renumbers the rows in place. An offset that
+    /// survived either would paint the wrong body where the reader left the other.
+    pub(crate) fn clear_body_scrolls(&mut self) {
+        self.body_scrolls.borrow_mut().clear();
+    }
+
     /// Take the window's current text selection to the clipboard, if a drag
     /// left one.
     ///
@@ -8089,6 +8253,9 @@ impl Render for Shell {
             self.following_tail = true;
             self.think_open.clear();
             self.inject_open.clear();
+            // A body is addressed by row, so the offsets belong to the session
+            // that just closed.
+            self.clear_body_scrolls();
             self.question_progress.clear();
             self.process_open.clear();
             self.process_page.borrow_mut().clear();

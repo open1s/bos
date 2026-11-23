@@ -32,6 +32,12 @@ impl NvidiaVendor {
     /// Create a NVIDIA vendor with an explicit endpoint, model, and key.
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
         Self {
+            // The shared OpenAI-compatible default replays the live turn's
+            // `reasoning_content`; a NIM reasoning model streams it and, once
+            // tools are in play, requires it back (the DeepSeek-R1 contract the
+            // endpoint hosts). The engine clears every earlier turn before a
+            // request, so this can only replay the live turn, and NIM has no
+            // portable off field, so an explicit Off just omits the effort.
             inner: OpenAiVendor::new(endpoint, model, api_key),
         }
     }
@@ -142,7 +148,10 @@ mod tests {
     use config::Section;
     use serde::Deserialize;
 
-    use crate::llm::{Content, LlmClient, LlmRequest, LlmSession};
+    use crate::llm::{
+        Content, LlmClient, LlmContext, LlmMessage, LlmRequest, LlmSession, ProviderRequest,
+        ReactSession, ReasoningEffort,
+    };
     use crate::{
         JsonExtractor, StreamExtractor,
         llm::vendor::{NvidiaVendor, OpenAIExtractor},
@@ -165,6 +174,119 @@ mod tests {
         assert!(spans2.is_some());
         println!("Extracted spans: {:?}", spans);
         println!("Extracted spans2: {:?}", spans2);
+    }
+
+    /// The live turn's reasoning replays on the assistant row its tool call
+    /// rides: NVIDIA NIM hosts the DeepSeek-R1 contract, which requires the
+    /// turn's `reasoning_content` back once tools are in play.
+    #[test]
+    fn the_turns_reasoning_content_replays_on_the_assistant_row() {
+        let vendor = NvidiaVendor::new(
+            "http://127.0.0.1:11436/v1".to_string(),
+            "mistralai/mistral-large".to_string(),
+            "k".to_string(),
+        );
+        let request = LlmRequest {
+            model: "mistralai/mistral-large".to_string(),
+            input: Content::text("continue"),
+            provider_request: Some(ProviderRequest {
+                messages: vec![
+                    LlmMessage::user("run it"),
+                    LlmMessage::assistant_reasoning("the argument is one"),
+                    LlmMessage::assistant_tool_call(
+                        "call-1",
+                        "echo",
+                        serde_json::json!({ "n": 1 }),
+                    ),
+                    LlmMessage::tool_result("call-1", "{\"echoed\":1}"),
+                ],
+                input: Content::text("continue"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let wire =
+            vendor
+                .inner
+                .request_preview(&request, &LlmSession::new(), &LlmContext::default());
+        let assistant = wire["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("an assistant row");
+        assert_eq!(
+            assistant["reasoning_content"], "the argument is one",
+            "the live turn's reasoning rides the assistant row: {wire}"
+        );
+        assert_eq!(assistant["tool_calls"][0]["id"], "call-1");
+    }
+
+    /// A cleared turn carries no reasoning, so the adapter has nothing to put
+    /// on the wire: no chain of thought crosses a turn boundary.
+    #[test]
+    fn a_cleared_turn_leaves_no_reasoning_on_the_wire() {
+        let vendor = NvidiaVendor::new(
+            "http://127.0.0.1:11436/v1".to_string(),
+            "mistralai/mistral-large".to_string(),
+            "k".to_string(),
+        );
+        let mut session = LlmSession::new();
+        session.push(LlmMessage::user("earlier"));
+        session.push(LlmMessage::assistant_reasoning("earlier private thought"));
+        session.push(LlmMessage::assistant("earlier answer"));
+        session.clear_reasoning();
+        let request = LlmRequest {
+            model: "mistralai/mistral-large".to_string(),
+            input: Content::text("next"),
+            ..Default::default()
+        };
+        let wire = vendor
+            .inner
+            .request_preview(&request, &session, &LlmContext::default());
+        let serialized = serde_json::to_string(&wire).expect("serializes");
+        assert!(
+            !serialized.contains("earlier private thought"),
+            "a later turn must not replay the earlier chain: {serialized}"
+        );
+        assert!(
+            !serialized.contains("reasoning_content"),
+            "the wire carries no reasoning after the turn boundary: {serialized}"
+        );
+    }
+
+    /// Off has no portable NVIDIA switch, so it omits the effort instead of
+    /// sending DeepSeek's `thinking` field to an endpoint that never asked for
+    /// it.
+    #[test]
+    fn off_omits_reasoning_without_sending_a_thinking_field() {
+        let vendor = NvidiaVendor::new(
+            "http://127.0.0.1:11436/v1".to_string(),
+            "mistralai/mistral-large".to_string(),
+            "k".to_string(),
+        );
+        let request = LlmRequest {
+            model: "mistralai/mistral-large".to_string(),
+            input: Content::text("next"),
+            reasoning_effort: Some(ReasoningEffort::None),
+            ..Default::default()
+        };
+        let wire =
+            vendor
+                .inner
+                .request_preview(&request, &LlmSession::new(), &LlmContext::default());
+        assert!(
+            wire.get("thinking").is_none(),
+            "no invented off field: {wire}"
+        );
+        assert!(
+            wire.get("reasoning").is_none(),
+            "no invented off field: {wire}"
+        );
+        assert!(
+            wire.get("reasoning_effort").is_none(),
+            "an explicit off sends no effort: {wire}"
+        );
     }
 
     #[tokio::test]

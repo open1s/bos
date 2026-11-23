@@ -4363,3 +4363,41 @@ through `dismiss_slash_palette`, which closes the card and CLEARS the leading
 ends empty); Enter is unchanged (a skill inserts `/name `, a command runs, a
 child list selects). Skim over skill names is pinned by a subsequence case:
 `/mtn` finds `skill-motion` while `skill-zeta` stays out.
+
+Round 198: the wheel now comes OUT of a chat body into the transcript. A step body
+stopped the wheel unconditionally, so a notch at its top or its end did nothing
+(the conversation under the pointer was unreachable without moving the pointer
+off the box), while an injection body stopped nothing, so one notch moved the box
+AND the chat. Both are one rule now: the body keeps the wheel while it has room
+and the surplus chains into the transcript in the SAME event
+(`smooth::split_wheel`, `Shell::scroll_body`, `transcript::body_wheel`).
+
+- Bodies had no `ScrollHandle` at all (only an `.id(..)`), so nothing could read
+  their offset. `Shell::body_scrolls` is a sibling of `body_states`, keyed by the
+  same `BodySlot`, with the same frame stamp and `BODY_STATES_MAX` age rule;
+  `BodySlot::Inject { message, source }` names a row that carries several
+  sources. Cleared in the session-change hook and when `land_manual_compaction`
+  lands, because a checkpoint renumbers the rows IN PLACE and the slot names a row.
+- GPUI applies the scroller's own delta BEFORE the listener runs, so the handler
+  measures the jump against the offset the last frame painted and puts it back
+  (`BodyScroll::last`), then eases its own target. Same trap `chat_last_offset`
+  already documents from the transcript's side.
+- The split is computed against the body's TARGET, not the painted offset: an ease
+  in flight has already booked its room, so a target-based split chains the surplus
+  immediately while a painted-based one (the transcript's rule, left alone)
+  re-aims short of the end and silently absorbs the notch - a fast wheel strands at
+  the box's edge. A body that fits is the `max == 0` case of the same arithmetic,
+  not a branch; a target left outside a shrunken range is corrected without
+  reading as a scroll the reader asked for.
+- The hover diff card was NOT a double-scroll defect: it is drawn in the
+  transcript's relative frame, BESIDE the scroller, so its wheel cannot bubble to
+  the transcript. The probe for its test found the real bug instead: leaving the
+  changes row clears the hover, so the card cannot be wheeled at all (the pointer
+  must stay on the row). That is still open.
+- Evidence: 5 unit cases on `split_wheel` (room, end, partial split, mirror at the
+  top, shrink, zero range) and 4 interaction tests that dispatch
+  `PlatformInput::Scroll` over the body. Discrimination measured by reverting each
+  handler: the step body left the chat at `-2127.5 -> -2127.5` (dead wheel) and the
+  injection moved it `-1739.5 -> -1779.5` (double scroll) before the fix.
+- Trap: the session-change hook clears `inject_open` on the FIRST frame, so a test
+  that opens a disclosure before that frame loses it; open it after the row paints.

@@ -47,11 +47,21 @@ several signed / redacted / encrypted blocks keep their own state.
 
 | Provider wire | What is replayed | Field / item |
 |---|---|---|
-| OpenAI Chat Completions | nothing | none |
+| OpenAI-compatible Chat Completions (default; NVIDIA NIM and custom gateways included) | the turn's reasoning text | `reasoning_content` on the assistant row |
+| Custom OpenAI-compatible gateway using `reasoning` | the turn's reasoning text | `reasoning` on the assistant row |
+| Custom OpenAI-compatible gateway using `reasoning_details` | text + structured details | `reasoning` + `reasoning_details` |
 | DeepSeek Chat Completions | the turn's reasoning text | `reasoning_content` on the assistant row |
 | OpenRouter Chat Completions | text + structured details | `reasoning` + `reasoning_details` |
 | Anthropic Messages | signed thinking and redacted thinking | `thinking` / `redacted_thinking` blocks |
 | OpenAI / DeepSeek Responses | the reasoning item, verbatim | `reasoning` input item (id, encrypted_content, content, summary, signature) |
+
+OpenAI's own chat API has no reasoning field, so its requests never carry
+one: a reasoning block only exists when the model emitted it in this turn.
+A generic OpenAI-compatible client learns the custom gateway's dialect from its
+own response - `reasoning_content`, `reasoning` or `reasoning_details` - and
+replays the next step in the same field, so an arbitrary gateway does not have
+to be named in advance. `ReasoningReplay::None` is the explicit opt-out for an
+endpoint whose schema rejects the field.
 
 Anthropic extended thinking is requested from the reader's effort level:
 `low` / `medium` / `high` map to a `budget_tokens` and the completion cap is
@@ -62,7 +72,10 @@ and `include: ["reasoning.encrypted_content"]` so the item is replayable.
 `thinking: {"type": "disabled"}`, OpenRouter gets
 `reasoning: {"enabled": false}`, and a Responses endpoint that accepts an off
 value gets `effort: "none"` (OpenAI's own Responses API omits the block, which
-has no portable off value).
+has no portable off value). The generic OpenAI-compatible default replays
+`reasoning_content` but has no portable off field, so an explicit Off only omits
+the effort there: replay and the off switch are separate provider facts, and a
+vendor opts into each one on its own.
 
 A provider switch cannot replay one vendor's state into another: the engine
 clears prior turns before every request, so only the current turn's blocks are

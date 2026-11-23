@@ -1067,6 +1067,23 @@ fn chat_wheel(this: &mut Shell, event: &ScrollEvent, window: &mut Window, cx: &m
     cx.stop_propagation();
 }
 
+/// One wheel event over a chat body.
+///
+/// The body takes what fits and the transcript takes the rest in the same event
+/// (see `Shell::scroll_body`), so the wheel never dies at a body's edge and a
+/// body never moves the conversation it cannot.
+fn body_wheel(
+    this: &mut Shell,
+    slot: BodySlot,
+    event: &ScrollEvent,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) {
+    let dy = wheel_delta(event, window);
+    this.scroll_body(slot, dy, cx);
+    cx.stop_propagation();
+}
+
 /// The trajectory tab's wheel handler.
 pub(crate) fn traj_wheel(
     this: &mut Shell,
@@ -4837,6 +4854,10 @@ impl Shell {
                 cx.notify();
             })));
         if open {
+            let scroll = self.body_scroll(BodySlot::Inject {
+                message: index,
+                source: slot,
+            });
             // The reference bounds the body at 141px and writes it in its code
             // face (11px/16px) on the code-block fill, indented under the title.
             root = root.child(
@@ -4852,6 +4873,22 @@ impl Shell {
                             .id(SharedString::from(format!("inject-scroll-{index}-{slot}")))
                             .max_h(px(141.0))
                             .overflow_y_scroll()
+                            .track_scroll(&scroll)
+                            // Same rule as a step body: the box takes the wheel
+                            // while it can move, the transcript takes the surplus.
+                            // Without a listener both moved at once.
+                            .on_scroll(cx.listener(move |this, event, window, cx| {
+                                body_wheel(
+                                    this,
+                                    BodySlot::Inject {
+                                        message: index,
+                                        source: slot,
+                                    },
+                                    event,
+                                    window,
+                                    cx,
+                                );
+                            }))
                             .rounded(px(8.0))
                             .bg(rgb(theme::new_session_fill()))
                             .pt(px(10.0))
@@ -5804,10 +5841,13 @@ impl Shell {
         // transcript order.
         let (step_message, step_tool) = match slot {
             BodySlot::Step { message, tool, .. } => (message, tool),
-            BodySlot::Row(..) | BodySlot::Segment(..) => (0, 0),
+            BodySlot::Row(..) | BodySlot::Segment(..) | BodySlot::Inject { .. } => (0, 0),
         };
         let payload = text.to_string();
         let copy_id = format!("step-copy-{label}-{}-{is_input}", payload.len());
+        // The body's own eased scroll. The handler needs it to clamp against the
+        // room left and to hand the rest of the notch to the transcript.
+        let scroll = self.body_scroll(slot);
 
         let mut block = div()
             .ml(px(10.0))
@@ -5887,11 +5927,13 @@ impl Shell {
                         )))
                         .max_h(px(theme::TOOL_BODY_MAX))
                         .overflow_y_scroll()
-                        // The wheel belongs to this box while it scrolls. Without
-                        // stopping here the transcript scroller also receives the
-                        // delta and moves the whole conversation under the pointer.
-                        .on_scroll(cx.listener(|_this, _event, _window, cx| {
-                            cx.stop_propagation();
+                        .track_scroll(&scroll)
+                        // The wheel belongs to this box only while it can move.
+                        // At its end the surplus carries into the transcript in
+                        // the same event; stopping unconditionally here is what
+                        // made the wheel die at the box's edge.
+                        .on_scroll(cx.listener(move |this, event, window, cx| {
+                            body_wheel(this, slot, event, window, cx);
                         }))
                         .child(body),
                 ),

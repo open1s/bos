@@ -29,6 +29,14 @@ impl Smooth {
         self.target = Some(offset);
     }
 
+    /// Where the offset is heading, or `None` when nothing is animating.
+    ///
+    /// A wheel that arrives mid-ease has to add to this, not to the painted
+    /// offset: replacing the target would drop the motion already underway.
+    pub(crate) fn target(&self) -> Option<f32> {
+        self.target
+    }
+
     /// Whether a frame is still needed.
     pub(crate) fn animating(&self) -> bool {
         self.target.is_some()
@@ -70,12 +78,33 @@ pub(crate) fn wheel_target(current: f32, delta: f32, max: f32) -> f32 {
     (current + delta).clamp(-max, 0.0)
 }
 
+/// Split one wheel delta between an inner scroller and the one outside it.
+///
+/// `target` is where the inner scroller is HEADING (GPUI's scrolled-down offset
+/// is negative), `max` is its `max_offset` as a positive magnitude, and `dy` is
+/// the wheel delta in pixels. The scroller takes exactly the room it has left and
+/// the surplus comes back for the outer one, so one event never moves two
+/// scrollers by more than it asked for and never loses the tail of a notch that
+/// crossed the end.
+///
+/// Aiming from the target rather than the painted offset is what keeps a fast
+/// wheel from stalling: an ease in flight has already booked the room, so the
+/// next event's surplus chains instead of being absorbed into the animation.
+pub(crate) fn split_wheel(target: f32, dy: f32, max: f32) -> (f32, f32) {
+    // A body whose content shrank can hold a target outside its new range; the
+    // correction is bookkeeping, and it must not read as a scroll the reader
+    // asked for, so the delta is split from the in-range offset.
+    let current = target.clamp(-max, 0.0);
+    let next = (current + dy).clamp(-max, 0.0);
+    (next, dy - (next - current))
+}
+
 #[cfg(test)]
 mod tests {
     // By name, never `use super::*`: this file imports gpui at module scope, and a
     // glob would bring gpui's own `test` attribute macro into scope - the builtin
     // then resolves back to it and the expansion recurses until rustc gives up.
-    use super::{Smooth, wheel_target};
+    use super::{Smooth, split_wheel, wheel_target};
 
     /// An eased scroll walks towards its target instead of jumping to it, and it
     /// stops asking for frames once it arrives.
@@ -100,6 +129,70 @@ mod tests {
     }
 
     /// The wheel clamps at both ends of the scroller's range.
+    /// A scroller with room takes the whole delta; nothing chains.
+    #[test]
+    fn a_body_with_room_keeps_the_whole_wheel() {
+        assert_eq!(
+            split_wheel(-100.0, -50.0, 500.0),
+            (-150.0, 0.0),
+            "room absorbs it"
+        );
+    }
+
+    /// A scroller already at its end takes none of it.
+    #[test]
+    fn a_body_at_its_end_passes_the_whole_wheel() {
+        assert_eq!(
+            split_wheel(-220.0, -120.0, 220.0),
+            (-220.0, -120.0),
+            "the outer scroller gets the event"
+        );
+    }
+
+    /// A notch that outruns the room splits: the box lands on its end and the
+    /// outer scroller gets exactly the difference.
+    #[test]
+    fn a_body_with_part_of_the_room_left_splits_the_notch() {
+        assert_eq!(
+            split_wheel(-100.0, -120.0, 140.0),
+            (-140.0, -80.0),
+            "40 fits, 80 chains"
+        );
+    }
+
+    /// The split is symmetric at the top: a scroller 10px from its top hands the
+    /// rest of an upward notch out.
+    #[test]
+    fn the_split_is_symmetric_at_the_top() {
+        assert_eq!(
+            split_wheel(-10.0, 120.0, 500.0),
+            (0.0, 110.0),
+            "10 fits, 110 chains"
+        );
+    }
+
+    /// A body whose content shrank under the target is clamped by a delta it never
+    /// asked for, and nothing chains: the clamp is bookkeeping, not a scroll.
+    #[test]
+    fn a_shrunk_body_clamps_without_consuming_a_delta() {
+        assert_eq!(
+            split_wheel(-300.0, 0.0, 200.0),
+            (-200.0, 0.0),
+            "the target lands in range"
+        );
+    }
+
+    /// A body with no overflow at all has no room to take, so the whole wheel
+    /// chains: the dead zone is this case, not a branch.
+    #[test]
+    fn a_body_that_fits_passes_everything() {
+        assert_eq!(
+            split_wheel(0.0, -120.0, 0.0),
+            (0.0, -120.0),
+            "no room means all of it chains"
+        );
+    }
+
     #[test]
     fn a_wheel_never_scrolls_past_an_end() {
         assert_eq!(wheel_target(0.0, 300.0, 500.0), 0.0, "not above the top");
