@@ -28,6 +28,9 @@ mod federation_node;
 pub(crate) mod federation_tools;
 pub(crate) mod file_result;
 pub(crate) mod files;
+// The composer's fuzzy matcher (skim's subsequence scorer), one implementation
+// for the slash palette and the reference card.
+pub(crate) mod fuzzy;
 pub(crate) mod glob;
 pub(crate) mod grep;
 pub(crate) mod history;
@@ -78,6 +81,8 @@ pub(crate) mod vcs;
 /// The local web-search tool: the model's own search client.
 pub(crate) mod web;
 pub(crate) mod workspace_ignore;
+// The `@` picker's flat path index, built off the input path.
+pub(crate) mod workspace_index;
 pub(crate) mod workspace_templates;
 
 /// Run the extension developer CLI and return its exit code.

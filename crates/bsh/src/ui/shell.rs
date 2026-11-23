@@ -1011,6 +1011,25 @@ pub(crate) struct Shell {
     jobs_counts_version: u64,
     /// The composer command menu (the reference's add listbox).
     pub(crate) command_menu: super::command_menu::CommandMenu,
+    /// The `@` picker's workspace index: one flat path list per workspace,
+    /// built off the input path and refreshed while the card is open.
+    pub(crate) file_index: crate::workspace_index::FileIndex,
+    /// The index build in flight; replacing it cancels the older build.
+    pub(crate) index_build: Option<Task<()>>,
+    /// The workspace watcher while the `@` card is open.
+    pub(crate) index_watch: Option<notify::RecommendedWatcher>,
+    /// The root that watcher watches.
+    pub(crate) index_watch_root: Option<std::path::PathBuf>,
+    /// The pump that turns watcher events into rescans.
+    pub(crate) index_watch_task: Option<Task<()>>,
+    /// Closes the watcher channel before the pump is cancelled.
+    pub(crate) index_watch_close: Option<Box<dyn Fn()>>,
+    /// The watcher generation, so a stale pump stops touching the index.
+    pub(crate) index_watch_generation: u64,
+    /// How many index builds this shell started, so a test can prove a frame
+    /// and a key press never restart one.
+    #[cfg(test)]
+    pub(crate) index_builds: usize,
     /// The composer's slash palette: the grouped Add / Commands / Skills card.
     pub(crate) slash: super::slash_palette::SlashPalette,
     /// The inline note the composer is editing, if any.
@@ -1683,6 +1702,10 @@ impl Shell {
                             &this.extension_commands,
                         );
                         this.command_menu.sync(this.composer_value.as_str());
+                        // The index and the row cache follow the draft: the
+                        // next frame draws what this keystroke computed.
+                        this.sync_file_index(cx);
+                        this.refresh_command_rows(cx);
                         cx.notify();
                     }
                     InputEvent::PressEnter {
@@ -2141,7 +2164,12 @@ impl Shell {
             // slash palette. Without this the card answered no key at all.
             if !shell.read(cx).slash.open && shell.read(cx).command_menu.trigger.is_some() {
                 let key = event.keystroke.key.as_str();
-                if matches!(key, "up" | "down" | "escape") {
+                if matches!(key, "escape") {
+                    // Dismissing the picker must leave no picker text: the
+                    // `@query` token goes with the card.
+                    shell.update(cx, |this, cx| this.dismiss_command_card(window, cx));
+                    cx.stop_propagation();
+                } else if matches!(key, "up" | "down") {
                     shell.update(cx, |this, cx| this.command_card_key(key, cx));
                     cx.stop_propagation();
                 }
@@ -2151,6 +2179,13 @@ impl Shell {
                 return;
             }
             let keystroke = event.keystroke.clone();
+            if keystroke.key.as_str() == "escape" {
+                // The palette owns its query: dismissing it leaves an empty
+                // composer, the same contract the reference card has.
+                shell.update(cx, |this, cx| this.dismiss_slash_palette(window, cx));
+                cx.stop_propagation();
+                return;
+            }
             let handled = shell.update(cx, |this, cx| this.slash_key(&keystroke, cx));
             if handled == super::slash_palette::SlashKey::Handled {
                 cx.stop_propagation();
@@ -2412,6 +2447,15 @@ impl Shell {
             jobs_counts_for: None,
             jobs_counts_version: 0,
             command_menu: super::command_menu::CommandMenu::default(),
+            file_index: crate::workspace_index::FileIndex::default(),
+            index_build: None,
+            index_watch: None,
+            index_watch_root: None,
+            index_watch_task: None,
+            index_watch_close: None,
+            index_watch_generation: 0,
+            #[cfg(test)]
+            index_builds: 0,
             slash: super::slash_palette::SlashPalette::default(),
             note: None,
             note_input,
@@ -4369,15 +4413,18 @@ impl Shell {
     /// session, a streaming turn, no chosen model, no credential, or nothing
     /// old enough to fold. The checkpoint is installed only after the summary
     /// returns, so a failed or stopped request leaves the session untouched.
-    /// Move the plus card's highlight with the arrow keys, or close it.
+    /// Move the plus card's highlight with the arrow keys.
     ///
-    /// The kit's textarea consumes arrows in its own key context, so the card
-    /// is driven from the same app-level interceptor the slash palette uses.
+    /// Escape is NOT handled here: it dismisses the card through
+    /// [Shell::dismiss_command_card], which also removes the trigger token from
+    /// the draft. The kit's textarea consumes arrows in its own key context, so
+    /// the card is driven from the same app-level interceptor the slash palette
+    /// uses.
     pub(crate) fn command_card_key(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some(trigger) = self.command_menu.trigger else {
+        if self.command_menu.trigger.is_none() {
             return;
-        };
-        let rows = self.card_rows(trigger).len();
+        }
+        let rows = self.command_menu.rows.len();
         if rows == 0 {
             return;
         }
@@ -4387,9 +4434,6 @@ impl Shell {
             }
             "up" => {
                 self.command_menu.active = (self.command_menu.active + rows - 1) % rows;
-            }
-            "escape" => {
-                self.command_menu.close();
             }
             _ => {}
         }

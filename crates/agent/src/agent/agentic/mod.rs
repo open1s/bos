@@ -552,6 +552,9 @@ pub struct Agent {
     /// Optional host hook preserving results the context cap cut.
     #[rkyv(with = qserde::rkyv::with::Skip)]
     tool_spill: Option<Arc<dyn react::engine::ToolSpill>>,
+    /// Optional host hook keeping the full result the model was not sent.
+    #[rkyv(with = qserde::rkyv::with::Skip)]
+    tool_result_sink: Option<Arc<dyn react::engine::ToolResultSink>>,
 }
 
 impl Agent {
@@ -628,6 +631,7 @@ impl Agent {
             last_stream_tool_time: std::sync::Mutex::new(std::time::Duration::ZERO),
             steers: Arc::new(SteerMailbox::new()),
             tool_spill: None,
+            tool_result_sink: None,
         }
     }
 
@@ -959,6 +963,13 @@ impl Agent {
     #[must_use]
     pub fn with_tool_spill(mut self, spill: Arc<dyn react::engine::ToolSpill>) -> Self {
         self.tool_spill = Some(spill);
+        self
+    }
+
+    /// Install a host hook that keeps the full result the model was not sent.
+    #[must_use]
+    pub fn with_tool_result_sink(mut self, sink: Arc<dyn react::engine::ToolResultSink>) -> Self {
+        self.tool_result_sink = Some(sink);
         self
     }
 
@@ -2748,6 +2759,7 @@ impl Clone for Agent {
             // other's mid-turn messages.
             steers: Arc::new(SteerMailbox::new()),
             tool_spill: self.tool_spill.clone(),
+            tool_result_sink: self.tool_result_sink.clone(),
         }
     }
 }

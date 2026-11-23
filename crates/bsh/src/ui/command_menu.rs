@@ -22,9 +22,12 @@
 use std::path::PathBuf;
 
 use gpui_kit::*;
+use notify::Watcher as _;
 
 use super::shell::Shell;
+use crate::fuzzy;
 use crate::theme;
+use crate::workspace_index::{Entry, IndexStatus};
 
 /// Measured `.card{min-width:min(220px,100%);max-width:100%;max-height:320px;
 /// padding:3px;position:absolute;bottom:calc(100% + 4px);left:0;right:0;
@@ -51,6 +54,13 @@ pub(crate) const DETAIL_FONT: f32 = 11.0;
 pub(crate) const STATUS_PAD_X: f32 = 8.0;
 pub(crate) const STATUS_PAD_Y: f32 = 7.0;
 pub(crate) const STATUS_FONT: f32 = 12.0;
+
+/// The most rows one card draws.
+///
+/// The index ranks every candidate; the card draws this many, so a query that
+/// matches thousands of paths still costs one bounded list. The status line
+/// reports the full match count, which is what makes the cut honest.
+const MAX_ROWS: usize = 200;
 
 /// One menu row: the reference's own `{ id, label, detail }` option, with what
 /// bsh does when it is chosen. The reference's `badge` (`<sup>`, 8px/600) and
@@ -139,24 +149,136 @@ pub(crate) fn slash_query(text: &str) -> Option<&str> {
     token.strip_prefix('/')
 }
 
-/// The reference's `filterOptions`: a trimmed, lowercased substring test over
-/// the row's own label and detail; a blank query keeps every row in order.
+/// The rows one query keeps, best first.
+///
+/// The reference's `filterOptions` was a trimmed, lowercased substring test;
+/// this build splits the two fields by their nature: a NAME is matched as a
+/// subsequence (the needle `ab` matches *a*b*, and the score orders the rows),
+/// while a one-line DESCRIPTION is prose and matches only as a substring, so a
+/// short query cannot drag in every row whose sentence happens to contain its
+/// letters. A name match always outranks a description match, and a blank query
+/// keeps every row in catalog order.
 pub(crate) fn filter_indices(
     entries: &[CommandEntry],
     query: &str,
     lang: crate::i18n::Lang,
 ) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
-    entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            query.is_empty()
-                || lang.tr(entry.label).to_lowercase().contains(&query)
-                || lang.tr(entry.detail).to_lowercase().contains(&query)
-        })
+    let needle = query.trim();
+    if needle.is_empty() {
+        return (0..entries.len()).collect();
+    }
+    let mut label_hits: Vec<(usize, i64)> = Vec::new();
+    let mut detail_hits: Vec<usize> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        match fuzzy::score(&lang.tr(entry.label), needle) {
+            Some(score) => label_hits.push((index, score)),
+            None => {
+                // A description is prose: it matches as a substring, not as a
+                // scattered subsequence, so a short query cannot drag in every
+                // row whose one-liner happens to contain its letters.
+                if !fuzzy::substring_runs(&lang.tr(entry.detail), needle).is_empty() {
+                    detail_hits.push(index);
+                }
+            }
+        }
+    }
+    label_hits.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    label_hits
+        .into_iter()
         .map(|(index, _)| index)
+        .chain(detail_hits)
         .collect()
+}
+
+/// One scored row, or none when the needle matches neither the label nor the
+/// detail.
+///
+/// The label wins the score, so a row whose NAME matches is never described as
+/// a description match; the detail is only tried when the label does not
+/// match at all.
+fn scored_row(
+    id: String,
+    label: String,
+    detail: String,
+    action: CardAction,
+    needle: &str,
+) -> Option<(i64, CardRow)> {
+    if needle.is_empty() {
+        return Some((
+            0,
+            CardRow {
+                id,
+                label,
+                detail,
+                action,
+                label_runs: Vec::new(),
+                detail_runs: Vec::new(),
+            },
+        ));
+    }
+    let (score, label_runs, detail_runs) = match fuzzy::hit(&label, needle) {
+        Some((score, chars)) => (
+            score,
+            fuzzy::runs_in(&label, &chars, 0..label.len()),
+            Vec::new(),
+        ),
+        None => {
+            // A detail-only row is prose and ranks below every name match,
+            // which is why its score is zero rather than a fuzzy one.
+            let runs = fuzzy::substring_runs(&detail, needle);
+            if runs.is_empty() {
+                return None;
+            }
+            (0, Vec::new(), runs)
+        }
+    };
+    Some((
+        score,
+        CardRow {
+            id,
+            label,
+            detail,
+            action,
+            label_runs,
+            detail_runs,
+        },
+    ))
+}
+
+/// Whether a watcher event names a path the index never lists.
+///
+/// Checked per path COMPONENT, not by substring: an event for the `.bsh`
+/// directory itself (created when the ignore rules are first loaded) must not
+/// trigger a rescan, and on Windows a path may spell the separator either way.
+fn unindexed_path(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some(
+                ".bsh"
+                    | ".bsh-run"
+                    | ".codel"
+                    | ".bos"
+                    | ".git"
+                    | ".jj"
+                    | "target"
+                    | "node_modules"
+            )
+        )
+    })
+}
+
+/// Split a reference query into the directory scope and the needle.
+///
+/// `src/u` searches under `src` for `u`; `src/` browses `src`; a bare
+/// `supal` searches the whole workspace. The scope is a PREFIX OF THE TEXT the
+/// reader sees, which is what makes a drill something to backspace out of
+/// instead of a hidden mode.
+pub(crate) fn split_scope(query: &str) -> (&str, &str) {
+    match query.rfind('/') {
+        Some(index) => (&query[..index], &query[index + 1..]),
+        None => ("", query),
+    }
 }
 
 /// Which source the open card is showing. The reference's trigger component
@@ -172,6 +294,7 @@ pub(crate) enum Trigger {
 
 /// One drawn row. Both sources build these, so the card keeps one renderer and
 /// one set of measured numbers.
+#[derive(Clone)]
 pub(crate) struct CardRow {
     /// Stable id, for the row's key and its debug selector.
     pub(crate) id: String,
@@ -181,9 +304,32 @@ pub(crate) struct CardRow {
     pub(crate) detail: String,
     /// What choosing the row does.
     pub(crate) action: CardAction,
+    /// The byte ranges of `label` the query matched.
+    pub(crate) label_runs: Vec<(usize, usize)>,
+    /// The byte ranges of `detail` the query matched.
+    pub(crate) detail_runs: Vec<(usize, usize)>,
+}
+
+/// The rows one trigger draws, plus what the status line needs to say.
+pub(crate) struct CardRows {
+    /// The rows, in draw order.
+    pub(crate) rows: Vec<CardRow>,
+    /// How many candidates matched before [`MAX_ROWS`] cut the list.
+    pub(crate) matched: usize,
+    /// Whether the row cap cut the list.
+    pub(crate) truncated: bool,
+}
+
+impl CardRows {
+    /// The drawn row count.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
 }
 
 /// What choosing a row does.
+#[derive(Clone)]
 pub(crate) enum CardAction {
     /// Run a command row.
     Run(fn(&mut Shell, &mut Window, &mut Context<Shell>)),
@@ -266,6 +412,16 @@ pub(crate) struct CommandMenu {
     pub(crate) open: bool,
     pub(crate) trigger: Option<Trigger>,
     pub(crate) active: usize,
+    /// The rows the last draft change (or index install) computed.
+    ///
+    /// A frame and a key press read THIS list. Neither may walk the
+    /// filesystem: the reference source used to call the walk from `render`,
+    /// from every arrow press and again from `run_row`.
+    pub(crate) rows: Vec<CardRow>,
+    /// How many candidates matched before [`MAX_ROWS`] cut the list.
+    pub(crate) matched: usize,
+    /// Whether [`MAX_ROWS`] cut the list.
+    pub(crate) truncated: bool,
 }
 
 impl CommandMenu {
@@ -274,6 +430,9 @@ impl CommandMenu {
         self.open = !self.open;
         self.trigger = self.open.then_some(Trigger::Command);
         self.active = 0;
+        self.rows.clear();
+        self.matched = 0;
+        self.truncated = false;
     }
 
     /// Closing clears the highlight, so the next open parks on the top row the
@@ -282,6 +441,19 @@ impl CommandMenu {
         self.open = false;
         self.trigger = None;
         self.active = 0;
+        self.rows.clear();
+        self.matched = 0;
+        self.truncated = false;
+    }
+
+    /// Install the rows one query computed, keeping the highlight in range.
+    pub(crate) fn install(&mut self, rows: CardRows) {
+        if self.active >= rows.rows.len() {
+            self.active = rows.rows.len().saturating_sub(1);
+        }
+        self.rows = rows.rows;
+        self.matched = rows.matched;
+        self.truncated = rows.truncated;
     }
 
     /// Follow the draft: the card shows the source whose trigger the draft's
@@ -345,6 +517,8 @@ pub(crate) fn toggle_action(shell: &mut Shell, window: &mut Window, cx: &mut Con
         let handle = shell.composer.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
     }
+    shell.sync_file_index(cx);
+    shell.refresh_command_rows(cx);
     cx.notify();
 }
 
@@ -355,13 +529,20 @@ impl Shell {
     pub(crate) fn command_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let trigger = self.command_menu.trigger?;
         let lang = self.state.lang;
-        let rows = self.card_rows(trigger);
+        // The rows the last draft/index change computed: a frame never walks
+        // the filesystem, and never rebuilds a label it already has.
+        let rows = &self.command_menu.rows;
         // A filter that shrank under the highlight parks it back on the top.
-        let active = if self.command_menu.active >= rows.len() {
+        let active = if rows.is_empty() {
             0
         } else {
-            self.command_menu.active
+            self.command_menu.active.min(rows.len() - 1)
         };
+        // A first build has nothing to list yet. "Indexing…" is the status
+        // line's job; the empty copy would contradict it.
+        let building = trigger == Trigger::Reference
+            && self.file_index.status() == IndexStatus::Building
+            && self.file_index.entries().is_empty();
         let mut viewport = div()
             .id("commands-viewport")
             .debug_selector(|| "commands-viewport".to_string())
@@ -369,7 +550,7 @@ impl Shell {
             .flex_col()
             .min_h(px(0.0))
             .overflow_y_scroll();
-        if rows.is_empty() {
+        if rows.is_empty() && !building {
             viewport = viewport.child(
                 div()
                     .debug_selector(|| "commands-empty".to_string())
@@ -414,54 +595,116 @@ impl Shell {
                         .child(
                             div()
                                 .min_w(px(0.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
                                 .text_ellipsis()
-                                .child(SharedString::from(card_row.label.clone())),
+                                .child(super::marked_text(&card_row.label, &card_row.label_runs)),
                         ),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
                         .text_size(px(DETAIL_FONT))
                         .text_color(rgb(theme::faint()))
                         .text_ellipsis()
-                        .child(SharedString::from(card_row.detail.clone())),
+                        .child(super::marked_text(&card_row.detail, &card_row.detail_runs)),
                 );
             if selected {
                 row_el = row_el.bg(rgb(theme::hover()));
             }
             viewport = viewport.child(row_el);
         }
-        Some(
-            div()
-                .debug_selector(|| "composer-command-menu".to_string())
-                .absolute()
-                .bottom(px(CARD_GAP))
-                .left(px(0.0))
-                .right(px(0.0))
-                .min_w(px(CARD_MIN_W))
-                .max_h(px(CARD_MAX_H))
-                .flex()
-                .flex_col()
-                .p(px(CARD_PAD))
-                .rounded(px(16.0))
-                .bg(rgb(theme::page()))
-                .shadow_lg()
-                .occlude()
-                .child(viewport)
-                .into_any_element(),
-        )
+        let status = self.command_status();
+        let mut card = div()
+            .debug_selector(|| "composer-command-menu".to_string())
+            .absolute()
+            // Measured `.card{bottom:calc(100% + 4px)}`: ABOVE the composer
+            // card, not 4px off its own bottom, which put the list over the
+            // field it belongs to.
+            .bottom(relative(1.0))
+            .mb(px(CARD_GAP))
+            .left(px(0.0))
+            .right(px(0.0))
+            .min_w(px(CARD_MIN_W))
+            .max_h(px(CARD_MAX_H))
+            .flex()
+            .flex_col()
+            .p(px(CARD_PAD))
+            .rounded(px(16.0))
+            .bg(rgb(theme::page()))
+            .shadow_lg()
+            .occlude()
+            .child(viewport);
+        if let Some(status) = status {
+            card = card.child(
+                div()
+                    .debug_selector(|| "commands-status".to_string())
+                    .px(px(STATUS_PAD_X))
+                    .py(px(2.0))
+                    .text_size(px(STATUS_FONT))
+                    .text_color(rgb(theme::faint()))
+                    .child(status),
+            );
+        }
+        Some(card.into_any_element())
+    }
+
+    /// What the card's status line says, when it has something true to say.
+    ///
+    /// The line exists for the two states a list cannot show by itself: a first
+    /// build that has not finished ("Indexing…"), and a scan that failed. The
+    /// match count appears only while a query is present, so a clean browse is
+    /// not decorated with a number nobody asked for.
+    fn command_status(&self) -> Option<SharedString> {
+        if self.command_menu.trigger != Some(Trigger::Reference) {
+            return None;
+        }
+        let lang = self.state.lang;
+        if self.file_index.is_building() && self.file_index.entries().is_empty() {
+            return Some(lang.tr("commands.indexing").into());
+        }
+        if self.file_index.status() == IndexStatus::Failed {
+            return Some(lang.tr("commands.indexUnavailable").into());
+        }
+        let query = at_query(&self.composer_value).unwrap_or("");
+        if query.trim_start_matches('"').trim().is_empty() || self.command_menu.rows.is_empty() {
+            return None;
+        }
+        let count = self.command_menu.matched;
+        if self.command_menu.truncated || self.file_index.truncated() {
+            return Some(
+                crate::i18n::tr_args(
+                    lang,
+                    "commands.matchCapped",
+                    &[
+                        ("shown", self.command_menu.rows.len().to_string()),
+                        ("count", count.to_string()),
+                    ],
+                )
+                .into(),
+            );
+        }
+        let key = if count == 1 {
+            "commands.matchOne"
+        } else {
+            "commands.matchCount"
+        };
+        Some(crate::i18n::tr_args(lang, key, &[("count", count.to_string())]).into())
     }
 
     /// Enter over an open menu runs the highlighted row instead of sending, and
     /// a row that names a mention consumes its own trigger token the way the
     /// reference's command does.
     pub(crate) fn run_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(trigger) = self.command_menu.trigger else {
+        let Some(_trigger) = self.command_menu.trigger else {
             return;
         };
-        let rows = self.card_rows(trigger);
-        let Some(card_row) = rows.into_iter().nth(row) else {
+        // The drawn row, not a recomputation: the query may have moved since the
+        // last frame, but the row the reader pressed is the row that runs.
+        let Some(card_row) = self.command_menu.rows.get(row).cloned() else {
             cx.notify();
             return;
         };
@@ -483,6 +726,10 @@ impl Shell {
                 self.command_menu.open = true;
                 self.command_menu.trigger = Some(Trigger::Reference);
                 self.command_menu.active = 0;
+                // The scope is the draft now, so the next query needs its rows
+                // recomputed from the folder that was just entered.
+                self.sync_file_index(cx);
+                self.refresh_command_rows(cx);
             }
         }
         cx.notify();
@@ -502,6 +749,8 @@ impl Shell {
         self.command_menu.active = 0;
         let handle = self.composer.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
+        self.sync_file_index(cx);
+        self.refresh_command_rows(cx);
         cx.notify();
     }
 
@@ -560,105 +809,219 @@ impl Shell {
     }
 
     /// The rows the active source produces for the draft's own query.
-    pub(crate) fn card_rows(&self, trigger: Trigger) -> Vec<CardRow> {
+    pub(crate) fn card_rows(&self, trigger: Trigger) -> CardRows {
         match trigger {
-            Trigger::Command => {
-                let entries = entries(self.state.active_streaming());
-                let query = slash_query(&self.composer_value).unwrap_or("");
-                let mut rows: Vec<CardRow> = filter_indices(&entries, query, self.state.lang)
-                    .into_iter()
-                    .map(|index| CardRow {
-                        id: entries[index].id.to_string(),
-                        label: self.state.lang.tr(entries[index].label).to_string(),
-                        detail: self.state.lang.tr(entries[index].detail).to_string(),
-                        action: CardAction::Run(entries[index].run),
-                    })
-                    .collect();
-                let needle = query.trim().to_lowercase();
-                for command in &self.extension_commands {
-                    if !needle.is_empty()
-                        && !command.name.to_lowercase().contains(&needle)
-                        && !command.description.to_lowercase().contains(&needle)
-                    {
-                        continue;
-                    }
-                    rows.push(CardRow {
-                        id: format!("ext-command-{}", command.name),
-                        label: command.name.clone(),
-                        detail: command.description.clone(),
-                        action: CardAction::Extension(command.name.clone()),
-                    });
-                }
-                rows
-            }
-            Trigger::Reference => {
-                let query = at_query(&self.composer_value).unwrap_or("");
-                self.reference_rows(query)
-            }
+            Trigger::Command => self.command_rows(),
+            Trigger::Reference => self.reference_rows(),
         }
     }
 
-    /// The reference source's candidates in the reference's own order - the file
-    /// rows, then the session rows - with the session half dropped for a quoted
-    /// query, which can only name a file.
-    fn reference_rows(&self, query: &str) -> Vec<CardRow> {
+    /// The plus card's rows: the built-in commands and the extension commands,
+    /// ranked together by one fuzzy score.
+    fn command_rows(&self) -> CardRows {
+        let entries = entries(self.state.active_streaming());
+        let query = slash_query(&self.composer_value).unwrap_or("");
+        let needle = query.trim();
+        let lang = self.state.lang;
+        let mut scored: Vec<(i64, CardRow)> = Vec::new();
+        for index in filter_indices(&entries, query, lang) {
+            let entry = &entries[index];
+            let label = lang.tr(entry.label);
+            let detail = lang.tr(entry.detail);
+            if let Some(row) = scored_row(
+                entry.id.to_string(),
+                label,
+                detail,
+                CardAction::Run(entry.run),
+                needle,
+            ) {
+                scored.push(row);
+            }
+        }
+        for command in &self.extension_commands {
+            if let Some(row) = scored_row(
+                format!("ext-command-{}", command.name),
+                command.name.clone(),
+                command.description.clone(),
+                CardAction::Extension(command.name.clone()),
+                needle,
+            ) {
+                scored.push(row);
+            }
+        }
+        if !needle.is_empty() {
+            // The built-in rows and the extension rows are one ranking: the
+            // best row is first whichever source owns it.
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        }
+        CardRows {
+            matched: scored.len(),
+            truncated: false,
+            rows: scored.into_iter().map(|(_, row)| row).collect(),
+        }
+    }
+
+    /// The reference card's rows: the file block (folders tied first), then the
+    /// session block, both ranked by the same fuzzy score.
+    fn reference_rows(&self) -> CardRows {
+        let query = at_query(&self.composer_value).unwrap_or("");
         let quoted = query.starts_with('"');
         let raw = query.trim_start_matches('"');
-        // A `#L<start>-L<end>` suffix is part of the reference, not part of the
-        // path it matches: the query lists files by their path and the pick
-        // inserts the range back.
+        // A line-range suffix is part of the reference, not part of the path it
+        // matches: the query lists files by their path and the pick inserts the
+        // range back.
         let (path_query, range) = crate::reference::split_range(raw);
-        let needle = path_query.to_lowercase();
+        let (scope, needle) = split_scope(path_query);
         let mut rows: Vec<CardRow> = Vec::new();
-        for (index, (path, directory)) in self.reference_files(path_query).into_iter().enumerate() {
-            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            let detail = match range {
-                Some((start, end)) if !directory => {
-                    format!("{path} · L{start}-{end}")
+        let mut matched: usize;
+        let mut truncated = false;
+
+        // The file block. A blank needle BROWSES the scope's own children;
+        // anything else searches the whole subtree, so a nested file is found
+        // by its own name without the reader typing the folders above it.
+        if needle.is_empty() {
+            let children = self.file_index.children(scope);
+            matched = children.len();
+            for (index, entry) in children.into_iter().enumerate() {
+                if rows.len() >= MAX_ROWS {
+                    truncated = true;
+                    break;
                 }
-                _ => path.clone(),
-            };
-            rows.push(CardRow {
-                id: format!("ref-file-{index}"),
-                label: if directory { format!("{name}/") } else { name },
-                detail,
-                action: if directory {
-                    CardAction::Drill(mention(&path, true))
-                } else {
-                    CardAction::Insert(mention_with_range(&path, false, range))
-                },
+                rows.push(self.reference_row(index, entry, range, &[]));
+            }
+        } else {
+            let candidates: Vec<&Entry> = self.file_index.under(scope).collect();
+            let mut hits = fuzzy::rank(needle, candidates.iter().map(|entry| entry.rel.as_str()));
+            matched = hits.len();
+            // Score first; on an equal score a folder wins, then the filtered
+            // list's own order (the index is sorted by path, so this is
+            // deterministic without a second sort key).
+            hits.sort_by(|left, right| {
+                right
+                    .score
+                    .cmp(&left.score)
+                    .then_with(|| candidates[right.index].dir.cmp(&candidates[left.index].dir))
+                    .then_with(|| left.index.cmp(&right.index))
             });
+            for (index, hit) in hits.into_iter().enumerate() {
+                if rows.len() >= MAX_ROWS {
+                    truncated = true;
+                    break;
+                }
+                rows.push(self.reference_row(index, candidates[hit.index], range, &hit.chars));
+            }
         }
+
         if quoted {
-            return rows;
+            return CardRows {
+                rows,
+                matched,
+                truncated,
+            };
         }
-        for (index, session) in self
+
+        // The session block: the same matcher over the titles, so a session is
+        // found by a partial title exactly as a path is found by a partial path.
+        let sessions: Vec<&crate::model::Session> = self
             .state
             .store
             .sessions
             .iter()
             .filter(|session| session.archived_at.is_none())
-            .filter(|session| needle.is_empty() || session.title.to_lowercase().contains(&needle))
-            .enumerate()
-        {
-            rows.push(CardRow {
-                id: format!("ref-session-{index}"),
-                label: session.title.clone(),
-                detail: self.workspace_name(&session.workspace),
-                // A session is NOT a path: the reference serializes it as a
-                // labelled mention, which the file guidance excludes from the
-                // `@path` rule.
-                action: CardAction::Insert(session_mention(&session.title, &session.id)),
-            });
+            .collect();
+        if needle.is_empty() {
+            matched += sessions.len();
+            for (index, session) in sessions.into_iter().enumerate() {
+                if rows.len() >= MAX_ROWS {
+                    truncated = true;
+                    break;
+                }
+                rows.push(self.session_row(index, session, &[]));
+            }
+        } else {
+            let ranked = fuzzy::rank(
+                path_query,
+                sessions.iter().map(|session| session.title.as_str()),
+            );
+            matched += ranked.len();
+            for (index, hit) in ranked.into_iter().enumerate() {
+                if rows.len() >= MAX_ROWS {
+                    truncated = true;
+                    break;
+                }
+                rows.push(self.session_row(index, sessions[hit.index], &hit.chars));
+            }
         }
-        rows
+        CardRows {
+            rows,
+            matched,
+            truncated,
+        }
     }
 
-    /// The active workspace's filesystem root, the root the agent's own tools are
-    /// confined to (the reference asks its remote `fileReferences` for the same
-    /// list).
-    fn workspace_root(&self) -> Option<PathBuf> {
-        self.state.workspace_root()
+    /// One file row: the drawn label, the parent path, and the mention it
+    /// inserts (or the drill it starts).
+    fn reference_row(
+        &self,
+        index: usize,
+        entry: &Entry,
+        range: Option<(u32, u32)>,
+        chars: &[usize],
+    ) -> CardRow {
+        let name = entry.name();
+        let parent = entry.parent();
+        let label = if entry.dir {
+            format!("{name}/")
+        } else {
+            name.to_string()
+        };
+        let detail = match range {
+            Some((start, end)) if !entry.dir && !parent.is_empty() => {
+                format!("{parent} · L{start}-{end}")
+            }
+            Some((start, end)) if !entry.dir => format!("L{start}-{end}"),
+            _ => parent.to_string(),
+        };
+        // The match is against the full relative path; split its character
+        // indices across the label (the basename) and the detail (the parent
+        // path) so each drawn piece highlights only the characters it shows.
+        let name_start = entry.rel.len() - name.len();
+        let label_runs = fuzzy::runs_in(&entry.rel, chars, name_start..entry.rel.len());
+        let detail_end = parent.len();
+        let detail_runs = fuzzy::runs_in(&entry.rel, chars, 0..detail_end);
+        CardRow {
+            id: format!("ref-file-{index}"),
+            label,
+            detail,
+            action: if entry.dir {
+                CardAction::Drill(mention(&entry.rel, true))
+            } else {
+                CardAction::Insert(mention_with_range(&entry.rel, false, range))
+            },
+            label_runs,
+            detail_runs,
+        }
+    }
+
+    /// One session row: a title, its workspace, and the labelled mention.
+    fn session_row(
+        &self,
+        index: usize,
+        session: &crate::model::Session,
+        chars: &[usize],
+    ) -> CardRow {
+        let label = session.title.clone();
+        CardRow {
+            id: format!("ref-session-{index}"),
+            label_runs: fuzzy::runs_in(&label, chars, 0..label.len()),
+            label,
+            detail: self.workspace_name(&session.workspace),
+            // A session is NOT a path: the reference serializes it as a
+            // labelled mention, which the file guidance excludes from the
+            // path rule.
+            action: CardAction::Insert(session_mention(&session.title, &session.id)),
+            detail_runs: Vec::new(),
+        }
     }
 
     /// The display name of the workspace a row belongs to.
@@ -673,69 +1036,169 @@ impl Shell {
             .unwrap_or_default()
     }
 
-    /// The workspace files the query names, bounded: three levels under the root,
-    /// 200 rows, the usual heavy directories skipped, and a query that names a
-    /// directory walked as a prefix. The reference's lookup is remote and fuzzy;
-    /// this is the local backing for it.
-    fn reference_files(&self, query: &str) -> Vec<(String, bool)> {
-        const MAX_ROWS: usize = 200;
-        const MAX_DEPTH: usize = 2;
-        const SKIP: [&str; 6] = [".git", ".jj", "target", "node_modules", "dist", "build"];
-        let Some(root) = self.workspace_root() else {
-            return Vec::new();
-        };
-        let (start, needle) = match query.rfind('/') {
-            Some(index) => (
-                root.join(query[..index].trim_matches('"')),
-                query[index + 1..].to_lowercase(),
-            ),
-            None => (root.clone(), query.to_lowercase()),
-        };
-        let mut rows: Vec<(String, bool)> = Vec::new();
-        let mut stack = vec![(start, 0usize)];
-        while let Some((dir, depth)) = stack.pop() {
-            if rows.len() >= MAX_ROWS {
-                break;
-            }
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            let mut found: Vec<(PathBuf, bool)> = entries
-                .flatten()
-                .filter_map(|entry| {
-                    let path = entry.path();
-                    let name = path.file_name()?.to_string_lossy().to_string();
-                    let directory = path.is_dir();
-                    if name.starts_with('.') || (directory && SKIP.contains(&name.as_str())) {
-                        return None;
-                    }
-                    Some((path, directory))
-                })
-                .collect();
-            // Directories first, then by name, so a fresh open reads like a tree.
-            found.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-            for (path, directory) in found {
-                if rows.len() >= MAX_ROWS {
-                    break;
-                }
-                let Ok(relative) = path.strip_prefix(&root) else {
-                    continue;
-                };
-                let Some(relative) = relative.to_str() else {
-                    continue;
-                };
-                let relative = relative.replace('\\', "/");
-                let lowered = relative.to_lowercase();
-                if !needle.is_empty() && !lowered.contains(&needle) {
-                    continue;
-                }
-                let descend = directory && depth < MAX_DEPTH && lowered.starts_with(&needle);
-                rows.push((relative, directory));
-                if descend {
-                    stack.push((path, depth + 1));
-                }
-            }
+    /// Escape on the reference card: close it and take its trigger token out of
+    /// the draft.
+    ///
+    /// The picker owns the `@query` it was opened with, so dismissing it must
+    /// leave no picker text in the composer: `hello @alp` becomes `hello`, and
+    /// a lone `@alp` becomes empty. A `+`-opened card has no token to remove,
+    /// and a `/` token belongs to the slash palette's own Escape, so only an
+    /// `@` token is consumed.
+    pub(crate) fn dismiss_command_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_menu.close();
+        let text = self.composer_value.clone();
+        let start = trigger_start(&text);
+        if text[start..].starts_with('@') {
+            let next = text[..start].trim_end().to_string();
+            self.set_composer_text(&next, window, cx);
         }
-        rows
+        self.sync_file_index(cx);
+        cx.notify();
+    }
+
+    /// Recompute the open card's rows from the current draft and index.
+    ///
+    /// This is the ONE place rows are built outside a test. The composer's
+    /// change listener calls it, an installed index calls it, and a drill calls
+    /// it; a frame and a key press never do.
+    pub(crate) fn refresh_command_rows(&mut self, cx: &mut Context<Self>) {
+        let Some(trigger) = self.command_menu.trigger else {
+            self.command_menu.rows.clear();
+            self.command_menu.matched = 0;
+            self.command_menu.truncated = false;
+            return;
+        };
+        let rows = self.card_rows(trigger);
+        self.command_menu.install(rows);
+        cx.notify();
+    }
+
+    /// Keep the reference card's workspace index and watcher in step with the
+    /// draft.
+    ///
+    /// Starting the index is a SIDE EFFECT of the card opening, not of a
+    /// frame: this runs from the composer's change listener, from the File
+    /// row, from a drill, and from the index's own completion.
+    pub(crate) fn sync_file_index(&mut self, cx: &mut Context<Self>) {
+        let wanted =
+            self.command_menu.open && self.command_menu.trigger == Some(Trigger::Reference);
+        let Some(root) = self.state.workspace_root().filter(|_| wanted) else {
+            self.stop_index_watch();
+            return;
+        };
+        if let Some(generation) = self.file_index.begin_if_needed(&root) {
+            self.start_index_build(root.clone(), generation, cx);
+        }
+        self.start_index_watch(root, cx);
+    }
+
+    /// Scan the workspace on a worker thread and install the result.
+    ///
+    /// The walk is blocking filesystem work, so it never runs on the UI thread
+    /// or on GPUI's executor: a plain thread owns it and an async_channel
+    /// carries the result back. The generation is checked on install, so a
+    /// result for an older root or an older build cannot replace a newer one.
+    fn start_index_build(&mut self, root: PathBuf, generation: u64, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.index_builds += 1;
+        }
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(crate::workspace_index::scan(&root));
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(scan) => this.file_index.install(generation, scan),
+                    Err(error) => this.file_index.fail(generation, error),
+                }
+                this.refresh_command_rows(cx);
+            });
+        });
+        self.index_build = Some(task);
+    }
+
+    /// Watch the workspace while the reference card is open.
+    ///
+    /// The Files pane's watcher is the pattern: notify's own thread sends, a
+    /// foreground task debounces and rescans. Only the card's lifetime pays for
+    /// it, so a workspace the reader is not picking from is not watched.
+    fn start_index_watch(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if self.index_watch.is_some() && self.index_watch_root.as_deref() == Some(root.as_path()) {
+            return;
+        }
+        self.stop_index_watch();
+        let (tx, rx) = async_channel::unbounded();
+        let watch_root = root.clone();
+        let Ok(mut watcher) =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                let Ok(event) = event else {
+                    return;
+                };
+                // Only components BELOW the workspace decide: a workspace that
+                // happens to live under a folder called target is still watched.
+                let relevant = event.paths.iter().any(|path| {
+                    let relative = path.strip_prefix(&watch_root).unwrap_or(path);
+                    !unindexed_path(relative)
+                });
+                if relevant {
+                    let _ = tx.send_blocking(());
+                }
+            })
+        else {
+            return;
+        };
+        if watcher
+            .watch(&root, notify::RecursiveMode::Recursive)
+            .is_err()
+        {
+            return;
+        }
+        self.index_watch = Some(watcher);
+        self.index_watch_root = Some(root);
+        self.index_watch_generation = self.index_watch_generation.wrapping_add(1);
+        let generation = self.index_watch_generation;
+        let close_rx = rx.clone();
+        let task = cx.spawn(async move |this, cx| {
+            while rx.recv().await.is_ok() {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                while rx.try_recv().is_ok() {}
+                let _ = this.update(cx, |this, cx| {
+                    if this.index_watch_generation != generation {
+                        return;
+                    }
+                    if !this.command_menu.open
+                        || this.command_menu.trigger != Some(Trigger::Reference)
+                    {
+                        return;
+                    }
+                    let Some(root) = this.index_watch_root.clone() else {
+                        return;
+                    };
+                    let generation = this.file_index.begin(&root);
+                    this.start_index_build(root, generation, cx);
+                });
+            }
+        });
+        self.index_watch_task = Some(task);
+        self.index_watch_close = Some(Box::new(move || {
+            close_rx.close();
+        }));
+    }
+
+    /// Stop the watcher and detach its channel before the task is cancelled.
+    pub(crate) fn stop_index_watch(&mut self) {
+        if let Some(close) = self.index_watch_close.take() {
+            close();
+        }
+        self.index_watch_task = None;
+        self.index_watch = None;
+        self.index_watch_root = None;
     }
 }

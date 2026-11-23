@@ -17777,12 +17777,13 @@ fn the_command_trigger_is_the_last_slash_token() {
     assert_eq!(slash_query(""), None);
 }
 
-/// The filter is the reference's `filterOptions`: a trimmed, lowercased
-/// substring test over the row's own label and detail, and a blank query keeps
-/// every row in its order. The expectations are read out of the dictionary the
-/// rows draw from, so the test cannot pass on a query the rows never show.
+/// The filter is the composer's fuzzy rule: a partial query matches as a
+/// subsequence, the label is tried before the detail, smart case applies, and a
+/// blank query keeps every row in its order. The expectations are read out of
+/// the dictionary the rows draw from, so the test cannot pass on a query the
+/// rows never show.
 #[test]
-fn the_command_filter_is_the_references_substring_test() {
+fn the_command_filter_is_fuzzy_and_partial() {
     use super::command_menu::{entries, filter_indices};
     use crate::i18n::Lang;
     let idle = entries(false);
@@ -17809,10 +17810,18 @@ fn the_command_filter_is_the_references_substring_test() {
         }),
         "and only rows that carry the query"
     );
-    assert_eq!(
-        filter_indices(&idle, &label.to_uppercase(), Lang::En),
-        hits,
-        "the test is lowercased on both sides"
+    assert!(
+        filter_indices(&idle, &label.to_uppercase(), Lang::En).is_empty(),
+        "smart case: an all-uppercase needle does not match a mixed-case row"
+    );
+    // A partial query matches as a subsequence: the label's first and last
+    // characters are enough, with anything between them skipped.
+    let first = label.chars().next().expect("a label");
+    let last = label.chars().next_back().expect("a label");
+    let partial: String = [first, last].iter().collect();
+    assert!(
+        filter_indices(&idle, &partial, Lang::En).contains(&2),
+        "a partial needle finds the row"
     );
     assert_eq!(
         filter_indices(&idle, &format!("  {label}  "), Lang::En),
@@ -17857,9 +17866,25 @@ fn set_command_draft(shell: &Entity<Shell>, cx: &mut VisualTestContext, text: &s
             // The listener the keystroke path runs, so the card follows the
             // draft here exactly as it does for a real key.
             shell.command_menu.sync(text);
+            shell.sync_file_index(cx);
+            shell.refresh_command_rows(cx);
             cx.notify();
         });
     });
+    // The index is built on a worker thread and delivered on the foreground
+    // executor; drain both queues until it lands, so the assertion after this
+    // helper sees the rows a reader would.
+    let mut built = false;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if cx.update(|_, cx| !shell.read(cx).file_index.is_building()) {
+            built = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(built, "the workspace index builds within the helper");
     cx.update(|window, cx| window.draw(cx).clear(cx));
 }
 
@@ -18414,7 +18439,7 @@ fn the_composer_editor_holds_the_token_its_renderer_paints(cx: &mut TestAppConte
 /// space survives typing, and an `@` inside a word is not a trigger.
 #[test]
 fn the_reference_trigger_keeps_quoted_mentions_whole() {
-    use super::command_menu::{at_query, mention};
+    use super::command_menu::{at_query, mention, split_scope};
     assert_eq!(at_query("@"), Some(""));
     assert_eq!(at_query("hey @src"), Some("src"));
     assert_eq!(
@@ -18431,6 +18456,11 @@ fn the_reference_trigger_keeps_quoted_mentions_whole() {
         "@src/",
         "a directory mention ends at its separator"
     );
+    // The scope is the path prefix in the TEXT the reader sees.
+    assert_eq!(split_scope(""), ("", ""));
+    assert_eq!(split_scope("supal"), ("", "supal"));
+    assert_eq!(split_scope("src/"), ("src", ""));
+    assert_eq!(split_scope("src/u"), ("src", "u"));
 }
 
 /// Typing `@` opens the reference source in the same card: the workspace files
@@ -18506,6 +18536,31 @@ fn the_at_trigger_lists_workspace_files_and_sessions(cx: &mut TestAppContext) {
         cx.debug_bounds("command-row-ref-file-0").is_some(),
         "now listing inside the directory"
     );
+    // A file under a folder is found by its OWN name, with no folder typed:
+    // the flat index searches the whole workspace, which is the fzf behavior
+    // the old prefix-only walk could not give.
+    set_command_draft(&shell, cx, "@gamma");
+    let nested = cx
+        .debug_bounds("command-row-ref-file-0")
+        .expect("a nested file is found by its own name");
+    cx.simulate_click(nested.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "@sub/gamma.rs ",
+        "and the mention carries the path the index knew"
+    );
+    // A partial needle matches as a subsequence, not as a substring.
+    set_command_draft(&shell, cx, "@gma");
+    assert!(
+        cx.debug_bounds("command-row-ref-file-0").is_some(),
+        "a partial name finds the nested file"
+    );
+    set_command_draft(&shell, cx, "@zzzzz");
+    assert!(
+        cx.debug_bounds("command-row-ref-file-0").is_none(),
+        "a miss draws no file row"
+    );
     set_command_draft(&shell, cx, "@");
     assert!(
         cx.debug_bounds("command-row-ref-session-0").is_some(),
@@ -18515,6 +18570,187 @@ fn the_at_trigger_lists_workspace_files_and_sessions(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("composer-command-menu").is_none(),
         "a draft with no trigger closes the card"
+    );
+}
+
+/// A frame and an arrow press read the rows the last change computed; neither
+/// restarts the walk. The card also keeps drawing the index after the
+/// workspace disappears, which is the proof that the draw path has no filesystem
+/// call left in it.
+#[gpui::test]
+fn the_reference_card_reads_its_rows_without_rescanning(cx: &mut TestAppContext) {
+    let root = std::env::temp_dir().join(format!("bsh-command-index-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("deep")).expect("a scratch tree");
+    std::fs::write(root.join("deep/needle.rs"), "n").expect("a file");
+    let workspace_root = root.clone();
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("command-index", 1);
+        state.settings.ensure_workspace();
+        let active = state.settings.global.general.active_workspace.clone();
+        if let Some(workspace) = state
+            .settings
+            .global
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == active)
+        {
+            workspace.root = workspace_root.to_string_lossy().to_string();
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    set_command_draft(&shell, cx, "@needle");
+    let builds = cx.update(|_, cx| shell.read(cx).index_builds);
+    assert_eq!(builds, 1, "one build for one open");
+    for _ in 0..10 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| shell.command_card_key("down", cx));
+        shell.update(cx, |shell, cx| shell.command_card_key("up", cx));
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).index_builds),
+        builds,
+        "a frame or an arrow press never restarts the walk"
+    );
+    assert!(
+        cx.debug_bounds("command-row-ref-file-0").is_some(),
+        "and the row is still the cached one"
+    );
+    // The workspace goes away; a redraw must still show the rows, because the
+    // list a frame reads is the index, not the filesystem. The watcher is
+    // stopped first so this test does not race its own teardown with an OS
+    // event source.
+    cx.update(|_, cx| shell.update(cx, |shell, _| shell.stop_index_watch()));
+    std::fs::remove_dir_all(&root).expect("the tree is removable");
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| shell.refresh_command_rows(cx));
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        cx.debug_bounds("command-row-ref-file-0").is_some(),
+        "the cached row outlives the directory it names"
+    );
+}
+
+/// The reference card's keys: Enter puts the highlighted row into the composer
+/// and closes, Escape closes without inserting and leaves the typed trigger
+/// alone (the same contract the slash palette has).
+#[gpui::test]
+fn the_at_card_enter_selects_and_escape_dismisses(cx: &mut TestAppContext) {
+    let root = std::env::temp_dir().join(format!("bsh-command-keys-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("sub")).expect("a scratch tree");
+    std::fs::write(root.join("alpha.txt"), "a").expect("a file");
+    std::fs::write(root.join("beta.md"), "b").expect("a file");
+    std::fs::write(root.join("sub/gamma.rs"), "g").expect("a file");
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("command-keys", 1);
+        state.settings.ensure_workspace();
+        let active = state.settings.global.general.active_workspace.clone();
+        if let Some(workspace) = state
+            .settings
+            .global
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == active)
+        {
+            workspace.root = root.to_string_lossy().to_string();
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Enter takes the highlighted file into the input.
+    set_command_draft(&shell, cx, "@alp");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "enter inserted the mention", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell.composer_value == "@alpha.txt " && !shell.command_menu.open
+        })
+    });
+
+    // Escape inserts nothing AND leaves no picker text behind: the `@query`
+    // token goes with the card.
+    set_command_draft(&shell, cx, "@alp");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("escape");
+    draw_until(cx, "escape closed the card", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-command-menu").is_none()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "",
+        "escape leaves the input empty"
+    );
+
+    // Text before the token survives; only the picker's own fragment goes.
+    set_command_draft(&shell, cx, "hello @alp");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("escape");
+    draw_until(
+        cx,
+        "escape closed the card over prose",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("composer-command-menu").is_none(),
+    );
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "hello",
+        "the prose stays and the @query is consumed"
+    );
+
+    // Escape must close a card with NO rows too: a first index build draws
+    // "Indexing…" with an empty list, and the old zero-row guard returned
+    // before it reached the escape arm, so the card could not be dismissed.
+    set_command_draft(&shell, cx, "@zzzzz");
+    focus_composer(&shell, cx);
+    assert!(
+        cx.debug_bounds("composer-command-menu").is_some(),
+        "an unmatched query keeps the card open with an empty list"
+    );
+    cx.simulate_keystrokes("escape");
+    draw_until(cx, "escape closed the empty card", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-command-menu").is_none()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "",
+        "and the unmatched query is gone too"
+    );
+
+    // Enter on a folder writes the folder into the input as the next scope and
+    // keeps the card open, which is the reference's drill.
+    set_command_draft(&shell, cx, "@sub");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "enter drilled into the folder", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell.composer_value == "@sub/" && shell.command_menu.open
+        })
+    });
+    assert!(
+        cx.debug_bounds("command-row-ref-file-0").is_some(),
+        "the drilled folder lists its own children"
+    );
+    // Escape then closes the drilled card and leaves the folder scope typed.
+    cx.simulate_keystrokes("escape");
+    draw_until(cx, "escape closed the drilled card", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("composer-command-menu").is_none()
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "",
+        "escape consumes the drilled scope too"
     );
 }
 
@@ -28394,6 +28630,18 @@ fn typing_filters_the_slash_palette_across_every_group(cx: &mut TestAppContext) 
             && cx.debug_bounds("slash-header-skills").is_some(),
         "every group that still matches keeps its header"
     );
+    // Skim, not substring: a skill is found by a partial name whose letters
+    // are not adjacent.
+    set_slash_draft(&shell, cx, "/mtn");
+    let partial = slash_row_ids(&shell, cx);
+    assert!(
+        partial.contains(&"skill-motion".to_string()),
+        "m...t...n finds the motion skill: {partial:?}"
+    );
+    assert!(
+        !partial.contains(&"skill-zeta".to_string()),
+        "and leaves the skill that does not match out: {partial:?}"
+    );
 }
 
 /// Up and down move the highlight; Enter on Model opens its child list and
@@ -28465,9 +28713,10 @@ fn the_arrow_keys_move_the_slash_selection_and_enter_runs_it(cx: &mut TestAppCon
     assert!(!open, "and the palette closed behind the choice");
 }
 
-/// Esc closes the card and leaves the trigger exactly as typed.
+/// Esc closes the card and takes the slash trigger out of the composer: the
+/// picker leaves no text behind, exactly as the reference card does.
 #[gpui::test]
-fn escape_closes_the_slash_palette_and_keeps_the_slash(cx: &mut TestAppContext) {
+fn escape_closes_the_slash_palette_and_clears_the_input(cx: &mut TestAppContext) {
     let root = skills_scratch("slash-escape");
     skills_write_manifest(&root, "motion", "motion paths", false);
     let (harness, cx) = slash_shell(cx, "slash-escape", root, 1);
@@ -28478,12 +28727,17 @@ fn escape_closes_the_slash_palette_and_keeps_the_slash(cx: &mut TestAppContext) 
     draw_until(cx, "the card closed", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("composer-slash-palette").is_none()
     });
-    let (open, draft) = cx.update(|_, cx| {
+    let (open, draft, editor) = cx.update(|_, cx| {
         let shell = shell.read(cx);
-        (shell.slash.open, shell.composer_value.clone())
+        (
+            shell.slash.open,
+            shell.composer_value.clone(),
+            shell.composer.read(cx).value().to_string(),
+        )
     });
     assert!(!open, "the card is closed");
-    assert_eq!(draft, "/mo", "and the trigger text is untouched");
+    assert_eq!(draft, "", "the slash query is gone");
+    assert_eq!(editor, "", "and the editor is empty too");
 }
 
 /// Tab completes the highlighted row's name into the editor, keeping the card
@@ -28696,7 +28950,7 @@ fn the_slash_view_model_filters_every_source_and_the_trigger_is_the_leading_slas
     let listed: Vec<&str> = groups
         .iter()
         .flat_map(|group| group.items.iter())
-        .filter_map(|index| catalogue.row(*index))
+        .filter_map(|matched| catalogue.row(matched.index))
         .map(|item| item.id.as_str())
         .collect();
     assert_eq!(
@@ -28718,7 +28972,7 @@ fn the_slash_view_model_filters_every_source_and_the_trigger_is_the_leading_slas
     for item in groups
         .iter()
         .flat_map(|group| group.items.iter())
-        .filter_map(|index| catalogue.row(*index))
+        .filter_map(|matched| catalogue.row(matched.index))
     {
         match &item.action {
             SlashAction::Command(command) => assert!(
@@ -28737,7 +28991,7 @@ fn the_slash_view_model_filters_every_source_and_the_trigger_is_the_leading_slas
     let beta = catalogue.groups("beta", Lang::En);
     assert_eq!(beta.len(), 1, "one matching group");
     assert_eq!(beta[0].kind, SlashKind::Skill);
-    let beta_item = catalogue.row(beta[0].items[0]).expect("the beta row");
+    let beta_item = catalogue.row(beta[0].items[0].index).expect("the beta row");
     assert_eq!(beta_item.id, "skill-beta", "matched by name");
     assert!(beta_item.user_only, "the flag survives the filter");
     // The DESCRIPTION is a match field too: "ledger" appears only there.
@@ -28746,7 +29000,7 @@ fn the_slash_view_model_filters_every_source_and_the_trigger_is_the_leading_slas
         ledger
             .iter()
             .flat_map(|group| group.items.iter())
-            .filter_map(|index| catalogue.row(*index))
+            .filter_map(|matched| catalogue.row(matched.index))
             .map(|item| item.id.as_str())
             .collect::<Vec<_>>(),
         vec!["skill-beta"],
@@ -28762,7 +29016,7 @@ fn the_slash_view_model_filters_every_source_and_the_trigger_is_the_leading_slas
     let file = file
         .iter()
         .flat_map(|group| group.items.iter())
-        .filter_map(|index| catalogue.row(*index))
+        .filter_map(|matched| catalogue.row(matched.index))
         .find(|item| item.id == "cmd-file")
         .expect("the File row");
     assert!(file.description.is_empty(), "File draws no description");
@@ -29026,7 +29280,7 @@ fn every_listed_command_runs_a_real_handler(cx: &mut TestAppContext) {
                     .iter()
                     .filter(|group| group.kind == kind)
                     .flat_map(|group| group.items.iter())
-                    .filter_map(|index| catalogue.row(*index))
+                    .filter_map(|matched| catalogue.row(matched.index))
                     .map(|item| match &item.action {
                         SlashAction::Command(command) => *command,
                         other => panic!("a {kind:?} row with a non-command action: {other:?}"),
@@ -38145,6 +38399,7 @@ fn extension_commands_join_the_composer_palette(cx: &mut TestAppContext) {
         shell
             .read(cx)
             .card_rows(super::command_menu::Trigger::Command)
+            .rows
     });
     assert!(
         rows.iter()
@@ -38235,11 +38490,14 @@ fn choosing_an_extension_command_writes_the_annotation(cx: &mut TestAppContext) 
     // there either. The words survive after the annotation, because a command
     // token only resolves at the start of a message.
     let index = cx.update(|_, cx| {
-        shell.update(cx, |this, _| {
+        shell.update(cx, |this, cx| {
             this.composer_value = "summarize this".to_string();
             this.command_menu.open = true;
             this.command_menu.trigger = Some(super::command_menu::Trigger::Command);
-            this.card_rows(super::command_menu::Trigger::Command)
+            // The card's rows are the cached ones the frame and Enter read.
+            this.refresh_command_rows(cx);
+            this.command_menu
+                .rows
                 .iter()
                 .position(|row| row.id == "ext-command-hello__greet")
                 .expect("the extension row in the plus card")

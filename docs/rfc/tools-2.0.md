@@ -212,10 +212,10 @@ Three consequences are deliberate:
   flags, echoed arguments) is not model data. It stays in the runtime
   `ToolResult`.
 - Two audit facts (`sandbox`, `network`) are read from the stored payload by
-  `bsh::audit::confinement_of`. The shell views do not carry them to the
-  model, so the audit's confinement columns are empty for new shell/codel rows
-  until the per-call sidecar (§6.1) gives audit the full payload back. That is
-  a deliberate, tracked loss inside this stacked change, not an oversight.
+  `bsh::audit::confinement_of`. The shell view keeps them only when they are
+  NOT the confined defaults (`heel`, `deny-all`), so a routine call costs the
+  model nothing while an unconfined call - the row audit exists to show -
+  still reaches it. The full per-call sidecar (§6.1) removes the special case.
 - The catalogue gate and golden snapshots in `tool_view.rs` fail when a
   built-in loses its view or a projection grows a field.
 
@@ -270,13 +270,14 @@ model-level accuracy exists yet (FR-14).
 
 Priority order, with the evidence that it is still missing:
 
-1. **Full-payload sidecar (§4.5).** The model document is projected, so the
-   stored text no longer holds fields a projection elides. `bsh::audit`
-   derives `sandbox`/`network` from the stored payload, so the shell views
-   keep those two keys today. The planned fix is one structured sidecar per
-   call on the stored tool record (full `ToolResult`), read by audit and the
-   UI ahead of the legacy text parse. Until it lands, a view must not drop a
-   key a reader needs.
+1. **Full-payload sidecar (§4.5).** The engine seam is in place:
+   `ToolResultSink` receives the uncapped runtime envelope for every call.
+   What remains is BSH adoption - `StreamToken::ToolResult` carries no call id
+   and no full payload, so the host must correlate the sink's calls with the
+   `AgentEvent::ToolResult` stream (a per-turn FIFO is enough) and store the
+   payload on `ToolEvent`, which audit and the UI then read ahead of the text
+   parse. Until it lands, the shell view's non-default `sandbox`/`network`
+   special case is the audit's fallback.
 2. **Async built-in coverage in the runtime seam.** All 48 names declare a
    view; the 34 synchronous built-ins are wrapped at the bundle hand-off and
    the async ones are wrapped at each `try_add_async_tool` site. A future

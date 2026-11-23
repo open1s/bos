@@ -26,10 +26,11 @@
 //! Session log as a ZIP archive, the same contract as the reference's row.
 //!
 //! The item list is a VIEW MODEL with two caches, because a keystroke must be
-//! O(keystroke), not O(catalogue). The catalogue's rows and their lowercased
-//! haystacks are built once per settings generation and language; a query then
-//! returns row INDICES into them. A frame reads what the last query change
-//! computed rather than walking or copying the catalogue on every paint.
+//! O(keystroke), not O(catalogue). The catalogue's rows are built once per
+//! settings generation and language; a query then SCORES them (a fuzzy pass over
+//! the name, a substring test over the one-liner) and returns matches carrying
+//! the byte ranges to paint. A frame reads what the last query change computed
+//! rather than walking or copying the catalogue on every paint.
 
 use std::time::Duration;
 
@@ -40,6 +41,7 @@ use gpui_kit::*;
 use super::shell::Shell;
 use super::{DivExt, IconName, icon, txt};
 use crate::extension::CommandSurface;
+use crate::fuzzy;
 use crate::i18n::Lang;
 use crate::theme;
 
@@ -164,18 +166,44 @@ pub(crate) enum SlashAction {
     },
 }
 
+/// One row a query matched, with the characters that matched.
+///
+/// `index` addresses the palette's active row list (the root catalogue, or a
+/// child list). The runs are BYTE ranges into the drawn label and description,
+/// so the renderer needs no second match pass.
+pub(crate) struct SlashMatch {
+    /// The row's index in the active list.
+    pub(crate) index: usize,
+    /// The matched byte ranges of the row's label.
+    pub(crate) label_runs: Vec<(usize, usize)>,
+    /// The matched byte ranges of the row's DRAWN description (the user-only
+    /// marker included).
+    pub(crate) detail_runs: Vec<(usize, usize)>,
+}
+
+impl SlashMatch {
+    /// A row kept without a match, for a blank query and a child list.
+    fn plain(index: usize) -> Self {
+        Self {
+            index,
+            label_runs: Vec::new(),
+            detail_runs: Vec::new(),
+        }
+    }
+}
+
 /// One section or group of the card.
 ///
-/// `items` are INDICES into the palette's active row list (the root catalogue,
-/// or a child list's own rows), not copies of them: a query change re-derives
-/// these indices without re-allocating a single catalogue entry.
+/// `items` are MATCHES into the palette's active row list, not copies of the
+/// rows: a query change re-derives these without re-allocating a catalogue
+/// entry.
 pub(crate) struct SlashGroup {
     /// Which section this is.
     pub(crate) kind: SlashKind,
     /// The translated header text.
     pub(crate) title: String,
-    /// The rows this query matched, as indices into the active row list.
-    pub(crate) items: Vec<usize>,
+    /// The rows this query matched, in draw order.
+    pub(crate) items: Vec<SlashMatch>,
 }
 
 /// A skill the card can offer, with the catalogue facts the row needs.
@@ -454,8 +482,6 @@ pub(crate) struct SlashCatalogue {
     /// Every row, in draw order: the Add section, the Commands section, then
     /// the skills by name.
     rows: Vec<SlashItem>,
-    /// The lowercased (label, description) per row, the substring haystack.
-    lowered: Vec<(String, String)>,
     /// Number of extension rows between the built-in commands and the skills.
     extension_rows: usize,
 }
@@ -493,25 +519,23 @@ impl SlashCatalogue {
                 action: SlashAction::Insert(skill.name.clone()),
             });
         }
-        let lowered = rows
-            .iter()
-            .map(|row| (row.label.to_lowercase(), row.description.to_lowercase()))
-            .collect();
         Self {
             rows,
-            lowered,
             extension_rows,
         }
     }
 
-    /// The groups one query matches.
+    /// The groups one query matches, best row first inside each section.
     ///
-    /// A trimmed, lowercased substring test over the label AND the description,
-    /// the way the reference's slash menu ranks its catalog rows. An empty
-    /// group is left out; a query that matches nothing returns no groups, which
-    /// the renderer treats as the reference's own auto-close condition.
+    /// The composer's one fuzzy rule ([crate::fuzzy]) replaces the reference's
+    /// substring test: a needle matches as a subsequence, the label is tried
+    /// first and the description second, and rows are score-ordered WITHIN
+    /// their section - the Add / Commands / Skills headers never move, so the
+    /// card keeps the reader's map. An empty group is left out; a query that
+    /// matches nothing returns no groups, which the renderer treats as the
+    /// reference's own auto-close condition.
     pub(crate) fn groups(&self, query: &str, lang: Lang) -> Vec<SlashGroup> {
-        let needle = query.trim().to_lowercase();
+        let needle = query.trim();
         let adds = SlashCommand::adds().len();
         let commands = SlashCommand::commands().len() + self.extension_rows;
         let sections = [
@@ -521,13 +545,49 @@ impl SlashCatalogue {
         ];
         let mut groups: Vec<SlashGroup> = Vec::with_capacity(sections.len());
         for (kind, start, end) in sections {
-            let items: Vec<usize> = (start..end)
-                .filter(|&index| {
-                    needle.is_empty()
-                        || self.lowered[index].0.contains(&needle)
-                        || self.lowered[index].1.contains(&needle)
-                })
-                .collect();
+            let items: Vec<SlashMatch> = if needle.is_empty() {
+                (start..end).map(SlashMatch::plain).collect()
+            } else {
+                let mut scored: Vec<(i64, SlashMatch)> = Vec::new();
+                for (offset, row) in self.rows[start..end].iter().enumerate() {
+                    let index = start + offset;
+                    if let Some((score, chars)) = fuzzy::hit(&row.label, needle) {
+                        scored.push((
+                            score,
+                            SlashMatch {
+                                index,
+                                label_runs: fuzzy::runs_in(&row.label, &chars, 0..row.label.len()),
+                                detail_runs: Vec::new(),
+                            },
+                        ));
+                        continue;
+                    }
+                    let runs = fuzzy::substring_runs(&row.description, needle);
+                    if !runs.is_empty() {
+                        // A description is prose: a substring, not a scattered
+                        // subsequence. The drawn description carries the
+                        // user-only marker as a prefix, and the matched bytes
+                        // belong to the bare text.
+                        let drawn = marked_description(row, lang);
+                        let offset = drawn.len().saturating_sub(row.description.len());
+                        scored.push((
+                            0,
+                            SlashMatch {
+                                index,
+                                label_runs: Vec::new(),
+                                detail_runs: runs
+                                    .into_iter()
+                                    .map(|(start, end)| (start + offset, end + offset))
+                                    .collect(),
+                            },
+                        ));
+                    }
+                }
+                scored.sort_by(|left, right| {
+                    right.0.cmp(&left.0).then(left.1.index.cmp(&right.1.index))
+                });
+                scored.into_iter().map(|(_, row)| row).collect()
+            };
             if !items.is_empty() {
                 groups.push(SlashGroup {
                     kind,
@@ -780,7 +840,7 @@ impl SlashPalette {
         self.reset_rows(vec![SlashGroup {
             kind: SlashKind::Choice,
             title,
-            items: (0..self.choice.len()).collect(),
+            items: (0..self.choice.len()).map(SlashMatch::plain).collect(),
         }]);
     }
 
@@ -809,7 +869,7 @@ impl SlashPalette {
         self.reset_rows(vec![SlashGroup {
             kind: SlashKind::Choice,
             title,
-            items: (0..self.choice.len()).collect(),
+            items: (0..self.choice.len()).map(SlashMatch::plain).collect(),
         }]);
     }
 
@@ -847,9 +907,9 @@ impl SlashPalette {
         self.groups
             .iter()
             .flat_map(move |group| group.items.iter())
-            .filter_map(move |index| match pane {
-                SlashPane::Root => self.catalogue.row(*index),
-                SlashPane::Permissions | SlashPane::Models => self.choice.get(*index),
+            .filter_map(move |matched| match pane {
+                SlashPane::Root => self.catalogue.row(matched.index),
+                SlashPane::Permissions | SlashPane::Models => self.choice.get(matched.index),
             })
     }
 
@@ -942,9 +1002,9 @@ impl Shell {
             let mut index = 0;
             for group in &self.slash.groups {
                 viewport = viewport.child(slash_group_header(group));
-                for row in &group.items {
-                    if let Some(item) = self.slash.row(*row) {
-                        viewport = viewport.child(self.slash_row(index, item, cx));
+                for matched in &group.items {
+                    if let Some(item) = self.slash.row(matched.index) {
+                        viewport = viewport.child(self.slash_row(index, item, matched, cx));
                     }
                     index += 1;
                 }
@@ -972,7 +1032,13 @@ impl Shell {
     }
 
     /// One row, exactly the reference's .tki__G_item: glyph, name, description.
-    fn slash_row(&self, index: usize, item: &SlashItem, cx: &mut Context<Self>) -> AnyElement {
+    fn slash_row(
+        &self,
+        index: usize,
+        item: &SlashItem,
+        matched: &SlashMatch,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let selected = index == self.slash.active;
         let id = item.id.clone();
         let mut row = div()
@@ -1011,7 +1077,7 @@ impl Shell {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .child(SharedString::from(item.label.clone())),
+                    .child(super::marked_text(&item.label, &matched.label_runs)),
             );
         let description = marked_description(item, self.state.lang);
         if !description.is_empty() {
@@ -1026,7 +1092,7 @@ impl Shell {
                     .text_right()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .child(SharedString::from(description)),
+                    .child(super::marked_text(&description, &matched.detail_runs)),
             );
         }
         if selected {
@@ -1122,9 +1188,25 @@ impl Shell {
             .sync(&next, &self.state, &self.extension_commands);
     }
 
-    /// The menu's key contract: up and down move, Esc closes and leaves the
-    /// trigger, Tab completes the name. Enter is the composer's own PressEnter
-    /// event, because the kit's input owns that keystroke.
+    /// Escape on the slash palette: close it and take its trigger out of the
+    /// draft.
+    ///
+    /// The palette's query is the WHOLE draft (a leading slash), so clearing
+    /// leaves an empty composer: dismissing the picker must leave no picker
+    /// text, exactly as the reference card does. A child list (permissions or
+    /// models) is the same picker, so the same rule applies there.
+    pub(crate) fn dismiss_slash_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.slash.close();
+        if self.composer_value.starts_with('/') {
+            self.set_composer_text("", window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The menu's key contract: up and down move, Tab completes the name.
+    /// Enter is the composer's own PressEnter event, because the kit's input
+    /// owns that keystroke, and Escape goes through
+    /// [Shell::dismiss_slash_palette] so the trigger does not stay behind.
     pub(crate) fn slash_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> SlashKey {
         if !self.slash.open {
             return SlashKey::Pass;
@@ -1140,11 +1222,6 @@ impl Shell {
             }
             "down" => {
                 self.slash.move_by(1);
-                cx.notify();
-                SlashKey::Handled
-            }
-            "escape" => {
-                self.slash.close();
                 cx.notify();
                 SlashKey::Handled
             }

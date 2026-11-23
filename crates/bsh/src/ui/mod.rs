@@ -73,6 +73,25 @@ pub(crate) fn txt(text: impl Into<SharedString>, size: f32, color: u32) -> Div {
         .child(text.into())
 }
 
+/// A text leaf whose matched characters carry the accent.
+///
+/// `runs` are byte ranges into `text` (see [`crate::fuzzy::runs_in`]). The
+/// leaf inherits size, colour and ellipsis from the enclosing div, so the
+/// caller keeps the measured type scale and the row keeps its one-line shape.
+pub(crate) fn marked_text(text: &str, runs: &[(usize, usize)]) -> StyledText {
+    let highlights = runs.iter().map(|(start, end)| {
+        (
+            *start..*end,
+            HighlightStyle {
+                color: Some(Hsla::from(rgb(crate::theme::accent()))),
+                font_weight: Some(FontWeight::MEDIUM),
+                ..HighlightStyle::default()
+            },
+        )
+    });
+    StyledText::new(SharedString::from(text.to_string())).with_highlights(highlights)
+}
+
 /// A read-only prose leaf whose glyphs join the window's text selection.
 ///
 /// The shell draws static text as `div` leaves, which paint glyphs but register

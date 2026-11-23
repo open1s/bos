@@ -38,6 +38,19 @@ parquet = { version = "60.0.0", features = ["arrow"] }
 # of "the editor supports this type", the compiled grammar is the other half.
 gpui-kit = { version = "=0.8.1", features = ["tree-sitter-languages"] }
 glob = "0.3"
+# The composer's fuzzy matcher is skim's own subsequence scorer (the engine
+# behind `sk`), used as a LIBRARY only: the picker draws in GPUI, so skim's
+# TUI is never started. Default features are off because `cli` would add clap,
+# `image` would add ratatui-image and `listen` would add interprocess - none of
+# which a library consumer can use. Two consequences worth knowing:
+#
+# - skim's lib sets a mimalloc #[global_allocator], so linking it makes mimalloc
+#   the allocator for the whole BSH process. No other crate in this graph
+#   defines one, so this is the only allocator; a second definition would be a
+#   compile error ("conflicts with global allocator in: skim").
+# - the lib still links ratatui, crossterm and portable-pty unconditionally.
+#   They are dead weight here, not a second UI.
+skim = { version = "=5.9.0", default-features = false }
 
 # The WebView backend: a native Wry view (WKWebView on macOS) hosted in the
 # GPUI window, replacing the CDP capture pipeline in the browser pane. Built on

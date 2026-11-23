@@ -4298,3 +4298,68 @@ this working copy: the installed 1.100 toolchain already fails `-D warnings` on
 206 `collapsible_if` errors in `shell_tests.rs` and `capability`, none in the
 two files this round touched.
 
+
+## Round 194: the composer's cards are fzf-backed (skim 5.9.0)
+
+The `/` palette and the `@` picker now share one fuzzy matcher, and the `@`
+picker is backed by a workspace index, so neither card walks the filesystem on a
+frame or an arrow press.
+
+- `skim = { version = "=5.9.0", default-features = false }` in `crates/bsh`.
+  Two consequences: skim's lib sets a mimalloc `#[global_allocator]`, so
+  mimalloc is BSH's allocator now (no other crate defines one; a second
+  definition is a compile error), and it links ratatui/crossterm/portable-pty
+  even with defaults off. `fuzzy.rs` wraps `SkimMatcherV2` (smart case) and
+  converts its CHARACTER indices to UTF-8 byte ranges for `StyledText`.
+- The split is deliberate: NAMES, paths and titles match as subsequences
+  (`ab` -> *a*b*); one-line DESCRIPTIONS match as case-insensitive substrings.
+  Pure fuzzy over prose pulled "Compact" into `/mo` (`m` in Compact, `o` in
+  older), which broke Tab completion and read as noise.
+- `workspace_index.rs`: one flat `Entry { rel, dir }` list per workspace, built
+  by `glob::build_walker` (one ignore policy: .gitignore/.ignore/.rgignore, the
+  27 heavy-tree skips, no hidden, no symlinks) plus `workspace_ignore::Rules`.
+  `FileIndex` owns root/entries/status/generation and drops a result from an
+  older generation; `scan` is blocking and runs on a plain thread.
+- `command_menu.rs` caches the rows (`CommandMenu.rows`) on draft change, index
+  install and drill; `render`, `command_card_key` and `run_row` read that cache
+  and never walk. The `@` query is TEXT-AS-SCOPE: `src/u` searches under `src`
+  for `u`, `src/` browses it, a folder pick writes `src/` into the field, and
+  Backspace widens. A blank query browses the scope's children, then the session
+  block; files and folders are one score order (folders win ties only), sessions
+  a second. A 20px status line appears only for "Indexing...", a failed scan, or
+  a match count while a query is present. The notify watcher runs only while the
+  card is open; a 2s TTL rescans on open when it was not.
+- `slash_palette.rs` keeps the Add/Commands/Skills sections and their order,
+  score-sorts inside each, and draws the match runs on label and description
+  (the user-only marker is offset out of the description run).
+- Measured on this checkout (debug): 1,422 indexed entries, scan 32ms, one query
+  2.7-3.5ms (release matcher over 9.7k synthetic paths was 2.2-4.0ms). Tests:
+  fuzzy 12, workspace_index 9 (+1 ignored perf probe), both card suites.
+- Two traps: `draw_until` does NOT poll the foreground executor, so a test that
+  spans an index build needs `cx.run_until_parked()` plus a sleep; and deleting
+  a watched root inside a test trips gpui-pre's non-determinism check at
+  `end_test`, so stop the watcher first.
+
+Round 195: the composer's two cards no longer sit over the field they belong to.
+Measured CSS is `.card{bottom:calc(100% + 4px)}`; the command card was anchored
+`bottom: 4px` off its OWN bottom, so the list covered the composer (the @
+screenshot showed it). It now uses the slash palette's
+`.bottom(relative(1.0)).mb(px(CARD_GAP))` and draws above the composer, with
+the draft's `@mention` chip still visible underneath.
+
+Round 196: the reference card's keys are pinned by a test. Enter inserts the
+highlighted file as a mention and closes; Enter on a folder writes `dir/` and
+keeps the card open (the reference's drill); Escape closes and CONSUMES the
+picker's @query token, so `hello @alp` becomes `hello` and a lone `@alp`
+becomes empty - dismissing the picker leaves no picker text in the composer. The
+bug it found: `command_card_key` returned when the row list was EMPTY, before
+the escape arm, so a card showing "Indexing..." or an unmatched query could not
+be dismissed with Escape. Escape now goes through `dismiss_command_card` (which
+also stops the workspace watcher), before the zero-row guard.
+
+Round 197: the slash palette's keys now match the reference card's. Esc goes
+through `dismiss_slash_palette`, which closes the card and CLEARS the leading
+`/query` from the composer (the palette's query is the whole draft, so the field
+ends empty); Enter is unchanged (a skill inserts `/name `, a command runs, a
+child list selects). Skim over skill names is pinned by a subsequence case:
+`/mtn` finds `skill-motion` while `skill-zeta` stays out.

@@ -119,6 +119,11 @@ projection!(view_bash {
     "stderr" => "stderr": Keep::NonEmpty,
     "exit_code" => "exit_code": Keep::NonZero,
     "sandbox_reason" => "sandbox_reason": Keep::NonEmpty,
+    // Audit reads these two from the stored result. A confined call is the
+    // norm and says nothing to the model; an unconfined one is exactly the
+    // fact the audit exists to show.
+    "sandbox" => "sandbox": Keep::Not("heel"),
+    "network" => "network": Keep::Not("deny-all"),
 });
 
 // run_code's answer is the program's own result plus the log lines it printed.
@@ -1072,7 +1077,9 @@ mod tests {
             data,
             json!({
                 "stdout": "hi\n",
+                "sandbox": "none",
                 "sandbox_reason": "a preset turned the sandbox off",
+                "network": "unconfined",
             })
         );
     }
