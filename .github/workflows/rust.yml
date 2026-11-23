@@ -93,6 +93,11 @@ jobs:
       # The browser engine drives a real Chrome under Xvfb; those cases are
       # load-flaky on a shared Linux runner and are covered on macOS.
       - name: Test
+        env:
+          # This lane runs tests in parallel, so a frame time measures CPU
+          # contention too. The serial release gate keeps the strict 20ms
+          # ceiling; here a gross regression still fails at 60ms.
+          BSH_FRAME_BUDGET_MS: "60"
         run: >-
           xvfb-run -a cargo test --workspace --exclude jsbos --exclude nbos
           -- --skip browser::engine::tests
