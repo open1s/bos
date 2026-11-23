@@ -1092,25 +1092,30 @@ impl Shell {
         self.start_index_watch(root, cx);
     }
 
-    /// Scan the workspace on a worker thread and install the result.
+    /// Scan the workspace off the UI thread and install the result.
     ///
-    /// The walk is blocking filesystem work, so it never runs on the UI thread
-    /// or on GPUI's executor: a plain thread owns it and an async_channel
-    /// carries the result back. The generation is checked on install, so a
-    /// result for an older root or an older build cannot replace a newer one.
+    /// The walk is blocking filesystem work, so it never runs on the UI thread:
+    /// GPUI's background executor owns it, which also keeps the completion on
+    /// the executor that scheduled it (a plain thread with a channel would wake
+    /// this foreground task from a foreign thread). The generation is checked
+    /// on install, so a result for an older root or an older build cannot
+    /// replace a newer one.
     fn start_index_build(&mut self, root: PathBuf, generation: u64, cx: &mut Context<Self>) {
         #[cfg(test)]
         {
             self.index_builds += 1;
         }
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let _ = tx.send_blocking(crate::workspace_index::scan(&root));
-        });
         let task = cx.spawn(async move |this, cx| {
-            let Ok(result) = rx.recv().await else {
-                return;
-            };
+            // The walk is blocking filesystem work, so it belongs on the
+            // background executor (never on the UI thread). A plain thread and
+            // an async channel would also work in production, but the send
+            // would wake this foreground task from a foreign thread, which
+            // gpui's test scheduler rejects as nondeterministic; the executor's
+            // own spawn keeps the wake on the executor that owns it.
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::workspace_index::scan(&root) })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(scan) => this.file_index.install(generation, scan),
@@ -1164,7 +1169,20 @@ impl Shell {
         let generation = self.index_watch_generation;
         let close_rx = rx.clone();
         let task = cx.spawn(async move |this, cx| {
-            while rx.recv().await.is_ok() {
+            loop {
+                // notify calls back on its own thread. Receiving here on the
+                // foreground executor would wake this task from that thread,
+                // which gpui's test scheduler rejects as nondeterministic; a
+                // background receive keeps the wake on the executor that owns
+                // it, and the debounce below still runs on the foreground.
+                let receiver = rx.clone();
+                let received = cx
+                    .background_executor()
+                    .spawn(async move { receiver.recv().await })
+                    .await;
+                if received.is_err() {
+                    break;
+                }
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(200))
                     .await;

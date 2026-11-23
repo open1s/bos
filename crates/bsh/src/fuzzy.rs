@@ -131,6 +131,17 @@ pub(crate) fn substring_runs(text: &str, needle: &str) -> Vec<(usize, usize)> {
     if needle.is_empty() {
         return Vec::new();
     }
+    // skim's smart case: an uppercase character in the needle makes the match
+    // case-sensitive. The fuzzy half already behaves that way, and the two
+    // halves must agree or one query would find a row by its description while
+    // missing it by its name - and an ALL-UPPERCASE needle would still match a
+    // mixed-case row through the prose fallback.
+    if needle.chars().any(char::is_uppercase) {
+        return match text.find(needle) {
+            Some(start) => vec![(start, start + needle.len())],
+            None => Vec::new(),
+        };
+    }
     let lowered_text = text.to_lowercase();
     let lowered_needle = needle.to_lowercase();
     if lowered_text.len() != text.len() || lowered_needle.len() != needle.len() {
@@ -236,9 +247,21 @@ mod tests {
     }
 
     #[test]
-    fn a_prose_needle_is_a_case_insensitive_substring() {
+    fn a_prose_needle_follows_smart_case() {
+        // A lowercase needle ignores case, exactly like the fuzzy half.
         assert_eq!(
-            substring_runs("Enter or leave plan mode", "PLAN"),
+            substring_runs("Enter or leave PLAN mode", "plan"),
+            vec![(15, 19)]
+        );
+        assert_eq!(
+            substring_runs("Enter or leave plan mode", "plan"),
+            vec![(15, 19)]
+        );
+        // An uppercase needle is case-sensitive: it must not reach a
+        // mixed-case row through the prose fallback.
+        assert!(substring_runs("Enter or leave plan mode", "PLAN").is_empty());
+        assert_eq!(
+            substring_runs("Enter or leave PLAN mode", "PLAN"),
             vec![(15, 19)]
         );
         assert!(
