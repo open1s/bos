@@ -134,6 +134,12 @@ jobs:
       # resetting; a real test failure still fails on the second attempt.
       - name: Test
         shell: bash
+        env:
+          # The release runner is a correctness gate, not a benchmark: a frame
+          # duration there measures CPU contention. Skip the wall-clock budget
+          # assertions; the exact row/scan counts still run, and the parallel
+          # correctness lane keeps the time bounds.
+          BSH_IGNORE_TIMED_TESTS: "1"
         # One test thread: GPUI's test scheduler is thread-local and asserts
         # when activity from another thread reaches the running test. Under
         # parallel execution a background task from one shell test lands on

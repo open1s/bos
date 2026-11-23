@@ -61,6 +61,16 @@ impl Render for Harness {
 /// bounded instead of retrying forever.
 const DRAW_UNTIL_MAX: usize = 8;
 
+/// Whether WALL-CLOCK budgets are ignored for this run.
+///
+/// The release gate runs on a shared runner where a duration measures CPU
+/// contention as much as the code. It sets `BSH_IGNORE_TIMED_TESTS`, so the
+/// exact, load-independent assertions still run while the time bounds do not.
+/// The parallel correctness lane leaves it unset and keeps the budgets.
+fn timed_budget_ignored() -> bool {
+    std::env::var_os("BSH_IGNORE_TIMED_TESTS").is_some()
+}
+
 /// Pump frames until `predicate` holds, or fail naming it at the bound.
 ///
 /// RULE: a test may not depend on a SINGLE draw after a state change. A click
@@ -31232,10 +31242,12 @@ fn typing_and_backspacing_never_resolves_the_skill_catalogue(cx: &mut TestAppCon
          a keystroke must be O(keystroke), not O(catalogue)",
         2 * KEYS
     );
-    assert!(
-        per_key < CEILING,
-        "a keystroke averaged {per_key:?}, above the {CEILING:?} ceiling"
-    );
+    if !timed_budget_ignored() {
+        assert!(
+            per_key < CEILING,
+            "a keystroke averaged {per_key:?}, above the {CEILING:?} ceiling"
+        );
+    }
 
     // The card follows the text it ends on: "/" matches everything again.
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -31543,11 +31555,13 @@ fn a_long_transcript_only_builds_the_rows_near_the_viewport(cx: &mut TestAppCont
         "a frame built {per_frame} of {} message rows; it must build only the viewport's share",
         TURNS * 2
     );
-    assert!(
-        frame < FRAME_CEILING,
-        "a frame took {frame:?} with {} messages, above the {FRAME_CEILING:?} ceiling",
-        TURNS * 2
-    );
+    if !timed_budget_ignored() {
+        assert!(
+            frame < FRAME_CEILING,
+            "a frame took {frame:?} with {} messages, above the {FRAME_CEILING:?} ceiling",
+            TURNS * 2
+        );
+    }
 
     // The offscreen first turn is a spacer, not an element...
     assert!(
@@ -35499,10 +35513,12 @@ fn a_single_message_with_thousands_of_calls_keeps_each_tab_smooth(cx: &mut TestA
         .unwrap_or(20.0);
     for (name, ms) in &readings {
         eprintln!("TAB {name} {ms:.2}ms");
-        assert!(
-            *ms < budget,
-            "{name} painted a {ms:.2}ms frame with 3,000 calls in the log (budget {budget}ms)"
-        );
+        if !timed_budget_ignored() {
+            assert!(
+                *ms < budget,
+                "{name} painted a {ms:.2}ms frame with 3,000 calls in the log (budget {budget}ms)"
+            );
+        }
     }
     // Go to end / go first are one click, not a hundred "next page" clicks.
     cx.update(|_, cx| {
