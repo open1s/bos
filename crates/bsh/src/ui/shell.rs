@@ -7830,6 +7830,10 @@ impl Shell {
 
 impl Drop for Shell {
     fn drop(&mut self) {
+        // The file watcher's pump is a local task fed by notify's own thread.
+        // Close its channel and cancel it here, while the shell's thread still
+        // owns it, so the executor never drops it from another thread.
+        self.stop_files_watch();
         if let Some(service) = &self.task_runs {
             let service: Arc<dyn crate::extension::runs::RunsService> = service.clone();
             crate::extension::runs::clear_runs_service_if(&service);

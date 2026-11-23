@@ -165,6 +165,17 @@ pub trait ToolSpill: Send + Sync {
     fn spill(&self, tool: &str, full: &str) -> Option<String>;
 }
 
+/// Host hook that keeps the full result the model was not sent.
+///
+/// The model reads a projection (see [`crate::tool::registry::Tool::model_view`]);
+/// audit and the UI read the whole envelope. The engine passes the uncapped
+/// envelope under the provider's call id, so a host can store it once and stop
+/// reconstructing payload facts by parsing model text.
+pub trait ToolResultSink: Send + Sync {
+    /// Keep the full envelope for one call.
+    fn record(&self, tool: &str, call_id: &str, full: &str);
+}
+
 /// Render one tool result as the shared envelope, capped for the model.
 ///
 /// Every result the engine hands the model goes through here: a success keeps
@@ -178,16 +189,25 @@ fn render_tool_result(
     projected: Option<Value>,
     cap: usize,
     spill: Option<&dyn ToolSpill>,
+    sink: Option<&dyn ToolResultSink>,
+    call_id: &str,
 ) -> String {
     let envelope = match result {
         Ok(value) => ToolResult::from_value(tool, value.clone()),
         Err(error) => ToolResult::from_error(tool, &error.as_tool_error()),
     };
+    // A host that keeps the full result gets it here, before any projection or
+    // cap: the model reads a view, audit and the UI read the whole envelope.
+    let full = sink.map(|sink| {
+        let full = envelope.to_text(usize::MAX);
+        sink.record(tool, call_id, &full);
+        full
+    });
     let (text, cut) = envelope.to_model_text_cut(projected, cap);
     if !cut {
         return text;
     }
-    let full = envelope.to_text(usize::MAX);
+    let full = full.unwrap_or_else(|| envelope.to_text(usize::MAX));
     let Some(path) = spill.and_then(|hook| hook.spill(tool, &full)) else {
         return text;
     };
@@ -271,6 +291,8 @@ pub struct ReActEngine<A: ReActApp> {
     tool_result_caps: std::collections::HashMap<String, usize>,
     /// Optional host hook for preserving results the cap cut.
     tool_spill: Option<Arc<dyn ToolSpill>>,
+    /// Optional host hook that keeps the full envelope of every result.
+    tool_result_sink: Option<Arc<dyn ToolResultSink>>,
     /// The step guard, when the caller asks for one. `None` is the harness
     /// contract: a turn ends when the MODEL stops asking for tools, and a
     /// healthy run must not be cut off by a number. The bound exists for
@@ -309,6 +331,7 @@ pub struct ReActEngineBuilder<A: ReActApp> {
     tool_result_cap: usize,
     tool_result_caps: std::collections::HashMap<String, usize>,
     tool_spill: Option<Arc<dyn ToolSpill>>,
+    tool_result_sink: Option<Arc<dyn ToolResultSink>>,
     parallel_tool_calls: bool,
     telemetry: Telemetry,
     resilience: Option<ReActResilience>,
@@ -1035,6 +1058,8 @@ impl<A: ReActApp> ReActEngine<A> {
                                     projected,
                                     self.result_cap_for(&observed),
                                     self.tool_spill.as_deref(),
+                                    self.tool_result_sink.as_deref(),
+                                    &call_id,
                                 );
                                 trace.note_tool_result(result.is_ok());
 
@@ -1322,6 +1347,8 @@ impl<A: ReActApp> ReActEngine<A> {
                                     projected,
                                     self.result_cap_for(&observed),
                                     self.tool_spill.as_deref(),
+                                    self.tool_result_sink.as_deref(),
+                                    &call_id,
                                 );
                                 trace.note_tool_result(result.is_ok());
 
@@ -1769,6 +1796,8 @@ impl<A: ReActApp> ReActEngine<A> {
                                 projected,
                                 self.result_cap_for(&observed),
                                 self.tool_spill.as_deref(),
+                                self.tool_result_sink.as_deref(),
+                                &call_id,
                             );
                             trace.note_tool_result(result.is_ok());
 
@@ -2160,6 +2189,8 @@ mod repeat_guard_tests {
             None,
             256,
             Some(&Capture(captured.clone())),
+            None,
+            "call-1",
         );
         let value: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(value["spill"], ".bsh-spill/test.json");
@@ -2171,5 +2202,56 @@ mod repeat_guard_tests {
                 .as_ref()
                 .is_some_and(|full| full.len() > 4_000)
         );
+    }
+
+    #[test]
+    fn the_sink_keeps_the_full_envelope_the_model_was_not_sent() {
+        use std::sync::{Arc, Mutex};
+
+        struct Capture(Arc<Mutex<Option<(String, String, String)>>>);
+        impl super::ToolResultSink for Capture {
+            fn record(&self, tool: &str, call_id: &str, full: &str) {
+                *self.0.lock().expect("lock") =
+                    Some((tool.to_owned(), call_id.to_owned(), full.to_owned()));
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let payload = serde_json::json!({
+            "stdout": "hi\n",
+            "stderr": "",
+            "exit_code": 0,
+            "success": true,
+            "sandbox": "heel",
+            "network": "deny-all",
+        });
+        let projected = serde_json::json!({"stdout": "hi\n"});
+        let text = super::render_tool_result(
+            "bash",
+            &Ok(payload),
+            Some(projected),
+            0,
+            None,
+            Some(&Capture(captured.clone())),
+            "call-9",
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["data"]["stdout"], "hi\n");
+        assert!(
+            value["data"].get("sandbox").is_none(),
+            "the model sees the view"
+        );
+
+        let (tool, call_id, full) = captured
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the sink was called");
+        assert_eq!(tool, "bash");
+        assert_eq!(call_id, "call-9");
+        let full: serde_json::Value = serde_json::from_str(&full).expect("full envelope");
+        assert_eq!(full["status"], "success");
+        assert_eq!(full["summary"], "bash completed");
+        assert_eq!(full["data"]["sandbox"], "heel", "the full payload is kept");
     }
 }

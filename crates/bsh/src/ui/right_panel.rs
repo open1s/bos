@@ -861,6 +861,16 @@ pub(crate) struct FilesPane {
     /// The watcher while the tree surface is visible, and the root it watches.
     pub(crate) watch: Option<notify::RecommendedWatcher>,
     pub(crate) watch_root: Option<PathBuf>,
+    /// The pump that turns watcher events into refreshes.
+    ///
+    /// Held rather than detached so this pane's teardown cancels it on the
+    /// thread that owns the shell: a detached local task outliving the window
+    /// is what gpui-pre's test scheduler aborts on when the executor drops it
+    /// from another thread.
+    pub(crate) watch_task: Option<gpui::Task<()>>,
+    /// Closes the watcher channel before the task is cancelled, so a late
+    /// event from notify's own event-loop thread finds no waker to call.
+    pub(crate) watch_close: Option<Box<dyn Fn()>>,
     pub(crate) watch_generation: u64,
     /// Latest requested VCS read, so an older subprocess cannot overwrite it.
     pub(crate) vcs_generation: u64,
@@ -1034,6 +1044,8 @@ impl FilesPane {
             changed_only: false,
             watch: None,
             watch_root: None,
+            watch_task: None,
+            watch_close: None,
             watch_generation: 0,
             vcs_generation: 0,
             scroll: ScrollHandle::new(),
@@ -10662,8 +10674,7 @@ impl Shell {
     /// cached tree goes with them, and the pane re-lists whatever workspace is
     /// active now. The extension tabs carry a workspace too, and follow it.
     pub(crate) fn refile_workspace(&mut self, cx: &mut Context<Self>) {
-        self.files.watch = None;
-        self.files.watch_root = None;
+        self.stop_files_watch();
         self.files.watch_generation = self.files.watch_generation.wrapping_add(1);
         self.sync_files_watch(cx);
         self.refile_extension_tabs(cx);
@@ -10763,6 +10774,21 @@ impl Shell {
         cx.notify();
     }
 
+    /// Stop the workspace watcher and cancel its pump on this thread.
+    ///
+    /// Closing the channel first is what removes the waker a notify event
+    /// would otherwise call from its own event-loop thread; cancelling the
+    /// task while that waker is live is the abort the shell's own task handles
+    /// avoid. The watcher is dropped last, after no pump can reach it.
+    pub(crate) fn stop_files_watch(&mut self) {
+        if let Some(close) = self.files.watch_close.take() {
+            close();
+        }
+        self.files.watch_task = None;
+        self.files.watch = None;
+        self.files.watch_root = None;
+    }
+
     /// Start or stop the workspace watcher with the Files surface.
     pub(crate) fn sync_files_watch(&mut self, cx: &mut Context<Self>) {
         let wanted = self.right.open
@@ -10772,15 +10798,13 @@ impl Shell {
             if self.files.watch.is_some() || self.files.watch_root.is_some() {
                 self.files.watch_generation = self.files.watch_generation.wrapping_add(1);
             }
-            self.files.watch = None;
-            self.files.watch_root = None;
+            self.stop_files_watch();
             return;
         };
         if self.files.watch_root.as_deref() == Some(root.as_path()) {
             return;
         }
-        self.files.watch = None;
-        self.files.watch_root = None;
+        self.stop_files_watch();
         let (tx, rx) = async_channel::unbounded();
         let Ok(mut watcher) =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -10813,7 +10837,8 @@ impl Shell {
         self.files.watch_root = Some(root);
         self.files.watch_generation = self.files.watch_generation.wrapping_add(1);
         let generation = self.files.watch_generation;
-        cx.spawn(async move |this, cx| {
+        let close_rx = rx.clone();
+        let task = cx.spawn(async move |this, cx| {
             while rx.recv().await.is_ok() {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(200))
@@ -10826,8 +10851,11 @@ impl Shell {
                     this.refresh_files(cx);
                 });
             }
-        })
-        .detach();
+        });
+        self.files.watch_task = Some(task);
+        self.files.watch_close = Some(Box::new(move || {
+            close_rx.close();
+        }));
     }
 
     /// Expand every existing directory that contains a visible change.

@@ -10356,6 +10356,9 @@ mod tests {
             "the workspace document holds no session identity"
         );
         // The view preference is persisted, in the machine document only.
+        // Persisting is debounced to the next tick, so flush the pending write
+        // before reading the document a relaunch would see.
+        state.flush_settings();
         let root = state.settings.save_root.clone().expect("a scratch root");
         let global = std::fs::read_to_string(root.join("settings.toml"))
             .expect("the global settings document");

@@ -20954,11 +20954,17 @@ fn a_file_row_opens_the_comparison_pane(cx: &mut TestAppContext) {
         .expect("the header carries the right panel's toggle");
     cx.simulate_click(toggle.center(), Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    draw_until(cx, "the Files card renders", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-card-right.tab.files").is_some()
+    });
     let card = cx
         .debug_bounds("right-card-right.tab.files")
         .expect("the Files card renders");
     cx.simulate_click(card.center(), Modifiers::default());
-    draw_until(cx, "the tree renders", DRAW_UNTIL_MAX, |cx| {
+    // The tree is listed off the UI thread, so pump the executor rather than
+    // counting frames: a loaded or software-rendered runner may answer after
+    // several frames have already been drawn.
+    draw_until_settled(cx, "the tree renders", |cx| {
         cx.debug_bounds("diff-README.md").is_some()
     });
 
@@ -26473,7 +26479,11 @@ fn opening_several_panes_keeps_a_tab_for_each(cx: &mut TestAppContext) {
             shell.update(cx, |this, cx| this.open_right_tab(tab, window, cx));
         });
     }
-    cx.update(|window, cx| window.draw(cx).clear(cx));
+    draw_until(cx, "the three pane tabs render", DRAW_UNTIL_MAX, |cx| {
+        cx.debug_bounds("right-tab").is_some()
+            && cx.debug_bounds("right-tab-files").is_some()
+            && cx.debug_bounds("right-tab-browser").is_some()
+    });
 
     // Extensions is the active tab; the other two are still on screen.
     assert!(
@@ -38921,6 +38931,18 @@ fn a_long_message_still_selects(cx: &mut TestAppContext) {
         let root = cx.new(|cx| gpui_kit::base::Root::new(shell, window, cx));
         SelectionHarness { root }
     });
+    // A long message is paged: only one page of its parts is laid out at a
+    // time. Reach the last page the reader would use before selecting from it.
+    draw_until(
+        cx,
+        "the timeline page control renders",
+        DRAW_UNTIL_MAX,
+        |cx| cx.debug_bounds("timeline-last-1").is_some(),
+    );
+    let last_page = cx
+        .debug_bounds("timeline-last-1")
+        .expect("the last-page control");
+    cx.simulate_click(last_page.center(), Modifiers::default());
     draw_until(cx, "the long message renders", DRAW_UNTIL_MAX, |cx| {
         cx.debug_bounds("msg-part-1-59").is_some()
     });
@@ -39414,6 +39436,10 @@ fn the_file_tree_shows_vcs_badges_and_deleted_ghosts(cx: &mut TestAppContext) {
             this.files.changed_only = true;
             this.sync_files_watch(cx);
             assert!(this.files.watch.is_some(), "watch starts with Files");
+            assert!(
+                this.files.watch_task.is_some() && this.files.watch_close.is_some(),
+                "the pump is owned here, so teardown can cancel it on this thread"
+            );
             cx.notify();
         });
     });
@@ -39431,6 +39457,10 @@ fn the_file_tree_shows_vcs_badges_and_deleted_ghosts(cx: &mut TestAppContext) {
         shell.update(cx, |this, cx| {
             this.show_right_tab(crate::ui::right_panel::RightTab::Diff, cx);
             assert!(this.files.watch.is_none(), "watch stops off Files");
+            assert!(
+                this.files.watch_task.is_none() && this.files.watch_close.is_none(),
+                "and its pump is cancelled with it"
+            );
         });
     });
 }

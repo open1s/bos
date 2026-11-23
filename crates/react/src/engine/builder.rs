@@ -15,6 +15,7 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
             // No per-tool override until a host names one.
             tool_result_caps: std::collections::HashMap::new(),
             tool_spill: None,
+            tool_result_sink: None,
             parallel_tool_calls: false,
             telemetry: Telemetry::new(),
             resilience: None,
@@ -93,6 +94,15 @@ impl<A: ReActApp> ReActEngineBuilder<A> {
     /// Install a host hook that preserves results cut by the model cap.
     pub fn tool_spill(mut self, spill: Arc<dyn ToolSpill>) -> Self {
         self.tool_spill = Some(spill);
+        self
+    }
+
+    /// Install a host hook that keeps the full envelope of every result.
+    ///
+    /// The model reads a projection; this is how a host keeps the whole
+    /// payload for audit and UI without re-parsing model text.
+    pub fn tool_result_sink(mut self, sink: Arc<dyn ToolResultSink>) -> Self {
+        self.tool_result_sink = Some(sink);
         self
     }
 
@@ -230,6 +240,7 @@ impl<A: ReActApp + Default> ReActEngineBuilder<A> {
             tool_result_cap: self.tool_result_cap,
             tool_result_caps: self.tool_result_caps,
             tool_spill: self.tool_spill,
+            tool_result_sink: self.tool_result_sink,
             parallel_tool_calls: self.parallel_tool_calls,
             telemetry: self.telemetry,
             llm_timeout_secs: self.llm_timeout_secs,

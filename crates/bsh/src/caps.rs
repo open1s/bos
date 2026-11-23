@@ -10598,6 +10598,7 @@ mod tests {
                 "job_kill".to_string(),
                 "job_list".to_string(),
                 "job_output".to_string(),
+                "run_code".to_string(),
             ]
         );
         assert_eq!(
