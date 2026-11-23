@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## v4.1.26 (2026-11-23)
+
+- **The wheel chains out of a chat body into the transcript.** A tool-call body
+  stopped the wheel unconditionally, so a notch at its top or its end did
+  nothing at all: the conversation under the pointer could not be reached
+  without moving the pointer off the box. An injection body stopped nothing,
+  so one notch scrolled the box AND the whole conversation under it. Both now
+  follow one rule - the body keeps the wheel only while it has room, and the
+  surplus carries into the transcript in the same event, so a notch that
+  crosses the end is split instead of lost. The bodies also get the
+  transcript's eased scroll, a body whose content shrank is clamped back into
+  range, and the offsets are dropped when the session switches or a checkpoint
+  renumbers the rows.
 
 - **Turn-local reasoning reaches every provider.** Every OpenAI-compatible
   chat endpoint - the built-in families, NVIDIA NIM and custom gateways - now
