@@ -1,5 +1,22 @@
 # Changelog
 
+## v4.1.25 (2026-11-23)
+
+- **An all-uppercase query no longer slips through the description fallback.**
+  The composer matches names fuzzily with skim's smart case, but matched a
+  row's one-line description as a case-insensitive substring - so `PLAN` missed
+  every mixed-case name and still found a row through its description. The prose
+  half now applies the same rule as the fuzzy half: a lowercase needle ignores
+  case, an uppercase character makes the match case-sensitive.
+
+- **The `@` index no longer wakes the UI from a worker thread.** The workspace
+  scan ran on a plain thread and handed its result back through a channel that
+  the foreground task awaited, so a completion could wake GPUI's local executor
+  from a foreign thread; the release gate reported it as "your test is not
+  deterministic". The scan now runs on GPUI's background executor, and the
+  workspace watcher receives the same way. The generation checks, the debounce
+  and the ignore rules are unchanged.
+
 ## v4.1.24 (2026-11-23)
 
 - **`/` and `@` pick fuzzily.** Both composer cards rank their rows with
