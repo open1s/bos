@@ -811,6 +811,39 @@ pub(crate) fn build_agent_for_session_with_subagents_jobs_and_review(
     )
 }
 
+/// Register the resolved skill catalogue on the turn's agent.
+///
+/// One directory scan per source, then one body read per enabled skill. The
+/// per-manifest seam this replaced re-discovered the WHOLE source directory
+/// for every manifest, so the 121-skill catalogue measured here did 121 scans
+/// and took 2.2 s on the UI thread at send - the enter-key stall a reader sees
+/// before their row paints. The set registered is identical: only the
+/// catalogue's enabled survivors are loaded, and a manifest that vanished
+/// since the scan registers nothing.
+fn register_scanned_skills(agent: &mut Agent, effective: &crate::settings::Effective) {
+    let mut sources: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for skill in effective.enabled_skills() {
+        let Some(root) = skill.manifest.parent().and_then(Path::parent) else {
+            continue;
+        };
+        match sources.iter_mut().find(|(known, _)| known == root) {
+            Some((_, names)) => names.push(skill.name.clone()),
+            None => sources.push((root.to_path_buf(), vec![skill.name.clone()])),
+        }
+    }
+    for (root, names) in sources {
+        let mut loader = agent::skills::SkillLoader::new(root);
+        if loader.discover().is_err() {
+            continue;
+        }
+        for name in names {
+            if let Some(content) = loader.load(&name) {
+                agent.register_skill_content(content);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_agent_for_session_inner(
     settings: &Settings,
@@ -1646,13 +1679,12 @@ fn build_agent_for_session_inner(
     // the pane's toggle and the agent's build one fact instead of two scans that
     // agree by luck.
     //
-    // A preview build skips this: registering every manifest is the expensive
-    // part of a build (2.2 s on the 121 skills measured here), and the pane
-    // lists skills from that same cached catalogue instead.
+    // A preview build skips this: reading the catalogue is the expensive part
+    // of a build, and the pane lists skills from that same cached catalogue
+    // instead. A real build scans each source ONCE and loads its survivors;
+    // the per-manifest seam used to re-scan the directory for every skill.
     if scanned_skills == ScannedSkills::Register {
-        for skill in eff.enabled_skills() {
-            let _ = agent.register_skill_manifest(skill.manifest.clone());
-        }
+        register_scanned_skills(&mut agent, &eff);
     }
 
     // Installed extension packages named by a path in the global inventory.
