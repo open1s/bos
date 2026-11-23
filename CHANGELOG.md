@@ -1,5 +1,38 @@
 # Changelog
 
+## v4.1.24 (2026-11-23)
+
+- **`/` and `@` pick fuzzily.** Both composer cards rank their rows with
+  skim's own subsequence matcher (word-start bonuses, smart case) and highlight
+  the matched characters, so a needle like `ab` finds `a…b` in order instead
+  of demanding a prefix. skim 5.9.0 is used as a library; the picker stays
+  GPUI, and the highlight indices are character-based, so a CJK needle colours
+  the right glyph.
+
+- **The `@` card reads an index, not the filesystem.** Candidates come from a
+  flat, ignore-aware workspace index built on a worker thread and swapped in by
+  generation: the old path walked the tree from the render function, from every
+  arrow press and again from the Enter handler (9,732 files outside the build
+  trees in this workspace). The walk reuses the file tools' own walker and
+  rules - `.gitignore`, `.ignore`, `.rgignore`, `.bsh/.ignore`, the hidden
+  and no-symlink policies - holds folders as well as files, is capped at
+  200,000 entries with an honest truncated marker, and is rebuilt only when the
+  workspace changes, the card opens stale, or the workspace watcher reports a
+  change.
+
+- **An agent build scans each skill source once.** Registering N enabled skills
+  re-discovered the same source directory N times; 121 skills cost about 2.2 s
+  on the UI thread, which blocked the first frame after Enter.
+  `register_scanned_skills` groups by source and discovers once - 866 ms ->
+  100 ms measured (debug, warm cache), with the same registered set.
+
+- **The model reads a projection of a tool result, not the whole payload.**
+  Built-in tools declare the fields a result may show the model; host state
+  (cwd, timeouts, empty stderr, status echoes, the derivable summary) stops
+  riding along, and a failure carries the error class plus the two recovery
+  flags. `bash "echo hi"` measured 124 bytes unprojected against 45 projected.
+  Extensions, MCP and federation keep their own payloads.
+
 ## v4.1.23 (2026-11-22)
 
 - **A fresh workspace samples for coding.** With no `temperature` and no reply
