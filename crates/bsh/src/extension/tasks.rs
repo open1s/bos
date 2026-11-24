@@ -910,6 +910,11 @@ pub(crate) struct BoardRow {
     pub(crate) host: Host,
     /// The origin session.
     pub(crate) session: String,
+    /// The parent task id, when the record names one: the edge the graph nests
+    /// this row under.
+    pub(crate) parent: Option<String>,
+    /// Tasks that must succeed first, in stored order.
+    pub(crate) deps: Vec<String>,
     /// When it was created, in unix milliseconds.
     pub(crate) created_ms: u64,
     /// The next scheduled fire, for at or every.
@@ -951,6 +956,8 @@ pub(crate) fn board(tasks: &[Task]) -> Board {
             status: task.status,
             host: task.host.clone(),
             session: task.origin.session.clone(),
+            parent: task.parent.clone(),
+            deps: task.deps.clone(),
             created_ms: task.created_ms,
             next_fire_ms: task.trigger.next_fire_ms(),
             attempts: task.attempts.len() as u32,
@@ -1705,5 +1712,31 @@ mod tests {
             .expect("one row");
         assert_eq!(row.verification, VerificationStatus::Failed);
         assert_eq!(row.status, TaskStatus::Succeeded);
+    }
+
+    /// The board carries the edges the desktop's graph draws, so a client can
+    /// nest a child under its parent and name what a row waits on without
+    /// asking for every record.
+    #[test]
+    fn the_board_row_carries_the_edges() {
+        let mut parent = task("task-parent");
+        parent.status = TaskStatus::Running;
+        let mut child = task("task-child");
+        child.parent = Some("task-parent".to_string());
+        child.deps = vec!["task-other".to_string()];
+        let board = board(&[parent, child]);
+        let rows: Vec<&BoardRow> = board.sections.iter().flat_map(|s| &s.rows).collect();
+        let row = rows
+            .iter()
+            .find(|row| row.id == "task-child")
+            .expect("the child row");
+        assert_eq!(row.parent.as_deref(), Some("task-parent"));
+        assert_eq!(row.deps, vec!["task-other".to_string()]);
+        let row = rows
+            .iter()
+            .find(|row| row.id == "task-parent")
+            .expect("the parent row");
+        assert!(row.parent.is_none());
+        assert!(row.deps.is_empty());
     }
 }

@@ -117,6 +117,25 @@ impl ExtensionMcp {
     }
 }
 
+/// How one server's transport reads in a client's roster.
+///
+/// It is the launch description without anything secret: a stdio row is the
+/// command line a reader recognizes, and an HTTP row is only the endpoint, never
+/// the headers that carry the credential.
+pub(crate) fn transport_label(transport: &McpTransport) -> String {
+    match transport {
+        McpTransport::Stdio { command, args } => {
+            let mut text = quote_arg(command);
+            for arg in args {
+                text.push(' ');
+                text.push_str(&quote_arg(arg));
+            }
+            text
+        }
+        McpTransport::Http { url, .. } => url.clone(),
+    }
+}
+
 /// Quote one argument the way a shell would, for a readable command line.
 fn quote_arg(arg: &str) -> String {
     let needs_quotes = arg.is_empty()
@@ -873,6 +892,38 @@ mod tests {
             enabled,
             scope: McpScope::Global,
         }
+    }
+
+    /// The roster's transport line is the launch description, and an HTTP
+    /// server's headers - where the credential lives - never travel with it.
+    #[test]
+    fn a_transport_label_names_the_launch_and_no_credential() {
+        assert_eq!(
+            transport_label(&McpTransport::Stdio {
+                command: "npx".to_string(),
+                args: vec!["-y".to_string(), "@docs/server".to_string()],
+            }),
+            "npx -y @docs/server"
+        );
+        assert_eq!(
+            transport_label(&McpTransport::Stdio {
+                command: "my server".to_string(),
+                args: Vec::new(),
+            }),
+            "'my server'",
+            "an argument that needs quoting is quoted for the reader"
+        );
+        assert_eq!(
+            transport_label(&McpTransport::Http {
+                url: "https://mcp.example.test/sse".to_string(),
+                headers: vec![(
+                    "Authorization".to_string(),
+                    "Bearer sk-never-shown".to_string()
+                )],
+            }),
+            "https://mcp.example.test/sse",
+            "only the endpoint travels: a header is a credential"
+        );
     }
 
     /// A server that cannot start is recorded, not fatal: the turn still runs

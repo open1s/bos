@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod edit;
 pub(crate) mod global;
 pub(crate) mod mcp;
 pub(crate) mod provider;
@@ -517,6 +518,32 @@ fn active_root(global: &GlobalSettings) -> String {
         .unwrap_or_default()
 }
 
+/// Parse a capacity the way the settings forms document it: a number,
+/// optionally with a K or M suffix, so 128K and 1M are accepted beside 131072.
+///
+/// The tolerance is shared with the Settings dialog because both surfaces
+/// write the same fields: a terminal that refused what the window accepts would
+/// make one document readable only from one interface.
+pub(crate) fn parse_capacity(text: &str) -> Option<usize> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (digits, scale) = match trimmed.chars().last()? {
+        'k' | 'K' => (&trimmed[..trimmed.len() - 1], 1024),
+        'm' | 'M' => (&trimmed[..trimmed.len() - 1], 1024 * 1024),
+        _ => (trimmed, 1),
+    };
+    // A count copied from the docs or a log carries digit grouping ("12,800").
+    // Grouping is punctuation, not a value, so it is dropped before the parse;
+    // anything else that is not a number stays a refusal.
+    let digits: String = digits
+        .chars()
+        .filter(|character| *character != ',' && *character != '_')
+        .collect();
+    digits.trim().parse::<usize>().ok()?.checked_mul(scale)
+}
+
 impl Settings {
     /// Read the two documents, and do nothing else.
     ///
@@ -574,19 +601,30 @@ impl Settings {
     /// guard that keeps a redesign from silently eating a configuration it
     /// cannot read.
     pub(crate) fn save(&self) -> std::io::Result<()> {
+        let root = self.active_workspace_root();
+        self.save_for_root(std::path::Path::new(&root))
+    }
+
+    /// Write both documents back, placing the workspace one under `root`.
+    ///
+    /// This is [`Self::save`] with the root named by the caller, because a
+    /// Runtime Host serves one workspace and must write THAT workspace's
+    /// document - not whichever project the reader's window opened last, which
+    /// is what the active-workspace registry answers. The staging, the commit
+    /// order and the rollback are the same as a dialog save.
+    pub(crate) fn save_for_root(&self, root: &Path) -> std::io::Result<()> {
         // The documents may now name directories the cached catalogue was not
         // scanned from, and a skill install may have moved files under an
         // unchanged list, so the next resolution re-reads the catalogue.
         self.invalidate_skills();
         let global_path = self.writable_global_path()?;
-        let root = self.active_workspace_root();
         let workspace = self.workspace.clone();
         // Stage BOTH documents before committing either (issue #310): a
         // validation or serialization failure on the workspace must not leave
         // the global already changed.
         self.global.validate().map_err(as_io)?;
         let global_text = self.global.to_toml().map_err(as_io)?;
-        let workspace_path = if root.is_empty() {
+        let workspace_path = if root.as_os_str().is_empty() {
             // Nothing to place is nothing to report. Something to place with no
             // root is a loss the reader has to see: the dialog would otherwise
             // say "saved" about a document that never landed anywhere, and the
@@ -603,7 +641,7 @@ impl Settings {
             // Stage the workspace serialization too, so a failure here leaves
             // the global untouched.
             workspace.to_toml().map_err(as_io)?;
-            Some(WorkspaceSettings::path(std::path::Path::new(&root)))
+            Some(WorkspaceSettings::path(root))
         };
         // Commit with rollback: remember the previous global bytes, write the
         // global atomically, then the workspace; if the workspace write fails,

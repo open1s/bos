@@ -171,24 +171,42 @@ impl ReviewStore {
 
     /// Load every changeset for one session, oldest first.
     pub(crate) fn load_changesets(&self, session: &str) -> Vec<ChangeSet> {
+        self.load_changesets_result(session).unwrap_or_default()
+    }
+
+    /// Load every changeset for one session, failing when a record is unreadable.
+    ///
+    /// The lenient [`Self::load_changesets`] answers a review tab, which keeps
+    /// drawing the records it could read. A client that must tell "this session
+    /// changed nothing" from "this store cannot be read" asks here instead, so a
+    /// corrupt manifest is reported rather than silently dropped.
+    pub(crate) fn load_changesets_result(&self, session: &str) -> io::Result<Vec<ChangeSet>> {
         let dir = self.root.join("changesets");
-        let Ok(entries) = fs::read_dir(dir) else {
-            return Vec::new();
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
         };
-        let mut sets: Vec<ChangeSet> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                    return None;
-                }
-                let bytes = fs::read(&path).ok()?;
-                let set: ChangeSet = serde_json::from_slice(&bytes).ok()?;
-                (set.session == session).then_some(set)
-            })
-            .collect();
+        let mut sets: Vec<ChangeSet> = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path)?;
+            let set: ChangeSet = serde_json::from_slice(&bytes).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: {error}", path.display()),
+                )
+            })?;
+            if set.session == session {
+                sets.push(set);
+            }
+        }
         sets.sort_by_key(|set| set.created_at_ms);
-        sets
+        Ok(sets)
     }
 
     /// Load the newest changeset for one session.

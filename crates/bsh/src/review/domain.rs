@@ -480,7 +480,7 @@ fn net_kind(revisions: &[Revision]) -> ChangeKind {
     }
 }
 
-fn kind_name(kind: &ChangeKind) -> &'static str {
+pub(crate) fn kind_name(kind: &ChangeKind) -> &'static str {
     match kind {
         ChangeKind::Created => "created",
         ChangeKind::Modified => "modified",

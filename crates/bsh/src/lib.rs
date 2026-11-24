@@ -54,6 +54,10 @@ pub(crate) mod reference;
 mod reliability_harness;
 pub(crate) mod review;
 pub(crate) mod runner;
+// The standalone Runtime Host and its clients (RFC-011 … RFC-016). The GUI
+// stays the shell it is today; this module is the second interface, and the
+// contract both interfaces speak.
+pub(crate) mod runtime;
 pub(crate) mod schedule;
 pub(crate) mod sed;
 pub(crate) mod settings;
@@ -63,9 +67,10 @@ pub(crate) mod store;
 pub(crate) mod subagent;
 pub(crate) mod task_tools;
 pub(crate) mod terminal;
-// The Windows pane's software screen (issue #296): compiled on Windows and in
-// tests (its VT parsing is unit-tested on every host).
-#[cfg(any(windows, test))]
+// The software screen the terminal pane parses (issue #296): the Windows
+// desktop pane needs it, and so does the TUI's terminal view on every
+// platform - a terminal client hands no native view to a Metal surface, so it
+// paints these cells instead. Its VT parsing is unit-tested on every host.
 pub(crate) mod terminal_grid;
 // The Windows pane's ConPTY host (issue #296); Windows-only.
 #[cfg(windows)]
@@ -75,6 +80,9 @@ pub(crate) mod tool_metadata;
 pub(crate) mod tool_output;
 pub(crate) mod tool_view;
 pub(crate) mod trash;
+// The terminal client of the Runtime Host: it renders projections and sends
+// Commands over the same contract the GUI migration will use.
+pub(crate) mod tui;
 pub(crate) mod ui;
 pub(crate) mod vault;
 pub(crate) mod vcs;
@@ -92,6 +100,25 @@ pub(crate) mod workspace_templates;
 /// platform's internal types are not a second public API.
 pub fn extension_cli(args: &[String]) -> i32 {
     extension::cli(args)
+}
+
+/// Run `bsh host`, the standalone Runtime Host (RFC-011).
+///
+/// It is a separate process on purpose: the Host owns execution and durable
+/// state, so an interface can be closed, restarted or upgraded without owning - or
+/// losing - the work that is running.
+pub fn runtime_host_main(args: &[String]) -> i32 {
+    runtime::host_main(args)
+}
+
+/// Run `bsh tui`, the terminal client of a Runtime Host (RFC-015).
+///
+/// The client discovers the Host through its published endpoint. It starts one
+/// only for a data directory that has none, and stops only the Host it started
+/// itself, so `bsh tui` alone is a complete runtime while an existing
+/// `bsh host` keeps owning the work.
+pub fn runtime_tui_main(args: &[String]) -> i32 {
+    runtime::tui_main(args)
 }
 
 /// Run the federation management CLI, returning its exit code.
@@ -114,6 +141,14 @@ pub fn set_federation_profile(name: &str) -> bool {
     }
 }
 
+/// The subcommands this build answers without opening a window.
+///
+/// One list feeds three decisions: which bare words are commands rather than a
+/// typo in the shell's launch flags, which launches keep their console on
+/// Windows, and which dispatch the binary answers before it builds a window.
+/// Keeping them in one place is what stops those three from drifting apart.
+pub const HEADLESS_COMMANDS: [&str; 5] = ["ext", "federation", "fed", "host", "tui"];
+
 /// The first bare argument, when it is not a command this build handles.
 ///
 /// A misspelt subcommand used to fall through to the GUI launch: the app then
@@ -125,7 +160,7 @@ pub fn unknown_launch_command(args: &[String]) -> Option<String> {
     if first.starts_with('-') {
         return None;
     }
-    if matches!(first.as_str(), "ext" | "federation" | "fed") {
+    if HEADLESS_COMMANDS.contains(&first.as_str()) {
         return None;
     }
     Some(first.clone())
@@ -256,7 +291,7 @@ mod launch_command_tests {
 
     #[test]
     fn known_commands_are_not_typos() {
-        for value in ["ext", "federation", "fed"] {
+        for value in ["ext", "federation", "fed", "host", "tui"] {
             assert_eq!(unknown_launch_command(&args(&[value])), None, "{value}");
         }
     }

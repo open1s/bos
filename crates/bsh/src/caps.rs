@@ -907,6 +907,7 @@ fn build_agent_for_session_inner(
 ",
         );
         system_prompt.push_str(crate::prompts::HARNESS_CONTEXT);
+        system_prompt.push_str(crate::prompts::TOOL_FAILURE_RULE);
         system_prompt.push_str(crate::prompts::COMPLETE_PERSONA_CONTRACT);
     }
     let mut config = AgentConfig {
@@ -5635,6 +5636,34 @@ def parse(source, code_path, result_path, preamble):
             sys.exit(4)
 
 
+def report_runtime_error(result_path, error, code_path, preamble):
+    # The traceback's last frame in the caller's file is the failing statement;
+    # its line is reported in the caller's own numbering, so the reader can fix
+    # the line it wrote rather than a line of the generated file.
+    line = 0
+    trace = error.__traceback__
+    while trace is not None:
+        if trace.tb_frame.f_code.co_filename == code_path:
+            line = trace.tb_lineno - preamble
+        trace = trace.tb_next
+    text = ""
+    try:
+        with open(code_path, encoding="utf-8") as source_file:
+            rows = source_file.read().splitlines()
+        if 0 < line + preamble <= len(rows):
+            text = rows[line + preamble - 1].strip()
+    except OSError:
+        pass
+    payload = {
+        "type": type(error).__name__,
+        "message": str(error),
+        "line": max(line, 0),
+        "text": text,
+    }
+    with open(result_path, "w", encoding="utf-8") as result_file:
+        json.dump({"runtime_error": payload}, result_file, ensure_ascii=False)
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -5647,16 +5676,23 @@ def main():
     tree = parse(source, code_path, result_path, preamble)
     namespace = {"__name__": "__main__", "__file__": code_path}
     has_result = bool(tree.body) and isinstance(tree.body[-1], ast.Expr)
-    if has_result:
-        prefix = ast.Module(body=tree.body[:-1], type_ignores=[])
-        ast.fix_missing_locations(prefix)
-        exec(compile(prefix, code_path, "exec"), namespace)
-        expression = ast.Expression(tree.body[-1].value)
-        ast.fix_missing_locations(expression)
-        value = eval(compile(expression, code_path, "eval"), namespace)
-    else:
-        exec(compile(tree, code_path, "exec"), namespace)
-        value = None
+    try:
+        if has_result:
+            prefix = ast.Module(body=tree.body[:-1], type_ignores=[])
+            ast.fix_missing_locations(prefix)
+            exec(compile(prefix, code_path, "exec"), namespace)
+            expression = ast.Expression(tree.body[-1].value)
+            ast.fix_missing_locations(expression)
+            value = eval(compile(expression, code_path, "eval"), namespace)
+        else:
+            exec(compile(tree, code_path, "exec"), namespace)
+            value = None
+    except Exception as error:
+        # A program that raises is a correction, not a tool failure: exit 5 with
+        # the type, message and the caller's own line so the host can say what
+        # to fix. SystemExit and KeyboardInterrupt keep their own behavior.
+        report_runtime_error(result_path, error, code_path, preamble)
+        sys.exit(5)
     # A print/expression call returning None is not a completion value. Keep
     # the key absent instead of rendering a literal null after the logs.
     if has_result and value is None:
@@ -5712,12 +5748,21 @@ def read_files(paths, **kwargs):
     return call("read_files", {"paths": paths, **kwargs})
 
 
-def grep(pattern, **kwargs):
-    return call("grep", {"pattern": pattern, **kwargs})
+def grep(pattern, path=None, **kwargs):
+    # The tool's own signature is grep(pattern, path, ...): accept the path
+    # positionally too, so the obvious call binds instead of raising a
+    # TypeError the program cannot recover from.
+    arguments = {"pattern": pattern, **kwargs}
+    if path is not None:
+        arguments["path"] = path
+    return call("grep", arguments)
 
 
-def glob(pattern, **kwargs):
-    return call("glob", {"pattern": pattern, **kwargs})
+def glob(pattern, path=None, **kwargs):
+    arguments = {"pattern": pattern, **kwargs}
+    if path is not None:
+        arguments["path"] = path
+    return call("glob", arguments)
 
 
 def list_dir(path=".", **kwargs):
@@ -5996,6 +6041,23 @@ impl agent::tools::Tool for RunCodeTool {
                 let _ = std::fs::remove_file(&helper);
                 return Err(compile_error(report));
             }
+            // A program that raised is a correction too: the runner reported the
+            // type, the message and the caller's own line.
+            if let Some(report) = runtime_failure(&result_file) {
+                let captured = if stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\nCaptured output:\n{}", stdout.trim_end())
+                };
+                let _ = std::fs::remove_file(&script);
+                let _ = std::fs::remove_file(&runner);
+                let _ = std::fs::remove_file(&result_file);
+                let _ = std::fs::remove_file(&helper);
+                return Err(ToolError::Failed(format!(
+                    "code run failed (exception): {}{captured}",
+                    runtime_error_message(report)
+                )));
+            }
             let kind = if timeout {
                 "timeout"
             } else if result["exit_code"].as_i64() == Some(3) {
@@ -6105,6 +6167,47 @@ fn compile_error(report: serde_json::Value) -> ToolError {
     }
     detail.push_str(&format!("\nFix line {line} and call run_code again."));
     ToolError::InvalidInput(detail)
+}
+
+/// The runner's report of a program that raised, when it wrote one.
+///
+/// The report carries the exception type, its message and the line the caller
+/// wrote, so the failure names what to fix instead of a traceback through the
+/// generated file.
+fn runtime_failure(result_file: &std::path::Path) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(result_file).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    payload.get("runtime_error").cloned()
+}
+
+/// What the model is told about a program that raised.
+///
+/// The class stays a failure: the program DID run, so earlier statements may
+/// already have changed the world, and the message says so rather than leaving
+/// the model to infer it. The repair is the line the caller wrote - not the
+/// generated file's line, which is offset by the host's preamble.
+fn runtime_error_message(report: serde_json::Value) -> String {
+    let kind = report["type"].as_str().unwrap_or("exception");
+    let message = report["message"].as_str().unwrap_or("no detail");
+    let line = report["line"].as_i64().unwrap_or(0);
+    let text = report["text"].as_str().unwrap_or_default().trim();
+    let mut detail = format!("{kind}: {message}");
+    if line > 0 {
+        detail.push_str(&format!(" (your program, line {line})"));
+    }
+    if !text.is_empty() {
+        detail.push_str(&format!("\n  {text}"));
+    }
+    if line > 0 {
+        detail.push_str(&format!(
+            "\nEarlier statements may already have run; fix line {line} and call run_code again."
+        ));
+    } else {
+        detail.push_str(
+            "\nEarlier statements may already have run; fix the program and call run_code again.",
+        );
+    }
+    detail
 }
 
 /// read_file - read a UTF-8 file inside the workspace.
@@ -9305,6 +9408,10 @@ mod tests {
         assert!(prompt.contains(agent::WORKFLOW_GUIDANCE));
         assert!(prompt.contains(crate::prompts::HARNESS_CONTEXT));
         assert!(
+            prompt.contains(crate::prompts::TOOL_FAILURE_RULE),
+            "the failed-call rule reaches the request"
+        );
+        assert!(
             prompt.contains(agent::prompts::TOOL_PLAN),
             "the plan rule reaches the request"
         );
@@ -9346,12 +9453,18 @@ mod tests {
     /// the skill catalogue is deliberately NOT part of it (the vendor ranks that
     /// against the request instead). The headroom below the cap is kept for
     /// capability-gated rules, not for prose.
+    ///
+    /// Measured 2026-11-24: 16,857 bytes with the failed-call rule (885 of
+    /// them) against 15,972 without it, so the old 16,000 ceiling had 28 bytes
+    /// left and this rule forced a decision rather than slipping in. It stays
+    /// because an abandoned turn costs a whole round trip; the ceiling moved to
+    /// 17,500 so a capability-gated rule still fits beside it.
     #[test]
     fn the_system_prompt_stays_within_its_budget() {
         let built = build(&bare());
         let prompt = &built.agent.config().system_prompt;
         assert!(
-            prompt.len() < 16_000,
+            prompt.len() < 17_500,
             "the system prompt rides on every step: {} bytes",
             prompt.len()
         );
@@ -9653,6 +9766,10 @@ mod tests {
         assert!(
             prompt.contains(crate::prompts::HARNESS_CONTEXT),
             "the host-owned runtime contract survives complete mode (issue #332)"
+        );
+        assert!(
+            prompt.contains(crate::prompts::TOOL_FAILURE_RULE),
+            "the failed-call rule is runtime contract, so a complete persona keeps it"
         );
         assert!(
             !prompt.contains(agent::HARNESS_IDENTITY),
@@ -18262,7 +18379,7 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
             .execute(
                 "run_code",
                 &serde_json::json!({
-                    "code": "r = bsh.call('read_file', '{\"path\": \"a.txt\"}')\nassert isinstance(r, dict), type(r)\ng = bsh.grep('broker')\nassert isinstance(g, dict), type(g)\nprint(type(r).__name__, type(g).__name__, r['content'])"
+                    "code": "r = bsh.call('read_file', '{\"path\": \"a.txt\"}')\nassert isinstance(r, dict), type(r)\ng = bsh.grep('broker', 'a.txt', limit=5)\nassert isinstance(g, dict), type(g)\nprint(type(r).__name__, type(g).__name__, r['content'])"
                 }),
             )
             .expect("run_code");
@@ -18413,6 +18530,30 @@ print('two')
             "the traceback is not repeated: {text}"
         );
         assert!(text.contains("Captured output:\nbefore the boom"), "{text}");
+    }
+
+    #[test]
+    fn run_code_runtime_failure_names_the_program_line() {
+        let root = scratch("run-code-raise");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let error = registry
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "print('one')\nraise NameError(\"missing thing\")"
+                }),
+            )
+            .expect_err("a raising program fails");
+        let text = error.to_string();
+        assert!(text.contains("NameError: missing thing"), "{text}");
+        // The caller's own line, not the generated file's (which is 4 lines on).
+        assert!(text.contains("your program, line 2"), "{text}");
+        assert!(text.contains("raise NameError"), "{text}");
+        assert!(!text.contains("code-4"), "no generated filename: {text}");
+        assert!(text.contains("Captured output:\none"), "{text}");
     }
 
     #[test]

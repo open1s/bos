@@ -1034,7 +1034,10 @@ const TARGET_KEYS: [&str; 10] = [
 ];
 
 /// The path, host or command a call named.
-fn target_of(args: &str) -> String {
+///
+/// Shared with the terminal's AUDIT pane, so the desktop page and the TUI name
+/// a call's target by the same rule rather than by two similar ones.
+pub(crate) fn target_of(args: &str) -> String {
     let value: Option<serde_json::Value> = serde_json::from_str(args).ok();
     if let Some(value) = value {
         for key in TARGET_KEYS {

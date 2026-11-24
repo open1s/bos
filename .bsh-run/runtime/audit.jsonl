@@ -1,0 +1,2 @@
+{"at":"2026-11-24T11:41:34.598043Z","principal":"host","action":"host_ready","workspace_id":"f064859a-dad1-5827-ae56-5dc2f831e507","session_id":null,"decision":"allowed","detail":"instance 014c8f49-c418-4a34-84ce-33c7f58b6b67 recovered 0 events"}
+{"at":"2026-11-24T11:54:49.810073Z","principal":"host","action":"host_stopped","workspace_id":"f064859a-dad1-5827-ae56-5dc2f831e507","session_id":null,"decision":"allowed","detail":"durable state flushed"}

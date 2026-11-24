@@ -15,6 +15,12 @@ path = "src/lib.rs"
 name = "bsh"
 path = "src/main.rs"
 
+# The Runtime Host (RFC-011) and its terminal client (RFC-015) are
+# subcommands of the one binary above - `bsh host` and `bsh tui` - the way the
+# extension CLI is `bsh ext`. They stay separate processes: the Host owns
+# execution, the client renders projections over local IPC. The GUI launch is
+# unchanged and neither subcommand embeds it.
+
 [dependencies]
 codel-mcp = { path = "../codel-mcp" }
 notify = "9.0.0"
@@ -79,6 +85,15 @@ async-trait = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 
 tokio = { workspace = true }
+# The terminal interface's base crate (RFC-015). ratatui owns the frame, the
+# alternate screen and the layout algebra, and re-exports crossterm so the key
+# events and the backend can never be two different versions. It is already in
+# the lock graph through skim's unconditional ratatui link, so naming it here
+# adds no package; the GUI binary keeps its own GPUI frame and never touches it.
+ratatui = "0.30"
+# Commit timestamps on every journal event; the clock is part of the wire
+# format. chrono already reaches this crate through `agent`.
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -107,8 +122,17 @@ hostkit = { path = "../hostkit" }
 gpui-libghostty = { path = "../../vendor/gpui-libghostty" }
 # The Windows terminal backend parses the ConPTY byte stream into a screen grid
 # (issue #296); macOS/Linux keep the Ghostty native surface. vt100 is a pure-Rust
-# VT parser, so it adds no native build step.
+# VT parser, so it adds no native build step. The terminal INTERFACE reuses it
+# on every platform: a terminal has no AppKit view to hand a Metal surface to,
+# so `tui/shell.rs` parses the PTY into the same grid and paints cells into the
+# ratatui frame.
 vt100 = "0.18"
+# The terminal interface's shell overlay owns its own PTY: `bsh tui` has no
+# Ghostty surface, so a shell in a panel needs openpty on macOS/Linux and
+# ConPTY on Windows, which is exactly portable-pty's abstraction. It is already
+# in the lock graph through skim's unconditional link, so naming it here adds
+# no package; the version is pinned to the one the lock already resolved.
+portable-pty = "=0.9.0"
 regorus = { workspace = true }
 # The edit tool's substring search. memchr is already in the workspace graph
 # through the framework's regex stack, so naming it adds no package; the

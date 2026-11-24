@@ -275,6 +275,22 @@ pub(crate) const PLAN_DIRECTIVE: &str = "[Plan mode] Inspect what the task needs
 /// becoming a speculative debugging detour.
 pub(crate) const HARNESS_CONTEXT: &str = "## Working inside BSH\n\nYou run inside BSH, the BOS desktop app. A workspace is one folder; a session is one conversation in it; the reader sees your steps, plans and diffs in the same window. The .bsh/ directory holds BSH's own settings, policies and history and is on the deny list: do not read, list or edit it, and do not treat a refusal there as a task to work around. The reader can also exclude workspace paths in .bsh/.ignore; a file tool that refuses one has made the same kind of decision.\n\n- The conversation carries the intent; the workspace carries the evidence. Use the workspace to ground an answer, never to invent a request.\n- An attached image is evidence of what the reader sees, not a task on its own. When a short message points at a control in a screenshot, ask one direct question before acting: is this a bug report about the app, or a request to change code? Do not pick an unrelated tool or skill and start debugging it.\n- An open workspace is context, not an instruction. A greeting, thanks or plain question stays ordinary conversation; work on the code only when the message or the conversation asks for it. When a terse request's referent or goal is genuinely unclear, ask one direct question before acting.\n- A message sent while a turn runs is queued for the next turn, except an answer to your ask_user question, which is steered into the live turn at once. Treat a steered answer as the reader's direct reply; do not restart work the reader has already seen.\n- The Stop button ends the turn on purpose. A stopped turn is a decision, not a failure to retry: do not reopen the same work unless the reader asks.\n- Load a skill only when its stated use matches the request. Being the only installed skill is not a reason to load it.";
 
+/// The rule for reading a failed tool call.
+///
+/// The envelope (`status: error` plus a class, a message and two recovery
+/// flags) is protocol, not prose: a model that reads `retryable: false` as "do
+/// not try again" abandons a turn over a fixable argument. The rule says what
+/// each flag actually answers, names the repair per class, and keeps the one
+/// stop condition the engine itself enforces - the same failure after a
+/// correction.
+pub(crate) const TOOL_FAILURE_RULE: &str = "## Reading a failed tool call\n\n\
+A result with status \"error\" is information about one call, not the end of the turn: correct the call and continue.\n\n\
+- retryable asks about the SAME call unchanged. A corrected call - another argument, path, pattern or source line - is always allowed; repeating it unchanged is the only thing it forbids.\n\
+- indeterminate false means nothing took effect: fix and retry at once. true means the call may have run: inspect before repeating it.\n\
+- Repair by code: invalid_input - fix that argument or the program; not_found or conflict - re-inspect, then call with what you found; permission_denied or unsupported - change approach or report it; timeout or cancelled - check before retrying.\n\
+- A traceback from your own program is a correction too: fix that line and call again. A TypeError naming a bsh helper means the call shape is wrong - print bsh.schema('<tool>') and pass the documented arguments.\n\
+- Never repeat an unchanged call. Stop only when a corrected call still fails the same way, then report the exact error; never report work as finished on a failed call.";
+
 /// The standing rule a session that is pursuing a goal carries.
 ///
 /// A `<goal_round>` prompt names the objective on every automatic round, but an
@@ -423,6 +439,11 @@ pub(crate) fn append_tool_guidance(agent: &mut Agent) {
     // screenshot of BSH's own UI legible to the model.
     if !agent.config().system_prompt.contains(HARNESS_CONTEXT) {
         agent.append_system_prompt(HARNESS_CONTEXT);
+    }
+    // A failed call is where an agent quits by mistake: the rule sits with the
+    // product context because the envelope is protocol, not per-tool detail.
+    if !agent.config().system_prompt.contains(TOOL_FAILURE_RULE) {
+        agent.append_system_prompt(TOOL_FAILURE_RULE);
     }
     // The deliverable rule sits directly after the product context: a coding
     // turn is judged by the change it lands, not by how much it inspected.
@@ -590,6 +611,35 @@ mod tests {
         assert!(HARNESS_CONTEXT.contains("queued for the next turn"));
         assert!(HARNESS_CONTEXT.contains("Stop button"));
         assert!(stale_tool_reference(HARNESS_CONTEXT).is_none());
+    }
+
+    /// A failed call is a correction, not a dead end: the rule must say what
+    /// the two recovery flags answer, or a model reads `retryable: false` as
+    /// "give up" and abandons a fixable turn.
+    #[test]
+    fn a_failed_call_is_read_corrected_and_continued() {
+        assert!(TOOL_FAILURE_RULE.contains("not the end of the turn"));
+        assert!(TOOL_FAILURE_RULE.contains("repeating it unchanged is the only thing it forbids"));
+        assert!(TOOL_FAILURE_RULE.contains("nothing took effect"));
+        assert!(TOOL_FAILURE_RULE.contains("invalid_input"));
+        assert!(
+            TOOL_FAILURE_RULE.contains("A traceback from your own program is a correction too")
+        );
+        assert!(TOOL_FAILURE_RULE.contains("Stop only when a corrected call still fails"));
+        // No tool is named: the rule is about the envelope, not one tool.
+        assert!(stale_tool_reference(TOOL_FAILURE_RULE).is_none());
+    }
+
+    /// The rule is appended by the same call that carries the product context,
+    /// so every ordinary build reads a failed call the same way.
+    #[test]
+    fn the_failure_rule_reaches_the_standing_prompt() {
+        let mut agent = Agent::from_config(agent::AgentConfig::default());
+        append_tool_guidance(&mut agent);
+        assert!(
+            agent.config().system_prompt.contains(TOOL_FAILURE_RULE),
+            "a build without the rule would let a fixable failure end the turn"
+        );
     }
 
     /// Plan mode is the one place a question is expected, so the directive

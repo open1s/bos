@@ -10,7 +10,8 @@
 /// own, which is the window users see behind BSH. Started from an existing
 /// terminal, the console also has the shell attached, and hiding it would hide
 /// the user's terminal - so only a one-process console is hidden. CLI
-/// invocations (`ext`, `--help`) keep their console either way.
+/// invocations (the headless subcommands, `--help`) keep their console either
+/// way.
 #[cfg(windows)]
 fn hide_launch_console() {
     use std::ffi::c_void;
@@ -79,7 +80,9 @@ fn main() {
     // A CLI invocation needs that console for its own output.
     #[cfg(windows)]
     {
-        let cli = args.first().is_some_and(|arg| arg == "ext")
+        let cli = args
+            .first()
+            .is_some_and(|arg| bsh::HEADLESS_COMMANDS.contains(&arg.as_str()))
             || args.iter().any(|arg| arg == "--help" || arg == "-h");
         if !cli {
             hide_launch_console();
@@ -99,16 +102,26 @@ fn main() {
     {
         std::process::exit(bsh::federation_cli(&args[1..]));
     }
+    // The runtime pair is headless too, and it lives in this binary so a
+    // checkout builds one executable: `bsh host` runs a detached authority,
+    // `bsh tui` attaches to one - and starts one in its own process when the
+    // data directory has none (RFC-011/RFC-015).
+    if args.first().is_some_and(|arg| arg == "host") {
+        std::process::exit(bsh::runtime_host_main(&args[1..]));
+    }
+    if args.first().is_some_and(|arg| arg == "tui") {
+        std::process::exit(bsh::runtime_tui_main(&args[1..]));
+    }
     // --help is answered here so it works without opening a window.
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]] [--panel=PANE] [--browser=URL] [--federation-profile=NAME]\n       bsh ext <command> [options]\n       bsh federation [--profile NAME] <command> [options]\n\n  --settings  open the settings dialog on launch\n  SECTION     a rail cell - account | vault | general | models | web-search |\n              extensions | agent-presets - or a hosted view: tools |\n              plugin-inventory | shell | agent-loop | mcp | archived-sessions |\n              workspaces | context | plugins | automation | policy | extensions\n              (default: account)\n  --panel     open a right-hand pane on launch: files | terminal | diff |
+            "bsh - BOS Harness\n\nUSAGE: bsh [--settings[=SECTION]] [--panel=PANE] [--browser=URL] [--federation-profile=NAME]\n       bsh ext <command> [options]\n       bsh federation [--profile NAME] <command> [options]\n       bsh host [options]\n       bsh tui [options]\n\n  --settings  open the settings dialog on launch\n  SECTION     a rail cell - account | vault | general | models | web-search |\n              extensions | agent-presets - or a hosted view: tools |\n              plugin-inventory | shell | agent-loop | mcp | archived-sessions |\n              workspaces | context | plugins | automation | policy | extensions\n              (default: account)\n  --panel     open a right-hand pane on launch: files | terminal | diff |
               browser | extensions | federation | tasks | memory
   --browser   open the Browser pane on URL (http or https)
   --federation-profile NAME
               run this instance's federation node under NAME, so several BSH
               instances on one machine are several nodes\n  ext         run the extension developer CLI; bsh ext help for the commands
-  federation  manage this node's identity and peer grants; bsh federation help"
+  federation  manage this node's identity and peer grants; bsh federation help\n  host        run the Runtime Host - sessions, executions, approvals and\n              durable state served over local IPC; bsh host --help\n  tui         run the terminal interface; it attaches to a running Host or\n              starts one itself; bsh tui --help"
         );
         return;
     }
@@ -120,7 +133,9 @@ fn main() {
         if command.starts_with("federat") {
             eprintln!("  did you mean: bsh federation --profile NAME <status|serve|pair|profiles>");
         } else {
-            eprintln!("  commands: bsh ext <command> | bsh federation <command>");
+            eprintln!(
+                "  commands: bsh ext <command> | bsh federation <command> | bsh host | bsh tui"
+            );
         }
         eprintln!("  run bsh --help for the launch flags");
         std::process::exit(2);

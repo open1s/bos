@@ -4471,6 +4471,21 @@ pub(crate) fn statuses(
     with_host(settings, workspace, |host| host.statuses()).unwrap_or_default()
 }
 
+/// The status rows, keeping the reason a host could not answer.
+///
+/// [`statuses`] answers an empty roster for a host that failed to open, which a
+/// client cannot tell from "nothing is installed". A client that reports the
+/// roster to a reader - the terminal's `/extensions`, a protocol query - needs
+/// the refusal, so it shows the failure instead of an empty list.
+pub(crate) fn status_roster(
+    settings: &crate::settings::Settings,
+    workspace: Option<&Path>,
+) -> Result<Vec<ExtensionStatus>, String> {
+    with_host(settings, workspace, |host| host.statuses()).ok_or_else(|| {
+        "the extension host could not be opened; the log names the refusal".to_string()
+    })
+}
+
 /// Open (or refresh) the host and read the launch surfaces in ONE lock hold.
 ///
 /// `statuses` opens the process-global host, and `cached_model_providers` /

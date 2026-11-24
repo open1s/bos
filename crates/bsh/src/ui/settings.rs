@@ -18,9 +18,12 @@ use super::shell::{ModelRowEditor, ModelsAddRoute, PresetEditor, SettingsToast, 
 use super::{DivExt, IconName, hairline_all, hairline_bottom, hairline_top, icon, txt};
 use crate::i18n::{Lang, tr, tr_args};
 use crate::settings::Settings;
+// One capacity parser for the dialog and the Host: a terminal write must accept
+// exactly the spellings this form accepts.
 use crate::settings::mcp::{
     McpScope, McpServer, McpTransport, format_headers, join_args, parse_headers, split_args,
 };
+use crate::settings::parse_capacity;
 use crate::settings::resolve::DiscoveredSkill;
 use crate::theme;
 
@@ -77,29 +80,6 @@ pub(crate) const NAV: [&str; 8] = [
     "extensions",
     "agent-presets",
 ];
-
-/// Resolve a section id (the part after `settings.`) to its rail index.
-/// Parse a capacity the way the reference documents it: a number, optionally
-/// with a K or M suffix, so 128K and 1M are accepted beside 131072.
-fn parse_capacity(text: &str) -> Option<usize> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let (digits, scale) = match trimmed.chars().last()? {
-        'k' | 'K' => (&trimmed[..trimmed.len() - 1], 1024),
-        'm' | 'M' => (&trimmed[..trimmed.len() - 1], 1024 * 1024),
-        _ => (trimmed, 1),
-    };
-    // A count copied from the docs or a log carries digit grouping ("12,800").
-    // Grouping is punctuation, not a value, so it is dropped before the parse;
-    // anything else that is not a number stays a refusal.
-    let digits: String = digits
-        .chars()
-        .filter(|character| *character != ',' && *character != '_')
-        .collect();
-    digits.trim().parse::<usize>().ok()?.checked_mul(scale)
-}
 
 /// The host the shortcut row's key labels are drawn for.
 ///

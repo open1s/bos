@@ -339,6 +339,14 @@ impl Vault {
     /// Provider resolution and the provider chooser use this; the Vault pane
     /// uses [`Vault::is_unlocked`] so it still asks for the passphrase to list,
     /// reveal, or edit entries.
+    /// The file this vault is read from and written to, when it has one.
+    ///
+    /// A settings report names the store's location so a reader knows which
+    /// file a key lands in; a vault assembled in memory alone has none.
+    pub(crate) fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
     pub(crate) fn is_app_available(&self) -> bool {
         self.unlocked.is_some()
     }
