@@ -23,7 +23,7 @@ fn main() {
                 .get(2)
                 .cloned()
                 .unwrap_or_else(|| "127.0.0.1:8765".to_owned());
-            http::run(&address)
+            serve_http(&address)
         }
         Some("--refresh") => refresh_once(),
         Some("--watch") => watch_loop(),
@@ -34,6 +34,17 @@ fn main() {
         eprintln!("codel-mcp: {error}");
         std::process::exit(1);
     }
+}
+
+fn serve_http(address: &str) -> Result<(), String> {
+    let token_configured = std::env::var("CODEL_HTTP_TOKEN").is_ok_and(|token| !token.is_empty());
+    if !token_configured && !http::resolves_to_loopback(address)? {
+        return Err(format!(
+            "refusing to bind non-loopback HTTP address {address} without CODEL_HTTP_TOKEN; \
+             set the token or bind a loopback address"
+        ));
+    }
+    http::run(address)
 }
 
 fn host() -> Result<workspace::HostContext, String> {

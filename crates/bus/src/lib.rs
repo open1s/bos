@@ -21,5 +21,5 @@ pub use publisher::Publisher;
 pub use query::{Query, QueryWrapper, Queryable, TopicQueryable};
 pub use queryable::QueryableWrapper;
 pub use session::{Bus, BusConfig, TlsConfig};
-pub use subscriber::Subscriber;
+pub use subscriber::{MAX_CONSECUTIVE_DECODE_FAILURES, RecvOutcome, Subscriber};
 pub use zenoh::Session;

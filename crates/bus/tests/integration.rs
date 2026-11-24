@@ -46,6 +46,79 @@ async fn dropping_a_bus_clone_keeps_subscriptions_alive() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_payload_does_not_end_a_subscription() {
+    let bus = Bus::from(BusConfig::default()).await;
+    let topic = unique_topic("malformed-payload");
+    let session = bus.session();
+
+    let (tx, rx) = mpsc::channel::<String>();
+    bus.subscribe(&topic, move |message: String| {
+        let _ = tx.send(message);
+    })
+    .await;
+
+    // Let the spawned subscription task declare the Zenoh subscription.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Anything on the shared key-space can write a payload that is not this
+    // type; the first one used to end the delivery loop for good.
+    session
+        .put(&topic, vec![0xFFu8; 4])
+        .await
+        .expect("a raw payload can be published");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    session
+        .put(
+            &topic,
+            bus::Codec.encode(&"hello".to_string()).expect("encode"),
+        )
+        .await
+        .expect("publish should succeed");
+
+    let received = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("a valid payload after a malformed one must still be delivered");
+    assert_eq!(received, "hello");
+    assert!(
+        bus.subscription_failures().is_empty(),
+        "a malformed payload is skipped, not reported as an end: {:?}",
+        bus.subscription_failures()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_topic_that_never_decodes_reports_the_failure() {
+    let bus = Bus::from(BusConfig::default()).await;
+    let topic = unique_topic("undecodable-topic");
+    let session = bus.session();
+
+    bus.subscribe(&topic, |_message: String| {}).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    for _ in 0..(bus::MAX_CONSECUTIVE_DECODE_FAILURES + 1) {
+        session
+            .put(&topic, vec![0xFFu8; 4])
+            .await
+            .expect("a raw payload can be published");
+    }
+
+    // Give the delivery task time to drain the burst and give up.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let failures = bus.subscription_failures();
+    assert_eq!(
+        failures.len(),
+        1,
+        "the ended subscription reports exactly once: {failures:?}"
+    );
+    assert!(
+        failures[0].contains("undecodable payloads"),
+        "the reason names the cause: {failures:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_with_timeout_without_replies_returns_an_error() {
     let bus = Bus::from(BusConfig::default()).await;
     let topic = unique_topic("no-replies");

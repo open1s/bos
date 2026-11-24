@@ -5580,29 +5580,71 @@ impl react::engine::ToolSpill for WorkspaceSpill {
     }
 }
 
+/// The lines the runner prepends to the caller's program: the tool broker's
+/// socket, injected before the program body.
+///
+/// The runner is told this line count, so a parse error names the line the
+/// caller wrote rather than the line in the generated file.
+#[cfg(unix)]
+const BSH_PREAMBLE: &str = r#"import os
+os.environ["BSH_TOOL_SOCKET"] = {}
+import bsh as _bsh
+globals()["bsh"] = _bsh
+"#;
+
 const BSH_RUNNER: &str = r#"import ast
 import json
 import sys
+
+
+def report_compile_error(result_path, error, preamble):
+    line = error.lineno or 0
+    column = error.offset or 0
+    # The host prepends its own preamble to the program; a failure inside it is
+    # the host's, not the caller's, and is reported without a line shift.
+    in_program = line > preamble
+    payload = {
+        "where": "program" if in_program else "host",
+        "line": line - preamble if in_program else line,
+        "column": column,
+        "message": error.msg,
+        "text": (error.text or "").strip(),
+    }
+    with open(result_path, "w", encoding="utf-8") as result_file:
+        json.dump({"compile_error": payload}, result_file, ensure_ascii=False)
+
+
+def parse(source, code_path, result_path, preamble):
+    # Typographic math (O(n²), x³) is valid in comments and strings but Python
+    # identifiers cannot carry superscripts. If the parser rejected the
+    # character, retry with the ASCII digit: the UTF-8 source stays the same
+    # length and the line mapping is preserved.
+    superscripts = str.maketrans({"⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9"})
+    try:
+        return ast.parse(source, filename=code_path, mode="exec")
+    except SyntaxError as error:
+        # A program that does not compile never ran: exit 4 tells the host to
+        # report bad input rather than a tool failure.
+        if "invalid character" not in str(error) or source == source.translate(superscripts):
+            report_compile_error(result_path, error, preamble)
+            sys.exit(4)
+        try:
+            return ast.parse(source.translate(superscripts), filename=code_path, mode="exec")
+        except SyntaxError as retry:
+            report_compile_error(result_path, retry, preamble)
+            sys.exit(4)
 
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
     code_path, result_path = sys.argv[1], sys.argv[2]
+    # The host prepends this many lines to the program; a parse error is
+    # reported against the caller's own numbering, not the generated file's.
+    preamble = int(sys.argv[3]) if len(sys.argv) > 3 else 0
     with open(code_path, encoding="utf-8-sig") as source_file:
         source = source_file.read()
-    try:
-        tree = ast.parse(source, filename=code_path, mode="exec")
-    except SyntaxError as error:
-        # Typographic math (O(n²), x³) is valid in comments and strings but
-        # Python identifiers cannot carry superscripts. If the parser rejected
-        # the character, retry with the ASCII digit: the UTF-8 source stays the
-        # same length and the line mapping is preserved.
-        superscripts = str.maketrans({"⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9"})
-        if "invalid character" not in str(error) or source == source.translate(superscripts):
-            raise
-        source = source.translate(superscripts)
-        tree = ast.parse(source, filename=code_path, mode="exec")
+    tree = parse(source, code_path, result_path, preamble)
     namespace = {"__name__": "__main__", "__file__": code_path}
     has_result = bool(tree.body) and isinstance(tree.body[-1], ast.Expr)
     if has_result:
@@ -5878,17 +5920,22 @@ impl agent::tools::Tool for RunCodeTool {
 
         let mut source = String::new();
         #[cfg(unix)]
-        if let Some((socket_path, _, _)) = &broker {
-            source.push_str(&format!(
-                r#"import os
-os.environ["BSH_TOOL_SOCKET"] = {}
-import bsh as _bsh
-globals()["bsh"] = _bsh
-"#,
-                serde_json::to_string(&socket_path.to_string_lossy().to_string())
-                    .expect("socket path")
-            ));
-        }
+        let preamble_lines = match &broker {
+            Some((socket_path, _, _)) => {
+                source.push_str(
+                    &BSH_PREAMBLE.replacen(
+                        "{}",
+                        &serde_json::to_string(&socket_path.to_string_lossy().to_string())
+                            .expect("socket path"),
+                        1,
+                    ),
+                );
+                BSH_PREAMBLE.lines().count()
+            }
+            None => 0,
+        };
+        #[cfg(not(unix))]
+        let preamble_lines = 0usize;
         source.push_str(code);
         std::fs::write(&script, source).map_err(|error| ToolError::Failed(error.to_string()))?;
         #[cfg(unix)]
@@ -5916,7 +5963,7 @@ globals()["bsh"] = _bsh
             .to_string_lossy()
             .into_owned();
         let mut command = serde_json::json!({
-            "command": format!("python3 {runner_relative} {relative} {result_relative}")
+            "command": format!("python3 {runner_relative} {relative} {result_relative} {preamble_lines}")
         });
         if let Some(timeout) = input.get("timeout_secs") {
             command["timeout_secs"] = timeout.clone();
@@ -5940,6 +5987,15 @@ globals()["bsh"] = _bsh
             .map(str::to_string)
             .collect::<Vec<_>>();
         if !success {
+            // A program the runner could not compile never ran: bad input, not
+            // a tool fault, and the runner reported the caller's own line.
+            if let Some(report) = compile_failure(&result_file) {
+                let _ = std::fs::remove_file(&script);
+                let _ = std::fs::remove_file(&runner);
+                let _ = std::fs::remove_file(&result_file);
+                let _ = std::fs::remove_file(&helper);
+                return Err(compile_error(report));
+            }
             let kind = if timeout {
                 "timeout"
             } else if result["exit_code"].as_i64() == Some(3) {
@@ -5948,18 +6004,12 @@ globals()["bsh"] = _bsh
                 "exception"
             };
             let detail = stderr.trim();
-            let captured = if logs.is_empty() {
+            // stderr is already the failure detail; repeating it under
+            // "Captured output" doubled the wall of text the model reads.
+            let captured = if stdout.trim().is_empty() {
                 String::new()
             } else {
-                format!(
-                    "
-Captured output:
-{}",
-                    logs.join(
-                        "
-"
-                    )
-                )
+                format!("\nCaptured output:\n{}", stdout.trim_end())
             };
             let _ = std::fs::remove_file(&script);
             let _ = std::fs::remove_file(&runner);
@@ -6009,6 +6059,52 @@ Captured output:
         let _ = std::fs::remove_file(&helper);
         Ok(output)
     }
+}
+
+/// The runner's report of a program that did not compile, when it wrote one.
+///
+/// The runner writes this envelope instead of a traceback: the parse failure is
+/// the caller's, and its line number is the caller's own (see `BSH_PREAMBLE`).
+fn compile_failure(result_file: &std::path::Path) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(result_file).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    payload.get("compile_error").cloned()
+}
+
+/// The tool error for a program that did not compile.
+///
+/// Nothing ran, so the outcome is determinate and the repair is in the source:
+/// the class is bad input rather than an internal failure, and the message names
+/// the caller's own line, column and source text. A failure inside the host's
+/// preamble is not the caller's and stays an internal failure.
+fn compile_error(report: serde_json::Value) -> ToolError {
+    let message = report["message"].as_str().unwrap_or("syntax error");
+    if report["where"].as_str() != Some("program") {
+        return ToolError::Failed(format!(
+            "code run failed (compile): the runner could not compile its own preamble: {message}"
+        ));
+    }
+    let line = report["line"].as_i64().unwrap_or(1).max(1);
+    let column = report["column"].as_i64().unwrap_or(0);
+    let text = report["text"].as_str().unwrap_or_default().trim();
+    let mut detail = format!("the program did not compile, so nothing ran: line {line}");
+    if column > 0 {
+        detail.push_str(&format!(", column {column}"));
+    }
+    detail.push_str(&format!(": {message}"));
+    if !text.is_empty() {
+        // An unmatched delimiter reports at the end of its line, so a very long
+        // line keeps its tail.
+        let count = text.chars().count();
+        let shown = if count > 400 {
+            format!("…{}", text.chars().skip(count - 399).collect::<String>())
+        } else {
+            text.to_string()
+        };
+        detail.push_str(&format!("\n  {shown}"));
+    }
+    detail.push_str(&format!("\nFix line {line} and call run_code again."));
+    ToolError::InvalidInput(detail)
 }
 
 /// read_file - read a UTF-8 file inside the workspace.
@@ -18255,6 +18351,70 @@ print('two')
         assert!(text.contains("code run failed (exception)"), "{text}");
         assert!(text.contains("boom"), "{text}");
     }
+
+    #[test]
+    fn run_code_compile_failure_is_bad_input_naming_the_program_line() {
+        let root = scratch("run-code-compile");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let marker = root.join("ran.txt");
+        let marker_literal =
+            serde_json::to_string(&marker.to_string_lossy().to_string()).expect("path literal");
+        let error = registry
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": format!(
+                        "open({marker_literal}, 'w').write('x')\nprint(bsh.bash(\"echo hi\")))"
+                    )
+                }),
+            )
+            .expect_err("a program that does not compile fails");
+        // Bad input, not a tool fault: nothing ran, so the failure is
+        // determinate and the repair is in the source.
+        assert_eq!(error.code().as_str(), "invalid_input");
+        assert!(!error.indeterminate(), "nothing ran");
+        let text = error.to_string();
+        // The line is the caller's own: the runner subtracts its preamble.
+        assert!(text.contains("line 2, column"), "{text}");
+        assert!(text.contains("unmatched"), "{text}");
+        assert!(text.contains("Fix line 2"), "{text}");
+        assert!(
+            !text.contains("runner.py") && !text.contains("Captured output"),
+            "the host traceback is not the program's report: {text}"
+        );
+        assert!(
+            !marker.exists(),
+            "a program that did not compile ran anyway"
+        );
+    }
+
+    #[test]
+    fn run_code_runtime_failure_reports_stdout_once() {
+        let root = scratch("run-code-stdout");
+        let mut settings = confined(&root);
+        settings.workspace.agent.permission = FULL_ACCESS.to_string();
+        let built = build(&settings);
+        let registry = built.agent.registry().expect("registry");
+        let error = registry
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "print('before the boom')\nraise ValueError('boom')"
+                }),
+            )
+            .expect_err("a raising program fails");
+        let text = error.to_string();
+        assert_eq!(
+            text.matches("ValueError: boom").count(),
+            1,
+            "the traceback is not repeated: {text}"
+        );
+        assert!(text.contains("Captured output:\nbefore the boom"), "{text}");
+    }
+
     #[test]
     fn run_code_exposes_tool_schemas() {
         let root = scratch("run-code-schema");

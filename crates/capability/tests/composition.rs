@@ -261,6 +261,89 @@ fn a_required_peer_does_not_fall_back_to_a_local_implementation() {
 }
 
 #[test]
+fn a_required_peer_the_requirement_excludes_is_refused() {
+    let local = Catalogue::new();
+    let scope = LocalScope::admitting(workspace(), &local);
+    let peer = peer_catalogue("node-b", &[("builtin/build", "1.0.0")]);
+    let spec = spec().with_peer(granted("node-b")).with_requirement(
+        requirement("builtin/build", "^1")
+            .with_remote(RemotePolicy::Required(node("node-b")))
+            .with_exclude(vec![node("node-b")]),
+    );
+
+    let error = resolve_host(&spec, &local, &[peer], &scope)
+        .expect_err("a requirement that excludes its own peer cannot bind to it");
+
+    assert!(
+        matches!(error, CompositionError::Invalid { .. }),
+        "the contradiction is refused instead of silently bound: {error:?}"
+    );
+}
+
+#[test]
+fn a_required_peer_is_held_to_the_health_policy() {
+    let local = Catalogue::new();
+    let scope = LocalScope::admitting(workspace(), &local);
+    let peer = peer_catalogue("node-b", &[("builtin/build", "1.0.0")])
+        .with_health(false)
+        .with_priority(7);
+    let mut spec = spec().with_peer(granted("node-b")).with_requirement(
+        requirement("builtin/build", "^1").with_remote(RemotePolicy::Required(node("node-b"))),
+    );
+
+    let error = resolve_host(&spec, &local, std::slice::from_ref(&peer), &scope)
+        .expect_err("an unhealthy peer cannot satisfy a requirement that forbids it");
+    assert!(
+        matches!(error, CompositionError::Invalid { .. }),
+        "the health policy reaches the required path: {error:?}"
+    );
+
+    spec.requirements[0] = requirement("builtin/build", "^1")
+        .with_remote(RemotePolicy::Required(node("node-b")))
+        .with_allow_unhealthy(true);
+    let resolved = resolve_host(&spec, &local, &[peer], &scope)
+        .expect("a peer the requirement allows regardless of health binds");
+    assert_eq!(
+        resolved.capabilities[0].binding,
+        Binding::Remote {
+            node: node("node-b"),
+            grant: GrantRef::new("grant:node-b"),
+        }
+    );
+    assert_eq!(
+        resolved.capabilities[0]
+            .decision
+            .as_ref()
+            .expect("a decision")
+            .priority,
+        7,
+        "the required decision reports the peer catalogue's priority"
+    );
+}
+
+#[test]
+fn a_peer_only_capability_is_authorized_by_the_spec_not_the_local_view() {
+    // The view admits the local catalogue, so it admits nothing here. The
+    // binding is still valid: a Workspace composes a capability no Node
+    // implements locally, and the spec's allowlist plus the peer's grant
+    // authorize it (both kernels check the call again at invoke time).
+    let local = Catalogue::new();
+    let scope = LocalScope::admitting(workspace(), &local);
+    let peer = peer_catalogue("node-b", &[("builtin/build", "1.0.0")]);
+    let spec = spec().with_peer(granted("node-b")).with_requirement(
+        requirement("builtin/build", "^1").with_remote(RemotePolicy::Required(node("node-b"))),
+    );
+
+    let resolved = resolve_host(&spec, &local, &[peer], &scope)
+        .expect("a peer-only capability is not vetoed by the local view");
+
+    assert!(matches!(
+        resolved.capabilities[0].binding,
+        Binding::Remote { .. }
+    ));
+}
+
+#[test]
 fn a_required_peer_must_be_allowlisted() {
     let local = catalogue(&[]);
     let scope = LocalScope::admitting(workspace(), &local);

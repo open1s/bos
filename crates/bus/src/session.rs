@@ -1,6 +1,8 @@
 //! Zenoh Bus management
 
-use crate::{Publisher, Session, Subscriber, ZenohError};
+use crate::{
+    MAX_CONSECUTIVE_DECODE_FAILURES, Publisher, RecvOutcome, Session, Subscriber, ZenohError,
+};
 use rkyv::api::high::HighDeserializer;
 use rkyv::rancor::{Error, Strategy};
 use rkyv::ser::Serializer;
@@ -20,6 +22,7 @@ use zenoh::Config;
 pub struct Bus {
     session: Arc<Session>,
     handles: Arc<Mutex<Vec<JoinHandle<Result<(), String>>>>>,
+    subscription_failures: Arc<Mutex<Vec<String>>>,
 }
 
 impl Bus {
@@ -28,6 +31,19 @@ impl Bus {
         Self {
             session,
             handles: Arc::new(Mutex::new(vec![])),
+            subscription_failures: Arc::new(Mutex::new(vec![])),
+        }
+    }
+
+    /// Every reason a subscription spawned by [`Bus::subscribe`] has stopped.
+    ///
+    /// The spawned tasks are kept private, so without this a task that ended
+    /// with an error - Zenoh closed the channel, or the topic stopped decoding -
+    /// looked exactly like one that was still delivering.
+    pub fn subscription_failures(&self) -> Vec<String> {
+        match self.subscription_failures.lock() {
+            Ok(failures) => failures.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -79,6 +95,7 @@ impl Bus {
         Ok(Self {
             session: Arc::new(session),
             handles: Arc::new(Mutex::new(vec![])),
+            subscription_failures: Arc::new(Mutex::new(vec![])),
         })
     }
 
@@ -96,6 +113,14 @@ impl Bus {
     }
 
     /// Subscribe to `topic`, calling `handler` for every decoded message.
+    ///
+    /// A payload that does not decode as `T` is skipped, not treated as the end
+    /// of the subscription: any writer on the shared key-space can publish one,
+    /// and ending the loop on it left the handler silently receiving nothing for
+    /// the rest of the process. The loop stops only when Zenoh closes the
+    /// subscription, or after [`MAX_CONSECUTIVE_DECODE_FAILURES`] undecodable
+    /// payloads in a row; either way the reason is recorded and readable from
+    /// [`Bus::subscription_failures`].
     pub async fn subscribe<T, F>(&self, topic: &str, mut handler: F)
     where
         F: FnMut(T) + Send + 'static,
@@ -105,16 +130,44 @@ impl Bus {
     {
         let bus = self.session.clone();
         let topic = String::from(topic);
+        let failures = self.subscription_failures.clone();
+        let task_topic = topic.clone();
 
         let handle: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
             let mut sub = Subscriber::<T>::new(topic)
                 .with_session(bus)
                 .await
-                .map_err(|e| e.to_string())?;
-            while let Some(query) = sub.recv().await {
-                handler(query);
+                .map_err(|e| format!("{task_topic}: {e}"))?;
+
+            let mut consecutive_failures = 0usize;
+            let result = loop {
+                match sub.recv_outcome().await {
+                    RecvOutcome::Payload(value) => {
+                        consecutive_failures = 0;
+                        handler(value);
+                    }
+                    RecvOutcome::Malformed(error) => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= MAX_CONSECUTIVE_DECODE_FAILURES {
+                            break Err(format!(
+                                "{task_topic}: gave up after {consecutive_failures} undecodable payloads in a row; last error: {error}"
+                            ));
+                        }
+                    }
+                    RecvOutcome::Closed => match sub.last_error() {
+                        Some(error) => break Err(format!("{task_topic}: {error}")),
+                        None => break Ok(()),
+                    },
+                }
+            };
+
+            if let Err(error) = &result {
+                match failures.lock() {
+                    Ok(mut failures) => failures.push(error.clone()),
+                    Err(poisoned) => poisoned.into_inner().push(error.clone()),
+                }
             }
-            Ok(())
+            result
         });
         self.push_handle(handle);
     }

@@ -6,10 +6,12 @@
 //! rules that keep the levels apart are enforced here, not by convention:
 //!
 //! - a local capability the Workspace view does not admit is refused; it is
-//!   never re-routed to a peer,
+//!   never re-routed to a peer (a peer-only capability is authorized by the
+//!   spec's allowlist and grant, not by widening this view),
 //! - a requirement that forbids remote binding never reaches a peer,
 //! - a requirement that requires a named peer never silently falls back to a
-//!   local implementation,
+//!   local implementation, and the requirement's exclude list and the peer's
+//!   health still apply to it,
 //! - every remote binding names the peer and the grant it runs under,
 //! - the result has exactly one workspace id, however many peers it uses.
 
@@ -96,7 +98,8 @@ pub enum RemotePolicy {
     Forbidden,
     /// Local first, then the allowlisted peers in order.
     Allowed,
-    /// This named peer only. A local implementation is not a fallback.
+    /// This named peer only. A local implementation is not a fallback, and the
+    /// requirement's `exclude` list and `allow_unhealthy` policy still apply.
     Required(NodeId),
 }
 
@@ -278,6 +281,12 @@ impl PeerCatalogue {
 }
 
 /// The authorized subset of the catalogue for one workspace.
+///
+/// It is built from the local catalogue ([`LocalScope::admitting`]), so it
+/// decides which local implementations a workspace may use - not where a
+/// capability executes. A peer binding is authorized by the spec's allowlist
+/// and its grant (ADR-008): a Workspace that composes a peer-only capability
+/// must keep working, so this view never vetoes one.
 #[derive(Debug, Clone)]
 pub struct LocalScope {
     /// The workspace this view belongs to.
@@ -560,15 +569,13 @@ fn resolve_one(
     // a remote binding: refusing the local one and taking a peer's would let a
     // workspace view widen itself through the federation. The one exception is
     // the other direction: a requirement that names a peer is executed there,
-    // so a local implementation is not a substitute for it.
+    // so a local implementation is not a substitute for it. The view governs
+    // local implementations only; a capability no Node implements here is
+    // authorized remotely by the spec's allowlist and the peer's grant.
     if !matches!(requirement.remote, RemotePolicy::Required(_))
         && let Some(descriptor) = local.get(&requirement.id)
     {
-        if !scope.admits(&requirement.id) {
-            return Err(CompositionError::NotAdmitted {
-                capability: requirement.id.clone(),
-            });
-        }
+        ensure_admitted(requirement, scope)?;
         check_version(requirement, descriptor)?;
         return Ok(Some(ResolvedCapability {
             descriptor: descriptor.clone(),
@@ -685,10 +692,31 @@ fn resolve_one(
                 .iter()
                 .find(|peer| &peer.node == node)
                 .ok_or_else(|| CompositionError::PeerNotAllowed { node: node.clone() })?;
-            let Some(catalogue) = catalogue_of(peers, node) else {
+            // Naming a peer required does not cancel the requirement's own
+            // policy: a spec that requires a peer and excludes it contradicts
+            // itself, and a requirement that forbids an unhealthy peer cannot
+            // be satisfied by one. Both are refused instead of bound.
+            if requirement.exclude.contains(node) {
+                return Err(CompositionError::Invalid {
+                    message: format!(
+                        "requirement {} requires peer {node}, which its exclude list refuses",
+                        requirement.id
+                    ),
+                });
+            }
+            let Some(peer_catalogue) = peers.iter().find(|candidate| &candidate.node == node)
+            else {
                 return peer_missing(requirement, node);
             };
-            let Some(descriptor) = catalogue.get(&requirement.id) else {
+            if !peer_catalogue.healthy && !requirement.allow_unhealthy {
+                return Err(CompositionError::Invalid {
+                    message: format!(
+                        "peer {node} is unhealthy and requirement {} does not allow unhealthy peers",
+                        requirement.id
+                    ),
+                });
+            }
+            let Some(descriptor) = peer_catalogue.catalogue.get(&requirement.id) else {
                 return peer_missing(requirement, node);
             };
             check_version(requirement, descriptor)?;
@@ -696,11 +724,6 @@ fn resolve_one(
                 .grant
                 .clone()
                 .ok_or_else(|| missing_grant(peer, requirement))?;
-            let priority = peers
-                .iter()
-                .find(|candidate| &candidate.node == node)
-                .map(|candidate| candidate.priority)
-                .unwrap_or(0);
             Ok(Some(ResolvedCapability {
                 descriptor: descriptor.clone(),
                 binding: Binding::Remote {
@@ -710,7 +733,7 @@ fn resolve_one(
                 decision: Some(ProviderDecision {
                     selected: node.clone(),
                     rejected: Vec::new(),
-                    priority,
+                    priority: peer_catalogue.priority,
                     prefer_rank: None,
                 }),
             }))
@@ -718,11 +741,21 @@ fn resolve_one(
     }
 }
 
-fn catalogue_of<'a>(peers: &'a [PeerCatalogue], node: &NodeId) -> Option<&'a Catalogue> {
-    peers
-        .iter()
-        .find(|peer| &peer.node == node)
-        .map(|peer| &peer.catalogue)
+/// Refuse a local implementation the workspace view does not admit.
+///
+/// The refusal happens before the remote branches run, so a capability the
+/// view refuses is never executed somewhere else instead.
+fn ensure_admitted(
+    requirement: &CapabilityRequirement,
+    scope: &LocalScope,
+) -> Result<(), CompositionError> {
+    if scope.admits(&requirement.id) {
+        Ok(())
+    } else {
+        Err(CompositionError::NotAdmitted {
+            capability: requirement.id.clone(),
+        })
+    }
 }
 
 fn check_version(
