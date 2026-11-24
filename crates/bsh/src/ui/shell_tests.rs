@@ -18754,6 +18754,116 @@ fn the_at_card_enter_selects_and_escape_dismisses(cx: &mut TestAppContext) {
     );
 }
 
+/// A session row OPENS the conversation instead of pasting a mention, and a
+/// chat that was archived or deleted stops being offered.
+#[gpui::test]
+fn the_at_session_rows_switch_and_hide_removed_chats(cx: &mut TestAppContext) {
+    let root = std::env::temp_dir().join(format!("bsh-command-switch-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("a scratch tree");
+    std::fs::write(root.join("alpha.txt"), "a").expect("a file");
+    init_test_app(cx);
+    let (harness, cx) = cx.add_window_view(move |window, cx| {
+        let mut state = state_with_turns("command-switch", 1);
+        state.settings.ensure_workspace();
+        let active = state.settings.global.general.active_workspace.clone();
+        if let Some(workspace) = state
+            .settings
+            .global
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == active)
+        {
+            workspace.root = root.to_string_lossy().to_string();
+        }
+        let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
+        Harness { shell }
+    });
+    let shell = cx.update(|_, cx| harness.read(cx).shell.clone());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A second chat with a searchable title, while the first stays active.
+    let second = cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            let first = this.state.active_id.clone().expect("the seeded chat");
+            let second = this.state.new_session().expect("a second chat");
+            if let Some(session) = this
+                .state
+                .store
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == second)
+            {
+                session.title = "budget review".to_string();
+            }
+            this.state.select(&first);
+            second
+        })
+    });
+
+    // Enter on the session row switches to that conversation and leaves no
+    // picker text in its composer.
+    set_command_draft(&shell, cx, "@budget");
+    focus_composer(&shell, cx);
+    cx.simulate_keystrokes("enter");
+    draw_until(cx, "the picker opened the chat", DRAW_UNTIL_MAX, |cx| {
+        cx.update(|_, cx| {
+            let shell = shell.read(cx);
+            shell.state.active_id.as_deref() == Some(second.as_str()) && !shell.command_menu.open
+        })
+    });
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).composer_value.clone()),
+        "",
+        "the @query does not follow the switch"
+    );
+
+    // Archived: no longer a row.
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| this.state.archive_session(&second));
+    });
+    set_command_draft(&shell, cx, "@budget");
+    assert!(
+        cx.debug_bounds("command-row-ref-session-0").is_none(),
+        "an archived chat is not offered"
+    );
+
+    // Deleted: no longer a row either. delete_session is the UI's own path,
+    // which parks the chat in the bin and removes it from the store.
+    let third = cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            let third = this.state.new_session().expect("a third chat");
+            if let Some(session) = this
+                .state
+                .store
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == third)
+            {
+                session.title = "draft to remove".to_string();
+            }
+            third
+        })
+    });
+    set_command_draft(&shell, cx, "@draft");
+    assert!(
+        cx.debug_bounds("command-row-ref-session-0").is_some(),
+        "a live chat is offered"
+    );
+    cx.update(|_, cx| {
+        shell.update(cx, |this, _| {
+            assert!(
+                this.state.delete_session(&third),
+                "the chat parks and leaves"
+            );
+        });
+    });
+    set_command_draft(&shell, cx, "@draft");
+    assert!(
+        cx.debug_bounds("command-row-ref-session-0").is_none(),
+        "a removed chat is not offered"
+    );
+}
+
 /// The Show coding view toggle is the one General row that gates a real
 /// surface, so the click is pressed and the gate read back: developer tools
 /// off hides the trajectory tab (`header.rs`), and the draft is what the

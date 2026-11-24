@@ -335,6 +335,12 @@ pub(crate) enum CardAction {
     Run(fn(&mut Shell, &mut Window, &mut Context<Shell>)),
     /// Replace the trigger token with this mention and close the card.
     Insert(String),
+    /// Switch to the session this row names.
+    ///
+    /// A session is a CONVERSATION, not a path: picking one in the reference
+    /// card opens it. The picker's `@query` is not a message reference, so it
+    /// is consumed with the card (the same rule as Escape).
+    OpenSession(String),
     /// Write one extension command's `/name ` annotation and close the card.
     ///
     /// The command's template is not inserted: the send composes it with the
@@ -381,19 +387,6 @@ fn trigger_start(text: &str) -> usize {
 /// for a directory so the next query lists inside it.
 pub(crate) fn mention(name: &str, directory: bool) -> String {
     mention_with_range(name, directory, None)
-}
-
-/// The canonical session mention: a labelled reference whose hidden target is
-/// the session id, like the reference's `@[label](dsh-session:...)` form.
-pub(crate) fn session_mention(title: &str, id: &str) -> String {
-    let label: String = title
-        .chars()
-        .map(|character| match character {
-            '[' | ']' => ' ',
-            other => other,
-        })
-        .collect();
-    format!("@[{}](dsh-session:{id})", label.trim())
 }
 
 /// The same mention with an optional `#L<start>-L<end>` reference range, so a
@@ -718,6 +711,15 @@ impl Shell {
                 self.command_menu.close();
                 self.cut_command_token(&format!("{text} "), window, cx);
             }
+            CardAction::OpenSession(id) => {
+                self.command_menu.close();
+                // The `@query` was a picker filter, not a message reference:
+                // switching sessions must not leave it in the composer. Text
+                // before the token is the reader's own and stays.
+                self.consume_reference_token(window, cx);
+                self.sync_file_index(cx);
+                self.open_session(&id, window, cx);
+            }
             CardAction::Extension(name) => {
                 self.insert_extension_command(&name, window, cx);
             }
@@ -922,12 +924,23 @@ impl Shell {
 
         // The session block: the same matcher over the titles, so a session is
         // found by a partial title exactly as a path is found by a partial path.
+        //
+        // The filter is the sidebar's own: archived chats, subagent runs and
+        // chats whose workspace is no longer registered are not rows a reader
+        // can open, so offering them in a picker would be a dead action.
+        let workspaces = &self.state.settings.global.workspaces;
         let sessions: Vec<&crate::model::Session> = self
             .state
             .store
             .sessions
             .iter()
             .filter(|session| session.archived_at.is_none())
+            .filter(|session| session.subagent.is_none())
+            .filter(|session| {
+                workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == session.workspace)
+            })
             .collect();
         if needle.is_empty() {
             matched += sessions.len();
@@ -1003,7 +1016,7 @@ impl Shell {
         }
     }
 
-    /// One session row: a title, its workspace, and the labelled mention.
+    /// One session row: a title, its workspace, and the switch it performs.
     fn session_row(
         &self,
         index: usize,
@@ -1016,10 +1029,9 @@ impl Shell {
             label_runs: fuzzy::runs_in(&label, chars, 0..label.len()),
             label,
             detail: self.workspace_name(&session.workspace),
-            // A session is NOT a path: the reference serializes it as a
-            // labelled mention, which the file guidance excludes from the
-            // path rule.
-            action: CardAction::Insert(session_mention(&session.title, &session.id)),
+            // A session is NOT a path and not a mention: choosing it opens the
+            // conversation, exactly as its sidebar row does.
+            action: CardAction::OpenSession(session.id.clone()),
             detail_runs: Vec::new(),
         }
     }
@@ -1046,14 +1058,23 @@ impl Shell {
     /// `@` token is consumed.
     pub(crate) fn dismiss_command_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_menu.close();
+        self.consume_reference_token(window, cx);
+        self.sync_file_index(cx);
+        cx.notify();
+    }
+
+    /// Remove the active `@query` from the draft, keeping the text before it.
+    ///
+    /// Both dismissal and a session switch call this: the picker's query is a
+    /// filter, not a reference the reader wrote, so it must never survive the
+    /// card. Prose before the token is untouched.
+    fn consume_reference_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer_value.clone();
         let start = trigger_start(&text);
         if text[start..].starts_with('@') {
             let next = text[..start].trim_end().to_string();
             self.set_composer_text(&next, window, cx);
         }
-        self.sync_file_index(cx);
-        cx.notify();
     }
 
     /// Recompute the open card's rows from the current draft and index.

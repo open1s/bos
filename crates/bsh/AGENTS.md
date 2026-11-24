@@ -4401,3 +4401,13 @@ and the surplus chains into the transcript in the SAME event
   injection moved it `-1739.5 -> -1779.5` (double scroll) before the fix.
 - Trap: the session-change hook clears `inject_open` on the FIRST frame, so a test
   that opens a disclosure before that frame loses it; open it after the row paints.
+
+Round 198: the reference card's session rows SWITCH conversations. The row used
+to paste a labelled `@[title](dsh-session:id)` mention as plain text, which read
+as a broken pick; it now carries `CardAction::OpenSession(id)` and calls
+`open_session`, consuming the `@query` token (prose before it stays) exactly as
+Escape does. The session block also uses the sidebar's own visibility rules:
+archived chats, subagent runs, and chats whose workspace is no longer registered
+are not offered, so a removed chat cannot come back through the picker. Pinned by
+`the_at_session_rows_switch_and_hide_removed_chats` (Enter switches, archived
+chat drops out, `delete_session` drops out).
