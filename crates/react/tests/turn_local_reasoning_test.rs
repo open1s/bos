@@ -278,6 +278,159 @@ async fn a_custom_session_clears_prior_reasoning_before_the_turn_starts() {
     );
 }
 
+/// A client that declares the DeepSeek pass-back rule: later turns must keep
+/// the earlier chain of thought because a tool-carrying request is rejected
+/// without it.
+struct ReplayRequired {
+    seen: Arc<Mutex<Vec<Vec<LlmMessage>>>>,
+}
+
+#[async_trait]
+impl LlmClient<LlmSession, LlmContext> for ReplayRequired {
+    async fn complete(
+        &self,
+        _persona: Option<String>,
+        _req: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> LlmResponseResult {
+        Err(LlmError::Other("this fixture streams".to_string()))
+    }
+
+    async fn stream_complete(
+        &self,
+        _persona: Option<String>,
+        req: LlmRequest,
+        _session: &mut LlmSession,
+        _context: &mut LlmContext,
+    ) -> Result<TokenStream, LlmError> {
+        if let Some(provider) = &req.provider_request {
+            self.seen.lock().unwrap().push(provider.wire_messages());
+        }
+        let tokens: Vec<Result<StreamToken, LlmError>> = vec![
+            Ok(StreamToken::Text("answer".to_string())),
+            Ok(StreamToken::Done),
+        ];
+        Ok(Box::pin(futures::stream::iter(tokens)))
+    }
+
+    fn replays_reasoning_across_turns(&self, _model: &str) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn a_provider_that_requires_pass_back_keeps_prior_reasoning() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = ReActEngineBuilder::<TestApp>::new()
+        .llm(Box::new(ReplayRequired {
+            seen: Arc::clone(&seen),
+        }))
+        .max_steps(2)
+        .build()
+        .expect("the engine builds");
+    let mut session = LlmSession::default();
+    session.push(LlmMessage::AssistantReasoning {
+        content: "earlier chain of thought".to_string(),
+        provider_state: None,
+    });
+    session.push(LlmMessage::assistant("earlier answer"));
+    let mut context = LlmContext::default();
+    let mut request = LlmRequest::new("deepseek-flash");
+    request.input = Content::text("next");
+    {
+        let stream = engine.react_stream(None, request, &mut session, &mut context);
+        futures::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            item.expect("stream item");
+        }
+    }
+
+    let requests = seen.lock().unwrap();
+    let first = requests.first().expect("one request");
+    assert!(
+        first.iter().any(|message| matches!(
+            message,
+            LlmMessage::AssistantReasoning { content, .. } if content == "earlier chain of thought"
+        )),
+        "the provider asked for pass-back, so the earlier block survives: {first:?}"
+    );
+    assert!(
+        session
+            .history()
+            .expect("history")
+            .iter()
+            .any(|message| matches!(message, LlmMessage::AssistantReasoning { .. })),
+        "the engine did not clear the session's reasoning"
+    );
+}
+
+#[test]
+fn deepseek_vendors_report_the_pass_back_requirement() {
+    use react::llm::vendor::{DeepSeekVendor, OpenAiVendor};
+
+    let deepseek = DeepSeekVendor::new(
+        "https://api.deepseek.com".to_string(),
+        "deepseek-flash".to_string(),
+        "k".to_string(),
+    );
+    assert!(
+        <DeepSeekVendor as LlmClient<LlmSession, LlmContext>>::replays_reasoning_across_turns(
+            &deepseek,
+            "deepseek/deepseek-flash",
+        ),
+        "DeepSeek rejects a tool request that lost an earlier reasoning block"
+    );
+    let generic = OpenAiVendor::new(
+        "https://api.deepseek.com".to_string(),
+        "deepseek-flash".to_string(),
+        "k".to_string(),
+    );
+    assert!(
+        <OpenAiVendor as LlmClient<LlmSession, LlmContext>>::replays_reasoning_across_turns(
+            &generic,
+            "deepseek-flash",
+        ),
+        "a generic client pointed at DeepSeek has the same requirement"
+    );
+    let openai = OpenAiVendor::new(
+        "https://api.openai.com/v1".to_string(),
+        "gpt-4o".to_string(),
+        "k".to_string(),
+    );
+    assert!(
+        !<OpenAiVendor as LlmClient<LlmSession, LlmContext>>::replays_reasoning_across_turns(
+            &openai, "gpt-4o",
+        ),
+        "OpenAI keeps the turn-local rule"
+    );
+}
+
+#[test]
+fn a_router_answers_the_pass_back_rule_per_vendor() {
+    let mut router = react::llm::vendor::LlmRouter::<LlmSession, LlmContext>::new();
+    router.register_vendor(
+        "deepseek".to_string(),
+        Box::new(ReplayRequired {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    router.register_vendor(
+        "openai".to_string(),
+        Box::new(Recording {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    assert!(
+        router.replays_reasoning_across_turns("deepseek/deepseek-flash"),
+        "the routed DeepSeek vendor asks for its blocks back"
+    );
+    assert!(
+        !router.replays_reasoning_across_turns("openai/gpt-4o"),
+        "a sibling vendor keeps the turn-local rule"
+    );
+}
+
 #[tokio::test]
 async fn a_new_turn_does_not_send_the_previous_turns_reasoning() {
     let seen = Arc::new(Mutex::new(Vec::new()));

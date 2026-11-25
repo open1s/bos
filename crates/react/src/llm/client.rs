@@ -44,6 +44,22 @@ pub trait LlmClient<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext
     fn provider_name(&self) -> &'static str {
         "unknown"
     }
+    /// Whether a later turn must replay the reasoning blocks this provider
+    /// emitted.
+    ///
+    /// The default is the turn-local rule: only the tool loop inside the turn
+    /// that produced a block replays it, and the engine drops earlier turns
+    /// before the first request. DeepSeek is the exception: once a request
+    /// carries `tools`, its thinking mode expects the earlier blocks back, so
+    /// its vendors answer `true` and the engine keeps them across turn
+    /// boundaries. The Responses and Chat adapters additionally normalize a
+    /// step that still lacks one (see `lead_steps_with_reasoning`).
+    ///
+    /// `model` is the routed id the request will send, because a router answers
+    /// per vendor rather than for the process.
+    fn replays_reasoning_across_turns(&self, _model: &str) -> bool {
+        false
+    }
     /// List the model identifiers the provider offers, when it can.
     ///
     /// The default is a refusal, not an empty list, so a caller can tell a

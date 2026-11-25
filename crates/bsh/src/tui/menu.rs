@@ -123,6 +123,11 @@ struct Command {
 /// a command the terminal cannot run.
 const COMMANDS: &[Command] = &[
     Command {
+        name: "/approve",
+        detail: "approve the approval a turn is waiting on · `^Y`",
+        bare: true,
+    },
+    Command {
         name: "/audit",
         detail: "audit this session's tool calls, and what was refused",
         bare: true,
@@ -138,6 +143,16 @@ const COMMANDS: &[Command] = &[
         bare: true,
     },
     Command {
+        name: "/copy",
+        detail: "copy the newest answer, or `id` for the session's id, to the clipboard",
+        bare: true,
+    },
+    Command {
+        name: "/fork",
+        detail: "branch this session into a chat that opens with its transcript",
+        bare: true,
+    },
+    Command {
         name: "/detail",
         detail: "read one tool call's arguments and output",
         bare: true,
@@ -145,6 +160,16 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "/diff",
         detail: "compare the working copy, or one file, with its baseline",
+        bare: true,
+    },
+    Command {
+        name: "/deny",
+        detail: "refuse it, with a reason the audit records · `^R`",
+        bare: true,
+    },
+    Command {
+        name: "/editor",
+        detail: "write the prompt in $EDITOR, and take the buffer back · `^X`",
         bare: true,
     },
     Command {
@@ -173,6 +198,11 @@ const COMMANDS: &[Command] = &[
         bare: true,
     },
     Command {
+        name: "/find",
+        detail: "reveal a previous row of this conversation by a word it carries",
+        bare: false,
+    },
+    Command {
         name: "/goal",
         detail: "show or change the session goal",
         bare: false,
@@ -194,8 +224,8 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/model",
-        detail: "set the model, or list the choices",
-        bare: false,
+        detail: "pick the model from a list, or name `<provider> <model>`",
+        bare: true,
     },
     Command {
         name: "/new",
@@ -204,8 +234,8 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/permission",
-        detail: "set the approval mode, or list them",
-        bare: false,
+        detail: "pick the approval mode from a list",
+        bare: true,
     },
     Command {
         name: "/skills",
@@ -219,8 +249,8 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/preset",
-        detail: "set the preset, or list the presets",
-        bare: false,
+        detail: "pick the preset from a list",
+        bare: true,
     },
     Command {
         name: "/queue",
@@ -254,7 +284,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/sessions",
-        detail: "list sessions, or open one by number",
+        detail: "open the session list, filter a chat by name, or pin/archive one by number",
         bare: true,
     },
     Command {
@@ -268,6 +298,11 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "/set",
         detail: "write or clear one settings field the Host marks editable",
+        bare: true,
+    },
+    Command {
+        name: "/subagents",
+        detail: "the child runs this conversation started; a number opens one, `all` every run",
         bare: true,
     },
     Command {
@@ -287,7 +322,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/trash",
-        detail: "list the bin, or park a session by its /sessions number",
+        detail: "open the bin, or park a session by its /sessions number",
         bare: true,
     },
     Command {
@@ -297,12 +332,27 @@ const COMMANDS: &[Command] = &[
     },
 ];
 
-/// The names this catalogue offers, so a test can prove the terminal runs
-/// every row the list draws.
+/// The rows this catalogue offers, so a test can prove the terminal runs every
+/// row the list draws: the name as typed, and whether accepting it runs the
+/// line outright.
 ///
 /// Only tests read this: the list itself is drawn from [`COMMANDS`], and a row
-/// the parser does not accept would be a promise the list cannot keep.
+/// the parser does not accept would be a promise the list cannot keep. The
+/// `bare` half is what makes that check honest - a row that runs on accept has
+/// to run when the same line is typed, while a row that leaves the composer
+/// open for an argument is allowed to answer with its usage line.
 #[cfg(test)]
+pub(crate) fn command_rows_for_test() -> Vec<(&'static str, bool)> {
+    COMMANDS
+        .iter()
+        .map(|command| (command.name, command.bare))
+        .collect()
+}
+
+/// Every command name this build backs, in the catalogue's own order.
+///
+/// The popup, the `/help` line and the answer to a mistyped line all read this
+/// one list, so a suggestion can never name a row the popup does not draw.
 pub(crate) fn command_names() -> Vec<&'static str> {
     COMMANDS.iter().map(|command| command.name).collect()
 }
@@ -382,6 +432,31 @@ impl Menu {
     /// The highlighted row.
     pub(crate) fn active(&self) -> usize {
         self.active
+    }
+
+    /// The slice of rows a frame draws, as `(start, visible)`.
+    ///
+    /// The window follows the highlight, keeping it on the last row while there
+    /// are more candidates below, the way a scrolling menu does. A frame and a
+    /// click both ask here, so the row a pointer names is the row that pointer
+    /// saw.
+    pub(crate) fn window(&self) -> (usize, usize) {
+        let visible = self.rows.len().min(VISIBLE_ROWS);
+        let start = self.active.saturating_sub(visible.saturating_sub(1));
+        (start, visible)
+    }
+
+    /// Put the highlight on a row, and report whether the list has that row.
+    ///
+    /// A pointer can name any drawn row, so this is the walk's own clamp with
+    /// the target chosen outright: a click on the last row lands where holding
+    /// Down would have.
+    pub(crate) fn select(&mut self, index: usize) -> bool {
+        if index >= self.rows.len() {
+            return false;
+        }
+        self.active = index;
+        true
     }
 
     /// Move the highlight, clamped at both ends: the first press does not wrap
@@ -726,15 +801,27 @@ mod tests {
 
     #[test]
     fn a_command_row_runs_and_an_argument_row_leaves_a_space() {
+        // The three picker commands run bare: the list they open is the
+        // argument, so Enter on the row is one keystroke instead of a space
+        // and a name retyped from memory.
         let mut menu = Menu::default();
         menu.sync("/mo", 3, None, &[], &[]);
         let (mut input, mut cursor) = ("/mo".to_string(), 3);
         assert_eq!(
             menu.accept(&mut input, &mut cursor),
+            Some(Accepted::Insert(true))
+        );
+        assert_eq!(input, "/model", "a picker command runs the line as typed");
+
+        let mut menu = Menu::default();
+        menu.sync("/go", 3, None, &[], &[]);
+        let (mut input, mut cursor) = ("/go".to_string(), 3);
+        assert_eq!(
+            menu.accept(&mut input, &mut cursor),
             Some(Accepted::Insert(false))
         );
-        assert_eq!(input, "/model ");
-        assert_eq!(cursor, 7, "the cursor sits after the inserted space");
+        assert_eq!(input, "/goal ");
+        assert_eq!(cursor, 6, "the cursor sits after the inserted space");
 
         let mut menu = Menu::default();
         menu.sync("/plan", 5, None, &[], &[]);
@@ -873,5 +960,57 @@ mod tests {
         let (mut input, mut cursor) = ("/co".to_string(), 3);
         assert_eq!(menu.accept(&mut input, &mut cursor), None);
         assert_eq!(input, "/co", "a closed list never edits the line");
+    }
+
+    #[test]
+    fn a_click_names_the_row_the_window_drew() {
+        // The popup has no header, so the row a pointer names is the slot it
+        // stands in under the popup's top row - and the window is what put a
+        // candidate in that slot. A frame and a click must read the same
+        // arithmetic, or a pointer would commit a row the reader never saw.
+        let mut menu = Menu::default();
+        menu.sync("/", 1, None, &[], &[]);
+        let rows = menu.rows().len();
+        assert!(rows > VISIBLE_ROWS, "the catalogue outgrows one window");
+
+        // At the top of the list the window starts at the first row, and the
+        // rows it draws are the catalogue's own in order.
+        let (start, visible) = menu.window();
+        assert_eq!((start, visible), (0, VISIBLE_ROWS));
+        let drawn: Vec<&str> = menu.rows()[start..start + visible]
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert_eq!(drawn, first_commands(VISIBLE_ROWS));
+
+        // Walking to the end scrolls the window, so the last drawn row is the
+        // highlighted one rather than the list's last candidate.
+        menu.move_by(isize::try_from(rows).expect("the catalogue fits an isize"));
+        let (start, visible) = menu.window();
+        assert_eq!(start + visible, rows, "the window ends on the last row");
+        assert_eq!(start + visible - 1, menu.active());
+
+        // Selecting the row a slot names is what a click does, and the accept
+        // that follows reads the highlight rather than the pointer. The label
+        // is taken before the accept, which closes the list.
+        menu.select(start);
+        assert_eq!(menu.active(), start);
+        let named = menu.rows()[start].label.clone();
+        let (mut input, mut cursor) = (String::new(), 0);
+        assert_eq!(
+            menu.accept(&mut input, &mut cursor),
+            Some(Accepted::Insert(true)),
+            "the row the pointer named is the row that runs"
+        );
+        assert_eq!(input, named);
+    }
+
+    /// The first `count` command names, the order a blank query ranks them in.
+    fn first_commands(count: usize) -> Vec<&'static str> {
+        COMMANDS
+            .iter()
+            .take(count)
+            .map(|command| command.name)
+            .collect()
     }
 }

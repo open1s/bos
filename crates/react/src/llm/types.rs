@@ -12,12 +12,18 @@ pub trait ReactSession {
     fn history(&self) -> Option<&[LlmMessage]>;
     /// Drop reasoning kept from an earlier turn.
     ///
-    /// Reasoning may be replayed to the provider that produced it, but only
-    /// inside the turn that produced it: a tool loop needs the block, a later
-    /// turn must not receive it. The engine calls this before a turn's first
-    /// request, so every session implementation must remove all
-    /// [`LlmMessage::AssistantReasoning`] messages (and the provider state they
-    /// carry) from the history it will return.
+    /// Reasoning is replayed to the provider that produced it. For most
+    /// providers that means only inside the turn that produced it: a tool loop
+    /// needs the block, a later turn must not receive it. The engine calls this
+    /// before a turn's first request, so every session implementation must
+    /// remove all [`LlmMessage::AssistantReasoning`] messages (and the provider
+    /// state they carry) from the history it will return.
+    ///
+    /// The engine skips this call when the vendor reports
+    /// [`crate::llm::LlmClient::replays_reasoning_across_turns`] — DeepSeek
+    /// rejects a tool-carrying request whose earlier turns lost their chain of
+    /// thought — so an implementation must also be correct when it is not
+    /// called at all.
     ///
     /// This method is deliberately required rather than defaulted to a no-op:
     /// a session that keeps history but skips this cleanup would replay a

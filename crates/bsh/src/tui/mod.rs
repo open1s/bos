@@ -12,8 +12,10 @@ use ratatui::widgets::Paragraph;
 use crate::runtime::ids::SessionId;
 
 mod app;
+mod editor;
 mod export;
 mod menu;
+mod picker;
 mod shell;
 mod skin;
 mod term;
@@ -72,7 +74,21 @@ fn event_loop(app: &mut app::App, terminal: &mut term::Terminal) -> Result<(), S
         // A short key timeout is what makes committed events visible while the
         // user is not typing; the Host, not this loop, drives the turn.
         match terminal.next_key(Duration::from_millis(60)) {
-            Ok(Some(key)) => app.handle_key(key),
+            Ok(Some(key)) => {
+                app.handle_key(key);
+                // `^X` and `/editor` ask for the reader's own editor, which
+                // needs the whole screen: the loop hands the terminal back for
+                // exactly as long as that program runs, then hands the answer
+                // to the app, which keeps the prompt or replaces it. The app
+                // cannot do this itself - the terminal is the loop's.
+                if let Some(text) = app.take_edit_request() {
+                    let outcome = terminal
+                        .hand_over(|| editor::run(&text))
+                        .map_err(|error| format!("terminal: {error}"))
+                        .and_then(|edited| edited.map_err(|error| error.to_string()));
+                    app.after_edit(outcome);
+                }
+            }
             Ok(None) => {}
             Err(error) => return Err(format!("terminal: {error}")),
         }

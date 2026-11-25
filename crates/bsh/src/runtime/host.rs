@@ -693,6 +693,15 @@ impl Core {
             QueryPayload::Federation => QueryResult::Federation {
                 report: self.executor.federation(),
             },
+            // The registry is the executor's, and the filter is the
+            // conversation: a terminal that opened a chat asks for that
+            // lineage, and one that asked for the Host's whole roster gets
+            // every run it holds.
+            QueryPayload::Subagents { session_id } => QueryResult::Subagents {
+                report: self
+                    .executor
+                    .subagents(session_id.map(|id| id.to_string()).as_deref()),
+            },
             QueryPayload::Review { session_id, change } => QueryResult::Review {
                 report: Box::new(
                     self.executor
@@ -921,6 +930,7 @@ impl Core {
                 let draft = EventDraft::new(EventPayload::SessionCreated {
                     title: title.clone(),
                     config,
+                    forked_from: None,
                     command_id,
                     payload_hash: payload_hash.clone(),
                 })
@@ -930,6 +940,44 @@ impl Core {
                     .map_err(|error| self.journal_rejection(inner, &error))?;
                 Ok((
                     Self::accepted(command_id, OperationId::new(session_id)),
+                    None,
+                ))
+            }
+            CommandPayload::ForkSession { session_id } => {
+                self.require_session(inner, envelope, *session_id)?;
+                // Read the source's title and configuration out before the
+                // append takes a mutable borrow of the same state.
+                let Some(source) = inner.projections.session(*session_id) else {
+                    return Err(Self::refuse(
+                        RejectionCode::NotFound,
+                        format!("session {session_id} does not exist"),
+                    ));
+                };
+                if source.trashed {
+                    return Err(Self::refuse(
+                        RejectionCode::InvalidRequest,
+                        "session is in the bin; restore it before forking it",
+                    ));
+                }
+                let (title, config) = (source.title.clone(), source.config.clone());
+                // The fork is a fresh chat with the source's history, so it is
+                // created with the configuration the source's next turn used:
+                // a branch a reader continues must run like the one it branched
+                // from, not like today's defaults.
+                let forked_id = SessionId::new();
+                let draft = EventDraft::new(EventPayload::SessionCreated {
+                    title,
+                    config,
+                    forked_from: Some(*session_id),
+                    command_id,
+                    payload_hash: payload_hash.clone(),
+                })
+                .session(forked_id)
+                .caused_by(command_id);
+                self.append_and_apply(inner, draft)
+                    .map_err(|error| self.journal_rejection(inner, &error))?;
+                Ok((
+                    Self::accepted(command_id, OperationId::new(forked_id)),
                     None,
                 ))
             }

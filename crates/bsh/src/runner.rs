@@ -215,10 +215,19 @@ impl Runner {
                     }
                 }
                 Role::Assistant => {
-                    // Reasoning stays in the transcript for the reader, but it
-                    // is NOT replayed: a model must never receive a previous
-                    // turn's chain of thought or its opaque provider state.
-                    // Only the current turn's engine session carries those.
+                    // Reasoning is replayed only to a provider that requires it
+                    // (DeepSeek rejects a tool-carrying request whose earlier
+                    // turns lost their chain of thought). Every other provider
+                    // keeps the turn-local rule: the transcript still shows the
+                    // block to the reader, but the request must not carry it.
+                    if agent.replays_reasoning_across_turns()
+                        && !message.reasoning.trim().is_empty()
+                    {
+                        session.push(react::llm::LlmMessage::AssistantReasoning {
+                            content: message.reasoning.clone(),
+                            provider_state: None,
+                        });
+                    }
                     if !message.text.is_empty() {
                         session.add_assistant(message.text.clone());
                     }
@@ -1192,6 +1201,66 @@ mod tests {
         fn provider_name(&self) -> &'static str {
             "context-capturing-mock"
         }
+    }
+
+    /// A provider that declares the DeepSeek pass-back requirement without
+    /// speaking the wire: enough to prove the seed and the engine keep the
+    /// transcript's reasoning for a later turn.
+    struct ReplayRequiredMock {
+        seen: Arc<std::sync::Mutex<Vec<react::llm::ProviderRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl agent::LlmClient<agent::agent::AgentSession, agent::agent::AgentReactContext>
+        for ReplayRequiredMock
+    {
+        async fn complete(
+            &self,
+            _persona: Option<String>,
+            _req: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> react::llm::LlmResponseResult {
+            Ok(summary_response("ok"))
+        }
+
+        async fn stream_complete(
+            &self,
+            _persona: Option<String>,
+            req: react::llm::LlmRequest,
+            _session: &mut agent::agent::AgentSession,
+            _context: &mut agent::agent::AgentReactContext,
+        ) -> Result<react::llm::TokenStream, react::llm::LlmError> {
+            if let Some(snapshot) = req.provider_request {
+                self.seen.lock().unwrap().push(snapshot);
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(react::llm::StreamToken::Text("ok".to_string())),
+                Ok(react::llm::StreamToken::Done),
+            ])))
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "replay-required-mock"
+        }
+
+        fn replays_reasoning_across_turns(&self, _model: &str) -> bool {
+            true
+        }
+    }
+
+    fn replay_agent(
+        seen: Arc<std::sync::Mutex<Vec<react::llm::ProviderRequest>>>,
+    ) -> Arc<agent::Agent> {
+        let mut provider = agent::agent::agentic::LlmProvider::new();
+        provider.register_vendor("mock".to_string(), Box::new(ReplayRequiredMock { seen }));
+        Arc::new(agent::Agent::new(
+            agent::AgentConfig {
+                model: "mock-model".to_string(),
+                ..Default::default()
+            },
+            Arc::new(provider),
+        ))
     }
 
     fn workspace(label: &str) -> std::path::PathBuf {
@@ -2220,6 +2289,119 @@ mod tests {
                 react::llm::LlmMessage::Assistant { content } if content == "answer"
             )),
             "the visible answer still replays"
+        );
+    }
+
+    /// A provider that requires pass-back (DeepSeek) gets the transcript's
+    /// reasoning seeded before the text it introduced, so the next tool-carrying
+    /// request can replay it. Without this the first follow-up turn is a 400.
+    #[test]
+    fn seeding_replays_reasoning_when_the_provider_requires_it() {
+        let agent = replay_agent(Arc::new(std::sync::Mutex::new(Vec::new())));
+        assert!(
+            agent.replays_reasoning_across_turns(),
+            "the fixture reports the requirement the seed keys off"
+        );
+        let mut assistant = crate::model::ChatMessage::assistant();
+        assistant.reasoning = "private thought".to_string();
+        assistant.parts = vec![crate::model::TurnPart::Thinking(15)];
+        assistant.text = "answer".to_string();
+        Runner::seed_session(
+            &agent,
+            &[
+                crate::model::ChatMessage::user("solve it".to_string()),
+                assistant,
+            ],
+        );
+        let session = agent.session();
+        let messages = session.messages();
+        let reasoning = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    react::llm::LlmMessage::AssistantReasoning { content, provider_state: None }
+                        if content == "private thought"
+                )
+            })
+            .expect("the reasoning row is seeded");
+        let answer = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    react::llm::LlmMessage::Assistant { content } if content == "answer"
+                )
+            })
+            .expect("the visible answer still replays");
+        assert!(
+            reasoning < answer,
+            "the block stays ahead of the text it introduced: {messages:?}"
+        );
+    }
+
+    /// The same requirement through a real BSH turn: the reseeded session keeps
+    /// the transcript's reasoning, the engine does not clear it, and the
+    /// provider's first request carries it ahead of the answer it introduced.
+    #[test]
+    fn a_second_turn_carries_the_seeded_reasoning_in_the_request() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = replay_agent(Arc::clone(&seen));
+        let root = workspace("reasoning-replay-turn");
+        let mut assistant = crate::model::ChatMessage::assistant();
+        assistant.reasoning = "private thought".to_string();
+        assistant.text = "finished".to_string();
+        let transcript = vec![crate::model::ChatMessage::user("go".to_string()), assistant];
+        let facts = crate::context::RuntimeFacts {
+            cwd: root.to_string_lossy().to_string(),
+            confined: true,
+            sandbox_reason: None,
+            permission: "workspace-write".to_string(),
+            preset: "standard".to_string(),
+            presets_disabled: false,
+        };
+        let mut runner = Runner::new();
+        let receiver = runner.spawn(
+            "reasoning-replay-turn",
+            agent,
+            react::llm::Content::Text("next".to_string()),
+            transcript,
+            facts,
+            None,
+            crate::context_assembly::MemoryState::Disabled,
+            false,
+            None,
+        );
+        drain(receiver);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let requests = seen.lock().unwrap();
+        let first = requests.first().expect("one request");
+        let reasoning = first
+            .messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    react::llm::LlmMessage::AssistantReasoning { content, .. }
+                        if content == "private thought"
+                )
+            })
+            .expect("the seeded reasoning reaches the provider request");
+        let answer = first
+            .messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    react::llm::LlmMessage::Assistant { content } if content == "finished"
+                )
+            })
+            .expect("the earlier answer still replays");
+        assert!(
+            reasoning < answer,
+            "the reasoning stays ahead of its answer: {:?}",
+            first.messages
         );
     }
 

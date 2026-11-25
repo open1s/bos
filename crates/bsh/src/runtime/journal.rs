@@ -450,6 +450,7 @@ mod tests {
         let draft = EventDraft::new(EventPayload::SessionCreated {
             title: title.to_string(),
             config: crate::runtime::contract::SessionConfig::default(),
+            forked_from: None,
             command_id: CommandId::new(),
             payload_hash: PayloadHash::of(&title),
         })

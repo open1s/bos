@@ -243,16 +243,24 @@ fn which(name: &str) -> bool {
 /// a page key that the application did not ask for); every binding the
 /// transcript uses has a terminal equivalent here, so the shell sees the same
 /// keystroke the reader pressed.
-pub(crate) fn encode(key: Key) -> Option<Vec<u8>> {
+pub(crate) fn encode(key: &Key) -> Option<Vec<u8>> {
     let bytes: Vec<u8> = match key {
         Key::Char(character) => character.to_string().into_bytes(),
         // Enter in a shell is a carriage return; a newline would only reach
         // the line editor as `^J`.
         Key::Enter | Key::Newline => b"\r".to_vec(),
         Key::Backspace => b"\x7f".to_vec(),
+        Key::Delete => b"\x1b[3~".to_vec(),
         Key::Escape => b"\x1b".to_vec(),
         Key::Left => b"\x1b[D".to_vec(),
         Key::Right => b"\x1b[C".to_vec(),
+        Key::Home => b"\x1b[H".to_vec(),
+        Key::End => b"\x1b[F".to_vec(),
+        // Modifier arrows are the CSI 1;<mod> form: 5 is Ctrl, 3 is Alt. The
+        // pane forwards Ctrl, which is what this client decodes a word step
+        // from, so the shell and the composer agree on one spelling.
+        Key::WordLeft => b"\x1b[1;5D".to_vec(),
+        Key::WordRight => b"\x1b[1;5C".to_vec(),
         Key::Up => b"\x1b[A".to_vec(),
         Key::Down => b"\x1b[B".to_vec(),
         Key::PageUp => b"\x1b[5~".to_vec(),
@@ -260,6 +268,13 @@ pub(crate) fn encode(key: Key) -> Option<Vec<u8>> {
         Key::ScrollUp => b"\x1b[A".to_vec(),
         Key::ScrollDown => b"\x1b[B".to_vec(),
         Key::Tab => b"\t".to_vec(),
+        // A paste goes to the shell whole, with its newlines as carriage
+        // returns: the pane is a terminal, and pasting a command into it is
+        // what a reader expects to do.
+        Key::Paste(text) => text.replace("\r\n", "\r").replace('\n', "\r").into_bytes(),
+        // A click is the frame's gesture, not the shell's: the pane has no
+        // pointer protocol, so there is nothing to forward.
+        Key::Click { .. } => return None,
         // A control chord is its C0 byte: Ctrl-A is 0x01, Ctrl-] is 0x1d.
         Key::Ctrl(character) => {
             let character = character.to_ascii_uppercase();
@@ -284,24 +299,35 @@ mod tests {
 
     #[test]
     fn plain_keys_encode_to_their_terminal_bytes() {
-        assert_eq!(encode(Key::Char('a')), Some(b"a".to_vec()));
-        assert_eq!(encode(Key::Enter), Some(b"\r".to_vec()));
-        assert_eq!(encode(Key::Tab), Some(b"\t".to_vec()));
-        assert_eq!(encode(Key::Backspace), Some(b"\x7f".to_vec()));
-        assert_eq!(encode(Key::Left), Some(b"\x1b[D".to_vec()));
+        assert_eq!(encode(&Key::Char('a')), Some(b"a".to_vec()));
+        assert_eq!(encode(&Key::Enter), Some(b"\r".to_vec()));
+        assert_eq!(encode(&Key::Tab), Some(b"\t".to_vec()));
+        assert_eq!(encode(&Key::Backspace), Some(b"\x7f".to_vec()));
+        assert_eq!(encode(&Key::Left), Some(b"\x1b[D".to_vec()));
+    }
+
+    /// The line and word steps reach the shell as the sequences its own line
+    /// editor reads, so Ctrl-Left inside a shell is one word there too.
+    #[test]
+    fn the_line_and_word_steps_encode_to_their_sequences() {
+        assert_eq!(encode(&Key::Delete), Some(b"\x1b[3~".to_vec()));
+        assert_eq!(encode(&Key::Home), Some(b"\x1b[H".to_vec()));
+        assert_eq!(encode(&Key::End), Some(b"\x1b[F".to_vec()));
+        assert_eq!(encode(&Key::WordLeft), Some(b"\x1b[1;5D".to_vec()));
+        assert_eq!(encode(&Key::WordRight), Some(b"\x1b[1;5C".to_vec()));
     }
 
     #[test]
     fn a_control_chord_is_its_c0_byte() {
-        assert_eq!(encode(Key::Ctrl('c')), Some(vec![0x03]));
-        assert_eq!(encode(Key::Ctrl('a')), Some(vec![0x01]));
+        assert_eq!(encode(&Key::Ctrl('c')), Some(vec![0x03]));
+        assert_eq!(encode(&Key::Ctrl('a')), Some(vec![0x01]));
         // The pane's own close chord is the only control byte it reserves.
-        assert_eq!(encode(Key::Ctrl(']')), Some(vec![0x1d]));
+        assert_eq!(encode(&Key::Ctrl(']')), Some(vec![0x1d]));
     }
 
     #[test]
     fn an_unmapped_control_chord_encodes_to_nothing() {
-        assert_eq!(encode(Key::Ctrl('1')), None);
+        assert_eq!(encode(&Key::Ctrl('1')), None);
     }
 
     /// A real pseudoconsole: the shell runs, its output reaches the grid and

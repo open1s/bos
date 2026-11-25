@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 
 use super::contract::{
     BrowserView, CatalogueView, ExtensionsReport, FederationReport, MemoryReport, MessageRole,
-    ReviewReport, SessionConfig, SessionConfigChange, SettingEdit, SettingsReport, TaskBoardReport,
-    TaskDetailReport, TurnUsage, WorkspaceDiffView, WorkspaceReport,
+    ReviewReport, SessionConfig, SessionConfigChange, SettingEdit, SettingsReport, SubagentReport,
+    TaskBoardReport, TaskDetailReport, TurnUsage, WorkspaceDiffView, WorkspaceReport,
 };
 use super::host::ApprovalHandle;
 use super::ids::{ExecutionId, SessionId, WorkspaceId};
@@ -323,6 +323,21 @@ pub trait TurnExecutor: Send + Sync {
         ReviewReport {
             state: "unsupported".to_string(),
             ..ReviewReport::default()
+        }
+    }
+
+    /// The delegated child runs a conversation started, or every run this
+    /// executor holds.
+    ///
+    /// The default reports an executor with no subagent registry rather than
+    /// an empty roster: "this conversation delegated nothing" and "this build
+    /// cannot delegate" are different answers, and a client that showed the
+    /// first for the second would tell the reader their turn never handed work
+    /// to a child when the tool was never attached.
+    fn subagents(&self, _session: Option<&str>) -> SubagentReport {
+        SubagentReport {
+            state: "unsupported".to_string(),
+            ..SubagentReport::default()
         }
     }
 

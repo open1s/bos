@@ -273,6 +273,27 @@ impl RuntimeClient {
         })
     }
 
+    /// Fork one session into a new chat that opens with its transcript.
+    ///
+    /// The branch is a durable fact of the Host's, so a second client opens the
+    /// same fork and a reconnect folds it back. The answer is the fork's own
+    /// session id, published as the operation id the way a creation publishes
+    /// one, which is what lets the caller open the chat it just made.
+    pub fn fork_session(&self, session_id: SessionId) -> Result<SessionId, ClientError> {
+        let command_id = CommandId::new();
+        let outcome = self.command(
+            Some(session_id),
+            None,
+            CommandPayload::ForkSession { session_id },
+            command_id,
+        )?;
+        accepted_operation(&outcome).and_then(|operation| {
+            operation
+                .parse()
+                .map_err(|_| ClientError::Contract("forked session id is not a uuid".to_string()))
+        })
+    }
+
     /// Rename one session.
     ///
     /// The title is a durable fact the Host journals, so a second client sees
@@ -757,6 +778,24 @@ impl RuntimeClient {
         };
         match self.query(None, payload)? {
             QueryResult::Diff { view } => Ok(view),
+            other => Err(ClientError::Contract(format!(
+                "unexpected query result {other:?}"
+            ))),
+        }
+    }
+
+    /// The delegated child runs one conversation started, or every run this
+    /// Host holds when no conversation is named.
+    ///
+    /// The desktop reads the same registry directly, through its task graph
+    /// and header; a client that attached to this Host has no way to see it, so
+    /// the answer travels.
+    pub fn subagents(
+        &self,
+        session_id: Option<SessionId>,
+    ) -> Result<crate::runtime::contract::SubagentReport, ClientError> {
+        match self.query(None, QueryPayload::Subagents { session_id })? {
+            QueryResult::Subagents { report } => Ok(report),
             other => Err(ClientError::Contract(format!(
                 "unexpected query result {other:?}"
             ))),

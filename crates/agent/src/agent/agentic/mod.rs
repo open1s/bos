@@ -2089,6 +2089,15 @@ impl Agent {
         }
     }
 
+    /// Whether the configured vendor needs earlier turns' reasoning replayed.
+    ///
+    /// A host that rebuilds the model session from its own transcript (BSH)
+    /// uses this to decide whether to seed the chain of thought it stored for
+    /// display. DeepSeek answers `true` once tools are offered.
+    pub fn replays_reasoning_across_turns(&self) -> bool {
+        self.llm.replays_reasoning_across_turns(&self.config.model)
+    }
+
     /// Lock and borrow the session.
     pub fn session(&self) -> std::sync::MutexGuard<'_, AgentSession> {
         self.session.lock().unwrap()

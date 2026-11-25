@@ -102,6 +102,10 @@ pub struct OpenAiVendor {
     fixed_reasoning_replay: bool,
     /// The reasoning dialect the endpoint has emitted, shared by clones.
     observed_reasoning_replay: Arc<AtomicU8>,
+    /// Whether a strict Responses endpoint replays history reasoning as plain
+    /// `reasoning_text` items. DeepSeek needs this and returns no encrypted
+    /// state to carry instead.
+    replay_text_reasoning: bool,
 }
 
 impl Clone for OpenAiVendor {
@@ -116,6 +120,7 @@ impl Clone for OpenAiVendor {
             reasoning_off: self.reasoning_off,
             fixed_reasoning_replay: self.fixed_reasoning_replay,
             observed_reasoning_replay: Arc::clone(&self.observed_reasoning_replay),
+            replay_text_reasoning: self.replay_text_reasoning,
         }
     }
 }
@@ -324,6 +329,7 @@ impl OpenAiVendor {
     /// Create a vendor with an explicit endpoint, model, and key.
     pub fn new(endpoint: String, model: String, api_key: String) -> Self {
         let client = Arc::new(crate::llm::vendor::build_http_client());
+        let replay_text_by_endpoint = endpoint.contains("api.deepseek.com");
 
         Self {
             client,
@@ -332,14 +338,18 @@ impl OpenAiVendor {
             api_key: Arc::new(api_key),
             parallel_tool_calls: true,
             // Every OpenAI-compatible chat endpoint treats reasoning as
-            // turn-local: the engine clears earlier turns, and a vendor that
-            // never emits a reasoning field never sees this one on the wire.
-            // A provider with a stricter schema opts out explicitly with
-            // `with_reasoning_replay(ReasoningReplay::None)`.
+            // turn-local by default: the engine clears earlier turns, and a
+            // vendor that never emits a reasoning field never sees this one on
+            // the wire. A provider that needs the blocks back across turns
+            // reports it through `replays_reasoning_across_turns`; one with a
+            // stricter schema opts out with `ReasoningReplay::None`.
             reasoning_replay: ReasoningReplay::Content,
             reasoning_off: ReasoningOff::None,
             fixed_reasoning_replay: false,
             observed_reasoning_replay: Arc::new(AtomicU8::new(OBSERVED_CONTENT)),
+            // A generic client pointed straight at DeepSeek is the same strict
+            // endpoint the named vendor is, so it needs the same pass-back.
+            replay_text_reasoning: replay_text_by_endpoint,
         }
     }
 
@@ -348,17 +358,21 @@ impl OpenAiVendor {
     /// The chat wire has no standalone reasoning message, so the text and the
     /// tool call of one model response become one assistant row and carry the
     /// reasoning field the vendor understands. Only the current turn reaches
-    /// this path: the engine clears earlier turns before the request.
+    /// this path unless the provider requires pass-back (DeepSeek), in which
+    /// case the engine keeps earlier turns and the seed supplies their text.
     fn flush_chat_assistant(
         messages: &mut Vec<OpenAiMessageJson>,
         pending_text: &mut Option<String>,
         pending_reasoning: &mut Option<(String, Option<ReasoningState>)>,
         tool_calls: Option<Vec<ToolCallJson>>,
         replay: ReasoningReplay,
+        after_tool: bool,
+        fill_missing: bool,
     ) {
         if pending_text.is_none() && pending_reasoning.is_none() && tool_calls.is_none() {
             return;
         }
+        let needs_reasoning = tool_calls.is_some() || after_tool;
         // An assistant row replayed for a reasoning-only step still needs a
         // content value some gateways accept; an empty string is safer than a
         // null when there is no tool call to carry the message.
@@ -384,6 +398,17 @@ impl OpenAiVendor {
                     }
                 }
             }
+        }
+        // DeepSeek refuses a chat request when a tool-making assistant message,
+        // or one that follows a tool result, carries no `reasoning_content`.
+        // A space is the placeholder its own gateway fix landed on; a real
+        // block from the turn always wins.
+        if fill_missing
+            && replay == ReasoningReplay::Content
+            && needs_reasoning
+            && message.reasoning_content.is_none()
+        {
+            message.reasoning_content = Some(" ".to_string());
         }
         messages.push(message);
     }
@@ -426,9 +451,22 @@ impl OpenAiVendor {
         self
     }
 
+    /// Replay history reasoning as plain `reasoning_text` input items.
+    ///
+    /// This is for a strict Responses endpoint that requires the chain of
+    /// thought back but returns no encrypted reasoning state (DeepSeek). An
+    /// endpoint that implements `encrypted_content` keeps replaying the item
+    /// verbatim instead.
+    #[must_use]
+    pub fn with_replay_text_reasoning(mut self, replay: bool) -> Self {
+        self.replay_text_reasoning = replay;
+        self
+    }
+
     /// Choose how this vendor replays reasoning inside the turn that produced
-    /// it. Cross-turn replay is never allowed; the engine clears reasoning at
-    /// the start of every turn.
+    /// it. Cross-turn replay is a separate provider fact: the engine clears
+    /// reasoning at the start of every turn unless
+    /// [`LlmClient::replays_reasoning_across_turns`] says otherwise.
     ///
     /// The matching provider off switch follows the replay dialect: DeepSeek's
     /// `reasoning_content` comes with `thinking`, OpenRouter's structured
@@ -522,6 +560,9 @@ impl OpenAiVendor {
         let replay_chat = self.chat_reasoning_replay();
         let mut pending_text: Option<String> = None;
         let mut pending_reasoning: Option<(String, Option<ReasoningState>)> = None;
+        // Whether the last non-assistant row was a tool result: a reply that
+        // follows one needs its `reasoning_content` even without a call.
+        let mut after_tool = false;
         {
             for message in &history {
                 // A non-assistant turn closes the assistant row collected from
@@ -539,6 +580,8 @@ impl OpenAiVendor {
                         &mut pending_reasoning,
                         None,
                         replay_chat,
+                        after_tool,
+                        self.replay_text_reasoning,
                     );
                 }
                 let json_msg = match message {
@@ -584,15 +627,18 @@ impl OpenAiVendor {
                             }
                         }
                     }
-                    crate::llm::LlmMessage::User { content } => OpenAiMessageJson {
-                        role: "user",
-                        content: Some(serialize_content(content)),
-                        ..Default::default()
-                    },
-                    // Reasoning is turn-local. Only a vendor whose wire has a
-                    // field for it (DeepSeek, OpenRouter) receives it, and it
-                    // is attached to the assistant row that follows rather than
-                    // sent as its own message.
+                    crate::llm::LlmMessage::User { content } => {
+                        after_tool = false;
+                        OpenAiMessageJson {
+                            role: "user",
+                            content: Some(serialize_content(content)),
+                            ..Default::default()
+                        }
+                    }
+                    // Reasoning is turn-local by default. Only a vendor whose
+                    // wire has a field for it (DeepSeek, OpenRouter) receives
+                    // it, and it is attached to the assistant row that follows
+                    // rather than sent as its own message.
                     crate::llm::LlmMessage::AssistantReasoning {
                         content,
                         provider_state,
@@ -639,6 +685,8 @@ impl OpenAiVendor {
                                 &mut pending_reasoning,
                                 Some(vec![call]),
                                 replay_chat,
+                                after_tool,
+                                self.replay_text_reasoning,
                             );
                             continue;
                         }
@@ -652,12 +700,15 @@ impl OpenAiVendor {
                     crate::llm::LlmMessage::ToolResult {
                         tool_call_id,
                         content,
-                    } => OpenAiMessageJson {
-                        role: "tool",
-                        content: Some(serde_json::Value::String(content.clone())),
-                        tool_call_id: Some(tool_call_id.clone()),
-                        ..Default::default()
-                    },
+                    } => {
+                        after_tool = true;
+                        OpenAiMessageJson {
+                            role: "tool",
+                            content: Some(serde_json::Value::String(content.clone())),
+                            tool_call_id: Some(tool_call_id.clone()),
+                            ..Default::default()
+                        }
+                    }
                 };
                 messages.push(json_msg);
             }
@@ -668,6 +719,8 @@ impl OpenAiVendor {
                     &mut pending_reasoning,
                     None,
                     replay_chat,
+                    after_tool,
+                    self.replay_text_reasoning,
                 );
             }
         }
@@ -939,6 +992,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 self.endpoint.clone(),
             )
             .with_parallel_tool_calls(self.parallel_tool_calls)
+            .with_replay_text_reasoning(self.replay_text_reasoning)
             .complete(persona, request, session, context)
             .await;
         }
@@ -1082,6 +1136,7 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
                 self.endpoint.clone(),
             )
             .with_parallel_tool_calls(self.parallel_tool_calls)
+            .with_replay_text_reasoning(self.replay_text_reasoning)
             .stream_complete(persona, request, session, context)
             .await;
         }
@@ -1451,6 +1506,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
     fn provider_name(&self) -> &'static str {
         "openai"
     }
+    fn replays_reasoning_across_turns(&self, _model: &str) -> bool {
+        self.replay_text_reasoning
+    }
 }
 /// Builder for [`OpenAiVendor`].
 pub struct OpenAiVendorBuilder {
@@ -1531,7 +1589,9 @@ impl OpenAiClient {
     ///
     /// The default is `ReasoningReplay::Content`; a custom gateway whose schema
     /// rejects `reasoning_content` opts out with `ReasoningReplay::None`.
-    /// Cross-turn replay is never allowed: the engine clears earlier turns.
+    /// Cross-turn replay is a separate provider fact: the engine clears earlier
+    /// turns unless [`LlmClient::replays_reasoning_across_turns`] says
+    /// otherwise.
     #[must_use]
     pub fn with_reasoning_replay(mut self, replay: ReasoningReplay) -> Self {
         self.inner = self.inner.with_reasoning_replay(replay);
@@ -1580,6 +1640,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
     }
     fn provider_name(&self) -> &'static str {
         "openai"
+    }
+    fn replays_reasoning_across_turns(&self, model: &str) -> bool {
+        LlmClient::<S, C>::replays_reasoning_across_turns(&self.inner, model)
     }
 }
 

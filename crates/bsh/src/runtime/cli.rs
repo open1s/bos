@@ -52,8 +52,10 @@ same local IPC endpoint and stops it again on quit, so `bsh tui` needs no second
 command to be a complete runtime.
 
 The interface shows sessions, runs turns and answers approvals on the Host the
-bsh window is configured for: the same `settings.toml`, the same vault entry and
-the same open workspace, so a terminal turn and a window turn send one request.
+bsh window is configured for: the same `settings.toml` and the same vault entry,
+so a terminal turn and a window turn send one request. The workspace is the
+folder `bsh tui` was started in - the project this terminal is open on - and
+--workspace names another one.
 
 options:
   --data-dir <dir>   durable state directory (default <bsh data dir>/runtime)
@@ -342,12 +344,31 @@ fn tui_config(options: &TuiOptions) -> RuntimeConfig {
             RuntimeConfig::with_data_dir(&options.data_dir)
         }
     };
-    apply_shell_settings(&mut config, &shell_settings(options.workspace.as_deref()));
-    if let Some(workspace) = &options.workspace {
-        config.workspace_root = workspace.clone();
+    // The terminal runs where it was started: the folder `bsh tui` is invoked
+    // from is the project, so its sessions, its `@` list, its shell and its own
+    // `.bsh` document are that folder's - the way opening it in the window
+    // makes it the workspace. `--workspace` still names the folder outright, and
+    // only a shell with no readable cwd falls back to the one the desktop last
+    // had open.
+    let root = terminal_workspace(options.workspace.clone(), std::env::current_dir().ok());
+    apply_shell_settings(&mut config, &shell_settings(root.as_deref()));
+    if let Some(root) = root {
+        config.workspace_root = root;
     }
     config.echo = options.echo;
     config
+}
+
+/// The folder a terminal Host serves.
+///
+/// An explicit `--workspace` is the reader naming the folder, so it wins. A
+/// terminal started without one serves the directory it was started in: a
+/// shell in a checkout is the same statement the window's picker makes, and a
+/// Host that served some other folder would run every turn somewhere the
+/// reader is not looking. `None` leaves the decision to the shell's settings,
+/// which is the only remaining source when the cwd cannot be read.
+fn terminal_workspace(explicit: Option<PathBuf>, cwd: Option<PathBuf>) -> Option<PathBuf> {
+    explicit.or(cwd).filter(|root| !root.as_os_str().is_empty())
 }
 
 /// The shell's own configuration, read where `bsh` reads it.
@@ -497,8 +518,33 @@ mod tests {
         // but the Host is still configured, exactly as the window would be.
         assert!(config.provider.api_key.is_empty());
         assert_eq!(config.provider.system_prompt, "be terse");
-        // The workspace is the one bsh has open, not the terminal's own cwd.
+        // For `bsh host` the workspace is the one bsh has open: a detached
+        // authority serves the desktop's project until a client names another.
         assert_eq!(config.workspace_root, root);
+    }
+
+    /// `bsh tui` serves the folder it was started in, so a terminal opened in a
+    /// checkout runs its turns there instead of in whatever workspace the
+    /// window last had open. `--workspace` still names a folder outright, and a
+    /// shell whose cwd cannot be read keeps the configured one.
+    #[test]
+    fn the_terminal_serves_the_folder_it_was_started_in() {
+        let here = scratch("terminal-cwd");
+        let named = scratch("terminal-named");
+        assert_eq!(terminal_workspace(None, Some(here.clone())), Some(here));
+        // An explicit flag outranks the directory, so a client can point at a
+        // project it is not standing in.
+        assert_eq!(
+            terminal_workspace(Some(named.clone()), Some(scratch("terminal-elsewhere"))),
+            Some(named)
+        );
+        // No readable directory is the one case that defers to the settings.
+        assert_eq!(terminal_workspace(None, None), None);
+        // An empty path is no path: it must not become the process root.
+        assert_eq!(
+            terminal_workspace(Some(PathBuf::new()), Some(PathBuf::new())),
+            None
+        );
     }
 
     /// A Host that has no shell configuration keeps `host.toml`: the settings

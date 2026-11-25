@@ -99,13 +99,16 @@ pub enum ResponsesInputItem {
     },
     /// A reasoning item returned by the model.
     ///
-    /// Only sent when the history carries the Responses provider state for it;
-    /// a reasoning message without that state is ordinary output and is not
-    /// replayed as input.
+    /// Sent from the Responses provider state a prior response carried, or
+    /// synthesized from plain history text for a strict endpoint such as
+    /// DeepSeek that requires the chain of thought back and has no encrypted
+    /// state to return. A strict item carries no `id`; the server merges its
+    /// `reasoning_text` parts into the adjacent assistant message.
     #[serde(rename = "reasoning")]
     Reasoning {
-        /// Provider reasoning item id.
-        id: String,
+        /// Provider reasoning item id, when the endpoint supplied one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         /// Opaque encrypted reasoning payload, when the provider returned one.
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
@@ -444,7 +447,15 @@ fn reasoning_state_from_item(item: &Value) -> Option<crate::llm::ReasoningState>
     }
     let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
     let encrypted = item.get("encrypted_content").and_then(Value::as_str);
-    if id.is_empty() && encrypted.is_none() {
+    // DeepSeek returns a plain `reasoning_text` part list and no encrypted
+    // state; the parts are the replayable payload, so an item without an id is
+    // still worth keeping for this turn's next step.
+    let has_text = ["content", "summary"].iter().any(|field| {
+        item.get(*field)
+            .and_then(Value::as_array)
+            .is_some_and(|parts| !parts.is_empty())
+    });
+    if id.is_empty() && encrypted.is_none() && !has_text {
         return None;
     }
     // Preserve the whole item: id, encrypted_content, content, summary and
@@ -456,7 +467,111 @@ fn reasoning_state_from_item(item: &Value) -> Option<crate::llm::ReasoningState>
     ))
 }
 
-fn build_input(history: Option<&[LlmMessage]>, input: &Content) -> Vec<ResponsesInputItem> {
+/// What one Responses input item is to a step of the model's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepKind {
+    /// A reasoning item.
+    Reasoning,
+    /// Something the model said.
+    Said,
+    /// A function call the model made.
+    Call,
+    /// The result of a call.
+    Output,
+    /// A user/system turn, which starts a new step.
+    Turn,
+}
+
+fn step_kind(item: &ResponsesInputItem) -> StepKind {
+    match item {
+        ResponsesInputItem::Reasoning { .. } => StepKind::Reasoning,
+        ResponsesInputItem::FunctionCall { .. } => StepKind::Call,
+        ResponsesInputItem::FunctionCallOutput { .. } => StepKind::Output,
+        ResponsesInputItem::Message { role, .. } if role == "assistant" => StepKind::Said,
+        ResponsesInputItem::Message { .. } => StepKind::Turn,
+    }
+}
+
+fn no_reasoning_item() -> ResponsesInputItem {
+    ResponsesInputItem::Reasoning {
+        id: None,
+        encrypted_content: None,
+        content: Some(vec![serde_json::json!({
+            "type": "reasoning_text",
+            "text": " ",
+        })]),
+        // The shape the service's own clients send for a placeholder: an
+        // explicit empty summary beside the text.
+        summary: Some(Vec::new()),
+        signature: None,
+    }
+}
+
+/// Make every step that needs one lead with a reasoning item.
+///
+/// DeepSeek reads one step (a run of the model's reasoning, what it said and
+/// the calls it made, between the user's last message or a tool output and the
+/// next) as one assistant message whose thinking is the item the step starts
+/// with. It refuses the whole request when such a step starts with a call, or
+/// starts with anything after a tool output: `[message, reasoning, call]` and
+/// `[output, message]` are both rejected, `[reasoning, message, call]` and
+/// `[output, reasoning, message]` are accepted. The step's own first reasoning
+/// item moves ahead of the rest; a step with none gets a space, which is the
+/// one placeholder the service accepts.
+fn lead_steps_with_reasoning(items: Vec<ResponsesInputItem>) -> Vec<ResponsesInputItem> {
+    let kinds: Vec<StepKind> = items.iter().map(step_kind).collect();
+    let mut slots: Vec<Option<ResponsesInputItem>> = items.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(slots.len() + 1);
+    let mut after_output = false;
+    let mut index = 0;
+    while index < slots.len() {
+        let kind = kinds[index];
+        if matches!(kind, StepKind::Output | StepKind::Turn) {
+            after_output = kind == StepKind::Output;
+            out.push(slots[index].take().expect("one item per slot"));
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut calls = false;
+        let mut first_reasoning = None;
+        let mut end = index;
+        while end < slots.len()
+            && matches!(
+                kinds[end],
+                StepKind::Reasoning | StepKind::Said | StepKind::Call
+            )
+        {
+            if kinds[end] == StepKind::Call {
+                calls = true;
+            }
+            if kinds[end] == StepKind::Reasoning && first_reasoning.is_none() {
+                first_reasoning = Some(end);
+            }
+            end += 1;
+        }
+        if (calls || after_output) && first_reasoning != Some(start) {
+            out.push(
+                first_reasoning
+                    .and_then(|lead| slots[lead].take())
+                    .unwrap_or_else(no_reasoning_item),
+            );
+        }
+        for slot in slots.iter_mut().take(end).skip(start) {
+            if let Some(item) = slot.take() {
+                out.push(item);
+            }
+        }
+        index = end;
+    }
+    out
+}
+
+fn build_input(
+    history: Option<&[LlmMessage]>,
+    input: &Content,
+    replay_text_reasoning: bool,
+) -> Vec<ResponsesInputItem> {
     let mut items = Vec::new();
     if let Some(history) = history {
         for message in history {
@@ -485,22 +600,40 @@ fn build_input(history: Option<&[LlmMessage]>, input: &Content) -> Vec<Responses
                     });
                 }
                 LlmMessage::AssistantReasoning {
+                    content: text,
                     provider_state: Some(state),
-                    ..
                 } if state.provider == "openai-responses" => {
                     let payload = &state.payload;
-                    if let Some(id) = payload
+                    let id = payload
                         .get("id")
                         .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
+                        .filter(|id| !id.is_empty());
+                    let mut content = payload.get("content").and_then(Value::as_array).cloned();
+                    // DeepSeek's item can arrive without an id while still
+                    // carrying the `reasoning_text` parts the next request must
+                    // echo; an OpenAI item always has one. When the item kept
+                    // the id but not the parts, the block's own text is the same
+                    // chain of thought and is the only thing left to replay.
+                    if replay_text_reasoning
+                        && !content.as_ref().is_some_and(|parts| !parts.is_empty())
                     {
+                        // An item that kept only its id or encrypted state still
+                        // needs a non-empty `reasoning_text`; the block's own
+                        // text is best, a space is the accepted placeholder.
+                        content = Some(vec![serde_json::json!({
+                            "type": "reasoning_text",
+                            "text": if text.trim().is_empty() { " " } else { text.as_str() },
+                        })]);
+                    }
+                    let has_content = content.as_ref().is_some_and(|parts| !parts.is_empty());
+                    if id.is_some() || has_content {
                         items.push(ResponsesInputItem::Reasoning {
-                            id: id.to_string(),
+                            id: id.map(str::to_string),
                             encrypted_content: payload
                                 .get("encrypted_content")
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
-                            content: payload.get("content").and_then(Value::as_array).cloned(),
+                            content,
                             summary: payload.get("summary").and_then(Value::as_array).cloned(),
                             signature: payload
                                 .get("signature")
@@ -509,8 +642,28 @@ fn build_input(history: Option<&[LlmMessage]>, input: &Content) -> Vec<Responses
                         });
                     }
                 }
+                // A DeepSeek host reseeds history from its transcript and has
+                // only the visible text, not the provider item. A request that
+                // carries tools is rejected when that text is omitted, so a
+                // strict endpoint gets it back as a `reasoning_text` item.
+                LlmMessage::AssistantReasoning {
+                    content,
+                    provider_state: None,
+                } if replay_text_reasoning && !content.trim().is_empty() => {
+                    items.push(ResponsesInputItem::Reasoning {
+                        id: None,
+                        encrypted_content: None,
+                        content: Some(vec![serde_json::json!({
+                            "type": "reasoning_text",
+                            "text": content,
+                        })]),
+                        summary: None,
+                        signature: None,
+                    });
+                }
                 // The visible reasoning text alone is not valid Responses
-                // input; without provider state it stays history-only.
+                // input for a state-carrying provider; without the state this
+                // turn produced it stays history-only.
                 LlmMessage::AssistantReasoning { .. } => {}
                 LlmMessage::AssistantToolCall {
                     tool_call_id,
@@ -539,7 +692,11 @@ fn build_input(history: Option<&[LlmMessage]>, input: &Content) -> Vec<Responses
             content: serialize_input_content(input),
         });
     }
-    items
+    if replay_text_reasoning {
+        lead_steps_with_reasoning(items)
+    } else {
+        items
+    }
 }
 
 fn serialize_tools(tools: Option<&[LlmTool]>) -> Option<Vec<Value>> {
@@ -632,7 +789,21 @@ fn build_instructions(
     }
 }
 
+/// How a Responses request replays reasoning.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResponsesReplay {
+    /// The endpoint implements OpenAI's summary / encrypted-item extensions.
+    pub allow_reasoning_state: bool,
+    /// Synthesize plain `reasoning_text` items from history text for a strict
+    /// endpoint that requires the chain of thought back.
+    pub replay_text_reasoning: bool,
+}
+
 /// Build a [`ResponsesRequest`] from a generic request and history.
+///
+/// This is the public default: history reasoning is replayed only through the
+/// provider state the endpoint returned. A strict endpoint that needs plain
+/// text back uses [`build_request_with_replay`].
 pub fn build_request(
     persona: Option<String>,
     req: &LlmRequest,
@@ -642,6 +813,32 @@ pub fn build_request(
     parallel_tool_calls: bool,
     allow_reasoning_state: bool,
 ) -> ResponsesRequest {
+    build_request_with_replay(
+        persona,
+        req,
+        session,
+        context,
+        stream,
+        parallel_tool_calls,
+        ResponsesReplay {
+            allow_reasoning_state,
+            replay_text_reasoning: false,
+        },
+    )
+}
+
+/// Build a [`ResponsesRequest`] with an explicit reasoning replay policy.
+pub fn build_request_with_replay(
+    persona: Option<String>,
+    req: &LlmRequest,
+    session: &impl ReactSession,
+    context: &impl ReactContext,
+    stream: bool,
+    parallel_tool_calls: bool,
+    replay: ResponsesReplay,
+) -> ResponsesRequest {
+    let allow_reasoning_state = replay.allow_reasoning_state;
+    let replay_text_reasoning = replay.replay_text_reasoning;
     let tools = serialize_tools(
         req.provider_request
             .as_ref()
@@ -669,7 +866,11 @@ pub fn build_request(
             }
             (
                 (!instructions.is_empty()).then_some(instructions),
-                build_input(Some(&provider.wire_messages()), &provider.input),
+                build_input(
+                    Some(&provider.wire_messages()),
+                    &provider.input,
+                    replay_text_reasoning,
+                ),
             )
         }
         None => (
@@ -679,7 +880,7 @@ pub fn build_request(
                 session,
                 context,
             ),
-            build_input(session.history(), &req.input),
+            build_input(session.history(), &req.input, replay_text_reasoning),
         ),
     };
     ResponsesRequest {
@@ -1000,6 +1201,9 @@ pub struct ResponsesTransport {
     api_key: Arc<String>,
     endpoint: Arc<String>,
     parallel_tool_calls: bool,
+    /// Replay history reasoning as plain `reasoning_text` input items. Set for
+    /// a strict endpoint (DeepSeek) that requires the chain of thought back.
+    replay_text_reasoning: bool,
 }
 
 impl ResponsesTransport {
@@ -1010,6 +1214,7 @@ impl ResponsesTransport {
             api_key,
             endpoint,
             parallel_tool_calls: true,
+            replay_text_reasoning: false,
         }
     }
 
@@ -1027,6 +1232,12 @@ impl ResponsesTransport {
         self
     }
 
+    /// Replay history reasoning as plain `reasoning_text` input items.
+    pub fn with_replay_text_reasoning(mut self, replay: bool) -> Self {
+        self.replay_text_reasoning = replay;
+        self
+    }
+
     /// Run a non-streaming Responses call.
     pub async fn complete(
         &self,
@@ -1041,14 +1252,17 @@ impl ResponsesTransport {
             request.model = "gpt-4".to_string();
         }
 
-        let responses_req = build_request(
+        let responses_req = build_request_with_replay(
             persona,
             &request,
             session,
             context,
             false,
             self.parallel_tool_calls,
-            self.allows_reasoning_state(),
+            ResponsesReplay {
+                allow_reasoning_state: self.allows_reasoning_state(),
+                replay_text_reasoning: self.replay_text_reasoning,
+            },
         );
 
         let url = format!("{}/responses", self.endpoint);
@@ -1125,14 +1339,17 @@ impl ResponsesTransport {
             request.model = "gpt-4".to_string();
         }
 
-        let responses_req = build_request(
+        let responses_req = build_request_with_replay(
             persona,
             &request,
             session,
             context,
             true,
             self.parallel_tool_calls,
-            self.allows_reasoning_state(),
+            ResponsesReplay {
+                allow_reasoning_state: self.allows_reasoning_state(),
+                replay_text_reasoning: self.replay_text_reasoning,
+            },
         );
 
         let url = format!("{}/responses", self.endpoint);
@@ -1405,6 +1622,7 @@ mod tests {
         let items = build_input(
             Some(&[LlmMessage::developer("HARNESS RULE")]),
             &Content::text("question"),
+            false,
         );
         match &items[0] {
             ResponsesInputItem::Message { role, content } => {
@@ -1432,7 +1650,7 @@ mod tests {
             },
             LlmMessage::assistant("answer"),
         ];
-        let items = build_input(Some(&history), &Content::text("next"));
+        let items = build_input(Some(&history), &Content::text("next"), false);
         assert!(
             items.iter().any(|item| matches!(
                 item,
@@ -1440,7 +1658,7 @@ mod tests {
                     id,
                     encrypted_content: Some(content),
                     ..
-                } if id == "rs_1" && content == "opaque"
+                } if id.as_deref() == Some("rs_1") && content == "opaque"
             )),
             "the provider state replays: {items:?}"
         );
@@ -1449,12 +1667,48 @@ mod tests {
             content: "summary".to_string(),
             provider_state: None,
         }];
-        let items = build_input(Some(&unsigned), &Content::text("next"));
+        let items = build_input(Some(&unsigned), &Content::text("next"), false);
         assert!(
             !items
                 .iter()
                 .any(|item| matches!(item, ResponsesInputItem::Reasoning { .. })),
-            "visible reasoning alone is not a Responses input item"
+            "visible reasoning alone is not a Responses input item for a state-carrying provider"
+        );
+        let replayed = build_input(Some(&unsigned), &Content::text("next"), true);
+        assert!(
+            matches!(
+                replayed.first(),
+                Some(ResponsesInputItem::Reasoning {
+                    id: None,
+                    content: Some(parts),
+                    ..
+                }) if parts == &vec![serde_json::json!({"type": "reasoning_text", "text": "summary"})]
+            ),
+            "a strict endpoint gets the text back as a reasoning_text item: {replayed:?}"
+        );
+
+        // A DeepSeek item may keep its id but lose the `reasoning_text` parts
+        // on a non-streaming decode; the block's text is the same chain of
+        // thought, so the strict endpoint gets it back.
+        let id_only = vec![LlmMessage::AssistantReasoning {
+            content: "kept text".to_string(),
+            provider_state: Some(ReasoningState::new(
+                "openai-responses",
+                serde_json::json!({"id": "rs_2"}),
+            )),
+        }];
+        let replayed = build_input(Some(&id_only), &Content::text("next"), true);
+        assert!(
+            matches!(
+                replayed.first(),
+                Some(ResponsesInputItem::Reasoning {
+                    id: Some(id),
+                    content: Some(parts),
+                    ..
+                }) if id == "rs_2"
+                    && parts == &vec![serde_json::json!({"type": "reasoning_text", "text": "kept text"})]
+            ),
+            "the id survives and the missing parts are rebuilt from the block text: {replayed:?}"
         );
 
         let foreign = vec![LlmMessage::AssistantReasoning {
@@ -1464,12 +1718,80 @@ mod tests {
                 serde_json::json!({"type": "thinking", "signature": "sig"}),
             )),
         }];
-        let items = build_input(Some(&foreign), &Content::text("next"));
+        let items = build_input(Some(&foreign), &Content::text("next"), true);
         assert!(
             !items
                 .iter()
                 .any(|item| matches!(item, ResponsesInputItem::Reasoning { .. })),
             "another provider's state is not replayed"
+        );
+    }
+
+    /// DeepSeek reads a step as one assistant message whose thinking is its
+    /// first item. A call, or anything after a tool output, must therefore lead
+    /// with a reasoning item; the step's own one moves ahead, and a step with
+    /// none gets the single space the service accepts.
+    #[test]
+    fn strict_endpoints_lead_every_step_with_reasoning() {
+        use crate::llm::{Content, LlmMessage, ReasoningState};
+
+        let history = vec![
+            LlmMessage::user("go"),
+            LlmMessage::assistant("let me check"),
+            LlmMessage::AssistantReasoning {
+                content: "why".to_string(),
+                provider_state: Some(ReasoningState::new(
+                    "openai-responses",
+                    serde_json::json!({"id": "rs_1", "content": [{"type": "reasoning_text", "text": "why"}]}),
+                )),
+            },
+            LlmMessage::AssistantToolCall {
+                tool_call_id: "call_1".to_string(),
+                name: "probe".to_string(),
+                args: serde_json::json!({}),
+            },
+            LlmMessage::ToolResult {
+                tool_call_id: "call_1".to_string(),
+                content: "result".to_string(),
+            },
+            LlmMessage::AssistantToolCall {
+                tool_call_id: "call_2".to_string(),
+                name: "probe".to_string(),
+                args: serde_json::json!({}),
+            },
+        ];
+        let items = build_input(Some(&history), &Content::text("next"), true);
+        // The first step's reasoning moved ahead of the text it introduced.
+        assert!(
+            matches!(
+                items.as_slice(),
+                [
+                    ResponsesInputItem::Message { role: user, .. },
+                    ResponsesInputItem::Reasoning { .. },
+                    ResponsesInputItem::Message { role: assistant, .. },
+                    ResponsesInputItem::FunctionCall { .. },
+                    ResponsesInputItem::FunctionCallOutput { .. },
+                    ResponsesInputItem::Reasoning { content: Some(parts), .. },
+                    ResponsesInputItem::FunctionCall { .. },
+                ] if user == "user" && assistant == "assistant"
+                    && parts == &vec![serde_json::json!({"type": "reasoning_text", "text": " "})]
+            ),
+            "each step leads with reasoning and the second gets a placeholder: {items:?}"
+        );
+
+        // Without the strict flag the order is left alone.
+        let plain = build_input(Some(&history), &Content::text("next"), false);
+        assert!(
+            matches!(
+                plain.as_slice(),
+                [
+                    ResponsesInputItem::Message { .. },
+                    ResponsesInputItem::Message { .. },
+                    ResponsesInputItem::Reasoning { .. },
+                    ..
+                ]
+            ),
+            "a state-carrying endpoint keeps the emitted order: {plain:?}"
         );
     }
 
@@ -1490,7 +1812,7 @@ mod tests {
                 }),
             )),
         }];
-        let items = build_input(Some(&history), &Content::text("next"));
+        let items = build_input(Some(&history), &Content::text("next"), false);
         match &items[0] {
             ResponsesInputItem::Reasoning {
                 content: replayed_content,

@@ -6,12 +6,14 @@
 //! failed one or wake an executor - a client only describes what the Host
 //! already decided.
 
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use chrono::{DateTime, Utc};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::runtime::client::{ClientError, RuntimeClient, tui_info};
 use crate::runtime::contract::{
@@ -22,17 +24,19 @@ use crate::runtime::contract::{
     PERMISSION_MODES, PlanItemStatus, PlanItemView, QueryPayload, QueryResult, Response,
     ReviewChangeView, ReviewDiffView, ReviewReport, ServerFrame, SessionConfig,
     SessionConfigChange, SessionProjection, SessionSummary, SettingEdit, SettingsReport,
-    SettingsRowView, SettingsSectionView, SkillView, SubscriptionClosedReason, TaskAttemptView,
-    TaskBoardReport, TaskDetailReport, TaskRowView, ToolCallStatus, ToolCallView, TurnUsage,
-    WorkspaceChangeView, WorkspaceDiffView, WorkspaceEntryView, WorkspaceReport,
+    SettingsRowView, SettingsSectionView, SkillView, SubagentReport, SubagentRunView,
+    SubscriptionClosedReason, TaskAttemptView, TaskBoardReport, TaskDetailReport, TaskRowView,
+    ToolCallStatus, ToolCallView, TurnUsage, WorkspaceChangeView, WorkspaceDiffView,
+    WorkspaceEntryView, WorkspaceReport,
 };
 use crate::runtime::ids::{ExecutionId, SessionId};
 
 use super::export;
 use super::menu;
+use super::picker;
 use super::shell::{self, Shell};
 use super::skin::{self, Footer, Painter, Skin, Tone};
-use super::term::Key;
+use super::term::{self, Key};
 
 /// Lines one page key moves through the transcript. The client paints against
 /// the cells it is about to fill, so a page is a fixed step here rather than a
@@ -43,21 +47,152 @@ const PAGE: usize = 10;
 /// step - the reader is aiming at a line, not turning a page.
 const SCROLL: usize = 3;
 
+/// Painted frames between two re-reads of an open child-run roster.
+///
+/// A child's state changes inside the Host's process and no committed event
+/// carries it here, so the pane asks again; asking on every frame would spend a
+/// query per paint for a roster that moves on the scale of a turn.
+const SUBAGENT_POLL_EVERY: u32 = 15;
+
 /// The command reference `/help` shows in the status row.
 const COMMANDS: &str = "commands: /new [title] · /sessions [number|text] · \
-                        /model <provider> <model> · /model lists · /preset <id> · \
-                        /permission <mode> · /plan [on|off] · /goal <objective> · \
-                        /goal edit|pause|resume|clear · /compact · /rename <title> · \
+                        /sessions pin|unpin|archive|unarchive <number> · \
+                        /sessions archived · \
+                        /model [provider model] · /preset [id] · /permission [mode] · \
+                        (bare picks from a list) · /plan [on|off] · /goal <objective> · \
+                        /goal edit|pause|resume|clear · /compact · /fork · \
+                        /copy [number|id] · \
+                        /rename <title> · /editor · \
                         /export [path] · /queue [clear] · /feedback [note|clear] · \
                         /detail [number|close] · /mcp [server] · /skills [text] · \
                         /memory [text] · /files [path] · /diff [path] · /extensions [text] · \
                         /tasks [id|graph] · /settings [section] · /set [key] [value] · \
-                        /federation · /browser · /trajectory · /audit [filter] · \
-                        /review [change] · /questions · /trash [number] · \
-                        /restore <number> · /purge <number> · /usage · /terminal — /help";
+                        /federation · /browser · /subagents [n|all] · /trajectory · /audit [filter] · \
+                        /find <text> · /review [change] · /questions · /trash [number] · \
+                        /restore <number> · /purge <number> · /usage · /terminal · \
+                        /approve · /deny [reason] — /help";
 
 /// Wide layouts get a session sidebar; narrow ones show only the transcript.
 const SIDEBAR_MIN_WIDTH: u16 = 64;
+
+/// The rows above the body: the header line and the rule under it.
+///
+/// The rail's click hit test measures from here, so it is named once rather
+/// than counted at two call sites.
+const BODY_TOP: usize = 2;
+
+/// The session rail's width, when the frame is wide enough for two columns.
+///
+/// The frame paints the rail with this width and the pointer hit-tests
+/// against it, so a click can never name a column the rail does not own.
+fn rail_width(width: usize) -> Option<usize> {
+    (width >= usize::from(SIDEBAR_MIN_WIDTH)).then(|| (width / 4).clamp(18, 30))
+}
+
+/// The rail row a click at `(row, column)` names, as an offset into the list
+/// window the frame painted, or `None` when the click missed the rail.
+///
+/// The separator between the columns belongs to neither: it is the rule the
+/// transcript starts against, so a click on it is not a session.
+fn rail_offset(row: usize, column: usize, width: usize, body_rows: usize) -> Option<usize> {
+    let rail = rail_width(width)?;
+    if column >= rail || row < BODY_TOP || row >= BODY_TOP + body_rows {
+        return None;
+    }
+    Some(row - BODY_TOP)
+}
+
+/// The transcript column's width: the frame minus the rail and its separator.
+///
+/// The painter and the pointer both measure the column here, so a click can
+/// never name a row the transcript does not paint.
+fn transcript_width(width: usize) -> usize {
+    match rail_width(width) {
+        Some(left) => width.saturating_sub(left + 1),
+        None => width,
+    }
+}
+
+/// The transcript row a click at `(row, column)` names, as an offset into the
+/// document the frame painted, or `None` when the click missed the column.
+///
+/// The separator between the two columns belongs to neither, and the rows
+/// above the body are chrome: neither names a tool call. A frame with no width
+/// has painted no column at all, so nothing there is a row either.
+fn transcript_offset(row: usize, column: usize, width: usize, body_rows: usize) -> Option<usize> {
+    if row < BODY_TOP || row >= BODY_TOP + body_rows {
+        return None;
+    }
+    let left = match rail_width(width) {
+        Some(rail) => rail + 1,
+        None => 0,
+    };
+    // The column has to fall inside the transcript's own cells: left of it is
+    // the rail or its separator, and past it is a column the frame never
+    // painted.
+    if column < left || column >= left + transcript_width(width) {
+        return None;
+    }
+    Some(row - BODY_TOP)
+}
+
+/// One block of transcript rows, each naming the tool call it draws.
+fn targets(rows: Vec<String>, call: Option<usize>) -> Vec<(String, Option<usize>)> {
+    rows.into_iter().map(|row| (row, call)).collect()
+}
+
+/// The choice row a click on screen row `row` names, or `None` when the click
+/// missed every choice.
+///
+/// A list is painted from `top` down: first `header` rows that belong to the
+/// list but name nothing (the choice list's title and key line), then the rows
+/// in `start..start + visible`. The pointer's row is the slot it stands in, so a
+/// click on a header row, or past the last row the list drew, names no choice -
+/// which is why a filter that hides rows can never make a click pick a row that
+/// is not drawn.
+fn list_offset(
+    row: usize,
+    top: usize,
+    header: usize,
+    start: usize,
+    visible: usize,
+    shown: usize,
+) -> Option<usize> {
+    let slot = row.checked_sub(top)?.checked_sub(header)?;
+    if slot >= visible {
+        return None;
+    }
+    let index = start + slot;
+    (index < shown).then_some(index)
+}
+
+/// The rows of a transcript a body `rows` tall shows, and the tool call each
+/// shown row names.
+///
+/// The document is bottom-aligned: its newest row sits directly above the
+/// input row, and `scroll` lifts older rows into view. The hits are cut with
+/// the same window, so a click opens the call the frame painted there rather
+/// than the call at that index before the scroll.
+fn window_bounds(total: usize, rows: usize, scroll: usize) -> (usize, usize) {
+    let end = total.saturating_sub(scroll.min(total));
+    (end.saturating_sub(rows), end)
+}
+
+fn window_rows(
+    lines: &[(String, Option<usize>)],
+    rows: usize,
+    scroll: usize,
+) -> (Vec<String>, Vec<Option<usize>>) {
+    let (start, end) = window_bounds(lines.len(), rows, scroll);
+    let fill = rows.saturating_sub(end - start);
+    let mut texts = vec![String::new(); fill];
+    let mut hits = vec![None; fill];
+    for (text, call) in &lines[start..end] {
+        texts.push(text.clone());
+        hits.push(*call);
+    }
+    (texts, hits)
+}
 
 /// A styled frame: the lines a pane draws, and the cursor cell to place when the
 /// pane has one.
@@ -135,6 +270,11 @@ pub(crate) struct App {
     /// state because a bin is a document the reader opens: the Host owns the
     /// records, this holds only the snapshot of them that is on screen.
     trash: Vec<SessionSummary>,
+    /// The workspace's Archived filter: the rows the last `/sessions archived`
+    /// listed, in the order `/sessions unarchive` addresses. Like the bin it
+    /// is a document the reader opens, so this holds only the snapshot that is
+    /// on screen while the Host owns the records.
+    archived: Vec<SessionSummary>,
     selected: usize,
     session: Option<SessionProjection>,
     /// Models and presets the Host offers; the terminal's form of the desktop
@@ -146,6 +286,13 @@ pub(crate) struct App {
     /// resolved once when the client attaches so every frame draws the same
     /// vocabulary.
     skin: Skin,
+    /// The size of the frame last painted.
+    ///
+    /// A click arrives in screen cells, and only the layout that painted those
+    /// cells knows which row is which session. Recording the size here lets the
+    /// pointer use the same arithmetic as the frame rather than a guess at the
+    /// terminal's dimensions.
+    frame: Cell<(usize, usize)>,
     input: String,
     /// Lines this client submitted, recalled with Up/Down the way a shell
     /// recalls them.
@@ -197,6 +344,11 @@ pub(crate) struct App {
     /// can read. Read from the Host on open, because the turn running beside
     /// this client may visit a page at any moment.
     browser: Option<BrowserPane>,
+    /// The conversation's delegated child runs, when the reader asked for
+    /// them: the desktop's task-graph children and header list. Read from the
+    /// Host on open and re-read while a child still runs, because a run
+    /// finishes without any event this client subscribed to.
+    subagents: Option<SubagentsPane>,
     /// The open session's trajectory, when the reader asked for it: every turn
     /// the Host ran with the messages and calls it produced. Derived from the
     /// projection, so opening it sends no request.
@@ -205,6 +357,13 @@ pub(crate) struct App {
     /// terminal has no Ghostty surface to draw into, so this pane owns the pty
     /// and paints its grid into the frame; `None` is the ordinary view.
     shell: Option<Shell>,
+    /// The prompt waiting for the reader's own editor, when `/editor` or `^X`
+    /// asked for it.
+    ///
+    /// The event loop owns the terminal, so the app cannot open an editor
+    /// itself: it leaves the text here, the loop hands the screen over, and the
+    /// answer comes back through [`App::after_edit`].
+    edit_request: Option<String>,
     /// What the Host's settings resolve to, when the reader asked to read them.
     /// The desktop's settings dialog is the editor; this pane is its read side,
     /// as a terminal can show it, so a reader can see what a turn runs with.
@@ -221,6 +380,39 @@ pub(crate) struct App {
     workspace: Option<PathBuf>,
     /// The `/` and `@` completion list.
     menu: menu::Menu,
+    /// The list a choice-taking command opened: `/model`, `/preset` and
+    /// `/permission` answer a reader who typed only the command with the
+    /// desktop's own picker, instead of a row of names to retype from.
+    picker: Option<picker::Picker>,
+    /// The screen row the open choice list's title was painted on.
+    ///
+    /// A click names a screen row, and only the frame that painted the list
+    /// knows which of its rows that is, so the frame records the block's top
+    /// here the same way it records its size in `frame`.
+    picker_at: Cell<Option<usize>>,
+    /// The screen row the open completion popup's first row was painted on.
+    ///
+    /// The popup has no title: its rows are candidates, so the frame records
+    /// the row its first candidate stood on and a click reads it back.
+    menu_at: Cell<Option<usize>>,
+    /// The document row the body's first painted row stands for, while the
+    /// body is the timeline.
+    ///
+    /// A `/find` hit is a document row, and the frame paints a window of the
+    /// document, so the offset between the two is the only way the frame can
+    /// reverse the row the reader picked. A pane scrolls its own way, so it
+    /// records nothing here and the highlight simply is not painted.
+    body_start: Cell<Option<usize>>,
+    /// The document row a `/find` revealed, reversed for as long as it is on
+    /// screen. Cleared when the conversation it numbered is replaced.
+    focus: Option<usize>,
+    /// The rows the last painted frame drew in the transcript column.
+    ///
+    /// `/find` searches exactly what the reader can see: the wrapping, the
+    /// tones and the call each row names are the frame's, so a hit is a row of
+    /// the screen and not a row of some other layout. A pane paints itself
+    /// instead, so this is empty while one is open and no row is named.
+    document: RefCell<Vec<(String, Option<usize>)>>,
     /// Turns typed while the open session was running, waiting their turn.
     queue: DraftQueue,
     /// The ask_user card, when a turn asked questions this client has not
@@ -533,6 +725,36 @@ struct FederationPane {
     scroll: usize,
 }
 
+/// The conversation's delegated child runs: the desktop's task-graph children.
+///
+/// The desktop draws these as nodes under the conversation in its Tasks graph
+/// and as rows in the header, from the in-process registry the `subagent` tool
+/// writes. A client that attached to the Host cannot see that registry, so the
+/// Host answers for it and this pane draws the same rows: the title the model
+/// gave the child, its state, its depth, its token use and its answer. A run
+/// outlives the turn that started it, so the pane is read from the Host rather
+/// than counted from the transcript, and re-read while a child still works.
+struct SubagentsPane {
+    /// What the Host answered: the runs, or the state that explains none.
+    report: SubagentReport,
+    /// The highlighted row, clamped where it is read so a roster that shrinks
+    /// under a live run cannot point past its last row.
+    selection: usize,
+    /// The run the reader opened, as an index into `report.runs`: its prompt
+    /// and its answer, which a terminal has no hover card to show.
+    open: Option<usize>,
+    /// Rows scrolled down from the pane's first body row.
+    scroll: usize,
+    /// Paints since the last re-read. A child's state changes without a Host
+    /// event this client subscribed to, so a live pane asks again on a slow
+    /// tick instead of on every frame or never.
+    ticks: u32,
+    /// The conversation whose lineage this roster was read for: `None` is the
+    /// Host's whole roster, which is what `/subagents all` asks for. Kept so a
+    /// re-read asks the same question the pane was opened with.
+    scope: Option<SessionId>,
+}
+
 /// The terminal's Browser pane: the desktop's Browser tab.
 ///
 /// The desktop pane is a text view of the page the agent's browser tools read:
@@ -587,12 +809,14 @@ impl App {
             frames,
             sessions: Vec::new(),
             trash: Vec::new(),
+            archived: Vec::new(),
             selected: 0,
             session: None,
             catalogue: CatalogueView::default(),
             host: None,
             status: None,
             skin: Skin::detect(),
+            frame: Cell::new((0, 0)),
             input: String::new(),
             history: PromptHistory::default(),
             cursor: 0,
@@ -608,14 +832,22 @@ impl App {
             extensions: None,
             federation: None,
             browser: None,
+            subagents: None,
             trajectory: None,
             shell: None,
+            edit_request: None,
             settings: None,
             applied: 0,
             subscription: None,
             live: None,
             workspace,
             menu: menu::Menu::default(),
+            picker: None,
+            picker_at: Cell::new(None),
+            menu_at: Cell::new(None),
+            body_start: Cell::new(None),
+            focus: None,
+            document: RefCell::new(Vec::new()),
             queue: DraftQueue::default(),
             question: None,
             question_dismissed: None,
@@ -633,6 +865,12 @@ impl App {
         };
         app.applied = snapshot.head;
         app.catalogue = app.client.catalogue()?;
+        // The Host names the folder it serves. In the common case that is the
+        // directory this terminal was launched in; when the client attached to
+        // a Host another process started, the Host's answer is the one that
+        // decides where turns run, so `@`, the shell and every workspace read
+        // follow it instead of pointing at a tree no turn can reach.
+        app.workspace = host_workspace(&app.catalogue.workspace_root, app.workspace.take());
         app.refresh()?;
         app.subscribe()?;
         if let Some(session_id) = open {
@@ -653,6 +891,45 @@ impl App {
     /// Whether the user asked to leave the interface.
     pub(crate) fn is_quitting(&self) -> bool {
         self.quit
+    }
+
+    /// The prompt waiting for the reader's editor, when a command asked for
+    /// one.
+    ///
+    /// The event loop polls this after every key instead of the app opening the
+    /// editor itself: an editor needs the terminal, and the terminal is the
+    /// loop's to give away.
+    pub(crate) fn take_edit_request(&mut self) -> Option<String> {
+        self.edit_request.take()
+    }
+
+    /// Take back what the reader's editor left in its buffer.
+    ///
+    /// `Ok(Some(text))` is the buffer they wrote, and it replaces the prompt
+    /// whether they added a line or cut the whole draft. `Ok(None)` is a
+    /// cancelled edit - an editor that exited in failure, which is what `:cq`
+    /// and a closed window both do - so the prompt stays word for word as it
+    /// was. `Err` is an editor that never ran: the reader has to be told,
+    /// because an editor that fails to start looks exactly like one that
+    /// opened and saved nothing.
+    pub(crate) fn after_edit(&mut self, outcome: Result<Option<String>, String>) {
+        match outcome {
+            Ok(Some(text)) => {
+                let lines = text.lines().count();
+                self.input = text;
+                self.cursor = self.input.len();
+                self.sync_menu();
+                self.set_status(
+                    Level::Info,
+                    format!("the editor left {lines} line(s) in the prompt"),
+                );
+            }
+            Ok(None) => self.set_status(Level::Info, "the editor closed; the prompt is unchanged"),
+            Err(error) => self.set_status(
+                Level::Error,
+                format!("the editor could not run: {error} — set $VISUAL or $EDITOR"),
+            ),
+        }
     }
 
     /// Apply every event the Host has pushed since the last call.
@@ -757,6 +1034,19 @@ impl App {
             }
             Some(SubscriptionClosedReason::ClientUnsubscribed) | None => {}
         }
+        // An open roster follows its runs while the reader watches: a child
+        // that finishes shows the answer it produced without the pane being
+        // re-opened, and a dropped re-read keeps the rows already on screen.
+        if let Some(pane) = self.subagents.as_mut() {
+            pane.ticks = pane.ticks.wrapping_add(1);
+        }
+        if self
+            .subagents
+            .as_ref()
+            .is_some_and(|pane| pane.ticks.is_multiple_of(SUBAGENT_POLL_EVERY))
+        {
+            self.poll_subagents();
+        }
         Ok(())
     }
 
@@ -771,11 +1061,20 @@ impl App {
                 self.close_terminal();
                 return;
             }
-            if let Some(bytes) = shell::encode(key)
+            if let Some(bytes) = shell::encode(&key)
                 && let Some(shell) = self.shell.as_mut()
             {
                 shell.write(&bytes);
             }
+            return;
+        }
+        // A choice list is modal: while it is up it owns every printable key as
+        // filter text and the arrows as its highlight, because a reader
+        // narrowing a list of models is not typing a turn. The chords it does
+        // not claim - Ctrl-C to stop the running turn, Ctrl-D to quit - fall
+        // through, so a turn that needs stopping is never held hostage by a
+        // list.
+        if self.picker_key(&key) {
             return;
         }
         // The trajectory pane owns the scrolling keys while it is open, the way
@@ -783,7 +1082,7 @@ impl App {
         // page keys walk the log. Its offset is measured from the newest row,
         // so Up scrolls back in time and Down returns toward the tail.
         if self.trajectory.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_trajectory();
                     return;
@@ -813,7 +1112,7 @@ impl App {
         // Typing still reaches the composer, so `/settings model` re-reads the
         // Host's resolution without closing the pane first.
         if self.settings.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_settings();
                     return;
@@ -843,7 +1142,7 @@ impl App {
         // Typing still reaches the composer, so `/tasks` re-reads the store
         // without closing the pane first.
         if self.tasks.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_tasks();
                     return;
@@ -872,7 +1171,7 @@ impl App {
         // walk the roster. Typing still reaches the composer, so `/federation`
         // re-reads the store without closing the pane first.
         if self.federation.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_federation();
                     return;
@@ -901,7 +1200,7 @@ impl App {
         // page keys walk the page. Typing still reaches the composer, so
         // `/browser` re-reads the Host without closing the pane first.
         if self.browser.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_browser();
                     return;
@@ -931,7 +1230,7 @@ impl App {
         // Typing still reaches the composer, so `/files src` opens another
         // directory without closing the pane first.
         if self.files.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_files();
                     return;
@@ -965,7 +1264,7 @@ impl App {
         // there Up and Down scroll it instead - the pane decides which, the
         // way the files pane decides between a listing and a document.
         if self.diff.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_diff();
                     return;
@@ -998,7 +1297,7 @@ impl App {
         // and typing still reaches the composer so `/extensions <text>`
         // narrows the roster without closing it first.
         if self.extensions.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_extensions();
                     return;
@@ -1028,7 +1327,7 @@ impl App {
         // steps back to the list before it closes the pane, which is the
         // desktop's breadcrumb out of a diff.
         if self.review.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.back_review();
                     return;
@@ -1061,7 +1360,7 @@ impl App {
         // the rows. Typing still reaches the composer, so `/memory <text>`
         // refines the search without closing the pane first.
         if self.memory.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_memory();
                     return;
@@ -1085,11 +1384,44 @@ impl App {
                 _ => {}
             }
         }
+        // The child-run pane walks its roster with the arrow keys and opens one
+        // run with Enter, the way the review pane walks its changed files.
+        // Escape unwinds one document at a time - the open run first, then the
+        // roster - so reading an answer never throws the list away.
+        if self.subagents.is_some() {
+            match &key {
+                Key::Escape => {
+                    self.close_subagents();
+                    return;
+                }
+                Key::Up | Key::ScrollUp => {
+                    self.move_subagents(-(SCROLL as isize));
+                    return;
+                }
+                Key::Down | Key::ScrollDown => {
+                    self.move_subagents(SCROLL as isize);
+                    return;
+                }
+                Key::Enter => {
+                    self.open_subagents_selection();
+                    return;
+                }
+                Key::PageUp => {
+                    self.move_subagents(-(PAGE as isize));
+                    return;
+                }
+                Key::PageDown => {
+                    self.move_subagents(PAGE as isize);
+                    return;
+                }
+                _ => {}
+            }
+        }
         // The audit pane owns the same keys: Escape returns to the transcript,
         // Up/Down walk the rows, and typing still reaches the composer so
         // `/audit <text>` narrows the list without closing it first.
         if self.audit.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_audit();
                     return;
@@ -1118,7 +1450,7 @@ impl App {
         // history, and Escape closes the pane instead of discarding the draft
         // the reader came back to. Typing still reaches the composer.
         if self.detail.is_some() {
-            match key {
+            match &key {
                 Key::Escape => {
                     self.close_detail();
                     return;
@@ -1147,7 +1479,7 @@ impl App {
         // accept the highlighted row, and Escape closes the list before it
         // reaches the composer.
         if self.menu.open() {
-            match key {
+            match &key {
                 Key::Up => {
                     self.menu.move_by(-1);
                     return;
@@ -1173,12 +1505,12 @@ impl App {
         // composer takes every key back - which is the reader answering in
         // their own words - so the card never swallows a keystroke they meant
         // to type.
-        if self.question_key(key) {
+        if self.question_key(&key) {
             return;
         }
-        match key {
+        match &key {
             Key::Char(character) => {
-                self.input.insert(self.cursor, character);
+                self.input.insert(self.cursor, *character);
                 self.cursor += character.len_utf8();
                 self.sync_menu();
             }
@@ -1214,6 +1546,43 @@ impl App {
                 }
                 self.sync_menu();
             }
+            // The line and word steps a terminal reader already has in their
+            // fingers: Home/End and Ctrl-A/Ctrl-E for the line, the modifier
+            // arrows for a word.
+            Key::Home | Key::Ctrl('a') => {
+                self.cursor = line_start(&self.input, self.cursor);
+                self.sync_menu();
+            }
+            Key::End | Key::Ctrl('e') => {
+                self.cursor = line_end(&self.input, self.cursor);
+                self.sync_menu();
+            }
+            Key::WordLeft => {
+                self.cursor = word_start(&self.input, self.cursor);
+                self.sync_menu();
+            }
+            Key::WordRight => {
+                self.cursor = word_end(&self.input, self.cursor);
+                self.sync_menu();
+            }
+            Key::Delete => {
+                delete_forward(&mut self.input, &mut self.cursor);
+                self.sync_menu();
+            }
+            // The three kills are readline's own cuts, so a draft can be taken
+            // apart without holding Backspace down.
+            Key::Ctrl('k') => {
+                kill_to_line_end(&mut self.input, &mut self.cursor);
+                self.sync_menu();
+            }
+            Key::Ctrl('u') => {
+                kill_to_line_start(&mut self.input, &mut self.cursor);
+                self.sync_menu();
+            }
+            Key::Ctrl('w') => {
+                kill_word(&mut self.input, &mut self.cursor);
+                self.sync_menu();
+            }
             Key::Up => {
                 self.recall(true);
                 self.sync_menu();
@@ -1222,19 +1591,33 @@ impl App {
                 self.recall(false);
                 self.sync_menu();
             }
-            Key::ScrollUp => self.scroll = self.scroll.saturating_add(SCROLL),
-            Key::ScrollDown => self.scroll = self.scroll.saturating_sub(SCROLL),
-            Key::PageUp => self.scroll = self.scroll.saturating_add(PAGE),
-            Key::PageDown => self.scroll = self.scroll.saturating_sub(PAGE),
+            Key::ScrollUp => self.scroll_transcript(SCROLL as isize),
+            Key::ScrollDown => self.scroll_transcript(-(SCROLL as isize)),
+            Key::PageUp => self.scroll_transcript(PAGE as isize),
+            Key::PageDown => self.scroll_transcript(-(PAGE as isize)),
             Key::Tab => self.toggle_plan(),
             Key::Ctrl('n') => self.cycle(1),
             Key::Ctrl('p') => self.cycle(-1),
             Key::Ctrl('t') => self.create_session(None),
             Key::Ctrl('c') => self.cancel_execution(),
-            Key::Ctrl('y') => self.decide_approval(true),
-            Key::Ctrl('r') => self.decide_approval(false),
+            Key::Ctrl('y') => self.decide_approval(true, None),
+            Key::Ctrl('r') => self.decide_approval(false, None),
             Key::Ctrl('d') => self.quit = true,
             Key::Ctrl('l') => self.refresh_all(),
+            // The chord every shell has carried for this gesture: hand the
+            // prompt to the editor the reader already types in.
+            Key::Ctrl('x') => self.edit_composer(),
+            // A paste lands in the composer whole: its newlines are text, not
+            // submits, so a multi-line block arrives as one edit.
+            Key::Paste(text) => {
+                self.input.insert_str(self.cursor, text);
+                self.cursor += text.len();
+                self.sync_menu();
+            }
+            // A click is the session rail's gesture: the pointer picks the
+            // row the rail painted, and the frame's own layout is what maps
+            // those cells back to a session.
+            Key::Click { row, column } => self.click(*row, *column),
             Key::Ctrl(_) => {}
         }
     }
@@ -1251,11 +1634,18 @@ impl App {
     ) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
         let width = width.max(40);
         let height = height.max(8);
+        // Remember the cells this frame is about to fill: a click names a
+        // screen row, and only this layout knows which session is painted
+        // there.
+        self.frame.set((width, height));
         // The composer is measured before the body: a multi-line prompt takes
         // rows from the transcript instead of pushing the frame past the
         // terminal and scrolling the header away.
         let (input_rows, cursor) = self.input_block(width);
         let menu_rows = self.menu_lines(width);
+        // The choice list is measured with the popup: it sits where a list
+        // attached to the composer sits, so its rows come out of the body's.
+        let picker_rows = self.picker_lines(width);
         // The plan block is measured with the composer and the popup: it sits
         // above them, so its rows come out of the transcript's budget.
         let plan_rows = self.plan_lines(width);
@@ -1266,16 +1656,7 @@ impl App {
         // The question card sits where the answer is typed, so its rows come
         // out of the transcript's budget like the plan block's.
         let question_rows = self.card_rows(width);
-        let body_rows = height
-            .saturating_sub(
-                input_rows.len()
-                    + menu_rows.len()
-                    + plan_rows.len()
-                    + queue_rows.len()
-                    + question_rows.len()
-                    + 5,
-            )
-            .max(1);
+        let body_rows = self.body_rows(width, height);
 
         let mut chrome = Painter::new(self.skin);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
@@ -1285,20 +1666,32 @@ impl App {
         lines.push(chrome.marker(&header, "bsh tui ", Tone::Heading, Tone::Muted));
         lines.push(chrome.tone(&rule(width), Tone::Muted));
 
-        let sidebar = (width >= usize::from(SIDEBAR_MIN_WIDTH)).then(|| (width / 4).clamp(18, 30));
-        let right_width = match sidebar {
-            Some(left) => width.saturating_sub(left + 1),
-            None => width,
-        };
+        let sidebar = rail_width(width);
+        let right_width = transcript_width(width);
         let left_lines = self.session_lines(sidebar.unwrap_or(width), body_rows);
-        let right_lines = self.transcript_lines(right_width, body_rows);
+        let (right_lines, _) = self.transcript(right_width, body_rows);
         // Each column is its own document, so each gets its own painter: the
         // tone a transcript row hands to its wrapped continuation must not leak
         // into the session list beside it.
         let mut left = Painter::new(self.skin);
         let mut right = Painter::new(self.skin);
         let top = self.session_top(body_rows);
+        // The row a `/find` revealed is painted as a bar while it is still on
+        // screen: a jump whose landing the reader cannot see is not a reveal.
+        let focus_row = self
+            .focus
+            .zip(self.body_start.get())
+            .and_then(|(focus, start)| focus.checked_sub(start))
+            .filter(|row| *row < body_rows);
         for row in 0..body_rows {
+            // Only the transcript column takes the bar: the rail beside it still
+            // means "the open session".
+            let right_row = match focus_row {
+                Some(focus) if focus == row => {
+                    right.tone(&pad(&right_lines[row], right_width), Tone::Select)
+                }
+                _ => right.row(&right_lines[row]),
+            };
             let line = match sidebar {
                 Some(left_width) => {
                     // The list's pointer is the one marker the frame does not
@@ -1316,10 +1709,10 @@ impl App {
                     };
                     let mut spans = column.spans;
                     spans.push(Span::styled("│", self.skin.style(Tone::Muted)));
-                    spans.extend(right.row(&right_lines[row]).spans);
+                    spans.extend(right_row.spans);
                     Line::from(spans)
                 }
-                None => right.row(&right_lines[row]),
+                None => right_row,
             };
             lines.push(line);
         }
@@ -1360,6 +1753,24 @@ impl App {
         });
         // The popup sits between the status row and the composer, so it reads
         // as an attachment to what is being typed rather than as transcript.
+        // A choice list stands in the same place, one row per choice.
+        //
+        // The list's top row is recorded for the pointer: a click arrives as a
+        // screen row, and this is the only record of which choice stood there.
+        self.picker_at
+            .set((!picker_rows.is_empty()).then_some(lines.len()));
+        for row in &picker_rows {
+            let tone = if row.starts_with('›') {
+                Tone::Select
+            } else {
+                Tone::Body
+            };
+            lines.push(chrome.tone(row, tone));
+        }
+        // The popup's rows start immediately, so the row its first candidate
+        // stands on is the whole of what a click needs to name a candidate.
+        self.menu_at
+            .set((!menu_rows.is_empty()).then_some(lines.len()));
         for row in &menu_rows {
             let tone = if row.starts_with('›') {
                 Tone::Select
@@ -1661,10 +2072,10 @@ impl App {
             return Vec::new();
         }
         let rows = self.menu.rows();
-        let visible = rows.len().min(menu::VISIBLE_ROWS);
-        // The window follows the highlight, keeping it on the last row while
-        // there are more candidates below, the way a scrolling menu does.
-        let start = self.menu.active().saturating_sub(visible - 1);
+        // The window is the menu's own, so the frame and a click read the same
+        // arithmetic: a pointer names a screen row, and the row it names is
+        // only a candidate because this window put it there.
+        let (start, visible) = self.menu.window();
         let marker = if self.menu.truncated() { "…" } else { " " };
         rows.iter()
             .skip(start)
@@ -1681,6 +2092,119 @@ impl App {
                 truncate(&format!("{pointer} {}{detail}", row.label), width)
             })
             .collect()
+    }
+
+    /// Open the list a choice-taking command names, or say why there is none.
+    ///
+    /// The rows come from the catalogue this client already holds, so opening a
+    /// list costs no query and no settings read. A command with nothing to
+    /// offer leaves the reader the sentence it always gave instead of an empty
+    /// box: a marker with no choice under it asks the reader to walk rows that
+    /// are not there.
+    fn open_picker(&mut self, kind: picker::Kind) {
+        // `/sessions`, `/trash` and `/sessions archived` list this workspace,
+        // not the catalogue: their rows come from the snapshot the printed
+        // listing reads, so the list and the numbers agree.
+        let mut items = match kind {
+            picker::Kind::Session => {
+                session_items(&self.sessions, Some(self.selected), picker::Kind::Session)
+            }
+            picker::Kind::Trash => session_items(&self.trash, None, picker::Kind::Trash),
+            picker::Kind::Archived => session_items(&self.archived, None, picker::Kind::Archived),
+            _ => kind.items(&self.catalogue),
+        };
+        if items.is_empty() {
+            self.picker = None;
+            self.set_status(Level::Error, kind.empty());
+            return;
+        }
+        // The row the session already runs is ticked, the way the desktop
+        // ticks the active model: the list then answers "what do I have" and
+        // "what might I pick" at once. A client with no session open ticks
+        // nothing rather than guessing at the machine default. A session list
+        // is ticked by its own builder, against the chat that is open.
+        if matches!(
+            kind,
+            picker::Kind::Session | picker::Kind::Trash | picker::Kind::Archived
+        ) {
+            self.picker = Some(picker::Picker::new(kind.title(), items));
+            return;
+        }
+        if let Some(config) = self.session.as_ref().map(|session| &session.config) {
+            kind.mark(&mut items, config);
+        }
+        self.picker = Some(picker::Picker::new(kind.title(), items));
+    }
+
+    /// Put the list away, committing nothing.
+    fn close_picker(&mut self) {
+        self.picker = None;
+    }
+
+    /// Commit the row under the highlight: the same command a typed name sends.
+    ///
+    /// A pick is not a second path to the Host: it becomes the command the
+    /// parser would have produced from `/model provider model`, so a chosen
+    /// pair and a typed one make the identical call.
+    fn commit_picker(&mut self) {
+        let Some(choice) = self.picker.as_ref().and_then(picker::Picker::choice) else {
+            return;
+        };
+        self.picker = None;
+        self.run_command(pick_command(choice));
+    }
+
+    /// The list's keys, while it is open.
+    ///
+    /// Returns whether the list consumed the key. Up and Down walk the rows, a
+    /// page key walks a page, Enter commits and Escape puts it away without
+    /// sending anything; every other chord reaches the client, which is what
+    /// keeps Ctrl-C working while a list is up.
+    fn picker_key(&mut self, key: &Key) -> bool {
+        if self.picker.is_none() {
+            return false;
+        }
+        let delta = match key {
+            Key::Up | Key::ScrollUp => -1,
+            Key::Down | Key::ScrollDown => 1,
+            Key::PageUp => -(PAGE as isize),
+            Key::PageDown => PAGE as isize,
+            Key::Enter => {
+                self.commit_picker();
+                return true;
+            }
+            Key::Escape => {
+                self.close_picker();
+                return true;
+            }
+            Key::Backspace => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.erase();
+                }
+                return true;
+            }
+            // A printable character narrows the list. A control chord is not
+            // filter text: it falls through to the client below.
+            Key::Char(character) if !character.is_control() => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.typed(*character);
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        if let Some(picker) = self.picker.as_mut() {
+            picker.move_by(delta);
+        }
+        true
+    }
+
+    /// The list's rows for this frame, empty when it is closed.
+    fn picker_lines(&self, width: usize) -> Vec<String> {
+        self.picker
+            .as_ref()
+            .map(|picker| picker_lines(picker, width))
+            .unwrap_or_default()
     }
 
     fn header(&self) -> String {
@@ -1758,6 +2282,8 @@ impl App {
             Footer::Approval
         } else if self.question.is_some() {
             Footer::Question
+        } else if self.picker.is_some() {
+            Footer::Picker
         } else if self.menu.open() {
             Footer::Menu
         } else if self.pane_open() {
@@ -1782,6 +2308,7 @@ impl App {
             || self.extensions.is_some()
             || self.review.is_some()
             || self.federation.is_some()
+            || self.subagents.is_some()
             || self.browser.is_some()
             || self.trajectory.is_some()
             || self.settings.is_some()
@@ -1817,6 +2344,32 @@ impl App {
         composer(&self.input, self.cursor, width)
     }
 
+    /// The rows the body gets once the composer and every dock around it have
+    /// taken theirs.
+    ///
+    /// The frame and the pointer both measure with this: a click is tested
+    /// against the same arithmetic that painted the row under it, even while
+    /// a plan block, a queued line or a question card is up.
+    fn body_rows(&self, width: usize, height: usize) -> usize {
+        let (input_rows, _) = self.input_block(width);
+        let menu_rows = self.menu_lines(width);
+        let picker_rows = self.picker_lines(width);
+        let plan_rows = self.plan_lines(width);
+        let queue_rows = self.queue_lines(width);
+        let question_rows = self.card_rows(width);
+        height
+            .saturating_sub(
+                input_rows.len()
+                    + menu_rows.len()
+                    + picker_rows.len()
+                    + plan_rows.len()
+                    + queue_rows.len()
+                    + question_rows.len()
+                    + 5,
+            )
+            .max(1)
+    }
+
     /// The first session row the sidebar shows for a body `rows` tall: the
     /// window keeps the selected row on its last line, the way a list does.
     fn session_top(&self, rows: usize) -> usize {
@@ -1847,87 +2400,120 @@ impl App {
         lines
     }
 
-    fn transcript_lines(&self, width: usize, rows: usize) -> Vec<String> {
+    /// The transcript column: the rows it paints and, for each row, the tool
+    /// call that row stands for.
+    ///
+    /// A pane is a document the reader asked to read, so its rows name
+    /// nothing; a timeline row that draws a call does, because the desktop
+    /// opens that call's detail when its row is clicked.
+    fn transcript(&self, width: usize, rows: usize) -> (Vec<String>, Vec<Option<usize>>) {
+        // A pane answers with the rows it drew and no targets, and it is not
+        // the timeline: nothing on it is a document row `/find` could name.
+        let quiet = |lines: Vec<String>| {
+            self.body_start.set(None);
+            self.document.borrow_mut().clear();
+            (lines, vec![None; rows])
+        };
         // The settings pane replaces the timeline while it is open: the reader
         // asked what a turn resolves from, so that is what the body shows.
         if let Some(pane) = self.settings.as_ref() {
-            return settings_pane(pane, width, rows);
+            return quiet(settings_pane(pane, width, rows));
         }
         // The trajectory pane replaces the timeline while it is open: the
         // reader asked for the typed event log, so that is what the body shows.
         if let Some(pane) = self.trajectory.as_ref() {
-            return trajectory_pane(pane, self.session.as_ref(), width, rows);
+            return quiet(trajectory_pane(pane, self.session.as_ref(), width, rows));
         }
         // The tasks pane replaces the timeline while it is open: the reader
         // asked for the workspace's board, so the board is what the body shows.
         if let Some(pane) = self.tasks.as_ref() {
-            return tasks_pane(pane, width, rows);
+            return quiet(tasks_pane(pane, width, rows));
         }
         // The federation pane replaces it the same way: the reader asked who
         // this node trusts, so the roster is what the body shows.
         if let Some(pane) = self.federation.as_ref() {
-            return federation_pane(pane, width, rows);
+            return quiet(federation_pane(pane, width, rows));
+        }
+        // The child-run pane replaces it the same way: the reader asked what
+        // this conversation delegated, so the roster is what the body shows.
+        if let Some(pane) = self.subagents.as_ref() {
+            return quiet(subagents_pane(pane, width, rows));
         }
         // The browser pane replaces it the same way: the reader asked what the
         // agent's browser read, so the page is what the body shows.
         if let Some(pane) = self.browser.as_ref() {
-            return browser_pane(pane, width, rows);
+            return quiet(browser_pane(pane, width, rows));
         }
         // The files pane replaces the timeline while it is open, the way the
         // other panes do: the reader asked to browse the workspace, so the
         // workspace is what the body shows.
         if let Some(pane) = self.files.as_ref() {
-            return files_pane(pane, width, rows);
+            return quiet(files_pane(pane, width, rows));
         }
         // The diff pane replaces it the same way: the reader asked what the
         // working copy changed, so the comparison is what the body shows.
         if let Some(pane) = self.diff.as_ref() {
-            return diff_pane(pane, width, rows);
+            return quiet(diff_pane(pane, width, rows));
         }
         // The memory pane replaces the timeline while it is open, like the
         // detail pane: the reader asked to read the store, so the store is what
         // the body shows.
         if let Some(pane) = self.audit.as_ref() {
-            return audit_pane(pane, self.session.as_ref(), width, rows);
+            return quiet(audit_pane(pane, self.session.as_ref(), width, rows));
         }
         if let Some(pane) = self.extensions.as_ref() {
-            return extensions_pane(pane, width, rows);
+            return quiet(extensions_pane(pane, width, rows));
         }
         // The review pane replaces the timeline the same way: the reader asked
         // what a turn changed, so the changeset is what the body shows.
         if let Some(pane) = self.review.as_ref() {
-            return review_pane(pane, width, rows);
+            return quiet(review_pane(pane, width, rows));
         }
         if let Some(pane) = self.memory.as_ref() {
-            return memory_pane(pane, width, rows);
+            return quiet(memory_pane(pane, width, rows));
         }
         // A reader who asked for one call sees that call instead of the
         // timeline: the pane carries its own title row, so the session, the
         // call's ordinal and the way back stay visible while it scrolls.
         if let Some(index) = self.detail {
-            return detail_pane(
+            return quiet(detail_pane(
                 self.session.as_ref(),
                 index,
                 width,
                 rows,
                 self.detail_scroll,
-            );
+            ));
         }
-        let mut lines: Vec<String> = Vec::new();
+        let mut lines: Vec<(String, Option<usize>)> = Vec::new();
         match &self.session {
-            None => lines.push("(no session — Ctrl-T creates one, Ctrl-N/P switches)".to_string()),
+            // No session is the same card with the other first fact: the
+            // folder still names where a turn would run, and the key that
+            // opens one is the answer to "why is nothing here?".
+            None => lines.extend(targets(
+                hero_rows(None, self.workspace.as_deref(), width),
+                None,
+            )),
             Some(session) => {
                 // One timeline: a tool call belongs between the user turn that
                 // caused it and the assistant text that follows, so the
-                // transcript orders by committed time rather than by kind.
-                let mut entries: Vec<Entry> = session
+                // transcript orders by committed time rather than by kind. Every
+                // row of a call names the call it draws: the name, a failed
+                // output or a changed patch row all open the same detail pane
+                // the desktop opens.
+                let mut entries: Vec<(Entry, Option<usize>)> = session
                     .messages
                     .iter()
-                    .map(Entry::Message)
-                    .chain(session.tool_calls.iter().map(Entry::Tool))
+                    .map(|message| (Entry::Message(message), None))
+                    .chain(
+                        session
+                            .tool_calls
+                            .iter()
+                            .enumerate()
+                            .map(|(index, call)| (Entry::Tool(call), Some(index))),
+                    )
                     .collect();
-                entries.sort_by_key(Entry::at);
-                for entry in entries {
+                entries.sort_by_key(|(entry, _)| entry.at());
+                for (entry, hit) in entries {
                     match entry {
                         Entry::Message(message) => {
                             let speaker = match (message.compaction, message.role) {
@@ -1938,9 +2524,10 @@ impl App {
                                 (false, MessageRole::User) => "you › ",
                                 (false, MessageRole::Assistant) => "bsh › ",
                             };
-                            lines.extend(message_rows(speaker, &message.text, width));
+                            lines
+                                .extend(targets(message_rows(speaker, &message.text, width), None));
                         }
-                        Entry::Tool(call) => lines.extend(tool_lines(call, width)),
+                        Entry::Tool(call) => lines.extend(targets(tool_lines(call, width), hit)),
                     }
                 }
                 for execution in &session.executions {
@@ -1949,13 +2536,16 @@ impl App {
                         | ExecutionStatus::Interrupted
                         | ExecutionStatus::NeedsIntervention => {
                             let detail = execution.detail.as_deref().unwrap_or("no detail");
-                            lines.extend(wrap(
-                                "! ",
-                                &format!(
-                                    "{}: {detail}",
-                                    format!("{:?}", execution.status).to_lowercase()
+                            lines.extend(targets(
+                                wrap(
+                                    "! ",
+                                    &format!(
+                                        "{}: {detail}",
+                                        format!("{:?}", execution.status).to_lowercase()
+                                    ),
+                                    width,
                                 ),
-                                width,
+                                None,
                             ));
                         }
                         ExecutionStatus::Queued | ExecutionStatus::Running => {
@@ -1968,41 +2558,53 @@ impl App {
                                 // Same claim the desktop makes while a turn runs:
                                 // the streamed text is shown under the speaker
                                 // prefix, then replaced by the committed answer.
-                                Some(live) => {
-                                    lines.extend(message_rows("bsh › ", &live.text, width))
-                                }
-                                None => {
-                                    lines.extend(wrap("… ", "the Host is running this turn", width))
-                                }
+                                Some(live) => lines.extend(targets(
+                                    message_rows("bsh › ", &live.text, width),
+                                    None,
+                                )),
+                                None => lines.extend(targets(
+                                    wrap("… ", "the Host is running this turn", width),
+                                    None,
+                                )),
                             }
                         }
                         ExecutionStatus::WaitingApproval => {
-                            lines.extend(wrap("… ", "waiting for an operator decision", width));
+                            lines.extend(targets(
+                                wrap("… ", "waiting for an operator decision", width),
+                                None,
+                            ));
                         }
                         ExecutionStatus::Completed | ExecutionStatus::Cancelled => {}
                     }
                 }
                 for approval in &session.approvals {
                     if approval.status == ApprovalStatus::Pending {
-                        lines.extend(wrap(
-                            "? ",
-                            &format!("approval pending: {}", approval.summary),
-                            width,
+                        lines.extend(targets(
+                            wrap(
+                                "? ",
+                                &format!("approval pending: {}", approval.summary),
+                                width,
+                            ),
+                            None,
                         ));
                     }
                 }
                 if lines.is_empty() {
-                    lines.push("(empty session — type a turn and press Enter)".to_string());
+                    lines.extend(targets(
+                        hero_rows(Some(session), self.workspace.as_deref(), width),
+                        None,
+                    ));
                 }
             }
         }
-        // Bottom-aligned: the newest line sits directly above the input row,
-        // and `scroll` lifts older lines into view.
-        let total = lines.len();
-        let end = total.saturating_sub(self.scroll.min(total));
-        let start = end.saturating_sub(rows);
-        let mut window = vec![String::new(); rows.saturating_sub(end - start)];
-        window.extend(lines[start..end].iter().cloned());
+        // The document is kept for `/find`: the rows the reader searches are
+        // exactly the rows this frame painted, so a hit names a row of the
+        // screen rather than a row of some other wrapping.
+        let start = window_bounds(lines.len(), rows, self.scroll).0;
+        self.body_start.set(Some(start));
+        let document = self.document.replace(lines);
+        let window = window_rows(&document, rows, self.scroll);
+        drop(document);
         window
     }
 
@@ -2027,6 +2629,9 @@ impl App {
         }
         self.selected = index.min(self.sessions.len() - 1);
         self.scroll = 0;
+        // A reveal numbers a row of the conversation that was open, so the bar
+        // it drew means nothing in the next one.
+        self.focus = None;
         // A call index belongs to the session that made it, so switching
         // sessions returns to the transcript instead of opening another
         // session's call under the same number. The question card is the same
@@ -2067,6 +2672,126 @@ impl App {
         let len = self.sessions.len();
         let next = (self.selected as i32 + delta).rem_euclid(len as i32) as usize;
         self.select(next);
+    }
+
+    /// Open the session a click on the rail names, or the call a click on a
+    /// transcript row names.
+    ///
+    /// The pointer arrives in screen cells. The rail's rows address a session;
+    /// the transcript's rows address a tool call, the way the desktop's do,
+    /// while its prose and blank rows address nothing.
+    fn click(&mut self, row: usize, column: usize) {
+        // An open choice list owns the pointer while it is drawn: it sits over
+        // the rows under it, and a click on its title is still its click.
+        if self.click_picker(row) {
+            return;
+        }
+        // The completion popup stands in the same place and takes its rows the
+        // same way: a click on a candidate is the candidate Enter accepts.
+        if self.click_menu(row) {
+            return;
+        }
+        let (width, height) = self.frame.get();
+        let body_rows = self.body_rows(width, height);
+        if let Some(offset) = rail_offset(row, column, width, body_rows) {
+            // The list keeps the selected row on its last line, so the row
+            // under the pointer is that offset plus the window's first session.
+            let index = self.session_top(body_rows) + offset;
+            // A row past the end of the list names nothing, and clicking the
+            // open session is not a change: it is the state the rail already
+            // shows.
+            if index >= self.sessions.len() || index == self.selected {
+                return;
+            }
+            self.select(index);
+            return;
+        }
+        let Some(offset) = transcript_offset(row, column, width, body_rows) else {
+            return;
+        };
+        // The frame and the pointer read the same document, so the row under
+        // the pointer names the call that row paints - or nothing, if the row
+        // is prose, blank, or part of a pane.
+        let (_, hits) = self.transcript(transcript_width(width), body_rows);
+        let Some(Some(index)) = hits.get(offset).copied() else {
+            return;
+        };
+        // Clicking the call the pane already shows is not a change.
+        if self.detail == Some(index) {
+            return;
+        }
+        self.open_detail(index);
+    }
+
+    /// Route a click to the open choice list, and report whether it was the
+    /// list's to take.
+    ///
+    /// The list is drawn as the rows above the composer, so a pointer on one of
+    /// them means the choice that row paints - the same choice Enter commits.
+    /// A click outside the list's rows leaves it open and answers `false`, so
+    /// the rail beside it still opens a session.
+    fn click_picker(&mut self, row: usize) -> bool {
+        if self.picker.is_none() {
+            return false;
+        }
+        let Some(picker) = self.picker.as_mut() else {
+            return false;
+        };
+        let (start, visible) = picker.window();
+        let shown = picker.rows().len();
+        let Some(top) = self.picker_at.get() else {
+            return false;
+        };
+        if let Some(index) = list_offset(row, top, 1, start, visible, shown) {
+            picker.select(index);
+            // The commit reads the highlight, so the two gestures share one
+            // path: a pick is the choice the row names, not a second code path
+            // that could resolve it differently.
+            self.commit_picker();
+            return true;
+        }
+        // A click on the list's title or its key line names no choice, but it
+        // is still the list's: the transcript under it has no row there to
+        // open, and the list must not close under a reader who missed a row.
+        row >= top
+    }
+
+    /// Route a click to the open completion popup, and report whether it was
+    /// the popup's to take.
+    ///
+    /// The popup is drawn as the rows above the composer with no header of its
+    /// own, so a pointer on one of them means the candidate that row paints -
+    /// the same candidate Enter accepts. A click outside those rows leaves the
+    /// popup open and answers `false`, so the rail and the transcript beside
+    /// it still answer a pointer.
+    fn click_menu(&mut self, row: usize) -> bool {
+        if !self.menu.open() {
+            return false;
+        }
+        let (start, visible) = self.menu.window();
+        let shown = self.menu.rows().len();
+        let Some(top) = self.menu_at.get() else {
+            return false;
+        };
+        if let Some(index) = list_offset(row, top, 0, start, visible, shown) {
+            self.menu.select(index);
+            // The accept reads the highlight, so the two gestures share one
+            // path: a pick is the row the pointer named, not a second code
+            // path that could resolve it differently.
+            self.accept();
+            return true;
+        }
+        false
+    }
+
+    /// Ask for the reader's own editor on the prompt as it stands.
+    ///
+    /// The text is written to a file by the loop that owns the terminal, so
+    /// this only records the request: a key handler that blocked on a program
+    /// the reader is typing into would be the wrong side of the redraw.
+    fn edit_composer(&mut self) {
+        self.edit_request = Some(self.input.clone());
+        self.set_status(Level::Info, "opening the editor the reader configured");
     }
 
     fn submit(&mut self) {
@@ -2178,7 +2903,7 @@ impl App {
     /// reader's focus on the card; the moment anything is typed the composer
     /// takes every key back, so a reader answering in their own words is never
     /// competing with a highlight.
-    fn question_key(&mut self, key: Key) -> bool {
+    fn question_key(&mut self, key: &Key) -> bool {
         if self.question.is_none() || !self.input.is_empty() {
             return false;
         }
@@ -2200,7 +2925,7 @@ impl App {
             // choose, so the pick always takes one more key press.
             Key::Char(digit) if digit.is_ascii_digit() => {
                 if let Some(card) = self.question.as_mut() {
-                    card.jump(digit);
+                    card.jump(*digit);
                 }
                 true
             }
@@ -2320,9 +3045,20 @@ impl App {
 
     /// Run one configuration command against the Host.
     fn run_command(&mut self, command: SlashCommand) {
+        // A command that opens a document replaces whatever document is open.
+        // The body is one column, so a pane left behind a newer one would come
+        // back - stale - when the newer one closed. The invariant lives here so
+        // every opening command inherits it, rather than each one remembering
+        // the full list of panes.
+        if command.opens_pane() {
+            self.close_panes();
+        }
         match command {
             SlashCommand::Help => self.set_status(Level::Info, COMMANDS),
             SlashCommand::New(title) => self.create_session(title),
+            // The prompt goes to the reader's own editor, which is a change to
+            // client state only: nothing is sent until Enter sends it.
+            SlashCommand::Editor => self.edit_composer(),
             SlashCommand::Sessions(argument) => self.sessions_command(argument.as_deref()),
             SlashCommand::Skills(filter) => self.skills_command(filter.as_deref()),
             SlashCommand::Unknown(head) => {
@@ -2332,22 +3068,11 @@ impl App {
                 );
             }
             SlashCommand::Usage(usage) => self.set_status(Level::Error, usage),
-            SlashCommand::Model(None, _) => {
-                let listed = listing(
-                    self.catalogue
-                        .providers
-                        .iter()
-                        .flat_map(|provider| {
-                            provider
-                                .models
-                                .iter()
-                                .map(|model| format!("{}/{model}", provider.provider))
-                        })
-                        .collect(),
-                    "no models are configured in bsh settings",
-                );
-                self.set_status(Level::Info, format!("models: {listed}"));
-            }
+            // The three commands whose argument is one of a fixed set answer a
+            // reader who typed only the command with a list. The desktop opens
+            // a picker for each of them; a terminal's names-in-a-row asked the
+            // reader to retype one, which is the work a list should do.
+            SlashCommand::Model(None, _) => self.open_picker(picker::Kind::Model),
             SlashCommand::Model(Some(provider), Some(model)) => self.configure(
                 SessionConfigChange {
                     provider: Some(provider),
@@ -2359,16 +3084,10 @@ impl App {
             SlashCommand::Model(Some(_), None) => {
                 self.set_status(
                     Level::Error,
-                    "usage: /model <provider> <model>; /model alone lists",
+                    "usage: /model <provider> <model>; /model alone opens the list",
                 );
             }
-            SlashCommand::Preset(None) => {
-                let listed = listing(
-                    self.catalogue.presets.clone(),
-                    "no presets are configured in bsh settings",
-                );
-                self.set_status(Level::Info, format!("presets: {listed}"));
-            }
+            SlashCommand::Preset(None) => self.open_picker(picker::Kind::Preset),
             SlashCommand::Preset(Some(preset)) => self.configure(
                 SessionConfigChange {
                     preset: Some(preset),
@@ -2376,10 +3095,7 @@ impl App {
                 },
                 |config| config.preset.is_some(),
             ),
-            SlashCommand::Permission(None) => self.set_status(
-                Level::Info,
-                format!("permissions: {}", PERMISSION_MODES.join(" · ")),
-            ),
+            SlashCommand::Permission(None) => self.open_picker(picker::Kind::Permission),
             SlashCommand::Permission(Some(permission)) => {
                 // The menu offers only the modes the contract names; a typo is
                 // answered here instead of being sent as a permission the
@@ -2411,6 +3127,11 @@ impl App {
                 |config| config.plan_mode == plan,
             ),
             SlashCommand::Compact => self.compact(),
+            SlashCommand::Fork => self.fork_session(),
+            SlashCommand::Copy(count) => self.copy_message(count.unwrap_or(1)),
+            SlashCommand::CopyId => self.copy_session_id(),
+            SlashCommand::Approve => self.decide_approval(true, None),
+            SlashCommand::Deny(note) => self.decide_approval(false, note),
             SlashCommand::GoalShow => self.show_goal(),
             SlashCommand::GoalSet(objective) => self.set_goal(objective),
             SlashCommand::GoalEdit(objective) => self.edit_goal(objective),
@@ -2442,6 +3163,7 @@ impl App {
             SlashCommand::Extensions(argument) => self.extensions_command(argument.as_deref()),
             SlashCommand::Federation => self.federation_command(),
             SlashCommand::Browser => self.browser_command(),
+            SlashCommand::Subagents(argument) => self.subagents_command(argument.as_deref()),
             SlashCommand::Trajectory => self.trajectory_command(),
             SlashCommand::Review(argument) => self.review_command(argument.as_deref()),
             SlashCommand::Trash(argument) => self.trash_command(argument.as_deref()),
@@ -2452,6 +3174,7 @@ impl App {
             SlashCommand::Settings(argument) => self.settings_command(argument.as_deref()),
             SlashCommand::Set { key, value } => self.set_command(key.as_deref(), value.as_deref()),
             SlashCommand::Audit(argument) => self.audit_command(argument.as_deref()),
+            SlashCommand::Find(text) => self.find_command(&text),
         }
     }
 
@@ -2964,6 +3687,29 @@ impl App {
         }
     }
 
+    /// Close every pane the body can show.
+    ///
+    /// The body is one column, so opening a document replaces whatever was
+    /// there. Keeping that invariant in one place is what stops a pane from
+    /// surviving behind a newer one and reappearing - stale - when the newer
+    /// one closes.
+    fn close_panes(&mut self) {
+        self.settings = None;
+        self.trajectory = None;
+        self.tasks = None;
+        self.federation = None;
+        self.browser = None;
+        self.subagents = None;
+        self.files = None;
+        self.diff = None;
+        self.audit = None;
+        self.extensions = None;
+        self.review = None;
+        self.memory = None;
+        self.detail = None;
+        self.detail_scroll = 0;
+    }
+
     /// Leave the Browser pane and keep whatever the composer holds.
     fn close_browser(&mut self) {
         self.browser = None;
@@ -2977,6 +3723,151 @@ impl App {
             return;
         };
         pane.scroll = pane.scroll.saturating_add_signed(delta);
+    }
+
+    /// The delegated child runs this view answers for.
+    ///
+    /// The desktop draws these as nodes under the conversation in its Tasks
+    /// graph and counts them in the header, from the registry the `subagent`
+    /// tool writes inside the turn's own process. A client that attached to the
+    /// Host has no registry to read, so this pane is a query rather than a
+    /// count of the transcript the way `/audit` is.
+    ///
+    /// No argument reads the open session's lineage - the children this
+    /// conversation delegated - `all` reads every run the Host holds, and a
+    /// number opens one row's prompt and answer. The roster is re-read while a
+    /// child still runs ([`Self::poll_subagents`]), because a run finishes
+    /// without any event this client subscribed to.
+    fn subagents_command(&mut self, argument: Option<&str>) {
+        let argument = argument.map(str::trim).filter(|text| !text.is_empty());
+        let all = argument.is_some_and(|text| text.eq_ignore_ascii_case("all"));
+        let number = match argument {
+            None => None,
+            Some(_) if all => None,
+            Some(text) => match text.parse::<usize>() {
+                Ok(number) => Some(number),
+                Err(_) => {
+                    self.set_status(
+                        Level::Error,
+                        format!("'{text}' is not a run number · usage: /subagents [number|all]"),
+                    );
+                    return;
+                }
+            },
+        };
+        // The conversation is the filter the desktop's graph uses: a reader who
+        // opened a chat asked about that chat's children, and only `all` asks
+        // the Host for every run it holds.
+        let scope = if all {
+            None
+        } else {
+            self.session.as_ref().map(|session| session.session_id)
+        };
+        let report = match self.client.subagents(scope) {
+            Ok(report) => report,
+            Err(error) => {
+                self.client_error(error);
+                return;
+            }
+        };
+        let summary = subagents_summary(&report, all);
+        let mut pane = SubagentsPane {
+            report,
+            selection: 0,
+            open: None,
+            scroll: 0,
+            ticks: 0,
+            scope,
+        };
+        if let Some(number) = number {
+            let total = pane.report.runs.len();
+            if number == 0 || number > total {
+                self.set_status(
+                    Level::Error,
+                    format!("no run {number}; /subagents lists {total} in this view"),
+                );
+                return;
+            }
+            pane.selection = number - 1;
+            pane.open = Some(number - 1);
+        }
+        self.subagents = Some(pane);
+        self.set_status(Level::Info, summary);
+    }
+
+    /// Leave the child-run pane, closing the run opened inside it first.
+    ///
+    /// One Escape unwinds one document, the way the files pane climbs out of a
+    /// file into its directory: a reader who opened a run to read its answer is
+    /// not also asking for the roster to go away.
+    fn close_subagents(&mut self) {
+        let Some(pane) = self.subagents.as_mut() else {
+            return;
+        };
+        if pane.open.take().is_some() {
+            pane.scroll = 0;
+            self.set_status(Level::Info, "closed the run · /subagents lists the roster");
+            return;
+        }
+        self.subagents = None;
+        self.set_status(Level::Info, "subagents closed");
+    }
+
+    /// Walk the roster, or scroll the run that is open: the pane decides which,
+    /// the way the files pane decides between a listing and a document.
+    fn move_subagents(&mut self, delta: isize) {
+        let Some(pane) = self.subagents.as_mut() else {
+            return;
+        };
+        if pane.open.is_some() {
+            pane.scroll = pane.scroll.saturating_add_signed(delta);
+            return;
+        }
+        let len = pane.report.runs.len();
+        if len > 0 {
+            pane.selection = pane.selection.saturating_add_signed(delta).min(len - 1);
+        }
+    }
+
+    /// Open the highlighted run: the task the child was given and the answer it
+    /// produced, which a terminal has no hover card to show.
+    fn open_subagents_selection(&mut self) {
+        let Some(pane) = self.subagents.as_mut() else {
+            return;
+        };
+        if pane.report.runs.is_empty() {
+            self.set_status(Level::Info, "no child run to open in this view");
+            return;
+        }
+        pane.selection = pane.selection.min(pane.report.runs.len() - 1);
+        pane.open = Some(pane.selection);
+        pane.scroll = 0;
+        let number = pane.selection + 1;
+        let title = pane.report.runs[pane.selection].title.trim().to_string();
+        self.set_status(Level::Info, format!("run {number} · {title} · Esc closes"));
+    }
+
+    /// Re-read an open roster while a child still runs.
+    ///
+    /// A child's state moves inside the Host's process and no event carries it
+    /// to this client, so the pane asks again on a slow tick: a run that
+    /// finished shows the answer it produced without the reader re-opening the
+    /// pane. A dropped re-read keeps the rows that are on screen - the next
+    /// tick asks again, and a refused query is not a reason to blank a document
+    /// the reader is reading.
+    fn poll_subagents(&mut self) {
+        let Some(scope) = self.subagents.as_ref().map(|pane| pane.scope) else {
+            return;
+        };
+        let Ok(report) = self.client.subagents(scope) else {
+            return;
+        };
+        if let Some(pane) = self.subagents.as_mut() {
+            pane.report = report;
+            let last = pane.report.runs.len().saturating_sub(1);
+            pane.selection = pane.selection.min(last);
+            pane.open = pane.open.filter(|open| *open < pane.report.runs.len());
+        }
     }
 
     /// List the workspace's bin, or park one of the sessions `/sessions`
@@ -2999,9 +3890,16 @@ impl App {
                 self.client_error(error);
                 return;
             }
-            let rows = self.trash_rows(Utc::now());
-            let status = trash_summary(&rows, self.trash.len());
-            self.set_status(Level::Info, status);
+            // The desktop's bin is a list whose rows carry a Restore action; a
+            // terminal opens the same list, and Enter is that action, so a pick
+            // and `/restore <n>` reach the Host by one path. A bin with nothing
+            // parked keeps the sentence instead of an empty box.
+            self.open_picker(picker::Kind::Trash);
+            if self.picker.is_none() {
+                let rows = self.trash_rows(Utc::now());
+                let status = trash_summary(&rows, self.trash.len());
+                self.set_status(Level::Error, status);
+            }
             return;
         };
         let Ok(number) = argument.parse::<usize>() else {
@@ -3371,6 +4269,18 @@ impl App {
         };
         // One pane at a time: the reader asked for a call, so the memory pane
         // they had open yields rather than hiding the call.
+        self.open_detail(index);
+    }
+
+    /// Show one call's detail, closing any pane that was in the way.
+    ///
+    /// `/detail` and a click on the call's transcript row reach the same pane,
+    /// so the close, the scroll reset and the status line are written once.
+    fn open_detail(&mut self, index: usize) {
+        let total = self
+            .session
+            .as_ref()
+            .map_or(0, |session| session.tool_calls.len());
         self.memory = None;
         self.audit = None;
         self.tasks = None;
@@ -3497,6 +4407,87 @@ impl App {
         }
     }
 
+    /// Move the transcript by `delta` rows, newest-first.
+    ///
+    /// A `/find` bar marks where a search landed, so the reader taking the
+    /// document into their own hands is them leaving it: the reveal is spent.
+    fn scroll_transcript(&mut self, delta: isize) {
+        self.scroll = self.scroll.saturating_add_signed(delta);
+        self.focus = None;
+    }
+
+    /// Reveal the rows of this conversation that contain `text`.
+    ///
+    /// A conversation is a document a terminal walks a screen at a time, and no
+    /// chord reaches a row that has scrolled past, so a reader who remembers a
+    /// word but not where it is gets a list of the rows that carry it and lands
+    /// on the row they pick.
+    ///
+    /// The document searched is the one the last frame painted, so a hit is a
+    /// row of the screen. A `#12` argument names the numbered row a list row
+    /// carries, which is the line the pick of that row commits: the pick and
+    /// the typed number end in the same place.
+    fn find_command(&mut self, argument: &str) {
+        let text = argument.trim();
+        if let Some(number) = text.strip_prefix('#').and_then(|row| row.parse().ok()) {
+            self.reveal_row(number);
+            return;
+        }
+        if text.is_empty() {
+            self.set_status(Level::Error, "usage: /find <text>");
+            return;
+        }
+        let hits = find_rows(&self.document.borrow(), text);
+        if hits.is_empty() {
+            self.picker = None;
+            self.set_status(Level::Error, picker::Kind::Find.empty());
+            return;
+        }
+        // One hit is the row the reader wanted, so it is revealed instead of
+        // being offered as a list of one.
+        if hits.len() == 1 {
+            self.picker = None;
+            self.reveal_row(hits[0].0);
+            return;
+        }
+        let count = if hits.len() <= MAX_FIND_ROWS {
+            format!("{} row(s)", hits.len())
+        } else {
+            format!("{MAX_FIND_ROWS} of {} rows", hits.len())
+        };
+        self.picker = Some(picker::Picker::new(
+            picker::Kind::Find.title(),
+            find_items(&hits),
+        ));
+        self.set_status(
+            Level::Info,
+            format!("{count} match '{text}' · Enter reveals · Esc closes"),
+        );
+    }
+
+    /// Scroll the transcript to numbered row `number`, and paint it as a bar
+    /// while it stays on screen.
+    ///
+    /// The scroll is measured against the frame this client painted last,
+    /// because the body's height is what decides where a row lands; a row
+    /// revealed into a window nobody sized would move on the next event.
+    fn reveal_row(&mut self, number: usize) {
+        let total = self.document.borrow().len();
+        if number == 0 || number > total {
+            self.set_status(
+                Level::Error,
+                format!("no row {number} in a transcript of {total} row(s)"),
+            );
+            return;
+        }
+        let (width, height) = self.frame.get();
+        let rows = self.body_rows(width.max(40), height.max(8));
+        let row = number - 1;
+        self.scroll = reveal_scroll(total, row, rows);
+        self.focus = Some(row);
+        self.set_status(Level::Info, format!("row {number} of {total}"));
+    }
+
     /// Read or write the session's feedback note: the terminal's `/feedback`.
     ///
     /// The note is durable Host state, so no argument prints what the projection
@@ -3597,11 +4588,41 @@ impl App {
         }
         let now = Utc::now();
         let Some(argument) = argument.map(str::trim).filter(|text| !text.is_empty()) else {
+            // The desktop answers its session menu with a list, so a bare
+            // `/sessions` opens one. Enter sends `/sessions <number>`, so a
+            // pick and a typed number make the same Host call, and a workspace
+            // with nothing to open keeps the sentence instead of an empty box.
             let rows = self.session_rows(None, now);
-            let status = session_summary(&rows, self.sessions.len(), None);
-            self.set_status(Level::Info, status);
+            self.open_picker(picker::Kind::Session);
+            if self.picker.is_none() {
+                let status = session_summary(&rows, self.sessions.len(), None);
+                self.set_status(Level::Error, status);
+            }
             return;
         };
+        // The desktop's session menu is one popup whose rows pin, archive and
+        // unarchive; a terminal names the row's action and the number the
+        // listing printed, so `/sessions pin 2` is the same click as its Pin
+        // row. A verb is only a verb when it carries that number: `/sessions
+        // pin release` searches for a chat whose title says pin, which is what
+        // the desktop's search box would do, and neither reading is guessed.
+        let mut words = argument.split_whitespace();
+        let head = words.next().unwrap_or_default();
+        let number = words.next().and_then(|word| word.parse::<usize>().ok());
+        match (head, number) {
+            // The Archived filter has its own search box in the desktop
+            // sidebar, so its rows take a filter too.
+            ("archived", _) => {
+                let filter = argument.strip_prefix(head).unwrap_or_default().trim();
+                self.archived_command(filter, now);
+                return;
+            }
+            ("pin" | "unpin" | "archive" | "unarchive", Some(number)) => {
+                self.session_flag_command(head, number);
+                return;
+            }
+            _ => {}
+        }
         // A number opens a row. Rows keep their number in the whole list, so
         // the same `/sessions 3` opens the third session whatever is filtered.
         if let Ok(number) = argument.parse::<usize>() {
@@ -3644,6 +4665,137 @@ impl App {
             .collect()
     }
 
+    /// The session menu's flag rows, as a terminal spells them.
+    ///
+    /// The four verbs act on one number from the list they are printed
+    /// against. Pin and archive name the state they want, not a toggle, so a
+    /// repeated `/sessions pin 2` is the Host's refusal rather than an
+    /// accidental unpin.
+    fn session_flag_command(&mut self, verb: &str, number: usize) {
+        // Unarchiving names a row of the Archived filter, because that is the
+        // listing that printed the number; the other three name a row of the
+        // session list. Reading the wrong list would act on a chat the reader
+        // never pointed at.
+        let target = if verb == "unarchive" {
+            // The filter is re-read first so the number is checked against the
+            // rows the Host holds now, the way `/restore` re-reads the bin.
+            if let Err(error) = self.refresh_archived() {
+                self.client_error(error);
+                return;
+            }
+            if number == 0 || number > self.archived.len() {
+                self.set_status(
+                    Level::Error,
+                    format!(
+                        "no archived session {number}; /sessions archived lists {} of them",
+                        self.archived.len()
+                    ),
+                );
+                return;
+            }
+            self.archived[number - 1].clone()
+        } else {
+            if number == 0 || number > self.sessions.len() {
+                self.set_status(
+                    Level::Error,
+                    format!(
+                        "no session {number}; /sessions lists {} in this workspace",
+                        self.sessions.len()
+                    ),
+                );
+                return;
+            }
+            self.sessions[number - 1].clone()
+        };
+        let answer = match verb {
+            "pin" => self.client.pin_session(target.session_id, true),
+            "unpin" => self.client.pin_session(target.session_id, false),
+            "archive" => self.client.archive_session(target.session_id, true),
+            _ => self.client.archive_session(target.session_id, false),
+        };
+        match answer {
+            Ok(_) => {
+                self.set_status(
+                    Level::Info,
+                    match verb {
+                        "pin" => format!("pinned session {number}: {}", target.title),
+                        "unpin" => format!("unpinned session {number}: {}", target.title),
+                        "archive" => format!(
+                            "archived session {number}: {} · /sessions archived lists it",
+                            target.title
+                        ),
+                        _ => format!("unarchived session {number}: {}", target.title),
+                    },
+                );
+                self.refresh_all();
+                // The archived list the reader may be holding has a new
+                // membership, so it is re-read instead of edited here.
+                if matches!(verb, "archive" | "unarchive")
+                    && let Err(error) = self.refresh_archived()
+                {
+                    self.client_error(error);
+                }
+            }
+            // A refusal is the Host's: a turn in flight is the one reason
+            // archiving is unsafe, and its words are the answer.
+            Err(error) => {
+                self.client_error(error);
+                self.refresh_all();
+            }
+        }
+    }
+
+    /// Re-read the Archived filter from the Host.
+    ///
+    /// The list is asked for on every use rather than kept from the last
+    /// listing: another client, or this client's own turn, can archive or
+    /// unarchive a chat between one command and the next.
+    fn refresh_archived(&mut self) -> Result<(), ClientError> {
+        self.archived = self.client.archived()?;
+        Ok(())
+    }
+
+    /// The numbered rows `/sessions archived` prints, in the order
+    /// `/sessions unarchive` addresses them.
+    fn archived_rows(&self, filter: Option<&str>, now: DateTime<Utc>) -> Vec<String> {
+        self.archived
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| filter.is_none_or(|filter| session_matches(session, filter)))
+            .map(|(index, session)| session_row(index, session, false, now))
+            .collect()
+    }
+
+    /// List the Archived filter, narrowed by a search when one is given.
+    ///
+    /// The rows keep the number they hold in the whole filter, so
+    /// `/sessions unarchive 4` still names the fourth archived chat while a
+    /// search narrows what is on screen - the same rule `/sessions` follows.
+    fn archived_command(&mut self, filter: &str, now: DateTime<Utc>) {
+        if let Err(error) = self.refresh_archived() {
+            self.client_error(error);
+            return;
+        }
+        let query = Some(filter).filter(|filter| !filter.is_empty());
+        if query.is_none() {
+            // A bare `/sessions archived` opens the list the desktop draws in
+            // its sidebar; Enter there is the Unarchive row of that list's own
+            // menu, so a pick and `/sessions unarchive <n>` make one call.
+            self.open_picker(picker::Kind::Archived);
+            if self.picker.is_some() {
+                return;
+            }
+        }
+        let rows = self.archived_rows(query, now);
+        let status = archived_summary(&rows, self.archived.len(), query);
+        let level = if rows.is_empty() {
+            Level::Error
+        } else {
+            Level::Info
+        };
+        self.set_status(level, status);
+    }
+
     /// Write the open session as Markdown, the terminal's `/export`.
     ///
     /// The desktop's Export row saves a ZIP through a native file dialog; a
@@ -3672,6 +4824,65 @@ impl App {
                 Level::Error,
                 format!("could not write {}: {error}", target.display()),
             ),
+        }
+    }
+
+    /// Put one answer on the reader's clipboard, the terminal's `/copy`.
+    ///
+    /// A terminal client cannot reach a native clipboard, so the copy leaves
+    /// through OSC 52 ([`term::copy`]): the emulator in front of the reader
+    /// sets its selection, which is what makes the gesture work in the same
+    /// places the terminal does - over SSH, in tmux, behind a screen. The text
+    /// is the projection's, not the frame's: a wrapped row, an answer scrolled
+    /// out of view and the markers a row carries are not part of the message,
+    /// so what lands on the clipboard is what the model wrote.
+    fn copy_message(&mut self, from_end: usize) {
+        let Some(session) = self.session.as_ref() else {
+            self.set_status(Level::Error, "no session to copy from; Ctrl-T creates one");
+            return;
+        };
+        // The message is taken out of the projection before the status row is
+        // written: the copy is owned text, so the frame and the Host are not
+        // borrowed while the terminal is written to.
+        let Some(text) = copy_text(session, from_end).map(str::to_string) else {
+            let missing = match from_end {
+                1 => "no answer in this session to copy".to_string(),
+                count => format!("this session has no answer {count} back to copy"),
+            };
+            self.set_status(Level::Error, missing);
+            return;
+        };
+        match term::copy(&text) {
+            Ok(copied) if copied.cut => self.set_status(
+                Level::Info,
+                format!(
+                    "copied the first {} characters; the answer is longer than one clipboard escape carries",
+                    copied.chars
+                ),
+            ),
+            Ok(copied) => self.set_status(
+                Level::Info,
+                format!("copied {} characters to the clipboard", copied.chars),
+            ),
+            Err(error) => self.set_status(Level::Error, format!("could not copy: {error}")),
+        }
+    }
+
+    /// Put the open session's id on the reader's clipboard.
+    ///
+    /// The desktop's session menu carries the same row. The id comes from the
+    /// projection - the Host's durable fact - not from the rail's label, so
+    /// what lands on the clipboard is the string another client's
+    /// `/sessions <number>` or a journal lookup would accept.
+    fn copy_session_id(&mut self) {
+        let Some(id) = self.current_session() else {
+            self.set_status(Level::Error, "no session to copy from; Ctrl-T creates one");
+            return;
+        };
+        let text = id.to_string();
+        match term::copy(&text) {
+            Ok(_) => self.set_status(Level::Info, format!("copied session id {text}")),
+            Err(error) => self.set_status(Level::Error, format!("could not copy: {error}")),
         }
     }
 
@@ -3975,6 +5186,36 @@ impl App {
         }
     }
 
+    /// Branch the open session into a new chat.
+    ///
+    /// The fork is the Host's, so the client does nothing but ask for it and
+    /// open the chat the Host names: the rows the fork opens with are read back
+    /// from the projection the same way every other client reads them, rather
+    /// than copied here where a reconnect would lose them.
+    fn fork_session(&mut self) {
+        let Some(session_id) = self.current_session() else {
+            self.set_status(Level::Error, "no session to fork; Ctrl-T creates one");
+            return;
+        };
+        match self.client.fork_session(session_id) {
+            Ok(forked) => {
+                self.refresh_all();
+                if let Some(index) = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.session_id == forked)
+                {
+                    self.select(index);
+                }
+                self.set_status(
+                    Level::Info,
+                    "session forked; the branch opens with this transcript",
+                );
+            }
+            Err(error) => self.client_error(error),
+        }
+    }
+
     fn cancel_execution(&mut self) {
         let Some(session) = self.session.as_ref() else {
             return;
@@ -4003,18 +5244,30 @@ impl App {
         }
     }
 
-    fn decide_approval(&mut self, approve: bool) {
+    fn decide_approval(&mut self, approve: bool, note: Option<String>) {
         let Some(approval) = self.pending_approval().cloned() else {
             self.set_status(Level::Info, "no pending approval in this session");
             return;
         };
+        // The note is the operator's reason, and the Host audits it beside the
+        // verdict: a reader who typed one is told it went, not just that the
+        // action stopped.
+        let sent = note
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
         match self
             .client
-            .decide_approval(approval.session_id, &approval, approve, None)
+            .decide_approval(approval.session_id, &approval, approve, sent.clone())
         {
             Ok(_) => {
                 let verdict = if approve { "approved" } else { "rejected" };
-                self.set_status(Level::Info, format!("approval {verdict}"));
+                let message = match sent {
+                    Some(note) => format!("approval {verdict} · note: {note}"),
+                    None => format!("approval {verdict}"),
+                };
+                self.set_status(Level::Info, message);
                 self.refresh_all();
             }
             Err(error) => self.client_error(error),
@@ -4219,6 +5472,15 @@ enum SlashCommand {
     Plan(Option<bool>),
     /// Fold the session's older history into one checkpoint.
     Compact,
+    /// Put one of the model's answers on the reader's clipboard; no number
+    /// copies the newest, and `n` counts answers back from it.
+    Copy(Option<usize>),
+    /// Put the open session's id on the reader's clipboard.
+    ///
+    /// The desktop's session menu has the same row: an id is what a reader
+    /// pastes into a bug report or a journal lookup, and a terminal's own
+    /// selection cannot always reach a row the frame cut.
+    CopyId,
     /// What the session is pursuing, read from the projection.
     GoalShow,
     /// Replace the session's goal with one statement, taken verbatim.
@@ -4235,8 +5497,21 @@ enum SlashCommand {
     Rename(Option<String>),
     /// Save the open session as Markdown; no path writes under the data dir.
     Export(Option<String>),
+    /// Write the prompt in the editor the reader already uses, and take the
+    /// buffer back as the prompt.
+    ///
+    /// A terminal's composer is the few rows between the transcript and the
+    /// footer, and a long prompt written there scrolls away from its own
+    /// beginning. `^X` is the same gesture, and the chord opencode and every
+    /// shell bind for it.
+    Editor,
     /// Create a session; no title names one after the clock.
     New(Option<String>),
+    /// Branch the open session: a new chat that opens with its transcript.
+    ///
+    /// The desktop session menu's fork row, reached from the prompt: the fork
+    /// is a Host fact, so the branch a terminal makes is one the desktop sees.
+    Fork,
     /// List the workspace's sessions; a number opens one, text filters them.
     Sessions(Option<String>),
     /// The skills this build registered; text searches names and descriptions.
@@ -4245,6 +5520,18 @@ enum SlashCommand {
     Queue(Option<String>),
     /// The session's feedback note; no argument reads it, `clear` drops it.
     Feedback(Option<String>),
+    /// Settle the pending approval in favour of the action.
+    ///
+    /// `^Y` is the chord a reader presses while a turn waits; the command names
+    /// the same verdict for the reader who is looking at `/help` instead of the
+    /// footer, and for the one whose terminal never delivers the chord.
+    Approve,
+    /// Refuse the pending approval, with the reader's reason when they gave one.
+    ///
+    /// The desktop dialog's deny box writes a note the Host audits beside the
+    /// verdict. A terminal has no box to open, so the rest of the line is that
+    /// note: `/deny the target is production` refuses and says why.
+    Deny(Option<String>),
     /// Open one tool call's arguments and full output; no argument opens the
     /// newest call, `close` returns to the transcript.
     Detail(Option<String>),
@@ -4256,6 +5543,14 @@ enum SlashCommand {
     Memory(Option<String>),
     /// The session's audited tool calls; text filters the list.
     Audit(Option<String>),
+    /// Reveal the rows of this conversation that contain the text.
+    ///
+    /// A long conversation is a document a terminal can only walk a screen at
+    /// a time, so the reader who remembers a word but not where it is gets a
+    /// list of the rows that carry it and lands on the one they pick. It is
+    /// client-side: the rows are the transcript the projection already gave
+    /// this client, so nothing is asked of the Host to search it.
+    Find(String),
     /// The workspace the Host serves; a path lists that directory or reads
     /// that file, and no path opens the root.
     Files(Option<String>),
@@ -4275,6 +5570,11 @@ enum SlashCommand {
     Federation,
     /// The browser's page: the desktop's Browser tab, as a terminal reads it.
     Browser,
+    /// The delegated child runs this conversation started: the desktop's task
+    /// graph children and header list. No argument reads the open session's
+    /// lineage, `all` reads every run the Host holds, and a number opens one
+    /// run's prompt and answer.
+    Subagents(Option<String>),
     /// The open session's typed event log: every turn the Host ran with the
     /// messages and calls inside it.
     Trajectory,
@@ -4312,6 +5612,33 @@ enum SlashCommand {
 }
 
 impl SlashCommand {
+    /// Whether this command swaps the body for a document.
+    ///
+    /// The body is one column, so a command that shows a pane replaces whatever
+    /// pane is open instead of layering over it: the reader's newest request is
+    /// what the screen answers. The list is kept beside [`App::close_panes`],
+    /// which it triggers.
+    fn opens_pane(&self) -> bool {
+        matches!(
+            self,
+            Self::Settings(_)
+                | Self::Set { .. }
+                | Self::Files(_)
+                | Self::Diff(_)
+                | Self::Tasks(_)
+                | Self::Extensions(_)
+                | Self::Federation
+                | Self::Browser
+                | Self::Subagents(_)
+                | Self::Trajectory
+                | Self::Review(_)
+                | Self::Memory(_)
+                | Self::Audit(_)
+                | Self::Detail(_)
+                | Self::Terminal
+        )
+    }
+
     /// Parse one prompt line; `None` keeps it as a turn for the model.
     fn parse(text: &str) -> Option<Self> {
         let mut words = text.split_whitespace();
@@ -4331,19 +5658,21 @@ impl SlashCommand {
                     Some(model.to_string()),
                 )),
                 _ => Some(Self::Usage(
-                    "usage: /model <provider> <model>; /model alone lists",
+                    "usage: /model <provider> <model>; /model alone opens the list",
                 )),
             },
             "/preset" => match (words.next(), words.next()) {
                 (None, None) => Some(Self::Preset(None)),
                 (Some(preset), None) => Some(Self::Preset(Some(preset.to_string()))),
-                _ => Some(Self::Usage("usage: /preset <id>; /preset alone lists")),
+                _ => Some(Self::Usage(
+                    "usage: /preset <id>; /preset alone opens the list",
+                )),
             },
             "/permission" => match (words.next(), words.next()) {
                 (None, None) => Some(Self::Permission(None)),
                 (Some(mode), None) => Some(Self::Permission(Some(mode.to_string()))),
                 _ => Some(Self::Usage(
-                    "usage: /permission <mode>; /permission alone lists",
+                    "usage: /permission <mode>; /permission alone opens the list",
                 )),
             },
             "/plan" => match (words.next(), words.next()) {
@@ -4355,6 +5684,41 @@ impl SlashCommand {
             "/compact" => match words.next() {
                 None => Some(Self::Compact),
                 _ => Some(Self::Usage("usage: /compact")),
+            },
+            // The branch is of the open session and the Host names it, so there
+            // is nothing to spell here: a title would be a second decision the
+            // desktop's fork row does not ask for either.
+            "/fork" => match words.next() {
+                None => Some(Self::Fork),
+                _ => Some(Self::Usage("usage: /fork")),
+            },
+            // A count is one number: 0 would name a message before the newest
+            // one, so it is refused here rather than answered with "no answer".
+            // `id` names the session itself, which is the desktop session
+            // menu's other clipboard row.
+            "/copy" => match (words.next(), words.next()) {
+                (None, None) => Some(Self::Copy(None)),
+                (Some(word), None) if word.eq_ignore_ascii_case("id") => Some(Self::CopyId),
+                (Some(count), None) => match count.parse::<usize>() {
+                    Ok(count) if count > 0 => Some(Self::Copy(Some(count))),
+                    _ => Some(Self::Usage(
+                        "usage: /copy [number|id] — no number copies the newest answer, `id` the session",
+                    )),
+                },
+                _ => Some(Self::Usage(
+                    "usage: /copy [number|id] — no number copies the newest answer, `id` the session",
+                )),
+            },
+            // The verdict the footer's chords spell out. Approving takes no
+            // argument; refusing takes the reader's reason as free text, the
+            // way `/feedback` takes a sentence.
+            "/approve" => match rest {
+                "" => Some(Self::Approve),
+                _ => Some(Self::Usage("usage: /approve — `^Y` is the same verdict")),
+            },
+            "/deny" => match rest {
+                "" => Some(Self::Deny(None)),
+                note => Some(Self::Deny(Some(note.to_string()))),
             },
             "/usage" => match words.next() {
                 None => Some(Self::UsageShow),
@@ -4372,6 +5736,13 @@ impl SlashCommand {
             "/memory" => match rest {
                 "" => Some(Self::Memory(None)),
                 query => Some(Self::Memory(Some(query.to_string()))),
+            },
+            // A search is free text and it is required: an empty `/find` would
+            // list every row, which is the transcript the reader is already
+            // looking at.
+            "/find" => match rest {
+                "" => Some(Self::Usage("usage: /find <text>")),
+                text => Some(Self::Find(text.to_string())),
             },
             // A filter is free text for the same reason: it may carry a path
             // with spaces, and an empty one lists every audited call.
@@ -4413,6 +5784,16 @@ impl SlashCommand {
                 None => Some(Self::Browser),
                 _ => Some(Self::Usage("usage: /browser")),
             },
+            // The argument is a row number or `all`, and the number is judged
+            // where the roster is at hand rather than here: a run that finished
+            // while the reader typed still answers with the count.
+            "/subagents" => match words.next() {
+                None => Some(Self::Subagents(None)),
+                Some(argument) if !argument.starts_with('-') => {
+                    Some(Self::Subagents(Some(argument.to_string())))
+                }
+                _ => Some(Self::Usage("usage: /subagents [number|all]")),
+            },
             // The log is the open session's, so it has no argument either: the
             // session is chosen by opening it, not by naming it here.
             "/trajectory" => match words.next() {
@@ -4452,6 +5833,10 @@ impl SlashCommand {
             // insensitively and only when they fill the whole argument, the
             // same `edit <objective>` prefix and the same verbatim objective.
             "/goal" => Some(goal_command(rest)),
+            "/editor" => match words.next() {
+                None => Some(Self::Editor),
+                _ => Some(Self::Usage("usage: /editor · ^X")),
+            },
             "/rename" => match rest {
                 "" => Some(Self::Rename(None)),
                 title => Some(Self::Rename(Some(title.to_string()))),
@@ -4727,6 +6112,109 @@ fn unfinished(status: ExecutionStatus) -> bool {
     )
 }
 
+/// The byte offset where the line holding `cursor` starts.
+///
+/// The composer holds several lines - Shift-Enter, Ctrl-J and a pasted block
+/// all insert one - so Home and Ctrl-A are line gestures rather than draft
+/// ones: a reader fixing the second line of a prompt does not want the cursor
+/// back at the top of it.
+fn line_start(input: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(input.len());
+    input[..cursor].rfind('\n').map_or(0, |index| index + 1)
+}
+
+/// The byte offset where the line holding `cursor` ends: its newline, or the
+/// end of the draft.
+fn line_end(input: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(input.len());
+    input[cursor..]
+        .find('\n')
+        .map_or(input.len(), |index| cursor + index)
+}
+
+/// The byte offset of the word that starts before `cursor`: the whitespace the
+/// cursor sits in is skipped first, then the run of non-whitespace before it.
+fn word_start(input: &str, cursor: usize) -> usize {
+    let head = input[..cursor.min(input.len())].trim_end();
+    head.char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8())
+}
+
+/// The byte offset just past the next word: the whitespace the cursor sits in
+/// is skipped, then the run of non-whitespace.
+///
+/// Landing after the word rather than on the space that follows it is what
+/// makes a repeated step move instead of stalling in the gap.
+fn word_end(input: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(input.len());
+    let mut end = 0;
+    let mut inside = false;
+    for (index, character) in input[cursor..].char_indices() {
+        if character.is_whitespace() && !inside {
+            end = index + character.len_utf8();
+            continue;
+        }
+        if character.is_whitespace() {
+            break;
+        }
+        inside = true;
+        end = index + character.len_utf8();
+    }
+    cursor + end
+}
+
+/// Delete the character under the cursor: the Delete key, the counterpart of
+/// Backspace, which deletes the one before it.
+fn delete_forward(input: &mut String, cursor: &mut usize) {
+    let at = (*cursor).min(input.len());
+    if let Some(character) = input[at..].chars().next() {
+        input.replace_range(at..at + character.len_utf8(), "");
+    }
+    *cursor = at;
+}
+
+/// Kill from the cursor to the end of its line (Ctrl-K).
+///
+/// At a line's end there is nothing to the right but the newline, and joining
+/// the two lines is what readline does there: the chord is never a no-op.
+fn kill_to_line_end(input: &mut String, cursor: &mut usize) {
+    let at = (*cursor).min(input.len());
+    let end = line_end(input, at);
+    let cut = if end > at {
+        end
+    } else if end < input.len() {
+        end + 1
+    } else {
+        end
+    };
+    input.replace_range(at..cut, "");
+    *cursor = at;
+}
+
+/// Kill from the start of the cursor's line to the cursor (Ctrl-U); at a line
+/// start it takes the newline before it, which is Ctrl-K's rule backwards.
+fn kill_to_line_start(input: &mut String, cursor: &mut usize) {
+    let at = (*cursor).min(input.len());
+    let start = line_start(input, at);
+    let cut = if start < at {
+        start
+    } else {
+        start.saturating_sub(1)
+    };
+    input.replace_range(cut..at, "");
+    *cursor = cut;
+}
+
+/// Delete the word before the cursor (Ctrl-W), the chord a shell uses.
+fn kill_word(input: &mut String, cursor: &mut usize) {
+    let at = (*cursor).min(input.len());
+    let start = word_start(input, at);
+    input.replace_range(start..at, "");
+    *cursor = start;
+}
+
 /// The composer block: the prompt wrapped to `width`, plus the row and column
 /// inside that block the terminal cursor belongs on.
 ///
@@ -4753,13 +6241,16 @@ fn composer(input: &str, cursor: usize, width: usize) -> (Vec<String>, (usize, u
             column = 0;
             continue;
         }
-        if column >= room {
+        // Columns, not characters: a wide glyph takes two cells, and the
+        // terminal's cursor is addressed in cells.
+        let advance = UnicodeWidthChar::width(character).unwrap_or(0);
+        if column + advance > room {
             rows.push(String::new());
             row += 1;
             column = 0;
         }
         rows[row].push(character);
-        column += 1;
+        column += advance;
     }
     let cursor_at = cursor_at.unwrap_or((row, column));
     let (cursor_row, cursor_column) = cursor_at;
@@ -4854,6 +6345,24 @@ fn session_index(sessions: &[SessionSummary], id: &str) -> Option<usize> {
     sessions.iter().position(|session| session.session_id == id)
 }
 
+/// The folder this client's workspace reads follow: the Host's answer when the
+/// Host named one, the launching directory otherwise.
+///
+/// One Host serves one workspace, so when the terminal attached to a Host
+/// another process started, the folder this terminal was launched in is not
+/// necessarily the folder turns run in. The Host's catalogue names the root
+/// every turn resolves, and that answer wins; only a Host that names no root
+/// (an executor with no workspace surface) falls back to the directory this
+/// client opened with, so `@`, `/files` and the shell never point at a tree no
+/// turn can reach.
+fn host_workspace(host_root: &str, launched: Option<PathBuf>) -> Option<PathBuf> {
+    let root = host_root.trim();
+    if root.is_empty() {
+        return launched;
+    }
+    Some(PathBuf::from(root))
+}
+
 /// The workspace's display name, the detail the desktop's `@` card draws on a
 /// session row.
 ///
@@ -4873,6 +6382,10 @@ fn session_row(
     now: DateTime<Utc>,
 ) -> String {
     let marker = if current { "›" } else { " " };
+    // The desktop sidebar marks a pinned chat with a star; a terminal spells
+    // the same state as a word beside the age, because a glyph that means
+    // nothing to a monochrome screen would be the only place it is said.
+    let pinned = if session.pinned { " · pinned" } else { "" };
     let state = match session.active_execution {
         Some(ExecutionStatus::WaitingApproval) => " · waiting approval",
         Some(_) => " · running",
@@ -4891,12 +6404,119 @@ fn session_row(
         .map(|preview| format!(" — {preview}"))
         .unwrap_or_default();
     format!(
-        "{marker}{}. {title}{preview} · {} · {} msg{state}{approvals}",
+        "{marker}{}. {title}{preview} · {} · {} msg{state}{approvals}{pinned}",
         index + 1,
         age(session.updated_at, now),
         session.message_count,
         title = session.title
     )
+}
+
+/// How many rows one `/find` list offers.
+///
+/// A common word sits on more rows than a list a reader has to walk is worth,
+/// so the list is a window: the status row says how many matched, and the row a
+/// reader wants is usually in the newest part of the conversation.
+const MAX_FIND_ROWS: usize = 20;
+
+/// The rows of `document` that contain `text`, numbered from one, with the text
+/// a list row shows.
+///
+/// A match ignores case, because a reader remembering a word rarely remembers
+/// how it was capitalised, and the number counts from one the way every other
+/// listing in this client numbers its rows.
+fn find_rows(document: &[(String, Option<usize>)], text: &str) -> Vec<(usize, String)> {
+    let needle = text.to_lowercase();
+    document
+        .iter()
+        .enumerate()
+        .filter(|(_, (row, _))| row.to_lowercase().contains(&needle))
+        .map(|(index, (row, _))| (index + 1, row.trim().to_string()))
+        .collect()
+}
+
+/// The rows a `/find` list paints: one per hit, and the numbered row as the
+/// fact beside the line that carries the text.
+fn find_items(hits: &[(usize, String)]) -> Vec<picker::Item> {
+    hits.iter()
+        .take(MAX_FIND_ROWS)
+        .map(|(number, text)| picker::Item {
+            label: text.clone(),
+            detail: format!("row {number}"),
+            choice: picker::Choice::Find(number - 1),
+            active: false,
+        })
+        .collect()
+}
+
+/// The scroll that leaves document row `row` in the middle of a body `rows`
+/// tall, for a document that is bottom-aligned.
+///
+/// The window is the last `rows` rows of the document, `scroll` above its end,
+/// so landing on a row means choosing where that end sits: half a screen past
+/// the hit puts it near the middle, which is where a reader wants a line they
+/// jumped to rather than against the edge of the screen.
+fn reveal_scroll(total: usize, row: usize, rows: usize) -> usize {
+    let end = (row + 1 + rows / 2).min(total);
+    total.saturating_sub(end)
+}
+
+/// The rows `/sessions` offers as a list: one per session of the snapshot, in
+/// the order the printed listing numbers them.
+///
+/// A row's `active` tick marks the chat that is already open, which is the
+/// question the desktop's session menu answers with its highlight: the list
+/// then says both where the reader is and where they might go.
+fn session_items(
+    sessions: &[SessionSummary],
+    tick: Option<usize>,
+    kind: picker::Kind,
+) -> Vec<picker::Item> {
+    let now = Utc::now();
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| picker::Item {
+            label: session.title.clone(),
+            detail: session_detail(session, now),
+            // The list the row came from decides which command its number is:
+            // the same index opens a session, takes one out of the bin, or
+            // brings one back from the archive.
+            choice: match kind {
+                picker::Kind::Trash => picker::Choice::Trash(index),
+                picker::Kind::Archived => picker::Choice::Archived(index),
+                _ => picker::Choice::Session(index),
+            },
+            active: tick == Some(index),
+        })
+        .collect()
+}
+
+/// The facts beside a session's title: how recent it is, how much it holds,
+/// and what it is doing.
+///
+/// The same four the printed row carries in words, kept to the right edge of a
+/// list row so they read as one column down the screen.
+fn session_detail(session: &SessionSummary, now: DateTime<Utc>) -> String {
+    let mut detail = format!(
+        "{} · {} msg",
+        age(session.updated_at, now),
+        session.message_count
+    );
+    if session.pinned {
+        detail.push_str(" · pinned");
+    }
+    match session.active_execution {
+        Some(ExecutionStatus::WaitingApproval) => detail.push_str(" · waiting approval"),
+        Some(_) => detail.push_str(" · running"),
+        None => {}
+    }
+    match session.pending_approvals {
+        0 => {}
+        1 => detail.push_str(" · 1 approval"),
+        count => detail.push_str(&format!(" · {count} approvals")),
+    }
+    detail
 }
 
 /// A relative age, the way the desktop's session menu shows one.
@@ -4947,6 +6567,35 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
             .preview
             .as_deref()
             .is_some_and(|preview| preview.to_lowercase().contains(&query))
+}
+
+/// The `/sessions archived` status line, the Archived filter's rows.
+///
+/// A separate line from `/sessions`: the two lists answer different questions,
+/// and the archived one says which verb takes a row back out.
+fn archived_summary(rows: &[String], total: usize, query: Option<&str>) -> String {
+    match (rows.is_empty(), query) {
+        (true, Some(query)) => format!("no archived session matches '{query}' · {total} archived"),
+        (true, None) => "no archived sessions · /sessions archive <number> hides one".to_string(),
+        (false, _) => {
+            let shown = rows
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let more = rows.len().saturating_sub(10);
+            let tail = if more > 0 {
+                format!(" | … {more} more")
+            } else {
+                String::new()
+            };
+            format!(
+                "archived: {} of {total} · {shown}{tail} | /sessions unarchive <n> brings one back",
+                rows.len()
+            )
+        }
+    }
 }
 
 /// The `/sessions` status line: how many rows matched, then the rows.
@@ -5345,7 +6994,7 @@ fn settings_body(report: &SettingsReport, section: Option<&str>, width: usize) -
     let label_width = sections
         .iter()
         .flat_map(|section| section.rows.iter())
-        .map(|row| row.label.chars().count())
+        .map(|row| cells(&row.label))
         .max()
         .unwrap_or(0)
         .clamp(2, 20);
@@ -5382,7 +7031,7 @@ fn settings_row(row: &SettingsRowView, label_width: usize, width: usize) -> Stri
     let mut line = format!(
         "{marker}{}{}  {value}",
         row.label,
-        " ".repeat(label_width.saturating_sub(row.label.chars().count()))
+        " ".repeat(label_width.saturating_sub(cells(&row.label)))
     );
     let source = row.source.trim();
     if !source.is_empty() {
@@ -5612,16 +7261,16 @@ fn files_row(entry: &WorkspaceEntryView, selected: bool, width: usize) -> String
         entry.name.clone()
     };
     let size = file_size_label(entry.size, entry.dir);
-    let marker_width = marker.chars().count();
+    let marker_width = cells(marker);
     if size.is_empty() {
         return truncate(&format!("{marker}{name}"), width);
     }
-    let size_width = size.chars().count();
+    let size_width = cells(&size);
     // One column of air between the name and the size, so a long name ends
     // before the figure instead of running into it.
     let name_room = width.saturating_sub(marker_width + size_width + 1).max(1);
     let name = truncate(&name, name_room);
-    let used = marker_width + name.chars().count() + size_width;
+    let used = marker_width + cells(&name) + size_width;
     let pad = width.saturating_sub(used).max(1);
     format!("{marker}{name}{}{size}", " ".repeat(pad))
 }
@@ -6428,7 +8077,7 @@ impl TaskTree<'_> {
         let branch = if last { "└─ " } else { "├─ " };
         let room = self
             .width
-            .saturating_sub(indent.chars().count() + branch.chars().count())
+            .saturating_sub(cells(indent) + cells(branch))
             .max(24);
         let row = self.rows[index];
         let notes = tasks_edge_notes(row, self.rows);
@@ -7055,6 +8704,292 @@ fn federation_summary(report: &FederationReport) -> String {
     }
     line.push_str(" · Esc closes · Up/Down scrolls");
     line
+}
+
+/// One child run's lifecycle word, as the roster row and the run's head show
+/// it.
+///
+/// The Host states the state rather than leaving the reader to infer it from a
+/// missing answer, so the pane passes the word through; a run whose state came
+/// back empty is named as unknown instead of being drawn as finished.
+fn subagent_state(run: &SubagentRunView) -> &str {
+    let state = run.status.trim();
+    if state.is_empty() { "unknown" } else { state }
+}
+
+/// The tokens one child run has spent: what it reported, or the estimate the
+/// registry keeps while it reports none.
+fn subagent_tokens(run: &SubagentRunView) -> u64 {
+    let reported = run.prompt_tokens + run.completion_tokens;
+    if reported > 0 {
+        reported
+    } else {
+        run.estimated_tokens
+    }
+}
+
+/// How long one child run took, or how long it has been running.
+///
+/// A finished run is measured to its finish and a live one to now, so a row a
+/// reader watches grows instead of showing the instant it started.
+fn subagent_elapsed(run: &SubagentRunView, now: DateTime<Utc>) -> String {
+    let end = run
+        .finished_at_ms
+        .unwrap_or_else(|| now.timestamp_millis().max(0) as u64);
+    if end <= run.started_at_ms {
+        return "0ms".to_string();
+    }
+    trajectory_duration(end - run.started_at_ms)
+}
+
+/// The roster counted by lifecycle word, as the pane's header says it.
+///
+/// The desktop's header summarises its child rows the same way: a reader who
+/// opened the roster asked how much of it is still working, so running runs lead
+/// and the settled ones follow.
+fn subagent_counts(runs: &[SubagentRunView]) -> String {
+    let mut running = 0usize;
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for run in runs {
+        match subagent_state(run) {
+            "running" => running += 1,
+            "failed" => failed += 1,
+            "done" => done += 1,
+            _ => {}
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if done > 0 {
+        parts.push(format!("{done} done"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if parts.is_empty() {
+        return "no state yet".to_string();
+    }
+    parts.join(" · ")
+}
+
+/// One roster row: the run's place in the lineage, what it is called, how it
+/// stands, and what it has spent.
+///
+/// The indentation is the desktop graph's: a run nested under a parent is drawn
+/// under it, capped so a deep tree cannot push its titles off the frame.
+fn subagent_row(
+    index: usize,
+    run: &SubagentRunView,
+    selected: bool,
+    width: usize,
+    now: DateTime<Utc>,
+) -> String {
+    let marker = if selected { "› " } else { "  " };
+    let indent = "  ".repeat(run.depth.saturating_sub(1).min(3));
+    let title = run.title.trim();
+    let title = if title.is_empty() {
+        "untitled run"
+    } else {
+        title
+    };
+    let mut row = format!(
+        "{marker}{}. {indent}{title} · {} · {} · {} tok",
+        index + 1,
+        subagent_state(run),
+        subagent_elapsed(run, now),
+        crate::state::human_tokens(subagent_tokens(run))
+    );
+    if run.steps > 0 {
+        row.push_str(&format!(" · {} step(s)", run.steps));
+    }
+    match run.pending {
+        0 => {}
+        1 => row.push_str(" · 1 queued"),
+        queued => row.push_str(&format!(" · {queued} queued")),
+    }
+    truncate(&row, width)
+}
+
+/// One child run as a document: the task it was given and what came back.
+///
+/// A terminal has no hover card to open on a node and no answer bubble under
+/// it, so the run a reader picked is drawn as the task and its answer, the way
+/// the detail pane draws a tool call.
+fn subagent_detail(run: &SubagentRunView, width: usize, now: DateTime<Utc>) -> Vec<String> {
+    let title = run.title.trim();
+    let title = if title.is_empty() {
+        "untitled run"
+    } else {
+        title
+    };
+    let mut lines = vec![truncate(
+        &format!(
+            "RUN · {title} · {} · {} · {} tok",
+            subagent_state(run),
+            subagent_elapsed(run, now),
+            crate::state::human_tokens(subagent_tokens(run))
+        ),
+        width,
+    )];
+    lines.push(truncate(
+        &format!(
+            "  depth {} · {} step(s) · run {}",
+            run.depth,
+            run.steps,
+            run.id.trim()
+        ),
+        width,
+    ));
+    let session = run.session.trim();
+    if !session.is_empty() {
+        lines.push(truncate(&format!("  conversation {session}"), width));
+    }
+    lines.push(String::new());
+    lines.push(truncate("TASK", width));
+    let prompt = run.prompt.trim();
+    if prompt.is_empty() {
+        lines.extend(wrap("  ", "the model named no task text", width));
+    } else {
+        lines.extend(wrap("  ", prompt, width));
+    }
+    lines.push(String::new());
+    let error = run
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let answer = run
+        .result_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    match (error, answer) {
+        (Some(error), _) => {
+            lines.push(truncate("FAILED", width));
+            lines.extend(wrap("  ", error, width));
+        }
+        (None, Some(answer)) => {
+            lines.push(truncate("ANSWER", width));
+            lines.extend(wrap("  ", answer, width));
+        }
+        (None, None) => lines.extend(wrap(
+            "  ",
+            "no answer yet; a run that is still working reports one when it finishes",
+            width,
+        )),
+    }
+    lines
+}
+
+/// The child-run pane's body: one run's document, or the roster.
+fn subagents_body(pane: &SubagentsPane, width: usize, now: DateTime<Utc>) -> Vec<String> {
+    if let Some(run) = pane.open.and_then(|index| pane.report.runs.get(index)) {
+        return subagent_detail(run, width, now);
+    }
+    let report = &pane.report;
+    // A build whose executor carries no subagent registry is not a workspace
+    // with no delegation: the pane says which of the two it is looking at, so
+    // a reader does not hunt for a tool that was never loaded.
+    if report.state.trim() != "ready" {
+        return wrap(
+            "  ",
+            &format!(
+                "this Host's executor carries no subagent registry ({}), so no turn it ran could delegate",
+                report.state.trim()
+            ),
+            width,
+        );
+    }
+    if report.runs.is_empty() {
+        return wrap(
+            "  ",
+            "no child run yet; a turn that delegates with the subagent tool lists its children here, with the task each was given and the answer it produced",
+            width,
+        );
+    }
+    let mut lines = Vec::with_capacity(report.runs.len() + 2);
+    lines.push(truncate(
+        &format!(
+            "RUNS · {} · {}",
+            report.runs.len(),
+            subagent_counts(&report.runs)
+        ),
+        width,
+    ));
+    lines.push(String::new());
+    for (index, run) in report.runs.iter().enumerate() {
+        lines.push(subagent_row(
+            index,
+            run,
+            index == pane.selection,
+            width,
+            now,
+        ));
+    }
+    lines
+}
+
+/// The child-run pane's title row: what the roster holds and how to walk it.
+fn subagents_title(pane: &SubagentsPane) -> String {
+    let report = &pane.report;
+    if let Some(run) = pane.open.and_then(|index| report.runs.get(index)) {
+        let title = run.title.trim();
+        let title = if title.is_empty() {
+            "untitled run"
+        } else {
+            title
+        };
+        return format!(
+            "subagents · {title} · {} · Up/Down scrolls · Esc closes",
+            subagent_state(run)
+        );
+    }
+    if report.state.trim() != "ready" {
+        return format!("subagents · {} · Esc closes", report.state.trim());
+    }
+    format!(
+        "subagents · {} run(s) · {} · Up/Down walks · Enter opens · Esc closes",
+        report.runs.len(),
+        subagent_counts(&report.runs)
+    )
+}
+
+/// The child-run pane: its title, then the body windowed to `rows`.
+fn subagents_pane(pane: &SubagentsPane, width: usize, rows: usize) -> Vec<String> {
+    let rows = rows.max(1);
+    let body_rows = rows.saturating_sub(1);
+    let body = subagents_body(pane, width, Utc::now());
+    let total = body.len();
+    let start = pane.scroll.min(total.saturating_sub(body_rows));
+    let end = (start + body_rows).min(total);
+    let mut lines = Vec::with_capacity(rows);
+    lines.push(truncate(&subagents_title(pane), width));
+    lines.extend(body[start..end].iter().cloned());
+    lines.resize(rows, String::new());
+    lines
+}
+
+/// The `/subagents` status line: what the roster holds and how to leave it.
+fn subagents_summary(report: &SubagentReport, all: bool) -> String {
+    let scope = if all {
+        "this Host"
+    } else {
+        "this conversation"
+    };
+    if report.state.trim() != "ready" {
+        return format!(
+            "subagents · {} · this build carries no subagent registry",
+            report.state.trim()
+        );
+    }
+    format!(
+        "subagents · {} run(s) in {scope} · {} · Enter opens · Esc closes",
+        report.runs.len(),
+        subagent_counts(&report.runs)
+    )
 }
 
 /// The browser's state in one word, as the pane's title and status line show
@@ -8072,6 +10007,52 @@ fn audit_summary(session: &SessionProjection, filter: Option<&str>) -> String {
     line
 }
 
+/// The card an empty session opens on: the desktop's hero, as terminal rows.
+///
+/// A window opens on a hero that says where the reader is - the folder the
+/// Host serves, the model the open turn will resolve from, and the two
+/// gestures the composer answers - so an empty terminal draws the same three
+/// facts inside the transcript's own box instead of one grey sentence. The
+/// rows reuse the fence markers, so the skin paints the card without a new
+/// vocabulary, and every row is cut to the frame's width.
+fn hero_rows(
+    session: Option<&SessionProjection>,
+    workspace: Option<&Path>,
+    width: usize,
+) -> Vec<String> {
+    // The title is the folder's own name, the way the desktop hero and its
+    // workspace rail open. A Host serving no workspace says so rather than
+    // letting the reader guess which folder a turn would run in.
+    let folder = match workspace.and_then(Path::file_name) {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => "no workspace".to_string(),
+    };
+    let mut rows = vec![format!("╭ {folder}")];
+    match session {
+        Some(session) => {
+            // The open conversation, then what a turn here resolves from: the
+            // same `config_summary` the header chip and `/settings` read.
+            rows.extend(wrap("│ ", &session.title, width));
+            rows.extend(wrap("│ ", &config_summary(&session.config), width));
+        }
+        // Nothing to resolve yet: the Host answers the catalogue before it
+        // answers a session list, so the card names the key that starts one.
+        None => rows.extend(wrap(
+            "│ ",
+            "no session open · ^T starts one · ^N/^P walk them",
+            width,
+        )),
+    }
+    rows.push("│".to_string());
+    rows.extend(wrap(
+        "│ ",
+        "Enter sends a turn · / lists commands · @ mentions a file",
+        width,
+    ));
+    rows.push("╰".to_string());
+    rows.into_iter().map(|row| truncate(&row, width)).collect()
+}
+
 fn config_summary(config: &SessionConfig) -> String {
     let model = config
         .model_ref()
@@ -8114,22 +10095,137 @@ fn usage_chip(usage: &TurnUsage) -> String {
     }
 }
 
-/// At most ten entries of a listing, marked when more exist.
-fn listing(entries: Vec<String>, empty: &str) -> String {
-    if entries.is_empty() {
-        return empty.to_string();
-    }
-    let shown = entries
+/// The answer `/copy` puts on the clipboard: the `from_end`-th message the
+/// model wrote, counting the newest as one, or `None` when the session holds
+/// fewer answers than that.
+///
+/// The reader's own turns and compaction checkpoints are skipped: both are
+/// rows the transcript shows, but what a reader copies out of a conversation
+/// is what the model answered. A checkpoint is condensed history the Host
+/// wrote, so copying it would read as an answer nobody gave.
+fn copy_text(session: &SessionProjection, from_end: usize) -> Option<&str> {
+    session
+        .messages
         .iter()
-        .take(10)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" · ");
-    if entries.len() > 10 {
-        format!("{shown} · …")
-    } else {
-        shown
+        .rev()
+        .filter(|message| !message.compaction && message.role == MessageRole::Assistant)
+        .nth(from_end.checked_sub(1)?)
+        .map(|message| message.text.as_str())
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// At most ten entries of a listing, marked when more exist.
+/// The command a picker's choice commits.
+///
+/// A pick becomes the line the reader could have typed: the two gestures end at
+/// the same `SlashCommand`, so a chosen model can never take a different path
+/// to the Host than a named one.
+fn pick_command(choice: picker::Choice) -> SlashCommand {
+    match choice {
+        picker::Choice::Model { provider, model } => {
+            SlashCommand::Model(Some(provider), Some(model))
+        }
+        picker::Choice::Preset(preset) => SlashCommand::Preset(Some(preset)),
+        picker::Choice::Permission(permission) => SlashCommand::Permission(Some(permission)),
+        // The listing numbers its rows from one, so the pick carries that
+        // number: `/sessions 2` is what the same click on the printed list is.
+        picker::Choice::Session(index) => SlashCommand::Sessions(Some((index + 1).to_string())),
+        // The bin's rows are numbered the way `/restore` addresses them.
+        picker::Choice::Trash(index) => SlashCommand::Restore(Some((index + 1).to_string())),
+        // The archived rows are numbered the way `/sessions unarchive` does.
+        picker::Choice::Archived(index) => {
+            SlashCommand::Sessions(Some(format!("unarchive {}", index + 1)))
+        }
+        // A hit's row is numbered from one, and `/find #12` is the line that
+        // reveals the row this pick reveals.
+        picker::Choice::Find(row) => SlashCommand::Find(format!("#{}", row + 1)),
     }
+}
+
+/// The rows a choice list paints: what it chooses, the rows around the
+/// highlight, and one row saying what the list holds and how to commit it.
+///
+/// The detail is right-aligned the way the desktop's picker draws it - the
+/// provider beside every model, on the same column for every row - so a reader
+/// scans one fact down the list instead of reading it off the end of each row.
+fn picker_lines(picker: &picker::Picker, width: usize) -> Vec<String> {
+    let rows = picker.rows();
+    if rows.is_empty() {
+        // A filter that matches nothing leaves the title and the way out: an
+        // empty frame would look like the list had closed itself.
+        return vec![
+            truncate(picker.title(), width),
+            truncate(&format!("none match '{}'", picker.query()), width),
+            truncate("Backspace erases · Esc closes", width),
+        ];
+    }
+    let query = picker.query();
+    let filter = if query.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" · filter '{query}'")
+    };
+    let mut lines = vec![truncate(
+        &format!("{}{filter} · type to narrow", picker.title()),
+        width,
+    )];
+    // The window follows the highlight, keeping it on the last visible row
+    // while there are more choices below, the way a scrolling list does.
+    let total = picker.len();
+    let shown = rows.len();
+    // The window is the list's own answer, so the rows this frame draws and
+    // the rows a click addresses are the same ones.
+    let (start, visible) = picker.window();
+    for (offset, item) in rows.iter().enumerate().skip(start).take(visible) {
+        // Two columns, so the marks never move the names: the pointer says
+        // where the reader is, the tick says what the session already runs,
+        // and a row can be both without either mark covering the other.
+        let pointer = format!(
+            "{}{}",
+            if offset == picker.selected() {
+                '›'
+            } else {
+                ' '
+            },
+            if item.active { '✓' } else { ' ' }
+        );
+        lines.push(picker_row(&item.label, &item.detail, width, &pointer));
+    }
+    // What the list holds, and whether more rows follow the window: a reader
+    // who filtered a 200-model catalogue down needs to know how many match.
+    let count = if shown == total {
+        format!("{total} choice(s)")
+    } else {
+        format!("{shown} of {total} match")
+    };
+    let more = if start + visible < shown { "… " } else { "" };
+    // The tick only explains one of the marks, so it is named only on a list
+    // that carries one: the bin and the archive have nothing to mark, and a key
+    // to a mark no row shows would be noise on the row that says how to commit.
+    let ticked = if picker.any_active() {
+        " · ✓ marks the active row"
+    } else {
+        ""
+    };
+    lines.push(truncate(
+        &format!("{more}{count} · ↑↓ walks · Enter picks · type filters{ticked}"),
+        width,
+    ));
+    lines
+}
+
+/// One choice row: the pointer and the name on the left, the fact about it on
+/// the right edge.
+fn picker_row(label: &str, detail: &str, width: usize, pointer: &str) -> String {
+    let head = format!("{pointer} {label}");
+    let detail = detail.trim();
+    if detail.is_empty() || cells(&head) + cells(detail) + 2 > width {
+        return truncate(&head, width);
+    }
+    // The gap the fit test above guarantees is what the pad fills: padding to
+    // the width minus the fact lands the fact on the last column of every row,
+    // so the column reads straight down instead of ending one cell short.
+    format!("{}{detail}", pad(&head, width - cells(detail)))
 }
 
 /// The approval row: the exact action, then the two chords.
@@ -8447,18 +10543,16 @@ fn detail_block(call: &ToolCallView, width: usize) -> Vec<String> {
 /// collapsing their indentation would change what the reader is reading. A row
 /// narrower than the pane is kept whole; a wider one is split at the edge.
 fn indented(prefix: &str, text: &str, width: usize) -> Vec<String> {
-    let gutter = prefix.chars().count();
+    let gutter = cells(prefix);
     let room = width.saturating_sub(gutter).max(8);
     let indent = " ".repeat(gutter);
     let mut lines: Vec<String> = Vec::new();
     for source in text.split('\n') {
-        let chars: Vec<char> = source.chars().collect();
-        if chars.is_empty() {
+        if source.is_empty() {
             lines.push(String::new());
             continue;
         }
-        for (index, chunk) in chars.chunks(room).enumerate() {
-            let chunk: String = chunk.iter().collect();
+        for (index, chunk) in break_cells(source, room).into_iter().enumerate() {
             lines.push(if index == 0 {
                 format!("{prefix}{chunk}")
             } else {
@@ -8507,22 +10601,66 @@ fn rule(width: usize) -> String {
     "─".repeat(width)
 }
 
+/// The width of `text` in terminal cells.
+///
+/// A row is measured in the cells the terminal paints, not in characters: a
+/// CJK ideograph or an emoji takes two columns and a combining mark none, so
+/// counting characters lands a Chinese title one column past the frame's right
+/// border and wraps a paragraph a cell too wide. Every writer in this module
+/// measures with this, so a title, a wrapped paragraph, the composer's cursor
+/// and the frame's borders all agree on what fits.
+fn cells(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// Break `text` into pieces of at most `room` cells each, never splitting a
+/// character: a wide glyph that would straddle the edge starts the next piece
+/// instead. This is the one splitter the panes share, so a document, a tool's
+/// output and a code block all break in the same column.
+fn break_cells(text: &str, room: usize) -> Vec<String> {
+    let room = room.max(1);
+    let mut pieces: Vec<String> = Vec::new();
+    let mut piece = String::new();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let advance = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used > 0 && used + advance > room {
+            pieces.push(std::mem::take(&mut piece));
+            used = 0;
+        }
+        piece.push(character);
+        used += advance;
+    }
+    pieces.push(piece);
+    pieces
+}
+
 fn truncate(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
+    if cells(text) <= width {
         return text.to_string();
     }
     if width == 0 {
         return String::new();
     }
-    let mut truncated: String = text.chars().take(width.saturating_sub(1)).collect();
-    truncated.push('…');
-    truncated
+    // The ellipsis is one cell, so the text keeps the other `width - 1`.
+    let room = width - 1;
+    let mut kept = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let advance = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + advance > room {
+            break;
+        }
+        kept.push(character);
+        used += advance;
+    }
+    kept.push('…');
+    kept
 }
 
 fn pad(text: &str, width: usize) -> String {
     let mut padded = truncate(text, width);
-    for _ in padded.chars().count()..width {
+    for _ in cells(&padded)..width {
         padded.push(' ');
     }
     padded
@@ -8536,31 +10674,53 @@ fn short(value: &str) -> String {
 /// Wrap `text` to `width` cells under `prefix`, breaking at spaces first and
 /// mid-word only when a single word cannot fit.
 fn wrap(prefix: &str, text: &str, width: usize) -> Vec<String> {
-    let width = width.max(prefix.chars().count() + 8);
-    let indent = " ".repeat(prefix.chars().count());
-    let room = width - prefix.chars().count();
+    let indent = " ".repeat(cells(prefix));
+    wrap_rows(prefix, &indent, text, width)
+}
+
+/// [`wrap`], with a different prefix for every row after the first.
+///
+/// A list item's words hang under the item's first word rather than under its
+/// glyph: the reader scans the items' left edge, not the bullets.
+fn wrap_hanging(prefix: &str, hang: &str, text: &str, width: usize) -> Vec<String> {
+    wrap_rows(prefix, hang, text, width)
+}
+
+/// The wrapper both forms share: `prefix` opens the first row, `hang` opens
+/// every row after it, and the room is what the wider of the two leaves.
+fn wrap_rows(prefix: &str, hang: &str, text: &str, width: usize) -> Vec<String> {
+    let margin = cells(prefix).max(cells(hang));
+    let room = width.max(margin + 8) - margin;
+    let indent = hang.to_string();
     let mut lines: Vec<String> = Vec::new();
     for paragraph in text.split('\n') {
         let mut current = String::new();
+        let mut used = 0usize;
         let mut started = false;
         for word in paragraph.split_whitespace() {
-            if started && current.chars().count() + 1 + word.chars().count() <= room {
+            let word_cells = cells(word);
+            if started && used + 1 + word_cells <= room {
                 current.push(' ');
                 current.push_str(word);
+                used += 1 + word_cells;
                 continue;
             }
             if started {
                 lines.push(std::mem::take(&mut current));
+                used = 0;
             }
-            current.push_str(word);
+            // A word longer than the row is broken instead of lost, at the
+            // last cell boundary that still fits a whole character.
+            for character in word.chars() {
+                let advance = UnicodeWidthChar::width(character).unwrap_or(0);
+                if used > 0 && used + advance > room {
+                    lines.push(std::mem::take(&mut current));
+                    used = 0;
+                }
+                current.push(character);
+                used += advance;
+            }
             started = true;
-            // A word longer than the row is broken instead of lost.
-            while current.chars().count() > room {
-                let tail: String = current.chars().skip(room).collect();
-                let head: String = std::mem::replace(&mut current, tail);
-                let head: String = head.chars().take(room).collect();
-                lines.push(head);
-            }
         }
         lines.push(current);
     }
@@ -8593,19 +10753,24 @@ const FENCE_GUTTER: &str = "│";
 /// that makes code readable, so inside a fence the text is handed to the frame
 /// as it was written - a tab becomes four spaces, and only a line wider than
 /// the frame is broken, under the same gutter, so a reader can still copy a
-/// line off the screen and run it.
+/// line off the screen and run it. Outside a fence the same answer is drawn
+/// through [`prose`], so a heading and a list arrive as a heading and a list
+/// instead of as the marks that wrote them.
 fn message_rows(speaker: &str, text: &str, width: usize) -> Vec<String> {
-    let indent = " ".repeat(speaker.chars().count());
+    let indent = " ".repeat(cells(speaker));
     let mut rows: Vec<String> = Vec::new();
-    let mut prose = String::new();
-    // Where prose continues: the speaker introduces the message once, then
-    // every later chunk hangs under it.
-    let mut prefix = speaker.to_string();
+    // Whether the speaker has been named yet: the first row of a message says
+    // who is talking, and every row after it hangs under that name.
+    let mut named = false;
     let mut in_fence = false;
+    // A message's own trailing newline draws nothing.
+    let text = text.trim_end_matches('\n');
+    if text.is_empty() {
+        return rows;
+    }
     for line in text.split('\n') {
-        let fence = fence_open(line);
         if in_fence {
-            match fence {
+            match fence_open(line) {
                 Some(_) => {
                     close_fence(&mut rows);
                     in_fence = false;
@@ -8614,17 +10779,15 @@ fn message_rows(speaker: &str, text: &str, width: usize) -> Vec<String> {
             }
             continue;
         }
-        let Some(tag) = fence else {
-            prose.push_str(line);
-            prose.push('\n');
+        let Some(tag) = fence_open(line) else {
+            push_line(&mut rows, line, speaker, &indent, &mut named, width);
             continue;
         };
-        push_prose(&mut rows, &mut prose, &mut prefix, &indent, width);
         // A message that opens on a block still names its speaker, or the
         // reader cannot tell an answer from the question above it.
-        if prefix == speaker && rows.is_empty() {
-            rows.push(prefix.clone());
-            prefix = indent.clone();
+        if !named {
+            rows.push(speaker.to_string());
+            named = true;
         }
         rows.push(fence_label(tag, width));
         in_fence = true;
@@ -8632,7 +10795,6 @@ fn message_rows(speaker: &str, text: &str, width: usize) -> Vec<String> {
     if in_fence {
         close_fence(&mut rows);
     }
-    push_prose(&mut rows, &mut prose, &mut prefix, &indent, width);
     rows
 }
 
@@ -8653,7 +10815,7 @@ fn fence_open(line: &str) -> Option<&str> {
 /// one.
 fn fence_label(tag: &str, width: usize) -> String {
     let room = width.saturating_sub(2);
-    let tag: String = tag.chars().take(room).collect();
+    let tag = truncate(tag, room);
     if tag.is_empty() {
         FENCE_OPEN.to_string()
     } else {
@@ -8677,30 +10839,217 @@ fn code_rows(line: &str, width: usize) -> Vec<String> {
     if line.is_empty() {
         return vec![FENCE_GUTTER.to_string()];
     }
-    // Two cells belong to the gutter, so the code gets the rest.
+    // Two cells belong to the gutter, so the code gets the rest. A code line
+    // is broken at a cell boundary, not a character count: a Chinese comment
+    // in a block must not push the gutter out of its column.
     let room = width.saturating_sub(2).max(8);
-    let chars: Vec<char> = line.chars().collect();
-    chars
-        .chunks(room)
-        .map(|chunk| format!("{FENCE_GUTTER} {}", chunk.iter().collect::<String>()))
+    break_cells(line, room)
+        .into_iter()
+        .map(|chunk| format!("{FENCE_GUTTER} {chunk}"))
         .collect()
 }
 
-/// Hand the prose gathered so far to the wrapper, then hang what follows under
-/// the speaker.
-fn push_prose(
+/// The bar a heading opens with.
+///
+/// The desktop makes a heading bold and larger; a terminal's weights are the
+/// terminal's own, so a heading is marked by the bar beside it, inside the
+/// message's own indent.
+const HEADING_MARK: &str = "▌";
+/// The bar a quoted line opens with, one per `>` it was written under.
+const QUOTE_MARK: &str = "▏";
+/// The glyph a list item opens with, one per nesting depth: markdown nests by
+/// indentation, and a model's outline flattened into one glyph loses its shape.
+const BULLET_MARKS: [&str; 3] = ["•", "◦", "▪"];
+/// The box a task item opens with: markdown's `- [ ]` and `- [x]`.
+const TASK_OPEN: &str = "☐";
+const TASK_DONE: &str = "☑";
+
+/// What one line of a message's prose is, as markdown writes it.
+///
+/// The desktop hands an answer to a markdown renderer, so a heading there is a
+/// heading and a list is a list. A terminal draws those shapes with the glyphs
+/// the rest of this client uses, and anything unrecognised stays the text it
+/// was.
+#[derive(Debug, PartialEq, Eq)]
+enum Prose<'a> {
+    /// A blank line: the reader's paragraph break.
+    Blank,
+    /// Words to wrap as they are.
+    Text(&'a str),
+    /// A heading's words; its level is the `#`s, which one bar does not draw.
+    Heading(&'a str),
+    /// A list item: where it nests, and what it says.
+    Item { depth: usize, text: &'a str },
+    /// A checkbox item, and whether it is ticked.
+    Task { done: bool, text: &'a str },
+    /// An ordered item: the number as written, and what it says.
+    Numbered { number: &'a str, text: &'a str },
+    /// A quoted line: how many `>` it opened with, and what it quotes.
+    Quote { depth: usize, text: &'a str },
+    /// `---`, `***` or `___`: the answer's own horizontal rule.
+    Rule,
+}
+
+/// What one source line of prose is.
+fn prose(line: &str) -> Prose<'_> {
+    let line = line.trim_end();
+    if line.trim().is_empty() {
+        return Prose::Blank;
+    }
+    let body = line.trim_start();
+    // Nesting is what the leading spaces say: two cells is one level, and an
+    // outline deeper than the glyphs this client has folds into the last one.
+    let depth = ((line.len() - body.len()) / 2).min(BULLET_MARKS.len() - 1);
+    if let Some(text) = heading(body) {
+        return Prose::Heading(text);
+    }
+    if is_rule(body) {
+        return Prose::Rule;
+    }
+    if let Some(quoted) = body.strip_prefix('>') {
+        let marks = body
+            .chars()
+            .take_while(|character| *character == '>')
+            .count();
+        return Prose::Quote {
+            depth: marks.clamp(1, 3),
+            text: quoted.trim_start_matches('>').trim_start(),
+        };
+    }
+    let marker = body.chars().next().unwrap_or(' ');
+    // A list item's marker is `-`, `*` or `+` followed by a space; the first
+    // character of a word is not a marker.
+    if matches!(marker, '-' | '*' | '+') && body[1..].starts_with(' ') {
+        let rest = body[1..].trim_start();
+        for (token, done) in [("[ ]", false), ("[x]", true), ("[X]", true)] {
+            if let Some(text) = rest.strip_prefix(token) {
+                return Prose::Task {
+                    done,
+                    text: text.trim_start(),
+                };
+            }
+        }
+        return Prose::Item { depth, text: rest };
+    }
+    // An ordered item keeps the number it was written with: renumbering a
+    // model's list would argue with the text that refers to its steps.
+    if marker.is_ascii_digit() {
+        let digits = body
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .count();
+        let after = &body[digits..];
+        if let Some(text) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
+            return Prose::Numbered {
+                number: &body[..digits],
+                text: text.trim_start(),
+            };
+        }
+    }
+    Prose::Text(body)
+}
+
+/// A heading's words, when the line opens with one to six `#`s and a space.
+///
+/// `#tag` is a word, not a heading: markdown wants the space, so a line that
+/// skips it stays the text it was.
+fn heading(body: &str) -> Option<&str> {
+    let hashes = body
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &body[hashes..];
+    if rest.is_empty() {
+        return Some(rest);
+    }
+    rest.starts_with(' ').then(|| rest.trim_start())
+}
+
+/// Whether the line is a horizontal rule: three or more of `-`, `*` or `_`,
+/// which is the whole rule markdown uses.
+fn is_rule(body: &str) -> bool {
+    let mut marks = body.chars().filter(|character| !character.is_whitespace());
+    let Some(first) = marks.next() else {
+        return false;
+    };
+    if !matches!(first, '-' | '*' | '_') {
+        return false;
+    }
+    let mut count = 1;
+    for character in marks {
+        if character != first {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 3
+}
+
+/// One prose source line, drawn the way the desktop's markdown renders it.
+fn push_line(
     rows: &mut Vec<String>,
-    prose: &mut String,
-    prefix: &mut String,
+    line: &str,
+    speaker: &str,
     indent: &str,
+    named: &mut bool,
     width: usize,
 ) {
-    let body = prose.trim_end_matches('\n');
-    if !body.trim().is_empty() {
-        rows.extend(wrap(prefix, body, width));
-        *prefix = indent.to_string();
+    // The first row of a message names its speaker; the rows after it hang
+    // under that name.
+    let first = if *named { indent } else { speaker };
+    match prose(line) {
+        Prose::Blank => {
+            // Nothing drawn yet means there is no paragraph to break: a message
+            // that opens on a blank line starts on its first word.
+            if rows.is_empty() {
+                return;
+            }
+            rows.push(first.to_string());
+        }
+        Prose::Text(text) => rows.extend(wrap(first, text, width)),
+        Prose::Heading(text) => block(
+            rows,
+            first,
+            indent,
+            &format!("{HEADING_MARK} "),
+            text,
+            width,
+        ),
+        Prose::Item { depth, text } => {
+            let glyph = format!("{} ", BULLET_MARKS[depth]);
+            block(rows, first, indent, &glyph, text, width);
+        }
+        Prose::Task { done, text } => {
+            let glyph = if done { TASK_DONE } else { TASK_OPEN };
+            block(rows, first, indent, &format!("{glyph} "), text, width);
+        }
+        Prose::Numbered { number, text } => {
+            block(rows, first, indent, &format!("{number}. "), text, width);
+        }
+        Prose::Quote { depth, text } => {
+            let bar = format!("{} ", QUOTE_MARK.repeat(depth));
+            block(rows, first, indent, &bar, text, width);
+        }
+        // A rule is a row of its own at the frame's full width, without the
+        // speaker's indent: it separates the message from itself, and the
+        // frame paints a row of `─` as the rule it is.
+        Prose::Rule => rows.push("─".repeat(width)),
     }
-    prose.clear();
+    *named = true;
+}
+
+/// Wrap a marked block: its glyph joins the speaker on the message's first
+/// row, and every row after it hangs under the block's words.
+fn block(rows: &mut Vec<String>, first: &str, indent: &str, glyph: &str, text: &str, width: usize) {
+    let head = format!("{first}{glyph}");
+    let hang = format!("{indent}{}", " ".repeat(cells(glyph)));
+    rows.extend(wrap_hanging(&head, &hang, text, width));
 }
 
 #[cfg(test)]
@@ -8793,6 +11142,158 @@ mod tests {
     }
 
     #[test]
+    fn prose_is_read_the_way_markdown_writes_it() {
+        assert_eq!(prose("plain words"), Prose::Text("plain words"));
+        assert_eq!(prose("## Steps"), Prose::Heading("Steps"));
+        assert_eq!(
+            prose("#tag is not a heading"),
+            Prose::Text("#tag is not a heading"),
+            "markdown wants the space, so a word that starts with # stays a word"
+        );
+        assert_eq!(
+            prose("- one"),
+            Prose::Item {
+                depth: 0,
+                text: "one"
+            }
+        );
+        assert_eq!(
+            prose("    - deep"),
+            Prose::Item {
+                depth: 2,
+                text: "deep"
+            },
+            "four spaces is two levels of nesting"
+        );
+        assert_eq!(
+            prose("- [x] done"),
+            Prose::Task {
+                done: true,
+                text: "done"
+            }
+        );
+        assert_eq!(
+            prose("- [ ] open"),
+            Prose::Task {
+                done: false,
+                text: "open"
+            }
+        );
+        assert_eq!(
+            prose("2) second"),
+            Prose::Numbered {
+                number: "2",
+                text: "second"
+            }
+        );
+        assert_eq!(
+            prose(">> quoted"),
+            Prose::Quote {
+                depth: 2,
+                text: "quoted"
+            }
+        );
+        assert_eq!(prose("---"), Prose::Rule);
+        assert_eq!(prose("  "), Prose::Blank);
+        assert_eq!(
+            prose("-5 degrees"),
+            Prose::Text("-5 degrees"),
+            "a minus sign without a space after it is arithmetic, not a list"
+        );
+    }
+
+    #[test]
+    fn a_markdown_answer_keeps_its_headings_lists_and_rules() {
+        let rows = message_rows(
+            "bsh › ",
+            "## Plan\n- first step\n- [x] done\n> note\n---\ntext",
+            40,
+        );
+        assert_eq!(rows[0], "bsh › ▌ Plan", "a heading is marked, not spelled");
+        assert_eq!(
+            rows[1], "      • first step",
+            "an item hangs under the speaker"
+        );
+        assert_eq!(
+            rows[2], "      ☑ done",
+            "a ticked box is the glyph of the task"
+        );
+        assert_eq!(rows[3], "      ▏ note");
+        assert_eq!(
+            rows[4],
+            "─".repeat(40),
+            "a rule is a row of its own, at the frame's full width"
+        );
+        assert_eq!(rows[5].trim(), "text");
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains("##") && !row.contains("- ")),
+            "no markdown marker reaches the screen: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_list_item_hangs_under_its_words_not_under_its_bullet() {
+        let rows = message_rows("you › ", "- alpha beta gamma delta", 20);
+        assert_eq!(
+            rows[0], "you › • alpha beta",
+            "the speaker and the glyph share the first row"
+        );
+        assert!(rows.len() > 1, "the item wraps: {rows:?}");
+        assert!(
+            rows[1].starts_with("        "),
+            "the text hangs two cells past the speaker, under the first word: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| cells(row) <= 20),
+            "the hanging indent still fits the frame: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn wide_text_fills_the_columns_it_occupies_not_the_characters_it_has() {
+        // Ten ideographs are twenty cells. Counting characters would put them
+        // on one row of "ten" and paint it past the frame's right border, which
+        // is what a Chinese paragraph looked like before this measured cells.
+        let text = "日本語の説明文です。";
+        let rows = wrap("› ", text, 12);
+        assert!(
+            rows.iter().all(|row| cells(row) <= 12),
+            "every row fits the frame: {rows:?}"
+        );
+        assert!(
+            rows.len() > 1,
+            "one row's worth of characters is more than the frame holds"
+        );
+        assert!(
+            rows[1].starts_with("  "),
+            "continuation hangs under the speaker: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_code_line_breaks_at_a_whole_character() {
+        let rows = message_rows(">> ", "```\n日本語のコメント\n```", 10);
+        assert!(
+            rows.iter().all(|row| cells(row) <= 10),
+            "the gutter stays in its column: {rows:?}"
+        );
+        assert_eq!(rows[2], "│ 日本語の", "four wide glyphs are eight cells");
+        assert!(
+            rows.iter().any(|row| row == "│ コメント"),
+            "the line continues under the same gutter: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn truncation_keeps_the_cells_it_promised() {
+        assert_eq!(cells("日本語"), 6);
+        assert_eq!(truncate("日本語テキスト", 8), "日本語…");
+        assert_eq!(cells(&truncate("日本語テキスト", 8)), 7);
+        assert_eq!(cells(&pad("日本語", 8)), 8);
+    }
+
+    #[test]
     fn slash_lines_parse_and_mistakes_stay_local() {
         assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
         assert_eq!(SlashCommand::parse("/compact"), Some(SlashCommand::Compact));
@@ -8837,6 +11338,20 @@ mod tests {
             SlashCommand::parse("/queue"),
             Some(SlashCommand::Queue(None))
         );
+        // The verdicts: approving takes nothing, and refusing keeps the reader's
+        // reason whole, because that sentence is the note the audit records.
+        assert_eq!(SlashCommand::parse("/approve"), Some(SlashCommand::Approve));
+        assert!(matches!(
+            SlashCommand::parse("/approve now"),
+            Some(SlashCommand::Usage(_))
+        ));
+        assert_eq!(SlashCommand::parse("/deny"), Some(SlashCommand::Deny(None)));
+        assert_eq!(
+            SlashCommand::parse("/deny the target is production"),
+            Some(SlashCommand::Deny(Some(
+                "the target is production".to_string()
+            )))
+        );
         // `/sessions` takes a number or free-text filter: a title carries
         // spaces, so the whole argument is kept.
         assert_eq!(
@@ -8853,8 +11368,37 @@ mod tests {
                 "release the hounds".to_string()
             )))
         );
-        // `/feedback` reads with no argument, drops on a `clear`, and otherwise
-        // takes the note verbatim, spaces and all.
+        // `/copy` reads the newest answer, a count back from it, or the
+        // desktop session menu's other row: the open session's id.
+        assert_eq!(SlashCommand::parse("/copy"), Some(SlashCommand::Copy(None)));
+        assert_eq!(
+            SlashCommand::parse("/copy 2"),
+            Some(SlashCommand::Copy(Some(2)))
+        );
+        assert_eq!(SlashCommand::parse("/copy id"), Some(SlashCommand::CopyId));
+        assert_eq!(
+            SlashCommand::parse("/copy ID"),
+            Some(SlashCommand::CopyId),
+            "the word is a noun, not a case-sensitive key"
+        );
+        // Zero names a message before the newest one, and a second word is a
+        // sentence this command does not read.
+        assert!(matches!(
+            SlashCommand::parse("/copy 0"),
+            Some(SlashCommand::Usage(_))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/copy id now"),
+            Some(SlashCommand::Usage(_))
+        ));
+        // A branch names nothing: the Host derives the chat from the open
+        // session, so an argument is a usage line rather than a title.
+        assert_eq!(SlashCommand::parse("/fork"), Some(SlashCommand::Fork));
+        assert!(matches!(
+            SlashCommand::parse("/fork release"),
+            Some(SlashCommand::Usage(_))
+        ));
+
         assert_eq!(
             SlashCommand::parse("/feedback"),
             Some(SlashCommand::Feedback(None))
@@ -9088,6 +11632,108 @@ mod tests {
         assert_eq!(cursor, (0, 2));
     }
 
+    /// Home and End are line gestures on a multi-line draft: the cursor lands
+    /// on the edge of its own line, never on the edge of the whole prompt.
+    #[test]
+    fn a_line_step_stops_at_the_cursor_line() {
+        let draft = "first line\nsecond line\nthird";
+        let second = draft.find("second").expect("second line");
+        let inside = second + "second".len();
+        assert_eq!(line_start(draft, inside), second);
+        assert_eq!(line_end(draft, inside), second + "second line".len());
+        // The first and last lines have no newline on one side, so the draft's
+        // own edges are theirs.
+        assert_eq!(line_start(draft, 0), 0);
+        assert_eq!(line_start(draft, inside), second);
+        assert_eq!(line_end(draft, 0), "first line".len());
+        assert_eq!(line_end(draft, draft.len()), draft.len());
+        // A cursor past the end is clamped rather than panicking: the draft can
+        // shrink under a key the frame already read, and the clamp lands on the
+        // last line, which is the one the reader was typing into.
+        assert_eq!(
+            line_start(draft, draft.len() + 40),
+            draft.find("third").expect("third line")
+        );
+    }
+
+    /// A word step lands on a word's edges and steps over the gap after it, so
+    /// repeating the key walks the draft instead of stalling on spaces.
+    #[test]
+    fn a_word_step_lands_on_word_edges_and_skips_the_gap() {
+        let draft = "fix the  parser bug";
+        let parser = draft.find("parser").expect("parser");
+        let bug = draft.find("bug").expect("bug");
+        // Backwards: the last word, the one before it, and the one before that
+        // - the double space between "the" and "parser" is crossed, not landed
+        // in.
+        assert_eq!(word_start(draft, draft.len()), bug);
+        assert_eq!(word_start(draft, bug), parser);
+        assert_eq!(word_start(draft, parser), draft.find("the").expect("the"));
+        assert_eq!(word_start(draft, 0), 0, "nothing before the first word");
+        // Forwards: past each word, never onto the space following it.
+        assert_eq!(word_end(draft, 0), draft.find(' ').expect("space"));
+        assert_eq!(word_end(draft, 3), draft.find("the").expect("the") + 3);
+        assert_eq!(word_end(draft, 7), parser + "parser".len());
+        assert_eq!(word_end(draft, draft.len()), draft.len());
+        // A CJK word has no spaces inside it, so the step crosses it whole and
+        // the boundary stays on a character edge.
+        let cjk = "修复 解析器";
+        assert_eq!(word_start(cjk, cjk.len()), "修复 ".len());
+        assert!(cjk.is_char_boundary(word_start(cjk, cjk.len())));
+    }
+
+    /// Delete and the three kills cut exactly the range their names describe,
+    /// which is what makes them predictable without a selection.
+    #[test]
+    fn the_delete_and_kill_chords_cut_the_range_they_name() {
+        // Delete takes the character under the cursor; the cursor stays.
+        let mut input = "abc".to_string();
+        let mut cursor = 1;
+        delete_forward(&mut input, &mut cursor);
+        assert_eq!((input.as_str(), cursor), ("ac", 1));
+        // At the end there is nothing under the cursor: no edit, no panic.
+        let mut cursor = input.len();
+        delete_forward(&mut input, &mut cursor);
+        assert_eq!((input.as_str(), cursor), ("ac", 2));
+
+        // Ctrl-K cuts to the end of the cursor's line and leaves the lines
+        // below it alone.
+        let mut input = "one two\nthree\nfour".to_string();
+        let mut cursor = 4;
+        kill_to_line_end(&mut input, &mut cursor);
+        assert_eq!((input.as_str(), cursor), ("one \nthree\nfour", 4));
+        // At a line's end the only thing to the right is the newline, so the
+        // chord joins the next line rather than doing nothing.
+        let mut input = "one\nthree".to_string();
+        let mut cursor = 3;
+        kill_to_line_end(&mut input, &mut cursor);
+        assert_eq!((input.as_str(), cursor), ("onethree", 3));
+
+        // Ctrl-U cuts back to the start of the cursor's line.
+        let mut input = "one two\nthree".to_string();
+        let mut cursor = 13;
+        kill_to_line_start(&mut input, &mut cursor);
+        assert_eq!((input.as_str(), cursor), ("one two\n", 8));
+        // At a line start it takes the newline before it, joining upwards.
+        let mut input = "one two\nthree".to_string();
+        let mut cursor = 8;
+        kill_to_line_start(&mut input, &mut cursor);
+        assert_eq!((input.as_str(), cursor), ("one twothree", 7));
+        // An empty draft is not an edit.
+        let mut input = String::new();
+        let mut cursor = 0;
+        kill_to_line_start(&mut input, &mut cursor);
+        assert_eq!((input.as_str(), cursor), ("", 0));
+
+        // Ctrl-W takes the word before the cursor, with the space it left.
+        let mut input = "fix the parser".to_string();
+        let mut cursor = input.len();
+        kill_word(&mut input, &mut cursor);
+        assert_eq!((input.as_str(), cursor), ("fix the ", 8));
+        kill_word(&mut input, &mut cursor);
+        assert_eq!((input.as_str(), cursor), ("fix ", 4));
+    }
+
     #[test]
     fn a_tall_prompt_scrolls_but_never_loses_the_cursor() {
         let input = (0..10)
@@ -9204,11 +11850,24 @@ mod tests {
         // The list draws its rows from its own catalogue, so a row no parser
         // arm owns would offer the reader a line that answers only with
         // "unknown command".
-        for name in super::menu::command_names() {
+        for (name, bare) in super::menu::command_rows_for_test() {
             match SlashCommand::parse(name) {
-                Some(SlashCommand::Unknown(_)) | Some(SlashCommand::Usage(_)) | None => {
-                    panic!("the menu offers '{name}', which the parser does not run")
+                // A row the parser has never heard of is a promise the list
+                // cannot keep, whichever way it is accepted.
+                None | Some(SlashCommand::Unknown(_)) => {
+                    panic!("the menu offers '{name}', which the parser does not know")
                 }
+                // A row that runs the moment it is accepted has to run when
+                // the same line is typed with no argument: answering with a
+                // usage line would leave the reader staring at a command that
+                // did nothing.
+                Some(SlashCommand::Usage(_)) if bare => {
+                    panic!("the menu runs '{name}' on accept, but the parser asks for an argument")
+                }
+                // A row that leaves the composer open for its argument is
+                // allowed to answer with its usage line: `/find` alone names
+                // no text to search for, and the row's job was to put the
+                // cursor where the argument is typed.
                 Some(_) => {}
             }
         }
@@ -9277,6 +11936,132 @@ mod tests {
         assert!(session_title(None).starts_with("Session "));
     }
 
+    /// The rail's rows are the sessions it paints, and only those: a click
+    /// past the list, on the separator beside it or in a frame too narrow to
+    /// have a rail opens no session.
+    #[test]
+    fn a_click_names_a_rail_row_only_inside_the_list() {
+        // A hundred-column frame draws a twenty-five-cell rail; row 2 is the
+        // body's first row, directly under the header and its rule.
+        assert_eq!(rail_offset(2, 0, 100, 20), Some(0));
+        assert_eq!(
+            rail_offset(3, 24, 100, 20),
+            Some(1),
+            "the list's second row is the frame's third"
+        );
+        assert_eq!(
+            rail_offset(21, 24, 100, 20),
+            Some(19),
+            "the last body row is still the rail's"
+        );
+        assert_eq!(
+            rail_offset(2, 25, 100, 20),
+            None,
+            "the separator column is not a session row"
+        );
+        assert_eq!(rail_offset(1, 3, 100, 20), None, "the header names nothing");
+        assert_eq!(
+            rail_offset(22, 3, 100, 20),
+            None,
+            "a row below the body is the composer's"
+        );
+        // A narrow frame paints no rail at all: its first column is the
+        // transcript's.
+        assert_eq!(rail_offset(2, 0, 60, 20), None);
+        // Before the first frame is painted there is no rail to name.
+        assert_eq!(rail_offset(2, 0, 0, 20), None);
+    }
+
+    /// The transcript column owns every body column the rail does not: the
+    /// separator beside the rail, the header and the rows past the body name
+    /// no transcript row.
+    #[test]
+    fn a_click_names_a_transcript_row_only_inside_the_column() {
+        // A hundred-column frame draws a twenty-five-cell rail and a
+        // seventy-four-cell transcript after the separator at column 25.
+        assert_eq!(transcript_width(100), 74);
+        assert_eq!(transcript_offset(2, 26, 100, 20), Some(0));
+        assert_eq!(
+            transcript_offset(21, 99, 100, 20),
+            Some(19),
+            "the body's last row is the transcript's"
+        );
+        assert_eq!(
+            transcript_offset(2, 25, 100, 20),
+            None,
+            "the separator column belongs to neither column"
+        );
+        assert_eq!(
+            transcript_offset(1, 30, 100, 20),
+            None,
+            "the header is not a row"
+        );
+        assert_eq!(
+            transcript_offset(2, 0, 100, 20),
+            None,
+            "the rail is not the transcript"
+        );
+        assert_eq!(
+            transcript_offset(22, 30, 100, 20),
+            None,
+            "a row below the body is the composer's"
+        );
+        // A narrow frame paints no rail, so its whole row is the transcript's.
+        assert_eq!(transcript_width(60), 60);
+        assert_eq!(transcript_offset(2, 0, 60, 20), Some(0));
+        // A column past the frame's own cells is not painted, so it names
+        // nothing even though it falls right of the rail.
+        assert_eq!(transcript_offset(2, 100, 100, 20), None);
+        // Before the first frame is painted there is no column to name.
+        assert_eq!(transcript_offset(2, 0, 0, 20), None);
+    }
+
+    /// The hits a click reads are the rows the frame paints: a row that draws
+    /// a tool call names that call, and a prose or blank row names nothing.
+    #[test]
+    fn a_transcript_row_names_the_call_the_frame_paints_there() {
+        // Every row of a call names the call, not only its first: the changed
+        // patch row is what a reader points at when they want the diff.
+        let lines: Vec<(String, Option<usize>)> = vec![
+            ("you › go".to_string(), None),
+            ("✓ bash · done".to_string(), Some(0)),
+            ("  + changed".to_string(), Some(0)),
+            ("✓ fs.read · done".to_string(), Some(1)),
+        ];
+        // A body taller than the document fills its top with blanks, so the
+        // newest row still sits directly above the composer.
+        let (texts, hits) = window_rows(&lines, 6, 0);
+        assert_eq!(texts.len(), 6);
+        assert_eq!(hits, [None, None, None, Some(0), Some(0), Some(1)]);
+        assert!(
+            texts[..2].iter().all(String::is_empty),
+            "the fill above the document is blank: {texts:?}"
+        );
+        assert_eq!(texts[5], "✓ fs.read · done");
+
+        // Scrolling lifts older rows into view; the hits move with them, so a
+        // click never opens the call that used to be at that row.
+        let (texts, hits) = window_rows(&lines, 6, 1);
+        assert_eq!(texts.len(), 6);
+        assert_eq!(hits, [None, None, None, None, Some(0), Some(0)]);
+
+        // A full body shows exactly its rows and nothing above them.
+        let (texts, hits) = window_rows(&lines, 3, 0);
+        assert_eq!(
+            texts,
+            vec![
+                "✓ bash · done".to_string(),
+                "  + changed".to_string(),
+                "✓ fs.read · done".to_string(),
+            ]
+        );
+        assert_eq!(hits, [Some(0), Some(0), Some(1)]);
+        // Scrolling past the top shows only the fill the document has.
+        let (texts, hits) = window_rows(&lines, 3, 9);
+        assert!(texts.iter().all(String::is_empty), "{texts:?}");
+        assert_eq!(hits, [None, None, None]);
+    }
+
     /// The `@` card's session rows resolve back to the snapshot's own row: an
     /// id another client parked since the picker opened opens nothing.
     #[test]
@@ -9303,6 +12088,57 @@ mod tests {
         );
         assert_eq!(session_index(&sessions, "not-an-id"), None);
         assert_eq!(session_index(&[], &first.to_string()), None);
+    }
+
+    /// The card an empty session opens on answers the three questions a
+    /// reader has before typing: where the turn runs, what it resolves from and
+    /// how to start one. Every row is cut to the frame, so a long title or a
+    /// narrow terminal cannot break the box.
+    #[test]
+    fn an_empty_session_opens_on_the_workspace_card() {
+        let root = Path::new("/Users/dev/bos");
+        let card = hero_rows(None, Some(root), 80);
+        assert_eq!(card.first().map(String::as_str), Some("╭ bos"));
+        assert_eq!(card.last().map(String::as_str), Some("╰"));
+        assert!(card.iter().any(|row| row.contains("^T starts one")));
+        assert!(card.iter().any(|row| row.contains("Enter sends a turn")));
+        // A Host serving no folder says so rather than leaving the title blank.
+        assert_eq!(
+            hero_rows(None, None, 80).first().map(String::as_str),
+            Some("╭ no workspace")
+        );
+        // The card is rows, not a document: a 12-column frame cuts each one.
+        for row in hero_rows(None, Some(root), 12) {
+            assert!(row.chars().count() <= 12, "row wider than the frame: {row}");
+        }
+    }
+
+    /// The Host says where turns run and the client believes it: a terminal
+    /// launched in one folder and attached to a Host serving another lists the
+    /// Host's tree, because that is the tree `@`, `/files` and the shell read.
+    #[test]
+    fn the_client_adopts_the_workspace_the_host_names() {
+        assert_eq!(
+            host_workspace("/Users/dev/bos", Some(PathBuf::from("/tmp"))),
+            Some(PathBuf::from("/Users/dev/bos")),
+            "the Host's root wins over the launching directory"
+        );
+        assert_eq!(
+            host_workspace("/Users/dev/bos", None),
+            Some(PathBuf::from("/Users/dev/bos")),
+            "an attached client with no directory of its own still knows the tree"
+        );
+        // A Host with no workspace surface names nothing; the client keeps the
+        // directory it opened with rather than losing the tree it can read.
+        assert_eq!(
+            host_workspace("", Some(PathBuf::from("/tmp"))),
+            Some(PathBuf::from("/tmp"))
+        );
+        assert_eq!(
+            host_workspace("   ", Some(PathBuf::from("/tmp"))),
+            Some(PathBuf::from("/tmp"))
+        );
+        assert_eq!(host_workspace("", None), None);
     }
 
     #[test]
@@ -9358,6 +12194,16 @@ mod tests {
             "the row names what waits: {row}"
         );
 
+        // The desktop sidebar stars a pinned chat; a terminal spells the same
+        // state as a word beside the age, and an unpinned row never carries it.
+        let mut starred = summary("Starred", None, 9);
+        starred.pinned = true;
+        assert_eq!(
+            session_row(0, &starred, false, now),
+            " 1. Starred · 9m · 3 msg · pinned"
+        );
+        assert!(!session_row(0, &open, false, now).contains("pinned"));
+
         // A filter reads the title and the newest message, without case, the
         // two fields the desktop's search box matches.
         assert!(session_matches(&open, "REL"));
@@ -9372,6 +12218,22 @@ mod tests {
         assert!(listed.ends_with("… 2 more"), "{listed}");
         assert!(session_summary(&[], 0, None).contains("no sessions"));
         assert!(session_summary(&[], 4, Some("zzz")).contains("no session matches 'zzz'"));
+    }
+
+    #[test]
+    fn the_archived_filter_lists_its_rows_and_names_the_way_back() {
+        // The filter has its own status line: it answers a different question
+        // from `/sessions`, so it says how many of the archived chats a search
+        // matched and which verb takes a row back out.
+        let rows = vec!["row".to_string(); 12];
+        let listed = archived_summary(&rows, 20, None);
+        assert!(listed.starts_with("archived: 12 of 20 · row"), "{listed}");
+        assert!(listed.ends_with("… 2 more | /sessions unarchive <n> brings one back"));
+        assert!(archived_summary(&[], 0, None).contains("no archived sessions"));
+        assert!(
+            archived_summary(&[], 3, Some("zzz"))
+                .contains("no archived session matches 'zzz' · 3 archived")
+        );
     }
 
     #[test]
@@ -12074,5 +14936,349 @@ mod tests {
             lines.iter().any(|row| row.contains("turn 1")),
             "a scroll past the top lands on the first row: {lines:?}"
         );
+    }
+
+    /// A catalogue with one model per provider and one preset, so a list has
+    /// two rows that differ in both columns.
+    fn picker_catalogue() -> CatalogueView {
+        CatalogueView {
+            providers: vec![
+                crate::runtime::contract::ProviderModels {
+                    provider: "deepseek".to_string(),
+                    models: vec!["deepseek-flash".to_string()],
+                },
+                crate::runtime::contract::ProviderModels {
+                    provider: "openai".to_string(),
+                    models: vec!["qwen3.8-flash".to_string()],
+                },
+            ],
+            presets: vec!["review".to_string()],
+            ..CatalogueView::default()
+        }
+    }
+
+    fn list_of(kind: picker::Kind) -> picker::Picker {
+        picker::Picker::new(kind.title(), kind.items(&picker_catalogue()))
+    }
+
+    #[test]
+    fn a_bare_command_draws_its_choices_as_a_list_not_a_line_of_names() {
+        let rows = picker_lines(&list_of(picker::Kind::Model), 48);
+        // The first row says what is being chosen and that a keystroke narrows
+        // it; without that, a list looks like transcript.
+        assert!(rows[0].starts_with("choose a model"), "{}", rows[0]);
+        assert!(rows[0].contains("type to narrow"), "{}", rows[0]);
+        // One row per choice: the highlight on the first, the fact on the right
+        // edge and on the same column for both rows, so the column reads down.
+        assert!(rows[1].starts_with("› "), "{}", rows[1]);
+        assert!(rows[1].trim_end().ends_with("deepseek"), "{}", rows[1]);
+        assert!(rows[2].starts_with("  "), "{}", rows[2]);
+        assert!(rows[2].trim_end().ends_with("openai"), "{}", rows[2]);
+        assert_eq!(
+            cells(&rows[1]),
+            cells(&rows[2]),
+            "the rows end on one column: {rows:?}"
+        );
+        assert_eq!(
+            cells(&rows[1]),
+            48,
+            "the fact reaches the right edge: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| cells(row) <= 48),
+            "no row overflows the frame: {rows:?}"
+        );
+        // The last row says how much the list holds and which keys spend it.
+        let footer = rows.last().expect("a footer row");
+        assert!(footer.contains("2 choice(s)"), "{footer}");
+        assert!(footer.contains("Enter picks"), "{footer}");
+    }
+
+    #[test]
+    fn a_typed_filter_narrows_the_list_and_says_how_much_of_it_still_matches() {
+        let mut list = list_of(picker::Kind::Model);
+        for character in "qwen".chars() {
+            list.typed(character);
+        }
+        let rows = picker_lines(&list, 48);
+        assert!(rows[0].contains("filter 'qwen'"), "{}", rows[0]);
+        assert_eq!(rows.len(), 3, "the title, the one match, the count");
+        assert!(rows[1].contains("qwen3.8-flash"), "{}", rows[1]);
+        assert!(
+            rows[2].contains("1 of 2 match"),
+            "a narrowed list says what it held: {}",
+            rows[2]
+        );
+        // A filter that matches nothing still says what happened and how to get
+        // out instead of drawing an empty box that reads as a closed list.
+        for character in "zzz".chars() {
+            list.typed(character);
+        }
+        let rows = picker_lines(&list, 48);
+        assert!(rows[1].contains("none match"), "{}", rows[1]);
+        assert!(rows[2].contains("Esc closes"), "{}", rows[2]);
+    }
+
+    #[test]
+    fn a_long_list_draws_a_window_that_follows_the_highlight() {
+        let items: Vec<picker::Item> = (0..12)
+            .map(|index| picker::Item {
+                label: format!("model-{index}"),
+                detail: "openai".to_string(),
+                choice: picker::Choice::Preset(format!("model-{index}")),
+                active: false,
+            })
+            .collect();
+        let mut list = picker::Picker::new("choose a model", items);
+        let rows = picker_lines(&list, 48);
+        assert_eq!(rows.len(), 10, "the title, eight rows, the count");
+        assert!(list_of(picker::Kind::Model).len() < 12);
+        assert!(
+            rows.last().expect("a footer").starts_with("… "),
+            "a window with more below says so: {}",
+            rows.last().expect("a footer")
+        );
+        // Walk to the end: the window moves so the highlight stays drawn, and
+        // nothing follows it any more.
+        while list.move_by(1) {}
+        let rows = picker_lines(&list, 48);
+        assert!(rows[1].contains("model-4"), "the window moved: {rows:?}");
+        assert!(
+            rows[8].starts_with("› "),
+            "the last choice is drawn: {rows:?}"
+        );
+        assert!(
+            !rows.last().expect("a footer").starts_with("… "),
+            "nothing follows the last row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_picked_row_commits_the_command_the_reader_could_have_typed() {
+        // A pick and a typed name are the same gesture in the end: both land on
+        // one `SlashCommand`, so a chosen row cannot take a different path to
+        // the Host than the name it stands for.
+        let models = list_of(picker::Kind::Model);
+        assert_eq!(
+            pick_command(models.choice().expect("the first row is highlighted")),
+            SlashCommand::parse("/model deepseek deepseek-flash").expect("the typed form")
+        );
+        let presets = list_of(picker::Kind::Preset);
+        assert_eq!(
+            pick_command(presets.choice().expect("the first row is highlighted")),
+            SlashCommand::parse("/preset review").expect("the typed form")
+        );
+        let modes = list_of(picker::Kind::Permission);
+        assert_eq!(
+            pick_command(modes.choice().expect("the first row is highlighted")),
+            SlashCommand::parse("/permission read-only").expect("the typed form")
+        );
+    }
+
+    /// A bare `/sessions` opens the workspace as a list, the way the desktop's
+    /// session menu does; its rows are the printed listing's own numbers.
+    #[test]
+    fn a_bare_sessions_command_lists_the_workspace_as_rows_to_pick_from() {
+        let now = Utc::now();
+        let row = |title: &str, minutes: i64, messages: usize, pinned: bool| SessionSummary {
+            session_id: SessionId::new(),
+            title: title.to_string(),
+            version: 1,
+            updated_at: now - chrono::Duration::minutes(minutes),
+            message_count: messages,
+            preview: None,
+            active_execution: None,
+            pending_approvals: 0,
+            pinned,
+            archived: false,
+        };
+        let sessions = vec![
+            row("draft the RFC", 2, 12, true),
+            row("fix the build", 90, 3, false),
+        ];
+        let items = session_items(&sessions, Some(1), picker::Kind::Session);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "draft the RFC");
+        assert!(items[0].detail.contains("2m"), "{}", items[0].detail);
+        assert!(items[0].detail.contains("12 msg"), "{}", items[0].detail);
+        assert!(items[0].detail.contains("pinned"), "{}", items[0].detail);
+        // The open chat is the ticked row, so the list says where the reader is
+        // as well as where they might go.
+        assert!(!items[0].active);
+        assert!(items[1].active);
+        let mut list = picker::Picker::new(picker::Kind::Session.title(), items);
+        let rows = picker_lines(&list, 60);
+        assert!(rows[0].starts_with("open a session"), "{}", rows[0]);
+        assert!(rows[1].starts_with("› "), "{}", rows[1]);
+        // A list that carries a tick explains it; the sessions list does.
+        assert!(
+            picker_lines(&list, 200)
+                .last()
+                .is_some_and(|footer| footer.contains("marks the active row")),
+            "the tick is named where a row shows it"
+        );
+        // Enter sends the number the printed listing prints, so a pick and a
+        // typed number land on the same Host call.
+        assert_eq!(
+            pick_command(list.choice().expect("the first row is highlighted")),
+            SlashCommand::Sessions(Some("1".to_string()))
+        );
+        // A filter narrows the list, and the number follows the row, not the
+        // position it is drawn at.
+        for character in "build".chars() {
+            list.typed(character);
+        }
+        assert_eq!(list.rows().len(), 1);
+        assert_eq!(
+            pick_command(list.choice().expect("the one match")),
+            SlashCommand::Sessions(Some("2".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_bin_and_the_archive_open_as_lists_whose_pick_is_the_typed_command() {
+        let now = Utc::now();
+        let parked = |title: &str, minutes: i64| SessionSummary {
+            session_id: SessionId::new(),
+            title: title.to_string(),
+            version: 1,
+            updated_at: now - chrono::Duration::minutes(minutes),
+            message_count: 4,
+            preview: None,
+            active_execution: None,
+            pending_approvals: 0,
+            pinned: false,
+            archived: false,
+        };
+
+        // A bin row is the number `/restore` takes, and nothing in the bin is
+        // the open chat, so no row carries a tick.
+        let bin = session_items(
+            &[parked("keep me", 5), parked("older", 90)],
+            None,
+            picker::Kind::Trash,
+        );
+        assert!(bin.iter().all(|item| !item.active));
+        assert_eq!(bin[0].label, "keep me");
+        let mut list = picker::Picker::new(picker::Kind::Trash.title(), bin);
+        assert!(
+            picker_lines(&list, 60)[0].starts_with("restore a parked session"),
+            "the list says what Enter does"
+        );
+        // No row of the bin is ticked, so the footer does not explain a mark
+        // the reader will never see.
+        let footer = picker_lines(&list, 200).pop().expect("a footer row");
+        assert!(
+            !footer.contains("marks the active row"),
+            "the bin has nothing to mark: {footer}"
+        );
+        assert!(footer.contains("Enter picks"), "{footer}");
+        assert_eq!(
+            pick_command(list.choice().expect("the first row is highlighted")),
+            SlashCommand::Restore(Some("1".to_string()))
+        );
+        // A filter narrows what is drawn; the number stays the row's own, so
+        // the pick still names the chat the printed listing numbered.
+        for character in "older".chars() {
+            list.typed(character);
+        }
+        assert_eq!(list.rows().len(), 1);
+        assert_eq!(
+            pick_command(list.choice().expect("the one match")),
+            SlashCommand::Restore(Some("2".to_string()))
+        );
+
+        // The archive's pick is the Unarchive row of the desktop's session
+        // menu, spelled as the command the same number is typed with.
+        let archived = session_items(&[parked("hidden", 3)], None, picker::Kind::Archived);
+        let list = picker::Picker::new(picker::Kind::Archived.title(), archived);
+        assert_eq!(
+            pick_command(list.choice().expect("the first row is highlighted")),
+            SlashCommand::Sessions(Some("unarchive 1".to_string()))
+        );
+
+        // An empty list has no rows to walk, so each says why instead.
+        assert!(picker::Kind::Trash.empty().contains("the bin is empty"));
+        assert!(
+            picker::Kind::Archived
+                .empty()
+                .contains("no archived sessions")
+        );
+        assert!(
+            picker::Kind::Trash
+                .items(&CatalogueView::default())
+                .is_empty()
+        );
+        assert!(
+            picker::Kind::Archived
+                .items(&CatalogueView::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_drawn_choice_is_the_row_it_stands_in() {
+        // The list's title is at `top`, so its first choice is one row below:
+        // the pointer names a slot, and only a slot inside the window that was
+        // actually drawn names a row.
+        assert_eq!(
+            list_offset(10, 10, 1, 0, 3, 12),
+            None,
+            "the title is not a choice"
+        );
+        assert_eq!(list_offset(11, 10, 1, 0, 3, 12), Some(0));
+        assert_eq!(list_offset(13, 10, 1, 0, 3, 12), Some(2));
+        assert_eq!(
+            list_offset(14, 10, 1, 0, 3, 12),
+            None,
+            "the key line under the window names no choice"
+        );
+        assert_eq!(list_offset(9, 10, 1, 0, 3, 12), None, "above the list");
+        // The window follows the highlight, so a scrolled list's first drawn
+        // row is the tenth choice, not the first one.
+        assert_eq!(list_offset(11, 10, 1, 9, 3, 12), Some(9));
+        // A filter can leave fewer rows than the window holds: the empty slots
+        // under the last match are not choices, so a click there does nothing.
+        assert_eq!(list_offset(13, 10, 1, 0, 3, 2), None);
+        assert_eq!(list_offset(12, 10, 1, 0, 3, 2), Some(1));
+    }
+
+    #[test]
+    fn a_pointer_pointing_at_a_row_walks_the_list_to_it() {
+        let items = picker::permission_items();
+        assert!(items.len() >= 3, "the contract names several modes");
+        let mut list = picker::Picker::new(picker::Kind::Permission.title(), items);
+        // Every row fits the window, so nothing has scrolled yet.
+        assert_eq!(list.window(), (0, list.rows().len()));
+        assert!(
+            list.select(1),
+            "pointing at another row moves the highlight"
+        );
+        assert_eq!(list.selected(), 1);
+        assert!(
+            !list.select(1),
+            "pointing at the row already lit is no change"
+        );
+        // Past the end is the last row, not nothing: a pointer can only ever
+        // land in the window that was drawn.
+        assert!(list.select(99));
+        assert_eq!(list.selected(), list.rows().len() - 1);
+        // A list with no rows has nowhere to point.
+        let mut empty = picker::Picker::new("nothing", Vec::new());
+        assert_eq!(empty.window(), (0, 0));
+        assert!(!empty.select(0));
+    }
+
+    #[test]
+    fn a_narrow_frame_keeps_the_choice_and_drops_the_fact() {
+        // The choice is why the list is open; the fact beside it is what a
+        // narrow frame can spend on it, so the fact goes first and the row
+        // still fits.
+        let narrow = picker_row("deepseek-v4-pro", "deepseek", 12, "› ");
+        assert!(cells(&narrow) <= 12, "{narrow:?}");
+        assert!(narrow.contains("deepseek"), "{narrow:?}");
+        let wide = picker_row("glm", "openai", 20, "› ");
+        assert_eq!(cells(&wide), 20, "the fact reaches the right edge");
+        assert!(wide.ends_with("openai"), "{wide:?}");
     }
 }

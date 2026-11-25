@@ -10,10 +10,50 @@ use chrono::Utc;
 
 use super::contract::{
     ApprovalStatus, ApprovalView, CompactionOutcomeView, EventEnvelope, EventPayload,
-    ExecutionStatus, ExecutionView, MessageRole, MessageView, OperationView, SessionConfig,
-    SessionProjection, SessionSummary, ToolCallStatus, ToolCallView,
+    ExecutionStatus, ExecutionView, MessageRole, MessageView, OperationView, PlanItemView,
+    SessionConfig, SessionProjection, SessionSummary, ToolCallStatus, ToolCallView,
 };
 use super::ids::{MessageId, OperationId, SessionId};
+
+/// The source rows a fork opens with.
+///
+/// They are copied out of the source projection before the fork's own entry
+/// takes its mutable borrow, so the fold never holds two borrows of the
+/// session map at once.
+struct Inherited {
+    messages: Vec<MessageView>,
+    tool_calls: Vec<ToolCallView>,
+    plan: Vec<PlanItemView>,
+    compaction: Option<CompactionOutcomeView>,
+    feedback: Option<String>,
+}
+
+/// Copy the history a fork opens with, ready to install on the fork.
+///
+/// A fork starts where its source stopped, so the rows it opens with are the
+/// source's: the same messages, tool calls, plan, compaction outcome and
+/// feedback note, at the same instants. They are copied here - not journalled
+/// twice - because the source's events already precede the branch in the same
+/// journal, which is what keeps a fork one durable fact.
+///
+/// The copy keeps the message ids it had. The fold has to stay a pure function
+/// of the journal, so minting ids here would hand a reconnecting client rows it
+/// never saw; a row that is the same row in both chats is the honest answer.
+///
+/// What a fork does NOT inherit is the source's running state: its executions,
+/// approvals and goal belong to the chat that is doing that work. A fork that
+/// carried an unfinished goal would run every round of it twice, and one that
+/// carried a pending approval would offer a decision about work the fork never
+/// asked for.
+fn inherited(source: &SessionProjection) -> Inherited {
+    Inherited {
+        messages: source.messages.clone(),
+        tool_calls: source.tool_calls.clone(),
+        plan: source.plan.clone(),
+        compaction: source.compaction.clone(),
+        feedback: source.feedback.clone(),
+    }
+}
 
 /// All projected sessions for one workspace.
 #[derive(Debug, Default)]
@@ -40,7 +80,23 @@ impl Projections {
             return;
         };
         match &event.payload {
-            EventPayload::SessionCreated { title, config, .. } => {
+            EventPayload::SessionCreated {
+                title,
+                config,
+                forked_from,
+                ..
+            } => {
+                // Whether this event is what creates the projection decides
+                // whether the fork inherits: a creation replayed twice must not
+                // copy the source's rows twice.
+                let fresh = !self.sessions.contains_key(&session_id);
+                let inherited = if fresh {
+                    forked_from
+                        .and_then(|id| self.sessions.get(&id))
+                        .map(inherited)
+                } else {
+                    None
+                };
                 let projection =
                     self.sessions
                         .entry(session_id)
@@ -66,6 +122,13 @@ impl Projections {
                 projection.title = title.clone();
                 projection.config = config.clone();
                 projection.version = event.sequence;
+                if let Some(rows) = inherited {
+                    projection.messages = rows.messages;
+                    projection.tool_calls = rows.tool_calls;
+                    projection.plan = rows.plan;
+                    projection.compaction = rows.compaction;
+                    projection.feedback = rows.feedback;
+                }
                 projection.updated_at = event.occurred_at;
             }
             EventPayload::SessionConfigured { config, .. } => {
@@ -648,6 +711,7 @@ mod tests {
             EventPayload::SessionCreated {
                 title: "test".to_string(),
                 config: SessionConfig::default(),
+                forked_from: None,
                 command_id: CommandId::new(),
                 payload_hash: PayloadHash::of(&"created"),
             },
@@ -681,6 +745,127 @@ mod tests {
             ));
         }
         projections
+    }
+
+    /// A branch is one durable fact, not a copy of the transcript.
+    ///
+    /// The fork inherits the rows its source had when it branched - messages,
+    /// calls, plan and the note the reader wrote - and keeps them as the same
+    /// rows, ids included, so folding the journal twice agrees. It inherits
+    /// none of the source's live work: a fork that carried a running execution,
+    /// a pending approval or an unfinished goal would offer decisions and
+    /// rounds about work it never did.
+    #[test]
+    fn a_fork_folds_its_sources_history_and_leaves_its_work_behind() {
+        let source = SessionId::new();
+        let fork = SessionId::new();
+        let mut projections = with_transcript(source);
+        projections.apply(&event(
+            6,
+            source,
+            EventPayload::PlanUpdated {
+                plan: vec![PlanItemView {
+                    text: "ship the branch".to_string(),
+                    status: crate::runtime::contract::PlanItemStatus::InProgress,
+                }],
+            },
+        ));
+        projections.apply(&event(
+            7,
+            source,
+            EventPayload::GoalChanged {
+                goal: Some(crate::runtime::contract::SessionGoalView {
+                    objective: "finish the release".to_string(),
+                    state: crate::runtime::contract::GoalState::Active,
+                    rounds: 2,
+                    max_rounds: 256,
+                    blocked_reason: None,
+                }),
+                command_id: None,
+                payload_hash: None,
+            },
+        ));
+        // The source's last turn is still running when the reader branches it.
+        projections.apply(&event(
+            8,
+            source,
+            EventPayload::TurnRequested {
+                message_id: MessageId::new(),
+                text: "the question in flight".to_string(),
+                command_id: CommandId::new(),
+                payload_hash: PayloadHash::of(&"in flight"),
+            },
+        ));
+        let source_rows = projections.session(source).expect("the source answers");
+        let expected = source_rows.messages.clone();
+        let expected_calls = source_rows.tool_calls.clone();
+        assert_eq!(expected.len(), 5, "four settled rows and one in flight");
+
+        projections.apply(&event(
+            9,
+            fork,
+            EventPayload::SessionCreated {
+                title: "test".to_string(),
+                config: SessionConfig::default(),
+                forked_from: Some(source),
+                command_id: CommandId::new(),
+                payload_hash: PayloadHash::of(&"fork"),
+            },
+        ));
+
+        let branch = projections.session(fork).expect("the fork answers");
+        assert_eq!(
+            branch.messages, expected,
+            "the branch opens with the source's rows"
+        );
+        assert_eq!(
+            branch.tool_calls, expected_calls,
+            "and the calls those rows made"
+        );
+        assert_eq!(branch.plan.len(), 1, "a branch keeps the plan it inherited");
+        assert!(
+            branch.executions.is_empty(),
+            "a fork owns no execution its source started"
+        );
+        assert!(
+            branch.approvals.is_empty(),
+            "and no approval it could be asked to settle"
+        );
+        assert!(
+            branch.goal.is_none(),
+            "a fork runs no rounds of its source's goal"
+        );
+        assert_eq!(
+            projections
+                .session(source)
+                .expect("the source is still there")
+                .messages,
+            expected,
+            "branching reads the source and changes nothing about it"
+        );
+
+        // The branch then grows on its own: later rows of the source's stay
+        // behind, because the fork is a snapshot at the moment it branched.
+        projections.apply(&event(
+            10,
+            source,
+            EventPayload::TurnSucceeded {
+                message_id: MessageId::new(),
+                text: "the answer the fork never saw".to_string(),
+                usage: None,
+            },
+        ));
+        let branch = projections.session(fork).expect("the fork answers");
+        assert_eq!(
+            branch.messages.len(),
+            expected.len(),
+            "later source rows stay behind"
+        );
+        assert_eq!(
+            projections.summaries().len(),
+            2,
+            "the list holds both chats"
+        );
     }
 
     /// Parking keeps every row; a purge is the one fact that drops them.

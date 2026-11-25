@@ -38,6 +38,12 @@ impl LlmProvider {
         self.inner.register_fallback(model, client);
     }
 
+    /// Whether the vendor that will serve `model` needs earlier turns'
+    /// reasoning replayed. See [`LlmClient::replays_reasoning_across_turns`].
+    pub fn replays_reasoning_across_turns(&self, model: &str) -> bool {
+        self.inner.replays_reasoning_across_turns(model)
+    }
+
     /// Convert this provider into a trait-object client.
     pub fn as_dyn(self: Arc<Self>) -> Box<dyn LlmClient<AgentSession, AgentReactContext>> {
         Box::new(ArcLlmClient(self))
@@ -175,6 +181,10 @@ impl LlmClient<AgentSession, AgentReactContext> for ArcLlmClient {
     fn provider_name(&self) -> &'static str {
         self.0.provider_name()
     }
+
+    fn replays_reasoning_across_turns(&self, model: &str) -> bool {
+        self.0.replays_reasoning_across_turns(model)
+    }
 }
 
 impl Default for LlmProvider {
@@ -213,5 +223,9 @@ impl LlmClient<AgentSession, AgentReactContext> for LlmProvider {
 
     fn provider_name(&self) -> &'static str {
         self.inner.provider_name()
+    }
+
+    fn replays_reasoning_across_turns(&self, model: &str) -> bool {
+        self.inner.replays_reasoning_across_turns(model)
     }
 }

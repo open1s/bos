@@ -1519,6 +1519,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "tungstenite 0.30.0",
+ "unicode-width 0.2.2",
  "uucore",
  "uuid",
  "vt100",

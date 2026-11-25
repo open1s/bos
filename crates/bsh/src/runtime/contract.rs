@@ -138,6 +138,23 @@ pub enum CommandPayload {
         /// New title.
         title: String,
     },
+    /// Branch one session: create a new chat that opens with its transcript.
+    ///
+    /// Forking is the desktop session menu's branch row, and it is a Host fact
+    /// rather than a client copy: an interface that forked in its own memory
+    /// would leave a chat the next client cannot see and a reconnect cannot
+    /// fold. The Host journals the branch with the source it came from, so the
+    /// fork opens with the same messages, calls and plan its source had at that
+    /// instant, and the answer names the fork's own session id through the
+    /// operation id - the same way a creation does.
+    ///
+    /// The fork is a new line of work, not a running duplicate: the source's
+    /// executions, approvals and goal stay behind, because a fork that carried
+    /// an unfinished goal would run every round of it twice.
+    ForkSession {
+        /// Session whose transcript the fork opens with.
+        session_id: SessionId,
+    },
     /// Submit a user turn. The Host durably accepts it and owns the execution.
     SendMessage {
         /// Session receiving the turn.
@@ -609,6 +626,25 @@ pub enum QueryPayload {
         #[serde(default)]
         change: Option<String>,
     },
+    /// The delegated child runs a conversation started: the desktop's Tasks
+    /// graph children.
+    ///
+    /// The desktop draws these under the main node of its task graph and lists
+    /// them in the header, from the same in-process registry the `subagent`
+    /// tool writes: the run's title, its status, how deep it sits, its token
+    /// use and its answer. A client that attached to this Host cannot see that
+    /// registry, so the Host answers for it rather than letting a terminal
+    /// pretend a turn never delegated anything.
+    ///
+    /// Runs outlive the turn that started them, which is why the filter is the
+    /// conversation and not the turn: a reader who opens this after the turn
+    /// settled still sees what its children did.
+    Subagents {
+        /// Conversation whose lineage is read; absent lists every run this
+        /// Host holds.
+        #[serde(default)]
+        session_id: Option<SessionId>,
+    },
     /// The browser's page: the desktop's Browser tab, in the form a terminal
     /// can read.
     ///
@@ -814,6 +850,11 @@ pub enum QueryResult {
     Federation {
         /// The node, its roster and the state that explains the count.
         report: FederationReport,
+    },
+    /// One conversation's delegated child runs.
+    Subagents {
+        /// The runs and the state that explains their count.
+        report: SubagentReport,
     },
     /// The browser's page and its navigation state.
     Browser {
@@ -1382,6 +1423,70 @@ pub struct ExtensionsReport {
     pub error: Option<String>,
 }
 
+/// One delegated child run, as the desktop's task graph and header draw it.
+///
+/// The row is the registry's own record, translated: the state spelling is the
+/// registry's (`running`, `done`, `failed`), and the token counts are the ones
+/// the child reported, with the estimate kept beside them for a run that has
+/// not priced its request yet. The prompt and the result travel with the row
+/// because a terminal has no hover card: opening a run shows the task it was
+/// given and the answer it produced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubagentRunView {
+    /// Stable run id, the row's key.
+    pub id: String,
+    /// The conversation this run belongs to.
+    pub session: String,
+    /// The run id of the direct parent, or the session id at the root.
+    pub parent: String,
+    /// How deep below the session root this run sits; one is a direct child.
+    pub depth: usize,
+    /// The short description the model supplied.
+    pub title: String,
+    /// The task text handed to the child.
+    pub prompt: String,
+    /// Lifecycle state: `running`, `done` or `failed`.
+    pub status: String,
+    /// When the child started, in unix milliseconds.
+    pub started_at_ms: u64,
+    /// When the child finished, in unix milliseconds, when it has.
+    pub finished_at_ms: Option<u64>,
+    /// A rough token estimate, shown while the child has not reported usage.
+    pub estimated_tokens: u64,
+    /// Prompt tokens the child reported.
+    pub prompt_tokens: u64,
+    /// Completion tokens the child reported.
+    pub completion_tokens: u64,
+    /// Monotonic counter for live updates; a client rebuilds when it moves.
+    pub revision: u64,
+    /// How many prompts the reader queued behind the child's current turn.
+    pub pending: usize,
+    /// Transcript rows the run has recorded, for the graph's step count.
+    pub steps: usize,
+    /// The final answer, clipped the way the desktop's hint is.
+    pub result_hint: Option<String>,
+    /// The failure text, when it failed.
+    pub error: Option<String>,
+}
+
+/// A conversation's delegated child runs.
+///
+/// `state` is one of:
+/// - `ready` - the registry was read; `runs` is what it holds.
+/// - `unsupported` - this executor carries no subagent registry, so no turn it
+///   ran could delegate. That is not the same answer as an empty roster: a
+///   client that showed "no child runs" for a build without the tool would
+///   send the reader looking for a delegation that was never possible.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubagentReport {
+    /// What was found, per the list in the type documentation.
+    pub state: String,
+    /// The runs, oldest first, filtered to the requested conversation.
+    pub runs: Vec<SubagentRunView>,
+}
+
 /// The federation node this Host runs and the peers it trusts.
 ///
 /// The desktop's Federation tab reads two things: the node's identity, which
@@ -1670,6 +1775,14 @@ pub struct CatalogueView {
     /// connectable one must agree, or the tools a client claims exist are not
     /// the tools a turn can call.
     pub mcp: Vec<McpServerView>,
+    /// The directory this Host serves, expanded.
+    ///
+    /// One Host serves one workspace, and a client that attached to a Host
+    /// another process started cannot know which folder that is. Naming it
+    /// here keeps a client's `@` list, shell and workspace reads on the tree
+    /// the Host's tools work in rather than on the directory the client
+    /// happened to be launched from.
+    pub workspace_root: String,
 }
 
 /// Ask for an event subscription.
@@ -1750,6 +1863,13 @@ pub enum EventPayload {
         /// The configuration the session started with.
         #[serde(default)]
         config: SessionConfig,
+        /// The session this one forked, when it is a branch rather than a fresh
+        /// chat. The rows the fork opens with are not journalled twice: the fold
+        /// reads them from the source session's own events, which already
+        /// precede this one, so a branch costs one durable fact instead of a copy
+        /// of the transcript.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forked_from: Option<SessionId>,
         /// Idempotency key of the accepting command.
         command_id: CommandId,
         /// Hash of the accepted command payload.
@@ -2084,7 +2204,7 @@ impl TurnUsage {
 }
 
 /// One projected message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageView {
     /// Message identity.
     pub message_id: MessageId,
@@ -2186,7 +2306,7 @@ pub struct ApprovalView {
 }
 
 /// One tool call a turn made, as the transcript shows it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallView {
     /// Execution whose turn made the call.
     #[serde(default)]

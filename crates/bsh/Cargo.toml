@@ -91,6 +91,12 @@ tokio = { workspace = true }
 # the lock graph through skim's unconditional ratatui link, so naming it here
 # adds no package; the GUI binary keeps its own GPUI frame and never touches it.
 ratatui = "0.30"
+# The terminal interface measures rows in CELLS, not characters: a CJK
+# ideograph or an emoji takes two columns, so counting `chars()` would push a
+# Chinese session title past the frame's right border and wrap a paragraph
+# one cell too wide. ratatui-core already measures with this crate, so naming
+# it adds no package; 0.2 is the version the lock resolved for it.
+unicode-width = "0.2"
 # Commit timestamps on every journal event; the clock is part of the wire
 # format. chrono already reaches this crate through `agent`.
 chrono = { workspace = true }

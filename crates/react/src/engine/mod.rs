@@ -721,10 +721,12 @@ impl<A: ReActApp> ReActEngine<A> {
         let mut thought = String::new();
 
         //build request
-        // Reasoning is turn-local: a tool loop replays it to the provider that
-        // produced it, but a new turn must never receive the previous turn's
-        // chain of thought or its opaque provider state.
-        session.clear_reasoning();
+        // Reasoning is turn-local unless the provider says otherwise: a tool
+        // loop replays it to the provider that produced it, and DeepSeek also
+        // expects earlier turns' blocks back once tools are in play.
+        if !self.llm.replays_reasoning_across_turns(&request.model) {
+            session.clear_reasoning();
+        }
         session.push(LlmMessage::user(request.input.clone()));
 
         // A turn ends when the MODEL stops asking for tools. The step bound is
@@ -1216,14 +1218,35 @@ impl<A: ReActApp> ReActEngine<A> {
                                 // Keep every field the item carried: content,
                                 // summary and signature are what a provider such
                                 // as OpenRouter requires to be replayed
-                                // unmodified inside this turn's tool loop.
+                                // unmodified inside this turn's tool loop. The
+                                // part tags are rebuilt because the decoded
+                                // struct keeps only the text, and DeepSeek
+                                // requires `reasoning_text` parts verbatim.
+                                let content_parts = parts
+                                    .iter()
+                                    .map(|part| {
+                                        serde_json::json!({
+                                            "type": "reasoning_text",
+                                            "text": part.text,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+                                let summary_parts = summary
+                                    .iter()
+                                    .map(|part| {
+                                        serde_json::json!({
+                                            "type": "summary_text",
+                                            "text": part.text,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
                                 let state = ReasoningState::new(
                                     "openai-responses",
                                     serde_json::json!({
                                         "id": id,
                                         "encrypted_content": encrypted_content,
-                                        "content": parts,
-                                        "summary": summary,
+                                        "content": content_parts,
+                                        "summary": summary_parts,
                                         "signature": signature,
                                     }),
                                 );
@@ -1500,8 +1523,11 @@ impl<A: ReActApp> ReActEngine<A> {
         let turn = self.turn.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Reasoning belongs to the turn that produced it: clear any prior-turn
-        // block before this turn's first request, then add the reader input.
-        session.clear_reasoning();
+        // block before this turn's first request, then add the reader input. A
+        // provider that expects pass-back (DeepSeek with tools) keeps them.
+        if !self.llm.replays_reasoning_across_turns(&request.model) {
+            session.clear_reasoning();
+        }
         session.push(LlmMessage::user(request.input.clone()));
 
         let stream = stream! {

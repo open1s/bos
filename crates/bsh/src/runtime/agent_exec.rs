@@ -42,9 +42,10 @@ use super::contract::{
     ApprovalRequest, ApprovalTarget, BrowserElementView, BrowserView, CatalogueView, ExtensionView,
     ExtensionsReport, FederationGrantView, FederationPeerView, FederationReport, McpServerView,
     MemoryReport, MessageRole, ProviderModels, ReviewReport, SessionConfig, SessionConfigChange,
-    SettingEdit, SettingsReport, SettingsRowView, SettingsSectionView, SkillView, TaskAttemptView,
-    TaskBoardReport, TaskDetailReport, TaskRowView, TaskSectionView, TurnUsage,
-    WorkspaceChangeView, WorkspaceDiffView, WorkspaceEntryView, WorkspaceReport,
+    SettingEdit, SettingsReport, SettingsRowView, SettingsSectionView, SkillView, SubagentReport,
+    SubagentRunView, TaskAttemptView, TaskBoardReport, TaskDetailReport, TaskRowView,
+    TaskSectionView, TurnUsage, WorkspaceChangeView, WorkspaceDiffView, WorkspaceEntryView,
+    WorkspaceReport,
 };
 use super::executor::{
     CompactContext, CompactionOutput, TurnContext, TurnError, TurnExecutor, TurnOutput,
@@ -520,6 +521,51 @@ impl AgentExecutor {
             };
         };
         super::review::report(root.as_path(), session, change)
+    }
+
+    /// The delegated child runs this Host's turns started.
+    ///
+    /// The registry is the one `caps::build_agent` hands every turn, keyed by
+    /// the conversation that delegated: the same rows the desktop's task graph
+    /// draws and its header lists. Nothing is started here - a query reads what
+    /// the `subagent` tool already wrote, so opening the pane never spawns a
+    /// child - and the transcript is deliberately left out: a header carries
+    /// the title, the state and the token counts a graph draws, while the
+    /// child's own rows would cost every answer the size of its whole run.
+    ///
+    /// A conversation the registry never saw answers an empty roster in the
+    /// `ready` state: the tool was attached and nothing was delegated, which
+    /// is a different fact from a build that cannot delegate at all.
+    fn subagent_report(&self, session: Option<&str>) -> SubagentReport {
+        let headers = match session {
+            Some(session) => self.subagents.headers_for(session),
+            None => self.subagents.headers(),
+        };
+        SubagentReport {
+            state: "ready".to_string(),
+            runs: headers
+                .into_iter()
+                .map(|header| SubagentRunView {
+                    id: header.id,
+                    session: header.session,
+                    parent: header.parent,
+                    depth: header.depth,
+                    title: header.title,
+                    prompt: header.prompt,
+                    status: header.status.as_str().to_string(),
+                    started_at_ms: header.started_at,
+                    finished_at_ms: header.finished_at,
+                    estimated_tokens: header.estimated_tokens,
+                    prompt_tokens: header.prompt_tokens,
+                    completion_tokens: header.completion_tokens,
+                    revision: header.revision,
+                    pending: header.pending,
+                    steps: header.steps,
+                    result_hint: header.result_hint,
+                    error: header.error,
+                })
+                .collect(),
+        }
     }
 
     /// The browser's page, as the desktop's Browser tab reads it.
@@ -1823,6 +1869,10 @@ impl TurnExecutor for AgentExecutor {
         self.review_report(session, change)
     }
 
+    fn subagents(&self, session: Option<&str>) -> SubagentReport {
+        self.subagent_report(session)
+    }
+
     fn browser(&self) -> BrowserView {
         self.browser_report()
     }
@@ -1889,6 +1939,16 @@ impl TurnExecutor for AgentExecutor {
                 .collect(),
             skills,
             mcp: mcp_roster(&settings, &self.mcp),
+            // The folder `open` resolved for this Host, read back from the
+            // workspace record its id names: an attached client lists the tree
+            // the file tools may touch instead of guessing from its own cwd.
+            workspace_root: settings
+                .global
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == self.workspace)
+                .map(|workspace| workspace.root.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -2423,6 +2483,53 @@ mod tests {
             std::env::temp_dir().join(format!("bsh-agent-exec-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("the scratch directory");
         root
+    }
+
+    /// The delegated children a turn spawns are the rows the query answers
+    /// with: a terminal that opens the pane sees the run its conversation
+    /// started, its state and its token use, and another conversation's run
+    /// stays out of it.
+    #[test]
+    fn the_subagent_query_lists_the_runs_a_conversation_started() {
+        let executor = executor(model_settings("workspace-write"));
+        let mine = SessionId::new().to_string();
+        let other = SessionId::new().to_string();
+        let id = executor
+            .subagents
+            .try_begin(&mine, &mine, 1, 900, "Research", "look", 3)
+            .expect("a free slot starts a run");
+        executor
+            .subagents
+            .try_begin(&other, &other, 1, 900, "Unrelated", "look", 3)
+            .expect("the second conversation gets its own slot");
+        executor
+            .subagents
+            .finish(&id, "the answer".to_string(), (120, 30), Vec::new());
+
+        // One conversation's lineage, which is what a client attached to a
+        // chat asks for: its own run and nothing from the neighbouring chat.
+        let report = executor.subagent_report(Some(mine.as_str()));
+        assert_eq!(report.state, "ready");
+        assert_eq!(report.runs.len(), 1, "only this conversation's run");
+        let run = &report.runs[0];
+        assert_eq!(run.id, id);
+        assert_eq!(run.title, "Research");
+        assert_eq!(run.status, "done");
+        assert_eq!(run.prompt_tokens, 120);
+        assert_eq!(run.completion_tokens, 30);
+        assert_eq!(run.depth, 1);
+        assert!(run.finished_at_ms.is_some());
+
+        // The whole roster answers both chats, because a client that named no
+        // conversation asked the Host what it holds.
+        assert_eq!(executor.subagent_report(None).runs.len(), 2);
+
+        // A conversation that delegated nothing is an empty roster, not the
+        // unsupported answer a build without the tool gives: the registry
+        // exists, so the count is a fact rather than a missing seam.
+        let quiet = executor.subagent_report(Some(SessionId::new().to_string().as_str()));
+        assert_eq!(quiet.state, "ready");
+        assert!(quiet.runs.is_empty());
     }
 
     fn executor(mut settings: Settings) -> AgentExecutor {

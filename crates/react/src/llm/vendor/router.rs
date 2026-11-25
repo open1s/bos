@@ -62,6 +62,26 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmRouter<S, 
         (None, model)
     }
 
+    /// Whether the vendor that will serve `model` needs an earlier turn's
+    /// reasoning replayed.
+    ///
+    /// The answer is per vendor, not per process: a router serves several
+    /// providers whose pass-back rules differ. An unknown vendor keeps the
+    /// turn-local default rather than guessing.
+    pub fn replays_reasoning_across_turns(&self, model: &str) -> bool {
+        let (vendor_id, _) = Self::split_model(model);
+        let entry = if let Some(vid) = vendor_id {
+            self.vendors.get(vid)
+        } else {
+            let first_key = self.vendors.iter().next().map(|r| r.key().clone());
+            first_key.and_then(|k| self.vendors.get(&k))
+        };
+        match entry {
+            Some(e) => e.value().replays_reasoning_across_turns(model),
+            None => false,
+        }
+    }
+
     /// Aggregate every provider failure into one error naming each attempt.
     fn all_failed(errors: &[LlmError]) -> LlmError {
         LlmError::Other(format!(
@@ -210,6 +230,9 @@ impl<S: Send + Sync + ReactSession, C: Send + Sync + ReactContext> LlmClient<S, 
     }
     fn provider_name(&self) -> &'static str {
         "llm-router"
+    }
+    fn replays_reasoning_across_turns(&self, model: &str) -> bool {
+        LlmRouter::replays_reasoning_across_turns(self, model)
     }
 }
 
