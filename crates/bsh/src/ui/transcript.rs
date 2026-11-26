@@ -368,7 +368,7 @@ pub(crate) fn tool_kind_key(name: &str) -> &'static str {
         "bash" | "run_command" | "terminal" => "tool.kind.bash",
         "read_file" => "tool.kind.read",
         "write_file" => "tool.kind.write",
-        "edit_file" | "apply_patch" | "sed" => "tool.kind.edit",
+        "edit_file" | "patch" | "apply_patch" | "sed" => "tool.kind.edit",
         "list_dir" => "tool.kind.list",
         "glob" | "grep" => "tool.kind.web",
         "load_skill" => "tool.kind.skill",
@@ -391,7 +391,7 @@ fn process_kind_key(name: &str) -> &'static str {
         "bash" | "run_command" | "terminal" => "msg.process.commands",
         "read_file" => "msg.process.read",
         "write_file" => "msg.process.write",
-        "edit_file" | "apply_patch" | "sed" => "msg.process.edit",
+        "edit_file" | "patch" | "apply_patch" | "sed" => "msg.process.edit",
         "list_dir" | "glob" | "grep" => "msg.process.search",
         "update_plan" => "msg.process.plan",
         "web_search" => "msg.process.web",
@@ -412,7 +412,7 @@ fn process_live_key(tools: &[crate::model::ToolEvent]) -> Option<&'static str> {
         "bash" | "run_command" | "terminal" => "msg.processLive.commands",
         "read_file" => "msg.processLive.read",
         "write_file" => "msg.processLive.write",
-        "edit_file" | "apply_patch" | "sed" => "msg.processLive.edit",
+        "edit_file" | "patch" | "apply_patch" | "sed" => "msg.processLive.edit",
         "list_dir" | "glob" | "grep" => "msg.processLive.search",
         "update_plan" => "msg.processLive.plan",
         "web_search" => "msg.processLive.web",
@@ -633,7 +633,7 @@ pub(crate) fn code_lang(name: &str, args: &str) -> Option<&'static str> {
     match name {
         "bash" | "run_command" | "terminal" => Some("bash"),
         "run_code" => Some("python"),
-        "write_file" | "edit_file" | "apply_patch" | "sed" | "read_file" => {
+        "write_file" | "edit_file" | "patch" | "apply_patch" | "sed" | "read_file" => {
             let path = json_field(args, "path")
                 .or_else(|| json_field(args, "file_path"))
                 .unwrap_or_default();
@@ -822,7 +822,7 @@ pub(crate) fn tool_diff(name: &str, args: &str) -> Option<Vec<(char, String)>> {
                     .collect(),
             )
         }
-        "edit_file" | "apply_patch" => {
+        "edit_file" | "patch" | "apply_patch" => {
             let mut lines: Vec<(char, String)> = Vec::new();
             if let Some(old) = json_field_exact(args, "old_string") {
                 lines.extend(old.lines().map(|line| ('-', line.to_string())));
@@ -942,11 +942,11 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
         name,
         "write_file"
             | "edit_file"
+            | "patch"
             | "apply_patch"
             | "sed"
             | "write"
             | "edit"
-            | "patch"
             | "create_file"
     )
 }
@@ -5518,7 +5518,7 @@ impl Shell {
         // fold handler is attached only when there is no link to protect.
         let opens_file = matches!(
             name.as_str(),
-            "read_file" | "write_file" | "edit_file" | "apply_patch" | "sed"
+            "read_file" | "write_file" | "edit_file" | "patch" | "apply_patch" | "sed"
         );
         let head = div()
             .id(SharedString::from(format!(

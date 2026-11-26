@@ -2,7 +2,7 @@
 //! tools always exclude.
 //!
 //! The file is written in .gitignore syntax and read by every file tool -
-//! list_dir, read_file, read_files, write_file, edit_file, apply_patch, glob
+//! list_dir, read_file, read_files, write_file, edit_file, patch, glob
 //! and grep - so a workspace can hide the trees its reader does not want the
 //! model to see or touch. It is not a security boundary: the tool policy still
 //! decides every path, and this file only narrows what the file tools offer.
@@ -104,7 +104,7 @@ pub(crate) const DEFAULT_IGNORE: &str = r#"# ===================================
 # =============================================================================
 #
 # The workspace file tools (list_dir, read_file, read_files, write_file,
-# edit_file, apply_patch, glob, grep) skip every path that matches a pattern
+# edit_file, patch, glob, grep) skip every path that matches a pattern
 # here. The format is .gitignore's: one pattern per line, # starts a comment,
 # a trailing / matches directories only, a leading / anchors a pattern to the
 # workspace root, * and ** glob, and a leading ! re-includes a path.

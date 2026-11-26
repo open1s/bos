@@ -23,13 +23,22 @@
 //! palette lists them beside its commands. The row inserts `/name ` and never
 //! runs: the gesture is resolved by the Host at send, so a terminal turn loads
 //! the same skill instructions a window's turn loads.
+//!
+//! The word a command's argument can be is the fourth list: `/plan ` offers `on`
+//! and `off` before the reader has to remember them from `/help`, and `/goal p`
+//! offers `pause` before anything else. Only a command that fixes its words gets
+//! rows - a title, a path or a note is free text no catalogue can guess - and
+//! the row replaces the word, not the line, so the argument is completed the
+//! way a shell completes one word of a command line. The list closes once the
+//! word is exactly one of the candidates: there is nothing left to choose, and
+//! the next Enter belongs to the composer.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::fuzzy;
 use crate::reference::format_mention;
-use crate::runtime::contract::SkillView;
+use crate::runtime::contract::{PERMISSION_MODES, SkillView};
 use crate::workspace_index::{self, Entry, STALE_AFTER};
 
 /// The most rows one query keeps. Past this the highlight has nowhere useful
@@ -50,6 +59,14 @@ const INDEX_CAP: usize = 50_000;
 enum Source {
     /// The `/` that starts the composer's first token.
     Command,
+    /// The first word of a command's argument, with the command it completes
+    /// and the words that argument can be.
+    Argument {
+        /// The command whose argument is being typed, as it is drawn.
+        name: &'static str,
+        /// The words that argument can be.
+        words: &'static [Word],
+    },
     /// An `@` that starts a word.
     File,
 }
@@ -107,6 +124,32 @@ pub(crate) enum Accepted {
     Session(String),
 }
 
+/// One word a command's argument can be, with what picking it does.
+///
+/// The gloss is drawn beside the word, the way the desktop's dialog explains a
+/// permission beside its row: `danger-full-access` names nothing a reader can
+/// weigh without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Word {
+    /// The word as the parser accepts it, exactly.
+    text: &'static str,
+    /// The one-line gloss drawn beside it.
+    detail: &'static str,
+}
+
+/// The words a command's first argument can be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arguments {
+    /// The command takes no argument at all.
+    None,
+    /// Free text, or a name only the Host can enumerate: a title, a path, a
+    /// note, a numeric id. There is nothing to rank, so no list opens.
+    Free,
+    /// A fixed vocabulary. Every word here is a whole argument - picking one
+    /// completes the line, so the row runs it.
+    Words(&'static [Word]),
+}
+
 /// One command the terminal backs, with the facts the list needs.
 struct Command {
     /// The name as typed, slash included.
@@ -114,6 +157,8 @@ struct Command {
     detail: &'static str,
     /// Whether the command does something useful with no arguments.
     bare: bool,
+    /// What the command's first argument can be.
+    arguments: Arguments,
 }
 
 /// The commands this build backs, in name order so a blank query is stable.
@@ -126,171 +171,260 @@ const COMMANDS: &[Command] = &[
         name: "/approve",
         detail: "approve the approval a turn is waiting on · `^Y`",
         bare: true,
+        arguments: Arguments::None,
     },
     Command {
         name: "/audit",
         detail: "audit this session's tool calls, and what was refused",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/browser",
         detail: "the page the agent's browser tools read",
         bare: true,
+        arguments: Arguments::None,
     },
     Command {
         name: "/compact",
         detail: "fold older history into one checkpoint",
         bare: true,
+        arguments: Arguments::None,
     },
     Command {
         name: "/copy",
         detail: "copy the newest answer, or `id` for the session's id, to the clipboard",
         bare: true,
+        arguments: Arguments::Words(&[Word {
+            text: "id",
+            detail: "the session's id, to paste into a report",
+        }]),
     },
     Command {
         name: "/fork",
         detail: "branch this session into a chat that opens with its transcript",
         bare: true,
+        arguments: Arguments::None,
     },
     Command {
         name: "/detail",
         detail: "read one tool call's arguments and output",
         bare: true,
+        arguments: Arguments::Words(&[Word {
+            text: "close",
+            detail: "back to the transcript",
+        }]),
     },
     Command {
         name: "/diff",
         detail: "compare the working copy, or one file, with its baseline",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/deny",
         detail: "refuse it, with a reason the audit records · `^R`",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/editor",
         detail: "write the prompt in $EDITOR, and take the buffer back · `^X`",
         bare: true,
+        arguments: Arguments::None,
     },
     Command {
         name: "/export",
         detail: "save this session as Markdown",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/extensions",
         detail: "list the installed extensions, or search them",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/federation",
         detail: "the node this build runs and the peers it trusts",
         bare: true,
+        arguments: Arguments::None,
     },
     Command {
         name: "/feedback",
         detail: "record or read this session's note",
         bare: true,
+        arguments: Arguments::Words(&[Word {
+            text: "clear",
+            detail: "drop the note",
+        }]),
     },
     Command {
         name: "/files",
         detail: "browse the workspace, or read one file",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/find",
         detail: "reveal a previous row of this conversation by a word it carries",
         bare: false,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/goal",
         detail: "show or change the session goal",
         bare: false,
+        arguments: Arguments::Words(&[
+            Word {
+                text: "clear",
+                detail: "drop the goal",
+            },
+            Word {
+                text: "pause",
+                detail: "stop it, keeping it",
+            },
+            Word {
+                text: "resume",
+                detail: "arm it again",
+            },
+        ]),
     },
     Command {
         name: "/help",
         detail: "list the commands and keys",
         bare: true,
+        arguments: Arguments::None,
     },
     Command {
         name: "/mcp",
         detail: "list the connected MCP servers, or one server's tools",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/memory",
         detail: "browse or search what this workspace remembers",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/model",
         detail: "pick the model from a list, or name `<provider> <model>`",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/new",
         detail: "create a session, titled if one is given",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/permission",
         detail: "pick the approval mode from a list",
         bare: true,
+        // The contract's own three modes, in the order it names them: the
+        // parser refuses any other word, so the list completes only these.
+        arguments: Arguments::Words(&[
+            Word {
+                text: PERMISSION_MODES[0],
+                detail: "reads, and asks before it writes",
+            },
+            Word {
+                text: PERMISSION_MODES[1],
+                detail: "writes inside the workspace",
+            },
+            Word {
+                text: PERMISSION_MODES[2],
+                detail: "runs without asking",
+            },
+        ]),
     },
     Command {
         name: "/skills",
         detail: "list the registered skills, or search them",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/plan",
         detail: "toggle plan mode",
         bare: true,
+        arguments: Arguments::Words(&[
+            Word {
+                text: "on",
+                detail: "plan before acting",
+            },
+            Word {
+                text: "off",
+                detail: "act directly",
+            },
+        ]),
     },
     Command {
         name: "/preset",
         detail: "pick the preset from a list",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/queue",
         detail: "the lines waiting for the running turn",
         bare: true,
+        arguments: Arguments::Words(&[Word {
+            text: "clear",
+            detail: "drop the waiting lines",
+        }]),
     },
     Command {
         name: "/restore",
         detail: "take one parked session back into the lists",
         bare: false,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/purge",
         detail: "drop one parked session for good",
         bare: false,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/rename",
         detail: "rename this session",
         bare: false,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/questions",
         detail: "bring back the model's unanswered question, or say there is none",
         bare: true,
+        arguments: Arguments::None,
     },
     Command {
         name: "/review",
         detail: "the files the last turn changed, or one change's diff",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/sessions",
         detail: "open the session list, filter a chat by name, or pin/archive one by number",
         bare: true,
+        // Only the word that stands alone: `pin`, `archive` and their inverses
+        // take the number the listing printed, so a completed line would still
+        // be half a command.
+        arguments: Arguments::Words(&[Word {
+            text: "archived",
+            detail: "the chats archived here",
+        }]),
     },
     Command {
         name: "/settings",
         detail: "the settings a turn resolves from, section by section",
         bare: true,
+        arguments: Arguments::Free,
     },
     // The write side of the rail above: one field, addressed by the key its row
     // carries, so a terminal changes a setting the way the dialog does instead
@@ -299,36 +433,49 @@ const COMMANDS: &[Command] = &[
         name: "/set",
         detail: "write or clear one settings field the Host marks editable",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/subagents",
         detail: "the child runs this conversation started; a number opens one, `all` every run",
         bare: true,
+        arguments: Arguments::Words(&[Word {
+            text: "all",
+            detail: "every child run the Host holds",
+        }]),
     },
     Command {
         name: "/trajectory",
         detail: "this session's typed event log: turns, messages and calls in order",
         bare: true,
+        arguments: Arguments::None,
     },
     Command {
         name: "/tasks",
         detail: "list the workspace's tasks, open one by id, or `graph` for the tree",
         bare: true,
+        arguments: Arguments::Words(&[Word {
+            text: "graph",
+            detail: "the task tree",
+        }]),
     },
     Command {
         name: "/terminal",
         detail: "open a shell at the workspace root; Ctrl-] closes it",
         bare: true,
+        arguments: Arguments::None,
     },
     Command {
         name: "/trash",
         detail: "open the bin, or park a session by its /sessions number",
         bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/usage",
         detail: "tokens this session's turns reported",
         bare: true,
+        arguments: Arguments::None,
     },
 ];
 
@@ -346,6 +493,23 @@ pub(crate) fn command_rows_for_test() -> Vec<(&'static str, bool)> {
     COMMANDS
         .iter()
         .map(|command| (command.name, command.bare))
+        .collect()
+}
+
+/// Every word a command's argument can be, as `(command, word)`, so a test can
+/// prove the list completes only lines the parser runs: a completed word is
+/// inserted and the line sends, so a word the parser refuses would be a row
+/// that answers with its usage line.
+#[cfg(test)]
+pub(crate) fn command_arguments_for_test() -> Vec<(&'static str, &'static str)> {
+    COMMANDS
+        .iter()
+        .flat_map(|command| {
+            let Arguments::Words(words) = command.arguments else {
+                return Vec::new();
+            };
+            words.iter().map(|word| (command.name, word.text)).collect()
+        })
         .collect()
 }
 
@@ -396,6 +560,7 @@ impl Menu {
         };
         let rows = match token.source {
             Source::Command => command_rows(&token.query, skills),
+            Source::Argument { name, words } => argument_rows(&token.query, name, words),
             Source::File => file_rows(&token.query, root, &mut self.files, sessions),
         };
         // An empty list closes the popup rather than leaving a marker with no
@@ -482,10 +647,16 @@ impl Menu {
     pub(crate) fn accept(&mut self, input: &mut String, cursor: &mut usize) -> Option<Accepted> {
         let token = self.open.clone()?;
         let row = self.rows.get(self.active)?.clone();
-        let end = (*cursor).min(input.len());
-        if token.start > end {
+        let caret = (*cursor).min(input.len());
+        if token.start > caret {
             return None;
         }
+        // The token covers the word it belongs to, not the caret's column alone:
+        // a reader who steps back into a half-typed word asks to replace that
+        // word, so a completion never lands in its middle. A word ends where
+        // whitespace begins, which is the rule that opened the token.
+        let tail = &input[token.start..];
+        let end = token.start + tail.find(char::is_whitespace).unwrap_or(tail.len());
         // A session is not a mention: the picker's query is a filter the
         // reader never meant to write, so it comes back out of the draft and
         // the conversation opens. The desktop's `consume_reference_token` cuts
@@ -522,6 +693,9 @@ fn token(input: &str, cursor: usize) -> Option<Token> {
             query: query.to_string(),
         });
     }
+    if let Some(token) = argument_token(head) {
+        return Some(token);
+    }
     let start = head.rfind('@')?;
     if !head[..start]
         .chars()
@@ -539,6 +713,61 @@ fn token(input: &str, cursor: usize) -> Option<Token> {
         start,
         query: query.to_string(),
     })
+}
+
+/// The word after a command whose argument comes from a fixed vocabulary.
+///
+/// Only the first argument word is completed: a second word is another decision
+/// (`/goal edit <objective>`), and a command whose vocabulary has run out has
+/// nothing left to offer. The `@` and `"` triggers belong to the file list and
+/// to quoting, so a word starting with either is left to them.
+fn argument_token(head: &str) -> Option<Token> {
+    let (name, rest) = head.split_once(char::is_whitespace)?;
+    let command = COMMANDS.iter().find(|command| command.name == name)?;
+    let Arguments::Words(words) = command.arguments else {
+        return None;
+    };
+    // `rest` starts at the whitespace that ended the name, so the word starts
+    // after it - and a second word means the list has had its say.
+    let word = rest.trim_start();
+    if word.contains(char::is_whitespace) || word.starts_with(['@', '"']) {
+        return None;
+    }
+    Some(Token {
+        source: Source::Argument {
+            name: command.name,
+            words,
+        },
+        start: head.len() - word.len(),
+        query: word.to_string(),
+    })
+}
+
+/// The rows a command's argument vocabulary offers, narrowed by what is typed.
+///
+/// A word the reader has already typed in full is not a candidate: ranking it
+/// would offer the line they just wrote, and Enter would pick it a second time
+/// instead of sending the command.
+fn argument_rows(query: &str, name: &'static str, words: &'static [Word]) -> Vec<Row> {
+    if words.iter().any(|word| word.text == query) {
+        return Vec::new();
+    }
+    let choices: Vec<&str> = words.iter().map(|word| word.text).collect();
+    fuzzy::rank(query, choices)
+        .into_iter()
+        .filter_map(|hit| words.get(hit.index))
+        .map(|word| Row {
+            // The row draws the whole line it would run: a bare word says
+            // nothing about which command it completes.
+            label: format!("{name} {}", word.text),
+            detail: word.detail.to_string(),
+            insert: word.text.to_string(),
+            // Picking a word completes the line, so the row runs it: the
+            // argument was the last thing missing.
+            submit: true,
+            session: None,
+        })
+        .collect()
 }
 
 /// The command rows one query ranks: the build's own commands, then the
@@ -797,6 +1026,64 @@ mod tests {
             menu.rows()[menu.active()].detail,
             "read the log (user-only)"
         );
+    }
+
+    /// A command's fixed vocabulary is a fourth list: the words it can take,
+    /// drawn with the line they complete, and one pick runs the line.
+    #[test]
+    fn an_argument_list_completes_the_word_and_runs_the_line() {
+        let mut menu = Menu::default();
+        menu.sync("/permission ", 12, None, &[], &[]);
+        assert!(
+            menu.open(),
+            "the space after a worded command opens its list"
+        );
+        let labels: Vec<&str> = menu.rows().iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "/permission read-only",
+                "/permission workspace-write",
+                "/permission danger-full-access",
+            ],
+            "every mode the contract names, in its own order"
+        );
+        // The gloss is the reason the row is worth reading: the mode's name
+        // alone does not say what it lets a turn do.
+        assert_eq!(menu.rows()[0].detail, "reads, and asks before it writes");
+        let (mut input, mut cursor) = ("/permission ".to_string(), 12);
+        assert_eq!(
+            menu.accept(&mut input, &mut cursor),
+            Some(Accepted::Insert(true)),
+            "the word was the last thing missing, so the line runs"
+        );
+        assert_eq!(input, "/permission read-only");
+        assert_eq!(cursor, input.len());
+
+        // A prefix narrows the list, the way the command list narrows itself.
+        let mut menu = Menu::default();
+        menu.sync("/goal p", 7, None, &[], &[]);
+        assert_eq!(menu.rows()[menu.active()].label, "/goal pause");
+
+        // A word typed in full closes the list: there is nothing left to pick,
+        // and the next Enter belongs to the composer rather than to a row that
+        // would insert what is already there.
+        let mut menu = Menu::default();
+        menu.sync("/plan off", 9, None, &[], &[]);
+        assert!(!menu.open());
+        // A second word is another decision (`/goal edit <objective>`), and a
+        // command with free text has no list at all.
+        let mut menu = Menu::default();
+        menu.sync("/goal edit ship it", 18, None, &[], &[]);
+        assert!(!menu.open());
+        menu.sync("/rename release notes", 19, None, &[], &[]);
+        assert!(!menu.open());
+        // An `@` in the argument still opens the file list: quoting a path is
+        // the argument's own job, not the vocabulary's.
+        let temp = temp_workspace();
+        let mut menu = Menu::default();
+        menu.sync("/plan @ap", 9, Some(temp.path()), &[], &[]);
+        assert_eq!(menu.rows()[menu.active()].label, "src/app.rs");
     }
 
     #[test]

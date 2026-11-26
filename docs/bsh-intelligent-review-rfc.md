@@ -21,7 +21,7 @@
 | P0 content-addressed SnapshotStore | 已实现（无 GC） | crates/bsh/src/review/store.rs |
 | P0 write_file 精确 before/after | 已实现 | crates/bsh/src/caps.rs |
 | P0 edit_file 精确 before/after | 已实现 | crates/bsh/src/caps.rs |
-| P0 apply_patch 逐文件精确 before/after | 已实现 | crates/bsh/src/caps.rs |
+| P0 patch 逐文件精确 before/after | 已实现 | crates/bsh/src/caps.rs |
 | P0 失败/缺失快照的显式状态 | 已实现 | SnapshotState / UnavailableReason |
 | P1 文本 diff | 已实现 | crates/bsh/src/review/diff.rs |
 | P1 结构 diff（Rust/TS/TSX/JS/Python） | 已实现（含 method -> impl 父节点缩进） | tree-sitter adapters |
@@ -190,7 +190,7 @@ GPUI Review surface, Chat cards, Task board, Audit, Export
 +-----------------------------+       +-----------------------------+
 | Agent tools / Task attempts |       |  Terminal / shell / jobs    |
 | write_file, edit_file,      |       |  arbitrary process effects  |
-| apply_patch, extensions     |       |                             |
+| patch, extensions     |       |                             |
 +--------------+--------------+       +--------------+--------------+
                |                                     |
                |  exact mutation boundary            |  observed / unattributed
@@ -961,7 +961,7 @@ pub(crate) struct ChangeDraft {
 
 ### 6.3 精确捕获：文件工具
 
-write_file / edit_file / apply_patch / extension 提供的文件写入工具必须走同一条路径：
+write_file / edit_file / patch / extension 提供的文件写入工具必须走同一条路径：
 
 ~~~text
 resolve path
@@ -980,7 +980,7 @@ resolve path
 2. **after 必须在同一锁内读取。** 否则下一次写可能已经覆盖。
 3. **失败调用不产生 revision。** 如果工具在 mutate 前失败，不记录 change；如果 mutate 后读取失败，记录 Unavailable(ReadFailed)，不要把请求内容当 after。
 4. **unchanged 是有效结果。** write_file 的 byte-identical write 不产生 revision，但可以记录一个 Unchanged evidence（可选）。
-5. **apply_patch 逐文件捕获。** 每个文件独立 before/after；部分成功时只记录成功的文件，失败文件标 Unavailable 或省略并说明。
+5. **patch 逐文件捕获。** 每个文件独立 before/after；部分成功时只记录成功的文件，失败文件标 Unavailable 或省略并说明。
 6. **create_file 归一到 write_file 语义。** 已有 UI 代码已经做这个归一（crates/bsh/src/ui/diff_pane.rs:170-186），domain 层应统一，而不是让 UI 继续补洞。
 
 **现有 write_bytes 的行为需要保留：**
@@ -1358,7 +1358,7 @@ pub(crate) trait ReviewService: Send + Sync {
 | 阶段 | 内容 | 退出条件 |
 |---|---|---|
 | **M0 Domain** | 类型、digest、manifest、store、feature flag；不接线 | 单元测试覆盖不变量；旧 session 仍可加载 |
-| **M1 Exact File Capture** | write_file / edit_file / apply_patch 接入；Diff pane 读真实 change | 覆盖写不再显示 Rewritten；create/edit/patch 有真实 diff |
+| **M1 Exact File Capture** | write_file / edit_file / patch 接入；Diff pane 读真实 change | 覆盖写不再显示 Rewritten；create/edit/patch 有真实 diff |
 | **M2 Text Diff + Chat/Diff** | Text diff、legacy fallback、Chat changed-files card 改用 change | 旧 session 标 legacy；新 session 卡片与磁盘一致 |
 | **M3 Structural + Review UI** | tree-sitter adapters、Review tab、findings/decision | Rust/TS/JS/Python 结构树可展开；decision 绑定 digest |
 | **M4 Task/Audit 联接** | task attempt/review/audit 链接；board badge；deep link | 点击链路完整；reload 后仍可跳转 |
@@ -1390,7 +1390,7 @@ pub(crate) trait ReviewService: Send + Sync {
 |---|---|---|
 | A1 | write_file 覆盖一个已有文件 | before/after 真实；diff 是磁盘差异；不再显示 Rewritten |
 | A2 | edit_file 替换字符串 | before/after 真实；hunk 行号正确 |
-| A3 | apply_patch 多文件 | 每个文件独立 change；部分失败有明确状态 |
+| A3 | patch 多文件 | 每个文件独立 change；部分失败有明确状态 |
 | A4 | 创建/删除/重命名 | Created / Deleted / Renamed；重命名显示为 move |
 | A5 | 图片变更 | 显示尺寸/格式/像素差异；不再 diff.binary |
 | A6 | PDF/docx/archive/config | 至少 metadata + 结构摘要；不支持时明确 fallback |
@@ -1414,7 +1414,7 @@ pub(crate) trait ReviewService: Send + Sync {
 
 **集成：**
 
-- write_file/edit_file/apply_patch 的 before/after 与磁盘一致。
+- write_file/edit_file/patch 的 before/after 与磁盘一致。
 - 并发写同一路径：revision 顺序和 lock 一致。
 - task attempt seal + review open + decision + audit event。
 - 旧 session 加载、保存、再次加载的兼容性。

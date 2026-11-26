@@ -184,7 +184,7 @@ projection!(view_sed {
     "exit_code" => "exit_code": Keep::NonZero,
 });
 
-projection!(view_apply_patch {
+projection!(view_patch {
     "files" => "files": Keep::Always,
     "failed" => "failed": Keep::NonZero,
     "changed_files" => "changed_files": Keep::Always,
@@ -490,7 +490,7 @@ fn view_federation_capabilities(payload: &Value) -> Value {
 /// The names that carry a declared view, in the same order as the built-in
 /// metadata table.
 pub(crate) const VIEW_TOOLS: &[&str] = &[
-    "apply_patch",
+    "patch",
     "ask_user",
     "bash",
     "close_surface",
@@ -552,7 +552,7 @@ pub(crate) fn view_for(name: &str) -> Option<fn(&Value) -> Value> {
         return None;
     }
     Some(match name {
-        "apply_patch" => view_apply_patch,
+        "patch" => view_patch,
         "ask_user" => view_ask_user,
         "bash" => view_bash,
         "close_surface" => view_close_surface,
@@ -791,7 +791,7 @@ mod tests {
 
     /// The full built-in roster, in the order the metadata table declares it.
     const BUILTINS: [&str; 48] = [
-        "apply_patch",
+        "patch",
         "ask_user",
         "bash",
         "close_surface",

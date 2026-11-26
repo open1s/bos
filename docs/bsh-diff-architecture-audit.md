@@ -11,7 +11,7 @@ a matrix with evidence, not a roadmap restatement.
 The surface has four layers and one shared content store.
 
 ```
-write_file / edit_file / apply_patch
+write_file / edit_file / patch
         |
         v
 ReviewRuntime  -- exact before/after snapshots -->  .bsh/review/objects

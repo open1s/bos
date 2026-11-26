@@ -24,7 +24,8 @@
 | Input Type | Description | Tools Affected |
 |------------|-------------|----------------|
 | **Simple Parameters** | Direct value inputs (strings, numbers) | `read_file`, `bash`, `glob` |
-| **Structured Objects** | JSON objects with required fields | `task_create`, `apply_patch` |
+| **Structured Objects** | JSON objects with required fields | `task_create` |
+| **Structured Text** | One document with line markers | `patch` |
 | **Union Types** | Multiple valid input formats | `browser_open` (URL validation) |
 | **Optional Parameters** | Not all parameters required | Most tools with `additionalProperties` |
 | **Conditional Logic** | Input requirements based on other values | `task_create` (tier-dependent fields) |

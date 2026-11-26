@@ -1030,9 +1030,18 @@ fn build_agent_for_session_inner(
         false
     };
     let preset_tools = eff.preset_tools.as_deref();
+    // `patch` took the place of `apply_patch`; a stored switch or a custom
+    // preset written before the rename still names the old tool, so both
+    // spellings select the same switch.
     let off_tool = |name: &str| {
-        eff.disabled_tools.iter().any(|d| d == name)
-            || preset_tools.is_some_and(|tools| !tools.iter().any(|tool| tool == name))
+        eff.disabled_tools
+            .iter()
+            .any(|d| d == name || (name == "patch" && d == "apply_patch"))
+            || preset_tools.is_some_and(|tools| {
+                !tools
+                    .iter()
+                    .any(|tool| tool == name || (name == "patch" && tool == "apply_patch"))
+            })
     };
     // The goal tools are session-durable state, not a preset capability: a
     // preset's tool allowlist must NOT withdraw the only path that can complete
@@ -1277,9 +1286,9 @@ fn build_agent_for_session_inner(
                 declare("sed"),
             )));
         }
-        if writes && !off_tool("apply_patch") {
+        if writes && !off_tool("patch") {
             files.push(Arc::new(DeclaredTool::new(
-                Arc::new(apply_patch_tool(
+                Arc::new(patch_tool(
                     files_root.clone(),
                     enforce_escape,
                     policy.clone(),
@@ -1287,7 +1296,7 @@ fn build_agent_for_session_inner(
                     preset.clone(),
                     review.clone(),
                 )),
-                declare("apply_patch"),
+                declare("patch"),
             )));
         }
         if !off_tool("list_dir") {
@@ -2471,13 +2480,13 @@ pub(crate) fn workspace_tool_scope() -> react::tool::admission::InitialToolScope
             "job_output",
             "list_dir",
             "mcp",
+            "patch",
             "read_file",
             "read_files",
             "recall",
             "remember",
             "run_code",
             "sed",
-            "apply_patch",
             "subagent",
             "update_plan",
             "web_search",
@@ -4267,10 +4276,10 @@ const MAX_BATCH_READ_FILES: usize = 10;
 /// Maximum number of files changed by one patch call.
 const MAX_PATCH_FILES: usize = 10;
 
-/// Maximum exact-text edits applied to one file by one patch call.
+/// Maximum hunks applied to one file by one patch call.
 const MAX_PATCH_EDITS: usize = 20;
 
-/// Maximum combined old/new text accepted by one patch request.
+/// Maximum unified-diff text accepted by one patch request.
 const MAX_PATCH_INPUT_BYTES: usize = 1024 * 1024;
 
 /// The largest file `edit_file` rewrites, in bytes.
@@ -5781,8 +5790,8 @@ def edit_file(path, old_string, new_string, **kwargs):
     return call("edit_file", {"path": path, "old_string": old_string, "new_string": new_string, **kwargs})
 
 
-def apply_patch(patch, **kwargs):
-    return call("apply_patch", {"patch": patch, **kwargs})
+def patch(patch_text, **kwargs):
+    return call("patch", {"patch": patch_text, **kwargs})
 
 
 def codel(action, **kwargs):
@@ -6641,8 +6650,442 @@ pub(crate) fn read_files_tool(
     )
 }
 
-/// apply_patch - apply exact-text edits to several files in one call.
-fn apply_patch_tool(
+/// One line of a file or a hunk. The text excludes the newline; newline is
+/// false only for the last line of a file that does not end with one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchLine {
+    text: String,
+    newline: bool,
+}
+
+/// A hunk line's role in the diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HunkKind {
+    Context,
+    Remove,
+    Add,
+}
+
+#[derive(Debug, Clone)]
+struct HunkLine {
+    kind: HunkKind,
+    line: PatchLine,
+}
+
+/// One @@ -old_start,old_count +new_start,new_count @@ hunk.
+#[derive(Debug, Clone)]
+struct DiffHunk {
+    old_start: usize,
+    old_count: usize,
+    _new_start: usize,
+    new_count: usize,
+    lines: Vec<HunkLine>,
+}
+
+/// One ---/+++ section of a unified diff. None is /dev/null: a creation on the
+/// old side, a deletion on the new side.
+#[derive(Debug, Clone)]
+struct DiffFile {
+    old_path: Option<String>,
+    new_path: Option<String>,
+    hunks: Vec<DiffHunk>,
+}
+
+/// Why a section is being applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffAction {
+    Update,
+    Create,
+    Delete,
+}
+
+/// Split file text into lines, keeping whether each line had a terminator.
+fn diff_lines(text: &str) -> Vec<PatchLine> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            out.push(PatchLine {
+                text: text[start..index].to_string(),
+                newline: true,
+            });
+            start = index + 1;
+        }
+    }
+    if start < text.len() {
+        out.push(PatchLine {
+            text: text[start..].to_string(),
+            newline: false,
+        });
+    }
+    out
+}
+
+/// Rebuild text from lines, honouring a missing final newline.
+fn join_diff_lines(lines: &[PatchLine]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&line.text);
+        if line.newline {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The path in a ---/+++ header, with a/ or b/ stripped.
+fn diff_header_path(raw: &str, prefix: &str) -> Option<String> {
+    let raw = raw.split('\t').next().unwrap_or(raw).trim();
+    let raw = raw
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(raw);
+    if raw == "/dev/null" {
+        return None;
+    }
+    let raw = raw.strip_prefix(prefix).unwrap_or(raw);
+    Some(raw.to_string())
+}
+
+/// Parse one unified diff (the output of diff -u or git diff).
+fn parse_unified_diff(text: &str) -> Result<Vec<DiffFile>, ToolError> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut files: Vec<DiffFile> = Vec::new();
+    let mut at = 0usize;
+    while at < lines.len() {
+        let line = lines[at];
+        if line.is_empty() {
+            at += 1;
+            continue;
+        }
+        if line.starts_with("Index: ")
+            || line.starts_with("===")
+            || line.starts_with("diff --git ")
+            || line.starts_with("index ")
+            || line.starts_with("new file mode ")
+            || line.starts_with("deleted file mode ")
+            || line.starts_with("old mode ")
+            || line.starts_with("new mode ")
+            || line.starts_with("similarity index ")
+            || line.starts_with("rename from ")
+            || line.starts_with("rename to ")
+        {
+            at += 1;
+            continue;
+        }
+        let Some(old_raw) = line.strip_prefix("--- ") else {
+            return Err(ToolError::invalid_field(
+                "patch",
+                format!("line {}: expected a --- file header, got {}", at + 1, line),
+            ));
+        };
+        let old_path = diff_header_path(old_raw, "a/");
+        at += 1;
+        let Some(new_raw) = lines.get(at).and_then(|line| line.strip_prefix("+++ ")) else {
+            return Err(ToolError::invalid_field(
+                "patch",
+                format!("line {}: --- must be followed by +++", at + 1),
+            ));
+        };
+        let new_path = diff_header_path(new_raw, "b/");
+        at += 1;
+
+        let mut hunks = Vec::new();
+        while at < lines.len() && lines[at].starts_with("@@") {
+            let (hunk, next) = parse_diff_hunk(&lines, at)?;
+            hunks.push(hunk);
+            at = next;
+        }
+        if hunks.is_empty() && old_path.is_some() && new_path.is_some() {
+            return Err(ToolError::invalid_field(
+                "patch",
+                "a file section needs at least one @@ hunk",
+            ));
+        }
+        files.push(DiffFile {
+            old_path,
+            new_path,
+            hunks,
+        });
+    }
+    if files.is_empty() {
+        return Err(ToolError::invalid_field(
+            "patch",
+            "contains no ---/+++ file section",
+        ));
+    }
+    Ok(files)
+}
+
+/// Parse @@ -old_start,old_count +new_start,new_count @@ (counts default 1).
+fn parse_diff_hunk_header(header: &str) -> Result<(usize, usize, usize, usize), ToolError> {
+    let header = header.trim_end();
+    let body = header.strip_prefix("@@ -").ok_or_else(|| {
+        ToolError::invalid_field("patch", format!("not a hunk header: {}", header))
+    })?;
+    let (old, rest) = body.split_once(" +").ok_or_else(|| {
+        ToolError::invalid_field("patch", format!("not a hunk header: {}", header))
+    })?;
+    let new = rest
+        .split_once(" @@")
+        .map(|(new, _)| new)
+        .or_else(|| rest.split_once("@@").map(|(new, _)| new))
+        .ok_or_else(|| {
+            ToolError::invalid_field("patch", format!("not a hunk header: {}", header))
+        })?;
+    let range = |text: &str| -> Result<(usize, usize), ToolError> {
+        let (start, count) = text.split_once(',').unwrap_or((text, "1"));
+        let start = start.trim().parse::<usize>().map_err(|_| {
+            ToolError::invalid_field("patch", format!("bad hunk line number in {}", header))
+        })?;
+        let count = count.trim().parse::<usize>().map_err(|_| {
+            ToolError::invalid_field("patch", format!("bad hunk line count in {}", header))
+        })?;
+        Ok((start, count))
+    };
+    let (old_start, old_count) = range(old)?;
+    let (new_start, new_count) = range(new)?;
+    if old_count > 0 && old_start == 0 {
+        return Err(ToolError::invalid_field(
+            "patch",
+            format!("a non-empty hunk cannot start at line 0: {}", header),
+        ));
+    }
+    Ok((old_start, old_count, new_start, new_count))
+}
+
+/// Parse one hunk's header and lines, returning the hunk and the next index.
+fn parse_diff_hunk(lines: &[&str], start: usize) -> Result<(DiffHunk, usize), ToolError> {
+    let header = lines[start];
+    let (old_start, old_count, new_start, new_count) = parse_diff_hunk_header(header)?;
+    let mut at = start + 1;
+    let mut out = Vec::new();
+    let mut old_seen = 0usize;
+    let mut new_seen = 0usize;
+    let mut changed = false;
+    while at < lines.len() && (old_seen < old_count || new_seen < new_count) {
+        let raw = lines[at];
+        if raw.is_empty() {
+            // A diff whose trailing whitespace was stripped leaves a blank
+            // context line rather than a single space.
+            out.push(HunkLine {
+                kind: HunkKind::Context,
+                line: PatchLine {
+                    text: String::new(),
+                    newline: true,
+                },
+            });
+            old_seen += 1;
+            new_seen += 1;
+            at += 1;
+            continue;
+        }
+        let (kind, text) = match raw.as_bytes()[0] {
+            b' ' => (HunkKind::Context, &raw[1..]),
+            b'-' => (HunkKind::Remove, &raw[1..]),
+            b'+' => (HunkKind::Add, &raw[1..]),
+            b'\\' => {
+                // A no-newline marker belongs to the line before it.
+                if let Some(last) = out.last_mut() {
+                    last.line.newline = false;
+                }
+                at += 1;
+                continue;
+            }
+            _ => {
+                return Err(ToolError::invalid_field(
+                    "patch",
+                    format!(
+                        "line {}: a hunk line must start with space, - or +, got {}",
+                        at + 1,
+                        raw
+                    ),
+                ));
+            }
+        };
+        match kind {
+            HunkKind::Context => {
+                old_seen += 1;
+                new_seen += 1;
+            }
+            HunkKind::Remove => {
+                old_seen += 1;
+                changed = true;
+            }
+            HunkKind::Add => {
+                new_seen += 1;
+                changed = true;
+            }
+        }
+        if old_seen > old_count || new_seen > new_count {
+            return Err(ToolError::invalid_field(
+                "patch",
+                format!(
+                    "hunk at line {} has more lines than its header counts",
+                    start + 1
+                ),
+            ));
+        }
+        out.push(HunkLine {
+            kind,
+            line: PatchLine {
+                text: text.to_string(),
+                newline: true,
+            },
+        });
+        at += 1;
+        if at < lines.len() && lines[at].starts_with('\\') {
+            if let Some(last) = out.last_mut() {
+                last.line.newline = false;
+            }
+            at += 1;
+        }
+    }
+    if old_seen != old_count || new_seen != new_count {
+        return Err(ToolError::invalid_field(
+            "patch",
+            format!(
+                "hunk at line {} expects {} old / {} new lines, found {} / {}",
+                start + 1,
+                old_count,
+                new_count,
+                old_seen,
+                new_seen
+            ),
+        ));
+    }
+    if !changed {
+        return Err(ToolError::invalid_field(
+            "patch",
+            format!("hunk at line {} has no - or + line", start + 1),
+        ));
+    }
+    Ok((
+        DiffHunk {
+            old_start,
+            old_count,
+            _new_start: new_start,
+            new_count,
+            lines: out,
+        },
+        at,
+    ))
+}
+
+/// Where one hunk's old lines occur, starting at the expected line and
+/// searching outward, the way patch does when earlier hunks shifted the file.
+fn find_diff_hunk(lines: &[PatchLine], old: &[PatchLine], candidate: usize) -> Option<usize> {
+    if old.is_empty() {
+        return Some(candidate.min(lines.len()));
+    }
+    let max = lines.len().saturating_sub(old.len());
+    let at = candidate.min(max);
+    if lines[at..].starts_with(old) {
+        return Some(at);
+    }
+    for delta in 1..=lines.len().max(1) {
+        if let Some(pos) = at.checked_sub(delta)
+            && pos <= max
+            && lines[pos..].starts_with(old)
+        {
+            return Some(pos);
+        }
+        let pos = at.saturating_add(delta);
+        if pos <= max && lines[pos..].starts_with(old) {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+/// Apply one hunk in place, updating the running line offset.
+fn apply_diff_hunk(
+    lines: &mut Vec<PatchLine>,
+    hunk: &DiffHunk,
+    offset: &mut isize,
+    path: &str,
+) -> Result<(), ToolError> {
+    let mut old = Vec::with_capacity(hunk.old_count);
+    let mut new = Vec::with_capacity(hunk.new_count);
+    for line in &hunk.lines {
+        match line.kind {
+            HunkKind::Context => {
+                old.push(line.line.clone());
+                new.push(line.line.clone());
+            }
+            HunkKind::Remove => old.push(line.line.clone()),
+            HunkKind::Add => new.push(line.line.clone()),
+        }
+    }
+    if old.len() != hunk.old_count || new.len() != hunk.new_count {
+        return Err(ToolError::invalid_field(
+            "patch",
+            format!("hunk counts in {} do not match its lines", path),
+        ));
+    }
+    let expected = if hunk.old_count == 0 {
+        hunk.old_start
+    } else {
+        hunk.old_start.saturating_sub(1)
+    };
+    let candidate = (expected as isize + *offset).max(0) as usize;
+    let mut chosen = find_diff_hunk(lines, &old, candidate)
+        .map(|position| (position, old.clone(), new.clone(), 0usize));
+    if chosen.is_none() {
+        // GNU patch retries with up to two lines of fuzz: the outermost
+        // context lines may differ, and only the changed core must match.
+        for fuzz in 1..=2usize {
+            let lead = hunk
+                .lines
+                .iter()
+                .take_while(|line| line.kind == HunkKind::Context)
+                .count()
+                .min(fuzz);
+            let trail = hunk
+                .lines
+                .iter()
+                .rev()
+                .take_while(|line| line.kind == HunkKind::Context)
+                .count()
+                .min(fuzz);
+            if lead == 0 && trail == 0 {
+                continue;
+            }
+            if lead + trail > old.len() {
+                continue;
+            }
+            let old_core = old[lead..old.len() - trail].to_vec();
+            let new_core = new[lead..new.len() - trail].to_vec();
+            if old_core.is_empty() {
+                continue;
+            }
+            let at = (expected as isize + lead as isize + *offset).max(0) as usize;
+            if let Some(position) = find_diff_hunk(lines, &old_core, at) {
+                chosen = Some((position, old_core, new_core, lead));
+                break;
+            }
+        }
+    }
+    let Some((position, matched, replacement, lead)) = chosen else {
+        return Err(ToolError::invalid_field(
+            "patch",
+            format!(
+                "hunk at old line {} in {} did not match the file; regenerate the diff against the file's current content",
+                hunk.old_start, path
+            ),
+        ));
+    };
+    lines.splice(
+        position..position + matched.len(),
+        replacement.iter().cloned(),
+    );
+    *offset = position as isize - (expected as isize + lead as isize)
+        + (replacement.len() as isize - matched.len() as isize);
+    Ok(())
+}
+
+/// patch - apply a standard unified diff to files.
+fn patch_tool(
     root: Option<PathBuf>,
     enforce: bool,
     policy: Arc<PolicySet>,
@@ -6651,222 +7094,196 @@ fn apply_patch_tool(
     review: Option<Arc<crate::review::ReviewRuntime>>,
 ) -> FunctionTool {
     FunctionTool::new(
-        "apply_patch",
-        "Apply exact-text edits to 2–10 files in one call; use edit_file for one file. Each file is validated before its atomic write, and a failed edit leaves that file unchanged. Not a cross-file transaction; inspect each result's error field.",
+        "patch",
+        "Apply a standard unified diff, exactly as patch reads one: ---/+++ file headers, then @@ -old_start,old_count +new_start,new_count @@ hunks whose lines start with a space (context), - (removed) or + (added). Pass the diff itself, as diff -u or git diff prints it; a/ and b/ prefixes are stripped. Hunks are located by line number and exact context, searching outward when earlier hunks shifted the file, with up to two lines of fuzz as patch allows. --- /dev/null creates a file, +++ /dev/null deletes one. Each file is written atomically; a hunk that does not match leaves that file unchanged.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "changes": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": MAX_PATCH_FILES,
-                    "description": "One to ten distinct file paths, each with an ordered list of exact-text edits.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "minLength": 1,
-                                "maxLength": 4096,
-                                "description": "Existing UTF-8 file path relative to the workspace or absolute inside the allowed workspace."
-                            },
-                            "edits": {
-                                "type": "array",
-                                "minItems": 1,
-                                "maxItems": MAX_PATCH_EDITS,
-                                "description": "Ordered exact-text edits applied in memory before one atomic write.",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "old_string": {
-                                            "type": "string",
-                                            "minLength": 1,
-                                            "maxLength": 262144,
-                                            "description": "Exact non-empty text to find. It must occur exactly once unless replace_all is true."
-                                        },
-                                        "new_string": {
-                                            "type": "string",
-                                            "maxLength": 262144,
-                                            "description": "Replacement text; an empty string deletes the matched text."
-                                        },
-                                        "replace_all": {
-                                            "type": "boolean",
-                                            "description": "Set true only when every occurrence of old_string should be replaced."
-                                        }
-                                    },
-                                    "required": ["old_string", "new_string"],
-                                    "additionalProperties": false
-                                }
-                            }
-                        },
-                        "required": ["path", "edits"],
-                        "additionalProperties": false
-                    }
+                "patch": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_PATCH_INPUT_BYTES,
+                    "description": "A unified diff: --- old, +++ new, then @@ -a,b +c,d @@ hunks with space/-/+ lines. As printed by diff -u or git diff."
                 }
             },
-            "required": ["changes"],
+            "required": ["patch"],
             "additionalProperties": false
         }),
         move |args| {
-            let changes = args
-                .get("changes")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| ToolError::invalid_field("changes", "must be an array"))?;
-            if changes.is_empty() || changes.len() > MAX_PATCH_FILES {
-                return Err(ToolError::InvalidInput(format!(
-                    "changes must contain between 1 and {MAX_PATCH_FILES} files"
-                )));
+            let text = args
+                .get("patch")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ToolError::invalid_field("patch", "must be a string"))?;
+            if text.len() > MAX_PATCH_INPUT_BYTES {
+                return Err(ToolError::invalid_field(
+                    "patch",
+                    format!("must not exceed {} bytes", MAX_PATCH_INPUT_BYTES),
+                ));
+            }
+            let files = parse_unified_diff(text)?;
+            if files.len() > MAX_PATCH_FILES {
+                return Err(ToolError::invalid_field(
+                    "patch",
+                    format!("must touch at most {} files", MAX_PATCH_FILES),
+                ));
             }
 
-            // Preflight every path and the aggregate patch payload before any
-            // file is read or written. Duplicate aliases must not partially
-            // apply the first occurrence before the second is discovered.
+            // Preflight every path and policy decision before touching a file.
             let rules = ignore_rules(root.as_deref());
-            let mut input_bytes = 0usize;
-            let mut seen_targets = HashSet::with_capacity(changes.len());
-            let mut targets = Vec::with_capacity(changes.len());
-            for change in changes {
-                let raw = change
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        ToolError::InvalidInput("every change requires a string path".to_string())
-                    })?;
-                input_bytes = input_bytes.saturating_add(raw.len());
-                let target =
-                    resolve_path(root.as_deref(), raw, enforce).map_err(ToolError::InvalidInput)?;
-                if !seen_targets.insert(target.clone()) {
-                    return Err(ToolError::InvalidInput(format!(
-                        "duplicate target path in apply_patch: {}",
-                        target.display()
-                    )));
+            let mut seen_targets = HashSet::with_capacity(files.len());
+            let mut targets = Vec::with_capacity(files.len());
+            // patch chooses the name that exists when the two headers differ:
+            // a diff of old.txt -> new.txt applied where new.txt is absent
+            // patches old.txt, exactly the file the reader still has.
+            let exists = |name: &str| {
+                resolve_path(root.as_deref(), name, enforce)
+                    .ok()
+                    .is_some_and(|path| fs::metadata(path).is_ok())
+            };
+            for file in &files {
+                if file.hunks.len() > MAX_PATCH_EDITS {
+                    return Err(ToolError::invalid_field(
+                        "patch",
+                        format!(
+                            "a file section has {} hunks; use at most {} per file",
+                            file.hunks.len(),
+                            MAX_PATCH_EDITS
+                        ),
+                    ));
                 }
-                refuse_ignored(rules.as_ref(), &target)?;
-                check_path(
-                    &policy,
-                    &session,
-                    &preset,
-                    "apply_patch",
-                    Action::Write,
-                    &target,
-                )?;
-
-                let edits = change
-                    .get("edits")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| ToolError::invalid_field("edits", "must be an array"))?;
-                if edits.is_empty() || edits.len() > MAX_PATCH_EDITS {
-                    return Err(ToolError::InvalidInput(format!(
-                        "edits must contain between 1 and {MAX_PATCH_EDITS} operations per file"
-                    )));
-                }
-                for edit in edits {
-                    let old = edit
-                        .get("old_string")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            ToolError::InvalidInput("each edit requires old_string".to_string())
-                        })?;
-                    let new = edit
-                        .get("new_string")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            ToolError::InvalidInput("each edit requires new_string".to_string())
-                        })?;
-                    if old.is_empty() || old == new {
-                        return Err(ToolError::InvalidInput(
-                            "old_string must be non-empty and different from new_string"
-                                .to_string(),
+                let (path, action) = match (&file.old_path, &file.new_path) {
+                    (Some(old), Some(new)) if old != new => {
+                        let path = if exists(new) || !exists(old) {
+                            new.clone()
+                        } else {
+                            old.clone()
+                        };
+                        (path, DiffAction::Update)
+                    }
+                    (Some(_), Some(new)) => (new.clone(), DiffAction::Update),
+                    (None, Some(new)) => (new.clone(), DiffAction::Create),
+                    (Some(old), None) => (old.clone(), DiffAction::Delete),
+                    (None, None) => {
+                        return Err(ToolError::invalid_field(
+                            "patch",
+                            "both sides of a file section are /dev/null",
                         ));
                     }
-                    input_bytes = input_bytes
-                        .saturating_add(old.len())
-                        .saturating_add(new.len());
-                    if input_bytes > MAX_PATCH_INPUT_BYTES {
-                        return Err(ToolError::InvalidInput(format!(
-                            "combined patch text must not exceed {MAX_PATCH_INPUT_BYTES} bytes"
-                        )));
-                    }
+                };
+                let target = resolve_path(root.as_deref(), &path, enforce)
+                    .map_err(ToolError::InvalidInput)?;
+                if !seen_targets.insert(target.clone()) {
+                    return Err(ToolError::invalid_field(
+                        "patch",
+                        format!(
+                            "{} resolves to the same file as another section; use one section",
+                            path
+                        ),
+                    ));
                 }
-                targets.push(target);
+                refuse_ignored(rules.as_ref(), &target)?;
+                check_path(&policy, &session, &preset, "patch", Action::Write, &target)?;
+                targets.push((target, action));
             }
 
-            let mut results = Vec::with_capacity(changes.len());
+            let mut results = Vec::with_capacity(files.len());
             let mut changed_files = 0usize;
-
-            for (change, target) in changes.iter().zip(targets) {
-                let raw = change
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .expect("path was validated during preflight");
+            for (file, (target, action)) in files.iter().zip(targets) {
                 let result = (|| -> Result<serde_json::Value, ToolError> {
-                    let edits = change
-                        .get("edits")
-                        .and_then(serde_json::Value::as_array)
-                        .expect("edits were validated during preflight");
-
                     let lock = file_lock(&target);
                     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let before = review
                         .as_ref()
                         .map(|runtime| runtime.before(&target))
                         .unwrap_or(SnapshotState::Absent);
-                    let original = read_editable(&target)?;
-                    let mut content = original.clone();
-                    let mut replacements = 0usize;
-
-                    for edit in edits {
-                        let old = edit["old_string"]
-                            .as_str()
-                            .expect("old_string was validated during preflight");
-                        let new = edit["new_string"]
-                            .as_str()
-                            .expect("new_string was validated during preflight");
-                        let replace_all = edit
-                            .get("replace_all")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false);
-                        let outcome = replace_text(&content, old, new, replace_all)
-                            .map_err(|error| match error {
-                                ReplaceError::NotFound => {
-                                    ToolError::Failed(not_found_message(&target, &content, old))
-                                }
-                                ReplaceError::Ambiguous(count) => ToolError::InvalidInput(
+                    let original = match action {
+                        DiffAction::Create => {
+                            if fs::metadata(&target).is_ok() {
+                                return Err(ToolError::invalid_field(
+                                    "patch",
                                     format!(
-                                        "old_string occurs {count} times in {}; set replace_all=true only if every occurrence is intended",
+                                        "{} already exists; a --- /dev/null section only creates a new file",
                                         target.display()
                                     ),
-                                ),
-                            })?;
-                        replacements += outcome.replacements;
-                        if let Some(updated) = outcome.updated {
-                            content = updated;
+                                ));
+                            }
+                            String::new()
                         }
-                    }
-
-                    if content.len() as u64 > MAX_EDIT_BYTES {
-                        return Err(ToolError::InvalidInput(format!(
-                            "patched file would exceed the {MAX_EDIT_BYTES} byte edit ceiling"
-                        )));
-                    }
-                    let unchanged = original == content;
-                    if !unchanged {
-                        write_bytes(&target, content.as_bytes())?;
-                        if let Some(runtime) = &review {
-                            runtime.record(&target, ChangeOperation::Patch, before, "apply_patch");
-                        }
-                        changed_files += 1;
-                    }
-                    let (diff, added, deleted, diff_truncated) = if unchanged {
-                        (Vec::new(), 0, 0, false)
-                    } else {
-                        crate::sed::line_diff(original.as_bytes(), content.as_bytes())
+                        DiffAction::Update | DiffAction::Delete => read_editable(&target)?,
                     };
+                    let mut lines = diff_lines(&original);
+                    let mut offset = 0isize;
+                    for hunk in &file.hunks {
+                        apply_diff_hunk(
+                            &mut lines,
+                            hunk,
+                            &mut offset,
+                            &target.display().to_string(),
+                        )?;
+                    }
+                    let content = join_diff_lines(&lines);
+                    let unchanged = original == content;
+                    let outcome = match action {
+                        DiffAction::Delete => {
+                            if !lines.is_empty() {
+                                return Err(ToolError::invalid_field(
+                                    "patch",
+                                    format!(
+                                        "a deletion of {} left {} line(s); the diff does not remove the whole file",
+                                        target.display(),
+                                        lines.len()
+                                    ),
+                                ));
+                            }
+                            fs::remove_file(&target).map_err(|error| failed(&target, &error))?;
+                            if let Some(runtime) = &review {
+                                runtime.record(&target, ChangeOperation::Delete, before, "patch");
+                            }
+                            changed_files += 1;
+                            "deleted"
+                        }
+                        DiffAction::Create | DiffAction::Update => {
+                            if content.len() as u64 > MAX_EDIT_BYTES {
+                                return Err(ToolError::invalid_field(
+                                    "patch",
+                                    format!(
+                                        "patched file would exceed the {} byte edit ceiling",
+                                        MAX_EDIT_BYTES
+                                    ),
+                                ));
+                            }
+                            if action == DiffAction::Create || !unchanged {
+                                write_bytes(&target, content.as_bytes())?;
+                                if let Some(runtime) = &review {
+                                    let operation = if action == DiffAction::Create {
+                                        ChangeOperation::Create
+                                    } else {
+                                        ChangeOperation::Patch
+                                    };
+                                    runtime.record(&target, operation, before, "patch");
+                                }
+                                changed_files += 1;
+                            }
+                            if action == DiffAction::Create {
+                                "created"
+                            } else if unchanged {
+                                "unchanged"
+                            } else {
+                                "patched"
+                            }
+                        }
+                    };
+                    let (diff, added, deleted, diff_truncated) =
+                        if unchanged && action != DiffAction::Delete {
+                            (Vec::new(), 0, 0, false)
+                        } else {
+                            crate::sed::line_diff(original.as_bytes(), content.as_bytes())
+                        };
                     Ok(serde_json::json!({
                         "path": target.display().to_string(),
                         "status": crate::file_result::OK,
-                        "outcome": if unchanged { "unchanged" } else { "patched" },
-                        "replacements": replacements,
+                        "outcome": outcome,
+                        "hunks": file.hunks.len(),
                         "bytes": content.len(),
                         "added": added,
                         "deleted": deleted,
@@ -6878,7 +7295,7 @@ fn apply_patch_tool(
                 match result {
                     Ok(value) => results.push(value),
                     Err(error) => results.push(serde_json::json!({
-                        "path": raw,
+                        "path": target.display().to_string(),
                         "status": crate::file_result::ERROR,
                         "error": error.to_string()
                     })),
@@ -6892,8 +7309,6 @@ fn apply_patch_tool(
             let diff_truncated = results
                 .iter()
                 .any(|file| file["diff_status"].as_str() == Some("truncated"));
-            // Item failures are per-file entries, not a call-level error. See
-            // `read_files`: the batch completed and every target has a verdict.
             let status = if failed > 0 {
                 crate::file_result::PARTIAL
             } else {
@@ -6901,23 +7316,24 @@ fn apply_patch_tool(
             };
             let mut result = serde_json::json!({
                 "files": results,
-                "count": changes.len(),
+                "count": files.len(),
                 "failed": failed,
                 "changed_files": changed_files,
                 "diff_status": if diff_truncated { "truncated" } else { "complete" }
             });
             result["summary"] = serde_json::json!(if failed > 0 {
                 format!(
-                    "patched {} of {} files; {failed} failed",
+                    "patched {} of {} files; {} failed",
                     changed_files,
-                    results.len()
+                    results.len(),
+                    failed
                 )
             } else if changed_files == 0 {
                 format!("{} files unchanged", results.len())
             } else {
-                format!("patched {changed_files} of {} files", results.len())
+                format!("patched {} of {} files", changed_files, results.len())
             });
-            crate::file_result::finish(&mut result, "apply_patch", status, None);
+            crate::file_result::finish(&mut result, "patch", status, None);
             Ok(result)
         },
     )
@@ -7123,6 +7539,195 @@ fn edit_file_tool(
 /// is honored, and the same per-path lock the other write tools take is held
 /// across the read-modify-write. A dry run asks the policy for a READ, because
 /// it writes nothing.
+/// The GNU sed command line, parsed into the one request this tool runs.
+struct SedArgv {
+    script: String,
+    file: String,
+    quiet: bool,
+    extended: bool,
+    posix: bool,
+    line_length: Option<usize>,
+    backup_suffix: Option<String>,
+    in_place: bool,
+}
+
+/// Parse GNU sed's own arguments for the one input file this tool edits.
+fn parse_sed_argv(values: &[serde_json::Value]) -> Result<SedArgv, ToolError> {
+    let mut args = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(arg) = value.as_str() else {
+            return Err(ToolError::InvalidInput(
+                "every sed argument must be a string".to_string(),
+            ));
+        };
+        args.push(arg.to_string());
+    }
+    let mut expressions: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut quiet = false;
+    let mut extended = false;
+    let mut posix = false;
+    let mut line_length = None;
+    let mut backup_suffix = None;
+    let mut in_place = false;
+    let mut options = true;
+    let mut at = 0usize;
+    while at < args.len() {
+        let arg = args[at].as_str();
+        if options && arg == "--" {
+            options = false;
+            at += 1;
+            continue;
+        }
+        if options && arg.starts_with("--") {
+            let (name, value) = arg
+                .split_once('=')
+                .map_or((arg, None), |(name, value)| (name, Some(value)));
+            match name {
+                "--quiet" | "--silent" => quiet = true,
+                "--regexp-extended" => extended = true,
+                "--posix" => posix = true,
+                "--separate" | "--unbuffered" | "--sandbox" | "--debug" => {}
+                "--in-place" => {
+                    in_place = true;
+                    backup_suffix = value.map(str::to_string);
+                }
+                "--line-length" => {
+                    let value = match value {
+                        Some(value) => value.to_string(),
+                        None => {
+                            at += 1;
+                            args.get(at).cloned().ok_or_else(|| {
+                                ToolError::InvalidInput("--line-length needs a number".to_string())
+                            })?
+                        }
+                    };
+                    line_length = Some(parse_sed_line_length(&value)?);
+                }
+                "--expression" => {
+                    let value = match value {
+                        Some(value) => value.to_string(),
+                        None => {
+                            at += 1;
+                            args.get(at).cloned().ok_or_else(|| {
+                                ToolError::InvalidInput("--expression needs a script".to_string())
+                            })?
+                        }
+                    };
+                    expressions.push(value);
+                }
+                "--file" => {
+                    return Err(ToolError::InvalidInput(
+                        "-f/--file is not supported; pass the program text with -e or the script field"
+                            .to_string(),
+                    ));
+                }
+                "--zero-terminated" => {
+                    return Err(ToolError::InvalidInput(
+                        "-z/--zero-terminated is not supported by the bundled sed engine"
+                            .to_string(),
+                    ));
+                }
+                other => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "unknown sed option: {other}"
+                    )));
+                }
+            }
+            at += 1;
+            continue;
+        }
+        if options && arg.starts_with('-') && arg.len() > 1 {
+            let cluster = &arg[1..];
+            for (index, flag) in cluster.char_indices() {
+                match flag {
+                    'n' => quiet = true,
+                    'E' | 'r' => extended = true,
+                    's' | 'u' => {}
+                    'i' => {
+                        in_place = true;
+                        let suffix = &cluster[index + 1..];
+                        backup_suffix = (!suffix.is_empty()).then(|| suffix.to_string());
+                        break;
+                    }
+                    'e' | 'l' => {
+                        let mut value = cluster[index + 1..].to_string();
+                        if value.is_empty() {
+                            at += 1;
+                            value = args.get(at).cloned().ok_or_else(|| {
+                                ToolError::InvalidInput(format!("-{flag} needs a value"))
+                            })?;
+                        }
+                        if flag == 'l' {
+                            line_length = Some(parse_sed_line_length(&value)?);
+                        } else {
+                            expressions.push(value);
+                        }
+                        break;
+                    }
+                    'f' => {
+                        return Err(ToolError::InvalidInput(
+                            "-f is not supported; pass the program text with -e or the script field"
+                                .to_string(),
+                        ));
+                    }
+                    'z' => {
+                        return Err(ToolError::InvalidInput(
+                            "-z is not supported by the bundled sed engine".to_string(),
+                        ));
+                    }
+                    other => {
+                        return Err(ToolError::InvalidInput(format!(
+                            "unknown sed option: -{other}"
+                        )));
+                    }
+                }
+            }
+            at += 1;
+            continue;
+        }
+        positional.push(arg.to_string());
+        at += 1;
+    }
+    if expressions.is_empty() {
+        if positional.is_empty() {
+            return Err(ToolError::InvalidInput(
+                "sed needs a script and one input file".to_string(),
+            ));
+        }
+        expressions.push(positional.remove(0));
+    }
+    if positional.len() != 1 {
+        return Err(ToolError::InvalidInput(if positional.is_empty() {
+            "sed needs one input file; reading stdin is not supported".to_string()
+        } else {
+            "sed edits one file per call; use patch for several files".to_string()
+        }));
+    }
+    Ok(SedArgv {
+        script: expressions.join("\n"),
+        file: positional.remove(0),
+        quiet,
+        extended,
+        posix,
+        line_length,
+        backup_suffix,
+        in_place,
+    })
+}
+
+fn parse_sed_line_length(value: &str) -> Result<usize, ToolError> {
+    let number = value.parse::<usize>().map_err(|_| {
+        ToolError::InvalidInput("sed line length must be a positive integer".to_string())
+    })?;
+    if !(1..=10_000).contains(&number) {
+        return Err(ToolError::InvalidInput(
+            "sed line length must be between 1 and 10000".to_string(),
+        ));
+    }
+    Ok(number)
+}
+
 fn sed_tool(
     root: Option<PathBuf>,
     enforce: bool,
@@ -7133,11 +7738,12 @@ fn sed_tool(
 ) -> FunctionTool {
     FunctionTool::new(
         "sed",
-        "Edit one workspace file with a sed program - use this instead of a `sed -i`/`perl -i` command through bash: this path is policy-checked, records the change, and keeps the original when the script fails. The program runs over a private copy, replacing by rename. GNU in-place output: the automatic print and p, P, =, l, F and s///p write to the file; e, r, R, w and W are refused. When the exact text is known and unique, edit_file is simpler; for a global or pattern-based change this is the tool.",
+        "Edit one workspace file with a sed program - use this instead of a `sed -i`/`perl -i` command through bash: this path is policy-checked, records the change, and keeps the original when the script fails. Pass sed's own command line in args, e.g. [\"-i.bak\",\"-E\",\"s/old/new/g\",\"file.txt\"], or the structured path/script fields. The program runs over a private copy, replacing by rename even when the script matched nothing, as sed -i does. GNU in-place output: the automatic print and p, P, =, l, F and s///p write to the file; e, r, R, w and W are refused. When the exact text is known and unique, edit_file is simpler; for a global or pattern-based change this is the tool.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Existing text file to edit, inside the workspace." },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "sed's own command-line arguments, e.g. [\"-i.bak\",\"-E\",\"s/old/new/g\",\"file.txt\"]. Without -i the result is returned as content (a dry run); one input file." },
+                "path": { "type": "string", "description": "Existing text file to edit, inside the workspace. Structured alternative to args." },
                 "script": { "type": "string", "minLength": 1, "maxLength": 8192, "description": "One sed program, e.g. 's/old/new/g'; newlines/semicolons separate commands." },
                 "dry_run": { "type": "boolean", "description": "Return the resulting text without writing. Defaults to false." },
                 "extended": { "type": "boolean", "description": "POSIX extended regexes (sed -E). Defaults to false." },
@@ -7146,35 +7752,77 @@ fn sed_tool(
                 "line_length": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Wrap column for l (sed -l). Defaults to 70." },
                 "backup_suffix": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Keep the original at path + suffix (sed -iSUFFIX); no path separator." }
             },
-            "required": ["path", "script"],
             "additionalProperties": false
         }),
         move |args| {
-            let raw = arg_str(args, "path")?;
-            let script = arg_str(args, "script")?;
-            let flag = |key: &str| {
-                args.get(key)
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            };
-            let dry_run = flag("dry_run");
-            let quiet = flag("quiet");
-            let line_length = match args.get("line_length").filter(|value| !value.is_null()) {
-                Some(value) => {
-                    let Some(number) = value.as_u64() else {
+            let argv = args.get("args").and_then(serde_json::Value::as_array);
+            let (raw, script, dry_run, quiet, extended, posix, line_length, argv_backup) =
+                if let Some(argv) = argv {
+                    if [
+                        "path",
+                        "script",
+                        "dry_run",
+                        "quiet",
+                        "extended",
+                        "posix",
+                        "line_length",
+                        "backup_suffix",
+                    ]
+                    .iter()
+                    .any(|key| args.get(*key).is_some())
+                    {
                         return Err(ToolError::InvalidInput(
-                            "line_length must be a positive integer".to_string(),
-                        ));
-                    };
-                    if !(1..=10_000).contains(&number) {
-                        return Err(ToolError::InvalidInput(
-                            "line_length must be between 1 and 10000".to_string(),
+                            "use either args (sed's command line) or the structured path/script fields, not both"
+                                .to_string(),
                         ));
                     }
-                    Some(number as usize)
-                }
-                None => None,
-            };
+                    let parsed = parse_sed_argv(argv)?;
+                    (
+                        parsed.file,
+                        parsed.script,
+                        !parsed.in_place,
+                        parsed.quiet,
+                        parsed.extended,
+                        parsed.posix,
+                        parsed.line_length,
+                        parsed.backup_suffix,
+                    )
+                } else {
+                    let raw = arg_str(args, "path")?;
+                    let script = arg_str(args, "script")?;
+                    let flag = |key: &str| {
+                        args.get(key)
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    };
+                    let line_length = match args.get("line_length").filter(|value| !value.is_null())
+                    {
+                        Some(value) => {
+                            let Some(number) = value.as_u64() else {
+                                return Err(ToolError::InvalidInput(
+                                    "line_length must be a positive integer".to_string(),
+                                ));
+                            };
+                            if !(1..=10_000).contains(&number) {
+                                return Err(ToolError::InvalidInput(
+                                    "line_length must be between 1 and 10000".to_string(),
+                                ));
+                            }
+                            Some(number as usize)
+                        }
+                        None => None,
+                    };
+                    (
+                        raw,
+                        script,
+                        flag("dry_run"),
+                        flag("quiet"),
+                        flag("extended"),
+                        flag("posix"),
+                        line_length,
+                        None,
+                    )
+                };
             let target =
                 resolve_path(root.as_deref(), &raw, enforce).map_err(ToolError::InvalidInput)?;
             refuse_ignored(ignore_rules(root.as_deref()).as_ref(), &target)?;
@@ -7191,11 +7839,14 @@ fn sed_tool(
             // copied, and the resolved sibling obeys the same ignore/policy
             // rules as the target.
             let mut backup: Option<PathBuf> = None;
-            if let Some(suffix) = args
-                .get("backup_suffix")
-                .and_then(serde_json::Value::as_str)
-                .filter(|suffix| !suffix.trim().is_empty())
-            {
+            let suffix = argv_backup.or_else(|| {
+                args.get("backup_suffix")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|suffix| !suffix.trim().is_empty())
+                    .map(str::to_string)
+            });
+            if let Some(suffix) = suffix {
+                let suffix = suffix.as_str();
                 if dry_run {
                     return Err(ToolError::InvalidInput(
                         "dry_run writes nothing, so it cannot keep a backup_suffix".to_string(),
@@ -7236,8 +7887,8 @@ fn sed_tool(
                 .unwrap_or(SnapshotState::Absent);
             let request = crate::sed::Request {
                 script: &script,
-                extended: flag("extended"),
-                posix: flag("posix"),
+                extended,
+                posix,
                 quiet,
                 line_length,
                 backup: backup.as_deref(),
@@ -7903,10 +8554,10 @@ mod tests {
     use super::{
         BuiltAgent, EGRESS_ALLOWLIST_TEMPLATE, FULL_ACCESS, READ_ONLY, WORKSPACE_WRITE,
         WorkspaceEgress, agent_messages, allows_writes, build_agent, check_spawn, compactable_span,
-        egress_allowlist_path, is_confined, offers_local_web_search, plugin_provider_node,
-        read_egress_rules, read_page_bytes, refresh_plugin_providers, sandbox_spec_for,
-        surfaced_capabilities, tool_gates_for, web_search_config, with_bridge_pool,
-        workspace_tool_scope, write_file_tool,
+        egress_allowlist_path, is_confined, offers_local_web_search, parse_sed_argv,
+        plugin_provider_node, read_egress_rules, read_page_bytes, refresh_plugin_providers,
+        sandbox_spec_for, surfaced_capabilities, tool_gates_for, web_search_config,
+        with_bridge_pool, workspace_tool_scope, write_file_tool,
     };
     use crate::settings::Settings;
     use crate::settings::global::{ModelEntry, Preset};
@@ -8797,7 +9448,7 @@ mod tests {
             "read_files",
             "write_file",
             "edit_file",
-            "apply_patch",
+            "patch",
             "sed",
             "list_dir",
             "update_plan",
@@ -10849,11 +11500,11 @@ mod tests {
         assert_eq!(
             names("files"),
             vec![
-                "apply_patch".to_string(),
                 "edit_file".to_string(),
                 "glob".to_string(),
                 "grep".to_string(),
                 "list_dir".to_string(),
+                "patch".to_string(),
                 "read_files".to_string(),
                 "sed".to_string(),
                 "write_file".to_string(),
@@ -11187,7 +11838,6 @@ mod tests {
         assert_eq!(
             names(&confined),
             vec![
-                "apply_patch".to_string(),
                 "ask_user".to_string(),
                 "bash".to_string(),
                 "close_surface".to_string(),
@@ -11210,6 +11860,7 @@ mod tests {
                 "memory-tools__memory_forget".to_string(),
                 "memory-tools__memory_recall".to_string(),
                 "memory-tools__memory_remember".to_string(),
+                "patch".to_string(),
                 "patch_surface".to_string(),
                 "present_surface".to_string(),
                 "read_file".to_string(),
@@ -12056,7 +12707,7 @@ verdict := {{"allow": false, "rule": "{rule}", "reason": "refused by the workspa
     /// These schemas ride EVERY request as part of the provider's cached prompt
     /// prefix, so each essay-length description is re-prefilled on every cache
     /// miss and burns window the conversation needs. Built-in Tools 2.0 added
-    /// `read_files` and `apply_patch` and the measured set is 17,191 chars
+    /// `read_files` and `patch` and the measured set is 17,191 chars
     /// across 22 tools, so the ceiling sits just above it: a new essay-length
     /// description trips the test, while the shipped surface fits. Raising this
     /// number again is the wrong fix - trim the copy instead.
@@ -13435,7 +14086,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     }
 
     #[test]
-    fn apply_patch_updates_multiple_files_with_one_atomic_write_each() {
+    fn patch_updates_multiple_files_with_one_atomic_write_each() {
         let root = scratch("apply-patch-multi");
         std::fs::write(root.join("a.rs"), "fn old_a() {}\n").expect("a");
         std::fs::write(root.join("b.rs"), "fn old_b() {}\n").expect("b");
@@ -13445,23 +14096,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .registry()
             .expect("registry")
             .execute(
-                "apply_patch",
+                "patch",
                 &serde_json::json!({
-                    "changes": [
-                        {
-                            "path": "a.rs",
-                            "edits": [
-                                {"old_string": "old_a", "new_string": "new_a"},
-                                {"old_string": "fn new_a()", "new_string": "pub fn new_a()"}
-                            ]
-                        },
-                        {
-                            "path": "b.rs",
-                            "edits": [
-                                {"old_string": "old_b", "new_string": "new_b"}
-                            ]
-                        }
-                    ]
+                    "patch": "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn old_a() {}\n+fn new_a() {}\n@@ -1 +1 @@\n-fn new_a() {}\n+pub fn new_a() {}\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-fn old_b() {}\n+fn new_b() {}\n"
                 }),
             )
             .expect("patch call");
@@ -13474,11 +14111,11 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             std::fs::read_to_string(root.join("b.rs")).expect("b"),
             "fn new_b() {}\n"
         );
-        assert_eq!(result["files"][0]["replacements"], 2);
+        assert_eq!(result["files"][0]["hunks"], 2);
     }
 
     #[test]
-    fn apply_patch_preflights_every_target_before_mutating_any_file() {
+    fn patch_preflights_every_target_before_mutating_any_file() {
         let root = scratch("apply-patch-preflight");
         let outside = scratch("apply-patch-preflight-outside");
         std::fs::write(root.join("src.rs"), "value").expect("seed");
@@ -13488,13 +14125,14 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
 
         let error = registry
             .execute(
-                "apply_patch",
-                &serde_json::json!({"changes": [
-                    {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "changed"}]},
-                    {"path": outside.join("secret.rs").to_string_lossy(), "edits": [
-                        {"old_string": "secret", "new_string": "exposed"}
-                    ]}
-                ]}),
+                "patch",
+                &serde_json::json!({
+                    "patch": format!(
+                        "--- src.rs\n+++ src.rs\n@@ -1 +1 @@\n-value\n+changed\n--- {}\n+++ {}\n@@ -1 +1 @@\n-secret\n+exposed\n",
+                        outside.join("secret.rs").display(),
+                        outside.join("secret.rs").display()
+                    )
+                }),
             )
             .expect_err("an outside target rejects the whole request during preflight");
         assert!(error.to_string().contains("workspace"));
@@ -13509,7 +14147,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     }
 
     #[test]
-    fn apply_patch_leaves_a_file_unchanged_when_any_edit_fails() {
+    fn patch_leaves_a_file_unchanged_when_any_edit_fails() {
         let root = scratch("apply-patch-failure");
         let file = root.join("src.rs");
         std::fs::write(&file, "let value = 1;\n").expect("seed");
@@ -13519,15 +14157,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .registry()
             .expect("registry")
             .execute(
-                "apply_patch",
+                "patch",
                 &serde_json::json!({
-                    "changes": [{
-                        "path": "src.rs",
-                        "edits": [
-                            {"old_string": "value = 1", "new_string": "value = 2"},
-                            {"old_string": "missing", "new_string": "present"}
-                        ]
-                    }]
+                    "patch": "--- src.rs\n+++ src.rs\n@@ -1 +1 @@\n-let value = 1;\n+let value = 2;\n@@ -3 +3 @@\n-missing\n+present\n"
                 }),
             )
             .expect("per-file error is reported in the result");
@@ -13546,7 +14178,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
     /// A missing file is one failed entry, not a refusal of the whole patch;
     /// the other files still apply and the summary counts them.
     #[test]
-    fn apply_patch_reports_a_missing_file_per_entry() {
+    fn patch_reports_a_missing_file_per_entry() {
         let root = scratch("apply-patch-missing");
         std::fs::write(root.join("a.txt"), "one\ntwo\n").expect("seed");
         let result = build(&confined(&root))
@@ -13554,12 +14186,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             .registry()
             .expect("registry")
             .execute(
-                "apply_patch",
+                "patch",
                 &serde_json::json!({
-                    "changes": [
-                        {"path": "a.txt", "edits": [{"old_string": "one", "new_string": "ONE"}]},
-                        {"path": "missing.txt", "edits": [{"old_string": "x", "new_string": "y"}]}
-                    ]
+                    "patch": "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-one\n+ONE\n--- missing.txt\n+++ missing.txt\n@@ -1 +1 @@\n-x\n+y\n"
                 }),
             )
             .expect("a missing file is a per-file outcome");
@@ -13602,16 +14231,15 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
 
         let patch = registry
             .execute(
-                "apply_patch",
-                &serde_json::json!({"changes": [
-                    {"path": "missing-a.txt",
-                     "edits": [{"old_string": "x", "new_string": "y"}]}
-                ]}),
+                "patch",
+                &serde_json::json!({
+                    "patch": "--- missing-a.txt\n+++ missing-a.txt\n@@ -1 +1 @@\n-x\n+y\n"
+                }),
             )
             .expect("a missing file is a per-file outcome");
         assert_eq!(patch["status"], "partial", "{patch}");
         assert_eq!(patch["summary"], "patched 0 of 1 files; 1 failed");
-        let envelope = react::tool::ToolResult::from_value("apply_patch", patch);
+        let envelope = react::tool::ToolResult::from_value("patch", patch);
         assert_eq!(envelope.status, react::tool::ToolStatus::Partial);
         assert!(
             envelope.error.is_none(),
@@ -13619,39 +14247,251 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
         );
     }
 
+    /// A CRLF file's diff carries the carriage return in each line, exactly
+    /// as diff -u prints it; the hunk matches by line, terminators included.
     #[test]
-    fn apply_patch_rejects_duplicate_paths_and_empty_search_text() {
-        let root = scratch("apply-patch-invalid");
-        std::fs::write(root.join("src.rs"), "value").expect("seed");
+    fn patch_matches_a_crlf_file() {
+        let root = scratch("patch-crlf");
+        std::fs::write(root.join("crlf.txt"), "one\r\ntwo\r\n").expect("seed");
+        let result = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "patch",
+                &serde_json::json!({
+                    "patch": "--- crlf.txt\n+++ crlf.txt\n@@ -1,2 +1,2 @@\n-one\r\n-two\r\n+ONE\r\n+TWO\r\n"
+                }),
+            )
+            .expect("the hunk lands");
+        assert_eq!(result["changed_files"], 1, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("crlf.txt")).expect("patched"),
+            "ONE\r\nTWO\r\n"
+        );
+    }
+
+    /// The redesigned tool is one string, not a nested object: the shape the
+    /// model got wrong is gone from the schema entirely.
+    #[test]
+    fn patch_takes_one_patch_string_and_no_legacy_name() {
+        let root = scratch("patch-schema");
         let built = build(&confined(&root));
         let registry = built.agent.registry().expect("registry");
-        let duplicate = registry
+        assert!(
+            registry.get("apply_patch").is_none(),
+            "the old name is not advertised"
+        );
+        let tool = registry.get("patch").expect("the patch tool");
+        let schema = tool.json_schema();
+        assert_eq!(schema["required"], serde_json::json!(["patch"]));
+        let properties = schema["properties"].as_object().expect("properties");
+        assert_eq!(properties.len(), 1, "one input: {schema}");
+        assert_eq!(properties["patch"]["type"], "string");
+        assert!(
+            tool.description().contains("unified diff"),
+            "the description names the wire format"
+        );
+    }
+
+    /// patch picks the header name that exists: a diff old -> new applied
+    /// where new is absent patches old, the name the reader still has.
+    #[test]
+    fn patch_falls_back_to_the_old_name_when_new_is_absent() {
+        let root = scratch("patch-name-fallback");
+        std::fs::write(root.join("old.txt"), "old\n").expect("seed");
+        let result = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
             .execute(
-                "apply_patch",
-                &serde_json::json!({"changes": [
-                    {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "one"}]},
-                    {"path": "src.rs", "edits": [{"old_string": "value", "new_string": "two"}]}
-                ]}),
+                "patch",
+                &serde_json::json!({
+                    "patch": "--- old.txt\n+++ new.txt\n@@ -1 +1 @@\n-old\n+new\n"
+                }),
             )
-            .expect_err("duplicate targets reject the complete patch request");
-        assert!(duplicate.to_string().contains("duplicate target"));
+            .expect("the existing old name is patched");
+        assert_eq!(result["changed_files"], 1, "{result}");
         assert_eq!(
-            std::fs::read_to_string(root.join("src.rs")).expect("unchanged"),
-            "value"
+            std::fs::read_to_string(root.join("old.txt")).expect("patched"),
+            "new\n"
+        );
+        assert!(!root.join("new.txt").exists(), "no new file is invented");
+    }
+
+    /// GNU patch retries with fuzz: one leading context line may differ and
+    /// the hunk still lands, leaving that line untouched.
+    #[test]
+    fn patch_applies_with_one_line_of_fuzz() {
+        let root = scratch("patch-fuzz");
+        std::fs::write(root.join("src.rs"), "wrong\nb\ncontext2\n").expect("seed");
+        let result = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "patch",
+                &serde_json::json!({
+                    "patch": "--- src.rs\n+++ src.rs\n@@ -1,3 +1,3 @@\n context-old\n-b\n+B\n context2\n"
+                }),
+            )
+            .expect("the hunk lands with fuzz");
+        assert_eq!(result["changed_files"], 1, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).expect("patched"),
+            "wrong\nB\ncontext2\n"
+        );
+    }
+
+    /// Extended git headers before the first --- are metadata, not content;
+    /// the a/ and b/ prefixes are stripped and a timestamp after a tab is not
+    /// part of the path.
+    #[test]
+    fn patch_reads_a_git_diff_with_extended_headers() {
+        let root = scratch("patch-git");
+        std::fs::write(root.join("a.txt"), "old\n").expect("seed");
+        let result = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "patch",
+                &serde_json::json!({
+                    "patch": "diff --git a/a.txt b/a.txt\nindex 1111111..2222222 100644\n--- a/a.txt\t2026-11-26 20:00:00.000000000 +0800\n+++ b/a.txt\t2026-11-26 20:00:01.000000000 +0800\n@@ -1 +1 @@\n-old\n+new\n"
+                }),
+            )
+            .expect("the git diff lands");
+        assert_eq!(result["changed_files"], 1, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("patched"),
+            "new\n"
+        );
+    }
+
+    /// A zero-count hunk inserts exactly where its line number says.
+    #[test]
+    fn patch_inserts_by_line_number() {
+        let root = scratch("apply-patch-invalid");
+        std::fs::write(root.join("src.rs"), "value\n").expect("seed");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let inserted = registry
+            .execute(
+                "patch",
+                &serde_json::json!({
+                    "patch": "--- src.rs\n+++ src.rs\n@@ -1,0 +2 @@\n+added\n"
+                }),
+            )
+            .expect("a zero-count hunk inserts after the named line");
+        assert_eq!(inserted["files"][0]["outcome"], "patched", "{inserted}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).expect("inserted"),
+            "value\nadded\n"
+        );
+    }
+
+    /// A later hunk's header numbers the original file; the lines an earlier
+    /// hunk added shift where it actually applies, and patch tracks that shift.
+    #[test]
+    fn patch_tracks_the_offset_of_earlier_hunks() {
+        let root = scratch("patch-offset");
+        std::fs::write(root.join("src.rs"), "a\nb\nc\nd\n").expect("seed");
+        let result = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "patch",
+                &serde_json::json!({
+                    "patch": "--- src.rs\n+++ src.rs\n@@ -1,2 +1,3 @@\n a\n b\n+inserted\n@@ -3 +4 @@\n-c\n+C\n"
+                }),
+            )
+            .expect("both hunks land");
+        assert_eq!(result["changed_files"], 1, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).expect("patched"),
+            "a\nb\ninserted\nC\nd\n"
+        );
+    }
+
+    /// When the expected line does not carry the hunk's context, patch searches
+    /// outward before refusing; the same displaced file still applies.
+    #[test]
+    fn patch_searches_outward_for_a_displaced_hunk() {
+        let root = scratch("patch-search");
+        std::fs::write(root.join("src.rs"), "prefix\na\nb\n").expect("seed");
+        let result = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "patch",
+                &serde_json::json!({
+                    "patch": "--- src.rs\n+++ src.rs\n@@ -1,2 +1,2 @@\n-a\n+B\n b\n"
+                }),
+            )
+            .expect("the hunk is found one line down");
+        assert_eq!(result["changed_files"], 1, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).expect("patched"),
+            "prefix\nB\nb\n"
+        );
+    }
+
+    /// /dev/null on the old side creates the new file; on the new side it
+    /// deletes the old one, the two forms patch itself accepts.
+    #[test]
+    fn patch_creates_and_deletes_from_dev_null() {
+        let root = scratch("patch-dev-null");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+        let created = registry
+            .execute(
+                "patch",
+                &serde_json::json!({
+                    "patch": "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n"
+                }),
+            )
+            .expect("the creation lands");
+        assert_eq!(created["files"][0]["outcome"], "created", "{created}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).expect("created"),
+            "one\ntwo\n"
         );
 
-        let empty = registry
+        let deleted = registry
             .execute(
-                "apply_patch",
-                &serde_json::json!({"changes": [
-                    {"path": "src.rs", "edits": [{"old_string": "", "new_string": "x"}]}
-                ]}),
+                "patch",
+                &serde_json::json!({
+                    "patch": "--- a/new.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n"
+                }),
             )
-            .expect_err("the schema rejects an empty old_string");
-        assert!(empty.to_string().contains("old_string"));
+            .expect("the deletion lands");
+        assert_eq!(deleted["files"][0]["outcome"], "deleted", "{deleted}");
+        assert!(!root.join("new.txt").exists(), "the file is gone");
+    }
+
+    /// A file without a final newline is described with the standard marker;
+    /// the marker keeps both sides unterminated.
+    #[test]
+    fn patch_honours_the_no_newline_marker() {
+        let root = scratch("patch-no-newline");
+        std::fs::write(root.join("src.rs"), "value").expect("seed");
+        let result = build(&confined(&root))
+            .agent
+            .registry()
+            .expect("registry")
+            .execute(
+                "patch",
+                &serde_json::json!({
+                    "patch": "--- src.rs\n+++ src.rs\n@@ -1 +1 @@\n-value\n\\ No newline at end of file\n+one\n\\ No newline at end of file\n"
+                }),
+            )
+            .expect("the hunk lands");
+        assert_eq!(result["changed_files"], 1, "{result}");
         assert_eq!(
-            std::fs::read_to_string(root.join("src.rs")).expect("unchanged"),
-            "value"
+            std::fs::read_to_string(root.join("src.rs")).expect("patched"),
+            "one"
         );
     }
 
@@ -13807,6 +14647,87 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             )
             .expect_err("a path outside the workspace is refused");
         assert!(escaped.to_string().contains("escapes the workspace"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sed_argv_parses_quiet_and_in_place() {
+        let parsed = parse_sed_argv(&[
+            serde_json::json!("-n"),
+            serde_json::json!("/two/p"),
+            serde_json::json!("a.txt"),
+        ])
+        .expect("parses");
+        assert_eq!(parsed.script, "/two/p");
+        assert_eq!(parsed.file, "a.txt");
+        assert!(parsed.quiet);
+        assert!(!parsed.in_place);
+
+        let parsed = parse_sed_argv(&[
+            serde_json::json!("-i.bak"),
+            serde_json::json!("-e"),
+            serde_json::json!("s/a/b/g"),
+            serde_json::json!("a.txt"),
+        ])
+        .expect("parses");
+        assert_eq!(parsed.script, "s/a/b/g");
+        assert!(parsed.in_place);
+        assert_eq!(parsed.backup_suffix.as_deref(), Some(".bak"));
+    }
+
+    /// The sed tool accepts sed's own command line: -i edits in place, no -i
+    /// is a dry run (sed's stdout), -iSUFFIX keeps the backup, and -n/-e work.
+    #[test]
+    fn the_sed_tool_accepts_gnu_arguments() {
+        let root = scratch("sed-argv");
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").expect("seed");
+        let built = build(&confined(&root));
+        let registry = built.agent.registry().expect("registry");
+
+        let dry = registry
+            .execute(
+                "sed",
+                &serde_json::json!({
+                    "args": ["-n", "/two/p", "a.txt"]
+                }),
+            )
+            .expect("the argv dry run runs");
+        assert_eq!(dry["mode"], "dry-run", "{dry}");
+        assert_eq!(dry["content"], "two\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("original"),
+            "one\ntwo\nthree\n"
+        );
+
+        let edited = registry
+            .execute(
+                "sed",
+                &serde_json::json!({
+                    "args": ["-i.bak", "-e", "s/one/1/g", "a.txt"]
+                }),
+            )
+            .expect("the argv edit runs");
+        assert_eq!(edited["mode"], "applied", "{edited}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("edit"),
+            "1\ntwo\nthree\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt.bak")).expect("backup"),
+            "one\ntwo\nthree\n"
+        );
+
+        let both = registry
+            .execute(
+                "sed",
+                &serde_json::json!({
+                    "args": ["-i", "s/1/one/g", "a.txt"],
+                    "script": "s/1/one/g",
+                    "path": "a.txt"
+                }),
+            )
+            .expect_err("the two interfaces cannot be mixed");
+        assert!(both.to_string().contains("either args"), "{both}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -14119,12 +15040,9 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
                 }),
             ),
             (
-                "apply_patch",
+                "patch",
                 serde_json::json!({
-                    "changes": [{
-                        "path": "a.txt",
-                        "edits": [{ "old_string": "needle", "new_string": "changed" }]
-                    }]
+                    "patch": "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-needle\n+changed\n"
                 }),
             ),
             (
@@ -14325,7 +15243,7 @@ verdict := {"allow": false, "rule": "no-secret-reads", "reason": "secrets are no
             "read_files",
             "write_file",
             "edit_file",
-            "apply_patch",
+            "patch",
             "sed",
             "list_dir",
         ] {
@@ -18254,12 +19172,9 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
                 }),
             ),
             (
-                "apply_patch",
+                "patch",
                 serde_json::json!({
-                    "changes": [{
-                        "path": "a.txt",
-                        "edits": [{ "old_string": "changed", "new_string": "patched" }]
-                    }]
+                    "patch": "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-changed\n\\ No newline at end of file\n+patched\n\\ No newline at end of file\n"
                 }),
             ),
             (
@@ -18293,7 +19208,7 @@ verdict := {"allow": false, "rule": "require-sandbox", "reason": "this workspace
                         "the edit result carries its changed lines: {value}"
                     );
                 }
-                "apply_patch" => {
+                "patch" => {
                     assert_eq!(value["files"][0]["outcome"], "patched", "{value}");
                     assert_eq!(value["files"][0]["diff_status"], "complete", "{value}");
                     assert!(

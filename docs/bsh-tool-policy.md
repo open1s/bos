@@ -320,7 +320,7 @@ explicit empty list mounts nothing:
   means none. MCP entries are server namespaces (the name the settings entry
   or extension server registers under).
 - The tool vocabulary is `bash`, `glob`, `grep`, `read_file`, `read_files`,
-  `write_file`, `edit_file`, `sed`, `apply_patch`, `list_dir`, `update_plan`,
+  `write_file`, `edit_file`, `sed`, `patch`, `list_dir`, `update_plan`,
   `job_output`, `job_list`, `job_kill`, `subagent`, `send_message`,
   `interrupt_agent`, the four `schedule_*` tools and the `federation_*`
   family. `schedule_*` answers to the permission matrix (Read Only schedules
@@ -336,7 +336,7 @@ explicit empty list mounts nothing:
 
 `<workspace>/.bsh/.ignore` is not a policy module. It is a `.gitignore`-syntax
 list the file tools (`list_dir`, `read_file`, `read_files`, `write_file`,
-`edit_file`, `sed`, `apply_patch`, `glob`, `grep`) consult on every call. A
+`edit_file`, `sed`, `patch`, `glob`, `grep`) consult on every call. A
 matched path is hidden from listings and searches and refused by the read/write
 tools;
 `!` re-includes a path, and `.bsh`/`.bos` are excluded unconditionally. The
@@ -371,7 +371,7 @@ existing shape; the shared fields add meaning without moving data:
   `hint` says to pass it as `offset`.
 - `count` is the number of returned items (`lines`, `matches`, `entries`,
   `files`); for `grep` it counts matching lines only, and `rows` (when context
-  is set) counts the framing too. `read_files` and `apply_patch` also report `failed`/`returned`
+  is set) counts the framing too. `read_files` and `patch` also report `failed`/`returned`
   and supply a `summary` with the counts, so the envelope says "read 3 of 4
   files; 1 failed" instead of a generic "partial"; every per-file entry carries
   its own `status`.
@@ -418,11 +418,16 @@ The mutating tools use the same envelope: `write_file` reports `outcome`
 (`created`/`updated`/`unchanged`) and `bytes`; `edit_file` reports `outcome`
 (`updated`/`unchanged`), `replacements`, `bytes`, `added`, `deleted`, a bounded
 `diff` of the changed lines, and `diff_status` (`complete`/`truncated`);
-`apply_patch` reports the same per-file fields plus `failed`,
-`changed_files` and a `summary` that counts the mixed outcome (a missing file
-is one failed entry, not a refusal of the batch; only an invalid request -
-duplicate path, ignored path, out-of-workspace path - fails the whole call);
-`sed` reports `outcome` (`changed`/`unchanged`), `mode`
+`patch` takes one standard unified diff and reports the same per-file
+fields plus `failed`, `changed_files` and a `summary` that counts the mixed
+outcome (a missing file or an unmatched hunk is one failed entry, not a refusal
+of the batch; only an invalid request - a path that resolves to two names, an
+ignored or out-of-workspace path, a malformed document - fails the whole
+call);
+`sed` replaces the file on every applied run, even when `outcome` says
+`unchanged`, exactly as `sed -i` does. It accepts sed's own command line in
+`args` (`-n`, `-i[SUFFIX]`, `-E`/`-r`, `-e`, `-l`, `--posix`, `--`) as well
+as the structured `path`/`script` fields. It reports `outcome` (`changed`/`unchanged`), `mode`
 (`dry-run`/`applied`), `content_kind` (`text`/`binary`) and `content_status`
 (`complete`/`truncated`) for a dry run, and `diff`/`diff_status` when retained,
 with a hint that the rest is readable through `read_file`. A quiet `p` script is
@@ -445,7 +450,7 @@ out-of-workspace path) is a call-level error.
 - Every replacing write goes through one platform seam: `rename` on Unix and
   `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows. `std::fs::rename`
   alone fails on Windows when the destination exists, so it cannot back
-  `write_file`, `edit_file`, `apply_patch` or `sed`.
+  `write_file`, `edit_file`, `patch` or `sed`.
 - The per-path write lock folds case on Windows, where `New.txt` and `new.txt`
   are one file.
 - Reads and writes are byte-preserving. CRLF is kept, and an edit miss whose

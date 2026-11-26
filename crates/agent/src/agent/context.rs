@@ -4562,13 +4562,7 @@ mod budget_tests {
         let mut session = AgentSession::new();
         let mut context = AgentReactContext::new("session".to_string());
         let _ = app
-            .after_tool_result(
-                "apply_patch",
-                &mut result,
-                "call-1",
-                &mut session,
-                &mut context,
-            )
+            .after_tool_result("patch", &mut result, "call-1", &mut session, &mut context)
             .await;
         match result {
             Err(ReactError::ToolFailure(react::tool::ToolError::InvalidField {

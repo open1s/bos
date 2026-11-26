@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- **The sed tool follows GNU sed -i.** A successful applied run always replaces
+  the target (and moves the original to the backup when a suffix is set), even
+  when the script matched nothing and the bytes are unchanged; the result still
+  says `unchanged`. The tool also accepts sed's own command line in `args`
+  (`-n`, `-i[SUFFIX]`, `-E`/`-r`, `-e`, `-l`, `--posix`, `--`) and the
+  structured `path`/`script` fields. The script language is uutils' GNU sed,
+  with the policy sandbox still refusing `e`, `r`, `R`, `w` and `W`.
+
+- **File edits use one `patch` document.** `apply_patch` is now `patch`, and
+  it takes one standard unified diff - exactly what `diff -u` or `git diff`
+  prints - instead of a nested `changes:[{path, edits:[…]}]` object:
+  `---`/`+++` file headers and `@@ -a,b +c,d @@` hunks whose lines start
+  with a space (context), `-` or `+`. Hunks are located by line number and
+  exact context and searched outward when earlier hunks shifted the file;
+  `--- /dev/null` creates a file, `+++ /dev/null` deletes one, and a global
+  hunk offset carries through the section. A hunk that does not match leaves
+  its file unchanged and is one per-file error. The old tool name remains only
+  as a display and preset alias; `bsh.patch(patch_text)` is the script helper.
+
 ## v4.1.26 (2026-11-23)
 
 - **The wheel chains out of a chat body into the transcript.** A tool-call body

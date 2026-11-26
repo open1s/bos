@@ -256,7 +256,10 @@ fn plan_step_match(text: &str, evidence: &TurnEvidence) -> u8 {
 
 /// A tool that changes a workspace file.
 fn is_edit_tool(name: &str) -> bool {
-    matches!(name, "write_file" | "edit_file" | "apply_patch" | "sed")
+    matches!(
+        name,
+        "write_file" | "edit_file" | "patch" | "apply_patch" | "sed"
+    )
 }
 
 /// The command a bash call ran, lowered, or empty when its arguments do not
@@ -7705,7 +7708,7 @@ mod tests {
             .session_mut(&id)
             .and_then(|session| session.messages.last_mut())
         {
-            for (name, output) in [("apply_patch", "ok"), ("bash", "ok")] {
+            for (name, output) in [("patch", "ok"), ("bash", "ok")] {
                 message.tools.push(crate::model::ToolEvent {
                     name: name.to_string(),
                     args: if name == "bash" {
@@ -7760,7 +7763,7 @@ mod tests {
                 .expect("the reply")
                 .tools
                 .push(crate::model::ToolEvent {
-                    name: "apply_patch".to_string(),
+                    name: "patch".to_string(),
                     args: "{}".to_string(),
                     output: Some("ok".to_string()),
                     ms: Some(1),
@@ -7849,7 +7852,7 @@ mod tests {
                 .expect("the reply")
                 .tools
                 .push(crate::model::ToolEvent {
-                    name: "apply_patch".to_string(),
+                    name: "patch".to_string(),
                     args: "{}".to_string(),
                     output: Some("ok".to_string()),
                     ms: Some(1),
@@ -7950,7 +7953,7 @@ mod tests {
                 .expect("the reply")
                 .tools
                 .push(crate::model::ToolEvent {
-                    name: "apply_patch".to_string(),
+                    name: "patch".to_string(),
                     args: "{\"path\":\"src/lib.rs\"}".to_string(),
                     output: Some("ok".to_string()),
                     ms: Some(1),
@@ -7988,7 +7991,7 @@ mod tests {
                 .messages
                 .push(crate::model::ChatMessage::assistant());
             let message = session.messages.last_mut().expect("the reply");
-            for name in ["apply_patch", "update_plan"] {
+            for name in ["patch", "update_plan"] {
                 message.tools.push(crate::model::ToolEvent {
                     name: name.to_string(),
                     args: "{}".to_string(),
@@ -8027,7 +8030,7 @@ mod tests {
                 .expect("the reply")
                 .tools
                 .push(crate::model::ToolEvent {
-                    name: "apply_patch".to_string(),
+                    name: "patch".to_string(),
                     args: "{\"path\":\"src/lib.rs\"}".to_string(),
                     output: Some("ok".to_string()),
                     ms: Some(1),
@@ -8109,7 +8112,7 @@ mod tests {
                 .push(crate::model::ChatMessage::assistant());
             let message = session.messages.last_mut().expect("the reply");
             for (name, args) in [
-                ("apply_patch", "{\"path\":\"src/lib.rs\"}"),
+                ("patch", "{\"path\":\"src/lib.rs\"}"),
                 ("update_plan", "{}"),
             ] {
                 message.tools.push(crate::model::ToolEvent {
@@ -8151,7 +8154,7 @@ mod tests {
                 .expect("the reply")
                 .tools
                 .push(crate::model::ToolEvent {
-                    name: "apply_patch".to_string(),
+                    name: "patch".to_string(),
                     args: "{\"path\":\"src/parser.rs\"}".to_string(),
                     output: Some("ok".to_string()),
                     ms: Some(1),
@@ -8188,7 +8191,7 @@ mod tests {
                 .expect("the reply")
                 .tools
                 .push(crate::model::ToolEvent {
-                    name: "apply_patch".to_string(),
+                    name: "patch".to_string(),
                     args: "{\"path\":\"src/bar.rs\"}".to_string(),
                     output: Some("ok".to_string()),
                     ms: Some(1),

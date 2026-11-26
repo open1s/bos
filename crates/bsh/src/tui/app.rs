@@ -10424,7 +10424,7 @@ fn tool_lines(call: &ToolCallView, width: usize) -> Vec<String> {
     lines
 }
 
-/// The changed rows of a landed `apply_patch` call, if its arguments carry one.
+/// The changed rows of a landed `patch` call, if its arguments carry one.
 ///
 /// Only added and removed lines are drawn: a unified diff's file headers are
 /// noise in a transcript row, and a long patch is capped so one call cannot
@@ -11536,11 +11536,12 @@ mod tests {
     #[test]
     fn a_landed_patch_shows_the_rows_it_changed() {
         let at = Utc::now();
-        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-let old = 1;\n+let new = 2;\n*** End Patch";
+        let patch =
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-let old = 1;\n+let new = 2;\n";
         let call = ToolCallView {
             execution_id: None,
             step: 2,
-            tool: "apply_patch".to_string(),
+            tool: "patch".to_string(),
             summary: "src/lib.rs".to_string(),
             args: serde_json::json!({ "patch": patch }).to_string(),
             status: ToolCallStatus::Completed,
@@ -11550,7 +11551,7 @@ mod tests {
             finished_at: Some(at),
         };
         let lines = tool_lines(&call, 60);
-        assert_eq!(lines[0], "✓ apply_patch src/lib.rs · 4ms · done");
+        assert_eq!(lines[0], "✓ patch src/lib.rs · 4ms · done");
         assert_eq!(lines[1], "  - let old = 1;");
         assert_eq!(lines[2], "  + let new = 2;");
 
@@ -11842,6 +11843,26 @@ mod tests {
             ExecutionStatus::NeedsIntervention,
         ] {
             assert!(!unfinished(status), "{status:?} will not run again");
+        }
+    }
+
+    /// A worded command's completed line has to be one the parser answers, not
+    /// one it refuses: the argument list's row runs the line it completes, so a
+    /// word the parser does not accept would be a row that ends in a usage
+    /// message.
+    #[test]
+    fn every_word_the_menu_offers_completes_a_line_the_terminal_runs() {
+        for (name, word) in super::menu::command_arguments_for_test() {
+            let line = format!("{name} {word}");
+            match SlashCommand::parse(&line) {
+                None | Some(SlashCommand::Unknown(_)) => {
+                    panic!("the menu completes '{line}', which the parser does not know")
+                }
+                Some(SlashCommand::Usage(_)) => {
+                    panic!("the menu runs '{line}' on accept, but the parser asks for more")
+                }
+                Some(_) => {}
+            }
         }
     }
 

@@ -24,10 +24,10 @@
 //! silent no-op. The tool does not advertise a switch that does nothing.
 //!
 //! An edit never runs on the reader's file: the program processes a private
-//! copy beside the target and the copy replaces the target by rename only when
-//! its bytes differ (or when a backup suffix asks for GNU's always-replace
-//! semantics). A failed or no-op script therefore leaves the original
-//! untouched, inode and mtime included.
+//! copy beside the target and the copy replaces the target by rename. That is
+//! GNU sed -i's own rule: a successful in-place run replaces the file even when
+//! its bytes are identical, so the inode and mtime move. A failed script leaves
+//! the original untouched.
 //!
 //! The target is resolved through symlinks, as every BSH file tool does. That is
 //! GNU's --follow-symlinks arm; GNU's default of replacing the link itself is
@@ -163,9 +163,8 @@ impl Error {
 ///
 /// A dry run processes a private copy in the system temp directory and removes
 /// it. An edit processes a private copy BESIDE the target and renames that copy
-/// over the target only when its bytes differ, or when a backup suffix asks for
-/// GNU's always-replace semantics. A failed or no-op script leaves the original
-/// file - inode and mtime included - untouched.
+/// over the target, as GNU sed -i does even when the bytes are identical. A
+/// failed script leaves the original file untouched.
 pub(crate) fn apply(target: &Path, request: &Request, dry_run: bool) -> Result<Outcome, Error> {
     if request.script.trim().is_empty() {
         return Err(Error::Refused("script must not be empty".to_string()));
@@ -237,14 +236,12 @@ pub(crate) fn apply(target: &Path, request: &Request, dry_run: bool) -> Result<O
     } else {
         line_diff(&before, &after)
     };
-    // GNU's -i always replaces the file and moves the original to the backup;
-    // without a backup this tool keeps the stronger no-op rule and leaves an
-    // unchanged file alone.
+    // GNU's -i always replaces the file and moves the original to the backup,
+    // even when the script matched nothing; so does this tool.
     if !dry_run {
         match request.backup {
             Some(backup) => temporary.replace_with_backup(target, backup)?,
-            None if changed => temporary.replace(target)?,
-            None => {}
+            None => temporary.replace(target)?,
         }
     }
     Ok(Outcome {
@@ -716,13 +713,49 @@ mod tests {
     }
 
     #[test]
-    fn a_script_that_changes_nothing_reports_unchanged() {
+    fn a_script_that_changes_nothing_still_replaces_like_sed_i() {
         let dir = scratch("unchanged");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha\n").expect("the input");
+        #[cfg(unix)]
+        let before_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&file).expect("the input").ino()
+        };
         let outcome = apply(&file, &request("s/missing/present/"), false).expect("sed runs");
         assert!(!outcome.changed);
         assert_eq!(fs::read_to_string(&file).expect("the original"), "alpha\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                before_inode,
+                fs::metadata(&file).expect("the edit").ino(),
+                "sed -i replaces the file even when the bytes did not change"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_quiet_dry_run_reports_the_filtered_text() {
+        let dir = scratch("quiet-dry");
+        let file = dir.join("a.txt");
+        fs::write(&file, "one\ntwo\nthree\n").expect("the input");
+        let quiet = Request {
+            script: "/two/p",
+            extended: false,
+            posix: false,
+            quiet: true,
+            line_length: None,
+            backup: None,
+        };
+        let outcome = apply(&file, &quiet, true).expect("the dry run");
+        assert_eq!(outcome.content.as_deref(), Some("two\n"));
+        assert_eq!(
+            fs::read_to_string(&file).expect("the original"),
+            "one\ntwo\nthree\n"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -146,7 +146,7 @@ BSH 的 Diff、Audit、Tasks 都是真实实现，不是空壳：
 - **现状：** 写工具没有 snapshot hook；file_lock 只在工具内部；decorator 在锁外读 before 会产生竞态。
 - **证据：** crates/bsh/src/caps.rs:4999-5004、:5073-5078。
 - **影响：** 即使有 store，也无法保证 before/after 属于同一次写。
-- **目标：** SnapshotProvider 接入 write_file/edit_file/apply_patch；before/after 与 mutate 在同一 per-path lock 内。
+- **目标：** SnapshotProvider 接入 write_file/edit_file/patch；before/after 与 mutate 在同一 per-path lock 内。
 - **关闭条件：** 并发写同一路径的测试证明 revision 顺序与磁盘一致。
 - **优先级：** P0。
 
@@ -378,7 +378,7 @@ BSH 的 Diff、Audit、Tasks 都是真实实现，不是空壳：
 
 ### M1：Exact File Capture（P0）
 
-- write_file / edit_file / apply_patch 接入；Diff pane 读真实 change。
+- write_file / edit_file / patch 接入；Diff pane 读真实 change。
 - 出口：覆盖写不再 Rewritten；create/edit/patch 有真实 diff；并发测试。
 
 ### M2：Text Diff + Chat/Diff 投影（P1 前置）
