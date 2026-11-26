@@ -895,6 +895,11 @@ mod tests {
         ));
         assert!(!tool_result_failed("{\"success\":true}"));
         assert!(!tool_result_failed("plain output"));
+        // A shell command's non-zero exit is a process report: the tool call
+        // completed, and the prompt tells the model to read `exit_code`.
+        assert!(!tool_result_failed(
+            "{\"stdout\":\"\",\"stderr\":\"\",\"exit_code\":1,\"success\":false}"
+        ));
     }
 
     /// A plan in the agent's own store becomes the request's plan block; an

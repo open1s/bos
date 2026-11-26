@@ -92,6 +92,17 @@ fn is_result_contract(object: &Map<String, Value>) -> bool {
     object.get("status").is_some() && object.get("tool").and_then(Value::as_str).is_some()
 }
 
+/// Whether a payload reports a process the tool ran, rather than the tool call.
+///
+/// A shell result carries `exit_code`, and its `success` restates that code.
+/// The process failing is the answer the caller asked for — `grep` finding
+/// nothing exits 1 — not the tool call failing. The bash tool's own contract
+/// says so (`TOOL_BASH`: "a non-zero exit is reported, not failed"), so the
+/// envelope must not turn it into an `internal` failure.
+fn is_process_report(object: &Map<String, Value>) -> bool {
+    object.get("exit_code").is_some()
+}
+
 /// Classify a status word a tool put in its own payload.
 ///
 /// Tools predate the envelope and some speak their own vocabulary ("ok",
@@ -222,8 +233,10 @@ impl ToolResult {
     /// A tool that reports `"success": false`, or one that speaks the result
     /// contract (`"tool"` plus `"status"`) and says `partial` or `error`, is
     /// telling the truth about the call; the envelope reads that verdict
-    /// instead of assuming a returned value means success. A bare `status` is
-    /// domain state and stays inside `data`.
+    /// instead of assuming a returned value means success. The exception is a
+    /// process report (a payload with `exit_code`): a non-zero exit is the
+    /// command's answer, not a failed tool call. A bare `status` is domain
+    /// state and stays inside `data`.
     pub fn from_value(tool: &str, value: Value) -> Self {
         let mut status = ToolStatus::Success;
         let mut summary: Option<String> = None;
@@ -243,7 +256,9 @@ impl ToolResult {
             {
                 status = parsed;
             }
-            if object.get("success").and_then(Value::as_bool) == Some(false) {
+            if object.get("success").and_then(Value::as_bool) == Some(false)
+                && !is_process_report(object)
+            {
                 status = ToolStatus::Error;
             }
             if object.get("truncated").and_then(Value::as_bool) == Some(true) {
@@ -448,9 +463,11 @@ impl ToolResult {
                     .map(ToolStatus::is_error)
                     .unwrap_or(matches!(raw, "error" | "failed" | "failure"));
             }
-            if object.get("success").and_then(Value::as_bool) == Some(false) {
-                return true;
-            }
+            // A process report's own `success` is the command's verdict; the
+            // tool call completed. This is the same exception `from_value`
+            // makes, kept here so a stored raw result reads the same way.
+            return object.get("success").and_then(Value::as_bool) == Some(false)
+                && !is_process_report(&object);
         }
         text.starts_with("Error:") || text.contains("\"success\":false")
     }
@@ -755,6 +772,35 @@ mod tests {
         assert!(error.retryable);
         assert!(result.summary.contains("the disk is full"));
         assert!(ToolResult::text_is_error(&result.to_text(0)));
+    }
+
+    /// A command's non-zero exit is its answer, not a failed tool call. The
+    /// bash contract says so, and marking it `internal` taught models to avoid
+    /// the shell after an ordinary no-match `grep`.
+    #[test]
+    fn a_nonzero_exit_is_a_process_report_not_a_tool_failure() {
+        let result = ToolResult::from_value(
+            "bash",
+            json!({
+                "stdout": "",
+                "stderr": "",
+                "exit_code": 1,
+                "success": false,
+                "sandbox": "none",
+            }),
+        );
+        assert_eq!(result.status, ToolStatus::Success);
+        assert!(result.error.is_none(), "the call itself completed");
+        assert_eq!(result.data["exit_code"], 1);
+        assert_eq!(result.data["success"], false);
+        assert!(
+            !ToolResult::text_is_error(&result.to_text(0)),
+            "the envelope does not report a failure"
+        );
+        assert!(
+            !ToolResult::text_is_error(r#"{"stdout":"","exit_code":1,"success":false}"#),
+            "a stored raw process report reads the same way"
+        );
     }
 
     #[test]

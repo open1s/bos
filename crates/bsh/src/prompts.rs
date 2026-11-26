@@ -287,7 +287,7 @@ pub(crate) const TOOL_FAILURE_RULE: &str = "## Reading a failed tool call\n\n\
 A result with status \"error\" is information about one call, not the end of the turn: correct the call and continue.\n\n\
 - retryable asks about the SAME call unchanged. A corrected call - another argument, path, pattern or source line - is always allowed; repeating it unchanged is the only thing it forbids.\n\
 - indeterminate false means nothing took effect: fix and retry at once. true means the call may have run: inspect before repeating it.\n\
-- Repair by code: invalid_input - fix that argument or the program; not_found or conflict - re-inspect, then call with what you found; permission_denied or unsupported - change approach or report it; timeout or cancelled - check before retrying.\n\
+- Repair by code: invalid_input - fix that argument or the program; not_found or conflict - re-inspect, then call with what you found; permission_denied or unsupported - change approach or report it; timeout or cancelled - check before retrying; internal - the harness could not classify the failure, so it is not a refusal: correct the call or use another tool and continue.\n\
 - A traceback from your own program is a correction too: fix that line and call again. A TypeError naming a bsh helper means the call shape is wrong - print bsh.schema('<tool>') and pass the documented arguments.\n\
 - Never repeat an unchanged call. Stop only when a corrected call still fails the same way, then report the exact error; never report work as finished on a failed call.";
 
@@ -625,6 +625,10 @@ mod tests {
         assert!(TOOL_FAILURE_RULE.contains("repeating it unchanged is the only thing it forbids"));
         assert!(TOOL_FAILURE_RULE.contains("nothing took effect"));
         assert!(TOOL_FAILURE_RULE.contains("invalid_input"));
+        assert!(
+            TOOL_FAILURE_RULE.contains("internal - the harness could not classify"),
+            "an unclassified failure is explicitly not a stop"
+        );
         assert!(
             TOOL_FAILURE_RULE.contains("A traceback from your own program is a correction too")
         );

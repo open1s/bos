@@ -135,8 +135,8 @@ struct RepeatedFailure {
 
 impl RepeatedFailure {
     /// Record one result; true exactly when it crosses the limit.
-    fn note(&mut self, tool: &str, result: &str) -> bool {
-        let Some(signature) = failure_signature(tool, result) else {
+    fn note(&mut self, tool: &str, args: &Value, result: &str) -> bool {
+        let Some(signature) = failure_signature(tool, args, result) else {
             return false;
         };
         let count = self.seen.entry(signature).or_insert(0);
@@ -226,18 +226,25 @@ fn render_tool_result(
 /// mentions a failure is not mistaken for one and a failure whose message
 /// contains no digits is still recognized.
 ///
-/// Digits are dropped (they carry PIDs, timings and line numbers, which differ
-/// between two attempts at the same broken command) and the rest is lowercased
-/// and collapsed to one line. The prefix is bounded so two megabyte failures
-/// still compare cheaply.
-fn failure_signature(tool: &str, result: &str) -> Option<String> {
+/// The call's arguments are hashed into the prefix: two different commands that
+/// fail with the same generic message are not one repeated failure. Digits are
+/// dropped from the message (they carry PIDs, timings and line numbers, which
+/// differ between two attempts at the same broken command) and the rest is
+/// lowercased and collapsed to one line. The prefix is bounded so two megabyte
+/// failures still compare cheaply.
+fn failure_signature(tool: &str, args: &Value, result: &str) -> Option<String> {
     if !ToolResult::text_is_error(result) {
         return None;
     }
     let mut signature = String::with_capacity(96);
     signature.push_str(tool);
     signature.push(':');
-    let prefix = tool.len() + 1;
+    signature.push_str(&call_fingerprint(args));
+    signature.push(':');
+    // Two different commands that both fail with the same generic envelope are
+    // not one repeated failure; the call's own arguments are part of its
+    // identity. Without them, three no-match greps closed the tool loop.
+    let prefix = signature.len();
     let limit = prefix + 160;
     for ch in result.chars() {
         if ch.is_ascii_digit() {
@@ -253,6 +260,18 @@ fn failure_signature(tool: &str, result: &str) -> Option<String> {
         }
     }
     Some(signature)
+}
+
+/// A stable fingerprint of one call's arguments.
+///
+/// The repeat guard counts a failure by the tool, the arguments it ran with and
+/// the normalized error, so only an unchanged retry accumulates strikes.
+fn call_fingerprint(args: &Value) -> String {
+    use std::hash::{Hash, Hasher};
+    let encoded = serde_json::to_string(args).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    encoded.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// The prompt overhead a mid-turn budget must leave room for.
@@ -1098,7 +1117,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                     });
                                 }
                                 let failure_text = result_text;
-                                if repeated.note(&observed, &failure_text) {
+                                if repeated.note(
+                                    &observed,
+                                    &Self::strip_call_id(&args),
+                                    &failure_text,
+                                ) {
                                     closing = true;
                                     request.host_guidance.push(HostGuidance::new(
                                         "repeat-failure",
@@ -1408,7 +1431,11 @@ impl<A: ReActApp> ReActEngine<A> {
                                     });
                                 }
                                 let failure_text = result_text;
-                                if repeated.note(&observed, &failure_text) {
+                                if repeated.note(
+                                    &observed,
+                                    &Self::strip_call_id(&args),
+                                    &failure_text,
+                                ) {
                                     closing = true;
                                     request.host_guidance.push(HostGuidance::new(
                                         "repeat-failure",
@@ -1848,7 +1875,7 @@ impl<A: ReActApp> ReActEngine<A> {
                             // A failing command that is retried unchanged is
                             // the environment refusing, not the model learning:
                             // three strikes and the turn closes with a report.
-                            if repeated.note(&observed, &result_text) {
+                            if repeated.note(&observed, &Self::strip_call_id(&args), &result_text) {
                                 closing = true;
                                 request
                                         .host_guidance
@@ -2101,29 +2128,47 @@ mod repeat_guard_tests {
 
     #[test]
     fn a_successful_result_has_no_failure_signature() {
-        assert!(failure_signature("bash", "{\"success\":true,\"exit_code\":0}").is_none());
-        assert!(failure_signature("read_file", "{\"content\":\"ok\"}").is_none());
+        assert!(
+            failure_signature(
+                "bash",
+                &serde_json::Value::Null,
+                "{\"success\":true,\"exit_code\":0}"
+            )
+            .is_none()
+        );
+        assert!(
+            failure_signature(
+                "read_file",
+                &serde_json::Value::Null,
+                "{\"content\":\"ok\"}"
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn digits_and_spacing_do_not_split_one_failure() {
-        let first = "{\"stdout\":\"\",\"stderr\":\"timed out after 30s\",\"exit_code\":1,\"success\":false}";
-        let second = "{\"stdout\":\"\",\"stderr\":\"timed out after 60s\",\"exit_code\":1,\"success\":false}";
+        let first = "{\"stderr\":\"timed out after 30s\",\"success\":false}";
+        let second = "{\"stderr\":\"timed out after 60s\",\"success\":false}";
         assert_eq!(
-            failure_signature("bash", first),
-            failure_signature("bash", second)
+            failure_signature("bash", &serde_json::Value::Null, first),
+            failure_signature("bash", &serde_json::Value::Null, second)
         );
     }
 
     #[test]
     fn three_identical_failures_trip_exactly_once() {
         let result = "{\"stdout\":\"Timed out waiting\",\"success\":false}";
+        let args = serde_json::Value::Null;
         let mut guard = RepeatedFailure::default();
         for _ in 0..REPEAT_FAILURE_LIMIT - 1 {
-            assert!(!guard.note("bash", result));
+            assert!(!guard.note("bash", &args, result));
         }
-        assert!(guard.note("bash", result), "the third failure trips");
-        assert!(!guard.note("bash", result), "the note is pushed once");
+        assert!(guard.note("bash", &args, result), "the third failure trips");
+        assert!(
+            !guard.note("bash", &args, result),
+            "the note is pushed once"
+        );
     }
 
     #[test]
@@ -2190,12 +2235,41 @@ mod repeat_guard_tests {
     #[test]
     fn a_different_tool_does_not_share_the_counter() {
         let result = "{\"success\":false,\"stderr\":\"refused\"}";
+        let args = serde_json::Value::Null;
         let mut guard = RepeatedFailure::default();
         for _ in 0..REPEAT_FAILURE_LIMIT - 1 {
-            guard.note("bash", result);
+            guard.note("bash", &args, result);
         }
-        assert!(!guard.note("read_file", result));
+        assert!(!guard.note("read_file", &args, result));
     }
+
+    /// The generic `internal` envelope is identical for every unclassified
+    /// failure, so the call's arguments are what tell one failure from another.
+    /// Without this, three different commands closed the tool loop.
+    #[test]
+    fn different_arguments_do_not_share_the_counter() {
+        let result = r#"{"status":"error","error":{"code":"internal","message":"the tool reported failure","retryable":false,"indeterminate":true}}"#;
+        let mut guard = RepeatedFailure::default();
+        for index in 0..REPEAT_FAILURE_LIMIT {
+            assert!(
+                !guard.note(
+                    "bash",
+                    &serde_json::json!({ "command": format!("grep pattern-{index}") }),
+                    result
+                ),
+                "a different command is a different failure"
+            );
+        }
+        let same = serde_json::json!({ "command": "grep pattern" });
+        for _ in 0..REPEAT_FAILURE_LIMIT - 1 {
+            assert!(!guard.note("bash", &same, result));
+        }
+        assert!(
+            guard.note("bash", &same, result),
+            "the same call unchanged still trips"
+        );
+    }
+
     #[test]
     fn a_capped_result_names_its_spill() {
         use std::sync::{Arc, Mutex};
