@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **The terminal asks for permission on a card.** The moment that gates a tool
+  call used to be one truncated line: at 72 columns the resource was cut off,
+  and under 60 the chords were gone with it. An approval now takes the rows
+  above the composer as a card that names the call (`shell.run`), the resource
+  it touches and the operator's summary in full - wrapped rather than cut -
+  with the time left before the request lapses and, when more than one waits,
+  how many are behind this one. On a short terminal the card gives way first:
+  the resource and the reason take a row each in turn, a part that did not fit
+  ends on `…`, and the composer keeps the row the reader types on. The footer
+  also offers `/deny <why>`, which refuses with a note the Host audits beside
+  the decision.
+
 - **The sed tool follows GNU sed -i.** A successful applied run always replaces
   the target (and moves the original to the backup when a suffix is set), even
   when the script matched nothing and the bytes are unchanged; the result still

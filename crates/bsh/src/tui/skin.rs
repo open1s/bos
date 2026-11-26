@@ -488,7 +488,7 @@ fn is_rule(text: &str) -> bool {
 pub(crate) enum Footer {
     /// Nothing is waiting: the ordinary editor.
     Idle,
-    /// An approval is pending, and two chords answer it.
+    /// An approval is pending, and its card waits on a verdict.
     Approval,
     /// The `ask_user` card is on screen.
     Question,
@@ -531,9 +531,17 @@ fn footer_groups(footer: Footer) -> &'static [&'static str] {
         // the way out. Ctrl-C stops a turn when there is one, so the quit
         // chord is only the twice-pressed one and the footer says so.
         Footer::Idle => &["Enter send", "^C ^C quit"],
-        // The approval is the frame's own warning line; the footer answers
-        // "and what do I press?" without repeating the target.
-        Footer::Approval => &["^Y approve", "^R reject"],
+        // The approval is the frame's own warning card; the footer answers
+        // "and what do I press?" without repeating the target, and without
+        // repeating the two chords the card already prints on its rows. A
+        // refusal can carry the reason it was refused - the Host audits it
+        // beside the decision - so the note is offered here, where the reader
+        // decides.
+        Footer::Approval => &[
+            "↑↓ chooses",
+            "Enter sends the choice",
+            "/deny <why> notes the refusal",
+        ],
         Footer::Question => &[
             "↑↓ walks options",
             "Enter answers",
@@ -704,10 +712,10 @@ mod tests {
 
     #[test]
     fn the_footer_spends_its_one_row_without_cutting_a_group() {
-        // An approval leads with its own two chords, so they survive even on a
-        // row that fits nothing else.
-        let narrow = footer_text(Footer::Approval, 28);
-        assert_eq!(narrow, "^Y approve · ^R reject");
+        // An approval leads with the keys that walk its own card, so they
+        // survive even on a row that fits nothing else.
+        let narrow = footer_text(Footer::Approval, 40);
+        assert_eq!(narrow, "↑↓ chooses · Enter sends the choice");
         // A wider row keeps adding whole groups and stops before the next one.
         let wide = footer_text(Footer::Idle, 80);
         assert!(wide.chars().count() <= 80);

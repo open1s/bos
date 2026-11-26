@@ -82,6 +82,41 @@ struct Token {
     query: String,
 }
 
+/// Which block a drawn row belongs to.
+///
+/// The desktop's card is grouped, and the terminal keeps the same blocks in the
+/// same order so a reader who knows one client recognizes the other: a slash
+/// list offers the commands and then the skills, and an at list offers folders
+/// and files and then the sessions. The heading is drawn only when a list holds
+/// more than one block, because a single-block list already says what it is in
+/// its own title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Group {
+    /// A command this build backs.
+    Command,
+    /// A skill the Host advertised.
+    Skill,
+    /// A workspace file or folder.
+    File,
+    /// A conversation the `@` list offers to open.
+    Session,
+    /// One word a command's argument can be.
+    Argument,
+}
+
+impl Group {
+    /// The heading drawn over the block's first row.
+    pub(crate) fn heading(self) -> &'static str {
+        match self {
+            Self::Command => "commands",
+            Self::Skill => "skills",
+            Self::File => "files",
+            Self::Session => "sessions",
+            Self::Argument => "argument",
+        }
+    }
+}
+
 /// One row the reader can accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Row {
@@ -89,6 +124,15 @@ pub(crate) struct Row {
     pub(crate) label: String,
     /// The one-line description, as drawn.
     pub(crate) detail: String,
+    /// The block this row belongs to.
+    pub(crate) group: Group,
+    /// The CHARACTER indices of `label` the query matched, in order.
+    ///
+    /// A row that matched is a row the reader asked for, and the frame shows
+    /// the characters that matched so the list answers "why is this here?"
+    /// instead of leaving them to guess at the ranking. Indices are characters,
+    /// not bytes, because a query and a name can both be CJK.
+    pub(crate) marks: Vec<usize>,
     /// What accepting the row replaces the token with.
     pub(crate) insert: String,
     /// Whether accepting runs the line instead of leaving it in the composer.
@@ -513,14 +557,6 @@ pub(crate) fn command_arguments_for_test() -> Vec<(&'static str, &'static str)> 
         .collect()
 }
 
-/// Every command name this build backs, in the catalogue's own order.
-///
-/// The popup, the `/help` line and the answer to a mistyped line all read this
-/// one list, so a suggestion can never name a row the popup does not draw.
-pub(crate) fn command_names() -> Vec<&'static str> {
-    COMMANDS.iter().map(|command| command.name).collect()
-}
-
 /// One workspace's candidate list, with the walk that produced it.
 struct Files {
     root: PathBuf,
@@ -597,6 +633,44 @@ impl Menu {
     /// The highlighted row.
     pub(crate) fn active(&self) -> usize {
         self.active
+    }
+
+    /// What the list is: the frame's title row, and the thing a reader asked
+    /// for.
+    pub(crate) fn title(&self) -> String {
+        match self.open.as_ref().map(|token| &token.source) {
+            Some(Source::Command) => "commands".to_string(),
+            // An argument list is one command's own vocabulary, so the title
+            // names the command the words complete.
+            Some(Source::Argument { name, .. }) => format!("{name} argument"),
+            Some(Source::File) => "references".to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// The text typed after the trigger, which is the query the rows answer.
+    pub(crate) fn query(&self) -> &str {
+        self.open
+            .as_ref()
+            .map(|token| token.query.as_str())
+            .unwrap_or_default()
+    }
+
+    /// Where the highlight stands in the list, counted from one: `(active,
+    /// total)`.
+    ///
+    /// A reader who narrowed fifty commands to three needs to know it - the
+    /// window alone says which rows are on screen, not how many matched.
+    pub(crate) fn position(&self) -> (usize, usize) {
+        (self.active + 1, self.rows.len())
+    }
+
+    /// Whether the rows span more than one [`Group`], which is what makes a
+    /// heading worth the row it takes.
+    pub(crate) fn mixed(&self) -> bool {
+        self.rows
+            .first()
+            .is_some_and(|first| self.rows.iter().any(|row| row.group != first.group))
     }
 
     /// The slice of rows a frame draws, as `(start, visible)`.
@@ -753,14 +827,19 @@ fn argument_rows(query: &str, name: &'static str, words: &'static [Word]) -> Vec
         return Vec::new();
     }
     let choices: Vec<&str> = words.iter().map(|word| word.text).collect();
+    // The row draws the whole line it would run, so the match the rank found on
+    // the word is shifted past the command the row writes in front of it.
+    let offset = name.chars().count() + 1;
     fuzzy::rank(query, choices)
         .into_iter()
-        .filter_map(|hit| words.get(hit.index))
-        .map(|word| Row {
+        .filter_map(|hit| words.get(hit.index).map(|word| (word, hit.chars)))
+        .map(|(word, chars)| Row {
             // The row draws the whole line it would run: a bare word says
             // nothing about which command it completes.
             label: format!("{name} {}", word.text),
             detail: word.detail.to_string(),
+            group: Group::Argument,
+            marks: chars.iter().map(|index| index + offset).collect(),
             insert: word.text.to_string(),
             // Picking a word completes the line, so the row runs it: the
             // argument was the last thing missing.
@@ -788,6 +867,8 @@ fn command_rows(query: &str, skills: &[SkillView]) -> Vec<Row> {
             Some(Row {
                 label: command.name.to_string(),
                 detail: command.detail.to_string(),
+                group: Group::Command,
+                marks: hit.chars,
                 session: None,
                 // A bare command runs; one that takes an argument leaves a
                 // space after its name so the reader types the argument.
@@ -808,8 +889,8 @@ fn command_rows(query: &str, skills: &[SkillView]) -> Vec<Row> {
     rows.extend(
         fuzzy::rank(query, labels)
             .into_iter()
-            .filter_map(|hit| skills.get(hit.index))
-            .map(|skill| Row {
+            .filter_map(|hit| skills.get(hit.index).map(|skill| (skill, hit.chars)))
+            .map(|(skill, chars)| Row {
                 session: None,
                 label: slash_name(&skill.name),
                 detail: if skill.user_only {
@@ -817,6 +898,10 @@ fn command_rows(query: &str, skills: &[SkillView]) -> Vec<Row> {
                 } else {
                     skill.description.clone()
                 },
+                group: Group::Skill,
+                // The rank ran over the drawn label, slash included, so the
+                // marks need no shift.
+                marks: chars,
                 insert: format!("{}{} ", SKILL_PREFIX, skill.name),
                 submit: false,
             }),
@@ -863,6 +948,10 @@ fn file_rows(
                     } else {
                         entry.parent().to_string()
                     },
+                    group: Group::File,
+                    // The rank ran over the path the row draws, so the marks
+                    // need no shift.
+                    marks: hit.chars,
                     // The mention grammar is the SEND's, not this list's: the
                     // text inserted here is the same `@path` the desktop
                     // inserts.
@@ -885,10 +974,12 @@ fn file_rows(
     rows.extend(
         fuzzy::rank(query, titles)
             .into_iter()
-            .filter_map(|hit| sessions.get(hit.index))
-            .map(|session| Row {
+            .filter_map(|hit| sessions.get(hit.index).map(|session| (session, hit.chars)))
+            .map(|(session, chars)| Row {
                 label: session.title.clone(),
                 detail: session.workspace.clone(),
+                group: Group::Session,
+                marks: chars,
                 // Nothing is inserted: accepting opens the conversation.
                 insert: String::new(),
                 submit: false,
@@ -1251,10 +1342,10 @@ mod tests {
 
     #[test]
     fn a_click_names_the_row_the_window_drew() {
-        // The popup has no header, so the row a pointer names is the slot it
-        // stands in under the popup's top row - and the window is what put a
-        // candidate in that slot. A frame and a click must read the same
-        // arithmetic, or a pointer would commit a row the reader never saw.
+        // The row a pointer names is the slot it stands in under the card's
+        // top row - and the window is what put a candidate in that slot. A
+        // frame and a pointer must read the same arithmetic, or a click would
+        // commit a row the reader never saw.
         let mut menu = Menu::default();
         menu.sync("/", 1, None, &[], &[]);
         let rows = menu.rows().len();

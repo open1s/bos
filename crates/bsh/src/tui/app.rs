@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use chrono::{DateTime, Utc};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -29,7 +29,7 @@ use crate::runtime::contract::{
     ToolCallStatus, ToolCallView, TurnUsage, WorkspaceChangeView, WorkspaceDiffView,
     WorkspaceEntryView, WorkspaceReport,
 };
-use crate::runtime::ids::{ExecutionId, SessionId};
+use crate::runtime::ids::{ApprovalId, ExecutionId, SessionId};
 
 use super::export;
 use super::menu;
@@ -166,6 +166,38 @@ fn list_offset(
     (index < shown).then_some(index)
 }
 
+/// The row a click named, counted from the approval card's top edge, when the
+/// click landed on the card at all.
+///
+/// A click above the card or past its last row names nothing: those rows belong
+/// to the transcript or to the composer, and neither is the card's to answer.
+fn card_offset(paint: ApprovalPaint, row: usize) -> Option<usize> {
+    row.checked_sub(paint.top)
+        .filter(|offset| *offset < paint.rows)
+}
+
+/// The choice a click named, from the row's offset inside the card.
+///
+/// `None` means the click was inside the card but between its choices - the
+/// title, the call, a wrapped part or the foot - which names no verdict while
+/// still being the card's row.
+fn choice_offset(paint: ApprovalPaint, offset: usize) -> Option<usize> {
+    offset
+        .checked_sub(paint.choices)
+        .filter(|index| *index < APPROVAL_CHOICES.len())
+}
+
+/// The choice a walking key lands on, clamped at both ends.
+///
+/// The card never wraps a press meant for one verdict around to the other: the
+/// reader who presses Up on the first choice stays where they are, the way they
+/// do in the list the popup draws.
+fn walk_choice(choice: usize, delta: isize) -> usize {
+    choice
+        .saturating_add_signed(delta)
+        .min(APPROVAL_CHOICES.len() - 1)
+}
+
 /// The rows of a transcript a body `rows` tall shows, and the tool call each
 /// shown row names.
 ///
@@ -248,6 +280,14 @@ const QUEUE_PREVIEW_CHARS: usize = 200;
 /// The tool refuses more than six, so this is the tool's own ceiling rather
 /// than a terminal budget: every option the model offered is on screen.
 const MAX_QUESTION_OPTIONS: usize = 6;
+
+/// How many rows of an approval's summary the card draws.
+///
+/// A summary is the operator-facing "why", usually one line; a long one wraps,
+/// and the card caps it so an approval cannot take the transcript's rows. The
+/// row the cap cuts says so, so a summary that continues is never read as a
+/// summary that ended.
+const MAX_APPROVAL_SUMMARY: usize = 4;
 
 /// Severity of the last status message.
 #[derive(Debug, Clone, Copy)]
@@ -390,11 +430,16 @@ pub(crate) struct App {
     /// knows which of its rows that is, so the frame records the block's top
     /// here the same way it records its size in `frame`.
     picker_at: Cell<Option<usize>>,
-    /// The screen row the open completion popup's first row was painted on.
+    /// The screen row the open completion popup was painted on, and which
+    /// candidate each of its rows stands for.
     ///
-    /// The popup has no title: its rows are candidates, so the frame records
-    /// the row its first candidate stood on and a click reads it back.
-    menu_at: Cell<Option<usize>>,
+    /// The popup is a card: a title, a heading per block, the candidate rows
+    /// and a footer of keys. Only the frame that painted it knows which screen
+    /// row carried which candidate, so the frame records the block's top row
+    /// and its per-row map together, and a click reads them back - a heading is
+    /// a row no click can name, rather than a row that silently commits the
+    /// candidate under it.
+    menu_slots: RefCell<Option<(usize, Vec<Option<usize>>)>>,
     /// The document row the body's first painted row stands for, while the
     /// body is the timeline.
     ///
@@ -422,10 +467,39 @@ pub(crate) struct App {
     /// The call this client put away with Escape, so a refresh does not bring
     /// the card back under the reader's hands.
     question_dismissed: Option<usize>,
+    /// Which of the approval card's choices the reader is standing on, and the
+    /// request the choice belongs to.
+    ///
+    /// The id rides beside the index because a highlight that outlived its
+    /// card would answer the next request with a key press meant for the last
+    /// one - and the next request is not always the milder of the two.
+    approval_choice: Option<(ApprovalId, usize)>,
+    /// Where the approval card stood in the last painted frame.
+    ///
+    /// The card is built from the projection as it is painted, so the frame is
+    /// the only record of which screen row carried which choice - and a click
+    /// names a screen row.
+    approval_paint: Cell<Option<ApprovalPaint>>,
     /// Whether this client is mid-dispatch of one queued line; a second
     /// dispatch from a nested refresh would race that line.
     flushing: bool,
     quit: bool,
+}
+
+/// Where the approval card stood in one painted frame.
+///
+/// Its top row, how many rows it spent, and which of those rows the first
+/// choice stands on. A card is built from the projection as it is painted, so
+/// nothing else in this client can reverse a screen row back to the verdict
+/// that row carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApprovalPaint {
+    /// The screen row the card's top edge was painted on.
+    top: usize,
+    /// How many rows the card spent, edges included.
+    rows: usize,
+    /// The first choice's row, counted from the card's top.
+    choices: usize,
 }
 
 /// The answer a running turn has streamed so far.
@@ -844,13 +918,15 @@ impl App {
             menu: menu::Menu::default(),
             picker: None,
             picker_at: Cell::new(None),
-            menu_at: Cell::new(None),
+            menu_slots: RefCell::new(None),
             body_start: Cell::new(None),
             focus: None,
             document: RefCell::new(Vec::new()),
             queue: DraftQueue::default(),
             question: None,
             question_dismissed: None,
+            approval_choice: None,
+            approval_paint: Cell::new(None),
             flushing: false,
             quit: false,
         };
@@ -1499,6 +1575,15 @@ impl App {
                 _ => {}
             }
         }
+        // An approval is the frame's one blocking question, so its card owns the
+        // walking keys while the prompt is empty: Up/Down step between the
+        // verdicts, Enter sends the highlighted one, and the horizontal pair
+        // does the same for a reader reaching for the two buttons the desktop
+        // puts side by side. Typing hands every key back to the composer, which
+        // is how a reader refuses with a reason.
+        if self.approval_key(&key) {
+            return;
+        }
         // The question card owns the walking keys while the prompt is empty:
         // Up/Down step through its options instead of the prompt history, and
         // Enter answers the highlighted one. The moment the reader types, the
@@ -1642,7 +1727,7 @@ impl App {
         // rows from the transcript instead of pushing the frame past the
         // terminal and scrolling the header away.
         let (input_rows, cursor) = self.input_block(width);
-        let menu_rows = self.menu_lines(width);
+        let (menu_rows, menu_slots) = self.menu_lines(width);
         // The choice list is measured with the popup: it sits where a list
         // attached to the composer sits, so its rows come out of the body's.
         let picker_rows = self.picker_lines(width);
@@ -1734,23 +1819,21 @@ impl App {
         for row in &question_rows {
             lines.push(chrome.row(row));
         }
-        // The row above the composer is a verdict when something is waiting and
-        // metadata otherwise: an approval is a warning, a refusal is an error,
-        // and a note the reader asked for is dim.
-        let prompt = self.prompt_line(width);
-        let tone = if self.pending_approval().is_some() {
-            Tone::Warn
-        } else {
-            match self.status.as_ref().map(|(level, _)| *level) {
-                Some(Level::Error) => Tone::Error,
-                Some(Level::Info) | None => Tone::Muted,
-            }
-        };
-        lines.push(if prompt.is_empty() {
-            chrome.blank()
-        } else {
-            chrome.tone(&prompt, tone)
-        });
+        // The row above the composer is the approval card when something waits
+        // on a keystroke, and metadata otherwise: a refusal is an error and a
+        // note the reader asked for is dim.
+        //
+        // The card is built from the projection as it is painted, so this is
+        // the only place that knows which screen row carried which verdict: a
+        // click names a screen row, and it is answered from what stands there.
+        let (prompt_rows, choices_at) = self.prompt_lines(self.skin, width, height);
+        self.approval_paint
+            .set(choices_at.map(|choices| ApprovalPaint {
+                top: lines.len(),
+                rows: prompt_rows.len(),
+                choices,
+            }));
+        lines.extend(prompt_rows);
         // The popup sits between the status row and the composer, so it reads
         // as an attachment to what is being typed rather than as transcript.
         // A choice list stands in the same place, one row per choice.
@@ -1767,18 +1850,14 @@ impl App {
             };
             lines.push(chrome.tone(row, tone));
         }
-        // The popup's rows start immediately, so the row its first candidate
-        // stands on is the whole of what a click needs to name a candidate.
-        self.menu_at
-            .set((!menu_rows.is_empty()).then_some(lines.len()));
-        for row in &menu_rows {
-            let tone = if row.starts_with('›') {
-                Tone::Select
-            } else {
-                Tone::Body
-            };
-            lines.push(chrome.tone(row, tone));
-        }
+        // The popup is drawn as the card it was built as: its title, its rows
+        // and its keys. The frame records where the card stood and which
+        // candidate each of its rows carries, so a click on a row commits the
+        // row the reader saw and a click on the title or a heading commits
+        // nothing.
+        *self.menu_slots.borrow_mut() =
+            (!menu_rows.is_empty()).then_some((lines.len(), menu_slots));
+        lines.extend(menu_rows);
         let input_row = lines.len();
         for row in &input_rows {
             // The prompt's first row is introduced by the composer's marker; a
@@ -2067,31 +2146,8 @@ impl App {
     }
 
     /// The completion popup's rows, or none when it is closed.
-    fn menu_lines(&self, width: usize) -> Vec<String> {
-        if !self.menu.open() {
-            return Vec::new();
-        }
-        let rows = self.menu.rows();
-        // The window is the menu's own, so the frame and a click read the same
-        // arithmetic: a pointer names a screen row, and the row it names is
-        // only a candidate because this window put it there.
-        let (start, visible) = self.menu.window();
-        let marker = if self.menu.truncated() { "…" } else { " " };
-        rows.iter()
-            .skip(start)
-            .take(visible)
-            .enumerate()
-            .map(|(offset, row)| {
-                let active = start + offset == self.menu.active();
-                let pointer = if active { "›" } else { marker };
-                let detail = if row.detail.is_empty() {
-                    String::new()
-                } else {
-                    format!("  {}", row.detail)
-                };
-                truncate(&format!("{pointer} {}{detail}", row.label), width)
-            })
-            .collect()
+    fn menu_lines(&self, width: usize) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
+        menu_lines(&self.menu, self.skin, width)
     }
 
     /// Open the list a choice-taking command names, or say why there is none.
@@ -2255,11 +2311,78 @@ impl App {
         )
     }
 
-    /// The row above the input: a pending approval, the last status, or blank.
-    fn prompt_line(&self, width: usize) -> String {
+    /// The rows between the last rule and the input.
+    ///
+    /// A pending approval takes the place of the status line: the reader is
+    /// being asked to authorise an action, and that question outranks whatever
+    /// the last command said. It is drawn as the card it is - the call, the
+    /// resource, the reason, the deadline and the two verdicts - because Enter
+    /// authorises what the highlighted row says and nothing else.
+    ///
+    /// The second half of the answer is where the card's first choice stands,
+    /// which is what a click needs to name the verdict it landed on.
+    fn prompt_lines(
+        &self,
+        skin: Skin,
+        width: usize,
+        height: usize,
+    ) -> (Vec<Line<'static>>, Option<usize>) {
         if let Some(approval) = self.pending_approval() {
-            return approval_line(approval, width);
+            let pending = self.pending_approval_count();
+            let budget = approval_budget(height);
+            let (rows, choices) = approval_card(
+                approval,
+                pending,
+                Utc::now(),
+                skin,
+                width,
+                budget,
+                self.approval_choice(),
+            );
+            return (rows, Some(choices));
         }
+        let prompt = self.status_line(width);
+        let tone = match self.status.as_ref().map(|(level, _)| *level) {
+            Some(Level::Error) => Tone::Error,
+            Some(Level::Info) | None => Tone::Muted,
+        };
+        let rows = vec![if prompt.is_empty() {
+            Line::from(String::new())
+        } else {
+            Line::from(Span::styled(prompt, skin.style(tone)))
+        }];
+        (rows, None)
+    }
+
+    /// How many rows [`App::prompt_lines`] is about to paint.
+    ///
+    /// The body's budget is measured before the prompt is painted, so this is
+    /// all the layout needs from the card. It is the card's height and not its
+    /// text, and that height does not follow the clock: the time left rides the
+    /// title row, which truncates instead of growing.
+    fn prompt_height(&self, width: usize, height: usize) -> usize {
+        match self.pending_approval() {
+            Some(approval) => {
+                let pending = self.pending_approval_count();
+                let budget = approval_budget(height);
+                approval_card(
+                    approval,
+                    pending,
+                    Utc::now(),
+                    self.skin,
+                    width,
+                    budget,
+                    self.approval_choice(),
+                )
+                .0
+                .len()
+            }
+            None => 1,
+        }
+    }
+
+    /// The last status line, narrowed to the frame it is painted into.
+    fn status_line(&self, width: usize) -> String {
         match &self.status {
             Some((level, message)) => {
                 let prefix = match level {
@@ -2270,6 +2393,25 @@ impl App {
             }
             None => String::new(),
         }
+    }
+
+    /// How many approvals the open session is waiting on.
+    ///
+    /// One card asks for one verdict, so the count is what its foot states
+    /// beside the approval it belongs to: a reader who settles this one is told
+    /// another waits behind it instead of meeting a second card as a surprise.
+    fn pending_approval_count(&self) -> usize {
+        self.session
+            .as_ref()
+            .map(|session| {
+                session
+                    .approvals
+                    .iter()
+                    .filter(|approval| approval.status == ApprovalStatus::Pending)
+                    .count()
+            })
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// Which keys this frame's footer should offer, given what is on screen.
@@ -2352,11 +2494,14 @@ impl App {
     /// a plan block, a queued line or a question card is up.
     fn body_rows(&self, width: usize, height: usize) -> usize {
         let (input_rows, _) = self.input_block(width);
-        let menu_rows = self.menu_lines(width);
+        let menu_rows = self.menu_lines(width).0;
         let picker_rows = self.picker_lines(width);
         let plan_rows = self.plan_lines(width);
         let queue_rows = self.queue_lines(width);
         let question_rows = self.card_rows(width);
+        // The prompt is measured with the popup: an approval card is tall, and
+        // its rows come out of the transcript's budget like the question card's.
+        let prompt_rows = self.prompt_height(width, height);
         height
             .saturating_sub(
                 input_rows.len()
@@ -2365,7 +2510,8 @@ impl App {
                     + plan_rows.len()
                     + queue_rows.len()
                     + question_rows.len()
-                    + 5,
+                    + prompt_rows
+                    + 4,
             )
             .max(1)
     }
@@ -2686,6 +2832,12 @@ impl App {
         if self.click_picker(row) {
             return;
         }
+        // The approval card stands above the list, and its rows name the
+        // verdict that stands on each of them: a click on one decides the
+        // request exactly as Enter on the highlight does.
+        if self.click_approval(row) {
+            return;
+        }
         // The completion popup stands in the same place and takes its rows the
         // same way: a click on a candidate is the candidate Enter accepts.
         if self.click_menu(row) {
@@ -2721,6 +2873,35 @@ impl App {
             return;
         }
         self.open_detail(index);
+    }
+
+    /// Route a click to the approval card, and report whether it was the
+    /// card's to take.
+    ///
+    /// The frame that painted the card is the only record of which screen row
+    /// carried which verdict, so a click is answered from what the reader saw -
+    /// the same choice Enter sends, through the same commit path. A click on
+    /// the card's edges, its call or its foot names no verdict but is still the
+    /// card's: the rows it covers are covered, so nothing else may answer for
+    /// them.
+    fn click_approval(&mut self, row: usize) -> bool {
+        let Some(paint) = self.approval_paint.get() else {
+            return false;
+        };
+        let Some(offset) = card_offset(paint, row) else {
+            return false;
+        };
+        let Some(id) = self.pending_approval().map(|approval| approval.approval_id) else {
+            return false;
+        };
+        let Some(index) = choice_offset(paint, offset) else {
+            // Inside the card, and between its choices: a heading, a wrapped
+            // part or the foot. Nothing under the card is reachable there.
+            return true;
+        };
+        self.approval_choice = Some((id, index));
+        self.decide_approval_choice();
+        true
     }
 
     /// Route a click to the open choice list, and report whether it was the
@@ -2759,29 +2940,38 @@ impl App {
     /// Route a click to the open completion popup, and report whether it was
     /// the popup's to take.
     ///
-    /// The popup is drawn as the rows above the composer with no header of its
-    /// own, so a pointer on one of them means the candidate that row paints -
-    /// the same candidate Enter accepts. A click outside those rows leaves the
-    /// popup open and answers `false`, so the rail and the transcript beside
-    /// it still answer a pointer.
+    /// The card the popup was painted as names the candidate standing on each
+    /// of its rows, so a pointer means the row the reader saw - the same row
+    /// the arrow keys land on and Enter accepts. A click on the card's title,
+    /// on a heading or on its key row names no candidate but is still the
+    /// card's: it answers `true` and nothing under it opens, because the rows
+    /// it covers are covered by the card.
     fn click_menu(&mut self, row: usize) -> bool {
         if !self.menu.open() {
             return false;
         }
-        let (start, visible) = self.menu.window();
-        let shown = self.menu.rows().len();
-        let Some(top) = self.menu_at.get() else {
-            return false;
+        // The frame that painted the card is the only thing that knows which
+        // screen row carried which candidate, so the click is answered from
+        // that record and from nothing else.
+        let (slot, covered) = {
+            let painted = self.menu_slots.borrow();
+            let Some((top, slots)) = painted.as_ref() else {
+                return false;
+            };
+            let slot =
+                menu_offset(row, *top, slots).filter(|index| *index < self.menu.rows().len());
+            let covered = (*top..top.saturating_add(slots.len())).contains(&row);
+            (slot, covered)
         };
-        if let Some(index) = list_offset(row, top, 0, start, visible, shown) {
-            self.menu.select(index);
-            // The accept reads the highlight, so the two gestures share one
-            // path: a pick is the row the pointer named, not a second code
-            // path that could resolve it differently.
-            self.accept();
-            return true;
-        }
-        false
+        let Some(index) = slot else {
+            return covered;
+        };
+        self.menu.select(index);
+        // The accept reads the highlight, so the two gestures share one path:
+        // a pick is the row the pointer named, not a second code path that
+        // could resolve it differently.
+        self.accept();
+        true
     }
 
     /// Ask for the reader's own editor on the prompt as it stands.
@@ -2805,6 +2995,20 @@ impl App {
         // A slash line changes the session's configuration; it is never sent
         // to the model, the way the desktop's own commands are not.
         if let Some(command) = SlashCommand::parse(&text) {
+            // A skill's gesture is a `/name` line too, and the send path - not
+            // this parser - is what loads it: the token leaves the request and
+            // the manifest's instructions ride in the same turn. So a line no
+            // command owns, whose name the catalogue registers, is a turn -
+            // exactly the line the completion list's skill row inserted.
+            if let SlashCommand::Unknown(_) = command
+                && invoked_skill(&text, &self.catalogue.skills).is_some()
+            {
+                if self.deliver(&text) {
+                    self.input.clear();
+                    self.cursor = 0;
+                }
+                return;
+            }
             self.input.clear();
             self.cursor = 0;
             self.run_command(command);
@@ -3062,10 +3266,7 @@ impl App {
             SlashCommand::Sessions(argument) => self.sessions_command(argument.as_deref()),
             SlashCommand::Skills(filter) => self.skills_command(filter.as_deref()),
             SlashCommand::Unknown(head) => {
-                self.set_status(
-                    Level::Error,
-                    format!("unknown command '{head}' — {COMMANDS}"),
-                );
+                self.set_status(Level::Error, unknown_line(&head));
             }
             SlashCommand::Usage(usage) => self.set_status(Level::Error, usage),
             // The three commands whose argument is one of a fixed set answer a
@@ -5244,6 +5445,63 @@ impl App {
         }
     }
 
+    /// The choice the approval card is standing on.
+    ///
+    /// A highlight recorded against a request that is no longer pending names
+    /// nothing: the card opens on its first choice, so the reader is never
+    /// asked to decide a fresh request with a bar that was left over.
+    fn approval_choice(&self) -> usize {
+        match (self.pending_approval(), self.approval_choice) {
+            (Some(approval), Some((id, choice))) if id == approval.approval_id => {
+                choice.min(APPROVAL_CHOICES.len() - 1)
+            }
+            _ => 0,
+        }
+    }
+
+    /// The approval card's keys, while it is up and the prompt is empty.
+    ///
+    /// Returns whether the card took the key, so the composer below never sees
+    /// a key the card already answered. The prompt being empty is the reader's
+    /// focus on the card: the moment anything is typed the composer takes every
+    /// key back, which is the reader refusing in their own words.
+    fn approval_key(&mut self, key: &Key) -> bool {
+        if self.pending_approval().is_none() || !self.input.is_empty() {
+            return false;
+        }
+        match key {
+            Key::Up | Key::ScrollUp | Key::Left => {
+                self.move_approval_choice(-1);
+                true
+            }
+            Key::Down | Key::ScrollDown | Key::Right => {
+                self.move_approval_choice(1);
+                true
+            }
+            Key::Enter => {
+                self.decide_approval_choice();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Walk the highlight, clamped at both ends: the card never wraps a press
+    /// meant for one verdict around to the other.
+    fn move_approval_choice(&mut self, delta: isize) {
+        let Some(id) = self.pending_approval().map(|approval| approval.approval_id) else {
+            return;
+        };
+        let choice = walk_choice(self.approval_choice(), delta);
+        self.approval_choice = Some((id, choice));
+    }
+
+    /// Send the verdict the highlight stands on.
+    fn decide_approval_choice(&mut self) {
+        let choice = APPROVAL_CHOICES[self.approval_choice().min(APPROVAL_CHOICES.len() - 1)];
+        self.decide_approval(choice.approve, None);
+    }
+
     fn decide_approval(&mut self, approve: bool, note: Option<String>) {
         let Some(approval) = self.pending_approval().cloned() else {
             self.set_status(Level::Info, "no pending approval in this session");
@@ -6732,6 +6990,36 @@ fn skill_matches(skill: &SkillView, filter: &str) -> bool {
     let filter = filter.to_lowercase();
     skill.name.to_lowercase().contains(&filter)
         || skill.description.to_lowercase().contains(&filter)
+}
+
+/// The skill a slash line's leading `/name` gesture names, when the catalogue
+/// registers one.
+///
+/// A skill's gesture and the terminal's own command prefix are the same `/`, so
+/// one line has two readings, and the catalogue is what decides between them: a
+/// name the Host advertises is a name the turn task can load, and a name it does
+/// not is a command the terminal does not own. The grammar is the send path's
+/// own - a leading token only, `[a-z0-9]+` groups joined by single hyphens - so
+/// `/usr/bin` and `5/8` stay prose rather than becoming turns.
+fn invoked_skill<'a>(text: &str, skills: &'a [SkillView]) -> Option<&'a SkillView> {
+    let name = crate::skill_invocation::leading_skill_name(text)?;
+    skills.iter().find(|skill| skill.name == name)
+}
+
+/// The status row a slash line no command owns gets.
+///
+/// A head that fits the gesture's shape is most often a skill the catalogue
+/// does not hold - a typo, or one installed after this client read the
+/// catalogue - so the row names the list that would settle it instead of the
+/// whole command reference. Anything else is a command typo, and the reference
+/// is exactly what that reader needs.
+fn unknown_line(head: &str) -> String {
+    match crate::skill_invocation::leading_skill_name(head) {
+        Some(name) => {
+            format!("no skill '{name}' is registered — /skills lists them, /help the commands")
+        }
+        None => format!("unknown command '{head}' — {COMMANDS}"),
+    }
 }
 
 /// One roster row: a server's name and its state.
@@ -10228,34 +10516,508 @@ fn picker_row(label: &str, detail: &str, width: usize, pointer: &str) -> String 
     format!("{}{detail}", pad(&head, width - cells(detail)))
 }
 
-/// The approval row: the exact action, then the two chords.
+/// The command menu, drawn as the card every other panel of the frame is.
 ///
-/// A summary alone is what the desktop shows beside its permission card; the
-/// exact action - the tool, what it does and the resource it touches - is what
-/// an operator needs before pressing a key that authorizes it.
-fn approval_line(approval: &ApprovalView, width: usize) -> String {
-    let target = &approval.action;
-    let resource = target
+/// A slash list is read while the reader is typing, so it is drawn the way the
+/// desktop draws its own menu: a titled card, one row per candidate with the
+/// name on the left and what the row is on the right, the highlighted row
+/// reversed across the card's whole width, a heading whenever the list spans
+/// more than one block, and a key row that says what the card accepts.
+///
+/// The candidate the screen row `row` names, under the card's painted top row.
+///
+/// The frame that drew the card recorded one slot per row it painted, so a
+/// pointer is answered from the same record the reader saw: a `None` slot is
+/// the title, a heading or the key row, and a row above or below the card
+/// names nothing at all.
+fn menu_offset(row: usize, top: usize, slots: &[Option<usize>]) -> Option<usize> {
+    row.checked_sub(top)
+        .and_then(|offset| slots.get(offset))
+        .copied()
+        .flatten()
+}
+
+/// The second half of the answer is what makes the card clickable: one entry
+/// per painted row naming the candidate that row carries, or `None` for the
+/// title, a heading and the key row. A pointer that lands on a `None` row is a
+/// pointer on the frame rather than on a choice, and the frame answers it.
+fn menu_lines(
+    menu: &menu::Menu,
+    skin: Skin,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
+    if !menu.open() || menu.rows().is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let rows = menu.rows();
+    let inner = width.saturating_sub(2);
+    let mut lines = Vec::with_capacity(rows.len() + 6);
+    let mut slots = Vec::with_capacity(rows.len() + 6);
+    // The card's top edge carries the title: what the list is belongs in the
+    // frame the list is drawn in, not on a row a candidate could be mistaken
+    // for. The query narrows it, so a card that answers "why three rows?" says
+    // what was typed.
+    let title = {
+        let title = menu.title();
+        match menu.query().trim() {
+            "" => title,
+            query => format!("{title} · '{query}'"),
+        }
+    };
+    lines.push(menu_top(&title, skin, width));
+    slots.push(None);
+    // The window is the menu's own, so the rows this frame draws and the rows
+    // a click addresses are the same ones.
+    let (start, visible) = menu.window();
+    let end = start.saturating_add(visible).min(rows.len());
+    let mixed = menu.mixed();
+    let mut drawn: Option<menu::Group> = None;
+    for (offset, row) in rows.iter().enumerate().take(end).skip(start) {
+        // A heading names the block beneath it, and only a list that holds
+        // more than one block needs one. The list's own title is already on
+        // the card's edge, so a block the title already names is not named
+        // twice.
+        if mixed && drawn != Some(row.group) && row.group.heading() != title {
+            lines.push(card_row(
+                &format!(" {}", row.group.heading()),
+                "",
+                Tone::Strong,
+                Tone::Body,
+                skin,
+                width,
+            ));
+            slots.push(None);
+        }
+        drawn = Some(row.group);
+        lines.push(menu_row(row, offset == menu.active(), skin, width));
+        slots.push(Some(offset));
+    }
+    // One row says where the highlight stands and what the card accepts. A
+    // command list runs the line and a file list only lands it in the
+    // composer, so the verb is the list's own, not a guess.
+    let (active, total) = menu.position();
+    let verb = if rows.iter().any(|row| row.submit) {
+        "Enter runs"
+    } else {
+        "Enter picks"
+    };
+    // The count is the list's own, so a window that shows six of forty-one
+    // still says forty-one; `+` says the walk that built the list stopped
+    // early, which makes the total itself a floor.
+    let walk = if menu.truncated() { "+" } else { "" };
+    let count = format!("{active}/{total}{walk} ");
+    lines.push(card_row(
+        &format!(" ↑↓ walks · {verb} · Esc closes"),
+        &count,
+        Tone::Muted,
+        Tone::Muted,
+        skin,
+        width,
+    ));
+    slots.push(None);
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner)),
+        skin.style(Tone::Muted),
+    )));
+    slots.push(None);
+    (lines, slots)
+}
+
+/// The card's top edge: the corner, a stub of the edge, the title, and the
+/// edge closed round to the other corner.
+///
+/// The title is the one part of the edge that is not a rule, and it is
+/// truncated rather than allowed to push the corner off the frame.
+fn menu_top(title: &str, skin: Skin, width: usize) -> Line<'static> {
+    let inner = width.saturating_sub(2);
+    let title = format!(" {} ", truncate(title.trim(), inner.saturating_sub(3)));
+    let dashes = inner.saturating_sub(cells(&title) + 1);
+    Line::from(vec![
+        Span::styled("╭─", skin.style(Tone::Muted)),
+        Span::styled(title, skin.style(Tone::Heading)),
+        Span::styled(format!("{}╮", "─".repeat(dashes)), skin.style(Tone::Muted)),
+    ])
+}
+
+/// One card row: what stands on the left, and what stands against the right
+/// edge.
+///
+/// Both are truncated to fit the card, so a heading or a key row never pushes
+/// the right border off the frame. The fact on the right gives way before the
+/// one on the left is cut: a row that says what it is still says what it is on
+/// a narrow frame.
+fn card_row(
+    left: &str,
+    right: &str,
+    left_tone: Tone,
+    right_tone: Tone,
+    skin: Skin,
+    width: usize,
+) -> Line<'static> {
+    let inner = width.saturating_sub(2);
+    let left = truncate(left, inner);
+    // One cell between the two, so they never touch.
+    let right = if cells(&left) + cells(right) < inner {
+        right.to_string()
+    } else {
+        String::new()
+    };
+    let gap = inner.saturating_sub(cells(&left) + cells(&right));
+    Line::from(vec![
+        Span::styled("│", skin.style(Tone::Muted)),
+        Span::styled(left, skin.style(left_tone)),
+        Span::styled(" ".repeat(gap), skin.style(Tone::Body)),
+        Span::styled(right, skin.style(right_tone)),
+        Span::styled("│", skin.style(Tone::Muted)),
+    ])
+}
+
+/// One candidate row: the pointer, the name with the characters the query
+/// matched marked, and the detail against the right edge.
+///
+/// The highlighted row is reversed for the card's whole inner width rather
+/// than for the length of its text, so the bar reads as one row of the list
+/// instead of as a highlight that stops mid-word.
+fn menu_row(row: &menu::Row, active: bool, skin: Skin, width: usize) -> Line<'static> {
+    let inner = width.saturating_sub(2);
+    let base = if active { Tone::Select } else { Tone::Body };
+    // The name takes the card before the detail does, and the detail keeps at
+    // most two cells in five of it - the share the desktop's palette gives its
+    // right-hand description. A name is therefore never cut to its first two
+    // letters so that a description can be whole.
+    let label = truncate(
+        &row.label,
+        inner.saturating_sub(4 + cells(row.detail.trim()).min(inner * 2 / 5)),
+    );
+    // What is left after the pointer, the name and the gap. A detail that does
+    // not fit is cut at the card's edge rather than dropped: half a description
+    // still says what the row is, and an empty column never does.
+    let room = inner.saturating_sub(4 + cells(&label));
+    let detail = if room >= 8 {
+        truncate(row.detail.trim(), room)
+    } else {
+        String::new()
+    };
+    // The card's edges are part of every row: a row that painted only its
+    // inner text would leave a gap in the border wherever a candidate stands.
+    let mut spans = vec![Span::styled("│", skin.style(Tone::Muted))];
+    spans.push(Span::styled(
+        if active { "›" } else { " " },
+        skin.style(base),
+    ));
+    spans.push(Span::styled(" ", skin.style(base)));
+    // Runs of one weight become one span, so a name with no marks is painted
+    // once and a fuzzy match is painted around the characters that hit.
+    let mut runs: Vec<(String, bool)> = Vec::new();
+    for (index, character) in label.chars().enumerate() {
+        let hit = row.marks.contains(&index);
+        match runs.last_mut() {
+            Some((text, same)) if *same == hit => text.push(character),
+            _ => runs.push((character.to_string(), hit)),
+        }
+    }
+    for (text, hit) in runs {
+        let style = match (active, hit) {
+            // Inside the reversed bar, the matched characters carry the one
+            // attribute the bar does not already use.
+            (true, true) => skin.style(Tone::Select).add_modifier(Modifier::UNDERLINED),
+            (true, false) => skin.style(Tone::Select),
+            (false, true) => skin.style(Tone::Accent),
+            (false, false) => skin.style(Tone::Body),
+        };
+        spans.push(Span::styled(text, style));
+    }
+    let used = 2 + cells(&label);
+    let gap = inner.saturating_sub(used + cells(&detail));
+    spans.push(Span::styled(" ".repeat(gap), skin.style(base)));
+    if !detail.is_empty() {
+        let tone = if active { Tone::Select } else { Tone::Muted };
+        spans.push(Span::styled(detail, skin.style(tone)));
+    }
+    spans.push(Span::styled("│", skin.style(Tone::Muted)));
+    Line::from(spans)
+}
+
+/// The approval card: the whole action a keystroke would authorise.
+///
+/// The desktop asks with a permission card, and this client used to ask with
+/// one truncated line - `Ctrl-Y` on an action whose resource had already been
+/// cut at the frame's edge. So the card states the call, the resource it
+/// touches and the operator's summary in full, wrapping them instead of cutting
+/// them, and says how long the request stays open and how many wait behind it.
+///
+/// Colour is not the only thing that separates the parts: the call is the first
+/// row, the resource the second, the summary the third, and a reader whose
+/// terminal takes no colour still reads the card in that order.
+///
+/// `budget` is the most rows the card may spend - see [`approval_budget`]. The
+/// call, the edges and the foot always fit; what the budget leaves is what the
+/// resource and the summary may wrap into, and a part the budget cut says so
+/// instead of ending a path or a reason mid-sentence without a mark.
+fn approval_card(
+    approval: &ApprovalView,
+    pending: usize,
+    now: DateTime<Utc>,
+    skin: Skin,
+    width: usize,
+    budget: usize,
+    choice: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let inner = width.saturating_sub(2);
+    let mut rows = Vec::with_capacity(budget.clamp(APPROVAL_FLOOR, 12));
+    // The edges, the call and the choices are the card's own shape; what they
+    // leave is room the foot and the wrapped parts take.
+    let elastic = budget.saturating_sub(APPROVAL_SHAPE);
+    // The foot is the card's record of which request this is and what waits
+    // behind it; the wrapped parts are what is being authorised. With only one
+    // row left to spend, the resource takes it and the foot gives way - a card
+    // that names the request but not its path would be asking the reader to
+    // authorise an action they cannot read.
+    let foot = elastic >= 2;
+    let elastic = elastic.saturating_sub(usize::from(foot));
+    rows.push(menu_top(
+        &format!("approval · {}", deadline(approval.expires_at, now)),
+        skin,
+        width,
+    ));
+    // The call first: what would run, and the action it takes. A path cut at
+    // the frame's edge names no resource, and the resource is half of what is
+    // being authorised - so on a frame with no row to spare for it, the call
+    // row carries it rather than the reader being asked to authorise an action
+    // they cannot name.
+    let call = format!(
+        " {}.{}",
+        approval.action.tool.trim(),
+        approval.action.action.trim()
+    );
+    let call = match approval.action.resource.as_deref().map(str::trim) {
+        Some(resource) if elastic == 0 && !resource.is_empty() => format!("{call} on {resource}"),
+        _ => call,
+    };
+    rows.push(card_row(&call, "", Tone::Heading, Tone::Muted, skin, width));
+    // Then what it touches and why. A path cut at the frame's edge names no
+    // resource, and the resource is half of what is being authorised, so both
+    // parts wrap instead of being cut - and on a short frame they take a row
+    // each in turn, because a card that answers "which path" and never "what
+    // for" is half an answer.
+    let resource_rows: Vec<String> = approval
+        .action
         .resource
         .as_deref()
-        .filter(|resource| !resource.trim().is_empty())
-        .map(|resource| format!(" on {resource}"))
+        .map(str::trim)
+        .filter(|resource| !resource.is_empty())
+        .map(|resource| wrap(" on ", resource, inner))
         .unwrap_or_default();
-    let summary = approval.summary.trim();
-    let detail = if summary.is_empty() {
-        String::new()
-    } else {
-        format!(" — {summary}")
+    let summary_rows: Vec<String> = {
+        let summary = approval.summary.trim();
+        if summary.is_empty() {
+            Vec::new()
+        } else {
+            wrap(" ", summary, inner)
+        }
     };
-    truncate(
-        &format!(
-            "approval {}: {}.{}{resource}{detail} · Ctrl-Y approve, Ctrl-R reject",
-            short(&approval.approval_id.to_string()),
-            target.tool,
-            target.action
-        ),
-        width,
-    )
+    let mut shown_resource = 0usize;
+    let mut shown_summary = 0usize;
+    while shown_resource + shown_summary < elastic
+        && (shown_resource < resource_rows.len() || shown_summary < summary_rows.len())
+    {
+        if shown_resource < resource_rows.len() {
+            shown_resource += 1;
+        }
+        if shown_resource + shown_summary < elastic && shown_summary < summary_rows.len() {
+            shown_summary += 1;
+        }
+    }
+    // A summary has a share of its own as well: one long reason may not take
+    // the rows a resource needs.
+    let shown_summary = shown_summary.min(MAX_APPROVAL_SUMMARY);
+    for (index, row) in resource_rows.iter().take(shown_resource).enumerate() {
+        let text = cut_mark(
+            row,
+            resource_rows.len() > shown_resource && index + 1 == shown_resource,
+            inner,
+        );
+        rows.push(card_row(&text, "", Tone::Body, Tone::Muted, skin, width));
+    }
+    for (index, row) in summary_rows.iter().take(shown_summary).enumerate() {
+        let text = cut_mark(
+            row,
+            summary_rows.len() > shown_summary && index + 1 == shown_summary,
+            inner,
+        );
+        rows.push(card_row(&text, "", Tone::Body, Tone::Muted, skin, width));
+    }
+    // The choices, last before the foot: the two verdicts the Host accepts, one
+    // row each, so a reader who has never used this client can see what the
+    // card is asking for and press Enter instead of hunting the footer for a
+    // chord. `choices_at` is where the first of them stands, which is what the
+    // pointer needs to name the row a click landed on.
+    let choices_at = rows.len();
+    for (index, option) in APPROVAL_CHOICES.iter().enumerate() {
+        rows.push(choice_row(option, index == choice, skin, width));
+    }
+    // The foot: which approval this is, and what waits behind it.
+    if foot {
+        let behind = if pending > 1 {
+            format!("1 of {pending} waiting ")
+        } else {
+            String::new()
+        };
+        rows.push(card_row(
+            &format!(" id {}", short(&approval.approval_id.to_string())),
+            &behind,
+            Tone::Muted,
+            Tone::Warn,
+            skin,
+            width,
+        ));
+    }
+    rows.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner)),
+        skin.style(Tone::Muted),
+    )));
+    (rows, choices_at)
+}
+
+/// One verdict the approval card offers.
+///
+/// The word the choice is, what pressing it does, and the chord that presses it
+/// without walking there first - the card is the list, and the chord is what a
+/// reader who has answered one of these before still reaches for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApprovalChoice {
+    /// The verdict, in one word.
+    label: &'static str,
+    /// What pressing it does, in the words the reader decides with.
+    hint: &'static str,
+    /// The chord that sends it without the highlight.
+    chord: &'static str,
+    /// Whether this choice authorises the action.
+    approve: bool,
+}
+
+/// The choices the card draws, in the order it draws them.
+///
+/// The order is the order the Host's verdicts are weighed in: the card opens on
+/// the first, which is the one a reader who asked for the work almost always
+/// means, and a refusal is one row down rather than a chord they have to know.
+const APPROVAL_CHOICES: &[ApprovalChoice] = &[
+    ApprovalChoice {
+        label: "approve",
+        hint: "carry it out",
+        chord: "^Y",
+        approve: true,
+    },
+    ApprovalChoice {
+        label: "reject",
+        hint: "refuse it",
+        chord: "^R",
+        approve: false,
+    },
+];
+
+/// The rows the approval card draws before any wrapped part: two edges, the
+/// call, and one row per choice.
+///
+/// A card shorter than this would be a card a reader cannot answer, so this is
+/// what the budget never goes below.
+const APPROVAL_SHAPE: usize = 3 + APPROVAL_CHOICES.len();
+
+/// The rows the approval card's budget never goes below: its own shape plus the
+/// row the resource takes.
+///
+/// The resource is half of what is being authorised, so even the shortest card
+/// spends a row on it - the reason and the foot are what a frame with no room
+/// left gives up instead.
+const APPROVAL_FLOOR: usize = APPROVAL_SHAPE + 1;
+
+/// One choice row: the pointer, the verdict, what it does, and the chord that
+/// sends it.
+///
+/// The highlighted row is reversed across the card's whole inner width, so the
+/// choice Enter would take reads as one bar rather than as a word coloured
+/// inside a line - the shape the completion popup gives the row it stands on,
+/// and one that survives a terminal with no colour at all.
+fn choice_row(option: &ApprovalChoice, active: bool, skin: Skin, width: usize) -> Line<'static> {
+    let inner = width.saturating_sub(2);
+    let pointer = if active { "› " } else { "  " };
+    // The chord gives way before the verdict does: a row without its key is
+    // still a choice, and a row with its key on it says which key sends it.
+    let chord = if inner >= cells(option.chord) + 2 {
+        option.chord
+    } else {
+        ""
+    };
+    let room = inner.saturating_sub(cells(chord) + usize::from(!chord.is_empty()));
+    let text = truncate(
+        &format!("{pointer}{} · {}", option.label, option.hint),
+        room,
+    );
+    let gap = inner.saturating_sub(cells(&text) + cells(chord));
+    let mut spans = vec![Span::styled("│", skin.style(Tone::Muted))];
+    if active {
+        spans.push(Span::styled(
+            format!("{text}{}{chord}", " ".repeat(gap)),
+            skin.style(Tone::Select),
+        ));
+    } else {
+        spans.push(Span::styled(text, skin.style(Tone::Body)));
+        spans.push(Span::styled(" ".repeat(gap), skin.style(Tone::Body)));
+        spans.push(Span::styled(chord.to_string(), skin.style(Tone::Muted)));
+    }
+    spans.push(Span::styled("│", skin.style(Tone::Muted)));
+    Line::from(spans)
+}
+
+/// A wrapped row whose part the card could not finish, marked so.
+///
+/// The mark is added only when it fits: a row already full to the edge is cut
+/// by the card itself, which puts its own ellipsis at the end, so the reader
+/// always sees that something was left off - and never sees a mark that pushed
+/// a character of the text off instead.
+fn cut_mark(row: &str, cut: bool, inner: usize) -> String {
+    if !cut {
+        return row.to_string();
+    }
+    // A cell for the space, a cell for the mark, and one more so the mark does
+    // not touch the card's edge: the part is cut a little earlier than it has
+    // to be, and the mark always lands on the row.
+    let room = inner.saturating_sub(3);
+    let head = break_cells(row, room)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    format!("{head} …")
+}
+
+/// How many rows an approval card may spend.
+///
+/// The card sits above the composer and takes its rows from the body, so a
+/// terminal too short for it would push the line the reader types on off the
+/// frame - the one row the card exists to answer. What the rest of the layout
+/// always needs is four chrome rows (header, two rules, footer), one transcript
+/// row and one composer row; the card gets what is left, and a frame with no
+/// room to spare gets its floor - the call, the resource, the choices and the
+/// two edges - rather than a card that cannot be answered.
+fn approval_budget(height: usize) -> usize {
+    height.saturating_sub(6).max(APPROVAL_FLOOR)
+}
+
+/// How long an approval stays open, in the words a reader reads at a glance.
+///
+/// A deadline that has passed says so: a card still asking for a verdict on a
+/// lapsed request would be asking for a keypress the Host has stopped waiting
+/// for.
+fn deadline(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = (expires_at - now).num_seconds();
+    if seconds <= 0 {
+        return "expired".to_string();
+    }
+    match seconds {
+        seconds if seconds < 60 => format!("{seconds}s left"),
+        seconds if seconds < 3600 => format!("{}m left", seconds / 60),
+        seconds => format!("{}h {:02}m left", seconds / 3600, (seconds % 3600) / 60),
+    }
 }
 
 /// The card a projected `ask_user` call is still waiting on: its index in the
@@ -11463,12 +12225,13 @@ mod tests {
     }
 
     #[test]
-    fn an_approval_row_names_the_exact_action() {
+    fn the_approval_card_states_the_whole_action() {
+        let at = Utc::now();
         let approval = ApprovalView {
             approval_id: crate::runtime::ids::ApprovalId::new(),
             session_id: SessionId::new(),
             execution_id: ExecutionId::new(),
-            summary: "remove the build directory".to_string(),
+            summary: "remove the build directory because the release rebuilds it".to_string(),
             action: ApprovalTarget {
                 tool: "shell".to_string(),
                 action: "run".to_string(),
@@ -11476,31 +12239,393 @@ mod tests {
             },
             action_digest: crate::runtime::ids::ActionDigest::of(&"shell.run"),
             status: ApprovalStatus::Pending,
-            expires_at: Utc::now(),
+            expires_at: at + chrono::Duration::minutes(4),
         };
-        let line = approval_line(&approval, 200);
+        let rows = approval_rows(&approval, 1, at, 60, approval_budget(24));
+        // Every row fills the frame it stands in: a card whose edges move with
+        // its text is a card that shifts under the reader's eye.
+        for row in &rows {
+            assert_eq!(cells(row), 60, "row fills the frame: {row:?}");
+        }
         assert!(
-            line.contains("shell.run on project/build"),
-            "the tool, its action and the resource are named: {line}"
+            rows[0].starts_with("╭─ approval · 4m left"),
+            "the edge names the request and its deadline: {:?}",
+            rows[0]
         );
         assert!(
-            line.contains("— remove the build directory"),
-            "the operator-facing summary rides along: {line}"
+            rows[1].contains("shell.run"),
+            "the call is the first row of the card: {:?}",
+            rows[1]
         );
-        // The row still narrows to the frame it is painted into.
-        assert!(approval_line(&approval, 40).chars().count() <= 40);
-        // A target with no resource and no summary is a clean two-part row.
-        let bare = ApprovalView {
+        let text = card_text(&rows);
+        assert!(
+            text.contains("on project/build"),
+            "the resource is named in full: {text}"
+        );
+        assert!(
+            text.contains("remove the build directory because the release rebuilds it"),
+            "a summary that fits is drawn whole, not cut: {text}"
+        );
+        assert!(
+            rows[rows.len() - 1].starts_with('╰'),
+            "the card closes under its last row"
+        );
+    }
+
+    #[test]
+    fn a_long_resource_wraps_instead_of_being_cut() {
+        let at = Utc::now();
+        let resource = "/Users/reader/Projects/bos/crates/bsh/src/tui/app.rs".to_string();
+        let approval = ApprovalView {
+            approval_id: crate::runtime::ids::ApprovalId::new(),
+            session_id: SessionId::new(),
+            execution_id: ExecutionId::new(),
+            summary: String::new(),
+            action: ApprovalTarget {
+                tool: "files".to_string(),
+                action: "write".to_string(),
+                resource: Some(resource.clone()),
+            },
+            action_digest: crate::runtime::ids::ActionDigest::of(&"files.write"),
+            status: ApprovalStatus::Pending,
+            expires_at: at + chrono::Duration::seconds(30),
+        };
+        // The narrowest frame the client paints: the path has to survive it.
+        let rows = approval_rows(&approval, 1, at, 40, approval_budget(24));
+        for row in &rows {
+            assert_eq!(cells(row), 40, "row fills the frame: {row:?}");
+        }
+        let text = card_text(&rows).replace(' ', "");
+        assert!(
+            text.contains(&resource.replace(' ', "")),
+            "every cell of the path is on the card: {text}"
+        );
+        assert!(
+            rows[0].contains("30s left"),
+            "the deadline survives a narrow frame: {:?}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn a_summary_past_the_cap_says_it_continues() {
+        let at = Utc::now();
+        let approval = ApprovalView {
+            approval_id: crate::runtime::ids::ApprovalId::new(),
+            session_id: SessionId::new(),
+            execution_id: ExecutionId::new(),
+            summary: vec!["word"; 200].join(" "),
+            action: ApprovalTarget {
+                tool: "shell".to_string(),
+                action: "run".to_string(),
+                resource: None,
+            },
+            action_digest: crate::runtime::ids::ActionDigest::of(&"shell.run"),
+            status: ApprovalStatus::Pending,
+            expires_at: at + chrono::Duration::hours(2),
+        };
+        let rows = approval_rows(&approval, 1, at, 60, approval_budget(24));
+        // Title, call, the capped summary, the two choices and the foot, then
+        // the two edges.
+        assert_eq!(
+            rows.len(),
+            2 + 1 + MAX_APPROVAL_SUMMARY + APPROVAL_CHOICES.len() + 1,
+            "the cap holds the card's height: {rows:?}"
+        );
+        assert!(
+            card_text(&rows).contains('…'),
+            "the row the cap cut says the summary continues: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_foot_says_how_many_approvals_wait_behind_this_one() {
+        let at = Utc::now();
+        let approval = ApprovalView {
+            approval_id: crate::runtime::ids::ApprovalId::new(),
+            session_id: SessionId::new(),
+            execution_id: ExecutionId::new(),
             summary: String::new(),
             action: ApprovalTarget {
                 tool: "turn".to_string(),
                 action: "execute".to_string(),
                 resource: None,
             },
-            ..approval
+            action_digest: crate::runtime::ids::ActionDigest::of(&"turn.execute"),
+            status: ApprovalStatus::Pending,
+            expires_at: at + chrono::Duration::minutes(2),
         };
-        let line = approval_line(&bare, 200);
-        assert!(line.contains("turn.execute · Ctrl-Y"), "{line}");
+        let same = approval_rows(&approval, 1, at, 60, approval_budget(24));
+        assert!(
+            !card_text(&same).contains("waiting"),
+            "one approval needs no count: {same:?}"
+        );
+        let more = approval_rows(&approval, 3, at, 60, approval_budget(24));
+        assert!(
+            card_text(&more).contains("1 of 3 waiting"),
+            "a reader is told what waits behind the card: {more:?}"
+        );
+        assert!(
+            more[1].contains("turn.execute"),
+            "a target with no resource is still two named parts: {:?}",
+            more[1]
+        );
+    }
+
+    #[test]
+    fn a_short_frame_still_leaves_room_for_the_line_the_reader_types_on() {
+        let at = Utc::now();
+        let approval = ApprovalView {
+            approval_id: crate::runtime::ids::ApprovalId::new(),
+            session_id: SessionId::new(),
+            execution_id: ExecutionId::new(),
+            summary: "rewrite every page of the site because the template changed".to_string(),
+            action: ApprovalTarget {
+                tool: "files".to_string(),
+                action: "write".to_string(),
+                resource: Some("/Users/reader/Projects/bos/README.md".to_string()),
+            },
+            action_digest: crate::runtime::ids::ActionDigest::of(&"files.write"),
+            status: ApprovalStatus::Pending,
+            expires_at: at + chrono::Duration::minutes(9),
+        };
+        // The card's budget is what a frame has left once the chrome, one
+        // transcript row and the composer have theirs.
+        assert_eq!(approval_budget(12), 6);
+        assert_eq!(approval_budget(24), 18);
+        assert_eq!(
+            approval_budget(8),
+            APPROVAL_FLOOR,
+            "a frame with no room to spare still gets a card that can be answered"
+        );
+        // Fourteen rows leaves two rows over the card's own shape, and the two
+        // wrapped parts take one each: the path and the reason, both cut.
+        let budget = approval_budget(14);
+        let rows = approval_rows(&approval, 1, at, 40, budget);
+        assert!(
+            rows.len() <= budget,
+            "the card keeps to its budget so the composer keeps its row: {rows:?}"
+        );
+        assert!(
+            rows[1].contains("files.write"),
+            "the call is never the part that gives way: {rows:?}"
+        );
+        let text = card_text(&rows);
+        assert!(
+            text.contains("/Users/reader/Projects/bos/"),
+            "the resource keeps its row while the reason keeps its own: {text}"
+        );
+        assert!(
+            text.contains("rewrite every page"),
+            "the reason is not dropped for a long path: {text}"
+        );
+        assert!(
+            text.contains('…'),
+            "both parts were cut, and both say so: {text}"
+        );
+        assert!(
+            text.contains(" id "),
+            "the approval's id keeps its row: {text}"
+        );
+        assert!(
+            text.contains("approve"),
+            "the verdicts keep their rows: {text}"
+        );
+        assert!(
+            rows[rows.len() - 1].starts_with('╰'),
+            "the card still closes under its last row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_tightest_card_still_names_what_it_authorises_and_how_to_answer() {
+        let at = Utc::now();
+        let approval = ApprovalView {
+            approval_id: crate::runtime::ids::ApprovalId::new(),
+            session_id: SessionId::new(),
+            execution_id: ExecutionId::new(),
+            summary: "rewrite every page of the site because the template changed".to_string(),
+            action: ApprovalTarget {
+                tool: "files".to_string(),
+                action: "write".to_string(),
+                resource: Some("/Users/reader/Projects/bos/README.md".to_string()),
+            },
+            action_digest: crate::runtime::ids::ActionDigest::of(&"files.write"),
+            status: ApprovalStatus::Pending,
+            expires_at: at + chrono::Duration::minutes(9),
+        };
+        // Twelve rows is the shortest frame that still has a transcript row:
+        // the card gets its floor and not one row more.
+        let budget = approval_budget(12);
+        let rows = approval_rows(&approval, 1, at, 40, budget);
+        assert_eq!(
+            rows.len(),
+            APPROVAL_FLOOR,
+            "the tightest card is the shape it never goes below: {rows:?}"
+        );
+        assert!(
+            rows[1].contains("files.write"),
+            "the call keeps its own row: {:?}",
+            rows[1]
+        );
+        assert!(
+            card_text(&rows).contains("/Users/reader/Projects/bos/"),
+            "with no row to spare, the resource still has one: {rows:?}"
+        );
+        let text = card_text(&rows);
+        assert!(
+            text.contains("approve") && text.contains("reject"),
+            "both verdicts keep their rows on the tightest frame: {text}"
+        );
+        assert!(
+            text.contains("›"),
+            "the bar says which verdict Enter sends: {text}"
+        );
+    }
+
+    #[test]
+    fn the_card_offers_every_verdict_the_host_accepts_as_a_row() {
+        let at = Utc::now();
+        let approval = ApprovalView {
+            approval_id: crate::runtime::ids::ApprovalId::new(),
+            session_id: SessionId::new(),
+            execution_id: ExecutionId::new(),
+            summary: String::new(),
+            action: ApprovalTarget {
+                tool: "shell".to_string(),
+                action: "run".to_string(),
+                resource: None,
+            },
+            action_digest: crate::runtime::ids::ActionDigest::of(&"shell.run"),
+            status: ApprovalStatus::Pending,
+            expires_at: at + chrono::Duration::minutes(2),
+        };
+        // The highlight opens on the first choice and can be walked to the
+        // last: what the keys do is what the card draws.
+        for choice in 0..APPROVAL_CHOICES.len() {
+            let (rows, choices_at) = approval_card(
+                &approval,
+                1,
+                at,
+                Skin::plain(),
+                60,
+                approval_budget(24),
+                choice,
+            );
+            let painted: Vec<String> = rows.iter().map(painted).collect();
+            for (index, option) in APPROVAL_CHOICES.iter().enumerate() {
+                let row = &painted[choices_at + index];
+                assert!(
+                    row.contains(option.label) && row.contains(option.hint),
+                    "every choice is a row that says what it does: {row:?}"
+                );
+                assert!(
+                    row.contains(option.chord),
+                    "every choice row prints the chord that sends it: {row:?}"
+                );
+                assert_eq!(
+                    row.contains('›'),
+                    index == choice,
+                    "exactly the row the reader stands on carries the pointer: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_names_a_choice_only_on_a_choice_row() {
+        // A card six rows tall, at screen row 10, whose choices start on its
+        // third row.
+        let paint = ApprovalPaint {
+            top: 10,
+            rows: 6,
+            choices: 2,
+        };
+        assert_eq!(card_offset(paint, 9), None, "a row above the card");
+        assert_eq!(card_offset(paint, 10), Some(0), "the card's first row");
+        assert_eq!(card_offset(paint, 15), Some(5), "the card's last row");
+        assert_eq!(card_offset(paint, 16), None, "a row below the card");
+        assert_eq!(choice_offset(paint, 0), None, "the title names no verdict");
+        assert_eq!(choice_offset(paint, 1), None, "the call names no verdict");
+        assert_eq!(choice_offset(paint, 2), Some(0), "the first choice");
+        assert_eq!(
+            choice_offset(paint, 1 + APPROVAL_CHOICES.len()).unwrap(),
+            APPROVAL_CHOICES.len() - 1,
+            "the last choice"
+        );
+        assert_eq!(
+            choice_offset(paint, 2 + APPROVAL_CHOICES.len()),
+            None,
+            "the foot names no verdict"
+        );
+    }
+
+    #[test]
+    fn a_walking_key_stops_at_both_ends() {
+        let last = APPROVAL_CHOICES.len() - 1;
+        assert_eq!(walk_choice(0, 1), 1, "Down walks toward the last choice");
+        assert_eq!(walk_choice(last, -1), last - 1, "Up walks back");
+        assert_eq!(walk_choice(0, -1), 0, "Up on the first choice stays put");
+        assert_eq!(walk_choice(last, 1), last, "Down on the last stays put");
+    }
+
+    #[test]
+    fn a_choice_row_fills_the_frame_at_any_width() {
+        let at = Utc::now();
+        let approval = ApprovalView {
+            approval_id: crate::runtime::ids::ApprovalId::new(),
+            session_id: SessionId::new(),
+            execution_id: ExecutionId::new(),
+            summary: String::new(),
+            action: ApprovalTarget {
+                tool: "shell".to_string(),
+                action: "run".to_string(),
+                resource: Some("cargo test -p bsh".to_string()),
+            },
+            action_digest: crate::runtime::ids::ActionDigest::of(&"shell.run"),
+            status: ApprovalStatus::Pending,
+            expires_at: at + chrono::Duration::minutes(2),
+        };
+        for width in 6..80 {
+            let (rows, choices_at) = approval_card(
+                &approval,
+                1,
+                at,
+                Skin::plain(),
+                width,
+                approval_budget(24),
+                0,
+            );
+            let painted: Vec<String> = rows.iter().map(painted).collect();
+            for row in painted.iter().skip(choices_at).take(APPROVAL_CHOICES.len()) {
+                assert_eq!(
+                    cells(row),
+                    width,
+                    "a choice row fills the {width}-wide frame: {row:?}"
+                );
+                let text = row.trim_start_matches(['│', ' ']);
+                assert!(
+                    !text.trim_matches(['│', ' ']).is_empty(),
+                    "a choice row says something at {width} wide: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_deadline_reads_in_the_unit_it_has_left() {
+        let at = Utc::now();
+        assert_eq!(deadline(at + chrono::Duration::seconds(30), at), "30s left");
+        assert_eq!(deadline(at + chrono::Duration::minutes(4), at), "4m left");
+        assert_eq!(
+            deadline(at + chrono::Duration::minutes(125), at),
+            "2h 05m left"
+        );
+        assert_eq!(
+            deadline(at - chrono::Duration::seconds(1), at),
+            "expired",
+            "a lapsed request says so instead of counting down"
+        );
     }
 
     #[test]
@@ -11957,6 +13082,61 @@ mod tests {
         assert!(session_title(None).starts_with("Session "));
     }
 
+    /// A `/name` line the parser does not own is a TURN when the catalogue
+    /// registers that skill: the completion list's skill row inserts exactly
+    /// this line, and the send path is what loads the manifest from it.
+    #[test]
+    fn a_registered_skill_gesture_is_a_turn_not_an_unknown_command() {
+        let skill = |name: &str, user_only: bool| SkillView {
+            name: name.to_string(),
+            description: String::new(),
+            user_only,
+        };
+        let skills = vec![skill("grill-me", true), skill("release", false)];
+
+        // The row's line, alone and followed by the reader's own task: the
+        // token is the gesture and the rest is what the skill works on.
+        assert_eq!(
+            invoked_skill("/grill-me", &skills).map(|skill| skill.name.as_str()),
+            Some("grill-me")
+        );
+        assert_eq!(
+            invoked_skill("/release  ship  1.2 ", &skills).map(|skill| skill.name.as_str()),
+            Some("release")
+        );
+        // A name nothing registers keeps the error: sending it would put a
+        // slash line in front of the model that no manifest answers.
+        assert!(invoked_skill("/grill", &skills).is_none());
+        // The grammar is the send path's, so what the terminal calls a
+        // gesture is what the turn task expands: a path and a fraction stay
+        // prose, and only the LEADING token is a gesture at all.
+        assert!(invoked_skill("/usr/bin/release", &skills).is_none());
+        assert!(invoked_skill("run /release", &skills).is_none());
+        assert!(invoked_skill("5/8", &skills).is_none());
+
+        // A command keeps its own line: `/skills` parses before the catalogue
+        // is asked, so a skill that borrowed a command's name could not take
+        // the command's line away from it.
+        let shadow = vec![skill("skills", false)];
+        assert!(invoked_skill("/skills", &shadow).is_some());
+        assert_eq!(
+            SlashCommand::parse("/skills"),
+            Some(SlashCommand::Skills(None)),
+            "the parser answers first, so the command wins"
+        );
+
+        // The row for a name nothing answers splits the two namespaces a
+        // slash line can name, so the reader is sent to the right list.
+        assert_eq!(
+            unknown_line("/grill-me"),
+            "no skill 'grill-me' is registered — /skills lists them, /help the commands"
+        );
+        assert_eq!(
+            unknown_line("/usr/bin"),
+            format!("unknown command '/usr/bin' — {COMMANDS}")
+        );
+    }
+
     /// The rail's rows are the sessions it paints, and only those: a click
     /// past the list, on the separator beside it or in a frame too narrow to
     /// have a rail opens no session.
@@ -12371,6 +13551,198 @@ mod tests {
             SlashCommand::parse("/questions 3"),
             Some(SlashCommand::Usage(_))
         ));
+    }
+
+    /// A painted row as the terminal prints it, for width and content checks.
+    fn painted(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// The words a card's rows carry, with the edges taken off and the rows
+    /// joined: a phrase that wraps is still one phrase to the reader, so a test
+    /// reads the card the way the reader does.
+    fn card_text(rows: &[String]) -> String {
+        rows.iter()
+            .map(|row| row.trim_matches('│').trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The approval card's painted rows, with its first choice highlighted.
+    ///
+    /// Every check below reads the card the frame paints, at the budget the
+    /// frame grants: the width and the height the reader's terminal has are the
+    /// two facts the card's shape follows.
+    fn approval_rows(
+        approval: &ApprovalView,
+        pending: usize,
+        now: DateTime<Utc>,
+        width: usize,
+        budget: usize,
+    ) -> Vec<String> {
+        approval_card(approval, pending, now, Skin::plain(), width, budget, 0)
+            .0
+            .iter()
+            .map(painted)
+            .collect()
+    }
+
+    #[test]
+    fn the_command_menu_is_a_card_and_every_row_it_paints_names_its_candidate() {
+        let mut menu = menu::Menu::default();
+        menu.sync("/", 1, None, &[], &[]);
+        assert!(menu.open(), "a bare slash opens the command list");
+        let (lines, slots) = menu_lines(&menu, Skin::plain(), 40);
+        assert_eq!(
+            lines.len(),
+            slots.len(),
+            "the frame records one slot per painted row"
+        );
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(
+                cells(&painted(line)),
+                40,
+                "row {index} fills the frame it stands in: {:?}",
+                painted(line)
+            );
+        }
+        let rows: Vec<String> = lines.iter().map(painted).collect();
+        assert!(
+            rows[0].starts_with("╭─ commands "),
+            "the card carries the list's own name"
+        );
+        assert!(rows[0].ends_with('╮'), "the top edge closes on the right");
+        assert!(
+            rows[rows.len() - 1].starts_with('╰'),
+            "the card closes under its last row"
+        );
+        assert!(
+            rows[rows.len() - 2].contains("Enter runs"),
+            "the key row says what accepts a command row"
+        );
+        // The edges, the key row and the title name no candidate: a pointer
+        // there is the card's, not a choice's.
+        assert_eq!(slots[0], None);
+        assert_eq!(slots[slots.len() - 1], None);
+        assert_eq!(slots[slots.len() - 2], None);
+        // Every drawn candidate is the row the window put there, in order, so
+        // the slot table and the highlight can never disagree.
+        let drawn: Vec<usize> = slots.iter().flatten().copied().collect();
+        let (start, visible) = menu.window();
+        assert_eq!(drawn, (start..start + visible).collect::<Vec<usize>>());
+        // The highlight is one bar across the card's inner width rather than a
+        // reversal that stops at the end of the name.
+        let row = slots
+            .iter()
+            .position(|slot| *slot == Some(menu.active()))
+            .expect("the highlight is drawn");
+        let bar = &lines[row].spans;
+        for span in bar.iter().take(bar.len() - 1).skip(1) {
+            assert!(
+                span.style.add_modifier.contains(Modifier::REVERSED),
+                "the highlight covers the whole row: {:?}",
+                span.content
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_card_spends_its_room_on_the_name_before_the_detail() {
+        // `/copy` is a short name with a long description, and `/fork` the
+        // same. At forty columns the detail has to give way; at a hundred the
+        // name must still be whole, and only the description is cut.
+        let mut menu = menu::Menu::default();
+        menu.sync("/co", 3, None, &[], &[]);
+        for width in [40, 72, 100] {
+            let (lines, _) = menu_lines(&menu, Skin::plain(), width);
+            let rows: Vec<String> = lines.iter().map(painted).collect();
+            let row = rows
+                .iter()
+                .find(|row| row.contains("/copy"))
+                .unwrap_or_else(|| panic!("the name is drawn whole at {width}: {rows:#?}"));
+            assert_eq!(
+                cells(row),
+                width,
+                "the row fills the frame it stands in: {row:?}"
+            );
+            assert!(
+                !row.contains("/co "),
+                "the name is not cut to the two letters the query hit: {row:?}"
+            );
+        }
+        // Where the description cannot be whole it is still on the row, cut
+        // against the edge it ran out of.
+        let (lines, _) = menu_lines(&menu, Skin::plain(), 72);
+        let row = painted(&lines[2]);
+        assert!(
+            row.trim_end_matches('│').ends_with('…'),
+            "a detail too long for the card is cut at its edge: {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrowed_menu_marks_the_characters_the_query_hit() {
+        let mut menu = menu::Menu::default();
+        menu.sync("/co", 3, None, &[], &[]);
+        let (lines, slots) = menu_lines(&menu, Skin::plain(), 60);
+        // The title says what narrowed the list, so a short list answers "why
+        // these rows?" without the reader re-reading the composer.
+        assert!(
+            painted(&lines[0]).contains("'co'"),
+            "the card's title names the filter"
+        );
+        // A row that is not the highlight paints the hit in the accent tone,
+        // so the reader sees why the row is in the list.
+        let skin = Skin::plain();
+        let row = slots
+            .iter()
+            .enumerate()
+            .find_map(|(index, slot)| (*slot == Some(1)).then_some(index))
+            .expect("the second candidate is drawn");
+        let body = skin.style(Tone::Body);
+        let muted = skin.style(Tone::Muted);
+        let marked: String = lines[row]
+            .spans
+            .iter()
+            .filter(|span| span.style != body && span.style != muted)
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            marked.to_lowercase().contains("co"),
+            "the matched characters are drawn in the accent tone, not as prose: {marked:?}"
+        );
+    }
+
+    #[test]
+    fn a_click_names_the_candidate_under_the_card_not_under_the_frame() {
+        // The card paints its title, its rows and its key row, and the frame
+        // records one slot for each. A click on a chrome row is the card's but
+        // names no candidate, and a click outside the card names nothing at
+        // all, so the rail and the transcript beside it still answer.
+        let slots = [None, None, Some(0), Some(1), None, None];
+        assert_eq!(menu_offset(0, 0, &slots), None, "the title is no candidate");
+        assert_eq!(menu_offset(2, 0, &slots), Some(0));
+        assert_eq!(menu_offset(3, 0, &slots), Some(1));
+        assert_eq!(
+            menu_offset(4, 0, &slots),
+            None,
+            "the key row is no candidate"
+        );
+        // The same table under a card painted lower on the screen.
+        assert_eq!(menu_offset(12, 10, &slots), Some(0));
+        assert_eq!(
+            menu_offset(9, 10, &slots),
+            None,
+            "a row above the card names nothing"
+        );
+        assert_eq!(
+            menu_offset(20, 10, &slots),
+            None,
+            "a row below the card names nothing"
+        );
     }
 
     #[test]
