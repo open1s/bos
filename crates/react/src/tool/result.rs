@@ -128,10 +128,23 @@ pub struct ToolErrorInfo {
     pub code: String,
     /// What happened, in one sentence.
     pub message: String,
-    /// Whether an unchanged retry may succeed.
+    /// Whether the turn can recover by calling again after applying `hint`.
+    ///
+    /// This is the flag a model reads first. A malformed argument is
+    /// recoverable after a correction, so it is true even though repeating the
+    /// unchanged call would fail again.
     pub retryable: bool,
+    /// Whether an unchanged retry may succeed, with no correction.
+    ///
+    /// Only a temporarily unavailable dependency answers true; the model must
+    /// change the call when this is false.
+    #[serde(default)]
+    pub retry_same_call: bool,
     /// Whether the world may already have changed despite the failure.
     pub indeterminate: bool,
+    /// The correction or next step to apply before calling again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
     /// The offending argument, when the failure names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
@@ -146,8 +159,10 @@ impl ToolErrorInfo {
         Self {
             code: error.code().as_str().to_string(),
             message: error.to_string(),
-            retryable: error.retryable(),
+            retryable: error.recoverable(),
+            retry_same_call: error.retryable(),
             indeterminate: error.indeterminate(),
+            hint: Some(error.hint()),
             field: error.field().map(str::to_string),
             missing: error.missing_field(),
         }
@@ -158,8 +173,20 @@ impl ToolErrorInfo {
         Self {
             code: code.as_str().to_string(),
             message: message.into(),
-            retryable: false,
+            retryable: matches!(
+                code,
+                ToolErrorCode::InvalidInput
+                    | ToolErrorCode::NotFound
+                    | ToolErrorCode::Conflict
+                    | ToolErrorCode::Ambiguous
+                    | ToolErrorCode::Timeout
+                    | ToolErrorCode::Cancelled
+                    | ToolErrorCode::Unavailable
+                    | ToolErrorCode::Internal
+            ),
+            retry_same_call: code == ToolErrorCode::Unavailable,
             indeterminate: true,
+            hint: Some(hint_for_code(code)),
             field: None,
             missing: false,
         }
@@ -334,7 +361,8 @@ impl ToolResult {
             summary: cap_text(&self.summary, cap.saturating_sub(192).max(32)),
             data: Value::Null,
             error: self.error.as_ref().map(|error| ToolErrorInfo {
-                message: cap_text(&error.message, 192),
+                message: cap_text(&error.message, 160),
+                hint: error.hint.as_ref().map(|hint| cap_text(hint, 128)),
                 ..error.clone()
             }),
             effects: Vec::new(),
@@ -473,29 +501,78 @@ impl ToolResult {
     }
 }
 
+/// The correction advice for a failure known only by its code.
+fn hint_for_code(code: ToolErrorCode) -> String {
+    match code {
+        ToolErrorCode::InvalidInput => {
+            "Correct the arguments the message names, then call again; the unchanged call will fail the same way.".to_string()
+        }
+        ToolErrorCode::NotFound => {
+            "Re-inspect with a read or list tool, then call again with the path or name you found.".to_string()
+        }
+        ToolErrorCode::Conflict => {
+            "Inspect the current state, then call again with the values that now hold.".to_string()
+        }
+        ToolErrorCode::Ambiguous => "Name exactly one target, then call again.".to_string(),
+        ToolErrorCode::PermissionDenied => {
+            "Do not repeat this call; choose a target the policy allows or report the refusal.".to_string()
+        }
+        ToolErrorCode::Timeout => {
+            "Check whether the operation took effect before calling again.".to_string()
+        }
+        ToolErrorCode::Cancelled => {
+            "Check the state before calling again; the call may have partially run.".to_string()
+        }
+        ToolErrorCode::Unavailable => {
+            "Retry the same call; the dependency was temporarily unavailable.".to_string()
+        }
+        ToolErrorCode::Unsupported => {
+            "Use a different tool, or report that this operation is unsupported.".to_string()
+        }
+        ToolErrorCode::Internal => {
+            "Correct the call or use another tool; if it fails again, report the exact error.".to_string()
+        }
+    }
+}
+
 /// The failure document a model reads.
 ///
 /// `missing` is left out because `invalid_input` plus a `field` already says
-/// which argument was wrong and that it was absent; the two recovery flags are
-/// kept because they decide retry versus report.
+/// which argument was wrong and that it was absent; the recovery flags and the
+/// hint are kept because they decide correct-and-retry versus report.
 fn model_error(error: Option<&ToolErrorInfo>, summary: &str) -> Value {
-    let (code, message, retryable, indeterminate, field) = match error {
-        Some(error) => (
-            error.code.as_str(),
-            error.message.as_str(),
-            error.retryable,
-            error.indeterminate,
-            error.field.as_deref(),
-        ),
-        None => ("internal", summary, false, true, None),
-    };
     let mut object = Map::new();
-    object.insert("code".to_string(), Value::String(code.to_string()));
-    object.insert("message".to_string(), Value::String(message.to_string()));
-    object.insert("retryable".to_string(), Value::Bool(retryable));
-    object.insert("indeterminate".to_string(), Value::Bool(indeterminate));
-    if let Some(field) = field {
-        object.insert("field".to_string(), Value::String(field.to_string()));
+    match error {
+        Some(error) => {
+            object.insert("code".to_string(), Value::String(error.code.clone()));
+            object.insert("message".to_string(), Value::String(error.message.clone()));
+            object.insert("retryable".to_string(), Value::Bool(error.retryable));
+            object.insert(
+                "retry_same_call".to_string(),
+                Value::Bool(error.retry_same_call),
+            );
+            object.insert(
+                "indeterminate".to_string(),
+                Value::Bool(error.indeterminate),
+            );
+            if let Some(hint) = &error.hint {
+                object.insert("hint".to_string(), Value::String(hint.clone()));
+            }
+            if let Some(field) = &error.field {
+                object.insert("field".to_string(), Value::String(field.clone()));
+            }
+        }
+        None => {
+            object.insert("code".to_string(), Value::String("internal".to_string()));
+            object.insert("message".to_string(), Value::String(summary.to_string()));
+            object.insert("retryable".to_string(), Value::Bool(true));
+            object.insert("retry_same_call".to_string(), Value::Bool(false));
+            object.insert("indeterminate".to_string(), Value::Bool(true));
+            object.insert(
+                "hint".to_string(),
+                Value::String(hint_for_code(ToolErrorCode::Internal)),
+            );
+        }
     }
     Value::Object(object)
 }
@@ -572,8 +649,14 @@ fn error_of(object: &Map<String, Value>, status: Option<&str>) -> Option<ToolErr
             if let Some(retryable) = error.get("retryable").and_then(Value::as_bool) {
                 info.retryable = retryable;
             }
+            if let Some(same_call) = error.get("retry_same_call").and_then(Value::as_bool) {
+                info.retry_same_call = same_call;
+            }
             if let Some(indeterminate) = error.get("indeterminate").and_then(Value::as_bool) {
                 info.indeterminate = indeterminate;
+            }
+            if let Some(hint) = error.get("hint").and_then(Value::as_str) {
+                info.hint = Some(hint.to_string());
             }
             Some(info)
         }
@@ -811,7 +894,14 @@ mod tests {
         assert!(result.data.is_null());
         let error = result.error.clone().expect("an error is present");
         assert_eq!(error.code, "timeout");
-        assert!(!error.retryable);
+        assert!(
+            error.retryable,
+            "the turn can recover after checking whether it ran"
+        );
+        assert!(
+            !error.retry_same_call,
+            "an unchanged retry may duplicate it"
+        );
         assert!(error.indeterminate);
         assert!(error.field.is_none());
 
@@ -951,8 +1041,22 @@ mod tests {
         assert_eq!(value["status"], "error");
         assert_eq!(value["error"]["code"], "invalid_input");
         assert_eq!(value["error"]["field"], "command");
-        assert_eq!(value["error"]["retryable"], false);
+        assert_eq!(
+            value["error"]["retryable"], true,
+            "a corrected call can recover"
+        );
+        assert_eq!(
+            value["error"]["retry_same_call"], false,
+            "the unchanged call cannot"
+        );
         assert_eq!(value["error"]["indeterminate"], false);
+        assert!(
+            value["error"]["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("command"),
+            "the hint names the argument to correct: {value}"
+        );
         assert!(value.get("data").is_none(), "a failure carries no payload");
         assert!(
             value["error"].get("missing").is_none(),

@@ -233,8 +233,22 @@ fn the_engine_records_one_model_document_for_every_outcome() {
     let timeout = by_id("call-timeout");
     assert_eq!(timeout["status"], "error");
     assert_eq!(timeout["error"]["code"], "timeout");
-    assert_eq!(timeout["error"]["retryable"], false);
+    assert_eq!(
+        timeout["error"]["retryable"], true,
+        "the turn can recover after inspecting the outcome"
+    );
+    assert_eq!(
+        timeout["error"]["retry_same_call"], false,
+        "an unchanged retry may duplicate the run"
+    );
     assert_eq!(timeout["error"]["indeterminate"], true);
+    assert!(
+        timeout["error"]["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Check"),
+        "the hint says what to check: {timeout}"
+    );
     assert!(timeout.get("data").is_none(), "a failure has no payload");
 
     // Partial is not failure, and the continuation is exact.

@@ -93,7 +93,9 @@ Failure:
   "error": {
     "code": "timeout",
     "message": "Tool execution timed out: …",
-    "retryable": false,
+    "retryable": true,
+    "retry_same_call": false,
+    "hint": "Check whether the operation took effect before calling again.",
     "indeterminate": true
   }
 }
@@ -109,10 +111,13 @@ Rules:
   data, so existing payload keys keep their meaning and their consumers.
 - `error` is present exactly when `status` is `error`.
 - A tool that returns `Ok` but reports `"success": false` is classified as a
-  failure. A payload status word is trusted only when the payload also names
-  its tool (`{"tool": …, "status": …}`, the file-tool contract), because a
-  bare `status` may be domain state: `job_output` returns `status: "failed"`
-  for a job it successfully described, and that call did not fail.
+  failure, except for a **process report**: a payload with `exit_code` is the
+  answer to "run this command", so a non-zero exit is data, not a failed tool
+  call (`grep` finding nothing exits 1). A payload status word is trusted only
+  when the payload also names its tool (`{"tool": …, "status": …}`, the
+  file-tool contract), because a bare `status` may be domain state:
+  `job_output` returns `status: "failed"` for a job it successfully
+  described, and that call did not fail.
 - `continuation` is omitted when there is nothing more to fetch, which is what
   tells the model the result is complete. The read tools use `next_offset` as
   their single continuation representation: no `next` object, and no
@@ -142,21 +147,24 @@ distinction is not lost, it is translated at the outer layer.
 
 ### 4.3 Error classes
 
-| Code | Meaning | Retryable | Indeterminate |
-|---|---|---:|---:|
-| `invalid_input` | arguments rejected (field-level where known) | no | no |
-| `not_found` | tool/resource/referenced entity absent | no | no |
-| `permission_denied` | policy or authority refused | no | no |
-| `conflict` | contradicts current state | no | no |
-| `ambiguous` | more than one target, none named | no | no |
-| `timeout` | bound expired | no | **yes** — the operation may have started |
-| `cancelled` | caller/runtime stopped it | no | **yes** — cancellation is not rollback |
-| `unavailable` | dependency unavailable | **yes** | no |
-| `unsupported` | operation not implemented | no | no |
-| `internal` | ran and failed, unclassified | no | **yes** — the body may have run |
+| Code | Meaning | Retryable (after hint) | Same-call retry | Indeterminate |
+|---|---|---:|---:|---:|
+| `invalid_input` | arguments rejected (field-level where known) | **yes** — correct it | no | no |
+| `not_found` | tool/resource/referenced entity absent | **yes** — re-inspect | no | no |
+| `permission_denied` | policy or authority refused | no | no | no |
+| `conflict` | contradicts current state | **yes** — re-inspect | no | no |
+| `ambiguous` | more than one target, none named | **yes** — name one | no | no |
+| `timeout` | bound expired | **yes** — check first | no | **yes** — the operation may have started |
+| `cancelled` | caller/runtime stopped it | **yes** — check first | no | **yes** — cancellation is not rollback |
+| `unavailable` | dependency unavailable | **yes** | **yes** | no |
+| `unsupported` | operation not implemented | no | no | no |
+| `internal` | ran and failed, unclassified | **yes** — correct or switch tool | no | **yes** — the body may have run |
 
-`retryable` is an admission, not a promise: a caller must still respect the
-tool's declared side effects, which is what the read-only retry guard does.
+`retryable` answers "can the turn recover by calling again after applying
+`hint`"; `retry_same_call` is the narrower admission "may this exact call
+succeed unchanged". The engine's automatic read-only retry and the model's
+no-correction retry both read the narrower flag. A caller must still respect
+the tool's declared side effects.
 
 ### 4.4 Truncation
 
@@ -177,7 +185,7 @@ After Phase 2 the engine renders one *model document* per call
 ~~~
 
 ~~~json
-{"status": "error", "error": {"code": "timeout", "message": "…", "retryable": false, "indeterminate": true}}
+{"status": "error", "error": {"code": "invalid_input", "message": "Invalid input: field 'changes' must be an array", "retryable": true, "retry_same_call": false, "indeterminate": false, "hint": "Correct 'changes' as the message describes, then call again; the unchanged call will fail the same way.", "field": "changes"}}
 ~~~
 
 Rules:
@@ -186,6 +194,9 @@ Rules:
   repeat-failure guard and `text_is_error` keep working on text alone.
 - A success or partial result carries `data`; a failure carries `error` and
   no `data`, so a failure can never be mistaken for a payload.
+- `error.hint` names the correction or check to apply first.
+  `error.retry_same_call` says whether the unchanged call may be repeated;
+  `error.retryable` says whether the turn can recover at all.
 - `summary` is deliberately absent — it is derivable from the tool name and
   the status. `ToolResult` still holds it for the UI, which reads
   `tool_output::outcome` (payload summary, else the verdict word).

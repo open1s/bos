@@ -59,10 +59,11 @@ impl std::fmt::Display for ToolErrorCode {
 /// This is the canonical tool error for the workspace. `agent` re-exports it
 /// rather than defining its own, so a tool author only handles one type.
 ///
-/// Every variant answers three questions the runtime needs: [`ToolError::code`]
-/// (what class of failure), [`ToolError::retryable`] (may an unchanged retry
-/// succeed), and [`ToolError::indeterminate`] (may the world have already
-/// changed). A timeout and a cancellation are distinct variants because one is
+/// Every variant answers four questions the runtime needs: [`ToolError::code`]
+/// (what class of failure), [`ToolError::recoverable`] (can the turn recover by
+/// calling again), [`ToolError::retryable`] (may an *unchanged* retry succeed),
+/// and [`ToolError::indeterminate`] (may the world have already changed).
+/// [`ToolError::hint`] carries the correction the model should apply first. A timeout and a cancellation are distinct variants because one is
 /// a bound and the other is a request, and neither implies that a side effect
 /// did not happen.
 #[derive(Debug, Error, Clone)]
@@ -175,8 +176,62 @@ impl ToolError {
     /// This is an admission, not a promise: a caller must still respect the
     /// tool's declared idempotency. A timeout is deliberately NOT retryable,
     /// because the operation may have started; check the outcome first.
+    ///
+    /// This is the engine's automatic-retry question. The model-facing envelope
+    /// calls it `retry_same_call`; its broader `retryable` flag means the turn
+    /// can recover by calling again after the error's `hint` is applied.
     pub fn retryable(&self) -> bool {
         matches!(self, Self::Unavailable { .. })
+    }
+
+    /// Whether the turn can recover by calling again, after reading the hint.
+    ///
+    /// A malformed argument is the motivating case: the call cannot succeed
+    /// unchanged, but telling a model `retryable: false` taught it to abandon
+    /// the turn instead of correcting the argument. A refusal or an unsupported
+    /// operation is not recoverable by retrying this tool at all.
+    pub fn recoverable(&self) -> bool {
+        !matches!(
+            self,
+            Self::PermissionDenied { .. } | Self::Unsupported { .. }
+        )
+    }
+
+    /// The correction or next step the model should apply before calling again.
+    pub fn hint(&self) -> String {
+        match self {
+            Self::InvalidInput(_) | Self::SchemaMismatch { .. } => {
+                "Correct the arguments the message names, then call again; the unchanged call will fail the same way.".to_string()
+            }
+            Self::InvalidField { field, .. } => format!(
+                "Correct '{field}' as the message describes, then call again; the unchanged call will fail the same way."
+            ),
+            Self::NotFound(_) => {
+                "Re-inspect with a read or list tool, then call again with the path or name you found.".to_string()
+            }
+            Self::Conflict { .. } => {
+                "Inspect the current state, then call again with the values that now hold.".to_string()
+            }
+            Self::Ambiguous { .. } => "Name exactly one target, then call again.".to_string(),
+            Self::PermissionDenied { .. } => {
+                "Do not repeat this call; choose a target the policy allows or report the refusal.".to_string()
+            }
+            Self::Timeout(_) => {
+                "Check whether the operation took effect before calling again.".to_string()
+            }
+            Self::Cancelled(_) => {
+                "Check the state before calling again; the call may have partially run.".to_string()
+            }
+            Self::Unavailable { .. } => {
+                "Retry the same call; the dependency was temporarily unavailable.".to_string()
+            }
+            Self::Unsupported { .. } => {
+                "Use a different tool, or report that this operation is unsupported.".to_string()
+            }
+            Self::Failed(_) => {
+                "Correct the call or use another tool; if it fails again, report the exact error.".to_string()
+            }
+        }
     }
 
     /// Whether the world may already have changed despite the failure.
@@ -334,6 +389,26 @@ mod tests {
         };
         assert!(unavailable.retryable());
         assert!(!unavailable.indeterminate());
+    }
+
+    /// A malformed argument is recoverable by a corrected call, but not by an
+    /// unchanged one. The two flags answer those two questions separately.
+    #[test]
+    fn a_correctable_failure_is_recoverable_but_not_retryable_unchanged() {
+        let invalid = ToolError::InvalidInput("changes must be an array".into());
+        assert!(invalid.recoverable());
+        assert!(!invalid.retryable());
+        assert!(invalid.hint().contains("Correct"));
+
+        let denied = ToolError::denied("no");
+        assert!(!denied.recoverable(), "a refusal is not a correction");
+        assert!(!denied.retryable());
+
+        let unavailable = ToolError::Unavailable {
+            message: "engine not running".into(),
+        };
+        assert!(unavailable.recoverable());
+        assert!(unavailable.retryable(), "the same call may now succeed");
     }
 
     #[test]

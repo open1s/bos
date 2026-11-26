@@ -3369,7 +3369,12 @@ impl ReActApp for AgentReActApp {
                 if let Some(modified) = plugins.on_tool_result(tool_result).await {
                     if modified.success {
                         *result = Ok(modified.result);
-                    } else {
+                    } else if result.is_ok() {
+                        // A plugin may turn a success into a failure, but it has
+                        // no class to give it. When the engine already holds a
+                        // classified failure, keep that error: replacing it with
+                        // the wrapper's rendered string stacked a "Tool error:"
+                        // prefix and flattened every class to `internal`.
                         *result = Err(ReactError::ToolError(
                             modified.error.unwrap_or_else(|| "Plugin error".to_string()),
                         ));
@@ -4516,5 +4521,60 @@ mod budget_tests {
             .expect("an older file with the removed field loads");
         assert_eq!(restored.messages().len(), 1);
         assert_eq!(restored.schema_version, SESSION_SCHEMA_VERSION);
+    }
+
+    /// A plugin may observe a failed result, but its string wrapper cannot name
+    /// the failure's class. Replacing the classified error flattened
+    /// `invalid_input` to `internal` and stacked "Tool error:" twice.
+    struct FlatteningPlugin;
+
+    #[async_trait::async_trait]
+    impl crate::agent::plugin::AgentPlugin for FlatteningPlugin {
+        fn name(&self) -> &str {
+            "flattening-plugin"
+        }
+
+        async fn on_tool_result(
+            &self,
+            result: crate::agent::plugin::ToolResultWrapper,
+        ) -> Option<crate::agent::plugin::ToolResultWrapper> {
+            Some(crate::agent::plugin::ToolResultWrapper {
+                result: serde_json::Value::Null,
+                success: false,
+                error: result.error,
+                metadata: std::collections::HashMap::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plugin_cannot_flatten_a_classified_tool_error() {
+        let plugins = Arc::new(crate::agent::plugin::PluginRegistry::new());
+        plugins.register(Arc::new(FlatteningPlugin));
+        let app = AgentReActApp::new(
+            Arc::new(crate::agent::hooks::HookRegistry::default()),
+            plugins,
+            "test".to_string(),
+        );
+        let mut result: Result<JsonValue, ReactError> = Err(ReactError::ToolFailure(
+            react::tool::ToolError::invalid_field("changes", "must be an array"),
+        ));
+        let mut session = AgentSession::new();
+        let mut context = AgentReactContext::new("session".to_string());
+        let _ = app
+            .after_tool_result(
+                "apply_patch",
+                &mut result,
+                "call-1",
+                &mut session,
+                &mut context,
+            )
+            .await;
+        match result {
+            Err(ReactError::ToolFailure(react::tool::ToolError::InvalidField {
+                field, ..
+            })) => assert_eq!(field, "changes"),
+            other => panic!("the classified error survives the plugin: {other:?}"),
+        }
     }
 }

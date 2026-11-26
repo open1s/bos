@@ -277,15 +277,16 @@ pub(crate) const HARNESS_CONTEXT: &str = "## Working inside BSH\n\nYou run insid
 
 /// The rule for reading a failed tool call.
 ///
-/// The envelope (`status: error` plus a class, a message and two recovery
-/// flags) is protocol, not prose: a model that reads `retryable: false` as "do
+/// The envelope (`status: error` plus a class, a message, recovery flags and a
+/// hint) is protocol, not prose: a model that reads `retryable: false` as "do
 /// not try again" abandons a turn over a fixable argument. The rule says what
 /// each flag actually answers, names the repair per class, and keeps the one
 /// stop condition the engine itself enforces - the same failure after a
 /// correction.
 pub(crate) const TOOL_FAILURE_RULE: &str = "## Reading a failed tool call\n\n\
 A result with status \"error\" is information about one call, not the end of the turn: correct the call and continue.\n\n\
-- retryable asks about the SAME call unchanged. A corrected call - another argument, path, pattern or source line - is always allowed; repeating it unchanged is the only thing it forbids.\n\
+- retryable true means the turn can recover by calling again, but read hint and retry_same_call. retry_same_call false (the usual case) means you must correct the call first; only retry_same_call true permits an unchanged retry. retryable false means this call cannot succeed by retrying: change approach or report it.\n\
+- hint names the exact correction or check to make before calling again.\n\
 - indeterminate false means nothing took effect: fix and retry at once. true means the call may have run: inspect before repeating it.\n\
 - Repair by code: invalid_input - fix that argument or the program; not_found or conflict - re-inspect, then call with what you found; permission_denied or unsupported - change approach or report it; timeout or cancelled - check before retrying; internal - the harness could not classify the failure, so it is not a refusal: correct the call or use another tool and continue.\n\
 - A traceback from your own program is a correction too: fix that line and call again. A TypeError naming a bsh helper means the call shape is wrong - print bsh.schema('<tool>') and pass the documented arguments.\n\
@@ -622,7 +623,8 @@ mod tests {
     #[test]
     fn a_failed_call_is_read_corrected_and_continued() {
         assert!(TOOL_FAILURE_RULE.contains("not the end of the turn"));
-        assert!(TOOL_FAILURE_RULE.contains("repeating it unchanged is the only thing it forbids"));
+        assert!(TOOL_FAILURE_RULE.contains("retry_same_call false"));
+        assert!(TOOL_FAILURE_RULE.contains("hint names the exact correction"));
         assert!(TOOL_FAILURE_RULE.contains("nothing took effect"));
         assert!(TOOL_FAILURE_RULE.contains("invalid_input"));
         assert!(

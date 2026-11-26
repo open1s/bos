@@ -6711,7 +6711,7 @@ fn apply_patch_tool(
             let changes = args
                 .get("changes")
                 .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| ToolError::InvalidInput("changes must be an array".to_string()))?;
+                .ok_or_else(|| ToolError::invalid_field("changes", "must be an array"))?;
             if changes.is_empty() || changes.len() > MAX_PATCH_FILES {
                 return Err(ToolError::InvalidInput(format!(
                     "changes must contain between 1 and {MAX_PATCH_FILES} files"
@@ -6754,7 +6754,7 @@ fn apply_patch_tool(
                 let edits = change
                     .get("edits")
                     .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| ToolError::InvalidInput("edits must be an array".to_string()))?;
+                    .ok_or_else(|| ToolError::invalid_field("edits", "must be an array"))?;
                 if edits.is_empty() || edits.len() > MAX_PATCH_EDITS {
                     return Err(ToolError::InvalidInput(format!(
                         "edits must contain between 1 and {MAX_PATCH_EDITS} operations per file"
