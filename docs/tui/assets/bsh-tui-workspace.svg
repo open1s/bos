@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+<title id="title">BSH TUI adaptive three-column workspace concept</title>
+<desc id="desc">Dark terminal workspace with sidebar navigation, central conversation timeline and composer, and right inspector with runtime status, jobs and agents.</desc>
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#080e19"/><stop offset="1" stop-color="#101b2b"/></linearGradient>
+  <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#1a8cff"/><stop offset="1" stop-color="#28d7c2"/></linearGradient>
+  <filter id="shadow"><feGaussianBlur stdDeviation="12"/></filter>
+  <style>
+    text{font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;fill:#dce7f7}
+    .muted{fill:#8294ad}.small{font-size:13px}.label{font-size:15px;font-weight:600}.heading{font-size:20px;font-weight:700}
+    .panel{fill:#0d1726;stroke:#293b55;stroke-width:1.2}.soft{fill:#142238;stroke:#2a3e5b}
+    .line{stroke:#263951;stroke-width:1}.blue{fill:#59a8ff}.green{fill:#35d6a1}.amber{fill:#ffb454}.cyan{fill:#37cce0}
+  </style>
+</defs>
+<rect width="1440" height="900" rx="18" fill="url(#bg)"/>
+<rect x="0" y="0" width="1440" height="76" fill="#0b1422" stroke="#263951"/>
+<path d="M28 22l18-10 18 10v30L46 62 28 52z" fill="none" stroke="#43b8ff" stroke-width="3"/><path d="M28 22l18 10 18-10M46 32v30" fill="none" stroke="#8d6cff" stroke-width="2"/>
+<text x="82" y="46" font-size="25" font-weight="800">BSH</text><text x="142" y="45" class="muted" font-size="15">Bos Shell</text>
+<text x="300" y="45" class="label blue">Home</text><text x="395" y="45">Conversations</text><text x="555" y="45">Jobs</text><text x="635" y="45">Agents</text><text x="730" y="45">Tools</text><text x="815" y="45">Capabilities</text><text x="965" y="45">Audit</text>
+<circle cx="1288" cy="37" r="5" class="green"/><text x="1302" y="43" class="small green">Host Connected</text><circle cx="1400" cy="37" r="17" fill="#1a2c44" stroke="#506783"/><text x="1395" y="42" class="small">U</text>
+<rect x="12" y="90" width="232" height="760" rx="12" class="panel"/>
+<text x="32" y="125" class="label">WORKSPACE</text>
+<rect x="24" y="146" width="208" height="42" rx="8" fill="#163d68" stroke="#286fbd"/><text x="54" y="173" class="label">▣  Conversations</text><text x="207" y="173" class="small muted">C</text>
+<text x="54" y="220">▤  Jobs</text><text x="207" y="220" class="small muted">J</text>
+<text x="54" y="265">♙  Agents</text><text x="207" y="265" class="small muted">A</text>
+<text x="54" y="310">⚒  Tools</text><text x="207" y="310" class="small muted">T</text>
+<text x="54" y="355">⬡  Capabilities</text><text x="207" y="355" class="small muted">P</text>
+<text x="54" y="400">◷  Activity</text><text x="207" y="400" class="small muted">L</text>
+<text x="54" y="445">▧  Audit</text><text x="207" y="445" class="small muted">U</text>
+<path d="M28 475H228" class="line"/><text x="32" y="510" class="label">PANELS</text><text x="54" y="550">▦  Inspector</text><text x="207" y="550" class="small muted">I</text><text x="54" y="595">▱  Files</text><text x="207" y="595" class="small muted">F</text><text x="54" y="640">⚙  Settings</text>
+<path d="M28 675H228" class="line"/><text x="32" y="710" class="label">LAYOUT</text><text x="54" y="750" class="green">● Adaptive</text><text x="54" y="790" class="muted small">Sidebar · Modal · Inline</text><text x="32" y="830" class="small green">BSH · Ready</text>
+<rect x="258" y="90" width="826" height="760" rx="12" class="panel"/>
+<rect x="276" y="106" width="210" height="42" rx="8" class="soft"/><text x="296" y="133" class="label">◉  Conversation</text><text x="1050" y="133" class="muted">⟳</text>
+<circle cx="306" cy="190" r="19" fill="#5144d9"/><text x="300" y="196" font-weight="700">U</text><text x="340" y="186" class="label">You</text><text x="390" y="186" class="small muted">14:32</text>
+<rect x="340" y="202" width="690" height="58" rx="10" class="soft"/><text x="360" y="237" font-size="17">Analyze the BSH architecture and prepare an implementation plan.</text>
+<path d="M306 292l18 10v26l-18 10-18-10v-26z" fill="none" stroke="#2fc7ec" stroke-width="3"/><text x="340" y="309" class="label">BSH Assistant</text><text x="462" y="309" class="small muted">14:33</text><text x="340" y="340">Analysis is ready. Here are the key findings and next steps:</text>
+<rect x="340" y="360" width="710" height="236" rx="12" fill="#111e30" stroke="#344b69"/>
+<circle cx="378" cy="399" r="17" class="green"/><path d="M370 399l6 6 11-13" fill="none" stroke="#07251d" stroke-width="3"/>
+<text x="410" y="397" class="green heading">Architecture Review</text><text x="410" y="422" class="small muted">Multi-Interface · Ratatui · Standalone Host · Durable Journal</text>
+<path d="M360 440H1030M585 452V576M812 452V576" class="line"/>
+<text x="360" y="474" class="green label">Strengths</text><text x="360" y="510" class="small">✓ Shared Runtime direction</text><text x="360" y="540" class="small">✓ Typed execution concepts</text><text x="360" y="570" class="small">✓ Durable state strategy</text>
+<text x="605" y="474" class="amber label">Risks to validate</text><text x="605" y="510" class="small">! Host / GUI coupling</text><text x="605" y="540" class="small">! Replay gap guarantees</text><text x="605" y="570" class="small">! Approval concurrency</text>
+<text x="832" y="474" class="blue label">Next steps</text><text x="832" y="510" class="small">→ Code Gap Analysis</text><text x="832" y="540" class="small">→ Freeze App Contract</text><text x="832" y="570" class="small">→ Vertical slice</text>
+<rect x="340" y="615" width="710" height="72" rx="10" class="soft"/><text x="360" y="645" class="label">Implementation backlog</text><text x="1010" y="645" class="small muted" text-anchor="end">0 / 42 stories</text><rect x="360" y="661" width="670" height="7" rx="4" fill="#263951"/>
+<rect x="340" y="710" width="710" height="112" rx="10" fill="#0b1728" stroke="#2879c8" stroke-width="1.5"/><text x="360" y="750" class="muted">Type a message or /command…</text><text x="360" y="795" class="small muted">/help    /jobs    /agents    /tools    /settings</text><rect x="990" y="765" width="42" height="42" rx="8" fill="#1678e8"/><text x="1002" y="793" font-size="20">➤</text>
+<rect x="1098" y="90" width="330" height="760" rx="12" class="panel"/>
+<text x="1122" y="128" class="heading">System Status</text><circle cx="1127" cy="162" r="5" class="green"/><text x="1144" y="168">Runtime Host</text><text x="1400" y="168" class="green" text-anchor="end">Healthy</text>
+<circle cx="1127" cy="199" r="5" class="green"/><text x="1144" y="205">Execution</text><text x="1400" y="205" class="green" text-anchor="end">Local</text>
+<circle cx="1127" cy="236" r="5" class="green"/><text x="1144" y="242">Agents</text><text x="1400" y="242" class="green" text-anchor="end">3 Online</text>
+<circle cx="1127" cy="273" r="5" class="blue"/><text x="1144" y="279">Jobs</text><text x="1400" y="279" class="blue" text-anchor="end">1 Running</text>
+<path d="M1118 302H1408" class="line"/><text x="1122" y="337" class="heading">Active Jobs</text><text x="1122" y="376" class="small blue">#1248</text><text x="1180" y="376" class="small">Architecture analysis</text><rect x="1122" y="392" width="280" height="8" rx="4" fill="#263951"/><rect x="1122" y="392" width="176" height="8" rx="4" fill="#2789f5"/><text x="1400" y="423" class="small muted" text-anchor="end">Running · 63%</text>
+<path d="M1118 447H1408" class="line"/><text x="1122" y="482" class="heading">Agents</text><circle cx="1130" cy="516" r="6" class="green"/><text x="1148" y="522">Planner</text><text x="1400" y="522" class="small muted" text-anchor="end">Planning</text><circle cx="1130" cy="553" r="6" class="amber"/><text x="1148" y="559">Implementer</text><text x="1400" y="559" class="small muted" text-anchor="end">Working</text><circle cx="1130" cy="590" r="6" class="cyan"/><text x="1148" y="596">Reviewer</text><text x="1400" y="596" class="small muted" text-anchor="end">Idle</text>
+<path d="M1118 622H1408" class="line"/><text x="1122" y="658" class="heading">Recent Activity</text><text x="1122" y="696" class="small muted">14:33</text><text x="1180" y="696" class="small">Plan updated</text><text x="1122" y="731" class="small muted">14:32</text><text x="1180" y="731" class="small">Tool completed</text><text x="1122" y="766" class="small muted">14:31</text><text x="1180" y="766" class="small">Conversation started</text>
+<rect x="0" y="868" width="1440" height="32" fill="#0b1422" stroke="#263951"/><text x="24" y="890" class="small muted">Mode: Adaptive   ·   Layout: 3-column</text><text x="1410" y="890" class="small muted" text-anchor="end">↑↓ Navigate   Enter Select   Esc Back</text>
+</svg>
