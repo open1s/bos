@@ -11,6 +11,7 @@ This directory defines the product requirements, architecture and UI/UX contract
 | [RFC: BSH TUI Architecture](rfc.md) | Host/client boundaries, application contract, event delivery, recovery, security and Ratatui architecture |
 | [UI/UX Specification](ui-ux.md) | Information architecture, screens, interaction rules, responsive layouts, accessibility and visual language |
 | [Product Requirements & Delivery Backlog](requirements.md) | Normative requirements, acceptance criteria, phased delivery and story-sized work items |
+| [Repository-backed Gap Analysis](gap-analysis.md) | Current implementation evidence, remaining gaps, and live Open Computer Use verification |
 | [Visual Concept](assets/bsh-tui-workspace.svg) | Editable vector concept of the primary workspace |
 
 ## Accepted design inputs

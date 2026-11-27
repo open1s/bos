@@ -52,9 +52,24 @@ pub enum ClientError {
     /// The Host rejected the request; nothing was mutated.
     #[error("{}: {}", .0.code.as_str(), .0.message)]
     Rejected(crate::runtime::contract::Rejection),
+    /// A mutation conflicts with the current Host version or state.
+    #[error("conflict: {}", .0.message)]
+    Conflict(crate::runtime::contract::Rejection),
+    /// The Host refused access; no protected projection was disclosed.
+    #[error("forbidden: {}", .0.message)]
+    Forbidden(crate::runtime::contract::Rejection),
     /// The Host closed the connection while a request was outstanding.
     #[error("the Runtime Host closed the connection")]
     Closed,
+    /// A mutation may have committed, but its acknowledgement did not arrive.
+    ///
+    /// The command id is safe to retry with the identical envelope: the Host's
+    /// durable command ledger deduplicates it. A caller must never generate a
+    /// new id and blindly repeat an operation with external side effects.
+    #[error("outcome unknown for command {command_id}; reconcile with the Host before retrying")]
+    OutcomeUnknown {
+        command_id: crate::runtime::ids::CommandId,
+    },
     /// The Host's answer did not match what this client speaks.
     #[error("runtime contract mismatch: {0}")]
     Contract(String),
@@ -234,11 +249,28 @@ impl RuntimeClient {
             .expect("pending lock")
             .insert(request_id, tx);
         if self.inner.pending.closed.load(Ordering::SeqCst) {
+            self.inner
+                .pending
+                .waiters
+                .lock()
+                .expect("pending lock")
+                .remove(&request_id);
             return Err(ClientError::Closed);
         }
         {
             let mut writer = self.inner.writer.lock().expect("client writer");
-            write_request(&mut writer, request_id, &request)?;
+            if let Err(error) = write_request(&mut writer, request_id, &request) {
+                self.inner
+                    .pending
+                    .waiters
+                    .lock()
+                    .expect("pending lock")
+                    .remove(&request_id);
+                if let Some(command_id) = command_id(&request) {
+                    return Err(ClientError::OutcomeUnknown { command_id });
+                }
+                return Err(error);
+            }
         }
         match rx.recv_timeout(REQUEST_TIMEOUT) {
             Ok(response) => classify(response),
@@ -249,9 +281,16 @@ impl RuntimeClient {
                     .lock()
                     .expect("pending lock")
                     .remove(&request_id);
-                Err(ClientError::Closed)
+                if let Some(command_id) = command_id(&request) {
+                    Err(ClientError::OutcomeUnknown { command_id })
+                } else {
+                    Err(ClientError::Closed)
+                }
             }
-            Err(RecvTimeoutError::Disconnected) => Err(ClientError::Closed),
+            Err(RecvTimeoutError::Disconnected) => match command_id(&request) {
+                Some(command_id) => Err(ClientError::OutcomeUnknown { command_id }),
+                None => Err(ClientError::Closed),
+            },
         }
     }
 
@@ -401,6 +440,20 @@ impl RuntimeClient {
         session_id: SessionId,
         text: impl Into<String>,
     ) -> Result<CommandOutcome, ClientError> {
+        self.send_message_with_id(session_id, text, CommandId::new())
+    }
+
+    /// Retry a user turn with the original idempotency key after an unknown outcome.
+    ///
+    /// The same text and command id return the Host's original outcome if it
+    /// already accepted the turn, and submit it once if the first request never
+    /// reached the Host.
+    pub fn send_message_with_id(
+        &self,
+        session_id: SessionId,
+        text: impl Into<String>,
+        command_id: CommandId,
+    ) -> Result<CommandOutcome, ClientError> {
         self.command(
             Some(session_id),
             None,
@@ -408,7 +461,7 @@ impl RuntimeClient {
                 session_id,
                 text: text.into(),
             },
-            CommandId::new(),
+            command_id,
         )
     }
 
@@ -661,7 +714,7 @@ impl RuntimeClient {
         };
         match self.request(Request::Query(envelope))? {
             Response::Query(result) => Ok(result),
-            Response::QueryRejected(rejection) => Err(ClientError::Rejected(rejection)),
+            Response::QueryRejected(rejection) => Err(rejection_error(rejection)),
             other => Err(ClientError::Contract(format!(
                 "query answered with {other:?}"
             ))),
@@ -962,6 +1015,15 @@ impl RuntimeClient {
     }
 }
 
+/// The idempotency key on a mutation whose response may be lost in transit.
+fn command_id(request: &Request) -> Option<crate::runtime::ids::CommandId> {
+    match request {
+        Request::Command(envelope) => Some(envelope.command_id),
+        Request::Control(envelope) => Some(envelope.command_id),
+        _ => None,
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         self.pending.closed.store(true, Ordering::SeqCst);
@@ -981,15 +1043,28 @@ pub fn tui_info() -> ClientInfo {
 fn classify(response: Response) -> Result<Response, ClientError> {
     match response {
         Response::Error(error) => Err(ClientError::Protocol(error)),
-        Response::QueryRejected(rejection) => Err(ClientError::Rejected(rejection)),
+        Response::QueryRejected(rejection) => Err(rejection_error(rejection)),
         other => Ok(other),
+    }
+}
+
+/// Keep contract error classes visible to application clients.
+fn rejection_error(rejection: crate::runtime::contract::Rejection) -> ClientError {
+    use crate::runtime::contract::RejectionCode;
+    match rejection.code {
+        RejectionCode::Conflict
+        | RejectionCode::ApprovalDigestMismatch
+        | RejectionCode::ApprovalExpired
+        | RejectionCode::ApprovalAlreadyDecided => ClientError::Conflict(rejection),
+        RejectionCode::Unauthorized => ClientError::Forbidden(rejection),
+        _ => ClientError::Rejected(rejection),
     }
 }
 
 fn accepted_operation(outcome: &CommandOutcome) -> Result<String, ClientError> {
     match outcome {
         CommandOutcome::Accepted { operation_id, .. } => Ok(operation_id.to_string()),
-        CommandOutcome::Rejected { rejection, .. } => Err(ClientError::Rejected(rejection.clone())),
+        CommandOutcome::Rejected { rejection, .. } => Err(rejection_error(rejection.clone())),
     }
 }
 

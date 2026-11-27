@@ -891,9 +891,9 @@ impl Shell {
                         let summary = format!("{status_label} · {}", prompt_snippet(&prompt));
                         let time = job_duration(elapsed, lang);
                         let token_text = if tokens == 0 {
-                            format!("~{} tok", crate::state::human_tokens(estimated_tokens))
+                            format!("~{} tok", crate::runtime::format::human_tokens(estimated_tokens))
                         } else {
-                            format!("{} tok", crate::state::human_tokens(tokens))
+                            format!("{} tok", crate::runtime::format::human_tokens(tokens))
                         };
                         let activity = match status {
                             SubagentStatus::Running => spinner().into_any_element(),

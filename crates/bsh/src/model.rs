@@ -786,7 +786,7 @@ pub(crate) struct Session {
 impl Session {
     /// A fresh, empty session in the given workspace.
     pub(crate) fn new(workspace: &str, title: impl Into<String>) -> Self {
-        let at = crate::state::now();
+        let at = crate::runtime::clock::now();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             title: title.into(),

@@ -24690,7 +24690,7 @@ fn a_branch_adopts_the_layout_it_was_cut_from(cx: &mut TestAppContext) {
             for message in session.messages.iter_mut() {
                 if message.role == crate::model::Role::Assistant {
                     message.text = body.clone();
-                    message.timing_mut().start = Some(crate::state::now_ms());
+                    message.timing_mut().start = Some(crate::runtime::clock::now_ms());
                     message.timing_mut().ms = Some(1_200);
                 }
             }
@@ -24742,8 +24742,8 @@ fn a_prompt_carries_its_time_and_a_copy_control(cx: &mut TestAppContext) {
         let id = state.active_id.clone().expect("a session");
         if let Some(session) = state.store.session_mut(&id) {
             session.messages[0].text = "aa".to_string();
-            session.messages[0].timing_mut().start = Some(crate::state::now_ms());
-            session.messages[1].timing_mut().start = Some(crate::state::now_ms());
+            session.messages[0].timing_mut().start = Some(crate::runtime::clock::now_ms());
+            session.messages[1].timing_mut().start = Some(crate::runtime::clock::now_ms());
         }
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
         Harness { shell }
@@ -24794,7 +24794,7 @@ fn the_message_copy_control_copies_its_own_text(cx: &mut TestAppContext) {
         let id = state.active_id.clone().expect("a session");
         if let Some(session) = state.store.session_mut(&id) {
             session.messages[3].text = "the second reply".to_string();
-            session.messages[3].timing_mut().start = Some(crate::state::now_ms());
+            session.messages[3].timing_mut().start = Some(crate::runtime::clock::now_ms());
             session.messages[3].timing_mut().ms = Some(1_200);
         }
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -24827,7 +24827,7 @@ fn the_branch_control_opens_the_branch_at_its_message(cx: &mut TestAppContext) {
         if let Some(session) = state.store.session_mut(&id) {
             let last = session.messages.len() - 1;
             session.messages[last].text = "the newest reply".to_string();
-            session.messages[last].timing_mut().start = Some(crate::state::now_ms());
+            session.messages[last].timing_mut().start = Some(crate::runtime::clock::now_ms());
             session.messages[last].timing_mut().ms = Some(900);
         }
         let shell = cx.new(|cx| Shell::build_for_test(window, None, state, cx));
@@ -30273,29 +30273,29 @@ fn the_plan_command_enters_with_off_and_the_task_hint(cx: &mut TestAppContext) {
     assert_eq!(after, before, "a refused send opens no turn");
 
     // The directive travels on the request, and only while the mode is on.
-    let plain = crate::state::turn_text("hello", false);
-    let planned = crate::state::turn_text("hello", true);
+    let plain = crate::runtime::turn::turn_text("hello", false);
+    let planned = crate::runtime::turn::turn_text("hello", true);
     assert_eq!(plain, "hello");
     assert!(
-        planned.contains(crate::state::PLAN_DIRECTIVE) && planned.ends_with("hello"),
+        planned.contains(crate::prompts::PLAN_DIRECTIVE) && planned.ends_with("hello"),
         "a plan-mode request carries the directive in front of the reader text"
     );
     // The reference does NOT inject goal state into an ordinary request: a goal
     // is a UI and durable-log fact, and only a goal round's own prompt carries
     // it to the model. An @reference in the line still adds its file guidance.
-    let goal_free = crate::state::turn_text("hello", true);
+    let goal_free = crate::runtime::turn::turn_text("hello", true);
     assert_eq!(
         goal_free, planned,
         "an ordinary request never carries goal state, armed or not"
     );
-    let referenced = crate::state::turn_text("look at @src/main.rs#L3-L9", false);
+    let referenced = crate::runtime::turn::turn_text("look at @src/main.rs#L3-L9", false);
     assert!(
         referenced.contains(crate::reference::FILE_REFERENCE_PROMPT),
         "a referenced turn teaches the model how to read an @token"
     );
     assert!(referenced.ends_with("look at @src/main.rs#L3-L9"));
     assert_eq!(
-        crate::state::turn_text("no reference here", false),
+        crate::runtime::turn::turn_text("no reference here", false),
         "no reference here",
         "an ordinary turn carries no guidance"
     );
@@ -31055,7 +31055,8 @@ fn the_file_row_links_a_file_reference(cx: &mut TestAppContext) {
         "one grammar emits the path and its range"
     );
     assert!(
-        crate::state::turn_text(&draft, false).contains(crate::reference::FILE_REFERENCE_PROMPT),
+        crate::runtime::turn::turn_text(&draft, false)
+            .contains(crate::reference::FILE_REFERENCE_PROMPT),
         "and a referenced turn teaches the model how to read it"
     );
 }
@@ -32347,7 +32348,7 @@ fn a_huge_output_is_a_preview_until_the_reader_opens_it(cx: &mut TestAppContext)
         view.turns[0].calls[0].preview.chars().count()
     });
     assert!(
-        preview_len <= crate::audit::PREVIEW_LIMIT + 3,
+        preview_len <= crate::runtime::audit_view::PREVIEW_LIMIT + 3,
         "the view model never carries the whole output: {preview_len}"
     );
 
@@ -32665,7 +32666,7 @@ fn an_egress_call_reports_its_own_network_state(cx: &mut TestAppContext) {
     });
     assert_eq!(
         category,
-        crate::audit::AuditCategory::Mcp,
+        crate::runtime::audit_view::AuditCategory::Mcp,
         "the namespaced tool is an MCP call"
     );
     assert_eq!(
@@ -36342,7 +36343,7 @@ fn a_turn_draws_thinking_content_and_tools_in_the_order_they_arrived(cx: &mut Te
                 args: "{\"command\": \"ls\"}".to_string(),
                 output: Some("done".to_string()),
                 ms: Some(40),
-                at: Some(crate::state::now_ms()),
+                at: Some(crate::runtime::clock::now_ms()),
             }];
             message.parts = vec![
                 crate::model::TurnPart::Thinking(first.len()),

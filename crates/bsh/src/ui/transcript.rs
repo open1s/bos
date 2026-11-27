@@ -112,7 +112,7 @@ impl TranscriptImageCache {
 /// The base64 payload is the ORIGINAL file, so its MIME/formats are preserved.
 /// This runs once per visible row (the cache owns the result), never per frame.
 fn decode_stored_image(url: &str) -> Option<CachedTranscriptImage> {
-    let (mime, payload) = crate::state::parse_data_url(url)?;
+    let (mime, payload) = crate::runtime::transcript::parse_data_url(url)?;
     let format = gpui_kit::ImageFormat::from_mime_type(mime)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload)

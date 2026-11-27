@@ -16,6 +16,22 @@
 //!   directory no other process owns, so one command is a whole runtime.
 //! - [`authz`] / [`audit`] — who acted, on what, and the record of the decision.
 //!
+//! The layer also owns everything the terminal and the window do the same way,
+//! so a view cannot drift from the other one:
+//!
+//! - [`session_repo`] — the desktop's own `Store` + `history` + `trash` stack,
+//!   so both interfaces read and write one session document.
+//! - [`context_prepare`] — one turn's context assembly (runtime facts, plan,
+//!   instructions, memory recall, extension prompts), used by the runner and
+//!   the Host executor.
+//! - [`transcript`] — replaying a stored conversation into an agent session,
+//!   including tool results and images.
+//! - [`turn`] — the request text one turn sends (references, plan directive).
+//! - [`grammar`] — the typed slash-command grammar.
+//! - [`format`] / [`clock`] — the number spellings and the timestamp units every
+//!   writer and reader shares.
+//! - [`audit_view`] — the deterministic audit page model over a session.
+//!
 //! The module is crate-private: the binaries reach it through the two entry
 //! points in this file, so the runtime's types never become a public API of the
 //! shell crate.
@@ -29,22 +45,30 @@
 
 pub(crate) mod agent_exec;
 pub(crate) mod audit;
+pub(crate) mod audit_view;
 pub(crate) mod authz;
 pub(crate) mod cli;
 pub(crate) mod client;
+pub(crate) mod clock;
 pub(crate) mod config;
+pub(crate) mod context_prepare;
 pub(crate) mod contract;
 pub(crate) mod embed;
 pub(crate) mod endpoint;
 pub(crate) mod executor;
+pub(crate) mod format;
+pub(crate) mod grammar;
 pub(crate) mod host;
 pub(crate) mod ids;
 pub(crate) mod journal;
 pub(crate) mod projection;
 pub(crate) mod review;
 pub(crate) mod server;
+pub(crate) mod session_repo;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub(crate) mod transcript;
+pub(crate) mod turn;
 
 use std::io::Write;
 

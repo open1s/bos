@@ -151,8 +151,8 @@ impl Projections {
                     execution_id: event.execution_id,
                     step: *step,
                     tool: tool.clone(),
-                    summary: summary.clone(),
-                    args: args.clone(),
+                    summary: crate::runtime::audit_view::redact_secrets(summary),
+                    args: crate::runtime::audit_view::redact_secrets(args),
                     status: ToolCallStatus::Running,
                     output: None,
                     duration_ms: None,
@@ -204,7 +204,7 @@ impl Projections {
                     } else {
                         ToolCallStatus::Failed
                     };
-                    call.output = Some(output.clone());
+                    call.output = Some(crate::runtime::audit_view::redact_secrets(output));
                     call.duration_ms = Some(*duration_ms);
                     call.finished_at = Some(event.occurred_at);
                 }
@@ -528,6 +528,29 @@ impl Projections {
             | EventPayload::HostDraining { .. }
             | EventPayload::HostStopped { .. } => {}
         }
+    }
+
+    /// Install a session read from the shared store.
+    ///
+    /// The store is the authority for what a chat IS - its transcript, title,
+    /// plan, goal and flags - while the journal is the authority for what the
+    /// runtime did. So the installed row keeps the execution and approval
+    /// records the fold already produced, and its version never moves
+    /// backwards: a client that saw sequence N must not be handed a row that
+    /// claims to be older than the one it acknowledged.
+    pub fn install(&mut self, mut projection: SessionProjection) {
+        if let Some(existing) = self.sessions.get(&projection.session_id) {
+            projection.executions = existing.executions.clone();
+            projection.approvals = existing.approvals.clone();
+            projection.version = projection.version.max(existing.version);
+            // The Host's session permission is a runtime fact (the desktop
+            // keeps the permission on the workspace), so the folded value wins
+            // when the store document does not carry one of its own.
+            if projection.config.permission.trim().is_empty() {
+                projection.config.permission = existing.config.permission.clone();
+            }
+        }
+        self.sessions.insert(projection.session_id, projection);
     }
 
     pub fn session(&self, id: SessionId) -> Option<&SessionProjection> {

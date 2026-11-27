@@ -13,6 +13,7 @@
 //! already holds, and committing one sends the same `SessionConfigChange` the
 //! typed command sent, so a pick and a typed name land on the same Host call.
 
+use super::nav;
 use crate::fuzzy;
 use crate::runtime::contract::{CatalogueView, PERMISSION_MODES, SessionConfig};
 
@@ -60,6 +61,13 @@ pub(crate) enum Kind {
     /// Enter scrolls the transcript to the row, because a hit is only useful
     /// once the reader is reading it in its place.
     Find,
+    /// The command palette: every destination and argument-free action.
+    ///
+    /// Not a slash command's list but the way to reach one. A frame narrower
+    /// than two columns has no rail, and a reader who cannot see the rail also
+    /// cannot read a command off it, so the destinations are offered by name
+    /// and the row runs the line it prints.
+    Command,
 }
 
 impl Kind {
@@ -73,6 +81,7 @@ impl Kind {
             Self::Trash => "restore a parked session",
             Self::Archived => "unarchive an archived session",
             Self::Find => "reveal a row of this conversation",
+            Self::Command => "go to a destination",
         }
     }
 
@@ -90,6 +99,7 @@ impl Kind {
             Self::Trash => "the bin is empty · /trash <number> parks the row /sessions numbers",
             Self::Archived => "no archived sessions · /sessions archive <number> hides one",
             Self::Find => "nothing in this conversation matches",
+            Self::Command => "this build names no destinations",
         }
     }
 
@@ -104,6 +114,7 @@ impl Kind {
             Self::Model => model_items(catalogue),
             Self::Preset => preset_items(catalogue),
             Self::Permission => permission_items(),
+            Self::Command => command_items(),
             Self::Session | Self::Trash | Self::Archived | Self::Find => Vec::new(),
         }
     }
@@ -156,6 +167,10 @@ pub(crate) enum Choice {
     /// Scroll the transcript to the `index`-th row of the timeline, which is
     /// the row a matched line of `/find` was found on.
     Find(usize),
+    /// Run one line of the palette: the command the row printed, parsed by the
+    /// same reader the composer uses, so a palette row and a typed line are the
+    /// same request.
+    Command(String),
 }
 
 /// One row a reader can walk to.
@@ -321,6 +336,24 @@ impl Picker {
         self.selected = 0;
         true
     }
+}
+
+/// The rows the command palette offers: every destination and action of
+/// [`nav`], in the order the rail carries them.
+///
+/// The detail is the command itself rather than a sentence about the row: a
+/// reader opens the palette because they cannot remember a spelling, and the
+/// row they pick is the spelling they leave with.
+pub(crate) fn command_items() -> Vec<Item> {
+    nav::entries()
+        .into_iter()
+        .map(|entry| Item {
+            label: entry.name.to_string(),
+            detail: entry.command.to_string(),
+            choice: Choice::Command(entry.command.to_string()),
+            active: false,
+        })
+        .collect()
 }
 
 /// The rows a `/model` picker offers: every model the Host's catalogue names,

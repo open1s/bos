@@ -7,7 +7,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::SteerMailbox;
 use agent::goal::GoalState;
@@ -21,6 +20,8 @@ use crate::model::{
 use crate::review::domain::{Change, Decision, FileDiff, Review, ReviewSnapshot};
 use crate::review::store::{ReviewRuntime, ReviewStore};
 use crate::runner::{AgentEvent, Runner};
+use crate::runtime::clock::{now, now_ms};
+use crate::runtime::format::context_share;
 use crate::settings::Settings;
 use crate::store::Store;
 
@@ -39,14 +40,6 @@ fn valid_egress_entry(entry: &str) -> bool {
     };
     address.parse::<std::net::IpAddr>().is_ok()
         && bits.parse::<u8>().is_ok_and(|bits| bits <= max_bits)
-}
-
-/// Wall-clock milliseconds since the Unix epoch, for the trajectory timeline.
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Record when a turn's first visible output arrived, once.
@@ -488,13 +481,6 @@ fn settle_ms(message: &mut ChatMessage, at: u64) {
 }
 
 /// Wall-clock seconds since the Unix epoch.
-pub(crate) fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Format a past instant in the reader's local time.
 pub(crate) fn local_stamp(at: u64) -> String {
     let (year, month, day, hour, minute) = local_parts(at);
@@ -6880,98 +6866,6 @@ impl AppState {
     }
 }
 
-/// The reference's display-ready cache-hit share, as text.
-///
-/// Its `formatCacheHitPercent` rounds to whole percent with ties up, but never
-/// lets a partial hit read as a full one: when rounding would reach 100 it
-/// widens the precision until the miss shows, so 199 of 200 reads `99.5`. No
-/// prompt input at all reads as unknown rather than zero.
-pub(crate) fn cache_hit_percent(cache_read: u64, prompt: u64) -> Option<String> {
-    if prompt == 0 {
-        return None;
-    }
-    let missed = prompt.saturating_sub(cache_read);
-    if missed == 0 {
-        return Some("100".to_string());
-    }
-    let units = (cache_read as u128 * 200 + prompt as u128) / (prompt as u128 * 2);
-    if units < 100 {
-        return Some(units.to_string());
-    }
-    // A partial hit whose whole percent rounds to 100: walk the precision out
-    // until the remaining miss shows, the way the reference does.
-    let mut places = 1usize;
-    let mut gap = missed as u128 * 200;
-    let tens = (prompt / 10) as u128;
-    while gap <= tens {
-        gap *= 10;
-        places += 1;
-    }
-    let ones = (prompt % 10) as u128;
-    let mut loss = 5u64;
-    for candidate in 1..5u64 {
-        let factor = candidate as u128 * 2 + 1;
-        if gap <= factor * tens + factor * ones / 10 {
-            loss = candidate;
-            break;
-        }
-    }
-    Some(format!("99.{}{}", "9".repeat(places - 1), 10 - loss))
-}
-
-/// A token count with the reference's own digit grouping: `17,734`.
-pub(crate) fn exact_tokens(tokens: u64) -> String {
-    let digits = tokens.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    out
-}
-
-/// Compact token counts the way the reference's own `formatTokens` reads them:
-/// `947`, `12.3K`, `518K`, `1.2M`.
-///
-/// Under a thousand it prints the count; above that it scales to K or M, where
-/// a scaled value of 100 or more rounds to a whole number and a smaller one
-/// keeps a single decimal. The reference localizes the two suffix keys, but its
-/// own doc comment pins the shipped values to K and M.
-pub(crate) fn human_tokens(tokens: u64) -> String {
-    fn scaled(value: u64, scale: u64) -> String {
-        let whole = value / scale;
-        let remainder = value % scale;
-        if whole >= 100 {
-            return (whole + u64::from(remainder * 2 >= scale)).to_string();
-        }
-        let tenths = whole * 10 + (remainder * 10 + scale / 2) / scale;
-        if tenths.is_multiple_of(10) {
-            (tenths / 10).to_string()
-        } else {
-            format!("{}.{}", tenths / 10, tenths % 10)
-        }
-    }
-    if tokens < 1_000 {
-        tokens.to_string()
-    } else if tokens < 1_000_000 {
-        format!("{}K", scaled(tokens, 1_000))
-    } else {
-        format!("{}M", scaled(tokens, 1_000_000))
-    }
-}
-
-/// The reference's own rounding of an occupancy share, capped at 100.
-///
-/// Its `contextPressure` computes `Math.min(100, Math.round(used / window *
-/// 100))`, so a 45.4% occupancy reads 45% in the ring and in the panel alike. A
-/// missing budget or an unmeasured prompt reads as unknown rather than zero.
-pub(crate) fn context_share(prompt: u64, budget: u64) -> Option<u64> {
-    (budget > 0 && prompt > 0)
-        .then(|| ((prompt as f64 / budget as f64) * 100.0).round().min(100.0) as u64)
-}
-
 /// Whether a session title matches a case-insensitive substring query.
 ///
 /// An empty or whitespace-only query matches everything, so the filter stays
@@ -7108,114 +7002,6 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 ///
 /// A turn with no attachment stays plain text. One with attachments becomes the
 /// multimodal form both vendors already map onto their own image blocks.
-/// The directive a plan-mode turn carries, in front of the reader's own text.
-///
-/// Plan mode is a promise about what the model may DO, so the instruction has
-/// to travel on the request itself: the reader's text stays what the transcript
-/// shows, while the model receives the plan-first preamble.
-/// Re-exported so the UI and the turn builder keep one path to the directive.
-pub(crate) const PLAN_DIRECTIVE: &str = crate::prompts::PLAN_DIRECTIVE;
-
-/// One typed slash command line, parsed the way the reference's command
-/// registry parses it: the name is the first whitespace-delimited token, and
-/// everything after it is the argument.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SlashLine {
-    /// `/plan ...`
-    Plan(PlanRequest),
-    /// `/goal ...`
-    Goal(GoalRequest),
-    /// `/compact` with its raw argument (the command takes none).
-    Compact(String),
-}
-
-/// What a `/plan` line asked for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PlanRequest {
-    /// Bare `/plan`: enter plan mode.
-    On,
-    /// `/plan off`: leave it without model input.
-    Off,
-    /// `/plan <task>`: enter plan mode and submit the task as the turn.
-    Task(String),
-}
-
-/// What a `/goal` line asked for.
-///
-/// The control words are recognized only when they fill the whole argument, so
-/// `/goal pause after verification` creates that literal objective.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GoalRequest {
-    /// Bare `/goal`: report the goal.
-    Show,
-    /// `/goal <objective>`: create and arm.
-    Create(String),
-    /// `/goal edit <objective>`: rewrite the objective in place.
-    Edit(String),
-    /// `/goal pause`
-    Pause,
-    /// `/goal resume`
-    Resume,
-    /// `/goal clear`
-    Clear,
-    /// `/goal edit` with no replacement.
-    InvalidEdit,
-}
-
-/// Parse a typed slash command line.
-///
-/// The commands the reference's command plane owns here take a line: `/plan`
-/// (hint `[off|message]`), `/goal`
-/// (`[<objective>|clear|edit <objective>|pause|resume]`) and `/compact`.
-/// `/compact` takes NO arguments - the shipped command returns its usage line
-/// when `rawInput.trim()` is non-empty - so the raw argument travels to the
-/// handler, which owns that refusal rather than the parser. Anything else, or a
-/// leading word that merely starts with one of them, is not a command line and
-/// is sent as a normal message.
-pub(crate) fn parse_slash_line(text: &str) -> Option<SlashLine> {
-    let text = text.trim();
-    let (name, rest) = match text.split_once(char::is_whitespace) {
-        Some((name, rest)) => (name, rest.trim()),
-        None => (text, ""),
-    };
-    match name {
-        "/plan" => Some(SlashLine::Plan(match rest {
-            "" => PlanRequest::On,
-            "off" => PlanRequest::Off,
-            task => PlanRequest::Task(task.to_string()),
-        })),
-        "/goal" => Some(SlashLine::Goal(parse_goal_request(rest))),
-        "/compact" => Some(SlashLine::Compact(rest.to_string())),
-        _ => None,
-    }
-}
-
-/// The `/goal` grammar: exact control words, `edit <objective>`, else an
-/// objective.
-fn parse_goal_request(rest: &str) -> GoalRequest {
-    if rest.is_empty() {
-        return GoalRequest::Show;
-    }
-    match rest.to_lowercase().as_str() {
-        "clear" => return GoalRequest::Clear,
-        "pause" => return GoalRequest::Pause,
-        "resume" => return GoalRequest::Resume,
-        "edit" => return GoalRequest::InvalidEdit,
-        _ => {}
-    }
-    if let Some(end) = rest.find(char::is_whitespace)
-        && rest[..end].eq_ignore_ascii_case("edit")
-    {
-        let objective = rest[end..].trim();
-        return if objective.is_empty() {
-            GoalRequest::InvalidEdit
-        } else {
-            GoalRequest::Edit(objective.to_string())
-        };
-    }
-    GoalRequest::Create(rest.to_string())
-}
-
 /// The fixed note a turn carries when the reader resumes stopped work.
 ///
 /// A stopped turn leaves the transcript, the tool results and the plan in
@@ -7266,28 +7052,6 @@ pub(crate) fn goal_round_input(objective: &str, round: u32, max_rounds: u32) -> 
     )
 }
 
-/// Everything one request carries in front of the reader's own line.
-///
-/// The reference does NOT inject goal state into an ordinary model request: a
-/// goal mutation is a UI and durable-log fact, and the only goal text a model
-/// sees is the round prompt plus any attachment message the command submitted.
-/// So this adds only the reference guidance (how to resolve an @token) and plan
-/// mode (what it may do), each when it applies; an ordinary turn's input stays
-/// exactly the reader's text.
-pub(crate) fn turn_text(text: &str, plan_mode: bool) -> String {
-    let mut out = String::new();
-    if crate::reference::has_references(text) {
-        out.push_str(crate::reference::FILE_REFERENCE_PROMPT);
-        out.push_str("\n\n");
-    }
-    if plan_mode {
-        out.push_str(PLAN_DIRECTIVE);
-        out.push_str("\n\n");
-    }
-    out.push_str(text);
-    out
-}
-
 pub(crate) fn turn_input(text: &str, attachments: &[Attachment]) -> react::llm::Content {
     if attachments.is_empty() {
         return react::llm::Content::Text(text.to_string());
@@ -7334,36 +7098,6 @@ pub(crate) const GOAL_ATTACHMENT_NOTE: &str = "Reference attachments for the goa
 /// turn sent: the text plus the data-URL blocks. An empty row contributes
 /// nothing. This is what makes the /goal attachment message readable by a later
 /// goal round instead of only visible in the transcript.
-pub(crate) fn message_content(message: &ChatMessage) -> Option<react::llm::Content> {
-    if message.images.is_empty() {
-        return (!message.text.is_empty()).then(|| react::llm::Content::Text(message.text.clone()));
-    }
-    let mut parts: Vec<react::llm::ContentPart> = Vec::new();
-    if !message.text.is_empty() {
-        parts.push(react::llm::ContentPart::Text {
-            text: message.text.clone(),
-        });
-    }
-    for url in &message.images {
-        let Some((mime, base64)) = parse_data_url(url) else {
-            continue;
-        };
-        if let react::llm::Content::Parts(mut block) =
-            react::llm::Content::binary(mime.to_string(), base64.to_string())
-        {
-            parts.append(&mut block);
-        }
-    }
-    (!parts.is_empty()).then_some(react::llm::Content::Parts(parts))
-}
-
-/// Split a data URL into its MIME type and base64 payload.
-pub(crate) fn parse_data_url(url: &str) -> Option<(&str, &str)> {
-    let rest = url.strip_prefix("data:")?;
-    let (mime, payload) = rest.split_once(";base64,")?;
-    (!mime.is_empty() && !payload.is_empty()).then_some((mime, payload))
-}
-
 /// The `(workspace id, root)` pairs the session store scatters sessions across.
 ///
 /// The store is rooted per workspace, so a session file lives beside the
@@ -7393,123 +7127,6 @@ mod tests {
         // The RFC 4648 vector for "f": the base64 every attachment assertion
         // below pins.
         super::Attachment::from_bytes("shot.png".to_string(), "image/png", b"f")
-    }
-
-    /// The /plan and /goal line grammar is the reference's command registry
-    /// grammar: exact control words only when they fill the argument, every
-    /// other suffix an objective, and `/plan off` the one non-objective word.
-    #[test]
-    fn the_slash_command_line_grammar_is_the_references() {
-        use super::{GoalRequest, PlanRequest, SlashLine, parse_slash_line};
-        assert_eq!(
-            parse_slash_line("/plan"),
-            Some(SlashLine::Plan(PlanRequest::On))
-        );
-        assert_eq!(
-            parse_slash_line("  /plan   "),
-            Some(SlashLine::Plan(PlanRequest::On))
-        );
-        assert_eq!(
-            parse_slash_line("/plan off"),
-            Some(SlashLine::Plan(PlanRequest::Off))
-        );
-        assert_eq!(
-            parse_slash_line("/plan build the thing"),
-            Some(SlashLine::Plan(PlanRequest::Task(
-                "build the thing".to_string()
-            )))
-        );
-        assert_eq!(parse_slash_line("/planner hi"), None);
-        assert_eq!(parse_slash_line("just a message"), None);
-        assert_eq!(parse_slash_line("mail a@b.com"), None);
-
-        assert_eq!(
-            parse_slash_line("/goal"),
-            Some(SlashLine::Goal(GoalRequest::Show))
-        );
-        assert_eq!(
-            parse_slash_line("/goal pause"),
-            Some(SlashLine::Goal(GoalRequest::Pause))
-        );
-        assert_eq!(
-            parse_slash_line("/goal PAUSE"),
-            Some(SlashLine::Goal(GoalRequest::Pause)),
-            "control words are case-insensitive"
-        );
-        assert_eq!(
-            parse_slash_line("/goal pause after verification"),
-            Some(SlashLine::Goal(GoalRequest::Create(
-                "pause after verification".to_string()
-            ))),
-            "a control word only acts when it fills the whole argument"
-        );
-        assert_eq!(
-            parse_slash_line("/goal edit a better objective"),
-            Some(SlashLine::Goal(GoalRequest::Edit(
-                "a better objective".to_string()
-            )))
-        );
-        assert_eq!(
-            parse_slash_line("/goal edit"),
-            Some(SlashLine::Goal(GoalRequest::InvalidEdit))
-        );
-        assert_eq!(
-            parse_slash_line("/goal clear"),
-            Some(SlashLine::Goal(GoalRequest::Clear))
-        );
-        assert_eq!(
-            parse_slash_line("/goal resume"),
-            Some(SlashLine::Goal(GoalRequest::Resume))
-        );
-        assert_eq!(
-            parse_slash_line("/goal CLEAR"),
-            Some(SlashLine::Goal(GoalRequest::Clear))
-        );
-        assert_eq!(
-            parse_slash_line("/goal ReSuMe"),
-            Some(SlashLine::Goal(GoalRequest::Resume))
-        );
-        assert_eq!(
-            parse_slash_line("/goal EdIt a better objective"),
-            Some(SlashLine::Goal(GoalRequest::Edit(
-                "a better objective".to_string()
-            )))
-        );
-        assert_eq!(
-            parse_slash_line("/goal edit\ta better objective"),
-            Some(SlashLine::Goal(GoalRequest::Edit(
-                "a better objective".to_string()
-            ))),
-            "edit is recognized before any Unicode whitespace"
-        );
-        assert_eq!(
-            parse_slash_line("/goal edit \u{00a0}"),
-            Some(SlashLine::Goal(GoalRequest::InvalidEdit)),
-            "an edit whose replacement trims to nothing is invalid"
-        );
-        assert_eq!(
-            parse_slash_line("/goal editx"),
-            Some(SlashLine::Goal(GoalRequest::Create("editx".to_string()))),
-            "edit must be a whole word"
-        );
-        assert_eq!(
-            parse_slash_line("/goal    "),
-            Some(SlashLine::Goal(GoalRequest::Show)),
-            "bare /goal with trailing whitespace shows"
-        );
-        assert_eq!(
-            parse_slash_line("/goal edit   "),
-            Some(SlashLine::Goal(GoalRequest::InvalidEdit))
-        );
-        assert_eq!(
-            parse_slash_line("/goal clear now"),
-            Some(SlashLine::Goal(GoalRequest::Create(
-                "clear now".to_string()
-            ))),
-            "a control word plus an argument is an objective"
-        );
-        assert_eq!(parse_slash_line("/goal/clear"), None);
-        assert_eq!(parse_slash_line("/goals clear"), None);
     }
 
     /// A scratch state with one active session, rooted under target.
@@ -9327,28 +8944,6 @@ mod tests {
         );
     }
 
-    /// The compact command takes no arguments; any suffix is the usage
-    /// refusal, and it is a command even when the slash card is closed.
-    #[test]
-    fn the_compact_grammar_is_argument_free() {
-        use super::{SlashLine, parse_slash_line};
-        assert_eq!(
-            parse_slash_line("/compact"),
-            Some(SlashLine::Compact(String::new()))
-        );
-        assert_eq!(
-            parse_slash_line("  /compact   "),
-            Some(SlashLine::Compact(String::new())),
-            "trailing whitespace trims to the bare command"
-        );
-        assert_eq!(
-            parse_slash_line("/compact last 5"),
-            Some(SlashLine::Compact("last 5".to_string())),
-            "the argument reaches the handler, which owns the refusal"
-        );
-        assert_eq!(parse_slash_line("/compactnow"), None);
-    }
-
     /// The command row's lifecycle, and its persistence, is the reference's
     /// command/done card: running, then the outcome text with its error state.
     #[test]
@@ -9548,7 +9143,8 @@ mod tests {
         assert_eq!(last.role, Role::User);
         assert_eq!(last.text, super::GOAL_ATTACHMENT_NOTE);
         assert_eq!(last.images, vec!["data:image/png;base64,Zg=="]);
-        let content = super::message_content(last).expect("multimodal content");
+        let content =
+            crate::runtime::transcript::message_content(last).expect("multimodal content");
         let react::llm::Content::Parts(parts) = content else {
             panic!("an attachment message must replay as parts");
         };
@@ -9593,7 +9189,7 @@ mod tests {
             .expect("the stored user row");
         assert_eq!(last.text, "look");
         assert_eq!(last.images, images);
-        let content = super::message_content(last).expect("multimodal replay");
+        let content = crate::runtime::transcript::message_content(last).expect("multimodal replay");
         let react::llm::Content::Parts(parts) = content else {
             panic!("an image row must replay as parts");
         };
@@ -9637,7 +9233,8 @@ mod tests {
             .expect("the landed steer row");
         assert_eq!(row.text, "look here");
         assert_eq!(row.images, vec!["data:image/png;base64,Zg=="]);
-        let content = super::message_content(row).expect("multimodal steer replay");
+        let content =
+            crate::runtime::transcript::message_content(row).expect("multimodal steer replay");
         assert!(matches!(
             content,
             react::llm::Content::Parts(parts)
@@ -9648,19 +9245,6 @@ mod tests {
                             if binary.url() == "data:image/png;base64,Zg=="
                     )
         ));
-    }
-
-    /// The occupancy share rounds like the reference's own `Math.round` and
-    /// caps at 100.
-    #[test]
-    fn the_context_share_rounds_like_the_reference() {
-        assert_eq!(super::context_share(454, 1_000), Some(45));
-        assert_eq!(super::context_share(455, 1_000), Some(46));
-        assert_eq!(super::context_share(999, 1_000), Some(100));
-        // A prompt past its budget still reads full, never 101%.
-        assert_eq!(super::context_share(50_000, 1_000), Some(100));
-        assert_eq!(super::context_share(0, 1_000), None);
-        assert_eq!(super::context_share(10, 0), None);
     }
 
     #[test]
@@ -9757,7 +9341,7 @@ mod tests {
             vec!["data:image/png;base64,Zg=="]
         );
     }
-    use super::{cache_hit_percent, exact_tokens, human_tokens, matches, stamp};
+    use super::{matches, stamp};
 
     #[test]
     fn an_empty_query_matches_every_title() {
@@ -10079,39 +9663,6 @@ mod tests {
             ceiling,
             "the ceiling is stable across settles"
         );
-    }
-
-    #[test]
-    fn token_counts_switch_units_at_a_thousand() {
-        assert_eq!(human_tokens(0), "0");
-        assert_eq!(human_tokens(947), "947");
-        assert_eq!(human_tokens(12_345), "12.3K");
-        assert_eq!(human_tokens(1_000), "1K");
-        assert_eq!(human_tokens(517_500), "518K", "a scaled 100+ rounds");
-        assert_eq!(human_tokens(69_200_000), "69.2M");
-    }
-
-    #[test]
-    fn exact_counts_group_in_threes() {
-        assert_eq!(exact_tokens(0), "0");
-        assert_eq!(exact_tokens(947), "947");
-        assert_eq!(exact_tokens(17_734), "17,734");
-        assert_eq!(exact_tokens(1_234_567), "1,234,567");
-    }
-
-    #[test]
-    fn the_cache_hit_never_rounds_a_partial_hit_to_full() {
-        assert_eq!(cache_hit_percent(67, 100).as_deref(), Some("67"));
-        assert_eq!(
-            cache_hit_percent(2, 3).as_deref(),
-            Some("67"),
-            "ties round up"
-        );
-        assert_eq!(cache_hit_percent(199, 200).as_deref(), Some("99.5"));
-        assert_eq!(cache_hit_percent(999, 1000).as_deref(), Some("99.9"));
-        assert_eq!(cache_hit_percent(200, 200).as_deref(), Some("100"));
-        assert_eq!(cache_hit_percent(0, 0), None);
-        assert_eq!(cache_hit_percent(0, 100).as_deref(), Some("0"));
     }
 
     #[test]

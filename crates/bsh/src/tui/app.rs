@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -29,11 +29,14 @@ use crate::runtime::contract::{
     ToolCallStatus, ToolCallView, TurnUsage, WorkspaceChangeView, WorkspaceDiffView,
     WorkspaceEntryView, WorkspaceReport,
 };
-use crate::runtime::ids::{ApprovalId, ExecutionId, SessionId};
+use crate::runtime::ids::{ApprovalId, CommandId, ExecutionId, SessionId};
 
+use super::board;
 use super::export;
 use super::menu;
+use super::nav;
 use super::picker;
+use super::prefs::{PaletteKey, Preferences, Theme};
 use super::shell::{self, Shell};
 use super::skin::{self, Footer, Painter, Skin, Tone};
 use super::term::{self, Key};
@@ -64,16 +67,24 @@ const COMMANDS: &str = "commands: /new [title] · /sessions [number|text] · \
                         /copy [number|id] · \
                         /rename <title> · /editor · \
                         /export [path] · /queue [clear] · /feedback [note|clear] · \
-                        /detail [number|close] · /mcp [server] · /skills [text] · \
+                        /detail [number|close] · /mcp [server] · /capabilities · /skills [text] · \
                         /memory [text] · /files [path] · /diff [path] · /extensions [text] · \
-                        /tasks [id|graph] · /settings [section] · /set [key] [value] · \
-                        /federation · /browser · /subagents [n|all] · /trajectory · /audit [filter] · \
+                        /tasks [id|graph|active|waiting|completed|failed|interrupted] · /settings [section] · /set [key] [value] · \
+                        /federation · /browser · /subagents [n|all] · /activity · /audit [filter] · \
+                        /reconnect · \
+                        /tui theme <auto|ansi|mono|truecolor> · /tui keymap palette <ctrl+p|ctrl+g|ctrl+o|ctrl+q|alt+g|alt+o|alt+q> · \
                         /find <text> · /review [change] · /questions · /trash [number] · \
                         /restore <number> · /purge <number> · /usage · /terminal · \
                         /approve · /deny [reason] — /help";
 
-/// Wide layouts get a session sidebar; narrow ones show only the transcript.
-const SIDEBAR_MIN_WIDTH: u16 = 64;
+/// Wide layouts get a session rail; narrow ones show only the transcript.
+///
+/// The concept's adaptive table puts the rail's floor at eighty cells: under
+/// that width the rail would leave the transcript too narrow to read, so a
+/// narrow frame navigates with the palette instead of a column.
+const SIDEBAR_MIN_WIDTH: usize = 80;
+/// At this width the header can carry the reference design's primary tabs.
+const PRIMARY_NAV_MIN_WIDTH: usize = 120;
 
 /// The rows above the body: the header line and the rule under it.
 ///
@@ -81,36 +92,80 @@ const SIDEBAR_MIN_WIDTH: u16 = 64;
 /// than counted at two call sites.
 const BODY_TOP: usize = 2;
 
+/// The rows a frame needs before its header can state the secondary facts.
+///
+/// The specification collapses nonessential status labels under twenty-four
+/// rows so the active content keeps the screen. The brand, the open session's
+/// title and the host's verdict are what a reader navigates by and stay at
+/// every height; the configuration, goal, usage and session-count chips are
+/// what a taller frame can afford to state beside them.
+const SHORT_FRAME_ROWS: usize = 24;
+
+/// How many of the header's secondary facts a frame `height` rows tall states.
+///
+/// Under [`SHORT_FRAME_ROWS`] the header keeps its brand, its title and the
+/// host's verdict and drops the chips: at that height a chip costs the
+/// transcript a row it cannot spare, and the same facts are a `/settings` or a
+/// `/status` away.
+fn header_fact_count(height: usize) -> usize {
+    if height < SHORT_FRAME_ROWS { 0 } else { 4 }
+}
+
+/// The primary tabs and the workspace destinations they open.
+const PRIMARY_TABS: [(&str, usize); 7] = [
+    ("Home", 0),
+    ("Conversations", 0),
+    ("Jobs", 1),
+    ("Agents", 2),
+    ("Tools", 3),
+    ("Capabilities", 4),
+    ("Audit", 6),
+];
+
 /// The session rail's width, when the frame is wide enough for two columns.
 ///
 /// The frame paints the rail with this width and the pointer hit-tests
 /// against it, so a click can never name a column the rail does not own.
 fn rail_width(width: usize) -> Option<usize> {
-    (width >= usize::from(SIDEBAR_MIN_WIDTH)).then(|| (width / 4).clamp(18, 30))
+    (width >= SIDEBAR_MIN_WIDTH).then(|| (width / 4).clamp(18, 30))
 }
 
-/// The rail row a click at `(row, column)` names, as an offset into the list
-/// window the frame painted, or `None` when the click missed the rail.
-///
-/// The separator between the columns belongs to neither: it is the rule the
-/// transcript starts against, so a click on it is not a session.
-fn rail_offset(row: usize, column: usize, width: usize, body_rows: usize) -> Option<usize> {
-    let rail = rail_width(width)?;
-    if column >= rail || row < BODY_TOP || row >= BODY_TOP + body_rows {
-        return None;
-    }
-    Some(row - BODY_TOP)
+/// The rail width for the reader's expanded or icon-only navigation mode.
+fn rail_width_for(width: usize, collapsed: bool) -> Option<usize> {
+    (width >= SIDEBAR_MIN_WIDTH).then(|| {
+        if collapsed {
+            6
+        } else {
+            (width / 4).clamp(18, 30)
+        }
+    })
 }
 
-/// The transcript column's width: the frame minus the rail and its separator.
+/// The transcript column's width: the frame minus the rail, its separator and
+/// the inspector column when the frame is wide enough to carry one.
 ///
 /// The painter and the pointer both measure the column here, so a click can
 /// never name a row the transcript does not paint.
 fn transcript_width(width: usize) -> usize {
-    match rail_width(width) {
-        Some(left) => width.saturating_sub(left + 1),
-        None => width,
+    let left = match rail_width(width) {
+        Some(left) => left + 1,
+        None => 0,
+    };
+    let right = match board::width(width) {
+        Some(right) => right + 1,
+        None => 0,
+    };
+    width.saturating_sub(left + right)
+}
+
+/// The transcript width after accounting for the current navigation mode.
+fn transcript_width_for(width: usize, collapsed: bool) -> usize {
+    if !collapsed {
+        return transcript_width(width);
     }
+    let left = rail_width_for(width, collapsed).map_or(0, |left| left + 1);
+    let right = board::width(width).map_or(0, |right| right + 1);
+    width.saturating_sub(left + right)
 }
 
 /// The transcript row a click at `(row, column)` names, as an offset into the
@@ -134,6 +189,99 @@ fn transcript_offset(row: usize, column: usize, width: usize, body_rows: usize) 
         return None;
     }
     Some(row - BODY_TOP)
+}
+
+/// The transcript offset using the rail width that was active when painted.
+fn transcript_offset_for(
+    row: usize,
+    column: usize,
+    width: usize,
+    body_rows: usize,
+    collapsed: bool,
+) -> Option<usize> {
+    if !collapsed {
+        return transcript_offset(row, column, width, body_rows);
+    }
+    if row < BODY_TOP || row >= BODY_TOP + body_rows {
+        return None;
+    }
+    let left = rail_width_for(width, collapsed).map_or(0, |rail| rail + 1);
+    let transcript_width = transcript_width_for(width, collapsed);
+    if column < left || column >= left + transcript_width {
+        return None;
+    }
+    Some(row - BODY_TOP)
+}
+
+/// The quick commands shown under an empty composer, with a compact send
+/// affordance in the same row.
+fn quick_actions(width: usize) -> String {
+    let actions = "/help   /agents   /tools   /jobs   /settings";
+    let suffix = "  [➤]";
+    let left = width.saturating_sub(cells(suffix));
+    let actions = truncate(actions, left);
+    format!("{}{}", pad(&actions, left), suffix)
+}
+
+/// The quick command the pointer selected, if it landed on a complete label.
+fn quick_command_at(column: usize) -> Option<&'static str> {
+    let actions = ["/help", "/agents", "/tools", "/jobs", "/settings"];
+    let mut start = 0;
+    for action in actions {
+        let end = start + action.len();
+        if (start..end).contains(&column) {
+            return Some(action);
+        }
+        start = end + 3;
+    }
+    None
+}
+
+/// The empty, rounded-corner composer frame shown around the editable rows.
+fn composer_border(width: usize, top: bool) -> String {
+    let horizontal = "─".repeat(width.saturating_sub(2));
+    if top {
+        format!("╭{horizontal}╮")
+    } else {
+        format!("╰{horizontal}╯")
+    }
+}
+
+/// A line inside the composer box, keeping the border and text within `width`.
+fn composer_box_runs(text: &str, width: usize, tone: Tone) -> Vec<(String, Tone)> {
+    let inner = width.saturating_sub(4);
+    let mut runs = vec![("│ ".to_string(), Tone::Accent)];
+    let used = if let Some(rest) = text.strip_prefix("› ") {
+        let marker = truncate("› ", inner);
+        let marker_width = cells(&marker);
+        runs.push((marker, Tone::Accent));
+        let content = truncate(rest, inner.saturating_sub(marker_width));
+        let used = marker_width + cells(&content);
+        runs.push((content, tone));
+        used
+    } else {
+        let content = truncate(text, inner);
+        let used = cells(&content);
+        runs.push((content, tone));
+        used
+    };
+    runs.push((" ".repeat(inner.saturating_sub(used)), tone));
+    runs.push((" │".to_string(), Tone::Accent));
+    runs
+}
+
+/// The quick command row inside the composer, with its send action highlighted.
+fn composer_quick_runs(width: usize) -> Vec<(String, Tone)> {
+    let inner = width.saturating_sub(4);
+    let quick = quick_actions(inner);
+    let button_start = quick.rfind("[➤]").unwrap_or(quick.len());
+    let (before, button) = quick.split_at(button_start);
+    vec![
+        ("│ ".to_string(), Tone::Accent),
+        (before.to_string(), Tone::Muted),
+        (button.to_string(), Tone::Button),
+        (" │".to_string(), Tone::Accent),
+    ]
 }
 
 /// One block of transcript rows, each naming the tool call it draws.
@@ -236,6 +384,17 @@ type ShellFrame = (Vec<Line<'static>>, Option<(usize, usize)>);
 /// How many composer rows a tall prompt may show before it scrolls.
 const MAX_COMPOSER_ROWS: usize = 6;
 
+/// What an empty composer says: the box's own invitation, in the muted ink a
+/// placeholder takes.
+const COMPOSER_HINT: &str = "Ask Bos to build, debug, or explain something";
+
+/// The row that marks a projection the Host is no longer answering for.
+///
+/// A dropped connection leaves the last projection on screen, and a still frame
+/// is indistinguishable from a quiet workspace unless the frame says so. This
+/// row says the rows are stale and names the two gestures that ask the Host
+/// again, and it is drawn above the status row rather than in it so the status
+/// row keeps the reason the Host went away.
 /// How many plan steps the block above the composer draws before it folds the
 /// rest into one counted row: the panel belongs above the prompt, so it may
 /// never take the transcript's rows for itself.
@@ -322,10 +481,21 @@ pub(crate) struct App {
     catalogue: CatalogueView,
     host: Option<HostStatus>,
     status: Option<(Level, String)>,
+    /// The Host's last refusal to answer, while the connection is gone.
+    ///
+    /// A dropped socket is not a reason to close the frame: what is on screen
+    /// is the last thing the Host said, and a reader who lost the connection
+    /// mid-turn still needs to read it. This field is what marks those rows
+    /// stale, and `/reconnect` - or `Alt-R` - is what clears it.
+    offline: Option<String>,
     /// How this terminal paints: the hues the reader's profile accepts,
     /// resolved once when the client attaches so every frame draws the same
     /// vocabulary.
     skin: Skin,
+    /// Client-local display preferences, persisted in the Host data directory.
+    preferences: Preferences,
+    /// Whether the wide-layout navigation rail is reduced to its icon strip.
+    sidebar_collapsed: bool,
     /// The size of the frame last painted.
     ///
     /// A click arrives in screen cells, and only the layout that painted those
@@ -389,10 +559,30 @@ pub(crate) struct App {
     /// Host on open and re-read while a child still runs, because a run
     /// finishes without any event this client subscribed to.
     subagents: Option<SubagentsPane>,
+    /// The conversation's delegation roster as the inspector column reads it.
+    ///
+    /// The concept's third column lists the agents behind the work, so the
+    /// rail carries the same roster the pane reads: cached here because a
+    /// column painted every frame cannot ask the Host every frame, and re-read
+    /// on the pane's cadence because a child finishes without an event this
+    /// client subscribed to.
+    agents: Option<SubagentReport>,
+    /// Paints since the rail's roster was last read, on the same slow cadence
+    /// as the pane's own poll.
+    agents_ticks: u32,
+    /// The latest workspace-wide durable task board, read for the dashboard
+    /// summary without querying the Host on every frame.
+    dashboard_tasks: Option<TaskBoardReport>,
+    /// Frames since the dashboard task summary was refreshed.
+    dashboard_ticks: u32,
     /// The open session's trajectory, when the reader asked for it: every turn
     /// the Host ran with the messages and calls it produced. Derived from the
     /// projection, so opening it sends no request.
     trajectory: Option<TrajectoryPane>,
+    /// The workspace's capabilities, when the reader asked for them: the
+    /// approval mode in force and the servers that carry the tools a model can
+    /// call. Read from the catalogue this client already fetched.
+    capabilities: Option<CapabilitiesPane>,
     /// The client's own shell, when the reader opened the terminal pane. A
     /// terminal has no Ghostty surface to draw into, so this pane owns the pty
     /// and paints its grid into the frame; `None` is the ordinary view.
@@ -440,6 +630,15 @@ pub(crate) struct App {
     /// a row no click can name, rather than a row that silently commits the
     /// candidate under it.
     menu_slots: RefCell<Option<(usize, Vec<Option<usize>>)>>,
+    /// What each row of the navigation rail's column stands for, as the last
+    /// frame painted it.
+    ///
+    /// The rail is a document of its own: a click arrives in screen cells and
+    /// only the layout that painted the column knows which destination or
+    /// which session stood on the row under the pointer. A row carrying no
+    /// name - a heading, the column's own air - is a row a click learns
+    /// nothing from.
+    rail_slots: RefCell<Vec<Option<nav::Hit>>>,
     /// The document row the body's first painted row stands for, while the
     /// body is the timeline.
     ///
@@ -480,10 +679,25 @@ pub(crate) struct App {
     /// the only record of which screen row carried which choice - and a click
     /// names a screen row.
     approval_paint: Cell<Option<ApprovalPaint>>,
+    /// The composer rows the last frame drew, used to route its quick actions
+    /// and send control to the same commands the keyboard uses.
+    composer_paint: Cell<Option<ComposerPaint>>,
     /// Whether this client is mid-dispatch of one queued line; a second
     /// dispatch from a nested refresh would race that line.
     flushing: bool,
+    /// A turn whose Host acknowledgement was lost; retried with its original key.
+    uncertain_send: Option<(SessionId, String, CommandId)>,
+    /// A cancellation awaiting explicit confirmation; Ctrl-C never cancels a
+    /// Host job on its own.
+    cancel_pending: Option<(SessionId, ExecutionId)>,
     quit: bool,
+}
+
+/// Screen rows belonging to the visible composer controls.
+#[derive(Clone, Copy)]
+struct ComposerPaint {
+    quick_row: Option<usize>,
+    width: usize,
 }
 
 /// Where the approval card stood in one painted frame.
@@ -771,6 +985,85 @@ struct SettingsPane {
 /// The read is a Host query on open: a turn's task tools write those records
 /// while the client is attached, so a cached board would show the work from
 /// before the turn that changed it.
+/// Which tasks the board shows.
+///
+/// The specification's Jobs view is a list with its own filters, and this is
+/// that list's foot: the rows are the Host's, so a filter is a window over a
+/// snapshot this client already holds rather than a second query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TaskFilter {
+    /// Everything the board holds, section by section.
+    #[default]
+    All,
+    /// Work that is not finished yet: the Host's running, queued and scheduled
+    /// sections, which is exactly what its history section is not.
+    Active,
+    /// Work parked on something - an approval, a dependency, a peer.
+    Waiting,
+    /// Work that finished.
+    Completed,
+    /// Work that stopped on an error.
+    Failed,
+    /// Work that was stopped from outside.
+    Interrupted,
+}
+
+impl TaskFilter {
+    /// Every filter, in the order the specification lists them.
+    const ALL: [Self; 6] = [
+        Self::All,
+        Self::Active,
+        Self::Waiting,
+        Self::Completed,
+        Self::Failed,
+        Self::Interrupted,
+    ];
+
+    /// The word the title and the empty state use.
+    fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Waiting => "waiting",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    /// The filter a `/tasks` word names, when it names one at all.
+    ///
+    /// A filter word is a fixed spelling the specification lists, so a word
+    /// this build does not know stays what it was before: an argument to look
+    /// up as a task id.
+    fn from_word(word: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|filter| filter.name().eq_ignore_ascii_case(word.trim()))
+    }
+
+    /// Whether a row of `section` belongs in this view.
+    ///
+    /// The state words are the record's own snake_case lifecycle spellings, so
+    /// a status this build has no rule for shows under `all` and nothing else:
+    /// guessing that an unknown word means "active" would put a finished task
+    /// under a heading that claims it is running.
+    fn keeps(self, section: &str, status: &str) -> bool {
+        let status = status.trim().to_ascii_lowercase();
+        let one_of = |words: &[&str]| words.contains(&status.as_str());
+        match self {
+            Self::All => true,
+            // The board's own sections are the Host's answer to "is it
+            // finished": history holds what ran and ended, the rest does not.
+            Self::Active => !section.eq_ignore_ascii_case("history"),
+            Self::Waiting => one_of(&["waiting", "blocked", "paused", "needs_approval"]),
+            Self::Completed => one_of(&["completed", "succeeded", "success", "done"]),
+            Self::Failed => one_of(&["failed", "error", "errored"]),
+            Self::Interrupted => one_of(&["interrupted", "cancelled", "canceled", "stopped"]),
+        }
+    }
+}
+
 struct TasksPane {
     /// The report the Host answered with: the four sections and their rows.
     report: TaskBoardReport,
@@ -780,6 +1073,8 @@ struct TasksPane {
     /// parents they name, with each row's dependencies spelled out, instead of
     /// the four board sections.
     graph: bool,
+    /// Which of the board's rows this frame shows.
+    filter: TaskFilter,
     /// Rows scrolled down from the pane's first body row.
     scroll: usize,
 }
@@ -855,6 +1150,23 @@ struct TrajectoryPane {
     back: usize,
 }
 
+/// The workspace's capabilities: what this Host can do on the reader's behalf,
+/// and whose declaration says so.
+///
+/// The concept lists Capabilities as a workspace destination, and the desktop
+/// answers it with the tools a turn may call and the scope each runs under. A
+/// terminal answers from the catalogue it already asked for: the approval mode
+/// the open session runs under, and the servers that carry the tools - each
+/// with the exact tools it offers and whether it is connected. The pane lists;
+/// it never authorises. A capability a pane shows is a fact about this build,
+/// not a grant, and the gates that decide are the Host's.
+struct CapabilitiesPane {
+    /// Rows scrolled down from the pane's first body row.
+    scroll: usize,
+    /// Host-reported extension contributions, when available.
+    extensions: Option<ExtensionsReport>,
+}
+
 /// The terminal's Audit pane: what this conversation actually did.
 ///
 /// The desktop's AUDIT page is derived, not stored: it is counted from the
@@ -877,6 +1189,7 @@ impl App {
         workspace: Option<PathBuf>,
     ) -> Result<Self, ClientError> {
         let (client, frames) = RuntimeClient::connect(data_dir, tui_info())?;
+        let preferences = Preferences::load(data_dir);
         let mut app = Self {
             client,
             data_dir: data_dir.to_path_buf(),
@@ -889,7 +1202,10 @@ impl App {
             catalogue: CatalogueView::default(),
             host: None,
             status: None,
-            skin: Skin::detect(),
+            offline: None,
+            skin: Skin::with_preference(preferences.theme),
+            preferences,
+            sidebar_collapsed: false,
             frame: Cell::new((0, 0)),
             input: String::new(),
             history: PromptHistory::default(),
@@ -907,7 +1223,12 @@ impl App {
             federation: None,
             browser: None,
             subagents: None,
+            agents: None,
+            agents_ticks: 0,
+            dashboard_tasks: None,
+            dashboard_ticks: 0,
             trajectory: None,
+            capabilities: None,
             shell: None,
             edit_request: None,
             settings: None,
@@ -919,6 +1240,7 @@ impl App {
             picker: None,
             picker_at: Cell::new(None),
             menu_slots: RefCell::new(None),
+            rail_slots: RefCell::new(Vec::new()),
             body_start: Cell::new(None),
             focus: None,
             document: RefCell::new(Vec::new()),
@@ -927,28 +1249,13 @@ impl App {
             question_dismissed: None,
             approval_choice: None,
             approval_paint: Cell::new(None),
+            composer_paint: Cell::new(None),
             flushing: false,
+            uncertain_send: None,
+            cancel_pending: None,
             quit: false,
         };
-        // Snapshot first, subscribe second: the head in the snapshot is the
-        // position the subscription resumes from, so no committed event can
-        // fall between the two calls.
-        let QueryResult::Snapshot { snapshot } = app.client.query(None, QueryPayload::Snapshot)?
-        else {
-            return Err(ClientError::Contract(
-                "Host answered a snapshot query with another projection".to_string(),
-            ));
-        };
-        app.applied = snapshot.head;
-        app.catalogue = app.client.catalogue()?;
-        // The Host names the folder it serves. In the common case that is the
-        // directory this terminal was launched in; when the client attached to
-        // a Host another process started, the Host's answer is the one that
-        // decides where turns run, so `@`, the shell and every workspace read
-        // follow it instead of pointing at a tree no turn can reach.
-        app.workspace = host_workspace(&app.catalogue.workspace_root, app.workspace.take());
-        app.refresh()?;
-        app.subscribe()?;
+        app.attach()?;
         if let Some(session_id) = open {
             let Some(index) = app
                 .sessions
@@ -964,9 +1271,98 @@ impl App {
         Ok(app)
     }
 
+    /// Adopt everything a client takes from a Host when it attaches.
+    ///
+    /// Snapshot first, subscribe second: the head in the snapshot is the
+    /// position the subscription resumes from, so no committed event can fall
+    /// between the two calls. Reconnecting runs exactly this sequence, which is
+    /// why it lives in one place rather than being spelled twice.
+    fn attach(&mut self) -> Result<(), ClientError> {
+        let QueryResult::Snapshot { snapshot } = self.client.query(None, QueryPayload::Snapshot)?
+        else {
+            return Err(ClientError::Contract(
+                "Host answered a snapshot query with another projection".to_string(),
+            ));
+        };
+        self.applied = snapshot.head;
+        self.catalogue = self.client.catalogue()?;
+        // The Host names the folder it serves. In the common case that is the
+        // directory this terminal was launched in; when the client attached to
+        // a Host another process started, the Host's answer is the one that
+        // decides where turns run, so `@`, the shell and every workspace read
+        // follow it instead of pointing at a tree no turn can reach. A
+        // reconnect keeps the tree it already follows: the answer can only
+        // replace a workspace this client never had.
+        self.workspace = host_workspace(&self.catalogue.workspace_root, self.workspace.take());
+        self.refresh()?;
+        self.poll_dashboard_tasks();
+        self.poll_agents();
+        self.subscribe()
+    }
+
+    /// Ask the Host again: the gesture a dropped connection leaves the reader.
+    ///
+    /// A new connection replaces the dead one and the projection is adopted
+    /// afresh, so a client that missed events while the socket was down comes
+    /// back on the Host's head rather than on its own guess. Nothing on screen
+    /// is cleared first: a failed attempt leaves the stale projection readable
+    /// and the offline row explaining why.
+    fn reconnect(&mut self) {
+        let (client, frames) = match RuntimeClient::connect(&self.data_dir, tui_info()) {
+            Ok(attached) => attached,
+            Err(error) => return self.set_status(Level::Error, error.to_string()),
+        };
+        self.client = client;
+        self.frames = frames;
+        self.subscription = None;
+        self.offline = None;
+        match self.attach() {
+            Ok(()) => {
+                self.set_status(Level::Info, "reconnected: this projection is live again");
+                self.retry_uncertain_send();
+            }
+            Err(error) => self.client_error(error),
+        }
+    }
+
+    /// Retry one uncertain turn after reconnect, reusing its durable key.
+    fn retry_uncertain_send(&mut self) {
+        let Some((session_id, text, command_id)) = self.uncertain_send.take() else {
+            return;
+        };
+        match self
+            .client
+            .send_message_with_id(session_id, text.clone(), command_id)
+        {
+            Ok(_) => {
+                if self.current_session() == Some(session_id) && self.input == text {
+                    self.input.clear();
+                    self.cursor = 0;
+                    self.sync_menu();
+                }
+                self.set_status(
+                    Level::Info,
+                    "Host confirmed the original turn; its idempotency key was reused",
+                );
+                self.refresh_all();
+                self.flush_queue();
+            }
+            Err(error @ ClientError::OutcomeUnknown { .. }) => {
+                self.uncertain_send = Some((session_id, text, command_id));
+                self.client_error(error);
+            }
+            Err(error) => self.client_error(error),
+        }
+    }
+
     /// Whether the user asked to leave the interface.
     pub(crate) fn is_quitting(&self) -> bool {
         self.quit
+    }
+
+    /// The canvas background the renderer fills behind the frame's rows.
+    pub(crate) fn page_style(&self) -> Style {
+        self.skin.page_style()
     }
 
     /// The prompt waiting for the reader's editor, when a command asked for
@@ -1123,6 +1519,18 @@ impl App {
         {
             self.poll_subagents();
         }
+        // The rail's Agents block follows the same roster on the same cadence:
+        // the concept's third column names the agents behind the work, and a
+        // reader watching the workspace sees a child appear and finish there
+        // without opening a pane for it.
+        self.agents_ticks = self.agents_ticks.wrapping_add(1);
+        if self.agents_ticks.is_multiple_of(SUBAGENT_POLL_EVERY) {
+            self.poll_agents();
+        }
+        self.dashboard_ticks = self.dashboard_ticks.wrapping_add(1);
+        if self.dashboard_ticks.is_multiple_of(SUBAGENT_POLL_EVERY) {
+            self.poll_dashboard_tasks();
+        }
         Ok(())
     }
 
@@ -1147,7 +1555,7 @@ impl App {
         // A choice list is modal: while it is up it owns every printable key as
         // filter text and the arrows as its highlight, because a reader
         // narrowing a list of models is not typing a turn. The chords it does
-        // not claim - Ctrl-C to stop the running turn, Ctrl-D to quit - fall
+        // not claim - Ctrl-D to quit - fall
         // through, so a turn that needs stopping is never held hostage by a
         // list.
         if self.picker_key(&key) {
@@ -1521,6 +1929,35 @@ impl App {
                 _ => {}
             }
         }
+        // The capabilities pane owns the scrolling keys while it is open, the
+        // way the audit beside it does: a roster of servers and their tools is
+        // taller than the body, so Escape returns to the transcript and the
+        // page keys walk the list.
+        if self.capabilities.is_some() {
+            match &key {
+                Key::Escape => {
+                    self.close_capabilities();
+                    return;
+                }
+                Key::Up | Key::ScrollUp => {
+                    self.scroll_capabilities(-(SCROLL as isize));
+                    return;
+                }
+                Key::Down | Key::ScrollDown => {
+                    self.scroll_capabilities(SCROLL as isize);
+                    return;
+                }
+                Key::PageUp => {
+                    self.scroll_capabilities(-(PAGE as isize));
+                    return;
+                }
+                Key::PageDown => {
+                    self.scroll_capabilities(PAGE as isize);
+                    return;
+                }
+                _ => {}
+            }
+        }
         // An open detail pane owns the scrolling keys: the reader is inside a
         // tool call, so Up and Down walk its rows rather than the prompt
         // history, and Escape closes the pane instead of discarding the draft
@@ -1593,7 +2030,18 @@ impl App {
         if self.question_key(&key) {
             return;
         }
+        if self.preferences.palette.matches(&key) {
+            self.open_picker(picker::Kind::Command);
+            return;
+        }
         match &key {
+            // `?` on an empty prompt asks what the reader can press. The answer
+            // is the status row, the same place `/help` puts the commands: a
+            // terminal has no popup to spare for a reference the reader reads
+            // once and then types over.
+            Key::Char('?') if self.input.is_empty() => {
+                self.set_status(Level::Info, self.keymap_text());
+            }
             Key::Char(character) => {
                 self.input.insert(self.cursor, *character);
                 self.cursor += character.len_utf8();
@@ -1615,9 +2063,10 @@ impl App {
                 self.sync_menu();
             }
             Key::Escape => {
-                self.input.clear();
-                self.cursor = 0;
+                // Escape closes completion first, then exits transient mode;
+                // it never discards the composer draft.
                 self.menu.close();
+                self.cancel_pending = None;
             }
             Key::Left => {
                 if let Some((index, _)) = self.input[..self.cursor].char_indices().next_back() {
@@ -1682,9 +2131,15 @@ impl App {
             Key::PageDown => self.scroll_transcript(-(PAGE as isize)),
             Key::Tab => self.toggle_plan(),
             Key::Ctrl('n') => self.cycle(1),
-            Key::Ctrl('p') => self.cycle(-1),
+            // The palette is the spec's own chord, and it is what a narrow
+            // frame navigates with: under two columns there is no rail to walk,
+            // so every destination has to be reachable by name. Walking back a
+            // session stays beside it on `^B`, which pairs with `^N`.
+            Key::Ctrl('b') => self.cycle(-1),
             Key::Ctrl('t') => self.create_session(None),
-            Key::Ctrl('c') => self.cancel_execution(),
+            // Ctrl-C is never overloaded to cancel a Host job; cancellation is
+            // an explicit `/cancel` command with contextual confirmation.
+            Key::Ctrl('c') => {}
             Key::Ctrl('y') => self.decide_approval(true, None),
             Key::Ctrl('r') => self.decide_approval(false, None),
             Key::Ctrl('d') => self.quit = true,
@@ -1704,6 +2159,12 @@ impl App {
             // those cells back to a session.
             Key::Click { row, column } => self.click(*row, *column),
             Key::Ctrl(_) => {}
+            // The rail's own chords: `Alt` plus the letter each destination
+            // prints. A chord no destination claims falls through as nothing,
+            // which is what the terminal did with it before the rail existed.
+            Key::Alt('v') => self.toggle_sidebar(),
+            Key::Alt('r') => self.reconnect(),
+            Key::Alt(character) => self.open_destination(*character),
         }
     }
 
@@ -1726,7 +2187,7 @@ impl App {
         // The composer is measured before the body: a multi-line prompt takes
         // rows from the transcript instead of pushing the frame past the
         // terminal and scrolling the header away.
-        let (input_rows, cursor) = self.input_block(width);
+        let (input_rows, cursor) = self.input_block(width.saturating_sub(4));
         let (menu_rows, menu_slots) = self.menu_lines(width);
         // The choice list is measured with the popup: it sits where a list
         // attached to the composer sits, so its rows come out of the body's.
@@ -1745,52 +2206,72 @@ impl App {
 
         let mut chrome = Painter::new(self.skin);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
-        // The frame's name is the heading; everything after it in the same row
-        // is the state the frame was painted from, so it recedes.
-        let header = truncate(&self.header(), width);
-        lines.push(chrome.marker(&header, "bsh tui ", Tone::Heading, Tone::Muted));
+        // The first row is the concept's header bar: the brand mark and the
+        // facts this frame was painted from on the left, the host's own verdict
+        // held against the right edge, which is where the mock puts it.
+        let verdict = self.host_verdict();
+        lines.push(chrome.runs(&header_bar(&self.header_runs(), &verdict, width)));
         lines.push(chrome.tone(&rule(width), Tone::Muted));
 
-        let sidebar = rail_width(width);
-        let right_width = transcript_width(width);
-        let left_lines = self.session_lines(sidebar.unwrap_or(width), body_rows);
-        let (right_lines, _) = self.transcript(right_width, body_rows);
+        let sidebar = rail_width_for(width, self.sidebar_collapsed);
+        let right_width = transcript_width_for(width, self.sidebar_collapsed);
+        // The inspector column, when the frame has room for it: the concept's
+        // third column, painted from state this client already holds.
+        let inspector = match sidebar {
+            Some(_) => board::width(width),
+            None => None,
+        };
+        let inspector_lines = inspector.map(|w| board::lines(&self.board(), w, body_rows));
+        // The rail spends its first row on its own name, so the list under it
+        // gets the rest of the column.
+        let rail = sidebar.map(|left_width| nav::lines(&self.nav(), left_width, body_rows));
+        // The transcript keeps the column's last cell as a gutter: a line that
+        // ran up against the column's rule would read as if the rule were the
+        // line's own last character.
+        let text_width = right_width.saturating_sub(1);
+        let (mut right_lines, _) = self.transcript(text_width, body_rows.saturating_sub(1));
+        right_lines.insert(0, self.conversation_tab(text_width));
+        right_lines.resize(body_rows, String::new());
+        right_lines.truncate(body_rows);
         // Each column is its own document, so each gets its own painter: the
         // tone a transcript row hands to its wrapped continuation must not leak
         // into the session list beside it.
         let mut left = Painter::new(self.skin);
         let mut right = Painter::new(self.skin);
-        let top = self.session_top(body_rows);
+        let mut far = Painter::new(self.skin);
+        // The rail's own rows are painted from their runs: the column decided
+        // what each row is - a destination, a heading, the workspace's verdict
+        // - where it wrote it, so the frame does not classify them again.
+        *self.rail_slots.borrow_mut() = rail
+            .as_ref()
+            .map(|(_, hits)| hits.clone())
+            .unwrap_or_default();
         // The row a `/find` revealed is painted as a bar while it is still on
         // screen: a jump whose landing the reader cannot see is not a reveal.
         let focus_row = self
             .focus
             .zip(self.body_start.get())
-            .and_then(|(focus, start)| focus.checked_sub(start))
+            .and_then(|(focus, start)| focus.checked_sub(start).map(|row| row + 1))
             .filter(|row| *row < body_rows);
         for row in 0..body_rows {
             // Only the transcript column takes the bar: the rail beside it still
             // means "the open session".
             let right_row = match focus_row {
                 Some(focus) if focus == row => {
-                    right.tone(&pad(&right_lines[row], right_width), Tone::Select)
+                    right.tone(&pad(&right_lines[row], text_width), Tone::Select)
                 }
+                _ if row == 0 => right.tone(&pad(&right_lines[row], text_width), Tone::Select),
                 _ => right.row(&right_lines[row]),
             };
-            let line = match sidebar {
-                Some(left_width) => {
-                    // The list's pointer is the one marker the frame does not
-                    // classify on its own: it means "the open session" on one
-                    // screen and "the highlighted row" on another.
-                    let text = pad(&left_lines[row], left_width);
-                    // A row past the end of the list names no session, so it
-                    // cannot be the selection either: a reversed blank bar
-                    // would read as a session that is not there.
-                    let named = top + row < self.sessions.len();
-                    let column = if named && top + row == self.selected {
-                        left.marker(&text, "› ", Tone::Select, Tone::Select)
-                    } else {
-                        left.tone(&text, Tone::Body)
+            let mut line = match sidebar {
+                Some(_) => {
+                    // The column paints exactly `body_rows` rows, so a row it
+                    // did not name is still one of its own - and a row it did
+                    // name carries the name a click acts on.
+                    let painted = rail.as_ref().and_then(|(rows, _)| rows.get(row));
+                    let column = match painted {
+                        Some(runs) => left.runs(runs),
+                        None => left.blank(),
                     };
                     let mut spans = column.spans;
                     spans.push(Span::styled("│", self.skin.style(Tone::Muted)));
@@ -1799,6 +2280,40 @@ impl App {
                 }
                 None => right_row,
             };
+            // The middle column is filled to its own width before the inspector
+            // is placed: the fill is the gutter the transcript leaves empty,
+            // and a column is a fixed place.
+            let used: usize = line.spans.iter().map(|span| cells(&span.content)).sum();
+            let column_width = right_width + sidebar.map_or(0, |left| left + 1);
+            if used < column_width {
+                line.spans.push(Span::raw(" ".repeat(column_width - used)));
+            }
+            // The inspector is the frame's right edge, so the conversation is
+            // padded to its own width first: a row that stopped short would
+            // move the column beside it, and a column is a fixed place.
+            if let (Some(_), Some(board_rows)) = (inspector, inspector_lines.as_ref()) {
+                line.spans
+                    .push(Span::styled("│", self.skin.style(Tone::Muted)));
+                let mut painted = far.runs(&board_rows[row]).spans;
+                line.spans.append(&mut painted);
+                // The column is the frame's last, but a row shorter than it
+                // would leave the frame ragged, so it is filled to its width.
+                let used: usize = line.spans.iter().map(|span| cells(&span.content)).sum();
+                if used < width {
+                    line.spans.push(Span::raw(" ".repeat(width - used)));
+                }
+            }
+            // A row wider than the frame would wrap in the terminal and shift
+            // every row under it, so the frame's own invariant is checked where
+            // the rows are assembled.
+            debug_assert!(
+                line.spans
+                    .iter()
+                    .map(|span| cells(&span.content))
+                    .sum::<usize>()
+                    <= width,
+                "a frame row is wider than the {width}-cell frame"
+            );
             lines.push(line);
         }
         // Both column builders always return `body_rows` entries, so the frame
@@ -1858,22 +2373,41 @@ impl App {
         *self.menu_slots.borrow_mut() =
             (!menu_rows.is_empty()).then_some((lines.len(), menu_slots));
         lines.extend(menu_rows);
+        lines.push(chrome.tone(&composer_border(width, true), Tone::ComposerBorder));
         let input_row = lines.len();
         for row in &input_rows {
             // The prompt's first row is introduced by the composer's marker; a
             // wrapped or scrolled row is prose and nothing else.
-            if row.starts_with("› ") {
-                lines.push(chrome.marker(row, "› ", Tone::Accent, Tone::Body));
+            if row.starts_with("› ") && self.input.is_empty() {
+                // An empty composer offers the mock's own invitation: someone
+                // who has just opened a session is told what the box is for.
+                let text = composer_hint(width.saturating_sub(4))
+                    .into_iter()
+                    .map(|(text, _)| text)
+                    .collect::<String>();
+                lines.push(chrome.runs(&composer_box_runs(&text, width, Tone::Muted)));
             } else {
-                lines.push(chrome.tone(row, Tone::Body));
+                lines.push(chrome.runs(&composer_box_runs(row, width, Tone::Body)));
             }
         }
-        // The footer spends its one row on the keys this state needs: a reader
-        // mid-approval is not told about the shell, and a reader scrolled into
-        // a pane is told how to leave it.
-        let footer = skin::footer_text(self.footer(), width);
-        lines.push(chrome.tone(&footer, Tone::Muted));
-        let column = cursor.1.min(width.saturating_sub(1));
+        let quick_row = if self.input.is_empty() {
+            let row = lines.len();
+            lines.push(chrome.runs(&composer_quick_runs(width)));
+            Some(row)
+        } else {
+            None
+        };
+        lines.push(chrome.tone(&composer_border(width, false), Tone::ComposerBorder));
+        self.composer_paint
+            .set(Some(ComposerPaint { quick_row, width }));
+        // The last row is the concept's status bar: what the frame is set to at
+        // the left edge, the keys this state needs at the right. A row too
+        // narrow for both keeps the keys, which are the half that changes what
+        // the reader can do next.
+        let keys = skin::footer_text(self.footer(), width);
+        let mode = self.layout_chip();
+        lines.push(chrome.runs(&status_bar(&mode, &keys, width)));
+        let column = cursor.1.saturating_add(2).min(width.saturating_sub(1));
         (lines, Some((input_row + cursor.0, column)))
     }
 
@@ -2214,8 +2748,7 @@ impl App {
     ///
     /// Returns whether the list consumed the key. Up and Down walk the rows, a
     /// page key walks a page, Enter commits and Escape puts it away without
-    /// sending anything; every other chord reaches the client, which is what
-    /// keeps Ctrl-C working while a list is up.
+    /// sending anything; every other chord reaches the client.
     fn picker_key(&mut self, key: &Key) -> bool {
         if self.picker.is_none() {
             return false;
@@ -2263,17 +2796,44 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn header(&self) -> String {
-        let phase = self
-            .host
-            .as_ref()
-            .map(|status| format!("{:?}", status.phase).to_lowercase())
-            .unwrap_or_else(|| "unknown".to_string());
-        let activity = self
-            .host
-            .as_ref()
-            .map(|status| format!("{:?}", status.activity).to_lowercase())
-            .unwrap_or_default();
+    /// The header bar's left half: the brand mark, the client's name, then the
+    /// facts this frame was painted from.
+    ///
+    /// The concept's header is one bar - its mark, its name, its destinations -
+    /// with the connection state at the right edge. A terminal has one row for
+    /// all of it, so the facts the desktop draws in chips above the transcript
+    /// take the destinations' place, and the open session is painted in the ink
+    /// the mock paints the destination the reader is on.
+    fn header_runs(&self) -> Vec<(String, Tone)> {
+        let frame_width = self.frame.get().0;
+        if frame_width >= PRIMARY_NAV_MIN_WIDTH {
+            let active = match self.destination() {
+                Some(nav::Hit::Workspace(index)) => Some(index),
+                Some(nav::Hit::Panel(_)) => None,
+                Some(nav::Hit::Toggle) => None,
+                None => None,
+            };
+            let mut runs: Vec<(String, Tone)> = vec![
+                ("⬡ BSH".to_string(), Tone::Chip),
+                ("  │  ".to_string(), Tone::Muted),
+            ];
+            for (tab, destination) in PRIMARY_TABS {
+                let selected = if tab == "Home" {
+                    active == Some(0) || active.is_none()
+                } else if tab == "Conversations" {
+                    false
+                } else {
+                    active == Some(destination)
+                };
+                let tone = if selected {
+                    Tone::TabActive
+                } else {
+                    Tone::Body
+                };
+                runs.push((format!(" {tab} "), tone));
+            }
+            return runs;
+        }
         let title = match &self.session {
             Some(session) => session.title.clone(),
             None => "no session".to_string(),
@@ -2305,10 +2865,363 @@ impl App {
             .and_then(session_usage)
             .map(|usage| usage_chip(&usage))
             .unwrap_or_else(|| "no usage".to_string());
+        let mut runs: Vec<(String, Tone)> = vec![
+            // The concept's compact brand mark; the redundant product subtitle
+            // is omitted to leave room for session facts.
+            ("⬡ BSH".to_string(), Tone::Chip),
+            ("   ".to_string(), Tone::Body),
+            (title, Tone::Accent),
+        ];
+        let facts = [
+            config,
+            goal,
+            usage,
+            format!("{} session(s)", self.sessions.len()),
+        ];
+        let kept = header_fact_count(self.frame.get().1);
+        for fact in facts.into_iter().take(kept) {
+            runs.push((" · ".to_string(), Tone::Muted));
+            runs.push((fact, Tone::Muted));
+        }
+        runs
+    }
+
+    /// The conversation tab row that sits above its timeline.
+    ///
+    /// The session title and its resolved model belong to this tab, where the
+    /// design places the open conversation, rather than being squeezed into the
+    /// global navigation bar.
+    fn conversation_tab(&self, width: usize) -> String {
+        let title = self
+            .session
+            .as_ref()
+            .map(|session| session.title.as_str())
+            .unwrap_or("New conversation");
+        let model = self
+            .session
+            .as_ref()
+            .and_then(|session| session.config.model.as_deref())
+            .unwrap_or_default();
+        let mut left = format!("▣ Conversation  ·  {title}");
+        if !model.is_empty() {
+            left.push_str(&format!("  ·  {model}"));
+        }
+        let right = "◷";
+        let left = truncate(&left, width.saturating_sub(cells(right) + 1));
         format!(
-            "bsh tui · {title} · {config} · {goal} · {usage} · host {phase}/{activity} · {} session(s)",
-            self.sessions.len()
+            "{left}{}{}",
+            " ".repeat(width.saturating_sub(cells(&left) + cells(right))),
+            right
         )
+    }
+
+    /// The host's verdict, in the concept's own words and hue.
+    ///
+    /// The mock paints a green dot and "Host Connected" at its header's right
+    /// edge; the terminal says the same thing in the same place - amber while
+    /// the host is still coming up, red once it has failed - and names the
+    /// activity only when there is one, so an idle host stays one word.
+    fn host_verdict(&self) -> (String, Tone) {
+        if self.offline.is_some() {
+            return (
+                "● Offline · stale · Alt+R reconnect  Ⓤ".to_string(),
+                Tone::Error,
+            );
+        }
+        let Some(status) = self.host.as_ref() else {
+            return ("● Host Unknown  Ⓤ".to_string(), Tone::Error);
+        };
+        let phase = format!("{:?}", status.phase).to_lowercase();
+        let (word, tone) = match phase.as_str() {
+            "ready" => ("Host Connected", Tone::Ok),
+            "failed" => ("Host Failed", Tone::Error),
+            "stopped" => ("Host Stopped", Tone::Warn),
+            "draining" => ("Host Draining", Tone::Warn),
+            // Initializing and recovering both mean "not open for work yet", and
+            // both are a wait rather than a verdict.
+            _ => ("Host Starting", Tone::Warn),
+        };
+        let activity = format!("{:?}", status.activity).to_lowercase();
+        if activity == "idle" {
+            (format!("● {word}  Ⓤ"), tone)
+        } else {
+            (format!("● {word} · {activity}  Ⓤ"), tone)
+        }
+    }
+
+    /// The status bar's left half: what this frame is set to.
+    ///
+    /// The concept names its mode and its column count there. The mode is the
+    /// same adaptive one - the rail appears when the width holds it - and the
+    /// count is the columns this frame actually painted at the width it was
+    /// handed, never the mock's, so the bar cannot claim a column that is not on
+    /// screen.
+    /// The facts the inspector column paints.
+    ///
+    /// Every one of them is already on this client - the host's status, the
+    /// session list, the open projection - so the column costs the Host no
+    /// request and cannot disagree with the panes beside it.
+    fn board(&self) -> board::Board {
+        let now = Utc::now();
+        let (host, host_tone) = if self.offline.is_some() {
+            ("Offline · stale".to_string(), Tone::Error)
+        } else {
+            match self.host.as_ref() {
+                Some(status) => match format!("{:?}", status.phase).to_lowercase().as_str() {
+                    "ready" => ("Healthy".to_string(), Tone::Ok),
+                    "failed" => ("Failed".to_string(), Tone::Error),
+                    "stopped" | "draining" => ("Stopped".to_string(), Tone::Warn),
+                    _ => ("Starting".to_string(), Tone::Warn),
+                },
+                None => ("Unknown".to_string(), Tone::Error),
+            }
+        };
+        // HostStatus is workspace-wide and authoritative. Counting loaded
+        // session summaries misses sessions the client has not opened and can
+        // therefore under-report work running outside this conversation.
+        let running = self
+            .host
+            .as_ref()
+            .map_or(0, |status| status.active_executions);
+        let uptime = self.host.as_ref().map_or_else(
+            || "unknown".to_string(),
+            |status| elapsed_label(now, status.started_at),
+        );
+        let mut active: Vec<board::Active> = Vec::new();
+        let mut jobs: Vec<board::Job> = Vec::new();
+        let mut agents: Vec<board::Agent> = Vec::new();
+        let mut recent: Vec<board::Recent> = Vec::new();
+        let mut goal = None;
+        if let Some(session) = self.session.as_ref() {
+            // A turn waiting on an approval is not running: its calls are held
+            // where they stand, and the column says which fact is queued.
+            let waiting = session
+                .executions
+                .last()
+                .is_some_and(|execution| execution.status == ExecutionStatus::WaitingApproval);
+            active.extend(
+                session
+                    .tool_calls
+                    .iter()
+                    .filter(|call| call.status == ToolCallStatus::Running)
+                    .rev()
+                    .map(|call| board::Active {
+                        tool: call.tool.clone(),
+                        started: call.started_at,
+                        waiting,
+                    }),
+            );
+            for message in session.messages.iter().rev().take(6) {
+                let (what, tone) = match (message.compaction, message.role) {
+                    (true, _) => ("compaction checkpoint".to_string(), Tone::Muted),
+                    (false, MessageRole::User) => ("message from you".to_string(), Tone::User),
+                    (false, MessageRole::Assistant) => {
+                        ("message from the model".to_string(), Tone::Body)
+                    }
+                };
+                recent.push(board::Recent {
+                    at: message.at,
+                    what,
+                    tone,
+                });
+            }
+            for call in session.tool_calls.iter().rev().take(6) {
+                let (word, tone) = match call.status {
+                    ToolCallStatus::Running => ("running", Tone::Warn),
+                    ToolCallStatus::Completed => ("done", Tone::Ok),
+                    ToolCallStatus::Failed => ("failed", Tone::Error),
+                };
+                recent.push(board::Recent {
+                    at: call.finished_at.unwrap_or(call.started_at),
+                    what: format!("{} {word}", call.tool),
+                    tone,
+                });
+            }
+            recent.sort_by_key(|recent| std::cmp::Reverse(recent.at));
+            recent.truncate(4);
+            goal = session.goal.as_ref().map(|goal| board::Goal {
+                objective: goal.objective.clone(),
+                rounds: goal.rounds,
+                max_rounds: goal.max_rounds,
+            });
+        }
+        // The roster the rail's Agents block reads. Newest first, because a
+        // reader watching a delegation cares about the child that just started
+        // more than the one that finished an hour ago.
+        if let Some(report) = self.agents.as_ref() {
+            agents.extend(report.runs.iter().rev().map(|run| board::Agent {
+                name: match run.title.trim() {
+                    "" => run.id.clone(),
+                    title => title.to_string(),
+                },
+                status: run.status.trim().to_ascii_lowercase(),
+                depth: run.depth,
+            }));
+        }
+        if let Some(report) = self.dashboard_tasks.as_ref() {
+            jobs.extend(
+                report
+                    .sections
+                    .iter()
+                    .filter(|section| matches!(section.section.as_str(), "running" | "queued"))
+                    .flat_map(|section| {
+                        section.rows.iter().map(|task| board::Job {
+                            id: short(&task.id),
+                            title: task.title.clone(),
+                            status: if task.status.is_empty() {
+                                section.section.clone()
+                            } else {
+                                task.status.clone()
+                            },
+                            attempts: task.attempts,
+                        })
+                    }),
+            );
+        }
+        board::Board {
+            host,
+            host_tone,
+            sessions: self.sessions.len(),
+            running,
+            uptime,
+            active,
+            jobs,
+            jobs_loaded: self.dashboard_tasks.as_ref().is_some_and(tasks_ready),
+            agents,
+            goal,
+            recent,
+            now,
+        }
+    }
+
+    /// The navigation rail's document: the destinations the concept names, the
+    /// workspace's sessions under them, and the verdict at the foot.
+    ///
+    /// Everything here is state the client already holds - which pane is open,
+    /// the session list the Host sent, the host's phase - so the rail costs the
+    /// Host no request and cannot disagree with the panes beside it.
+    fn nav(&self) -> nav::Nav {
+        let (status, tone) = match self.host.as_ref() {
+            Some(host) => match format!("{:?}", host.phase).to_lowercase().as_str() {
+                "ready" => ("● BSH · Ready".to_string(), Tone::Ok),
+                "failed" => ("● BSH · Failed".to_string(), Tone::Error),
+                "stopped" | "draining" => ("● BSH · Stopping".to_string(), Tone::Warn),
+                _ => ("● BSH · Starting".to_string(), Tone::Warn),
+            },
+            None => ("● BSH · Unknown".to_string(), Tone::Error),
+        };
+        nav::Nav {
+            active: self.destination(),
+            status: (status, tone),
+            version: env!("CARGO_PKG_VERSION"),
+            view: "Adaptive",
+            collapsed: self.sidebar_collapsed,
+        }
+    }
+
+    /// Toggle the wide-layout navigation rail without disturbing the draft.
+    fn toggle_sidebar(&mut self) {
+        if self.frame.get().0 >= SIDEBAR_MIN_WIDTH {
+            self.sidebar_collapsed = !self.sidebar_collapsed;
+        }
+    }
+
+    /// The destination the frame is on: the pane that has taken the body, or the
+    /// conversation itself when no pane has.
+    ///
+    /// The rail paints exactly one row as the reader's place, the way the
+    /// concept fills its own open destination. A pane with no destination - the
+    /// memory browser, a patch, a federation roster - is a document opened
+    /// *from* the conversation, so the frame stays on the conversation it was
+    /// opened over.
+    fn destination(&self) -> Option<nav::Hit> {
+        let hit = if self.picker.is_some() {
+            return None;
+        } else if self.tasks.is_some() {
+            nav::Hit::Workspace(1)
+        } else if self.subagents.is_some() {
+            nav::Hit::Workspace(2)
+        } else if self.extensions.is_some() {
+            nav::Hit::Workspace(3)
+        } else if self.capabilities.is_some() {
+            nav::Hit::Workspace(4)
+        } else if self.trajectory.is_some() {
+            nav::Hit::Workspace(5)
+        } else if self.audit.is_some() {
+            nav::Hit::Workspace(6)
+        } else if self.detail.is_some() {
+            nav::Hit::Panel(0)
+        } else if self.files.is_some() {
+            nav::Hit::Panel(1)
+        } else if self.settings.is_some() {
+            nav::Hit::Panel(2)
+        } else {
+            nav::Hit::Workspace(0)
+        };
+        Some(hit)
+    }
+
+    /// Open the destination a rail chord names.
+    ///
+    /// The rail advertises a letter and this binds `Alt` plus it: the composer
+    /// owns the plain keys, so a bare `j` has to stay a `j`. The destination
+    /// runs the command a reader could have typed - one navigation path with
+    /// two faces - and an unbound chord reaches the composer as nothing, which
+    /// is what the terminal did with it before the rail existed.
+    fn open_destination(&mut self, chord: char) {
+        let Some(index) = nav::WORKSPACE
+            .iter()
+            .position(|item| item.key.eq_ignore_ascii_case(&chord))
+        else {
+            let Some(index) = nav::PANELS
+                .iter()
+                .position(|item| item.key.eq_ignore_ascii_case(&chord))
+            else {
+                return;
+            };
+            return self.run_panel(index);
+        };
+        self.run_destination(index);
+    }
+
+    /// Open a workspace destination by its index in the rail's own table.
+    fn run_destination(&mut self, index: usize) {
+        if let Some(command) = nav::WORKSPACE
+            .get(index)
+            .and_then(|item| SlashCommand::parse(item.command))
+        {
+            self.run_command(command);
+        }
+    }
+
+    /// Open one of the rail's panels by its index in the rail's own table.
+    fn run_panel(&mut self, index: usize) {
+        if let Some(command) = nav::PANELS
+            .get(index)
+            .and_then(|item| SlashCommand::parse(item.command))
+        {
+            self.run_command(command);
+        }
+    }
+
+    fn layout_chip(&self) -> String {
+        let (width, _) = self.frame.get();
+        let columns = match (
+            rail_width_for(width, self.sidebar_collapsed),
+            board::width(width),
+        ) {
+            // The inspector only paints beside a rail: the concept's third
+            // column is a column of the workspace, not of the conversation.
+            (Some(_), Some(_)) => 3,
+            (Some(_), None) => 2,
+            _ => 1,
+        };
+        let mode = if self.sidebar_collapsed {
+            "Collapsed"
+        } else {
+            "Adaptive"
+        };
+        format!("Mode: {mode}  |  Layout: {columns}-Column")
     }
 
     /// The rows between the last rule and the input.
@@ -2453,6 +3366,7 @@ impl App {
             || self.subagents.is_some()
             || self.browser.is_some()
             || self.trajectory.is_some()
+            || self.capabilities.is_some()
             || self.settings.is_some()
     }
 
@@ -2493,7 +3407,7 @@ impl App {
     /// against the same arithmetic that painted the row under it, even while
     /// a plan block, a queued line or a question card is up.
     fn body_rows(&self, width: usize, height: usize) -> usize {
-        let (input_rows, _) = self.input_block(width);
+        let (input_rows, _) = self.input_block(width.saturating_sub(4));
         let menu_rows = self.menu_lines(width).0;
         let picker_rows = self.picker_lines(width);
         let plan_rows = self.plan_lines(width);
@@ -2502,6 +3416,7 @@ impl App {
         // The prompt is measured with the popup: an approval card is tall, and
         // its rows come out of the transcript's budget like the question card's.
         let prompt_rows = self.prompt_height(width, height);
+        let quick_rows = usize::from(self.input.is_empty());
         height
             .saturating_sub(
                 input_rows.len()
@@ -2511,39 +3426,10 @@ impl App {
                     + queue_rows.len()
                     + question_rows.len()
                     + prompt_rows
-                    + 4,
+                    + 6
+                    + quick_rows,
             )
             .max(1)
-    }
-
-    /// The first session row the sidebar shows for a body `rows` tall: the
-    /// window keeps the selected row on its last line, the way a list does.
-    fn session_top(&self, rows: usize) -> usize {
-        self.selected.saturating_sub(rows.saturating_sub(1))
-    }
-
-    fn session_lines(&self, width: usize, rows: usize) -> Vec<String> {
-        let start = self.session_top(rows);
-        let mut lines: Vec<String> = self
-            .sessions
-            .iter()
-            .skip(start)
-            .take(rows)
-            .enumerate()
-            .map(|(offset, session)| {
-                let index = start + offset;
-                let marker = if index == self.selected { "› " } else { "  " };
-                let state = match session.active_execution {
-                    Some(ExecutionStatus::WaitingApproval) => "?",
-                    Some(_) => "●",
-                    None => " ",
-                };
-                let title_width = width.saturating_sub(5);
-                format!("{marker}{} {state}", truncate(&session.title, title_width))
-            })
-            .collect();
-        lines.resize(rows, String::new());
-        lines
     }
 
     /// The transcript column: the rows it paints and, for each row, the tool
@@ -2569,6 +3455,17 @@ impl App {
         // reader asked for the typed event log, so that is what the body shows.
         if let Some(pane) = self.trajectory.as_ref() {
             return quiet(trajectory_pane(pane, self.session.as_ref(), width, rows));
+        }
+        // The capabilities pane replaces it too: the reader asked what this
+        // workspace may do, so the roster is what the body shows.
+        if let Some(pane) = self.capabilities.as_ref() {
+            return quiet(capabilities_pane(
+                pane,
+                &self.catalogue,
+                self.session.as_ref(),
+                width,
+                rows,
+            ));
         }
         // The tasks pane replaces the timeline while it is open: the reader
         // asked for the workspace's board, so the board is what the body shows.
@@ -2843,29 +3740,109 @@ impl App {
         if self.click_menu(row) {
             return;
         }
-        let (width, height) = self.frame.get();
-        let body_rows = self.body_rows(width, height);
-        if let Some(offset) = rail_offset(row, column, width, body_rows) {
-            // The list keeps the selected row on its last line, so the row
-            // under the pointer is that offset plus the window's first session.
-            let index = self.session_top(body_rows) + offset;
-            // A row past the end of the list names nothing, and clicking the
-            // open session is not a change: it is the state the rail already
-            // shows.
-            if index >= self.sessions.len() || index == self.selected {
-                return;
+        if let Some(paint) = self.composer_paint.get()
+            && paint.quick_row == Some(row)
+        {
+            if column >= paint.width.saturating_sub(cells("[➤]") + 2) {
+                self.submit();
+            } else if let Some(command) = quick_command_at(column.saturating_sub(2)) {
+                self.input = command.to_string();
+                self.cursor = self.input.len();
+                self.sync_menu();
+                self.submit();
             }
-            self.select(index);
             return;
         }
-        let Some(offset) = transcript_offset(row, column, width, body_rows) else {
+        if row == 0 && self.frame.get().0 >= PRIMARY_NAV_MIN_WIDTH {
+            let mut offset = 0usize;
+            for (index, (text, _)) in self.header_runs().into_iter().enumerate() {
+                let end = offset + cells(&text);
+                if index >= 2 && (offset..end).contains(&column) {
+                    let tab_index = index - 2;
+                    if tab_index == 0 {
+                        self.close_panes();
+                    } else {
+                        self.run_destination(PRIMARY_TABS[tab_index].1);
+                    }
+                    return;
+                }
+                offset = end;
+            }
+            return;
+        }
+        let (width, height) = self.frame.get();
+        let body_rows = self.body_rows(width, height);
+        let left_width = rail_width_for(width, self.sidebar_collapsed).map_or(0, |left| left + 1);
+        if row == BODY_TOP
+            && board::width(width).is_some()
+            && column
+                >= left_width
+                    + transcript_width_for(width, self.sidebar_collapsed).saturating_sub(5)
+            && column < left_width + transcript_width_for(width, self.sidebar_collapsed)
+        {
+            self.run_destination(0);
+            return;
+        }
+        // The rail's rows name destinations and sessions, and the frame that
+        // painted them is the only thing that knows which is which: a row it
+        // recorded as carrying no name - a heading, the column's air - answers
+        // a click with nothing.
+        if let Some(sidebar) = rail_width_for(width, self.sidebar_collapsed)
+            && column < sidebar
+            && row >= BODY_TOP
+            && row < BODY_TOP + body_rows
+        {
+            let offset = row - BODY_TOP;
+            let hit = self.rail_slots.borrow().get(offset).copied().flatten();
+            match hit {
+                Some(nav::Hit::Toggle) => self.toggle_sidebar(),
+                Some(nav::Hit::Workspace(index)) => self.run_destination(index),
+                Some(nav::Hit::Panel(index)) => self.run_panel(index),
+                None => {}
+            }
+            return;
+        }
+        if let Some(panel_width) = board::width(width)
+            && column >= width.saturating_sub(panel_width)
+            && row >= BODY_TOP
+            && row < BODY_TOP + body_rows
+        {
+            let board_rows = board::lines(&self.board(), panel_width, body_rows);
+            let text = board_rows
+                .get(row - BODY_TOP)
+                .into_iter()
+                .flatten()
+                .map(|(text, _)| text.as_str())
+                .collect::<String>();
+            if text.contains("SESSION AGENTS") {
+                self.run_destination(2);
+                return;
+            }
+            if text.contains("ACTIVE JOBS") {
+                self.run_destination(1);
+                return;
+            }
+            if text.contains("SESSION ACTIVITY") {
+                self.run_destination(5);
+                return;
+            }
+        }
+        let Some(offset) =
+            transcript_offset_for(row, column, width, body_rows, self.sidebar_collapsed)
+        else {
             return;
         };
         // The frame and the pointer read the same document, so the row under
         // the pointer names the call that row paints - or nothing, if the row
         // is prose, blank, or part of a pane.
-        let (_, hits) = self.transcript(transcript_width(width), body_rows);
-        let Some(Some(index)) = hits.get(offset).copied() else {
+        let (_, hits) = self.transcript(
+            transcript_width_for(width, self.sidebar_collapsed),
+            body_rows,
+        );
+        let Some(transcript_offset) = offset.checked_sub(1) else {
+            return;
+        };
+        let Some(Some(index)) = hits.get(transcript_offset).copied() else {
             return;
         };
         // Clicking the call the pane already shows is not a change.
@@ -2992,6 +3969,15 @@ impl App {
         // Every submitted line is recalled with Up/Down, commands included:
         // retyping a slash line is the same nuisance as retyping a turn.
         self.history.record(&text);
+        // A terminal opened on a folder with no session still has to take the
+        // first line it is given: the desktop's window starts a conversation
+        // from the message the reader sends, so the terminal creates the
+        // session it is about to send into rather than answering that first
+        // message with a chord to press first. A slash line is not a turn - it
+        // configures a session - so it is left to the parser below.
+        if !text.starts_with('/') && self.current_session().is_none() {
+            self.create_session(None);
+        }
         // A slash line changes the session's configuration; it is never sent
         // to the model, the way the desktop's own commands are not.
         if let Some(command) = SlashCommand::parse(&text) {
@@ -3028,6 +4014,13 @@ impl App {
     /// picked becomes the same text as one they typed, so the two gestures
     /// share one send path rather than two that could drift apart.
     fn deliver(&mut self, text: &str) -> bool {
+        if self.uncertain_send.is_some() {
+            self.set_status(
+                Level::Error,
+                "a previous turn has an unknown outcome; use /reconnect before sending another",
+            );
+            return false;
+        }
         let Some(session_id) = self.current_session() else {
             self.set_status(Level::Error, "no session to send to; Ctrl-T creates one");
             return false;
@@ -3052,12 +4045,21 @@ impl App {
             );
             return true;
         }
-        match self.client.send_message(session_id, text.to_string()) {
+        let command_id = CommandId::new();
+        match self
+            .client
+            .send_message_with_id(session_id, text.to_string(), command_id)
+        {
             Ok(_) => {
                 self.scroll = 0;
                 self.set_status(Level::Info, "turn accepted by the Host");
                 self.refresh_all();
                 true
+            }
+            Err(error @ ClientError::OutcomeUnknown { .. }) => {
+                self.uncertain_send = Some((session_id, text.to_string(), command_id));
+                self.client_error(error);
+                false
             }
             Err(error) => {
                 self.client_error(error);
@@ -3259,6 +4261,8 @@ impl App {
         }
         match command {
             SlashCommand::Help => self.set_status(Level::Info, COMMANDS),
+            SlashCommand::Tui(preference) => self.tui_preference(preference),
+            SlashCommand::Reconnect => self.reconnect(),
             SlashCommand::New(title) => self.create_session(title),
             // The prompt goes to the reader's own editor, which is a change to
             // client state only: nothing is sent until Enter sends it.
@@ -3319,15 +4323,35 @@ impl App {
                     |config| !config.permission.trim().is_empty(),
                 );
             }
-            SlashCommand::Plan(None) => self.toggle_plan(),
-            SlashCommand::Plan(Some(plan)) => self.configure(
+            SlashCommand::Plan(plan) => self.configure(
                 SessionConfigChange {
                     plan_mode: Some(plan),
                     ..SessionConfigChange::default()
                 },
                 |config| config.plan_mode == plan,
             ),
+            SlashCommand::PlanTask(task) => {
+                // The desktop's `/plan <task>` enters plan mode AND sends the
+                // task, so the model receives a plan-first request rather than
+                // a mode switch the reader has to send again. A terminal with
+                // no session yet creates the one it is about to configure.
+                if self.current_session().is_none() {
+                    self.create_session(None);
+                }
+                self.configure(
+                    SessionConfigChange {
+                        plan_mode: Some(true),
+                        ..SessionConfigChange::default()
+                    },
+                    |config| config.plan_mode,
+                );
+                if self.deliver(&task) {
+                    self.input.clear();
+                    self.cursor = 0;
+                }
+            }
             SlashCommand::Compact => self.compact(),
+            SlashCommand::Cancel(argument) => self.cancel_command(argument.as_deref()),
             SlashCommand::Fork => self.fork_session(),
             SlashCommand::Copy(count) => self.copy_message(count.unwrap_or(1)),
             SlashCommand::CopyId => self.copy_session_id(),
@@ -3366,6 +4390,7 @@ impl App {
             SlashCommand::Browser => self.browser_command(),
             SlashCommand::Subagents(argument) => self.subagents_command(argument.as_deref()),
             SlashCommand::Trajectory => self.trajectory_command(),
+            SlashCommand::Capabilities => self.capabilities_command(),
             SlashCommand::Review(argument) => self.review_command(argument.as_deref()),
             SlashCommand::Trash(argument) => self.trash_command(argument.as_deref()),
             SlashCommand::Restore(argument) => self.restore_command(argument.as_deref()),
@@ -3430,6 +4455,64 @@ impl App {
             Level::Info
         };
         self.set_status(level, mcp_detail(server));
+    }
+
+    /// The capabilities this workspace holds: the approval mode the open
+    /// session runs under, and the servers that carry the tools a model can
+    /// call.
+    ///
+    /// The roster is the Host's, so the catalogue is asked again here rather
+    /// than trusting the copy this client fetched when it attached: a server an
+    /// operator fixed in the settings a moment ago is reported from the pool.
+    /// The pane is a listing, not an authorisation - the mode and the gates
+    /// decide what a turn may do, and this screen only says what they say.
+    fn capabilities_command(&mut self) {
+        match self.client.catalogue() {
+            Ok(catalogue) => self.catalogue = catalogue,
+            Err(error) => {
+                self.client_error(error);
+                return;
+            }
+        }
+        let summary = capabilities_summary(&self.catalogue, self.session.as_ref());
+        let extensions = Some(match self.client.extensions() {
+            Ok(report) => report,
+            Err(error) => ExtensionsReport {
+                state: "failed".to_string(),
+                error: Some(error.to_string()),
+                ..ExtensionsReport::default()
+            },
+        });
+        // One pane at a time, like `/audit` and `/memory`.
+        self.settings = None;
+        self.detail = None;
+        self.memory = None;
+        self.files = None;
+        self.diff = None;
+        self.tasks = None;
+        self.extensions = None;
+        self.review = None;
+        self.federation = None;
+        self.trajectory = None;
+        self.capabilities = Some(CapabilitiesPane {
+            scroll: 0,
+            extensions,
+        });
+        self.set_status(Level::Info, summary);
+    }
+
+    /// Leave the Capabilities pane and keep whatever the composer holds.
+    fn close_capabilities(&mut self) {
+        self.capabilities = None;
+        self.set_status(Level::Info, "capabilities closed");
+    }
+
+    /// Walk the Capabilities pane's rows; the pane clamps the offset to its own
+    /// height, so a short roster never scrolls away from its first row.
+    fn scroll_capabilities(&mut self, delta: isize) {
+        if let Some(pane) = self.capabilities.as_mut() {
+            pane.scroll = pane.scroll.saturating_add_signed(delta);
+        }
     }
 
     /// The skills this build registered, and what each one does.
@@ -3512,13 +4595,14 @@ impl App {
             );
             return;
         };
-        let total = crate::state::exact_tokens(usage.total());
-        let input = crate::state::exact_tokens(usage.uncached_input());
-        let cached = crate::state::exact_tokens(usage.cached_tokens);
-        let output = crate::state::exact_tokens(usage.completion_tokens);
-        let percent = crate::state::cache_hit_percent(usage.cached_tokens, usage.prompt_tokens)
-            .map(|percent| format!(" · cache hit {percent}%"))
-            .unwrap_or_default();
+        let total = crate::runtime::format::exact_tokens(usage.total());
+        let input = crate::runtime::format::exact_tokens(usage.uncached_input());
+        let cached = crate::runtime::format::exact_tokens(usage.cached_tokens);
+        let output = crate::runtime::format::exact_tokens(usage.completion_tokens);
+        let percent =
+            crate::runtime::format::cache_hit_percent(usage.cached_tokens, usage.prompt_tokens)
+                .map(|percent| format!(" · cache hit {percent}%"))
+                .unwrap_or_default();
         self.set_status(
             Level::Info,
             format!(
@@ -3763,9 +4847,12 @@ impl App {
         let argument = argument
             .map(str::trim)
             .filter(|argument| !argument.is_empty());
-        // A task id is never the word, so the keyword wins over a lookup.
+        // A task id is never the word, so the keywords win over a lookup: the
+        // graph tab and the board's filters are both words a `/tasks` argument
+        // can be, and neither can name a record.
         let graph = argument.is_some_and(|argument| argument.eq_ignore_ascii_case("graph"));
-        let id = argument.filter(|_| !graph);
+        let filter = argument.and_then(TaskFilter::from_word);
+        let id = argument.filter(|_| !graph && filter.is_none());
         let detail = match id {
             Some(id) => match self.client.task_detail(id) {
                 Ok(detail) => Some(detail),
@@ -3778,10 +4865,16 @@ impl App {
         };
         match self.client.tasks() {
             Ok(report) => {
+                // A reader who re-reads the board without naming a filter is
+                // still looking through the one they chose: the pane is state
+                // the Host query refreshes, not one it resets.
+                let filter = filter
+                    .or_else(|| self.tasks.as_ref().map(|pane| pane.filter))
+                    .unwrap_or_default();
                 let summary = match (detail.as_ref(), graph) {
                     (Some(detail), _) => task_detail_summary(detail),
                     (None, true) => tasks_graph_summary(&report),
-                    (None, false) => tasks_summary(&report),
+                    (None, false) => tasks_summary(&report, filter),
                 };
                 let level = match detail.as_ref() {
                     Some(detail) if detail.state != "ready" => Level::Error,
@@ -3792,6 +4885,7 @@ impl App {
                     report,
                     detail,
                     graph,
+                    filter,
                     scroll: 0,
                 });
                 self.memory = None;
@@ -3897,6 +4991,7 @@ impl App {
     fn close_panes(&mut self) {
         self.settings = None;
         self.trajectory = None;
+        self.capabilities = None;
         self.tasks = None;
         self.federation = None;
         self.browser = None;
@@ -4068,6 +5163,28 @@ impl App {
             let last = pane.report.runs.len().saturating_sub(1);
             pane.selection = pane.selection.min(last);
             pane.open = pane.open.filter(|open| *open < pane.report.runs.len());
+        }
+    }
+
+    /// Re-read the open conversation's delegation roster for the rail.
+    ///
+    /// A failed read keeps the rows already there: the column is a summary, and
+    /// the session's own state - which the panes and the title already report -
+    /// is a better fact than an empty Agents block that says nothing happened.
+    fn poll_agents(&mut self) {
+        let scope = self.session.as_ref().map(|session| session.session_id);
+        if let Ok(report) = self.client.subagents(scope) {
+            self.agents = Some(report);
+        }
+    }
+
+    /// Refresh the dashboard's workspace-wide Jobs preview from the Host.
+    ///
+    /// The rail is painted on every frame, so its source is cached and queried
+    /// on the same slow cadence as the agent roster instead of blocking render.
+    fn poll_dashboard_tasks(&mut self) {
+        if let Ok(report) = self.client.tasks() {
+            self.dashboard_tasks = Some(report);
         }
     }
 
@@ -4489,6 +5606,7 @@ impl App {
         self.review = None;
         self.federation = None;
         self.trajectory = None;
+        self.capabilities = None;
         self.settings = None;
         self.files = None;
         self.diff = None;
@@ -5417,6 +6535,53 @@ impl App {
         }
     }
 
+    /// `/cancel` opens a contextual confirmation; `/cancel confirm` commits the
+    /// Host cancellation. Ctrl-C is not bound to cancellation.
+    fn cancel_command(&mut self, argument: Option<&str>) {
+        let Some(session) = self.session.as_ref() else {
+            self.set_status(Level::Info, "no session open · Ctrl-T creates one");
+            return;
+        };
+        let session_id = session.session_id;
+        let live = session.executions.iter().rev().find(|execution| {
+            matches!(
+                execution.status,
+                ExecutionStatus::Queued
+                    | ExecutionStatus::Running
+                    | ExecutionStatus::WaitingApproval
+            )
+        });
+        let Some(execution) = live else {
+            self.set_status(Level::Info, "no running execution in this session");
+            return;
+        };
+        let execution_id = execution.execution_id;
+        if argument != Some("confirm") {
+            self.cancel_pending = Some((session_id, execution_id));
+            self.set_status(
+                Level::Info,
+                format!(
+                    "cancel {execution_id} in session {session_id}? run /cancel confirm (Esc clears)"
+                ),
+            );
+            return;
+        }
+        match self.cancel_pending {
+            Some((pending_session, pending_execution))
+                if pending_session == session_id && pending_execution == execution_id =>
+            {
+                self.cancel_pending = None;
+                self.cancel_execution();
+            }
+            _ => {
+                self.set_status(
+                    Level::Info,
+                    "no matching cancellation is awaiting confirmation; run /cancel first",
+                );
+            }
+        }
+    }
+
     fn cancel_execution(&mut self) {
         let Some(session) = self.session.as_ref() else {
             return;
@@ -5448,14 +6613,15 @@ impl App {
     /// The choice the approval card is standing on.
     ///
     /// A highlight recorded against a request that is no longer pending names
-    /// nothing: the card opens on its first choice, so the reader is never
-    /// asked to decide a fresh request with a bar that was left over.
+    /// nothing: the card opens on [`APPROVAL_DEFAULT`], so the reader is never
+    /// asked to decide a fresh request with a bar that was left over - and a
+    /// card that opens on the refusal cannot be approved by a stray Enter.
     fn approval_choice(&self) -> usize {
         match (self.pending_approval(), self.approval_choice) {
             (Some(approval), Some((id, choice))) if id == approval.approval_id => {
                 choice.min(APPROVAL_CHOICES.len() - 1)
             }
-            _ => 0,
+            _ => APPROVAL_DEFAULT,
         }
     }
 
@@ -5553,7 +6719,7 @@ impl App {
     /// idle only when it is looking at it. A line that fails to send goes back
     /// to the head of the queue instead of being lost.
     fn flush_queue(&mut self) {
-        if self.flushing || self.queue.is_empty() {
+        if self.flushing || self.queue.is_empty() || self.uncertain_send.is_some() {
             return;
         }
         let Some(session_id) = self.current_session() else {
@@ -5693,10 +6859,69 @@ impl App {
     }
 
     fn client_error(&mut self, error: ClientError) {
+        // A dropped connection closes the socket, not the frame: what is on
+        // screen is the last thing the Host said, and a reader who lost the
+        // connection mid-turn still has the transcript to read. The rows are
+        // marked stale until `/reconnect` or `Alt-R` asks the Host again, which
+        // is also why a disconnect never reads as a cancelled job.
         if error.is_disconnected() {
-            self.quit = true;
+            self.offline = Some(error.to_string());
         }
         self.set_status(Level::Error, error.to_string());
+    }
+
+    fn keymap_text(&self) -> String {
+        format!(
+            "keys: {} palette · Alt+C/J/A/T/P/L/U panes · Alt+I inspector · Alt+F files · Alt+S settings · Enter send · Shift-Enter newline · Tab completion · Esc back · ^N/^B sessions · ^T new session · PgUp/PgDn scroll · ^L refresh · / commands · @ files · ^D quit",
+            self.preferences.palette.label()
+        )
+    }
+
+    /// Change and persist a presentation preference local to this TUI client.
+    fn tui_preference(&mut self, preference: Option<TuiPreference>) {
+        match preference {
+            None | Some(TuiPreference::Show) => {
+                self.set_status(
+                    Level::Info,
+                    format!(
+                        "TUI preferences · theme {:?} · palette {} · /tui theme <auto|ansi|mono|truecolor> · /tui keymap palette <ctrl+p|ctrl+g|ctrl+o|ctrl+q|alt+g|alt+o|alt+q>",
+                        self.preferences.theme,
+                        self.preferences.palette.label()
+                    ),
+                );
+            }
+            Some(TuiPreference::Theme(theme)) => {
+                let old = self.preferences;
+                self.preferences.theme = theme;
+                self.skin = Skin::with_preference(theme);
+                if let Err(error) = self.preferences.save(&self.data_dir) {
+                    self.preferences = old;
+                    self.skin = Skin::with_preference(old.theme);
+                    self.set_status(
+                        Level::Error,
+                        format!("could not save TUI preference: {error}"),
+                    );
+                } else {
+                    self.set_status(Level::Info, format!("TUI theme set to {theme:?}"));
+                }
+            }
+            Some(TuiPreference::Palette(palette)) => {
+                let old = self.preferences;
+                self.preferences.palette = palette;
+                if let Err(error) = self.preferences.save(&self.data_dir) {
+                    self.preferences = old;
+                    self.set_status(
+                        Level::Error,
+                        format!("could not save TUI preference: {error}"),
+                    );
+                } else {
+                    self.set_status(
+                        Level::Info,
+                        format!("command palette key is {}", palette.label()),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -5727,9 +6952,17 @@ enum SlashCommand {
     Model(Option<String>, Option<String>),
     Preset(Option<String>),
     Permission(Option<String>),
-    Plan(Option<bool>),
+    /// Enter or leave plan mode; the bare `/plan` enters it, the way the
+    /// desktop's own command does (a bare command is not a toggle there).
+    Plan(bool),
+    /// Enter plan mode and submit the task as this turn, which is what
+    /// `/plan <task>` means in the desktop's command registry.
+    PlanTask(String),
     /// Fold the session's older history into one checkpoint.
     Compact,
+    /// Request cancellation of the live Host execution; `/cancel confirm`
+    /// commits after the contextual confirmation.
+    Cancel(Option<String>),
     /// Put one of the model's answers on the reader's clipboard; no number
     /// copies the newest, and `n` counts answers back from it.
     Copy(Option<usize>),
@@ -5836,6 +7069,9 @@ enum SlashCommand {
     /// The open session's typed event log: every turn the Host ran with the
     /// messages and calls inside it.
     Trajectory,
+    /// What this workspace may do: the approval mode in force and the servers
+    /// whose tools a model can call, with the names each offers.
+    Capabilities,
     /// The session's latest sealed review; a change id or path shows its
     /// prepared diff, and no argument lists the changeset.
     Review(Option<String>),
@@ -5867,6 +7103,17 @@ enum SlashCommand {
     Usage(&'static str),
     /// A slash line no command owns.
     Unknown(String),
+    /// Configure TUI-local appearance or key bindings.
+    Tui(Option<TuiPreference>),
+    /// Reattach to the Runtime Host and reconcile the current projection.
+    Reconnect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiPreference {
+    Show,
+    Theme(Theme),
+    Palette(PaletteKey),
 }
 
 impl SlashCommand {
@@ -5892,6 +7139,7 @@ impl SlashCommand {
                 | Self::Review(_)
                 | Self::Memory(_)
                 | Self::Audit(_)
+                | Self::Capabilities
                 | Self::Detail(_)
                 | Self::Terminal
         )
@@ -5909,6 +7157,37 @@ impl SlashCommand {
         let rest = text[head.len()..].trim();
         match head {
             "/help" | "/?" => Some(Self::Help),
+            "/reconnect" => match words.next() {
+                None => Some(Self::Reconnect),
+                _ => Some(Self::Usage("usage: /reconnect")),
+            },
+            "/tui" => match (words.next(), words.next(), words.next(), words.next()) {
+                (None, None, None, None) => Some(Self::Tui(None)),
+                (Some("theme"), None, None, None) => Some(Self::Tui(Some(TuiPreference::Show))),
+                (Some("theme"), Some("auto"), None, None) => {
+                    Some(Self::Tui(Some(TuiPreference::Theme(Theme::Auto))))
+                }
+                (Some("theme"), Some("ansi"), None, None) => {
+                    Some(Self::Tui(Some(TuiPreference::Theme(Theme::Ansi))))
+                }
+                (Some("theme"), Some("mono"), None, None) => {
+                    Some(Self::Tui(Some(TuiPreference::Theme(Theme::Mono))))
+                }
+                (Some("theme"), Some("truecolor"), None, None) => {
+                    Some(Self::Tui(Some(TuiPreference::Theme(Theme::Truecolor))))
+                }
+                (Some("keymap"), Some("palette"), Some(chord), None) => {
+                    match PaletteKey::parse(chord) {
+                        Some(key) => Some(Self::Tui(Some(TuiPreference::Palette(key)))),
+                        None => Some(Self::Usage(
+                            "usage: /tui keymap palette <ctrl+p|ctrl+g|ctrl+o|ctrl+q|alt+g|alt+o|alt+q>",
+                        )),
+                    }
+                }
+                _ => Some(Self::Usage(
+                    "usage: /tui [theme <auto|ansi|mono|truecolor> | keymap palette <ctrl+p|ctrl+g|ctrl+o|ctrl+q|alt+g|alt+o|alt+q>]",
+                )),
+            },
             "/model" => match (words.next(), words.next(), words.next()) {
                 (None, None, None) => Some(Self::Model(None, None)),
                 (Some(provider), Some(model), None) => Some(Self::Model(
@@ -5933,15 +7212,26 @@ impl SlashCommand {
                     "usage: /permission <mode>; /permission alone opens the list",
                 )),
             },
-            "/plan" => match (words.next(), words.next()) {
-                (None, None) => Some(Self::Plan(None)),
-                (Some("on"), None) => Some(Self::Plan(Some(true))),
-                (Some("off"), None) => Some(Self::Plan(Some(false))),
-                _ => Some(Self::Usage("usage: /plan [on|off]")),
+            // The shared command grammar owns the `/plan` line: bare enters,
+            // `off` leaves, and everything else is the task the plan is for.
+            "/plan" => match crate::runtime::grammar::parse_slash_line(&format!("/plan {rest}")) {
+                Some(crate::runtime::grammar::SlashLine::Plan(request)) => Some(match request {
+                    crate::runtime::grammar::PlanRequest::On => Self::Plan(true),
+                    crate::runtime::grammar::PlanRequest::Off => Self::Plan(false),
+                    crate::runtime::grammar::PlanRequest::Task(task) => Self::PlanTask(task),
+                }),
+                _ => Some(Self::Usage("usage: /plan [off|<task>]")),
             },
             "/compact" => match words.next() {
                 None => Some(Self::Compact),
                 _ => Some(Self::Usage("usage: /compact")),
+            },
+            "/cancel" => match words.next() {
+                None => Some(Self::Cancel(None)),
+                Some("confirm") if words.next().is_none() => {
+                    Some(Self::Cancel(Some("confirm".to_string())))
+                }
+                _ => Some(Self::Usage("usage: /cancel [confirm]")),
             },
             // The branch is of the open session and the Host names it, so there
             // is nothing to spell here: a title would be a second decision the
@@ -6058,6 +7348,17 @@ impl SlashCommand {
                 None => Some(Self::Trajectory),
                 _ => Some(Self::Usage("usage: /trajectory")),
             },
+            "/activity" => match words.next() {
+                None => Some(Self::Trajectory),
+                _ => Some(Self::Usage("usage: /activity")),
+            },
+            // The roster is the whole workspace's, so it takes no argument: the
+            // servers carry what they carry, and the mode is the open
+            // session's.
+            "/capabilities" => match words.next() {
+                None => Some(Self::Capabilities),
+                _ => Some(Self::Usage("usage: /capabilities")),
+            },
             // A filter is free text, like `/audit`'s: it searches the ids and
             // the display names the extension host reports.
             "/extensions" => match rest {
@@ -6086,7 +7387,7 @@ impl SlashCommand {
                 "" => Some(Self::Purge(None)),
                 number => Some(Self::Purge(Some(number.to_string()))),
             },
-            // The `/goal` grammar is [`crate::state::parse_slash_line`]'s, not a
+            // The `/goal` grammar is the shared command registry's, not a
             // terminal invention: the same control words, matched case-
             // insensitively and only when they fill the whole argument, the
             // same `edit <objective>` prefix and the same verbatim objective.
@@ -6193,35 +7494,26 @@ impl SlashCommand {
     }
 }
 
-/// The `/goal` grammar, mirrored from [`crate::state::parse_goal_request`].
+/// The `/goal` grammar, from the shared command registry.
 ///
 /// The control words count only when they fill the whole argument, so
 /// `/goal pause after verification` creates that literal objective; `edit` is
 /// a prefix that takes the rest of the line, and anything else is the
-/// objective verbatim. Case follows the desktop's: the words are matched
-/// without case, the objective keeps the reader's own.
+/// objective verbatim. The parse itself lives in
+/// [`crate::runtime::grammar`], so the two interfaces cannot drift apart on
+/// what a goal line means.
 fn goal_command(rest: &str) -> SlashCommand {
-    if rest.is_empty() {
-        return SlashCommand::GoalShow;
-    }
-    match rest.to_lowercase().as_str() {
-        "clear" => return SlashCommand::GoalClear,
-        "pause" => return SlashCommand::GoalPause,
-        "resume" => return SlashCommand::GoalResume,
-        "edit" => return SlashCommand::Usage("usage: /goal edit <objective>"),
-        _ => {}
-    }
-    if let Some(end) = rest.find(char::is_whitespace)
-        && rest[..end].eq_ignore_ascii_case("edit")
-    {
-        let objective = rest[end..].trim();
-        return if objective.is_empty() {
+    match crate::runtime::grammar::parse_goal_request(rest) {
+        crate::runtime::grammar::GoalRequest::Show => SlashCommand::GoalShow,
+        crate::runtime::grammar::GoalRequest::Create(objective) => SlashCommand::GoalSet(objective),
+        crate::runtime::grammar::GoalRequest::Edit(objective) => SlashCommand::GoalEdit(objective),
+        crate::runtime::grammar::GoalRequest::Pause => SlashCommand::GoalPause,
+        crate::runtime::grammar::GoalRequest::Resume => SlashCommand::GoalResume,
+        crate::runtime::grammar::GoalRequest::Clear => SlashCommand::GoalClear,
+        crate::runtime::grammar::GoalRequest::InvalidEdit => {
             SlashCommand::Usage("usage: /goal edit <objective>")
-        } else {
-            SlashCommand::GoalEdit(objective.to_string())
-        };
+        }
     }
-    SlashCommand::GoalSet(rest.to_string())
 }
 
 /// The lines this client submitted, kept the way a shell keeps its history.
@@ -6527,6 +7819,19 @@ fn composer(input: &str, cursor: usize, width: usize) -> (Vec<String>, (usize, u
         })
         .collect();
     (lines, (cursor_row - top, 2 + cursor_column))
+}
+
+/// The composer's row when nothing has been typed: the marker it always
+/// carries, then the box's own invitation in the muted ink a placeholder takes,
+/// so it cannot be mistaken for a line the reader wrote.
+fn composer_hint(width: usize) -> Vec<(String, Tone)> {
+    vec![
+        ("› ".to_string(), Tone::Accent),
+        (
+            truncate(COMPOSER_HINT, width.saturating_sub(2)),
+            Tone::Muted,
+        ),
+    ]
 }
 
 /// The plan block as the frame draws it, given the plan the Host projected.
@@ -7068,6 +8373,241 @@ fn mcp_state(server: &McpServerView) -> String {
         0 => "connected, no tools".to_string(),
         count => format!("{count} tool(s)"),
     }
+}
+
+/// What an approval mode lets a turn do, in the words the pane uses.
+///
+/// The mode is the scope every call of the session runs under, so the pane
+/// names it beside the tools: a roster of tools alone leaves open what those
+/// tools are allowed to touch, which is the half of the question an operator
+/// came to this screen for.
+fn permission_scope(permission: &str) -> String {
+    match permission {
+        "read-only" => "read-only · side-effecting tools are withheld".to_string(),
+        "workspace-write" => "workspace-write · writes stay inside the workspace".to_string(),
+        "danger-full-access" => {
+            "danger-full-access · no confinement on writes or the shell".to_string()
+        }
+        other if other.trim().is_empty() => "unknown · this session has said nothing".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The Capabilities pane's body: the scope the open session runs under, then
+/// every server that carries tools, with the exact names it offers.
+fn capabilities_body(
+    catalogue: &CatalogueView,
+    session: Option<&SessionProjection>,
+    extensions: Option<&ExtensionsReport>,
+    width: usize,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(truncate("scope", width));
+    match session {
+        Some(session) => {
+            lines.push(truncate(
+                &format!(
+                    "  granted scope   {}",
+                    permission_scope(&session.config.permission)
+                ),
+                width,
+            ));
+            lines.push(truncate(
+                &format!("  bound session   {}", session.session_id),
+                width,
+            ));
+            lines.push(String::new());
+            lines.push(truncate("approval decisions", width));
+            let statuses = [
+                (ApprovalStatus::Pending, "requested"),
+                (ApprovalStatus::Approved, "approved"),
+                (ApprovalStatus::Rejected, "denied"),
+                (ApprovalStatus::Expired, "expired"),
+                (ApprovalStatus::Cancelled, "cancelled"),
+            ];
+            for (status, label) in statuses {
+                let approvals: Vec<_> = session
+                    .approvals
+                    .iter()
+                    .filter(|approval| approval.status == status)
+                    .collect();
+                if approvals.is_empty() {
+                    continue;
+                }
+                lines.push(truncate(&format!("  {label} · {}", approvals.len()), width));
+                for approval in approvals {
+                    let resource = approval
+                        .action
+                        .resource
+                        .as_deref()
+                        .map(|value| format!(" · {value}"))
+                        .unwrap_or_default();
+                    lines.extend(wrap(
+                        "    ",
+                        &format!(
+                            "{} · {} / {}{} · expires {}",
+                            approval.approval_id,
+                            approval.action.tool,
+                            approval.action.action,
+                            resource,
+                            approval
+                                .expires_at
+                                .with_timezone(&chrono::Local)
+                                .format("%H:%M")
+                        ),
+                        width,
+                    ));
+                }
+            }
+            if session.approvals.is_empty() {
+                lines.push(truncate("  no approval requests for this session", width));
+            }
+        }
+        None => lines.extend(wrap(
+            "  approval mode   ",
+            "no session open — Ctrl-T creates one",
+            width,
+        )),
+    }
+    if !catalogue.workspace_root.is_empty() {
+        lines.push(truncate(
+            &format!("  workspace       {}", catalogue.workspace_root),
+            width,
+        ));
+    }
+    lines.push(String::new());
+    lines.push(truncate("available tools", width));
+    if catalogue.mcp.is_empty() {
+        lines.extend(wrap(
+            "  ",
+            "no MCP server is configured in bsh settings or installed extensions",
+            width,
+        ));
+    }
+    for server in &catalogue.mcp {
+        let source = if server.extension {
+            "extension"
+        } else {
+            "settings"
+        };
+        lines.push(truncate(
+            &format!("  {} · {source} · {}", server.name, mcp_state(server)),
+            width,
+        ));
+        lines.push(truncate(&format!("    {}", server.transport), width));
+        // Only a connected server has tools to name: an entry that is disabled
+        // or failed says why above rather than claiming a roster it never
+        // fetched.
+        if !server.tools.is_empty() {
+            lines.extend(wrap(
+                "    ",
+                &format!("tools: {}", server.tools.join(", ")),
+                width,
+            ));
+        }
+        lines.push(String::new());
+    }
+    if let Some(report) = extensions {
+        for extension in &report.extensions {
+            if !extension.applied && extension.capabilities.is_empty() && extension.tools.is_empty()
+            {
+                continue;
+            }
+            lines.push(truncate(
+                &format!("  {} · extension · {}", extension.name, extension.state),
+                width,
+            ));
+            if !extension.tools.is_empty() {
+                lines.extend(wrap(
+                    "    ",
+                    &format!("available tools: {}", extension.tools.join(", ")),
+                    width,
+                ));
+            }
+            for capability in &extension.capabilities {
+                let decision = if capability.allowed {
+                    format!(
+                        "granted · {}",
+                        capability.scope.as_deref().unwrap_or("unscoped")
+                    )
+                } else {
+                    format!(
+                        "denied · {}",
+                        capability.reason.as_deref().unwrap_or("policy")
+                    )
+                };
+                lines.extend(wrap(
+                    "    ",
+                    &format!(
+                        "{} · {} · risk {}{}",
+                        capability.capability,
+                        decision,
+                        capability.risk,
+                        if capability.required {
+                            " · required"
+                        } else {
+                            " · optional"
+                        }
+                    ),
+                    width,
+                ));
+            }
+        }
+        if report.state != "ready" {
+            lines.extend(wrap(
+                "  ",
+                &format!(
+                    "extension capabilities {}{}",
+                    report.state,
+                    report
+                        .error
+                        .as_deref()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                ),
+                width,
+            ));
+        }
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+/// The `/capabilities` status line: the scope in force and how many servers and
+/// tools the roster names.
+fn capabilities_summary(catalogue: &CatalogueView, session: Option<&SessionProjection>) -> String {
+    let tools: usize = catalogue.mcp.iter().map(|server| server.tools.len()).sum();
+    let scope = match session {
+        Some(session) => session.config.permission.clone(),
+        None => "no session open".to_string(),
+    };
+    format!(
+        "capabilities · {scope} · {} server(s) · {tools} tool(s) · Up/Down scrolls · Esc closes",
+        catalogue.mcp.len()
+    )
+}
+
+/// The Capabilities pane: its title, then the body windowed to `rows`.
+fn capabilities_pane(
+    pane: &CapabilitiesPane,
+    catalogue: &CatalogueView,
+    session: Option<&SessionProjection>,
+    width: usize,
+    rows: usize,
+) -> Vec<String> {
+    let rows = rows.max(1);
+    let body_rows = rows.saturating_sub(1);
+    let body = capabilities_body(catalogue, session, pane.extensions.as_ref(), width);
+    let total = body.len();
+    let start = pane.scroll.min(total.saturating_sub(body_rows));
+    let end = (start + body_rows).min(total);
+    let mut lines = Vec::with_capacity(rows);
+    lines.push(truncate(&capabilities_summary(catalogue, session), width));
+    lines.extend(body[start..end].iter().cloned());
+    lines.resize(rows, String::new());
+    lines
 }
 
 /// One record as the Memory pane lists it: the text, then the facts the
@@ -7908,6 +9448,24 @@ fn tasks_count(report: &TaskBoardReport) -> usize {
         .sum()
 }
 
+/// The rows one filter keeps, across every section of the board.
+///
+/// The title pairs it with [`tasks_count`] so a narrowed board says how many
+/// of the board's rows it is showing rather than how many there are.
+fn tasks_kept_count(report: &TaskBoardReport, filter: TaskFilter) -> usize {
+    report
+        .sections
+        .iter()
+        .map(|section| {
+            section
+                .rows
+                .iter()
+                .filter(|row| filter.keeps(&section.section, &row.status))
+                .count()
+        })
+        .sum()
+}
+
 /// The rows one section holds, by the board's own section name.
 fn tasks_section_count(report: &TaskBoardReport, name: &str) -> usize {
     report
@@ -7991,7 +9549,7 @@ fn tasks_body(pane: &TasksPane, width: usize, now: DateTime<Utc>) -> Vec<String>
     if pane.graph {
         return tasks_graph_body(&pane.report, width, now);
     }
-    tasks_board_body(&pane.report, width, now)
+    tasks_board_body(&pane.report, pane.filter, width, now)
 }
 
 /// One task's record, laid out as the desktop's expanded card reads it.
@@ -8142,7 +9700,12 @@ fn one_line(text: &str) -> String {
 
 /// The board body when no task is open: the four sections, each under its own
 /// header.
-fn tasks_board_body(report: &TaskBoardReport, width: usize, now: DateTime<Utc>) -> Vec<String> {
+fn tasks_board_body(
+    report: &TaskBoardReport,
+    filter: TaskFilter,
+    width: usize,
+    now: DateTime<Utc>,
+) -> Vec<String> {
     if !tasks_ready(report) {
         return tasks_unready_body(report, width);
     }
@@ -8155,6 +9718,19 @@ fn tasks_board_body(report: &TaskBoardReport, width: usize, now: DateTime<Utc>) 
     }
     let mut lines: Vec<String> = Vec::new();
     for section in &report.sections {
+        // The filter is a window over the board this client already holds, so
+        // under a filter a section with nothing kept is absent rather than an
+        // empty heading: "QUEUED · 0 task(s)" would say the filter found a
+        // section, which is exactly what it did not do. Unfiltered, the zero
+        // stays - what the board holds and holds nothing of is a fact.
+        let rows: Vec<&TaskRowView> = section
+            .rows
+            .iter()
+            .filter(|row| filter.keeps(&section.section, &row.status))
+            .collect();
+        if rows.is_empty() && filter != TaskFilter::All {
+            continue;
+        }
         if !lines.is_empty() {
             lines.push(String::new());
         }
@@ -8162,13 +9738,23 @@ fn tasks_board_body(report: &TaskBoardReport, width: usize, now: DateTime<Utc>) 
             &format!(
                 "{} · {} task(s)",
                 section.section.to_uppercase(),
-                section.rows.len()
+                rows.len()
             ),
             width,
         ));
-        for row in &section.rows {
+        for row in rows {
             lines.push(tasks_row(row, width, now));
         }
+    }
+    if lines.is_empty() {
+        return wrap(
+            "  ",
+            &format!(
+                "the board holds no {} task; /tasks all lists every task",
+                filter.name()
+            ),
+            width,
+        );
     }
     lines
 }
@@ -8402,9 +9988,22 @@ fn tasks_title(pane: &TasksPane) -> String {
             tasks_edge_count(report)
         );
     }
+    // The filter is a window over the board, so the title leads with it when
+    // one is in force: a narrow board must not read as a small workspace.
+    let filter = match pane.filter {
+        TaskFilter::All => String::new(),
+        filter => format!("{} only · ", filter.name()),
+    };
+    let counted = match pane.filter {
+        TaskFilter::All => format!("{} task(s)", tasks_count(report)),
+        filter => format!(
+            "{} of {} task(s)",
+            tasks_kept_count(report, filter),
+            tasks_count(report)
+        ),
+    };
     format!(
-        "tasks · {place} · {} task(s) · {} running · /tasks <id> opens one · Up/Down scrolls · Esc closes",
-        tasks_count(report),
+        "tasks · {filter}{place} · {counted} · {} running · /tasks <id> opens one · /tasks <filter> narrows · Up/Down scrolls · Esc closes",
         tasks_section_count(report, "running")
     )
 }
@@ -8480,6 +10079,33 @@ fn trajectory_duration(ms: u64) -> String {
         return format!("{minutes}m {:02}s", seconds % 60);
     }
     format!("{}h {:02}m", minutes / 60, minutes % 60)
+}
+
+/// Host uptime as elapsed wall time, rounded down to its largest useful unit.
+fn elapsed_label(now: DateTime<Utc>, started: DateTime<Utc>) -> String {
+    let seconds = (now - started).num_seconds().max(0) as u64;
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60),
+        _ => format!("{}d {}h", seconds / 86_400, (seconds % 86_400) / 3_600),
+    }
+}
+
+#[cfg(test)]
+mod host_uptime_tests {
+    use super::elapsed_label;
+    use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn uptime_uses_the_largest_readable_elapsed_unit() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 27, 12, 0, 0).unwrap();
+        assert_eq!(elapsed_label(now, now - Duration::seconds(12)), "12s");
+        assert_eq!(elapsed_label(now, now - Duration::minutes(5)), "5m");
+        assert_eq!(elapsed_label(now, now - Duration::minutes(134)), "2h 14m");
+        assert_eq!(elapsed_label(now, now - Duration::hours(50)), "2d 2h");
+        assert_eq!(elapsed_label(now, now + Duration::minutes(1)), "0s");
+    }
 }
 
 /// One instant as the row's clock, in the terminal's own zone: a reader
@@ -8727,7 +10353,7 @@ fn task_detail_summary(detail: &TaskDetailReport) -> String {
 }
 
 /// The `/tasks` status line: the board's numbers and how to leave it.
-fn tasks_summary(report: &TaskBoardReport) -> String {
+fn tasks_summary(report: &TaskBoardReport, filter: TaskFilter) -> String {
     if !tasks_ready(report) {
         return tasks_unready_status(report, "tasks");
     }
@@ -8739,6 +10365,15 @@ fn tasks_summary(report: &TaskBoardReport) -> String {
         tasks_section_count(report, "scheduled"),
         tasks_section_count(report, "history")
     );
+    // The filter is the frame's own window, so the line names the one in force
+    // and the word that lifts it: a reader who narrowed the board and forgot
+    // would otherwise read these counts as the whole board's.
+    if filter != TaskFilter::All {
+        line.push_str(&format!(
+            " · {} only · /tasks all lifts the filter",
+            filter.name()
+        ));
+    }
     line.push_str(" · Esc closes · Up/Down scrolls");
     line
 }
@@ -9088,7 +10723,7 @@ fn subagent_row(
         index + 1,
         subagent_state(run),
         subagent_elapsed(run, now),
-        crate::state::human_tokens(subagent_tokens(run))
+        crate::runtime::format::human_tokens(subagent_tokens(run))
     );
     if run.steps > 0 {
         row.push_str(&format!(" · {} step(s)", run.steps));
@@ -9118,7 +10753,7 @@ fn subagent_detail(run: &SubagentRunView, width: usize, now: DateTime<Utc>) -> V
             "RUN · {title} · {} · {} · {} tok",
             subagent_state(run),
             subagent_elapsed(run, now),
-            crate::state::human_tokens(subagent_tokens(run))
+            crate::runtime::format::human_tokens(subagent_tokens(run))
         ),
         width,
     )];
@@ -10082,8 +11717,8 @@ fn extensions_summary(report: &ExtensionsReport, filter: Option<&str>) -> String
 
 /// The word the terminal prints for a call's family: the desktop AUDIT page's
 /// own categories, so the two surfaces name a call the same way.
-fn audit_category_word(category: crate::audit::AuditCategory) -> &'static str {
-    use crate::audit::AuditCategory;
+fn audit_category_word(category: crate::runtime::audit_view::AuditCategory) -> &'static str {
+    use crate::runtime::audit_view::AuditCategory;
     match category {
         AuditCategory::FileRead => "read",
         AuditCategory::FileWrite => "write",
@@ -10122,8 +11757,10 @@ fn audit_turn_of(session: &SessionProjection, call: &ToolCallView) -> Option<usi
 /// path with spaces is one filter like any other.
 fn audit_matches(call: &ToolCallView, filter: &str) -> bool {
     let filter = filter.to_lowercase();
-    let category = audit_category_word(crate::audit::AuditCategory::classify(&call.tool));
-    let target = crate::audit::target_of(&call.args);
+    let category = audit_category_word(crate::runtime::audit_view::AuditCategory::classify(
+        &call.tool,
+    ));
+    let target = crate::runtime::audit_view::target_of(&call.args);
     let outcome = audit_outcome_word(call.status);
     call.tool.to_lowercase().contains(&filter)
         || target.to_lowercase().contains(&filter)
@@ -10138,8 +11775,10 @@ fn audit_matches(call: &ToolCallView, filter: &str) -> bool {
 /// does not render an unbounded output or invent a second redaction rule for
 /// it.
 fn audit_row(session: &SessionProjection, call: &ToolCallView, width: usize) -> Vec<String> {
-    let category = audit_category_word(crate::audit::AuditCategory::classify(&call.tool));
-    let target = crate::audit::target_of(&call.args);
+    let category = audit_category_word(crate::runtime::audit_view::AuditCategory::classify(
+        &call.tool,
+    ));
+    let target = crate::runtime::audit_view::target_of(&call.args);
     let mut line = String::from("• ");
     if let Some(turn) = audit_turn_of(session, call) {
         line.push_str(&format!("T{turn} "));
@@ -10157,7 +11796,7 @@ fn audit_row(session: &SessionProjection, call: &ToolCallView, width: usize) -> 
         line.push_str(&format!(" · {ms}ms"));
     }
     let mut rows = vec![truncate(&line, width)];
-    let preview = crate::audit::preview(
+    let preview = crate::runtime::audit_view::preview(
         call.output
             .as_deref()
             .filter(|output| !output.trim().is_empty())
@@ -10325,9 +11964,11 @@ fn hero_rows(
         }
         // Nothing to resolve yet: the Host answers the catalogue before it
         // answers a session list, so the card names the key that starts one.
+        // The chords are the two the footer keeps for walking sessions, which
+        // leaves `^P` to the palette.
         None => rows.extend(wrap(
             "│ ",
-            "no session open · ^T starts one · ^N/^P walk them",
+            "no session open · ^T starts one · ^N/^B walk them",
             width,
         )),
     }
@@ -10376,8 +12017,8 @@ fn session_usage(session: &SessionProjection) -> Option<TurnUsage> {
 /// It shows the compact total the pill shows, plus the cache share when the
 /// provider reported one; `/usage` is where the exact figures are.
 fn usage_chip(usage: &TurnUsage) -> String {
-    let total = crate::state::human_tokens(usage.total());
-    match crate::state::cache_hit_percent(usage.cached_tokens, usage.prompt_tokens) {
+    let total = crate::runtime::format::human_tokens(usage.total());
+    match crate::runtime::format::cache_hit_percent(usage.cached_tokens, usage.prompt_tokens) {
         Some(percent) => format!("usage {total} · {percent}% cached"),
         None => format!("usage {total}"),
     }
@@ -10427,6 +12068,13 @@ fn pick_command(choice: picker::Choice) -> SlashCommand {
         // A hit's row is numbered from one, and `/find #12` is the line that
         // reveals the row this pick reveals.
         picker::Choice::Find(row) => SlashCommand::Find(format!("#{}", row + 1)),
+        // The palette's row prints the line it runs, so the pick is that line
+        // parsed by the composer's own reader. A row the parser does not know
+        // says so, exactly as typing it would: the palette cannot invent a
+        // command the client does not answer.
+        picker::Choice::Command(line) => {
+            SlashCommand::parse(&line).unwrap_or(SlashCommand::Unknown(line))
+        }
     }
 }
 
@@ -10816,16 +12464,30 @@ fn approval_card(
             wrap(" ", summary, inner)
         }
     };
+    // The decision is bound to this exact canonical reference. It is more
+    // important than explanatory prose: a short terminal may omit part of the
+    // summary, but must show which immutable action the Host will decide.
+    let digest_rows = wrap(" digest ", approval.action_digest.as_str(), inner);
     let mut shown_resource = 0usize;
+    let mut shown_digest = 0usize;
     let mut shown_summary = 0usize;
-    while shown_resource + shown_summary < elastic
-        && (shown_resource < resource_rows.len() || shown_summary < summary_rows.len())
+    while shown_resource + shown_digest + shown_summary < elastic
+        && (shown_resource < resource_rows.len()
+            || shown_digest < digest_rows.len()
+            || shown_summary < summary_rows.len())
     {
         if shown_resource < resource_rows.len() {
             shown_resource += 1;
         }
-        if shown_resource + shown_summary < elastic && shown_summary < summary_rows.len() {
+        if shown_resource + shown_digest + shown_summary < elastic
+            && shown_summary < summary_rows.len()
+        {
             shown_summary += 1;
+        }
+        if shown_resource + shown_digest + shown_summary < elastic
+            && shown_digest < digest_rows.len()
+        {
+            shown_digest += 1;
         }
     }
     // A summary has a share of its own as well: one long reason may not take
@@ -10838,6 +12500,14 @@ fn approval_card(
             inner,
         );
         rows.push(card_row(&text, "", Tone::Body, Tone::Muted, skin, width));
+    }
+    for (index, row) in digest_rows.iter().take(shown_digest).enumerate() {
+        let text = cut_mark(
+            row,
+            digest_rows.len() > shown_digest && index + 1 == shown_digest,
+            inner,
+        );
+        rows.push(card_row(&text, "", Tone::Muted, Tone::Muted, skin, width));
     }
     for (index, row) in summary_rows.iter().take(shown_summary).enumerate() {
         let text = cut_mark(
@@ -10898,9 +12568,10 @@ struct ApprovalChoice {
 
 /// The choices the card draws, in the order it draws them.
 ///
-/// The order is the order the Host's verdicts are weighed in: the card opens on
-/// the first, which is the one a reader who asked for the work almost always
-/// means, and a refusal is one row down rather than a chord they have to know.
+/// The verdicts are ordered as they are weighed - what the action would do
+/// first, then the refusal - because a reader scanning the card reads the
+/// consequence before the escape. The card does *not* open on that first row:
+/// see [`APPROVAL_DEFAULT`].
 const APPROVAL_CHOICES: &[ApprovalChoice] = &[
     ApprovalChoice {
         label: "approve",
@@ -10915,6 +12586,15 @@ const APPROVAL_CHOICES: &[ApprovalChoice] = &[
         approve: false,
     },
 ];
+
+/// The row a fresh card opens on: the refusal.
+///
+/// The specification is explicit that the default focus must not be the
+/// approval - a reader has to inspect the target, the scope and the expiry
+/// before a keystroke can authorise a side effect, and a card that opens on
+/// `approve` turns a stray Enter into one. Consent stays a single keystroke:
+/// the approving chord is `^Y`, and the row is one press down.
+const APPROVAL_DEFAULT: usize = 1;
 
 /// The rows the approval card draws before any wrapped part: two edges, the
 /// call, and one row per choice.
@@ -11237,13 +12917,19 @@ fn detail_pane(
     scroll: usize,
 ) -> Vec<String> {
     let rows = rows.max(1);
-    let Some(call) = session.and_then(|session| session.tool_calls.get(index)) else {
+    let Some(session) = session else {
         let mut lines =
             vec!["detail · that tool call is no longer in the projection · Esc closes".to_string()];
         lines.resize(rows, String::new());
         return lines;
     };
-    let total = session.map_or(0, |session| session.tool_calls.len());
+    let Some(call) = session.tool_calls.get(index) else {
+        let mut lines =
+            vec!["detail · that tool call is no longer in the projection · Esc closes".to_string()];
+        lines.resize(rows, String::new());
+        return lines;
+    };
+    let total = session.tool_calls.len();
     let duration = call
         .duration_ms
         .map(|ms| format!(" · {ms}ms"))
@@ -11257,7 +12943,7 @@ fn detail_pane(
         duration
     );
     let body_rows = rows.saturating_sub(1);
-    let body = fold_rows(detail_block(call, width), DETAIL_ROWS);
+    let body = fold_rows(detail_block(session, call, width), DETAIL_ROWS);
     let body_total = body.len();
     // Only content taller than the pane can scroll, so a short call never
     // scrolls away from its first row however many times the key was pressed.
@@ -11278,8 +12964,8 @@ fn detail_pane(
 /// is the rest of what the Host recorded - the request the model made and the
 /// whole output it got back - because a one-line summary cannot answer "what
 /// exactly did it run?".
-fn detail_block(call: &ToolCallView, width: usize) -> Vec<String> {
-    let mut lines = vec!["args".to_string()];
+fn detail_block(session: &SessionProjection, call: &ToolCallView, width: usize) -> Vec<String> {
+    let mut lines = vec!["input · args".to_string()];
     lines.extend(indented("  ", call.args.trim(), width));
     if !call.summary.trim().is_empty() {
         lines.push("summary".to_string());
@@ -11295,7 +12981,78 @@ fn detail_block(call: &ToolCallView, width: usize) -> Vec<String> {
         // this row only records that there is nothing to read.
         _ => lines.push(format!("output · none · {}", status_word(call.status))),
     }
+    lines.push("AUTHORIZATION".to_string());
+    let approvals: Vec<_> = session
+        .approvals
+        .iter()
+        .filter(|approval| Some(approval.execution_id) == call.execution_id)
+        .collect();
+    if approvals.is_empty() {
+        lines.push("  no approval recorded for this execution".to_string());
+    } else {
+        for approval in approvals {
+            let resource = approval
+                .action
+                .resource
+                .as_deref()
+                .map(|resource| format!(" on {resource}"))
+                .unwrap_or_default();
+            lines.extend(wrap(
+                "  ",
+                &format!(
+                    "{} {}{} · {} · ref {} · expires {}",
+                    approval.action.tool,
+                    approval.action.action,
+                    resource,
+                    approval_status_word(approval.status),
+                    approval.action_digest,
+                    approval
+                        .expires_at
+                        .with_timezone(&Local)
+                        .format("%Y-%m-%d %H:%M:%S"),
+                ),
+                width,
+            ));
+        }
+    }
+    lines.push("DIAGNOSTICS".to_string());
+    lines.push(format!("  tool state · {}", status_word(call.status)));
+    lines.push(format!("  started · {}", trajectory_clock(call.started_at)));
+    if let Some(ms) = call.duration_ms {
+        lines.push(format!("  duration · {}", trajectory_duration(ms)));
+    }
+    if let Some(execution_id) = call.execution_id
+        && let Some(execution) = session
+            .executions
+            .iter()
+            .find(|execution| execution.execution_id == execution_id)
+    {
+        lines.push(format!(
+            "  execution · {}",
+            short(&execution_id.to_string())
+        ));
+        lines.push(format!("  execution state · {:?}", execution.status));
+        if let Some(detail) = execution
+            .detail
+            .as_deref()
+            .filter(|detail| !detail.is_empty())
+        {
+            let safe = crate::runtime::audit_view::redact_secrets(detail);
+            lines.extend(indented("  ", &safe, width));
+        }
+    }
     lines
+}
+
+/// The Host's approval lifecycle word, as the Inspector prints it.
+fn approval_status_word(status: ApprovalStatus) -> &'static str {
+    match status {
+        ApprovalStatus::Pending => "pending",
+        ApprovalStatus::Approved => "approved",
+        ApprovalStatus::Rejected => "denied",
+        ApprovalStatus::Expired => "expired",
+        ApprovalStatus::Cancelled => "cancelled",
+    }
 }
 
 /// One text block with a two-cell gutter, breaking wide rows at the pane.
@@ -11363,6 +13120,76 @@ fn rule(width: usize) -> String {
     "─".repeat(width)
 }
 
+/// The concept's header bar: the brand and the frame's facts on the left, the
+/// host's verdict against the right edge.
+///
+/// The mock reserves its right edge for the connection state, so a reader finds
+/// that fact in the same place whether they are looking at the concept or the
+/// terminal. When the two halves do not both fit, the facts give way first: the
+/// verdict is one word, and the facts are all re-derivable from the transcript.
+fn header_bar(
+    left: &[(String, Tone)],
+    right: &(String, Tone),
+    width: usize,
+) -> Vec<(String, Tone)> {
+    let right_width = cells(&right.0);
+    // A row narrower than the verdict itself has no edge to align to: the state
+    // is cut to what the row holds, because half of it is still the truth.
+    if right_width >= width {
+        return vec![(truncate(&right.0, width), right.1)];
+    }
+    // The gap that keeps the verdict off the facts even when the row is full.
+    let room = width.saturating_sub(right_width + 3);
+    let mut runs = fit_runs(left, room);
+    let used: usize = runs.iter().map(|(text, _)| cells(text)).sum();
+    let gap = width.saturating_sub(used + right_width);
+    if gap > 0 {
+        runs.push((" ".repeat(gap), Tone::Body));
+    }
+    runs.push((right.0.clone(), right.1));
+    runs
+}
+
+/// The concept's status bar: what the frame is set to at the left edge, the keys
+/// this state needs at the right.
+///
+/// A row too narrow for both keeps the keys: the mode describes the frame, and
+/// the keys change what the reader can do next.
+fn status_bar(mode: &str, keys: &str, width: usize) -> Vec<(String, Tone)> {
+    let used = cells(mode) + cells(keys);
+    if used + 3 > width {
+        return vec![(keys.to_string(), Tone::Muted)];
+    }
+    vec![
+        (mode.to_string(), Tone::Muted),
+        (" ".repeat(width - used), Tone::Body),
+        (keys.to_string(), Tone::Muted),
+    ]
+}
+
+/// The longest prefix of `runs` that fits `room` cells, the last one cut.
+///
+/// A bar is chrome, so a fact that does not fit is dropped rather than wrapped:
+/// a wrapped header would take a body row from the transcript.
+fn fit_runs(runs: &[(String, Tone)], room: usize) -> Vec<(String, Tone)> {
+    let mut fitted: Vec<(String, Tone)> = Vec::new();
+    let mut used = 0usize;
+    for (text, tone) in runs {
+        let needed = cells(text);
+        if used + needed <= room {
+            used += needed;
+            fitted.push((text.clone(), *tone));
+            continue;
+        }
+        let left = room.saturating_sub(used);
+        if left > 1 {
+            fitted.push((truncate(text, left), *tone));
+        }
+        break;
+    }
+    fitted
+}
+
 /// The width of `text` in terminal cells.
 ///
 /// A row is measured in the cells the terminal paints, not in characters: a
@@ -11371,7 +13198,7 @@ fn rule(width: usize) -> String {
 /// border and wraps a paragraph a cell too wide. Every writer in this module
 /// measures with this, so a title, a wrapped paragraph, the composer's cursor
 /// and the frame's borders all agree on what fits.
-fn cells(text: &str) -> usize {
+pub(crate) fn cells(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
@@ -11397,7 +13224,12 @@ fn break_cells(text: &str, room: usize) -> Vec<String> {
     pieces
 }
 
-fn truncate(text: &str, width: usize) -> String {
+pub(crate) fn truncate(text: &str, width: usize) -> String {
+    // The width is measured on what the row will actually show: a control
+    // character becomes a space before anything is counted, so a title that
+    // arrived with a line break in it is still one row of `width` cells.
+    let flat = crate::tui::skin::flatten(text);
+    let text: &str = flat.as_ref();
     if cells(text) <= width {
         return text.to_string();
     }
@@ -12072,10 +13904,16 @@ mod tests {
             Some(SlashCommand::Rename(Some("Release the hounds".to_string()))),
             "a title keeps the spaces between its words"
         );
-        assert_eq!(SlashCommand::parse("/plan"), Some(SlashCommand::Plan(None)));
+        // The bare command ENTERS plan mode, the desktop's own rule; `off`
+        // leaves it; anything else is the task the plan is for.
+        assert_eq!(SlashCommand::parse("/plan"), Some(SlashCommand::Plan(true)));
         assert_eq!(
             SlashCommand::parse("/plan off"),
-            Some(SlashCommand::Plan(Some(false)))
+            Some(SlashCommand::Plan(false))
+        );
+        assert_eq!(
+            SlashCommand::parse("/plan build the thing"),
+            Some(SlashCommand::PlanTask("build the thing".to_string()))
         );
         assert_eq!(
             SlashCommand::parse("/model test fast"),
@@ -12088,10 +13926,11 @@ mod tests {
             SlashCommand::parse("/model test"),
             Some(SlashCommand::Usage(_))
         ));
-        assert!(matches!(
+        assert_eq!(
             SlashCommand::parse("/plan maybe"),
-            Some(SlashCommand::Usage(_))
-        ));
+            Some(SlashCommand::PlanTask("maybe".to_string())),
+            "a word that is not a control word is the task"
+        );
         assert_eq!(
             SlashCommand::parse("/queue clear"),
             Some(SlashCommand::Queue(Some("clear".to_string())))
@@ -12267,6 +14106,11 @@ mod tests {
             "a summary that fits is drawn whole, not cut: {text}"
         );
         assert!(
+            text.replace(' ', "")
+                .contains(approval.action_digest.as_str()),
+            "the full canonical decision reference is visible: {text}"
+        );
+        assert!(
             rows[rows.len() - 1].starts_with('╰'),
             "the card closes under its last row"
         );
@@ -12301,6 +14145,10 @@ mod tests {
             "every cell of the path is on the card: {text}"
         );
         assert!(
+            text.contains(approval.action_digest.as_str()),
+            "the full decision reference survives a narrow frame: {text}"
+        );
+        assert!(
             rows[0].contains("30s left"),
             "the deadline survives a narrow frame: {:?}",
             rows[0]
@@ -12329,7 +14177,7 @@ mod tests {
         // the two edges.
         assert_eq!(
             rows.len(),
-            2 + 1 + MAX_APPROVAL_SUMMARY + APPROVAL_CHOICES.len() + 1,
+            2 + 1 + 2 + MAX_APPROVAL_SUMMARY + APPROVAL_CHOICES.len() + 1,
             "the cap holds the card's height: {rows:?}"
         );
         assert!(
@@ -12370,6 +14218,63 @@ mod tests {
             "a target with no resource is still two named parts: {:?}",
             more[1]
         );
+    }
+
+    /// The concept's approval rule, kept where it can be read: a fresh card
+    /// stands on the refusal, so Enter cannot authorise a side effect the reader
+    /// has not looked at yet. Consent stays one keystroke, on its own chord.
+    #[test]
+    fn an_approval_card_opens_on_the_refusal_not_the_approval() {
+        let at = Utc::now();
+        let approval = ApprovalView {
+            approval_id: crate::runtime::ids::ApprovalId::new(),
+            session_id: SessionId::new(),
+            execution_id: ExecutionId::new(),
+            summary: "write every generated page".to_string(),
+            action: ApprovalTarget {
+                tool: "files".to_string(),
+                action: "write".to_string(),
+                resource: Some("/w/site/index.html".to_string()),
+            },
+            action_digest: crate::runtime::ids::ActionDigest::of(&"files.write"),
+            status: ApprovalStatus::Pending,
+            expires_at: at + chrono::Duration::minutes(4),
+        };
+        assert!(
+            !APPROVAL_CHOICES[APPROVAL_DEFAULT].approve,
+            "the default row refuses: {:?}",
+            APPROVAL_CHOICES[APPROVAL_DEFAULT]
+        );
+        // Both rows are still drawn, and the approving chord is still named, so
+        // the reader who does mean to approve is not slowed to a hunt.
+        let rows = approval_card(
+            &approval,
+            1,
+            at,
+            Skin::plain(),
+            60,
+            approval_budget(24),
+            APPROVAL_DEFAULT,
+        )
+        .0
+        .iter()
+        .map(painted)
+        .collect::<Vec<String>>();
+        let text = card_text(&rows);
+        assert!(
+            text.contains("approve"),
+            "the approval keeps its row: {text}"
+        );
+        assert!(text.contains("reject"), "the refusal keeps its row: {text}");
+        let highlight = rows
+            .iter()
+            .find(|row| row.contains('›'))
+            .unwrap_or_else(|| panic!("the card marks one row: {rows:?}"));
+        assert!(
+            highlight.contains("reject"),
+            "the bar stands on the refusal: {highlight:?}"
+        );
+        assert!(highlight.contains("^R"), "{highlight:?}");
     }
 
     #[test]
@@ -12758,6 +14663,45 @@ mod tests {
         assert_eq!(cursor, (0, 2));
     }
 
+    /// An empty composer says what the box is for, in the muted ink a
+    /// placeholder takes, so the reader cannot mistake it for a line they wrote.
+    #[test]
+    fn an_empty_composer_offers_the_boxes_own_invitation() {
+        let runs = composer_hint(80);
+        assert_eq!(runs[0], ("› ".to_string(), Tone::Accent));
+        assert_eq!(
+            runs[1].1,
+            Tone::Muted,
+            "the words are dimmer than the marker"
+        );
+        assert!(runs[1].0.starts_with("Ask Bos"), "{:?}", runs[1].0);
+        // A narrow frame keeps the marker and clips the words to the room the
+        // marker leaves, rather than pushing the row past the frame.
+        let narrow = composer_hint(12);
+        let used: usize = narrow.iter().map(|(text, _)| cells(text)).sum();
+        assert!(used <= 12, "{narrow:?} overflows a 12-cell frame");
+        assert_eq!(narrow[0].0, "› ");
+        assert!(narrow[1].0.ends_with('…'), "{:?}", narrow[1].0);
+        // The hint is the empty box's alone: a typed line paints its own words.
+        let (rows, _) = composer("hi", 2, 12);
+        assert_eq!(rows, vec!["› hi".to_string()]);
+    }
+
+    #[test]
+    fn the_empty_composer_exposes_quick_commands_and_a_send_control() {
+        let row = quick_actions(80);
+        for command in ["/help", "/agents", "/tools", "/jobs", "/settings"] {
+            assert!(row.contains(command), "{command} is visible in {row:?}");
+        }
+        assert!(row.ends_with("[➤]"), "send control is visible: {row:?}");
+        assert!(cells(&row) <= 80, "the control row stays in its column");
+        assert_eq!(quick_command_at(0), Some("/help"));
+        assert_eq!(quick_command_at(8), Some("/agents"));
+        assert_eq!(quick_command_at(18), Some("/tools"));
+        assert_eq!(quick_command_at(27), Some("/jobs"));
+        assert_eq!(quick_command_at(35), Some("/settings"));
+    }
+
     /// Home and End are line gestures on a multi-line draft: the cursor lands
     /// on the edge of its own line, never on the edge of the whole prompt.
     #[test]
@@ -13137,40 +15081,116 @@ mod tests {
         );
     }
 
-    /// The rail's rows are the sessions it paints, and only those: a click
-    /// past the list, on the separator beside it or in a frame too narrow to
-    /// have a rail opens no session.
+    /// The rail's rows are the slots a click reads: the frame records what each
+    /// painted destination names, while headings and view notes remain inert.
     #[test]
-    fn a_click_names_a_rail_row_only_inside_the_list() {
-        // A hundred-column frame draws a twenty-five-cell rail; row 2 is the
-        // body's first row, directly under the header and its rule.
-        assert_eq!(rail_offset(2, 0, 100, 20), Some(0));
-        assert_eq!(
-            rail_offset(3, 24, 100, 20),
-            Some(1),
-            "the list's second row is the frame's third"
-        );
-        assert_eq!(
-            rail_offset(21, 24, 100, 20),
-            Some(19),
-            "the last body row is still the rail's"
-        );
-        assert_eq!(
-            rail_offset(2, 25, 100, 20),
-            None,
-            "the separator column is not a session row"
-        );
-        assert_eq!(rail_offset(1, 3, 100, 20), None, "the header names nothing");
-        assert_eq!(
-            rail_offset(22, 3, 100, 20),
-            None,
-            "a row below the body is the composer's"
-        );
-        // A narrow frame paints no rail at all: its first column is the
-        // transcript's.
-        assert_eq!(rail_offset(2, 0, 60, 20), None);
-        // Before the first frame is painted there is no rail to name.
-        assert_eq!(rail_offset(2, 0, 0, 20), None);
+    fn a_rail_click_reads_the_row_the_frame_painted() {
+        let rail = nav::Nav {
+            active: Some(nav::Hit::Workspace(0)),
+            status: ("● BSH · Ready".to_string(), Tone::Ok),
+            version: "0.1.0",
+            view: "Adaptive",
+            collapsed: false,
+        };
+        let (painted, hits) = nav::lines(&rail, 24, 24);
+        // One slot per painted row, so a click inside the body - counted from
+        // the same top the painter counted from - never reads past the rail.
+        assert_eq!(hits.len(), painted.len());
+        assert_eq!(hits.len(), 24);
+        let text = |row: &nav::Row| -> String {
+            row.iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<String>()
+        };
+        let heading = painted
+            .iter()
+            .position(|row| text(row).contains("Views"))
+            .expect("the rail heads its views");
+        assert_eq!(hits[heading], None, "a heading names nothing");
+        let view_row = painted
+            .iter()
+            .position(|row| text(row).contains("Sidebar"))
+            .expect("the rail lists the Sidebar view");
+        assert_eq!(hits[view_row], None, "a view label is not a destination");
+    }
+
+    /// The concept's adaptive table, measured: below eighty cells the frame is
+    /// one column, from eighty a rail joins the transcript, and from a hundred
+    /// and twenty the inspector takes the right edge. Every band keeps the
+    /// transcript wide enough to read, which is the property the table is for.
+    #[test]
+    fn the_frame_folds_into_the_columns_its_width_allows() {
+        for width in [40, 64, 79] {
+            assert_eq!(rail_width(width), None, "{width} cells is one column");
+            assert_eq!(
+                board::width(width),
+                None,
+                "{width} keeps the inspector shut"
+            );
+            assert_eq!(
+                transcript_width(width),
+                width,
+                "{width} spends the whole frame on the transcript"
+            );
+        }
+        for width in [80, 99, 100, 119] {
+            assert!(
+                rail_width(width).is_some_and(|rail| rail >= 18),
+                "{width} carries the rail"
+            );
+            assert_eq!(
+                board::width(width),
+                None,
+                "{width} opens the inspector on demand, not by default"
+            );
+            let rail = rail_width(width).unwrap_or(0);
+            assert_eq!(transcript_width(width), width - rail - 1, "{width}");
+        }
+        for width in [120, 159, 160, 200] {
+            let rail = rail_width(width).expect("the widest band keeps its rail");
+            let board = board::width(width).expect("a wide frame carries the inspector");
+            // Each column keeps the mock's own floor and the two separators are
+            // paid for once, so the transcript is the rest of the frame - and
+            // the rest is still a readable document.
+            let used = rail + board + 2;
+            assert_eq!(transcript_width(width), width - used, "{width}");
+            assert!(
+                transcript_width(width) >= 60,
+                "{width} leaves the transcript {} cells",
+                transcript_width(width)
+            );
+        }
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_releases_width_to_the_transcript() {
+        assert_eq!(rail_width_for(160, true), Some(6));
+        assert_eq!(transcript_width_for(160, true), 120);
+        assert_eq!(transcript_offset_for(2, 7, 160, 20, true), Some(0));
+        assert_eq!(transcript_offset_for(2, 6, 160, 20, true), None);
+        assert_eq!(rail_width_for(79, true), None);
+    }
+
+    /// A frame under twenty-four rows states the facts a reader navigates by
+    /// and leaves the label chips off: the brand, the open session's title and
+    /// the host's verdict survive, the configuration, goal, usage and session
+    /// count are what a taller frame affords.
+    #[test]
+    fn a_short_frame_keeps_the_title_and_drops_the_label_chips() {
+        for height in [8, 16, 23] {
+            assert_eq!(
+                header_fact_count(height),
+                0,
+                "{height} rows leaves the chips off"
+            );
+        }
+        for height in [24, 40, 80] {
+            assert_eq!(
+                header_fact_count(height),
+                4,
+                "{height} rows states every fact"
+            );
+        }
     }
 
     /// The transcript column owns every body column the rail does not: the
@@ -13215,6 +15235,66 @@ mod tests {
         assert_eq!(transcript_offset(2, 100, 100, 20), None);
         // Before the first frame is painted there is no column to name.
         assert_eq!(transcript_offset(2, 0, 0, 20), None);
+    }
+
+    /// The concept's header bar holds the host's verdict against the right edge,
+    /// and gives up its facts rather than the verdict when the row is narrow.
+    #[test]
+    fn the_header_bar_keeps_the_hosts_verdict_at_the_right_edge() {
+        let left = vec![
+            ("◆ BSH".to_string(), Tone::Chip),
+            ("   ".to_string(), Tone::Body),
+            ("tui".to_string(), Tone::Accent),
+            (" · model".to_string(), Tone::Muted),
+        ];
+        let verdict = ("● Host Connected".to_string(), Tone::Ok);
+        // A wide row paints the whole bar: every fact, then the verdict, ending
+        // exactly at the frame's last cell.
+        let runs = header_bar(&left, &verdict, 100);
+        let text: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(cells(&text), 100, "the bar fills the row it owns");
+        assert!(text.starts_with("◆ BSH"), "{text:?}");
+        assert!(!text.contains("Bos Shell"), "redundant subtitle is omitted");
+        assert_eq!(
+            runs.last().map(|(text, _)| text.as_str()),
+            Some(verdict.0.as_str())
+        );
+        assert_eq!(runs.last().map(|(_, tone)| *tone), Some(Tone::Ok));
+        // A narrow row drops the facts and keeps the verdict whole: the state of
+        // the host is the one thing the reader cannot read elsewhere on screen.
+        let runs = header_bar(&left, &verdict, 32);
+        let text: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(cells(&text), 32);
+        assert!(text.ends_with("● Host Connected"), "{text:?}");
+        assert!(
+            !text.contains("· model"),
+            "the last fact gave way: {text:?}"
+        );
+        // So narrow that not even the verdict fits: what is left is the truth
+        // about the host, cut, and no fact at all.
+        let runs = header_bar(&left, &("● Host Connected".to_string(), Tone::Ok), 12);
+        let text: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+        assert!(text.starts_with("● Host"), "{text:?}");
+        assert!(cells(&text) <= 12);
+    }
+
+    /// The concept's status bar names the mode at one edge and the keys at the
+    /// other, and keeps the keys when the row cannot hold both.
+    #[test]
+    fn the_status_bar_trades_its_mode_for_the_keys_it_cannot_lose() {
+        let mode = "Mode: Adaptive · Layout: 2-column";
+        let keys = "Enter send · ^C ^C quit";
+        let runs = status_bar(mode, keys, 80);
+        let text: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(cells(&text), 80, "the bar fills the row it owns");
+        assert!(text.starts_with(mode), "{text:?}");
+        assert!(text.ends_with(keys), "{text:?}");
+        // A row with no room for both is the keys alone: the mode describes the
+        // frame, the keys change what the reader can do next.
+        let runs = status_bar(mode, keys, 30);
+        let text: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(text, keys);
+        assert!(cells(&text) <= 30);
     }
 
     /// The hits a click reads are the rows the frame paints: a row that draws
@@ -13936,6 +16016,50 @@ mod tests {
         // the tail is already in view, so the title stays on row zero.
         let scrolled = detail_pane(Some(&session), 0, 90, 10, 99);
         assert_eq!(scrolled[0], rows[0], "the title survives any scroll");
+    }
+
+    #[test]
+    fn inspector_includes_host_authorization_and_execution_diagnostics() {
+        let mut session = projection(vec![call(
+            "shell",
+            ToolCallStatus::Failed,
+            "{\"command\":\"rm -rf build\"}",
+            Some("refused"),
+        )]);
+        let execution_id = ExecutionId::new();
+        let digest = crate::runtime::ids::ActionDigest::of(&"shell.run");
+        session.tool_calls[0].execution_id = Some(execution_id);
+        session
+            .executions
+            .push(crate::runtime::contract::ExecutionView {
+                execution_id,
+                status: ExecutionStatus::Failed,
+                started_at: Utc::now(),
+                finished_at: Some(Utc::now()),
+                detail: Some("the Host refused the command".to_string()),
+            });
+        session.approvals.push(ApprovalView {
+            approval_id: ApprovalId::new(),
+            session_id: session.session_id,
+            execution_id,
+            summary: "remove generated build output".to_string(),
+            action: crate::runtime::contract::ApprovalTarget {
+                tool: "shell".to_string(),
+                action: "run".to_string(),
+                resource: Some("workspace/build".to_string()),
+            },
+            action_digest: digest.clone(),
+            status: ApprovalStatus::Rejected,
+            expires_at: Utc::now() + chrono::Duration::minutes(1),
+        });
+        let rows = detail_pane(Some(&session), 0, 100, 24, 0);
+        let body = rows.join("\n");
+        assert!(body.contains("AUTHORIZATION"), "{body}");
+        assert!(body.contains("denied"), "{body}");
+        assert!(body.contains(digest.as_str()), "{body}");
+        assert!(body.contains("DIAGNOSTICS"), "{body}");
+        assert!(body.contains("execution state · Failed"), "{body}");
+        assert!(body.contains("the Host refused the command"), "{body}");
     }
 
     #[test]
@@ -15055,6 +17179,7 @@ mod tests {
             ]),
             detail: Some(task_detail("task-ship-the-release", Vec::new())),
             graph: false,
+            filter: TaskFilter::All,
             scroll: 0,
         };
         let lines = tasks_pane(&pane, 80, 8);
@@ -15147,6 +17272,7 @@ mod tests {
             tools: tools.iter().map(|tool| tool.to_string()).collect(),
             commands: Vec::new(),
             panels: Vec::new(),
+            capabilities: Vec::new(),
             error: error.map(str::to_string),
         }
     }
@@ -15673,7 +17799,7 @@ mod tests {
             ),
             ("history", Vec::new()),
         ]);
-        let body = tasks_board_body(&board, 200, now);
+        let body = tasks_board_body(&board, TaskFilter::All, 200, now);
         let headers: Vec<&String> = body.iter().filter(|row| row.contains("task(s)")).collect();
         assert_eq!(headers.len(), 4, "every section is drawn: {body:?}");
         assert!(body[0].starts_with("RUNNING · 1 task(s)"), "{}", body[0]);
@@ -15697,6 +17823,7 @@ mod tests {
                 ("scheduled", Vec::new()),
                 ("history", Vec::new()),
             ]),
+            TaskFilter::All,
             60,
             now,
         );
@@ -15706,6 +17833,7 @@ mod tests {
                 state: "unsupported".to_string(),
                 ..TaskBoardReport::default()
             },
+            TaskFilter::All,
             60,
             now,
         );
@@ -15713,6 +17841,80 @@ mod tests {
             unsupported.join(" ").contains("carries no task board"),
             "{unsupported:?}"
         );
+    }
+
+    /// The Jobs filters are windows over one board: each keeps its own rows,
+    /// drops a section it emptied, and says so when it keeps nothing, so a
+    /// narrowed board never reads as a small workspace.
+    #[test]
+    fn a_task_filter_narrows_the_board_to_its_own_rows() {
+        let now = DateTime::from_timestamp_millis(1_700_000_060_000).expect("a moment");
+        let board = task_board(vec![
+            (
+                "running",
+                vec![task_row("ship the release", "running", None)],
+            ),
+            ("queued", Vec::new()),
+            ("scheduled", Vec::new()),
+            (
+                "history",
+                vec![
+                    task_row("cut the tag", "succeeded", None),
+                    task_row("probe the peer", "failed", None),
+                ],
+            ),
+        ]);
+        // Active is the board's own answer to "is it finished": the history
+        // section is what it is not, so it goes - rowless sections with it.
+        let active = tasks_board_body(&board, TaskFilter::Active, 200, now);
+        assert!(
+            active.iter().any(|row| row.contains("ship the release")),
+            "{active:?}"
+        );
+        assert!(
+            !active.iter().any(|row| row.contains("cut the tag")),
+            "{active:?}"
+        );
+        assert!(
+            !active.iter().any(|row| row.contains("HISTORY")),
+            "a section the filter emptied is absent: {active:?}"
+        );
+        // A terminal state keeps only the rows that ended that way, and keeps
+        // the section heading that names where they ended.
+        let failed = tasks_board_body(&board, TaskFilter::Failed, 200, now);
+        assert!(
+            failed.iter().any(|row| row.contains("probe the peer")),
+            "{failed:?}"
+        );
+        assert!(
+            !failed.iter().any(|row| row.contains("cut the tag")),
+            "{failed:?}"
+        );
+        assert!(
+            failed.iter().any(|row| row.contains("HISTORY")),
+            "{failed:?}"
+        );
+        // Nothing kept is said once, in the place the board would be.
+        let waiting = tasks_board_body(&board, TaskFilter::Waiting, 200, now);
+        assert!(
+            waiting.join(" ").contains("holds no waiting task"),
+            "the empty filter states itself: {waiting:?}"
+        );
+        // The word a `/tasks` argument is: a filter, or a task id to look up.
+        assert_eq!(TaskFilter::from_word("active"), Some(TaskFilter::Active));
+        assert_eq!(TaskFilter::from_word("FAILED"), Some(TaskFilter::Failed));
+        assert_eq!(TaskFilter::from_word("task-ship-the-release"), None);
+        // The title names the window in force, so a narrow board cannot pass
+        // for the whole one.
+        let pane = TasksPane {
+            report: board,
+            detail: None,
+            graph: false,
+            filter: TaskFilter::Failed,
+            scroll: 0,
+        };
+        let title = tasks_title(&pane);
+        assert!(title.contains("failed only"), "{title}");
     }
 
     /// The title and status rows state the board's numbers, and a Host with no
@@ -15728,7 +17930,7 @@ mod tests {
             ("scheduled", Vec::new()),
             ("history", vec![task_row("cut the tag", "succeeded", None)]),
         ]);
-        let summary = tasks_summary(&board);
+        let summary = tasks_summary(&board, TaskFilter::All);
         assert!(summary.contains("2 task(s)"), "{summary}");
         assert!(summary.contains("1 running"), "{summary}");
         assert!(summary.contains("1 settled"), "{summary}");
@@ -15737,6 +17939,7 @@ mod tests {
             report: board,
             detail: None,
             graph: false,
+            filter: TaskFilter::All,
             scroll: 0,
         });
         assert!(
@@ -15750,7 +17953,7 @@ mod tests {
             error: Some("this Host names no workspace directory".to_string()),
             ..TaskBoardReport::default()
         };
-        let summary = tasks_summary(&unsupported);
+        let summary = tasks_summary(&unsupported, TaskFilter::All);
         assert!(summary.contains("unsupported"), "{summary}");
         assert!(
             summary.contains("names no workspace directory"),
@@ -15776,6 +17979,7 @@ mod tests {
             report: board,
             detail: None,
             graph: false,
+            filter: TaskFilter::All,
             scroll: 0,
         };
         let lines = tasks_pane(&pane, 60, 6);
@@ -15859,6 +18063,7 @@ mod tests {
             report: board.clone(),
             detail: None,
             graph: true,
+            filter: TaskFilter::All,
             scroll: 0,
         };
         let title = tasks_title(&pane);
@@ -15884,6 +18089,7 @@ mod tests {
             report: board,
             detail: None,
             graph: false,
+            filter: TaskFilter::All,
             scroll: 0,
         };
         assert!(
@@ -16352,6 +18558,92 @@ mod tests {
 
     fn list_of(kind: picker::Kind) -> picker::Picker {
         picker::Picker::new(kind.title(), kind.items(&picker_catalogue()))
+    }
+
+    /// The palette is the rail made typeable: every destination and panel the
+    /// rail carries is a row, the row prints the line the rail's chord runs,
+    /// and picking it runs that same line.
+    ///
+    /// This is the keyboard reachability the concept asks for - a frame under
+    /// two columns has no rail to walk, so a destination that the palette does
+    /// not carry is a destination that frame cannot reach at all.
+    #[test]
+    fn the_palette_carries_every_destination_the_rail_carries() {
+        let rows = picker::Kind::Command.items(&picker_catalogue());
+        for item in nav::WORKSPACE.iter().chain(nav::PANELS.iter()) {
+            let row = rows
+                .iter()
+                .find(|row| row.label == item.name)
+                .unwrap_or_else(|| panic!("the palette has no row for {}", item.name));
+            assert_eq!(
+                row.detail, item.command,
+                "{} prints the line its chord runs",
+                item.name
+            );
+            assert_eq!(
+                SlashCommand::parse(&row.detail),
+                Some(pick_command(row.choice.clone())),
+                "{} runs what it prints",
+                item.name
+            );
+        }
+    }
+
+    /// Every palette row is a command this client answers to, and no two rows
+    /// are the same row: a list that offers a spelling the parser refuses reads
+    /// as a command that exists and does nothing.
+    #[test]
+    fn every_palette_row_is_a_command_and_none_repeats() {
+        let rows = picker::Kind::Command.items(&picker_catalogue());
+        let mut names: Vec<&str> = Vec::new();
+        let mut lines: Vec<&str> = Vec::new();
+        for row in &rows {
+            let parsed = SlashCommand::parse(&row.detail);
+            assert!(
+                matches!(parsed, Some(command) if !matches!(command, SlashCommand::Usage(_))),
+                "`{}` is not a command this client runs",
+                row.detail
+            );
+            assert!(
+                !names.contains(&row.label.as_str()),
+                "`{}` is listed twice",
+                row.label
+            );
+            assert!(
+                !lines.contains(&row.detail.as_str()),
+                "`{}` is listed twice",
+                row.detail
+            );
+            names.push(&row.label);
+            lines.push(&row.detail);
+        }
+    }
+
+    /// A filter typed at the palette ranks the row the reader is looking for to
+    /// the top, and Enter commits the line that row prints - the palette's
+    /// whole job in one keystroke.
+    #[test]
+    fn a_typed_filter_finds_a_destination_and_enter_runs_its_line() {
+        let mut list = list_of(picker::Kind::Command);
+        for character in "sett".chars() {
+            list.typed(character);
+        }
+        let rows = picker_lines(&list, 60);
+        assert!(
+            rows.first()
+                .is_some_and(|row| row.contains("filter 'sett'")),
+            "the title names the filter: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Settings") && row.contains("/settings")),
+            "the row says the name and the line: {rows:?}"
+        );
+        assert_eq!(
+            list.choice().map(pick_command),
+            Some(SlashCommand::parse("/settings").expect("a known command")),
+            "Enter runs the line the row prints"
+        );
     }
 
     #[test]

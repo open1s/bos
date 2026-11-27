@@ -34,7 +34,7 @@ use crate::runtime::contract::{
     ApprovalDecision, ApprovalRequest, ApprovalStatus, ApprovalTarget, ApprovalView,
     CommandEnvelope, CommandOutcome, CommandPayload, ControlEnvelope, ControlPayload, Cursor,
     CursorExpired, EventEnvelope, EventPayload, ExecutionActivity, ExecutionStatus, GoalState,
-    HostActivity, HostPhase, HostStatus, PlanItemStatus, PlanItemView, PrincipalView,
+    HostActivity, HostPhase, HostStatus, MessageRole, PlanItemStatus, PlanItemView, PrincipalView,
     ProtocolError, ProtocolErrorCode, QueryEnvelope, QueryPayload, QueryResult, Rejection,
     RejectionCode, Request, Response, SessionConfig, SessionGoalView, ShutdownMode, Snapshot,
     Subscribe, Subscribed,
@@ -49,6 +49,7 @@ use crate::runtime::ids::{
 };
 use crate::runtime::journal::{EventDraft, Journal, SubscriptionError};
 use crate::runtime::projection::Projections;
+use crate::runtime::session_repo::{SessionRepo, session_from_projection};
 
 /// How much live turn activity one subscription may fall behind before the
 /// transport resets it.
@@ -159,10 +160,24 @@ struct ApprovalRecord {
 struct Inner {
     phase: HostPhase,
     projections: Projections,
+    /// The desktop's session store. Sessions live here; the journal keeps the
+    /// runtime facts about them (executions, approvals, tool progress), so a
+    /// chat is one document both interfaces read.
+    repo: SessionRepo,
+    /// Where a running turn's answer row sits in the stored transcript, so a
+    /// tool fact lands on the row the turn is writing.
+    turn_rows: HashMap<ExecutionId, TurnRow>,
     ledger: HashMap<CommandId, LedgerEntry>,
     executions: HashMap<ExecutionId, ExecutionRecord>,
     approvals: HashMap<ApprovalId, ApprovalRecord>,
     degraded: bool,
+}
+
+/// The stored transcript row one execution is filling in.
+#[derive(Debug, Clone, Copy)]
+struct TurnRow {
+    session_id: SessionId,
+    row: usize,
 }
 
 impl Inner {
@@ -252,6 +267,35 @@ impl RuntimeHost {
 
         let workspace_root = config.canonical_workspace();
         let workspace_id = WorkspaceId::derived(&workspace_root.display().to_string());
+        // The session store is the desktop's: same directory, same document,
+        // same Parquet transcript. A real launch passes the registry's
+        // workspace id, so the chats this Host writes sit under the window's own
+        // workspace row; a scratch launch (a test, `--echo`) derives one, which
+        // keeps its sessions out of any registry the reader owns.
+        let workspace_key = config
+            .session_workspace
+            .clone()
+            .filter(|workspace| !workspace.trim().is_empty())
+            .unwrap_or_else(|| workspace_id.to_string());
+        let workspace_name = if config.session_workspace_name.trim().is_empty() {
+            workspace_root
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| workspace_root.display().to_string())
+        } else {
+            config.session_workspace_name.clone()
+        };
+        let repo = SessionRepo::open(
+            workspace_key,
+            workspace_name,
+            &workspace_root,
+            config.data_dir.join("sessions"),
+            config
+                .session_trash_dir
+                .clone()
+                .unwrap_or_else(|| config.data_dir.join("trash")),
+            config.session_secrets.clone(),
+        );
         let journal = Journal::open(
             config.journal_path(),
             workspace_id,
@@ -281,6 +325,8 @@ impl RuntimeHost {
             inner: Mutex::new(Inner {
                 phase: HostPhase::Initializing,
                 projections: Projections::new(),
+                repo,
+                turn_rows: HashMap::new(),
                 ledger: HashMap::new(),
                 executions: HashMap::new(),
                 approvals: HashMap::new(),
@@ -470,6 +516,12 @@ impl Core {
         let _ = self.phase_tx.send_replace(HostPhase::Recovering);
         inner.projections = Projections::from_events(&events);
         inner.ledger = rebuild_ledger(&events);
+        // The journal folds runtime facts; the shared store owns the chats.
+        // Reconcile the two before recovery decides which executions are live,
+        // so a chat the window wrote while this Host was down is a session the
+        // terminal lists, and a chat only the journal knew is written down once
+        // for both.
+        self.reconcile_session_store(&mut inner)?;
 
         // Anything that never reached a terminal fact was in flight when the
         // previous process died. Its external side effects are unknown, so it
@@ -497,6 +549,10 @@ impl Core {
             .caused_by("recovery");
             self.append_and_apply(&mut inner, draft)
                 .map_err(|error| HostError::Storage(error.to_string()))?;
+            // The row the dead process left open is closed here: recovery has
+            // no turn row to address, so the last unanswered answer row is the
+            // one it abandoned.
+            inner.repo.cancel_last_turn(&session_id.to_string());
         }
 
         let draft = EventDraft::new(EventPayload::HostReady {
@@ -519,6 +575,63 @@ impl Core {
                 events.len()
             ),
         ));
+        Ok(())
+    }
+
+    /// Bring the journal-folded sessions and the shared store together.
+    ///
+    /// Two directions, in this order:
+    ///
+    /// 1. A session the journal knows and the store does not is imported into
+    ///    the store. That is the one-time migration for a Host that predates
+    ///    the shared store; on a unified build it is also what makes a chat a
+    ///    crash left only in the journal visible to the window.
+    /// 2. A session the store has is installed into the projections, replacing
+    ///    the journal's copy of its CONTENT while keeping the runtime records
+    ///    the fold produced. A chat the window edited - a rename, a new turn, a
+    ///    goal - is therefore what the terminal reads.
+    fn reconcile_session_store(&self, inner: &mut Inner) -> Result<(), HostError> {
+        let journal_sessions = inner.projections.sessions();
+        for projection in journal_sessions {
+            // A parked chat is intentionally out of the store; importing it back
+            // would resurrect a delete the reader already made.
+            if projection.trashed {
+                continue;
+            }
+            let id = projection.session_id.to_string();
+            let known = inner.repo.session(&id).is_some();
+            if known {
+                continue;
+            }
+            let session = session_from_projection(&projection, inner.repo.workspace());
+            if let Err(error) = inner.repo.adopt(session) {
+                log::warn!("session {id}: could not be imported into the session store: {error}");
+            }
+        }
+
+        let ids: Vec<String> = inner
+            .repo
+            .sessions()
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        for id in ids {
+            let Some(session) = inner.repo.snapshot_of(&id) else {
+                continue;
+            };
+            let Ok(session_id) = id.parse::<SessionId>() else {
+                log::warn!("session store row {id} is not a runtime session id; leaving it alone");
+                continue;
+            };
+            let existing = inner.projections.session(session_id).cloned();
+            let permission = existing
+                .as_ref()
+                .map(|projection| projection.config.permission.clone())
+                .unwrap_or_else(|| self.executor.default_config().permission);
+            let version = existing.as_ref().map_or(0, |projection| projection.version);
+            let projection = inner.repo.project(&session, &permission, version);
+            inner.projections.install(projection);
+        }
         Ok(())
     }
 
@@ -884,6 +997,7 @@ impl Core {
         command_id: CommandId,
         payload_hash: &PayloadHash,
     ) -> Result<(CommandOutcome, Option<PreparedWork>), Rejection> {
+        let stored_goal = goal.clone();
         let draft = EventDraft::new(EventPayload::GoalChanged {
             goal,
             command_id: Some(command_id),
@@ -893,6 +1007,11 @@ impl Core {
         .caused_by(command_id);
         self.append_and_apply(inner, draft)
             .map_err(|error| self.journal_rejection(inner, &error))?;
+        // A goal is session state, not a client memory: the window's `/goal`
+        // panel reads the same record from the chat document.
+        inner
+            .repo
+            .set_goal(&session_id.to_string(), stored_goal.as_ref());
         Ok((
             Self::accepted(command_id, OperationId::new(session_id)),
             None,
@@ -921,12 +1040,19 @@ impl Core {
                         "session title is empty",
                     ));
                 }
-                let session_id = SessionId::new();
                 // A session is created with the configuration the executor can
                 // actually run, recorded as a durable fact: a client reading
                 // the session later sees what its first turn used, not what
                 // today's settings would have chosen.
                 let config = self.executor.default_config();
+                // The store mints the identity, so the chat exists as a
+                // document before the fact that created it is published: a
+                // client that reacts to the event can already open the chat.
+                let stored = inner.repo.create(title, &config);
+                let session_id = stored
+                    .id
+                    .parse::<SessionId>()
+                    .unwrap_or_else(|_| SessionId::new());
                 let draft = EventDraft::new(EventPayload::SessionCreated {
                     title: title.clone(),
                     config,
@@ -963,8 +1089,13 @@ impl Core {
                 // The fork is a fresh chat with the source's history, so it is
                 // created with the configuration the source's next turn used:
                 // a branch a reader continues must run like the one it branched
-                // from, not like today's defaults.
-                let forked_id = SessionId::new();
+                // from, not like today's defaults. The store copies the whole
+                // log, not only the window this client loaded.
+                let forked_id = inner
+                    .repo
+                    .fork(&session_id.to_string())
+                    .and_then(|session| session.id.parse::<SessionId>().ok())
+                    .unwrap_or_default();
                 let draft = EventDraft::new(EventPayload::SessionCreated {
                     title,
                     config,
@@ -998,6 +1129,9 @@ impl Core {
                 .caused_by(command_id);
                 self.append_and_apply(inner, draft)
                     .map_err(|error| self.journal_rejection(inner, &error))?;
+                // The document is renamed too, not only the fold: the window
+                // lists the session by its document's title.
+                inner.repo.rename(&session_id.to_string(), title);
                 Ok((
                     Self::accepted(command_id, OperationId::new(session_id)),
                     None,
@@ -1013,21 +1147,59 @@ impl Core {
                 }
                 let execution_id = ExecutionId::new();
                 let message_id = MessageId::new();
-                let (history, config) = inner
+                let config = inner
                     .projections
                     .session(*session_id)
-                    .map(|session| {
-                        let history = session
-                            .messages
-                            .iter()
-                            .map(|message| HistoryMessage {
-                                role: message.role,
-                                text: message.text.clone(),
-                            })
-                            .collect();
-                        (history, session.config.clone())
-                    })
+                    .map(|session| session.config.clone())
                     .unwrap_or_default();
+                // The transcript the model reads is the stored one, so a chat
+                // the window wrote and a chat the terminal wrote replay the
+                // same history. The projection is the fallback for a session
+                // the store has not adopted yet (a legacy journal row).
+                let stored = inner.repo.snapshot_of(&session_id.to_string());
+                let transcript = stored
+                    .as_ref()
+                    .map(|session| session.messages.clone())
+                    .unwrap_or_default();
+                let history = match &stored {
+                    Some(session) => session
+                        .messages
+                        .iter()
+                        .map(|message| HistoryMessage {
+                            role: match message.role {
+                                crate::model::Role::User => MessageRole::User,
+                                crate::model::Role::Assistant => MessageRole::Assistant,
+                            },
+                            text: message.text.clone(),
+                        })
+                        .collect(),
+                    None => inner
+                        .projections
+                        .session(*session_id)
+                        .map(|session| {
+                            session
+                                .messages
+                                .iter()
+                                .map(|message| HistoryMessage {
+                                    role: message.role,
+                                    text: message.text.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                };
+                // Write the reader's turn and an empty answer row before the
+                // model is asked anything. The row is what a restart resumes
+                // from and what a tool fact lands on while the turn runs.
+                let store_row = match inner.repo.begin_turn(&session_id.to_string(), text) {
+                    Ok(base) => Some(base + 1),
+                    Err(error) => {
+                        log::warn!(
+                            "session {session_id}: the turn was not written to the store: {error}"
+                        );
+                        None
+                    }
+                };
                 let draft = EventDraft::new(EventPayload::TurnRequested {
                     message_id,
                     text: text.clone(),
@@ -1054,7 +1226,9 @@ impl Core {
                         session_id: *session_id,
                         text: text.clone(),
                         history,
+                        transcript,
                         config,
+                        store_row,
                     })),
                 ))
             }
@@ -1104,7 +1278,7 @@ impl Core {
                     .configure(&current, change)
                     .map_err(|message| Self::refuse(RejectionCode::InvalidRequest, message))?;
                 let draft = EventDraft::new(EventPayload::SessionConfigured {
-                    config,
+                    config: config.clone(),
                     command_id,
                     payload_hash: payload_hash.clone(),
                 })
@@ -1112,6 +1286,10 @@ impl Core {
                 .caused_by(command_id);
                 self.append_and_apply(inner, draft)
                     .map_err(|error| self.journal_rejection(inner, &error))?;
+                // The model, preset and plan mode live on the chat document in
+                // the window too; a switch made in the terminal is a switch the
+                // next window turn reads.
+                inner.repo.configure(&session_id.to_string(), &config);
                 Ok((
                     Self::accepted(command_id, OperationId::new(*session_id)),
                     None,
@@ -1293,6 +1471,7 @@ impl Core {
             CommandPayload::SetFeedback { session_id, text } => {
                 self.require_session(inner, envelope, *session_id)?;
                 let note = Self::feedback_note(text)?;
+                let stored_note = note.clone();
                 let draft = EventDraft::new(EventPayload::FeedbackChanged {
                     feedback: note,
                     command_id,
@@ -1302,6 +1481,9 @@ impl Core {
                 .caused_by(command_id);
                 self.append_and_apply(inner, draft)
                     .map_err(|error| self.journal_rejection(inner, &error))?;
+                inner
+                    .repo
+                    .set_feedback(&session_id.to_string(), stored_note.as_deref());
                 Ok((
                     Self::accepted(command_id, OperationId::new(*session_id)),
                     None,
@@ -1364,6 +1546,12 @@ impl Core {
                 .caused_by(command_id);
                 self.append_and_apply(inner, draft)
                     .map_err(|error| self.journal_rejection(inner, &error))?;
+                // Purging is the one irreversible fact. The bin entry holds the
+                // only copy of the document and its transcript, so it has to go
+                // too - on the desktop's own purge path, not a local unlink.
+                if !inner.repo.purge_by_id(&session_id.to_string()) {
+                    log::warn!("session {session_id}: no bin entry to purge");
+                }
                 Ok((
                     Self::accepted(command_id, OperationId::new(session_id)),
                     None,
@@ -1476,6 +1664,29 @@ impl Core {
         .caused_by(command_id);
         self.append_and_apply(inner, draft)
             .map_err(|error| self.journal_rejection(inner, &error))?;
+        // The journal says which list the chat is in; the store says where the
+        // chat IS. Parking moves the document and its transcript pages into the
+        // desktop's bin, so the window's bin and the terminal's are one bin.
+        let id = session_id.to_string();
+        if trashed {
+            if inner.repo.session(&id).is_none()
+                && let Some(projection) = inner.projections.session(session_id).cloned()
+            {
+                let session = session_from_projection(&projection, inner.repo.workspace());
+                let _ = inner.repo.adopt(session);
+            }
+            if let Err(error) = inner.repo.park(&id) {
+                log::warn!("session {session_id}: could not be parked in the bin: {error}");
+            }
+        } else if let Err(error) = inner.repo.restore_by_id(&id) {
+            // A journal-only bin entry (a Host that predates the shared store)
+            // has no files to move back; the document is rebuilt from the fold.
+            log::warn!("session {session_id}: no bin entry to restore: {error}");
+            if let Some(projection) = inner.projections.session(session_id).cloned() {
+                let session = session_from_projection(&projection, inner.repo.workspace());
+                let _ = inner.repo.adopt(session);
+            }
+        }
         Ok(())
     }
 
@@ -1551,6 +1762,9 @@ impl Core {
         .caused_by(command_id);
         self.append_and_apply(inner, draft)
             .map_err(|error| self.journal_rejection(inner, &error))?;
+        // The star is a property of the chat document: the window's sort reads
+        // the file, not this journal.
+        inner.repo.set_pinned(&session_id.to_string(), pinned);
         Ok(())
     }
 
@@ -1605,6 +1819,9 @@ impl Core {
         .caused_by(command_id);
         self.append_and_apply(inner, draft)
             .map_err(|error| self.journal_rejection(inner, &error))?;
+        // The Archived filter is the chat document's own timestamp in the
+        // window, so the document is what is written here.
+        inner.repo.set_archived(&session_id.to_string(), archived);
         Ok(())
     }
 
@@ -1657,6 +1874,11 @@ impl Core {
             if let Some(handle) = record.handle.take() {
                 handle.abort();
             }
+        }
+        // The stored answer row closes too: a cancelled turn is a stopped row
+        // in the transcript both interfaces read, not a row still streaming.
+        if let Some(row) = inner.turn_rows.remove(&execution_id) {
+            inner.repo.cancel_turn(&row.session_id.to_string(), row.row);
         }
         Ok(())
     }
@@ -1926,13 +2148,17 @@ impl Core {
         payload_hash: &PayloadHash,
         outcome: Result<crate::runtime::executor::CompactionOutput, TurnError>,
     ) {
+        let mut landed = None;
         let draft = match outcome {
-            Ok(output) => EventDraft::new(EventPayload::SessionCompacted {
-                summary: output.summary,
-                folded: output.folded,
-                command_id,
-                payload_hash: payload_hash.clone(),
-            }),
+            Ok(output) => {
+                landed = Some((output.folded, output.summary.clone()));
+                EventDraft::new(EventPayload::SessionCompacted {
+                    summary: output.summary,
+                    folded: output.folded,
+                    command_id,
+                    payload_hash: payload_hash.clone(),
+                })
+            }
             Err(error) => EventDraft::new(EventPayload::SessionCompactionFailed {
                 error: error.message,
                 command_id,
@@ -1944,8 +2170,20 @@ impl Core {
         // A compaction that cannot be journaled is a storage failure, not a
         // property of the attempt: the Host fails closed like any other append
         // the journal refuses.
-        if let Err(error) = self.append_and_apply(&mut inner, draft) {
-            self.fail_closed(&mut inner, &error);
+        match self.append_and_apply(&mut inner, draft) {
+            Ok(_) => {
+                // The checkpoint is part of the chat's own history: the
+                // window's marker and the trajectory read the record from the
+                // document, not from this journal.
+                if let Some((folded, summary)) = landed {
+                    inner.repo.record_compaction(
+                        &session_id.to_string(),
+                        folded as usize,
+                        &summary,
+                    );
+                }
+            }
+            Err(error) => self.fail_closed(&mut inner, &error),
         }
     }
 
@@ -1961,6 +2199,7 @@ impl Core {
             execution_id: turn.execution_id,
             text: turn.text,
             history: turn.history,
+            transcript: turn.transcript,
             config: turn.config,
             approvals: ApprovalHandle::attached(ApprovalGate {
                 core: Arc::clone(self),
@@ -1982,6 +2221,15 @@ impl Core {
             return;
         }
         record.status = ExecutionStatus::Running;
+        if let Some(row) = turn.store_row {
+            inner.turn_rows.insert(
+                execution_id,
+                TurnRow {
+                    session_id: turn.session_id,
+                    row,
+                },
+            );
+        }
         let handle = tokio::spawn(async move {
             let pump = core.pump_progress(session_id, execution_id, progress_rx);
             let outcome = core.executor.execute(context).await;
@@ -2086,6 +2334,40 @@ impl Core {
                 if !is_live(record.status) {
                     break;
                 }
+                // The same tool fact lands on the stored answer row, so the
+                // window's audit page and trajectory read the calls a terminal
+                // turn made. The checkpoint keeps a crash from losing them.
+                if let Some(row) = inner.turn_rows.get(&execution_id).copied() {
+                    let id = row.session_id.to_string();
+                    match &payload {
+                        EventPayload::ToolCallStarted { tool, args, .. } => {
+                            inner.repo.note_tool_call(
+                                &id,
+                                row.row,
+                                tool,
+                                args,
+                                crate::runtime::clock::now_ms(),
+                            );
+                        }
+                        EventPayload::ToolCallFinished {
+                            tool,
+                            output,
+                            duration_ms,
+                            ..
+                        } => {
+                            inner
+                                .repo
+                                .note_tool_result(&id, row.row, tool, output, *duration_ms);
+                            if let Some(session) = inner.repo.session(&id).cloned() {
+                                inner.repo.checkpoint(&session, row.row.saturating_sub(1));
+                            }
+                        }
+                        EventPayload::PlanUpdated { plan } => {
+                            inner.repo.set_plan(&id, plan);
+                        }
+                        _ => {}
+                    }
+                }
                 let draft = EventDraft::new(payload)
                     .session(session_id)
                     .execution(execution_id)
@@ -2113,6 +2395,16 @@ impl Core {
             // late result must not append a second one.
             return;
         }
+        // What the stored answer row takes, captured before the outcome is
+        // moved into the event it journals.
+        let completed = match &outcome {
+            Ok(output) => Some((output.text.clone(), output.usage)),
+            Err(_) => None,
+        };
+        let failed = match &outcome {
+            Err(error) => Some(error.message.clone()),
+            Ok(_) => None,
+        };
         let (status, draft) = match outcome {
             Ok(output) => (
                 ExecutionStatus::Completed,
@@ -2135,6 +2427,22 @@ impl Core {
                 if let Some(record) = inner.executions.get_mut(&execution_id) {
                     record.status = status;
                     record.handle.take();
+                }
+                // Close the stored answer row: the transcript is what a later
+                // turn replays and what the window shows, so a completed or
+                // failed turn is written down whichever interface asked for it.
+                if let Some(row) = inner.turn_rows.remove(&execution_id) {
+                    let id = row.session_id.to_string();
+                    let written = match (completed, failed) {
+                        (Some((text, usage)), _) => {
+                            inner.repo.finish_turn(&id, row.row, &text, usage.as_ref())
+                        }
+                        (None, Some(error)) => inner.repo.fail_turn(&id, row.row, &error),
+                        (None, None) => Ok(()),
+                    };
+                    if let Err(error) = written {
+                        log::warn!("session {session_id}: the turn was not stored: {error}");
+                    }
                 }
                 // An executor error is a property of that turn, not of the
                 // Host: the Host stays Ready and keeps serving sessions.
@@ -2321,6 +2629,9 @@ impl Core {
                     handle.abort();
                 }
             }
+            if let Some(row) = inner.turn_rows.remove(&execution_id) {
+                inner.repo.cancel_turn(&row.session_id.to_string(), row.row);
+            }
         }
     }
 }
@@ -2330,12 +2641,20 @@ struct PreparedTurn {
     session_id: SessionId,
     text: String,
     history: Vec<HistoryMessage>,
+    /// The stored rows the turn replays, with their tool traffic and images.
+    transcript: Vec<crate::model::ChatMessage>,
     /// The configuration the session held when the turn was accepted.
     ///
     /// Resolved once at acceptance: a configuration change that lands while
     /// the turn runs applies to the NEXT turn, the way a desktop chat's model
     /// switch never rewrites a request already in flight.
     config: SessionConfig,
+    /// The stored transcript row this turn's answer is filling in.
+    ///
+    /// The user row and an empty answer row are written before the model is
+    /// asked anything, so a crash mid-turn leaves the question on disk. Tool
+    /// facts land on this row while the turn runs.
+    store_row: Option<usize>,
 }
 
 /// Work one accepted command queued for the executor.

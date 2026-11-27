@@ -1856,6 +1856,7 @@ impl TurnExecutor for ExtensionsExecutor {
                 tools: vec!["com.example.hosted.echo".to_string()],
                 commands: Vec::new(),
                 panels: Vec::new(),
+                capabilities: Vec::new(),
                 error: None,
             }],
             error: None,
@@ -2105,4 +2106,305 @@ async fn a_settings_query_and_write_are_the_executors_own() {
         "the refusal names the missing surface: {}",
         refusal.message
     );
+}
+
+/// The chat a terminal wrote is a document the window's own store reads.
+///
+/// This is the unification's central promise: one session format, one
+/// directory. The test opens the desktop's Store over the same workspace the
+/// Host served and reads the turn the terminal ran.
+#[tokio::test]
+async fn a_terminal_turn_is_written_to_the_desktop_session_store() {
+    let fix = Fixture::open().await;
+    let session_id = fix.create_session("shared chat");
+    let outcome = fix.command(
+        Some(session_id),
+        None,
+        CommandId::new(),
+        CommandPayload::SendMessage {
+            session_id,
+            text: "hello from the terminal".to_string(),
+        },
+    );
+    let execution_id: ExecutionId = accepted(&outcome)
+        .to_string()
+        .parse()
+        .expect("the operation names an execution");
+    wait_until("the echo turn to finish", || {
+        fix.session(session_id).and_then(|session| {
+            session
+                .executions
+                .iter()
+                .find(|execution| execution.execution_id == execution_id)
+                .map(|execution| execution.status)
+        }) == Some(ExecutionStatus::Completed)
+    })
+    .await;
+
+    // Open the window's store exactly as the shell does: the workspace's id,
+    // the workspace's root. It must find the chat the terminal just wrote.
+    let root = std::fs::canonicalize(&fix.host.config().workspace_root).expect("canonical root");
+    let workspace = fix
+        .host
+        .config()
+        .session_workspace
+        .clone()
+        .unwrap_or_else(|| WorkspaceId::derived(&root.display().to_string()).to_string());
+    let mut store = crate::store::Store::open_over(
+        &[(workspace, root.display().to_string())],
+        fix._dir.path().join("quarantine"),
+    );
+    let id = session_id.to_string();
+    store.ensure_document(&id);
+    store.rehydrate(&id);
+    let session = store
+        .session(&id)
+        .expect("the desktop store lists the chat");
+    assert_eq!(session.title, "shared chat");
+    assert_eq!(session.messages.len(), 2, "the turn's two rows are on disk");
+    assert_eq!(session.messages[0].text, "hello from the terminal");
+    assert!(
+        session.messages[1]
+            .text
+            .starts_with(&format!("[host echo {execution_id}]")),
+        "the answer is the one the turn produced: {}",
+        session.messages[1].text
+    );
+}
+
+/// A chat the window wrote is a session a terminal lists and replays.
+#[tokio::test]
+async fn a_desktop_chat_is_served_to_the_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace_root = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    let root = std::fs::canonicalize(&workspace_root).unwrap();
+    let workspace = "shared-workspace".to_string();
+    // The window writes its chat before any Host exists for this directory.
+    {
+        let mut store = crate::store::Store::open_over(
+            &[(workspace.clone(), root.display().to_string())],
+            dir.path().join("quarantine"),
+        );
+        let mut session = crate::model::Session::new(&workspace, "written by the window");
+        session
+            .messages
+            .push(crate::model::ChatMessage::user("hello from the window"));
+        store
+            .save(&session)
+            .expect("the window's store accepts the chat");
+        store.insert(session);
+        assert_eq!(store.sessions.len(), 1, "the store lists its chat");
+    }
+
+    let mut config = RuntimeConfig::with_data_dir(dir.path().join("runtime"));
+    config.workspace_root = workspace_root;
+    config.echo = true;
+    config.session_workspace = Some(workspace);
+    let host = RuntimeHost::open(config).await.expect("the Host opens");
+    let ctx = host.connection(Principal::local(host.local_uid()));
+    let target = Target {
+        workspace_id: host.workspace_id(),
+        session_id: None,
+    };
+    let response = host.handle_request(
+        &ctx,
+        Request::Query(QueryEnvelope {
+            target,
+            payload: QueryPayload::ListSessions,
+        }),
+    );
+    let Response::Query(QueryResult::Sessions { sessions }) = response.response else {
+        panic!("the list query was refused");
+    };
+    assert_eq!(sessions.len(), 1, "the window's chat is the Host's list");
+    assert_eq!(sessions[0].title, "written by the window");
+
+    let target = Target {
+        workspace_id: host.workspace_id(),
+        session_id: Some(sessions[0].session_id),
+    };
+    let response = host.handle_request(
+        &ctx,
+        Request::Query(QueryEnvelope {
+            target,
+            payload: QueryPayload::Session {
+                session_id: sessions[0].session_id,
+            },
+        }),
+    );
+    let Response::Query(QueryResult::Session {
+        session: Some(session),
+    }) = response.response
+    else {
+        panic!("the session query was refused");
+    };
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].text, "hello from the window");
+}
+
+/// A turn survives a Host restart because it is written to the shared store.
+#[tokio::test]
+async fn a_restarted_host_replays_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace_root = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    let mut config = RuntimeConfig::with_data_dir(dir.path().join("runtime"));
+    config.workspace_root = workspace_root;
+    config.echo = true;
+    config.session_workspace = Some("restart-workspace".to_string());
+
+    let session_id = {
+        let host = RuntimeHost::open(config.clone()).await.expect("first open");
+        let ctx = host.connection(Principal::local(host.local_uid()));
+        let target = Target {
+            workspace_id: host.workspace_id(),
+            session_id: None,
+        };
+        let response = host.handle_request(
+            &ctx,
+            Request::Command(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_instance_id: ctx.client_instance_id,
+                target,
+                expected_version: None,
+                payload: CommandPayload::CreateSession {
+                    title: "survives a restart".to_string(),
+                },
+            }),
+        );
+        let Response::Command(outcome) = response.response else {
+            panic!("the creation was refused");
+        };
+        let session_id: SessionId = accepted(&outcome)
+            .to_string()
+            .parse()
+            .expect("the operation names a session");
+        let target = Target {
+            workspace_id: host.workspace_id(),
+            session_id: Some(session_id),
+        };
+        let response = host.handle_request(
+            &ctx,
+            Request::Command(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_instance_id: ctx.client_instance_id,
+                target,
+                expected_version: None,
+                payload: CommandPayload::SendMessage {
+                    session_id,
+                    text: "before the restart".to_string(),
+                },
+            }),
+        );
+        let Response::Command(_) = response.response else {
+            panic!("the turn was refused");
+        };
+        wait_until("the turn to finish", || {
+            host.core
+                .lock()
+                .projections
+                .session(session_id)
+                .and_then(|session| session.executions.first().map(|execution| execution.status))
+                == Some(ExecutionStatus::Completed)
+        })
+        .await;
+        drop(host);
+        session_id
+    };
+
+    let host = RuntimeHost::open(config).await.expect("second open");
+    let ctx = host.connection(Principal::local(host.local_uid()));
+    let target = Target {
+        workspace_id: host.workspace_id(),
+        session_id: Some(session_id),
+    };
+    let response = host.handle_request(
+        &ctx,
+        Request::Query(QueryEnvelope {
+            target,
+            payload: QueryPayload::Session { session_id },
+        }),
+    );
+    let Response::Query(QueryResult::Session {
+        session: Some(session),
+    }) = response.response
+    else {
+        panic!("the restarted Host does not list the chat");
+    };
+    assert_eq!(session.title, "survives a restart");
+    assert_eq!(session.messages.len(), 2, "the transcript survived");
+    assert_eq!(session.messages[0].text, "before the restart");
+    assert!(session.messages[1].text.starts_with("[host echo "));
+}
+
+/// A parked chat is moved into the shared bin and comes back whole.
+///
+/// This is the desktop's delete, not a visibility flag: the store's document and
+/// its transcript pages move into the bin, and a restore returns the same
+/// conversation. The terminal drives the same two commands.
+#[tokio::test]
+async fn a_parked_chat_round_trips_through_the_shared_bin() {
+    let fix = Fixture::open().await;
+    let session_id = fix.create_session("bin round trip");
+    let outcome = fix.command(
+        Some(session_id),
+        None,
+        CommandId::new(),
+        CommandPayload::SendMessage {
+            session_id,
+            text: "remember me".to_string(),
+        },
+    );
+    let execution_id: ExecutionId = accepted(&outcome)
+        .to_string()
+        .parse()
+        .expect("the operation names an execution");
+    wait_until("the turn to finish", || {
+        fix.session(session_id).and_then(|session| {
+            session
+                .executions
+                .iter()
+                .find(|execution| execution.execution_id == execution_id)
+                .map(|execution| execution.status)
+        }) == Some(ExecutionStatus::Completed)
+    })
+    .await;
+
+    let outcome = fix.command(
+        Some(session_id),
+        None,
+        CommandId::new(),
+        CommandPayload::TrashSession { session_id },
+    );
+    accepted(&outcome);
+    assert!(
+        fix.session(session_id).expect("the fold keeps it").trashed,
+        "the journal marks the chat parked"
+    );
+    let bin = fix._dir.path().join("runtime").join("trash");
+    let parked: Vec<_> = std::fs::read_dir(&bin)
+        .expect("the shared bin exists")
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect();
+    assert_eq!(parked.len(), 1, "one envelope for the parked chat");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(parked[0].path()).expect("the envelope"))
+            .expect("the envelope parses");
+    assert_eq!(envelope["payload"]["id"], session_id.to_string());
+    assert_eq!(envelope["name"], "bin round trip");
+
+    let outcome = fix.command(
+        Some(session_id),
+        None,
+        CommandId::new(),
+        CommandPayload::RestoreSession { session_id },
+    );
+    accepted(&outcome);
+    let restored = fix.session(session_id).expect("the chat comes back");
+    assert!(!restored.trashed, "the journal marks it visible again");
+    assert_eq!(restored.title, "bin round trip");
+    assert_eq!(restored.messages.len(), 2, "the transcript came back too");
+    assert_eq!(restored.messages[0].text, "remember me");
 }

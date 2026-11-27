@@ -148,7 +148,7 @@ pub(crate) fn write_zip(dir: &Path, out: &Path) -> io::Result<usize> {
 /// and renamed into place, so a failed export never leaves half a file under the
 /// name the reader chose.
 pub(crate) fn write_audit(
-    view: &crate::audit::AuditView,
+    view: &crate::runtime::audit_view::AuditView,
     lang: crate::i18n::Lang,
     out: &Path,
     compositions: &[agent::capability::CompositionSnapshot],
@@ -243,8 +243,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("bsh-audit-export-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("a scratch directory");
-        let view = crate::audit::AuditView {
-            totals: crate::audit::AuditTotals {
+        let view = crate::runtime::audit_view::AuditView {
+            totals: crate::runtime::audit_view::AuditTotals {
                 turns: 1,
                 calls: 2,
                 files_read: 1,
@@ -257,18 +257,18 @@ mod tests {
                 pending: 0,
                 duration_ms: 1_200,
             },
-            policy: crate::audit::AuditPolicy::default(),
-            turns: vec![crate::audit::AuditTurn {
+            policy: crate::runtime::audit_view::AuditPolicy::default(),
+            turns: vec![crate::runtime::audit_view::AuditTurn {
                 index: 1,
                 message: 0,
                 started_at: Some(1_000),
                 duration_ms: 1_200,
                 calls: vec![
-                    crate::audit::AuditCall {
+                    crate::runtime::audit_view::AuditCall {
                         tool: "read_file".to_string(),
-                        category: crate::audit::AuditCategory::FileRead,
+                        category: crate::runtime::audit_view::AuditCategory::FileRead,
                         target: "a.md".to_string(),
-                        outcome: crate::audit::AuditOutcome::Ok,
+                        outcome: crate::runtime::audit_view::AuditOutcome::Ok,
                         at: Some(1_000),
                         ms: Some(4),
                         preview: "body".to_string(),
@@ -281,11 +281,11 @@ mod tests {
                         network: None,
                         diagnostic: None,
                     },
-                    crate::audit::AuditCall {
+                    crate::runtime::audit_view::AuditCall {
                         tool: "bash".to_string(),
-                        category: crate::audit::AuditCategory::Shell,
+                        category: crate::runtime::audit_view::AuditCategory::Shell,
                         target: "ls".to_string(),
-                        outcome: crate::audit::AuditOutcome::Ok,
+                        outcome: crate::runtime::audit_view::AuditOutcome::Ok,
                         at: Some(1_004),
                         ms: Some(9),
                         preview: "a.md".to_string(),
@@ -299,7 +299,7 @@ mod tests {
                         diagnostic: None,
                     },
                 ],
-                refusals: vec![crate::audit::AuditRefusal {
+                refusals: vec![crate::runtime::audit_view::AuditRefusal {
                     at_ms: 1_500,
                     tool: "write_file".to_string(),
                     target: "/etc/x".to_string(),

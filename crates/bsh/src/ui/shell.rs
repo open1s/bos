@@ -581,7 +581,7 @@ pub(crate) struct Shell {
     /// can filter without reading it per row.
     pub(crate) audit_query: String,
     /// Optional category filter for the audit call list.
-    pub(crate) audit_category: Option<crate::audit::AuditCategory>,
+    pub(crate) audit_category: Option<crate::runtime::audit_view::AuditCategory>,
     /// Current page of expanded or searched audit turns.
     pub(crate) audit_page: usize,
     /// The turns the reader has opened, by 1-based turn number.
@@ -3921,7 +3921,7 @@ impl Shell {
             out.push_str(note);
             out.push_str("\n\n");
         }
-        out.push_str(&crate::state::turn_text(&composed, plan));
+        out.push_str(&crate::runtime::turn::turn_text(&composed, plan));
         out
     }
 
@@ -5029,7 +5029,7 @@ impl Shell {
                 continue;
             };
             let plan = self.state.plan_mode(&task.session_id);
-            let request = crate::state::turn_text(&task.prompt, plan);
+            let request = crate::runtime::turn::turn_text(&task.prompt, plan);
             let input = crate::state::turn_input(&request, &[]);
             self.spawn_turn(task.session_id.clone(), input, transcript, budget, cx);
             self.state.settings.global.mark_schedule_ran(&id, now);
@@ -5241,7 +5241,7 @@ impl Shell {
                 continue;
             };
             let plan = self.state.plan_mode(&session);
-            let request = crate::state::turn_text(&record.request.objective, plan);
+            let request = crate::runtime::turn::turn_text(&record.request.objective, plan);
             let input = crate::state::turn_input(&request, &[]);
             self.spawn_turn(session.clone(), input, transcript, budget, cx);
             self.peer_delegation_runs.insert(session, id);
@@ -5636,7 +5636,7 @@ impl Shell {
                 continue;
             };
             let plan = self.state.plan_mode(&session);
-            let request = crate::state::turn_text(&task.objective, plan);
+            let request = crate::runtime::turn::turn_text(&task.objective, plan);
             let input = crate::state::turn_input(&request, &[]);
             self.spawn_turn(session.clone(), input, transcript, budget, cx);
             self.peer_task_deadlines
@@ -5872,7 +5872,7 @@ impl Shell {
                 continue;
             };
             let plan = self.state.plan_mode(&session);
-            let request = crate::state::turn_text(&text, plan);
+            let request = crate::runtime::turn::turn_text(&text, plan);
             let input = crate::state::turn_input(&request, &[]);
             self.spawn_turn(session.clone(), input, transcript, budget, cx);
             for (root, mut task, _) in settled {
@@ -7097,7 +7097,7 @@ impl Shell {
             return Err("the session is gone".to_string());
         };
         let plan = self.state.plan_mode(&spec.session);
-        let request = crate::state::turn_text(&spec.objective, plan);
+        let request = crate::runtime::turn::turn_text(&spec.objective, plan);
         let input = crate::state::turn_input(&request, &[]);
         let change_set = self.spawn_turn(spec.session.clone(), input, transcript, budget, cx);
         if let Some(change_set) = change_set {

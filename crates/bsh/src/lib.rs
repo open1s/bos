@@ -11,7 +11,6 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 pub(crate) mod assets;
 pub(crate) mod atomic_replace;
-pub(crate) mod audit;
 pub(crate) mod browser;
 pub(crate) mod caps;
 pub(crate) mod command_invocation;
@@ -81,7 +80,10 @@ pub(crate) mod tool_output;
 pub(crate) mod tool_view;
 pub(crate) mod trash;
 // The terminal client of the Runtime Host: it renders projections and sends
-// Commands over the same contract the GUI migration will use.
+// Commands over the contract. Everything it shares with the window - the
+// session store, context assembly, transcript replay, command grammar and
+// display formatting - lives in `runtime`, not in either view, so the two
+// interfaces are one application with two renderers.
 pub(crate) mod tui;
 pub(crate) mod ui;
 pub(crate) mod vault;

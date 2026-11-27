@@ -55,6 +55,22 @@ pub struct RuntimeConfig {
     pub echo: bool,
     /// Provider settings for the model-backed executor.
     pub provider: ReactSettings,
+    /// Workspace id the sessions this Host writes are tagged with.
+    ///
+    /// The desktop's registry minted it. `None` derives one from the workspace
+    /// root, which is right for a scratch data directory (a test, a smoke run)
+    /// and wrong for a real one: a session tagged with a derived id is invisible
+    /// to the window's workspace filter.
+    pub session_workspace: Option<String>,
+    /// Display name recorded on a bin entry for this workspace.
+    pub session_workspace_name: String,
+    /// The desktop's recycle bin, when the Host should share it.
+    ///
+    /// `None` parks under `<data_dir>/trash`, which keeps a scratch run out of
+    /// the reader's real bin.
+    pub session_trash_dir: Option<PathBuf>,
+    /// Credentials that must never be written into a session document.
+    pub session_secrets: Vec<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -72,6 +88,10 @@ impl Default for RuntimeConfig {
             shutdown_grace: Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_SECS),
             echo: false,
             provider: ReactSettings::default(),
+            session_workspace: None,
+            session_workspace_name: String::new(),
+            session_trash_dir: None,
+            session_secrets: Vec::new(),
         }
     }
 }

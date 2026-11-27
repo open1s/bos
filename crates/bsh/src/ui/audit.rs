@@ -30,11 +30,11 @@ use gpui_kit::*;
 
 use super::shell::Shell;
 use super::{DivExt, IconName, icon, txt};
-use crate::audit::{
-    self, AuditAllows, AuditCall, AuditCategory, AuditOutcome, AuditPolicy, AuditRefusal,
+use crate::i18n::tr_args;
+use crate::runtime::audit_view::{
+    self as audit, AuditAllows, AuditCall, AuditCategory, AuditOutcome, AuditPolicy, AuditRefusal,
     AuditTurn, AuditView,
 };
-use crate::i18n::tr_args;
 use crate::state::Tab;
 use crate::theme;
 
@@ -534,7 +534,7 @@ impl Shell {
             // for the other ranges is what keeps a repaint from rebuilding the
             // rows at a minute boundary for no reason.
             minute: if self.audit_range == 1 {
-                crate::state::now_ms() / 60_000
+                crate::runtime::clock::now_ms() / 60_000
             } else {
                 0
             },
@@ -3539,7 +3539,7 @@ mod tests {
     fn a_streaming_turn_does_not_rebuild_the_audit_page(cx: &mut TestAppContext) {
         let (shell, cx) = boot(cx, "audit-streaming", 4);
         let _ = cx.update(|_, cx| shell.read(cx).audit_view().turns.len());
-        let builds_before = crate::audit::audit_builds();
+        let builds_before = crate::runtime::audit_view::audit_builds();
         cx.update(|_, cx| {
             shell.update(cx, |shell, _| {
                 let id = shell.state.active_id.clone().expect("a session");
@@ -3555,7 +3555,7 @@ mod tests {
         });
         let _ = cx.update(|_, cx| shell.read(cx).audit_view().turns.len());
         assert_eq!(
-            crate::audit::audit_builds(),
+            crate::runtime::audit_view::audit_builds(),
             builds_before,
             "a streamed event leaves the page alone"
         );
@@ -3568,7 +3568,7 @@ mod tests {
     fn a_large_audit_page_builds_off_the_frame(cx: &mut TestAppContext) {
         let (shell, cx) = boot(cx, "audit-async", 900);
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let builds_after_first = crate::audit::audit_builds();
+        let builds_after_first = crate::runtime::audit_view::audit_builds();
         assert!(
             cx.debug_bounds("audit-turn-1").is_none(),
             "the first frame paints before the background build lands"
@@ -3585,7 +3585,7 @@ mod tests {
             "the background build installs the page"
         );
         assert_eq!(
-            crate::audit::audit_builds(),
+            crate::runtime::audit_view::audit_builds(),
             builds_after_first + 1,
             "the large page built exactly once, off the frame"
         );
@@ -3605,7 +3605,7 @@ mod tests {
             }
         }
         assert!(cx.debug_bounds("audit-turn-1").is_some());
-        let builds = crate::audit::audit_builds();
+        let builds = crate::runtime::audit_view::audit_builds();
         cx.update(|_, cx| {
             shell.update(cx, |shell, _| {
                 *shell.audit_cache.borrow_mut() = super::AuditCache::default();
@@ -3623,7 +3623,7 @@ mod tests {
             "the persisted page installs"
         );
         assert_eq!(
-            crate::audit::audit_builds(),
+            crate::runtime::audit_view::audit_builds(),
             builds,
             "reading the cache did not rebuild the model"
         );
@@ -3738,7 +3738,7 @@ mod tests {
         for _ in 0..4 {
             cx.update(|window, cx| window.draw(cx).clear(cx));
         }
-        let builds_before = crate::audit::audit_builds();
+        let builds_before = crate::runtime::audit_view::audit_builds();
         let rows_before = super::audit_rows_built();
         let long_ms = median_frame(cx, 12);
         let built = (super::audit_rows_built() - rows_before) as f64 / 12.0;
@@ -3748,7 +3748,7 @@ mod tests {
             "a 400-turn page built {built:.0} rows a frame: the window is not bounded"
         );
         assert_eq!(
-            crate::audit::audit_builds(),
+            crate::runtime::audit_view::audit_builds(),
             builds_before,
             "a repaint that changes nothing must reuse the view model"
         );
@@ -3794,7 +3794,7 @@ mod tests {
             "the top of the page is a spacer while the reader is at the tail"
         );
         assert_eq!(
-            crate::audit::audit_builds(),
+            crate::runtime::audit_view::audit_builds(),
             builds_before,
             "scrolling must not rebuild the view model"
         );
@@ -3834,7 +3834,7 @@ mod tests {
         }
         // `audit_builds` counts the view-model build, and the flat rows are
         // built in the same pass: a repaint that leaves it alone rebuilt neither.
-        let builds_before = crate::audit::audit_builds();
+        let builds_before = crate::runtime::audit_view::audit_builds();
         let rows_before = super::audit_flat_rows_built();
         let long_ms = median_frame(cx, 12);
         let built = (super::audit_flat_rows_built() - rows_before) as f64 / 12.0;
@@ -3844,7 +3844,7 @@ mod tests {
             "an {EVENTS}-event table built {built:.0} rows a frame: the table is not windowed"
         );
         assert_eq!(
-            crate::audit::audit_builds(),
+            crate::runtime::audit_view::audit_builds(),
             builds_before,
             "a repaint that changes nothing must reuse the flat model"
         );
@@ -3884,7 +3884,7 @@ mod tests {
             "the top of the table is a spacer while the reader is at the tail"
         );
         assert_eq!(
-            crate::audit::audit_builds(),
+            crate::runtime::audit_view::audit_builds(),
             builds_before,
             "scrolling must not rebuild the flat model"
         );

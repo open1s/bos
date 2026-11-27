@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::contract::ShutdownMode;
-use crate::runtime::embed::Authority;
 use crate::runtime::executor::ReactSettings;
 use crate::runtime::host::RuntimeHost;
 use crate::runtime::ids::SessionId;
@@ -47,9 +46,10 @@ usage: bsh tui [options]
 
 Run the terminal interface. When a Runtime Host already serves the data
 directory - `bsh host`, or another `bsh tui` - the interface attaches to it and
-leaves it running. Otherwise it starts a Host for this process, serves it on the
-same local IPC endpoint and stops it again on quit, so `bsh tui` needs no second
-command to be a complete runtime.
+leaves it running. Otherwise it starts a standalone `bsh host` process,
+serves it on the same local IPC endpoint and leaves it running on quit, so
+`bsh tui` needs no second command to be a complete runtime and TUI exit never
+cancels or stops Host-owned work.
 
 The interface shows sessions, runs turns and answers approvals on the Host the
 bsh window is configured for: the same `settings.toml` and the same vault entry,
@@ -70,12 +70,11 @@ keys:
   Enter              send the turn to the Host
   Ctrl-N / Ctrl-P    next / previous session
   Ctrl-T             create a session
-  Ctrl-C             cancel the session's running execution
+  Ctrl-C             not bound to job cancellation; use /cancel [confirm]
   Ctrl-Y / Ctrl-R    approve / reject the oldest pending approval
   Up / Down          scroll the transcript
-  Ctrl-D             quit; a Host this process started drains first - in-flight
-                     work gets its shutdown grace - while a Host owned by
-                     `bsh host` keeps running
+  Ctrl-D             quit; a Host started by `bsh tui` keeps running, and a
+                     Host owned by `bsh host` keeps running
 ";
 
 /// Parsed `bsh host` arguments.
@@ -162,17 +161,54 @@ pub(crate) fn host_main(args: &[String]) -> i32 {
 
 fn build_config(options: HostOptions) -> Result<RuntimeConfig, String> {
     let mut config = RuntimeConfig::with_data_dir(options.data_dir).load()?;
-    apply_shell_settings(&mut config, &shell_settings(options.workspace.as_deref()));
+    let settings = shell_settings(options.workspace.as_deref());
+    apply_shell_settings(&mut config, &settings);
     // An explicit flag is the reader's own instruction, so it wins over both
     // documents: the shell's settings describe the default, not a ceiling.
     if let Some(workspace) = options.workspace {
         config.workspace_root = workspace;
     }
+    // The final root, not the one the settings were read for: a `--workspace`
+    // names the folder the sessions belong to.
+    resolve_session_workspace(&mut config, settings);
     if let Some(socket) = options.socket {
         config.socket_path = socket;
     }
     config.echo = options.echo;
     Ok(config)
+}
+
+/// Tag the Host's sessions with the workspace the final root names.
+///
+/// The registry is how the window decides which sessions belong under which
+/// workspace row. A Host that served a folder the registry did not know would
+/// write chats the window could never list, so the folder is registered here -
+/// the same act as opening it in the window - and a folder the registry already
+/// knows keeps its existing identity.
+fn resolve_session_workspace(config: &mut RuntimeConfig, mut settings: Settings) {
+    let root = config.canonical_workspace();
+    let root_text = root.display().to_string();
+    if let Some(workspace) = settings.global.workspaces.iter().find(|workspace| {
+        std::fs::canonicalize(&workspace.root).is_ok_and(|registered| registered == root)
+    }) {
+        config.session_workspace = Some(workspace.id.clone());
+        config.session_workspace_name = workspace.name.clone();
+        return;
+    }
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| root_text.clone());
+    let id = settings.note_workspace(&name, &root_text);
+    // A scratch configuration keeps its registry in scratch space; a test build
+    // never writes the reader's global document.
+    if (settings.save_root.is_some() || !cfg!(test))
+        && let Err(error) = settings.save_global()
+    {
+        log::warn!("the workspace {root_text} could not be registered: {error}");
+    }
+    config.session_workspace = Some(id);
+    config.session_workspace_name = name;
 }
 
 /// Open the Host, serve until a stop signal, then drain it.
@@ -308,20 +344,20 @@ pub(crate) fn tui_main(args: &[String]) -> i32 {
     let config = tui_config(&options);
     let workspace =
         (!config.workspace_root.as_os_str().is_empty()).then(|| config.workspace_root.clone());
-    let authority = match Authority::open(config) {
-        Ok(authority) => authority,
+    // The TUI is only a client. When no standalone Host owns the data
+    // directory, start `bsh host` as a SEPARATE process and attach to it; a
+    // terminal exit never stops Host-owned work. `bsh host` remains explicitly
+    // startable for a Host that should outlive any particular client.
+    let _standalone = match spawn_standalone_host(&config) {
+        Ok(child) => child,
         Err(error) => {
             crate::runtime::report(error);
             return 1;
         }
     };
     let outcome = crate::tui::run(&options.data_dir, options.session, workspace);
-    // An embedded Host belongs to this process, so it stops after the
-    // interface restored the terminal: its messages stay readable and the
-    // socket is gone before the process exits.
-    if let Authority::Started(host) = authority {
-        host.stop();
-    }
+    // Do not stop `_standalone`: Host-owned work survives TUI exit. A child
+    // Host dropped here is not killed; it keeps serving the data directory.
     match outcome {
         Ok(()) => 0,
         Err(error) => {
@@ -329,6 +365,50 @@ pub(crate) fn tui_main(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// Start a standalone `bsh host` process when no Host already serves `config`.
+///
+/// The returned child is intentionally not killed on TUI exit. Client disconnect
+/// is not Host shutdown and not Job cancellation.
+fn spawn_standalone_host(config: &RuntimeConfig) -> Result<Option<std::process::Child>, String> {
+    if crate::runtime::endpoint::Endpoint::discover(&config.data_dir).is_ok() {
+        return Ok(None);
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot find the bsh executable: {error}"))?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("host")
+        .arg("--data-dir")
+        .arg(&config.data_dir)
+        .arg("--workspace")
+        .arg(&config.workspace_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if config.echo {
+        command.arg("--echo");
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot start standalone Runtime Host: {error}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while crate::runtime::endpoint::Endpoint::discover(&config.data_dir).is_err() {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("cannot query standalone Runtime Host: {error}"))?
+        {
+            return Err(format!(
+                "standalone Runtime Host exited during startup: {status}"
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("standalone Runtime Host did not publish its endpoint".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(Some(child))
 }
 
 /// Configuration for a Host this process would start.
@@ -351,10 +431,15 @@ fn tui_config(options: &TuiOptions) -> RuntimeConfig {
     // only a shell with no readable cwd falls back to the one the desktop last
     // had open.
     let root = terminal_workspace(options.workspace.clone(), std::env::current_dir().ok());
-    apply_shell_settings(&mut config, &shell_settings(root.as_deref()));
+    let settings = shell_settings(root.as_deref());
+    apply_shell_settings(&mut config, &settings);
     if let Some(root) = root {
         config.workspace_root = root;
     }
+    // The terminal serves the folder it was started in, so its chats are that
+    // folder's project chats: the same registration `open this folder` makes in
+    // the window, and the reason a chat made here appears in its sidebar.
+    resolve_session_workspace(&mut config, settings);
     config.echo = options.echo;
     config
 }
@@ -407,6 +492,21 @@ fn apply_shell_settings(config: &mut RuntimeConfig, settings: &Settings) {
     let root = settings.active_workspace_root();
     if !root.trim().is_empty() {
         config.workspace_root = PathBuf::from(root);
+    }
+    // The session store is the desktop's, so the Host takes the desktop's
+    // workspace identity, its bin and the credentials a session document must
+    // never carry. These are read before the model check below: a Host with no
+    // model still owns sessions, and a session tagged with a derived id would
+    // be invisible to the window's workspace filter.
+    if let Some(workspace) = settings.active_workspace() {
+        config.session_workspace = Some(workspace.id.clone());
+        config.session_workspace_name = workspace.name.clone();
+    }
+    config.session_secrets = settings.secrets();
+    // `trash_dir` refuses to invent a path for a test that has no save root, so
+    // a scratch configuration keeps its bin under the Host's data directory.
+    if settings.save_root.is_some() || !cfg!(test) {
+        config.session_trash_dir = Some(settings.trash_dir());
     }
     let effective = settings.effective();
     if effective.model.trim().is_empty() || effective.base_url.trim().is_empty() {
@@ -595,5 +695,42 @@ mod tests {
         assert_eq!(settings.workspace.agent.system_prompt, "from this checkout");
         let absent = with_workspace_document(Settings::default(), Some(&scratch("fresh")));
         assert!(absent.workspace.agent.system_prompt.is_empty());
+    }
+
+    /// A folder the registry does not know is registered once, and a folder it
+    /// knows keeps the identity (and name) the window gave it. This is what
+    /// makes a chat the terminal creates appear under the window's row.
+    #[test]
+    fn the_served_folder_is_registered_with_a_stable_identity() {
+        let root = scratch("served-folder");
+        let mut settings = Settings {
+            save_root: Some(scratch("register-home")),
+            ..Settings::default()
+        };
+        let mut first = RuntimeConfig::with_data_dir(scratch("first-host"));
+        first.workspace_root = root.clone();
+        resolve_session_workspace(&mut first, settings.clone());
+        let id = first.session_workspace.clone().expect("a workspace id");
+        assert_eq!(
+            settings.global.workspaces.len(),
+            0,
+            "the clone is untouched"
+        );
+        assert!(
+            settings
+                .global
+                .workspaces
+                .iter()
+                .all(|workspace| workspace.id != id),
+            "the original settings did not observe the clone's registration"
+        );
+
+        // Registering through the API and resolving again keeps that id.
+        let named = settings.note_workspace("my project", &root.display().to_string());
+        let mut second = RuntimeConfig::with_data_dir(scratch("second-host"));
+        second.workspace_root = root;
+        resolve_session_workspace(&mut second, settings);
+        assert_eq!(second.session_workspace.as_deref(), Some(named.as_str()));
+        assert_eq!(second.session_workspace_name, "my project");
     }
 }

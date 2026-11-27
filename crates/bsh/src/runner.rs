@@ -26,21 +26,6 @@ fn tool_result_failed(output: &str) -> bool {
     react::tool::ToolResult::text_is_error(output)
 }
 
-/// The live plan block for one turn, when the agent has a plan.
-///
-/// Built from the agent's own store (the `update_plan` tool writes through the
-/// same one), so the block is the plan the panel shows and not a second copy.
-fn plan_context_block(agent: &Agent) -> Option<crate::context_assembly::ContextBlock> {
-    let plan = crate::context::render_plan(&agent.plan_items())?;
-    Some(crate::context_assembly::ContextBlock {
-        source: crate::context_assembly::ContextSource::Plan,
-        trust: crate::context_assembly::ContextSource::Plan.trust(),
-        token_estimate: agent::agent::context::estimate_tokens(&plan),
-        provenance: Some("plan".to_string()),
-        text: plan,
-    })
-}
-
 /// One event the runner forwards to the shell.
 #[derive(Debug, Clone)]
 pub(crate) enum AgentEvent {
@@ -177,87 +162,13 @@ impl Runner {
         }
     }
 
-    /// Re-seed the agent session from the UI transcript.
+    /// Re-seed the agent session from the stored transcript.
     ///
-    /// The stored history replays in the model's own order: text, then each
-    /// tool call with its result. The runtime snapshot and workspace
-    /// instructions are injected by [`Runner::spawn`] after compaction,
-    /// immediately before the stream, so the fresh context is never folded
-    /// into the checkpoint it was meant to supersede.
+    /// The replay itself is shared with the Host executor
+    /// ([`crate::runtime::transcript`]): a window turn and a terminal turn must
+    /// read the same rows, including tool results and images.
     pub(crate) fn seed_session(agent: &Agent, transcript: &[ChatMessage]) {
-        let commands = crate::extension::cached_commands();
-        Self::seed_session_with(agent, transcript, &commands);
-    }
-
-    /// The same seed against an explicit command list.
-    ///
-    /// Split out so the replay of a `/command` annotation is testable without a
-    /// live extension host: the production path is [`Self::seed_session`], which
-    /// reads the host's current list once per seed.
-    pub(crate) fn seed_session_with(
-        agent: &Agent,
-        transcript: &[ChatMessage],
-        commands: &[crate::extension::CommandSurface],
-    ) {
-        let mut session = agent.session();
-        session.restore_messages(Vec::new());
-        for (row_index, message) in transcript.iter().enumerate() {
-            match message.role {
-                // A stored user row with images replays as the same multimodal
-                // content its live turn sent, which is how the /goal attachment
-                // message stays readable by a later goal round. An extension
-                // command's `/name` annotation replays as the block its live
-                // send carried, or a later turn reads a command it cannot see.
-                Role::User => {
-                    if let Some(content) = crate::state::message_content(message) {
-                        session
-                            .add_user_content(crate::command_invocation::replay(commands, content));
-                    }
-                }
-                Role::Assistant => {
-                    // Reasoning is replayed only to a provider that requires it
-                    // (DeepSeek rejects a tool-carrying request whose earlier
-                    // turns lost their chain of thought). Every other provider
-                    // keeps the turn-local rule: the transcript still shows the
-                    // block to the reader, but the request must not carry it.
-                    if agent.replays_reasoning_across_turns()
-                        && !message.reasoning.trim().is_empty()
-                    {
-                        session.push(react::llm::LlmMessage::AssistantReasoning {
-                            content: message.reasoning.clone(),
-                            provider_state: None,
-                        });
-                    }
-                    if !message.text.is_empty() {
-                        session.add_assistant(message.text.clone());
-                    }
-                    // The tool traffic replays too. Dropping it used to make
-                    // every turn re-do the last turn's reads - the model
-                    // re-read the same files each turn because the results it
-                    // already held were gone - and it moved the request
-                    // prefix, so the provider's prompt cache never carried
-                    // across turns. The stored outputs are the capped ones the
-                    // request sent; the ids are seed-local and only need to
-                    // pair call with result inside this history.
-                    for (call_index, event) in message.tools.iter().enumerate() {
-                        let call_id = format!("seed-{row_index}-{call_index}");
-                        let args: serde_json::Value =
-                            serde_json::from_str(&event.args).unwrap_or(serde_json::json!({}));
-                        session.push(react::llm::LlmMessage::AssistantToolCall {
-                            tool_call_id: call_id.clone(),
-                            name: event.name.clone(),
-                            args,
-                        });
-                        session.push(react::llm::LlmMessage::ToolResult {
-                            tool_call_id: call_id,
-                            content: event.output.clone().unwrap_or_else(|| {
-                                "The tool call produced no recorded result.".to_string()
-                            }),
-                        });
-                    }
-                }
-            }
-        }
+        crate::runtime::transcript::seed_session(agent, transcript);
     }
 
     /// Start streaming a turn, returning the event receiver.
@@ -292,7 +203,7 @@ impl Runner {
             .filter(|message| message.role == Role::User)
             .count()
             + 1;
-        let prepared_at = crate::state::now();
+        let prepared_at = crate::runtime::clock::now();
         let elapsed = self
             .prepared
             .insert(session_id.to_string(), prepared_at)
@@ -325,16 +236,17 @@ impl Runner {
             // un-compacted history, exactly the reference's "log a warning and
             // continue the turn" rule.
             if let Some(retain) = auto_retain
-                && let Ok(Some(outcome)) = agent.compact_now(retain, &stop_task).await {
-                    let event = AgentEvent::AutoCompacted {
-                        before: outcome.before_tokens,
-                        dropped: outcome.replaced,
-                        summary: outcome.summary,
-                    };
-                    if tx.send_blocking(event).is_err() {
-                        return;
-                    }
+                && let Ok(Some(outcome)) = agent.compact_now(retain, &stop_task).await
+            {
+                let event = AgentEvent::AutoCompacted {
+                    before: outcome.before_tokens,
+                    dropped: outcome.replaced,
+                    summary: outcome.summary,
+                };
+                if tx.send_blocking(event).is_err() {
+                    return;
                 }
+            }
             if stop_task.load(Ordering::SeqCst) {
                 return;
             }
@@ -363,9 +275,10 @@ impl Runner {
             if intent == ActionIntent::Unknown
                 && text.trim().chars().count() >= 12
                 && !text.contains("<extension_command")
-                && let Some(classified) = agent.classify_intent_with_model(&text).await {
-                    intent = classified;
-                }
+                && let Some(classified) = agent.classify_intent_with_model(&text).await
+            {
+                intent = classified;
+            }
             agent.set_action_intent(intent);
             // The classifier is a provider request too: its usage joins the
             // turn's totals instead of being billed invisibly.
@@ -376,390 +289,19 @@ impl Runner {
                     cached: u64::from(usage.cached_tokens),
                 });
             }
-            // The turn's own context is rendered HERE, on the runner's blocking
-            // runtime: the snapshot is pure, but instruction discovery stats the
-            // workspace, and the send path must not do file I/O on the UI
-            // thread. It is injected after the checkpoint so the fresh snapshot
-            // cannot be summarized into the history it supersedes.
-            let context = crate::context::TurnContext::from_facts_at(&facts, false, &time);
-            // The typed snapshot is built below, from the same facts, and its
-            // request blocks are what get injected: no separately rendered
-            // copy can drift from the assembled types (issue #411).
-            // Surface the auto-injection as a chat event: the persona the build
-            // composed, the runtime snapshot and the workspace instructions this
-            // turn carried. Recorded on the prompt row, display only.
-            {
-                let mut injections: Vec<crate::model::ContextInjection> = Vec::new();
-                // The TYPED assembly (issue #346): the exact system prompt plus
-                // the recall account it was built from. Diagnostics read the
-                // account, never search the rendered text.
-                let assembly = agent.assemble_prompt(&input).await;
-                // Retrieved memory is not part of the system prompt: it rides
-                // the provider request's untrusted context channel.
-                let persona = assembly.base_prompt.clone();
-                let recall =
-                    crate::context_assembly::MemoryRecallInfo::from_agent(&assembly.memory);
-
-                // The immutable snapshot is the source of truth: one typed
-                // block per source, each carrying its trust boundary and
-                // provenance to serialization (issue #346).
-                let mut blocks = vec![crate::context_assembly::ContextBlock {
-                    source: crate::context_assembly::ContextSource::Persona,
-                    trust: crate::context_assembly::ContextSource::Persona.trust(),
-                    text: assembly.base_prompt.clone(),
-                    token_estimate: agent::agent::context::estimate_tokens(&assembly.base_prompt),
-                    provenance: Some("persona".to_string()),
-                }];
-                if !context.snapshot.is_empty() {
-                    blocks.push(crate::context_assembly::ContextBlock {
-                        source: crate::context_assembly::ContextSource::HostRuntime,
-                        trust: crate::context_assembly::ContextSource::HostRuntime.trust(),
-                        text: context.snapshot.clone(),
-                        token_estimate: agent::agent::context::estimate_tokens(&context.snapshot),
-                        provenance: Some("runtime-context".to_string()),
-                    });
-                }
-                // The working plan is host state the model maintains, so it
-                // rides the request like the runtime facts: after a compaction
-                // or a long turn the old tool row may be all the model has.
-                if let Some(block) = plan_context_block(&agent) {
-                    blocks.push(block);
-                }
-                if !context.time_context.is_empty() {
-                    blocks.push(crate::context_assembly::ContextBlock {
-                        source: crate::context_assembly::ContextSource::TimeContext,
-                        trust: crate::context_assembly::ContextSource::TimeContext.trust(),
-                        text: context.time_context.clone(),
-                        token_estimate: agent::agent::context::estimate_tokens(&context.time_context),
-                        provenance: Some("time-context".to_string()),
-                    });
-                }
-                if let Some(instructions) = &context.instructions {
-                    blocks.push(crate::context_assembly::ContextBlock {
-                        source: crate::context_assembly::ContextSource::WorkspaceInstructions,
-                        trust: crate::context_assembly::ContextSource::WorkspaceInstructions.trust(),
-                        text: instructions.clone(),
-                        token_estimate: agent::agent::context::estimate_tokens(instructions),
-                        provenance: Some("AGENTS.md".to_string()),
-                    });
-                }
-                if let Some(block) =
-                    crate::context_assembly::memory_block(&recall, assembly.memory.block.as_deref())
-                {
-                    blocks.push(block);
-                }
-                // Extension instructions are task-scoped (issue #436): an
-                // installed package is not a request for its workflow guide.
-                // The same selection feeds the blocks, the manifest omissions
-                // and the report, so the request and diagnostics cannot
-                // disagree about what was included and why.
-                let task_text = input.as_text().unwrap_or_default();
-                let tool_names = agent.capability_tool_names();
-                let extension_plan = crate::extension::activation::activate(
-                    &agent.conditional_prompts(),
-                    task_text,
-                    &tool_names,
-                );
-                let mut extension_omissions = Vec::new();
-                for active in &extension_plan.active {
-                    for selected in &active.prompts {
-                        let prompt = &selected.prompt;
-                        let text = crate::extension::activation::render(active, selected);
-                        blocks.push(crate::context_assembly::ContextBlock {
-                            source: crate::context_assembly::ContextSource::Extension,
-                            trust: crate::context_assembly::ContextSource::Extension.trust(),
-                            token_estimate: agent::agent::context::estimate_tokens(&text),
-                            provenance: Some(format!(
-                                "ext:{}@{}#{}#{}",
-                                active.owner, active.version, prompt.id, prompt.kind
-                            )),
-                            text: text.clone(),
-                        });
-                        injections.push(crate::model::ContextInjection {
-                            kind: "extension".to_string(),
-                            content: text,
-                            // Name the contribution, not only the package: two
-                            // contributions of one extension must not draw two
-                            // indistinguishable rows (issue #436 review).
-                            source: format!(
-                                "{}@{}#{}",
-                                active.owner, active.version, prompt.id
-                            ),
-                        });
-                        log::debug!(
-                            target: "bsh::context",
-                            "extension context active: {}@{}#{} kind={} reason={} bytes={}",
-                            active.owner,
-                            active.version,
-                            prompt.id,
-                            prompt.kind,
-                            selected.reason,
-                            prompt.text.len()
-                        );
-                    }
-                }
-                for omission in &extension_plan.omissions {
-                    extension_omissions.push(crate::context_assembly::ContextOmission {
-                        source: crate::context_assembly::ContextSource::Extension,
-                        provenance: format!(
-                            "ext:{}@{}#{}#{}",
-                            omission.owner, omission.version, omission.contribution, omission.kind
-                        ),
-                        reason: omission.reason.clone(),
-                        tokens: omission.bytes / 4,
-                    });
-                    log::debug!(
-                        target: "bsh::context",
-                        "extension context omitted: {}@{}#{} reason={}",
-                        omission.owner,
-                        omission.version,
-                        omission.contribution,
-                        omission.reason
-                    );
-                }
-                let instruction_sources = context
-                    .instructions
-                    .as_deref()
-                    .map(|_| crate::instructions::sources(std::path::Path::new(&facts.cwd)).join(","));
-                // A content identity is opt-in: the key never lives in the
-                // repository, so logs cannot be dictionary-attacked by default.
-                let content_key = std::env::var("BSH_CONTEXT_CONTENT_KEY")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .map(String::into_bytes);
-                let content_key_id = std::env::var("BSH_CONTEXT_CONTENT_KEY_ID")
-                    .ok()
-                    .filter(|value| !value.is_empty());
-                // The persona is private text, so its version input is a keyed
-                // digest when a key is configured, and a coarse length label
-                // otherwise: the log never carries an unkeyed persona hash.
-                let persona_version = match content_key.as_deref() {
-                    Some(key) => crate::context_assembly::keyed_digest(key, &assembly.base_prompt),
-                    None => format!(
-                        "chars:{}:tokens:{}",
-                        assembly.base_prompt.chars().count(),
-                        agent::agent::context::estimate_tokens(&assembly.base_prompt)
-                    ),
-                };
-                let system_prompt_version = match content_key.as_deref() {
-                    Some(key) => crate::context_assembly::keyed_digest(
-                        key,
-                        &format!(
-                            "{}\n{}",
-                            assembly.base_prompt,
-                            context.instructions.as_deref().unwrap_or("")
-                        ),
-                    ),
-                    None => format!(
-                        "prompt-chars:{}",
-                        assembly.base_prompt.chars().count()
-                            + context
-                                .instructions
-                                .as_deref()
-                                .map(str::chars)
-                                .map(Iterator::count)
-                                .unwrap_or(0)
-                    ),
-                };
-                let runtime_config = crate::context_assembly::digest_text(
-                    &serde_json::json!({
-                        "temperature": agent.config().temperature,
-                        "max_tokens": agent.config().max_tokens,
-                        "reasoning_effort": agent.config().reasoning_effort,
-                        "api_mode": agent.config().api_mode,
-                    })
-                    .to_string(),
-                );
-                // Identity inputs are derived from the actual advertised tools,
-                // adapter and memory revision, not hard-coded labels (#432).
-                let tool_schema_digest = crate::context_assembly::digest_text(
-                    &serde_json::to_string(&agent.all_tools()).unwrap_or_default(),
-                );
-                let memory_revision = (!recall.records.is_empty()).then(|| {
-                    crate::context_assembly::digest_text(&recall.records.join(","))
-                });
-                let versions = crate::context_assembly::SourceVersions {
-                    persona: Some(persona_version),
-                    workspace_instructions: context.instructions.as_deref().map(|text| {
-                        format!(
-                            "{}:{}",
-                            crate::context_assembly::digest_text(text),
-                            instruction_sources.as_deref().unwrap_or("-")
-                        )
-                    }),
-                    memory_records: recall.records.clone(),
-                    tool_guidance: Some(format!("tools:{tool_schema_digest}")),
-                    provider: Some(agent.config().model.clone()),
-                    provider_adapter: Some(format!(
-                        "{}:{}:react-{}",
-                        agent
-                            .config()
-                            .model
-                            .split_once('/')
-                            .map(|(vendor, _)| vendor)
-                            .unwrap_or("openai"),
-                        agent.config().api_mode,
-                        react::llm::ADAPTER_VERSION
-                    )),
-                    provider_endpoint: Some(format!(
-                        "endpoint:{}",
-                        crate::context_assembly::digest_text(&agent.config().base_url)
-                    )),
-                    api_mode: Some(agent.config().api_mode.clone()),
-                    tool_schema: Some(tool_schema_digest),
-                    tool_schema_revision: Some("tool-definitions-v1".to_string()),
-                    memory_revision,
-                    memory_schema: Some(agent::memory::RECORD_SCHEMA.to_string()),
-                    system_prompt: Some(system_prompt_version),
-                    runtime_config: Some(runtime_config),
-                    session: Some(session.clone()),
-                    session_state: Some(format!("messages:{}", transcript.len())),
-                    turn: Some(time.turn as u64),
-                };
-                let snapshot = crate::context_assembly::AssemblySnapshot::build(
-                    blocks,
-                    versions,
-                    content_key
-                        .as_deref()
-                        .map(|key| (key, content_key_id.as_deref())),
-                )
-                .with_omissions(extension_omissions);
-                // Inject from the immutable snapshot, after the checkpoint and
-                // before the first request. The same snapshot becomes the
-                // typed request the engine attaches to every provider call
-                // (issue #421).
-                crate::context::inject_snapshot(&agent, &snapshot);
-                agent.set_provider_request(Some(snapshot.typed_provider_request()));
-
-                // Per-request assembly diagnostics (issues #336/#346): counts,
-                // labels and token estimates derived from the typed assembly,
-                // never raw memory or workspace content.
-                let mut report = crate::context_assembly::assemble_report(
-                    persona_complete,
-                    &assembly.base_prompt,
-                    &persona,
-                    &context.snapshot,
-                    &context.time_context,
-                    context.instructions.as_deref(),
-                    &memory_state,
-                    &recall,
-                    agent::agent::context::estimate_tokens(input.as_text().unwrap_or_default()),
-                );
-                report.composition_fingerprint = snapshot.fingerprint().composition.clone();
-                report.content_fingerprint = snapshot.fingerprint().content.clone();
-                // Extension inclusion/omission, from the same selection that
-                // built the blocks and the manifest (issue #436).
-                for active in &extension_plan.active {
-                    for selected in &active.prompts {
-                        let bytes = selected.prompt.text.len();
-                        report.estimated_tokens =
-                            report.estimated_tokens.saturating_add(bytes / 4);
-                        report.sources.push(crate::context_assembly::SourceStatus {
-                            source: crate::context_assembly::ContextSource::Extension,
-                            included: true,
-                            reason: Some(format!(
-                                "{}@{}#{}: {}",
-                                active.owner,
-                                active.version,
-                                selected.prompt.id,
-                                selected.reason
-                            )),
-                            tokens: bytes / 4,
-                        });
-                    }
-                }
-                for omission in snapshot.omissions() {
-                    report.sources.push(crate::context_assembly::SourceStatus {
-                        source: crate::context_assembly::ContextSource::Extension,
-                        included: false,
-                        reason: Some(format!(
-                            "{}: {}",
-                            omission.provenance, omission.reason
-                        )),
-                        tokens: omission.tokens,
-                    });
-                }
-                log::info!(
-                    target: "bsh::context",
-                    "context assembly: persona_complete={} memory={} retrieval_hits={} est_tokens={} snapshot_tokens={} fingerprint={} snapshot_fingerprint={} content_fingerprint={} retrieval_skip={}",
-                    report.persona_complete,
-                    report.memory.label(),
-                    report.retrieval_hits,
-                    report.estimated_tokens,
-                    snapshot.total_tokens(),
-                    report.composition_fingerprint.get(..16).unwrap_or(&report.composition_fingerprint),
-                    snapshot.fingerprint().composition_short(),
-                    report.content_fingerprint.as_deref().map(|value| &value[..16.min(value.len())]).unwrap_or("-"),
-                    report.retrieval_skip.as_deref().unwrap_or("none")
-                );
-                // The memory block's provenance, read from the snapshot itself.
-                if let Some(block) = snapshot.block(crate::context_assembly::ContextSource::RetrievedMemory) {
-                    log::debug!(
-                        target: "bsh::context",
-                        "retrieved memory block: trust={:?} tokens={} provenance={}",
-                        block.trust,
-                        block.token_estimate,
-                        block.provenance.as_deref().unwrap_or("-")
-                    );
-                }
-                // Per-block trust and provenance, read from the snapshot itself.
-                for block in snapshot.blocks() {
-                    log::debug!(
-                        target: "bsh::context",
-                        "context block: {} trust={:?} tokens={} provenance={}",
-                        block.source.label(),
-                        block.trust,
-                        block.token_estimate,
-                        block.provenance.as_deref().unwrap_or("-")
-                    );
-                }
-                for status in &report.sources {
-                    log::debug!(
-                        target: "bsh::context",
-                        "context source: {} included={} trust={:?} tokens={} reason={}",
-                        status.source.label(),
-                        status.included,
-                        status.source.trust(),
-                        status.tokens,
-                        status.reason.as_deref().unwrap_or("-")
-                    );
-                }
-
-                if !persona.trim().is_empty() {
-                    injections.push(crate::model::ContextInjection {
-                        kind: "persona".to_string(),
-                        content: persona,
-                        source: "persona".to_string(),
-                    });
-                }
-                if !context.snapshot.is_empty() {
-                    injections.push(crate::model::ContextInjection {
-                        kind: "context".to_string(),
-                        content: context.snapshot.clone(),
-                        source: "runtime-context".to_string(),
-                    });
-                }
-                if !context.time_context.is_empty() {
-                    injections.push(crate::model::ContextInjection {
-                        kind: "time".to_string(),
-                        content: context.time_context.clone(),
-                        source: "time-context".to_string(),
-                    });
-                }
-                if let Some(instructions) = &context.instructions {
-                    // Name the producer the way the reference does: the file the
-                    // instructions came from (AGENTS.md), not a generic kind.
-                    let source =
-                        crate::instructions::sources(std::path::Path::new(&facts.cwd)).join(", ");
-                    injections.push(crate::model::ContextInjection {
-                        kind: "instructions".to_string(),
-                        content: instructions.clone(),
-                        source,
-                    });
-                }
-                if !injections.is_empty() {
-                    let _ = tx.send_blocking(AgentEvent::ContextInjected { injections });
-                }
+            let injections = crate::runtime::context_prepare::prepare(
+                &agent,
+                &input,
+                &facts,
+                &time,
+                memory_state,
+                persona_complete,
+                &session,
+                transcript.len(),
+            )
+            .await;
+            if !injections.is_empty() {
+                let _ = tx.send_blocking(AgentEvent::ContextInjected { injections });
             }
 
             let mut tool_calls = 0usize;
@@ -861,16 +403,17 @@ impl Runner {
             // not - and the capture runs ASYNCHRONOUSLY beside the terminal
             // event, so a capture failure never invalidates the turn.
             if matches!(terminal_event, Some(AgentEvent::Done))
-                && let Some(capture) = &capture {
-                    let evidence = agent::memory::capture::TurnEvidence {
-                        user_text: text.clone(),
-                        assistant_text: answer.clone(),
-                        session: Some(session.clone()),
-                        turn: Some(format!("t{turn}")),
-                        tool_evidence: Vec::new(),
-                    };
-                    capture.spawn(&tokio::runtime::Handle::current(), evidence);
-                }
+                && let Some(capture) = &capture
+            {
+                let evidence = agent::memory::capture::TurnEvidence {
+                    user_text: text.clone(),
+                    assistant_text: answer.clone(),
+                    session: Some(session.clone()),
+                    turn: Some(format!("t{turn}")),
+                    tool_evidence: Vec::new(),
+                };
+                capture.spawn(&tokio::runtime::Handle::current(), evidence);
+            }
             if let Some(event) = terminal_event {
                 let _ = tx.send_blocking(event);
             }
@@ -908,7 +451,10 @@ mod tests {
     fn a_plan_becomes_a_context_block_for_the_request() {
         let provider = std::sync::Arc::new(agent::agent::agentic::LlmProvider::new());
         let agent = Agent::new(agent::AgentConfig::default(), provider);
-        assert!(plan_context_block(&agent).is_none(), "no plan, no block");
+        assert!(
+            crate::runtime::context_prepare::plan_context_block(&agent).is_none(),
+            "no plan, no block"
+        );
         agent.plan().replace(vec![
             agent::tools::PlanItem {
                 text: "Read the file".to_string(),
@@ -919,7 +465,8 @@ mod tests {
                 status: agent::tools::PlanStatus::InProgress,
             },
         ]);
-        let block = plan_context_block(&agent).expect("the plan block");
+        let block =
+            crate::runtime::context_prepare::plan_context_block(&agent).expect("the plan block");
         assert_eq!(block.source, crate::context_assembly::ContextSource::Plan);
         assert_eq!(block.trust, crate::context_assembly::Trust::HostAuthority);
         assert!(
@@ -2624,7 +2171,7 @@ mod tests {
             crate::model::ChatMessage::user("/hello__greet in one sentence".to_string()),
             crate::model::ChatMessage::assistant(),
         ];
-        Runner::seed_session_with(&agent, &transcript, &commands);
+        crate::runtime::transcript::seed_session_with(&agent, &transcript, &commands);
         let users: Vec<String> = agent
             .session()
             .messages()

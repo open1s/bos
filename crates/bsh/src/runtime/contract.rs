@@ -1402,8 +1402,29 @@ pub struct ExtensionView {
     pub commands: Vec<String>,
     /// Qualified panel names it contributed.
     pub panels: Vec<String>,
+    /// Capability decisions resolved by the extension host's policy engine.
+    #[serde(default)]
+    pub capabilities: Vec<ExtensionCapabilityView>,
     /// The last failure, when it failed.
     pub error: Option<String>,
+}
+
+/// One extension capability's policy result and scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtensionCapabilityView {
+    /// Stable capability name.
+    pub capability: String,
+    /// Whether policy currently allows the capability.
+    pub allowed: bool,
+    /// Granted scope, when allowed.
+    pub scope: Option<String>,
+    /// Policy's denial reason, when denied.
+    pub reason: Option<String>,
+    /// Risk class assigned by the capability registry.
+    pub risk: String,
+    /// Whether the extension requires this capability to activate.
+    pub required: bool,
 }
 
 /// The extensions this build has installed, and whether each is in force.

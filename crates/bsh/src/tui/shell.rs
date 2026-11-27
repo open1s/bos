@@ -275,6 +275,14 @@ pub(crate) fn encode(key: &Key) -> Option<Vec<u8>> {
         // A click is the frame's gesture, not the shell's: the pane has no
         // pointer protocol, so there is nothing to forward.
         Key::Click { .. } => return None,
+        // An Alt chord is the escape prefix followed by the letter, which is
+        // what a terminal sends for one: the pane forwards it so a shell's own
+        // Alt bindings keep working while the rail is behind it.
+        Key::Alt(character) => {
+            let mut bytes = b"\x1b".to_vec();
+            bytes.extend(character.to_string().into_bytes());
+            bytes
+        }
         // A control chord is its C0 byte: Ctrl-A is 0x01, Ctrl-] is 0x1d.
         Key::Ctrl(character) => {
             let character = character.to_ascii_uppercase();

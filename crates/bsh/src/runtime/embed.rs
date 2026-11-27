@@ -1,12 +1,11 @@
 //! Starting the Runtime Host inside `bsh tui` (RFC-011, RFC-015).
 //!
-//! A terminal user should not have to start two processes to talk to one agent,
-//! so `bsh tui` falls back to starting the Host itself when its data directory
-//! has no owner yet. The interface is still a client: the Host is served on the
-//! same local IPC endpoint an external `bsh host` would use, and the interface
-//! reaches it through the Application Contract like any other client. A second
-//! TUI, a GUI or a scripted client therefore attaches to the same sessions and
-//! the same work instead of starting a competing authority.
+//! This module retains an in-process Host constructor for callers that
+//! explicitly want embedded ownership. `bsh tui` itself does NOT use it: the
+//! terminal client attaches to a standalone Host and starts `bsh host` as a
+//! separate process when no Host owns the data directory, so TUI exit cannot
+//! stop Host-owned work. The Host is served on the same local IPC endpoint and
+//! reached through the Application Contract like any other client.
 //!
 //! The lock, not a health probe, decides ownership. `RuntimeHost::open` refuses
 //! a data directory another Host holds, and that refusal is exactly the signal
@@ -14,11 +13,9 @@
 //! an advisory lock when its process ends, a killed `bsh tui` never leaves
 //! behind an owner that blocks the next one.
 //!
-//! The trade-off of an embedded Host is process lifetime: a Host that runs
-//! inside the client cannot outlive the client. Quitting drains it - in-flight
-//! turns get the configured shutdown grace - and only then stops it. To keep
-//! work running after the terminal closes, run `bsh host` first and every
-//! `bsh tui` will attach to that one instead of starting another.
+//! An embedded Host shares its owner's process lifetime. `bsh tui` avoids that
+//! trade-off by spawning a standalone `bsh host`; callers using `Authority`
+//! directly own stopping it.
 
 use std::time::{Duration, Instant};
 

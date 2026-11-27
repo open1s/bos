@@ -68,6 +68,25 @@ uuid_id!(TaskId, "Identity of a delegated or scheduled task.");
 uuid_id!(ApprovalId, "Identity of one pending approval request.");
 uuid_id!(EventId, "Identity of one committed journal event.");
 uuid_id!(MessageId, "Identity of one projected chat message.");
+
+impl MessageId {
+    /// Derive an identity from the row a stored transcript carries.
+    ///
+    /// A stored session keeps no message ids: the row is the identity. A
+    /// projection re-read from the same document must mint the same value, or a
+    /// reconnecting client would read every row as a new message, so the mint is
+    /// a name-based UUID over the seed rather than a random one.
+    #[must_use]
+    pub fn derived(seed: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(seed.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
+    }
+}
 uuid_id!(
     CommandId,
     "Client-supplied idempotency key of one mutating command."

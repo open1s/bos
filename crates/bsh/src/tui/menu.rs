@@ -423,6 +423,12 @@ const COMMANDS: &[Command] = &[
         }]),
     },
     Command {
+        name: "/reconnect",
+        detail: "reattach to the Host and reconcile uncertain outcomes",
+        bare: true,
+        arguments: Arguments::None,
+    },
+    Command {
         name: "/restore",
         detail: "take one parked session back into the lists",
         bare: false,
@@ -504,10 +510,22 @@ const COMMANDS: &[Command] = &[
         }]),
     },
     Command {
+        name: "/activity",
+        detail: "chronological operational events for the open session",
+        bare: true,
+        arguments: Arguments::None,
+    },
+    Command {
         name: "/terminal",
         detail: "open a shell at the workspace root; Ctrl-] closes it",
         bare: true,
         arguments: Arguments::None,
+    },
+    Command {
+        name: "/tui",
+        detail: "show or change this client's theme and command-palette key",
+        bare: true,
+        arguments: Arguments::Free,
     },
     Command {
         name: "/trash",

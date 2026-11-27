@@ -1,11 +1,12 @@
 //! The terminal's painting vocabulary: what a row is *about*, and how it is drawn.
 //!
-//! The desktop paints the kit's hex tokens ([`crate::theme`]); a terminal must
-//! not, because its background belongs to the reader's profile rather than to
-//! BSH's page. So the hues here are the sixteen ANSI slots that profile already
-//! defines, and every distinct meaning also carries a shape - a bold label, dim
-//! metadata, a reversed selection - so a terminal without colour loses the hue
-//! and nothing else.
+//! The hues are the concept's own (`docs/tui/assets/bsh-tui-workspace.svg`):
+//! the navy page, the muted metadata, the four status inks and the violet brand
+//! mark, read cell for cell into [`ink`]. A terminal that reports true colour
+//! paints exactly those hexes; every other terminal gets the nearest of its own
+//! sixteen slots, and every distinct meaning also carries a shape - a bold
+//! label, dim metadata, a filled selection - so a terminal without colour loses
+//! the hue and nothing else.
 //!
 //! [`Painter`] is the one place a row of text becomes styled spans. The markers
 //! it classifies ([`MARKERS`]) are this client's own: a transcript row always
@@ -28,8 +29,48 @@
 // file; code outside it still has to be wired to be accepted.
 #![allow(dead_code)]
 
+use std::borrow::Cow;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+
+/// The concept's ink, cell for cell.
+///
+/// These are the mock's own hexes - the navy page, the raised panel, the fill a
+/// chosen row wears, the muted metadata and the four status hues - so the
+/// terminal and the desktop concept are the same palette rather than two
+/// approximations of one idea.
+pub(crate) mod ink {
+    use ratatui::style::Color;
+
+    /// The page, and the fill a chosen row wears on it.
+    pub(crate) const PAGE: Color = Color::Rgb(0x0b, 0x14, 0x22);
+    #[allow(dead_code)]
+    pub(crate) const PANEL: Color = Color::Rgb(0x0d, 0x17, 0x26);
+    pub(crate) const RAISED: Color = Color::Rgb(0x16, 0x3d, 0x68);
+    /// Text, and the metadata that recedes beside it.
+    pub(crate) const TEXT: Color = Color::Rgb(0xdc, 0xe7, 0xf7);
+    pub(crate) const MUTED: Color = Color::Rgb(0x82, 0x94, 0xad);
+    /// The four status hues the concept paints with.
+    pub(crate) const BLUE: Color = Color::Rgb(0x59, 0xa8, 0xff);
+    /// The send button fill from the composer concept.
+    pub(crate) const BUTTON: Color = Color::Rgb(0x16, 0x78, 0xe8);
+    /// The composer outline from the workspace concept.
+    pub(crate) const COMPOSER_BORDER: Color = Color::Rgb(0x28, 0x79, 0xc8);
+    pub(crate) const GREEN: Color = Color::Rgb(0x35, 0xd6, 0xa1);
+    pub(crate) const AMBER: Color = Color::Rgb(0xff, 0xb4, 0x54);
+    /// The brand mark's stroke, and the violet a reader's own turn wears.
+    pub(crate) const BRAND: Color = Color::Rgb(0x43, 0xb8, 0xff);
+    pub(crate) const VIOLET: Color = Color::Rgb(0x8d, 0x6c, 0xff);
+    /// The indigo strokes used by inactive navigation icons.
+    pub(crate) const NAV_ICON: Color = Color::Rgb(0x7c, 0x93, 0xff);
+    /// The cyan used by the selected navigation icon.
+    pub(crate) const NAV_ICON_ACTIVE: Color = Color::Rgb(0x37, 0xcc, 0xe0);
+    /// A failure. The concept draws no failing sample, so this is the one hue it
+    /// does not name: the same rigour as its amber, one step past it, because a
+    /// failure that reads as "waiting" teaches the reader the wrong thing.
+    pub(crate) const RED: Color = Color::Rgb(0xff, 0x6b, 0x6b);
+}
 
 /// What one row of the frame is about.
 ///
@@ -37,22 +78,23 @@ use ratatui::text::{Line, Span};
 /// becomes a hue, so a theme change never has to walk the renderers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tone {
-    /// Assistant prose, pane bodies: the terminal's own foreground.
+    /// Assistant prose, pane bodies: the concept's text ink.
     Body,
     /// The frame's header and a document's title row.
     Heading,
     /// A fact that matters - the open session's name, a column's title - in the
-    /// terminal's own foreground at weight. Not the heading, because the frame
-    /// has exactly one of those.
+    /// concept's text ink at weight. Not the heading, because the frame has
+    /// exactly one of those.
     Strong,
-    /// The brand mark the frame opens with: a solid block, reversed rather than
-    /// coloured, so it is a chip on every profile including a monochrome one.
+    /// The brand mark the frame opens with, in the stroke the mock draws its own
+    /// logo in; a reversed block on a terminal that cannot paint the hue.
     Chip,
-    /// A label that names the row it opens: the composer's prompt glyph.
+    /// A label that names the row it opens: the composer's prompt glyph, and the
+    /// destination the reader is on.
     Accent,
     /// Metadata, rules and hints: readable, never competing with content.
     Muted,
-    /// The reader's own turn.
+    /// The reader's own turn, in the violet the mock gives its avatar.
     User,
     /// A verdict that succeeded.
     Ok,
@@ -64,14 +106,42 @@ pub(crate) enum Tone {
     Add,
     /// A row a patch removed.
     Remove,
-    /// The row the reader is on. Reversed, so it survives a monochrome screen.
+    /// The row the reader is on: the mock's raised fill under its text ink, and
+    /// the reverse block every terminal has when the fill cannot be painted.
     Select,
+    /// The active global tab: blue and underlined, without a selection block.
+    TabActive,
+    /// The composer's primary send control.
+    Button,
+    /// The composer's blue outline.
+    ComposerBorder,
+    /// An inactive destination icon in the sidebar.
+    NavIcon,
+    /// The active destination icon in the sidebar.
+    NavIconActive,
 }
 
 /// Whether this terminal takes colour, and what each [`Tone`] draws in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Skin {
-    colour: bool,
+    colour: Colour,
+}
+
+/// How much colour the reader's terminal was promised.
+///
+/// The concept paints in hexes, so a terminal that says it takes twenty-four
+/// bits paints them. One that only names slots gets the nearest of its sixteen,
+/// and one that takes nothing keeps the shapes - which is the same ladder the
+/// spec asks for, with the concept's palette at the top of it rather than a
+/// guess at the reader's profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Colour {
+    /// `NO_COLOR`, or a terminal that would draw the escapes as text.
+    None,
+    /// The sixteen slots every profile already defines.
+    Ansi,
+    /// Twenty-four bits: the concept's own ink.
+    True,
 }
 
 impl Skin {
@@ -79,30 +149,95 @@ impl Skin {
     ///
     /// `NO_COLOR` wins over everything: its own rule is that any non-empty
     /// value asks for no colour. A `dumb` terminal draws escape sequences as
-    /// text, so it is asked for none either. No other probe is needed - this
-    /// client paints named ANSI slots, which every terminal that is not dumb
-    /// already has, and asking for true colour would only be a guess about the
-    /// reader's background.
+    /// text, so it is asked for none either. Below that, true colour is only
+    /// taken when the terminal says so in `COLORTERM` - the one variable the
+    /// ecosystem set for exactly this question - so a terminal that says
+    /// nothing gets the slots its profile is certain to have.
     pub(crate) fn detect() -> Self {
-        let no_color =
-            std::env::var_os("NO_COLOR").map(|value| value.to_string_lossy().into_owned());
-        let term = std::env::var_os("TERM").map(|value| value.to_string_lossy().into_owned());
-        Self::from_environment(no_color.as_deref(), term.as_deref())
+        let read =
+            |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
+        Self::from_environment(
+            read("NO_COLOR").as_deref(),
+            read("TERM").as_deref(),
+            read("COLORTERM").as_deref(),
+        )
+    }
+
+    /// Apply an explicit per-client theme, falling back to terminal detection.
+    pub(crate) fn with_preference(theme: super::prefs::Theme) -> Self {
+        use super::prefs::Theme;
+        match theme {
+            Theme::Auto => Self::detect(),
+            Theme::Ansi => Self {
+                colour: Colour::Ansi,
+            },
+            Theme::Mono => Self {
+                colour: Colour::None,
+            },
+            Theme::Truecolor => Self {
+                colour: Colour::True,
+            },
+        }
+    }
+
+    /// The design's page surface for the whole frame when this terminal can
+    /// paint RGB. ANSI and monochrome profiles keep their chosen background.
+    pub(crate) fn page_style(self) -> Style {
+        match self.colour {
+            Colour::True => Style::default().bg(ink::PAGE),
+            Colour::Ansi | Colour::None => Style::default(),
+        }
     }
 
     /// The plain skin: no hue, every shape kept. What a test draws with; the
     /// frame itself always asks [`Skin::detect`] what the profile accepts.
     #[cfg(test)]
     pub(crate) fn plain() -> Self {
-        Self { colour: false }
+        Self {
+            colour: Colour::None,
+        }
     }
 
-    /// Resolve the two answers a capability probe has: whether the reader
-    /// asked for no colour, and what the terminal calls itself.
-    fn from_environment(no_color: Option<&str>, term: Option<&str>) -> Self {
+    /// The concept's own ink, for the tests that check the palette against the
+    /// mock rather than against whichever terminal is running the suite.
+    #[cfg(test)]
+    pub(crate) fn mock() -> Self {
+        Self {
+            colour: Colour::True,
+        }
+    }
+
+    /// Resolve the three answers a capability probe has: whether the reader
+    /// asked for no colour, what the terminal calls itself, and whether it
+    /// claims twenty-four bits.
+    fn from_environment(
+        no_color: Option<&str>,
+        term: Option<&str>,
+        colorterm: Option<&str>,
+    ) -> Self {
         let refused = no_color.is_some_and(|value| !value.trim().is_empty())
             || term.is_some_and(|term| term.trim().eq_ignore_ascii_case("dumb"));
-        Self { colour: !refused }
+        let colour = if refused {
+            Colour::None
+        } else if colorterm.is_some_and(|value| {
+            value.trim().eq_ignore_ascii_case("truecolor")
+                || value.trim().eq_ignore_ascii_case("24bit")
+        }) {
+            Colour::True
+        } else {
+            Colour::Ansi
+        };
+        Self { colour }
+    }
+
+    /// One hue, at the depth this terminal takes: the concept's hex, the nearest
+    /// slot, or nothing at all.
+    fn hue(&self, true_colour: Color, ansi: Color, base: Style) -> Style {
+        match self.colour {
+            Colour::True => base.fg(true_colour),
+            Colour::Ansi => base.fg(ansi),
+            Colour::None => base,
+        }
     }
 
     /// One inline run's style: the row's tone plus what the run's mark named.
@@ -114,16 +249,13 @@ impl Skin {
             Inline::Plain => base,
             Inline::Strong => base.add_modifier(Modifier::BOLD),
             Inline::Emphasis => base.add_modifier(Modifier::ITALIC),
-            // Inline code takes the one hue no meaning in this vocabulary
-            // claims; a profile without colour keeps the weight instead, so the
-            // distinction survives a monochrome screen.
-            Inline::Code => {
-                if self.colour {
-                    base.fg(Color::Magenta)
-                } else {
-                    base.add_modifier(Modifier::BOLD)
-                }
-            }
+            // Inline code takes the concept's violet, the one hue no meaning in
+            // this vocabulary claims; a profile without colour keeps the weight
+            // instead, so the distinction survives a monochrome screen.
+            Inline::Code => match self.colour {
+                Colour::None => base.add_modifier(Modifier::BOLD),
+                _ => self.hue(ink::VIOLET, Color::Magenta, base),
+            },
         }
     }
 
@@ -131,31 +263,95 @@ impl Skin {
     pub(crate) fn style(&self, tone: Tone) -> Style {
         let plain = Style::default();
         let bold = plain.add_modifier(Modifier::BOLD);
-        // A named slot plus bold is the bright form of that slot on every
-        // xterm-compatible terminal, which is what keeps the accent legible on
-        // a dark background without pinning a hex value.
-        let hue = |colour: Color, base: Style| {
-            if self.colour { base.fg(colour) } else { base }
-        };
         match tone {
-            Tone::Body => plain,
-            Tone::Heading => hue(Color::Blue, bold),
-            Tone::Strong => bold,
-            // A chip is the terminal's own two colours swapped: the reader's
-            // foreground becomes the block and their background the lettering,
-            // which is legible on a light and a dark profile alike.
-            Tone::Chip => bold.add_modifier(Modifier::REVERSED),
-            Tone::Accent => hue(Color::Blue, bold),
-            Tone::Muted => plain.add_modifier(Modifier::DIM),
-            Tone::User => hue(Color::Cyan, bold),
-            Tone::Ok => hue(Color::Green, bold),
-            Tone::Warn => hue(Color::Yellow, bold),
-            Tone::Error => hue(Color::Red, bold),
-            Tone::Add => hue(Color::Green, plain),
-            Tone::Remove => hue(Color::Red, plain),
-            // Reverse and bold are the two attributes that mean "current row"
-            // in every terminal, and neither depends on colour at all.
-            Tone::Select => plain.add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            // Prose is the concept's text ink. On the sixteen-slot path the
+            // reader's own foreground is the closest thing their profile has to
+            // it, so nothing is pinned.
+            Tone::Body => match self.colour {
+                Colour::True => plain.fg(ink::TEXT),
+                _ => plain,
+            },
+            // A heading is the concept's text at weight, never a hue of its
+            // own: the mock sets its titles in the same ink as its prose.
+            Tone::Heading => self.hue(ink::TEXT, Color::Blue, bold),
+            Tone::Strong => match self.colour {
+                Colour::True => plain.fg(ink::TEXT).add_modifier(Modifier::BOLD),
+                _ => bold,
+            },
+            // The brand mark is the header's first stroke: the mock's own blue,
+            // and a reversed block on a terminal that cannot paint it.
+            Tone::Chip => match self.colour {
+                Colour::None => bold.add_modifier(Modifier::REVERSED),
+                _ => self.hue(ink::BRAND, Color::Blue, bold),
+            },
+            Tone::Accent => self.hue(ink::BLUE, Color::Blue, bold),
+            // Metadata recedes by ink on a colour terminal and by weight on a
+            // plain one; dimming an already-muted hex would lose it entirely.
+            Tone::Muted => match self.colour {
+                Colour::True => plain.fg(ink::MUTED),
+                Colour::Ansi => plain.fg(Color::Gray),
+                Colour::None => plain.add_modifier(Modifier::DIM),
+            },
+            // The reader's own turn wears the mock's violet: the colour its
+            // avatar carries, so a speaker is recognised before the label is
+            // read.
+            Tone::User => self.hue(ink::VIOLET, Color::Magenta, bold),
+            Tone::Ok => self.hue(ink::GREEN, Color::Green, bold),
+            Tone::Warn => self.hue(ink::AMBER, Color::Yellow, bold),
+            Tone::Error => self.hue(ink::RED, Color::Red, bold),
+            Tone::Add => self.hue(ink::GREEN, Color::Green, plain),
+            Tone::Remove => self.hue(ink::RED, Color::Red, plain),
+            // The row the reader is on is the mock's chosen nav row: text on
+            // the raised fill. Without colour it is the reverse block every
+            // terminal has, so the meaning never depends on the fill.
+            Tone::Select => match self.colour {
+                Colour::True => plain
+                    .fg(ink::TEXT)
+                    .bg(ink::RAISED)
+                    .add_modifier(Modifier::BOLD),
+                _ => plain.add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            },
+            Tone::TabActive => match self.colour {
+                Colour::True => plain
+                    .fg(ink::BLUE)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                Colour::Ansi => plain
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                Colour::None => plain.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            },
+            Tone::Button => match self.colour {
+                Colour::True => plain
+                    .fg(Color::White)
+                    .bg(ink::BUTTON)
+                    .add_modifier(Modifier::BOLD),
+                Colour::Ansi => plain
+                    .fg(Color::White)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+                Colour::None => plain.add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            },
+            Tone::ComposerBorder => match self.colour {
+                Colour::True => plain.fg(ink::COMPOSER_BORDER),
+                Colour::Ansi => plain.fg(Color::Blue),
+                Colour::None => plain.add_modifier(Modifier::BOLD),
+            },
+            Tone::NavIcon => match self.colour {
+                Colour::True => plain.fg(ink::NAV_ICON).add_modifier(Modifier::BOLD),
+                Colour::Ansi => plain.fg(Color::Blue).add_modifier(Modifier::BOLD),
+                Colour::None => plain.add_modifier(Modifier::BOLD),
+            },
+            Tone::NavIconActive => match self.colour {
+                Colour::True => plain
+                    .fg(ink::NAV_ICON_ACTIVE)
+                    .bg(ink::RAISED)
+                    .add_modifier(Modifier::BOLD),
+                Colour::Ansi => plain
+                    .fg(Color::Cyan)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+                Colour::None => plain.add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            },
         }
     }
 }
@@ -282,7 +478,7 @@ impl Painter {
         let spans: Vec<Span<'static>> = runs
             .iter()
             .filter(|(text, _)| !text.is_empty())
-            .map(|(text, tone)| Span::styled(text.clone(), self.skin.style(*tone)))
+            .map(|(text, tone)| Span::styled(flatten(text).into_owned(), self.skin.style(*tone)))
             .collect();
         Line::from(spans)
     }
@@ -319,6 +515,11 @@ impl Painter {
     /// The head is the row's own marker; the body is the row's content, so it
     /// is the body that carries its inline marks through [`Painter::prose`].
     fn spans(&self, text: &str, mark: usize, head: Tone, rest: Tone) -> Line<'static> {
+        // A row is one row: text that arrived with a line break in it - a
+        // session title taken from a message, a tool's own output - is drawn on
+        // the row it was given rather than moving the terminal's cursor.
+        let flat = flatten(text);
+        let text: &str = flat.as_ref();
         let head_style = self.skin.style(head);
         let rest_style = self.skin.style(rest);
         if head_style == rest_style && mark == 0 {
@@ -354,6 +555,28 @@ impl Painter {
             .map(|(text, mark)| Span::styled(text.to_string(), self.skin.marked(base, mark)))
             .collect()
     }
+}
+
+/// One row's text with the characters a row cannot carry.
+///
+/// A newline or a tab in a title would move the terminal's cursor and paint the
+/// rest of the frame into the wrong cells, so each control character becomes a
+/// space; every other character is kept exactly as written.
+pub(crate) fn flatten(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(
+        text.chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Whether a row may carry inline markdown: every row but a fenced block's own.
@@ -512,10 +735,11 @@ const KEYS: &[&str] = &[
     "Enter send",
     "Shift-Enter newline",
     "/ commands",
+    "^P go",
     "@ files",
     "^D quit",
     "PgUp/PgDn scroll",
-    "^N/^P sessions",
+    "^N/^B sessions",
     "^T new session",
     "^Y approve",
     "^R reject",
@@ -528,9 +752,14 @@ const KEYS: &[&str] = &[
 fn footer_groups(footer: Footer) -> &'static [&'static str] {
     match footer {
         // Idle leads with the two gestures a reader at rest needs: send, and
-        // the way out. Ctrl-C stops a turn when there is one, so the quit
-        // chord is only the twice-pressed one and the footer says so.
-        Footer::Idle => &["Enter send", "^C ^C quit"],
+        // the way out. Ctrl-C is not bound to job cancellation; the quit chord
+        // is Ctrl-D. Cancellation is explicit via /cancel [confirm].
+        Footer::Idle => &[
+            "↑↓ Navigate",
+            "Enter Select",
+            "Esc Close",
+            "Alt+V Toggle sidebar",
+        ],
         // The approval is the frame's own warning card; the footer answers
         // "and what do I press?" without repeating the target, and without
         // repeating the two chords the card already prints on its rows. A
@@ -561,6 +790,12 @@ fn footer_groups(footer: Footer) -> &'static [&'static str] {
     }
 }
 
+/// The chord a footer group is introduced by, so two groups about the same
+/// key can be recognised as one.
+fn footer_key(part: &str) -> &str {
+    part.split(' ').next().unwrap_or(part)
+}
+
 /// The footer for one state, filling `width` cells without cutting a group.
 ///
 /// Groups are dropped from the tail, never split: a row that ends in half a
@@ -568,8 +803,39 @@ fn footer_groups(footer: Footer) -> &'static [&'static str] {
 /// A width too small for even the first group still says the first thing, cut
 /// with an ellipsis, because an empty footer is worse than a clipped one.
 pub(crate) fn footer_text(footer: Footer, width: usize) -> String {
-    let mut parts: Vec<&'static str> = footer_groups(footer).to_vec();
-    parts.extend_from_slice(KEYS);
+    let groups = footer_groups(footer);
+    if footer == Footer::Idle {
+        let mut text = String::new();
+        for part in groups {
+            let candidate = if text.is_empty() {
+                (*part).to_string()
+            } else {
+                format!("{text}   {part}")
+            };
+            if candidate.chars().count() > width {
+                break;
+            }
+            text = candidate;
+        }
+        if text.is_empty() && !groups.is_empty() && width > 0 {
+            let part = groups[0];
+            text = part.chars().take(width.saturating_sub(1)).collect();
+            text.push('…');
+        }
+        return text;
+    }
+    let mut parts: Vec<&'static str> = groups.to_vec();
+    // A state that already names a chord keeps its own wording: the common
+    // keys repeat what the state's rows just said otherwise, and the row is
+    // the scarce resource.
+    for key in KEYS {
+        if !groups
+            .iter()
+            .any(|group| footer_key(group) == footer_key(key))
+        {
+            parts.push(key);
+        }
+    }
     let mut text = String::new();
     for part in &parts {
         let candidate = if text.is_empty() {
@@ -608,13 +874,117 @@ mod tests {
     fn colour_follows_the_readers_environment() {
         // The spec's own rule: any non-empty value is a refusal, and an empty
         // one is a value the reader forgot to clear.
-        assert!(!Skin::from_environment(Some("1"), Some("xterm-256color")).colour);
-        assert!(Skin::from_environment(Some(""), Some("xterm-256color")).colour);
+        assert_eq!(
+            Skin::from_environment(Some("1"), Some("xterm-256color"), None).colour,
+            Colour::None
+        );
+        assert_eq!(
+            Skin::from_environment(Some(""), Some("xterm-256color"), None).colour,
+            Colour::Ansi
+        );
         // A dumb terminal would draw the escapes as letters.
-        assert!(!Skin::from_environment(None, Some("dumb")).colour);
-        assert!(!Skin::from_environment(None, Some("DUMB")).colour);
-        assert!(Skin::from_environment(None, Some("xterm-256color")).colour);
-        assert!(Skin::from_environment(None, None).colour);
+        assert_eq!(
+            Skin::from_environment(None, Some("dumb"), None).colour,
+            Colour::None
+        );
+        assert_eq!(
+            Skin::from_environment(None, Some("DUMB"), Some("truecolor")).colour,
+            Colour::None
+        );
+        assert_eq!(
+            Skin::from_environment(None, Some("xterm-256color"), None).colour,
+            Colour::Ansi
+        );
+        assert_eq!(
+            Skin::from_environment(None, None, None).colour,
+            Colour::Ansi
+        );
+        // True colour is taken only when the terminal says so, and its own two
+        // spellings are the ones the ecosystem uses.
+        for claim in ["truecolor", "24bit", " TrueColor "] {
+            assert_eq!(
+                Skin::from_environment(None, Some("xterm-256color"), Some(claim)).colour,
+                Colour::True,
+                "{claim:?} must take the concept's ink"
+            );
+        }
+        // A terminal that says nothing is not guessed at: its profile's slots
+        // are certain, a hex it cannot paint is not.
+        assert_eq!(
+            Skin::from_environment(None, Some("screen-256color"), Some("no")).colour,
+            Colour::Ansi
+        );
+    }
+
+    #[test]
+    fn the_palette_is_the_concepts_own_ink() {
+        // Every hue the mock paints with is painted here as the same hex, so
+        // the terminal and the concept cannot drift apart unnoticed.
+        let skin = Skin::mock();
+        assert_eq!(skin.page_style().bg, Some(ink::PAGE));
+        let cases = [
+            (Tone::Body, ink::TEXT),
+            (Tone::Heading, ink::TEXT),
+            (Tone::Strong, ink::TEXT),
+            (Tone::Chip, ink::BRAND),
+            (Tone::Accent, ink::BLUE),
+            (Tone::Muted, ink::MUTED),
+            (Tone::User, ink::VIOLET),
+            (Tone::Ok, ink::GREEN),
+            (Tone::Warn, ink::AMBER),
+            (Tone::Error, ink::RED),
+            (Tone::Add, ink::GREEN),
+            (Tone::Remove, ink::RED),
+        ];
+        for (tone, expected) in cases {
+            assert_eq!(skin.style(tone).fg, Some(expected), "{tone:?}");
+        }
+        // The chosen row is the mock's raised fill under the text ink, which is
+        // what makes a selection read as a surface rather than as a colour.
+        let chosen = skin.style(Tone::Select);
+        assert_eq!(chosen.fg, Some(ink::TEXT));
+        assert_eq!(chosen.bg, Some(ink::RAISED));
+        // The hexes themselves are the mock's, not this module's invention.
+        assert_eq!(ink::TEXT, Color::Rgb(0xdc, 0xe7, 0xf7));
+        assert_eq!(ink::MUTED, Color::Rgb(0x82, 0x94, 0xad));
+        assert_eq!(ink::BLUE, Color::Rgb(0x59, 0xa8, 0xff));
+        assert_eq!(ink::BUTTON, Color::Rgb(0x16, 0x78, 0xe8));
+        assert_eq!(ink::COMPOSER_BORDER, Color::Rgb(0x28, 0x79, 0xc8));
+        assert_eq!(skin.style(Tone::Button).bg, Some(ink::BUTTON));
+        assert_eq!(
+            skin.style(Tone::ComposerBorder).fg,
+            Some(ink::COMPOSER_BORDER)
+        );
+        assert_eq!(ink::GREEN, Color::Rgb(0x35, 0xd6, 0xa1));
+        assert_eq!(ink::AMBER, Color::Rgb(0xff, 0xb4, 0x54));
+        assert_eq!(ink::VIOLET, Color::Rgb(0x8d, 0x6c, 0xff));
+        assert_eq!(ink::RAISED, Color::Rgb(0x16, 0x3d, 0x68));
+        assert_eq!(ink::PAGE, Color::Rgb(0x0b, 0x14, 0x22));
+        assert_eq!(ink::PANEL, Color::Rgb(0x0d, 0x17, 0x26));
+    }
+
+    #[test]
+    fn sixteen_slots_keep_the_meaning_a_hex_would_have_carried() {
+        // A terminal without true colour still tells a success from a warning
+        // from a failure: the concept's four status hues land on the four slots
+        // every profile defines, and the reader's own turn keeps the violet
+        // family as magenta.
+        let skin = Skin::from_environment(None, Some("xterm-256color"), None);
+        assert_eq!(skin.style(Tone::Ok).fg, Some(Color::Green));
+        assert_eq!(skin.style(Tone::Warn).fg, Some(Color::Yellow));
+        assert_eq!(skin.style(Tone::Error).fg, Some(Color::Red));
+        assert_eq!(skin.style(Tone::Accent).fg, Some(Color::Blue));
+        assert_eq!(skin.style(Tone::User).fg, Some(Color::Magenta));
+        assert_eq!(skin.style(Tone::Muted).fg, Some(Color::Gray));
+        // The chosen row keeps the reverse block here: a slot cannot paint the
+        // mock's fill, and a row the reader is on must never be a guess.
+        let chosen = skin.style(Tone::Select);
+        assert_eq!(chosen.fg, None);
+        assert_eq!(chosen.bg, None);
+        assert!(chosen.add_modifier.contains(Modifier::REVERSED));
+        // The same meanings are still apart from each other on that path.
+        assert_ne!(skin.style(Tone::Ok).fg, skin.style(Tone::Warn).fg);
+        assert_ne!(skin.style(Tone::Warn).fg, skin.style(Tone::Error).fg);
     }
 
     #[test]
@@ -719,13 +1089,41 @@ mod tests {
         // A wider row keeps adding whole groups and stops before the next one.
         let wide = footer_text(Footer::Idle, 80);
         assert!(wide.chars().count() <= 80);
-        assert!(wide.starts_with("Enter send · ^C ^C quit"));
+        assert!(wide.starts_with("↑↓ Navigate   Enter Select   Esc Close"));
         assert!(!wide.ends_with(" · "));
         assert!(!wide.ends_with('·'));
         // A row narrower than one group still says the first thing.
         let tiny = footer_text(Footer::Idle, 9);
         assert_eq!(tiny.chars().count(), 9);
         assert!(tiny.ends_with('…'));
+    }
+
+    /// A state that already leads with a chord does not get the common list
+    /// repeating it: the footer's row is the scarce resource, and a chord
+    /// printed twice teaches the reader nothing the first copy did not.
+    #[test]
+    fn the_footer_names_each_chord_once() {
+        for footer in [
+            Footer::Idle,
+            Footer::Busy,
+            Footer::Picker,
+            Footer::Menu,
+            Footer::Approval,
+            Footer::Question,
+            Footer::Pane,
+        ] {
+            let text = footer_text(footer, 200);
+            let mut seen: Vec<&str> = Vec::new();
+            for part in text.split(" · ") {
+                let key = footer_key(part);
+                assert!(!seen.contains(&key), "{footer:?} repeats `{key}`: {text:?}");
+                seen.push(key);
+            }
+        }
+        // The idle row uses the compact global navigation grammar.
+        let idle = footer_text(Footer::Idle, 200);
+        assert_eq!(idle.matches("Enter Select").count(), 1, "{idle:?}");
+        assert!(idle.starts_with("↑↓ Navigate"), "{idle:?}");
     }
 
     #[test]
@@ -833,11 +1231,11 @@ mod tests {
 
     #[test]
     fn inline_code_takes_the_one_hue_no_meaning_claims() {
-        let skin = Skin::from_environment(None, Some("xterm-256color"));
+        let skin = Skin::from_environment(None, Some("xterm-256color"), Some("truecolor"));
         let mut painter = Painter::new(skin);
         let line = painter.row("bsh › run `bsh ext list` first");
         assert_eq!(line.spans[2].content, "bsh ext list");
-        assert_eq!(line.spans[2].style.fg, Some(Color::Magenta));
+        assert_eq!(line.spans[2].style.fg, Some(ink::VIOLET));
         assert_eq!(line.spans[1].content, "run ");
         assert_eq!(line.spans[3].content, " first");
     }

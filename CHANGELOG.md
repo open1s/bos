@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- **One application, two renderers.** The terminal and the window now share the
+  code behind everything that is not a view. A session created in `bsh tui` is a
+  document the desktop's own store lists, and a chat the window wrote is a chat
+  the terminal opens: the Host writes and reads `Store` + `history` under
+  `<workspace>/.bsh/sessions`, parks deletes in the same recycle bin, and keeps
+  the same title, plan, goal, feedback, pin and archive flags. The pieces that
+  were duplicated in the window's shell moved into `runtime` and both
+  interfaces call them: context assembly (`runtime::context_prepare`, including
+  runtime facts, plan, workspace instructions, memory recall and extension
+  prompts), transcript replay with tool calls and images
+  (`runtime::transcript`), the request text (`runtime::turn`), the slash-command
+  grammar (`runtime::grammar`), token/occupancy formatting
+  (`runtime::format`), the clock (`runtime::clock`) and the audit view model
+  (`runtime::audit_view`). A terminal turn therefore sends the same request a
+  window turn sends, and a terminal chat is the conversation a window turn
+  resumes.
+
+- **The terminal wears the concept's own ink.** The TUI painted the reader's
+  sixteen ANSI slots, so it looked like whatever profile it was opened in rather
+  than like BSH. It now paints the palette of
+  `docs/tui/assets/bsh-tui-workspace.svg` cell for cell when the terminal reports
+  true colour (`COLORTERM=truecolor`/`24bit`): the navy text ink, the muted
+  metadata, the concept's blue, green, amber and violet, and the raised fill a
+  chosen row wears. A terminal that names only slots gets the nearest of its
+  sixteen, and one that takes no colour keeps every shape, so nothing depends on
+  the hue. The first row is the concept's header bar - `◆ BSH  Bos Shell`, the
+  open session in the blue the mock gives the destination you are on, the facts
+  the desktop shows in chips, and `● Host Connected` held against the right
+  edge in green, amber while it starts and red once it fails - and the last row
+  is its status bar, `Mode: Adaptive · Layout: 2-column` at the left edge with
+  the keys this state needs at the right, the keys winning when the row cannot
+  hold both. A header too narrow for its facts gives them up and keeps the
+  verdict whole.
+
 - **The terminal asks for permission on a card.** The moment that gates a tool
   call used to be one truncated line: at 72 columns the resource was cut off,
   and under 60 the chords were gone with it. An approval now takes the rows

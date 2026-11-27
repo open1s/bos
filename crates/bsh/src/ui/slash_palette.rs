@@ -1629,9 +1629,9 @@ impl Shell {
     /// Run one parsed `/plan` or `/goal` line. Its output is a UI notice, the
     /// way the reference keeps command output out of model requests.
     pub(crate) fn run_command_line(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        use crate::state::{PlanRequest, SlashLine};
+        use crate::runtime::grammar::{PlanRequest, SlashLine};
         let text = self.composer_value.clone();
-        let Some(line) = crate::state::parse_slash_line(&text) else {
+        let Some(line) = crate::runtime::grammar::parse_slash_line(&text) else {
             return false;
         };
         self.set_composer_text("", window, cx);
@@ -1659,8 +1659,13 @@ impl Shell {
     /// a title, Status, an optional Blocker, Objective, Rounds, Activation, a
     /// blank line and the commands meaningful from the live state - as a UI
     /// notice that never enters a model request.
-    fn run_goal_line(&mut self, request: crate::state::GoalRequest, cx: &mut Context<Self>) {
-        use crate::state::{GoalRefusal, GoalRequest};
+    fn run_goal_line(
+        &mut self,
+        request: crate::runtime::grammar::GoalRequest,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::runtime::grammar::GoalRequest;
+        use crate::state::GoalRefusal;
         let Some(id) = self.state.active_id.clone() else {
             return;
         };

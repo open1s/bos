@@ -13,7 +13,7 @@ use super::shell::Shell;
 use super::{DivExt, hairline_all, txt};
 use crate::i18n::Lang;
 use crate::model::ContextBreakdown;
-use crate::state::human_tokens;
+use crate::runtime::format::human_tokens;
 use crate::theme;
 
 /// The reference's legend order and tints: the system prompt, the tool

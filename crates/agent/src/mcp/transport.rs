@@ -131,6 +131,14 @@ impl StdioTransport {
             .envs(env.iter().map(|(key, value)| (*key, *value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            // A server's diagnostics are not the protocol: its stdout carries
+            // the JSON-RPC stream, and its stderr carries whatever the server's
+            // own runtime prints - a Python logger's banners, a Node
+            // traceback. A full-screen client paints the terminal the child
+            // would inherit, so an inherited stderr writes over the frame. The
+            // child gets a null sink instead: a server that fails is seen in
+            // the protocol stream, where its errors belong.
+            .stderr(Stdio::null())
             .kill_on_drop(true);
         if let Some(cwd) = cwd {
             process.current_dir(cwd);

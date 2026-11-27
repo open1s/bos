@@ -956,6 +956,20 @@ fn extension_view(status: &crate::extension::host::ExtensionStatus) -> Extension
         tools: status.tools.clone(),
         commands: status.commands.clone(),
         panels: status.panels.clone(),
+        capabilities: status
+            .capabilities
+            .iter()
+            .map(
+                |capability| crate::runtime::contract::ExtensionCapabilityView {
+                    capability: capability.capability.clone(),
+                    allowed: capability.allowed,
+                    scope: capability.scope.clone(),
+                    reason: capability.reason.clone(),
+                    risk: capability.risk.clone(),
+                    required: capability.required,
+                },
+            )
+            .collect(),
         error: status.error.clone(),
     }
 }
@@ -2085,31 +2099,17 @@ impl TurnExecutor for AgentExecutor {
             }
         }
 
-        // Seed the engine's own session with the transcript the Host projected,
-        // so this turn reads what earlier turns said. Reasoning and tool
-        // traffic stay out: the projection carries text, and a resumed chat
-        // must not replay either as a fresh model turn. The guard is scoped:
-        // holding the session lock across the stream would make the turn's
-        // future non-Send and block the Host's task spawn.
-        {
-            let mut session = built.agent.session();
-            session.restore_messages(Vec::new());
-            for message in &context.history {
-                match message.role {
-                    MessageRole::User => session.add_user(message.text.clone()),
-                    MessageRole::Assistant => {
-                        if !message.text.is_empty() {
-                            session.add_assistant(message.text.clone());
-                        }
-                    }
-                }
-            }
-        }
+        // Seed the engine's own session with the stored transcript, through the
+        // same replay a window turn uses: text, reasoning where the provider
+        // requires it, tool calls with their stored results, and a user row's
+        // images. A terminal chat is not replayed as a thinner conversation
+        // than the one the window would resume.
+        crate::runtime::transcript::seed_session(&built.agent, &context.transcript);
 
         // The reader's line goes through the same composition a desktop turn
         // uses, so an @reference and plan mode read the same in a terminal as
         // they do in a window.
-        let text = crate::state::turn_text(&context.text, context.config.plan_mode);
+        let text = crate::runtime::turn::turn_text(&context.text, context.config.plan_mode);
         // A `/name` skill gesture resolves against the agent this turn was
         // built with, exactly where the desktop runner resolves it: at the
         // send, not while the reader types. The transcript keeps the line the
@@ -2117,6 +2117,34 @@ impl TurnExecutor for AgentExecutor {
         // instructions.
         let (content, _invoked) =
             crate::skill_invocation::expand(&built.agent, Content::Text(text));
+        // The turn's context is the desktop's, assembled by the one shared
+        // implementation: runtime facts, the working plan, workspace
+        // instructions, memory recall and extension prompts ride in front of
+        // the request exactly as they do in a window. A terminal turn is not a
+        // stripped-down turn.
+        let facts = crate::context::RuntimeFacts::from_effective(&built.effective);
+        let turn = context
+            .history
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .count()
+            + 1;
+        let time = crate::context::TimeFacts {
+            turn,
+            elapsed: None,
+        };
+        let session = context.session_id.to_string();
+        crate::runtime::context_prepare::prepare(
+            &built.agent,
+            &content,
+            &facts,
+            &time,
+            built.memory_state.clone(),
+            built.persona_complete,
+            &session,
+            context.history.len(),
+        )
+        .await;
         let mut answer = String::new();
         // Text that has arrived but not yet been reported as activity.
         let mut delta = String::new();
@@ -2566,6 +2594,7 @@ mod tests {
             execution_id: ExecutionId::new(),
             text: text.to_string(),
             history: Vec::new(),
+            transcript: Vec::new(),
             config,
             approvals: ApprovalHandle::detached(),
             progress: crate::runtime::executor::ProgressHandle::detached(),

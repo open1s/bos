@@ -59,6 +59,8 @@ pub(crate) enum Key {
     Tab,
     /// A control chord: `Ctrl('c')` for `^C`.
     Ctrl(char),
+    /// An Alt chord: the navigation rail's destinations, as `Alt('j')`.
+    Alt(char),
     /// Text the terminal delivered as one paste, newlines and all.
     ///
     /// A paste is not a sequence of keystrokes: pressing Enter after every
@@ -135,6 +137,12 @@ fn copy_sequence(text: &str) -> String {
 /// The terminal in alternate-screen mode, restored on drop.
 pub(crate) struct Terminal {
     inner: DefaultTerminal,
+    /// Whether this instance currently owns terminal modes that need restoring.
+    ///
+    /// Setup can fail after Ratatui has entered raw mode, and callers also
+    /// restore explicitly before returning. Tracking ownership makes both
+    /// paths safe without issuing duplicate terminal control sequences.
+    active: bool,
 }
 
 impl Terminal {
@@ -144,16 +152,26 @@ impl Terminal {
         // installs a panic hook that restores both, so a panic in this client
         // cannot leave the user's shell without echo or a cursor.
         let inner = ratatui::try_init()?;
+        let mut terminal = Self {
+            inner,
+            active: true,
+        };
         // Mouse capture is this client's own addition: without it the wheel
         // never arrives as an event, and a long transcript could only be
         // scrolled a page at a time. It is undone in `restore`.
-        execute!(io::stdout(), EnableMouseCapture)?;
+        if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+            terminal.restore();
+            return Err(error);
+        }
         // Bracketed paste is the other: a terminal that is not asked sends a
         // pasted block as keys, so a pasted newline would submit the first
         // line of it. Being asked, it sends one `Paste` event instead, and
         // this client inserts the whole block without sending anything.
-        execute!(io::stdout(), EnableBracketedPaste)?;
-        Ok(Self { inner })
+        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+            terminal.restore();
+            return Err(error);
+        }
+        Ok(terminal)
     }
 
     /// Paint one frame. The renderer gets the terminal's own size, so no
@@ -211,15 +229,26 @@ impl Terminal {
     pub(crate) fn hand_over<T>(&mut self, run: impl FnOnce() -> T) -> io::Result<T> {
         let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
         ratatui::try_restore()?;
+        self.active = false;
         let value = run();
         self.inner = ratatui::try_init()?;
-        execute!(io::stdout(), EnableMouseCapture)?;
-        execute!(io::stdout(), EnableBracketedPaste)?;
+        self.active = true;
+        if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+            self.restore();
+            return Err(error);
+        }
+        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+            self.restore();
+            return Err(error);
+        }
         Ok(value)
     }
 
     /// Leave the alternate screen and restore the terminal mode.
     pub(crate) fn restore(&mut self) {
+        if !self.active {
+            return;
+        }
         // Mouse capture and the paste bracket are released before the screen
         // is: `try_restore` undoes raw mode and the alternate screen but knows
         // nothing about either, and a shell left in capture mode would swallow
@@ -227,6 +256,7 @@ impl Terminal {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = execute!(io::stdout(), DisableMouseCapture);
         let _ = ratatui::try_restore();
+        self.active = false;
     }
 }
 
@@ -248,12 +278,22 @@ fn decode(key: KeyEvent) -> Option<Key> {
         // A control chord keeps its character: the shell pane forwards them as
         // their C0 bytes, and its own close chord is Ctrl-], not a letter.
         KeyCode::Char(character) if control => Some(Key::Ctrl(character.to_ascii_lowercase())),
-        // Alt chords belong to the user's terminal/shell, not to this client.
-        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::ALT) => None,
+        // An Alt chord is the navigation rail's own gesture: the composer owns
+        // the plain letters, so the destinations the rail advertises are reached
+        // with the modifier in front of them. A terminal or shell that keeps Alt
+        // for itself simply never sends one, and the rail stays reachable by
+        // pointer and by command.
+        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(Key::Alt(character.to_ascii_lowercase()))
+        }
         KeyCode::Char(character) => Some(Key::Char(character)),
         // Shift-Enter is a line break, the desktop composer's own binding: a
         // prompt can carry several lines, and Enter alone still sends.
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Key::Newline),
+        // Ctrl-Enter is the explicit submit shortcut: a multiline composer can
+        // insert newlines with Shift-Enter, and an explicit chord submits
+        // without depending on single-line mode. It never inserts a newline.
+        KeyCode::Enter if control => Some(Key::Enter),
         KeyCode::Enter => Some(Key::Enter),
         KeyCode::Backspace => Some(Key::Backspace),
         KeyCode::Delete => Some(Key::Delete),
@@ -291,6 +331,19 @@ fn decode(key: KeyEvent) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_enter_is_an_explicit_submit_chord_and_shift_enter_is_a_newline() {
+        let press = |modifiers: KeyModifiers| KeyEvent {
+            code: KeyCode::Enter,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: ratatui::crossterm::event::KeyEventState::empty(),
+        };
+        assert_eq!(decode(press(KeyModifiers::NONE)), Some(Key::Enter));
+        assert_eq!(decode(press(KeyModifiers::CONTROL)), Some(Key::Enter));
+        assert_eq!(decode(press(KeyModifiers::SHIFT)), Some(Key::Newline));
+    }
 
     #[test]
     fn a_copy_is_one_osc_sequence_around_the_encoded_text() {

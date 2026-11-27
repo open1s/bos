@@ -129,6 +129,11 @@ pub struct TurnContext {
     pub text: String,
     /// Transcript before this turn, oldest first.
     pub history: Vec<HistoryMessage>,
+    /// The stored rows the turn replays, with their tool traffic and images.
+    ///
+    /// The shared replay reads these; `history` stays the role-and-text view a
+    /// simple executor (and the echo smoke run) consumes.
+    pub transcript: Vec<crate::model::ChatMessage>,
     /// Configuration this session's turn runs with.
     pub config: SessionConfig,
     /// Gate for operator approval of a concrete action.
@@ -584,6 +589,7 @@ mod tests {
                     text: "second".into(),
                 },
             ],
+            transcript: Vec::new(),
             config: crate::runtime::contract::SessionConfig::default(),
             approvals: ApprovalHandle::detached(),
             progress: ProgressHandle::detached(),

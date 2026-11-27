@@ -16,7 +16,7 @@ use super::shell::Shell;
 use super::{DivExt, IconName, hairline_all, icon, txt};
 use crate::i18n::{Lang, tr_args};
 use crate::model::UsageSummary;
-use crate::state::{cache_hit_percent, exact_tokens, human_tokens};
+use crate::runtime::format::{cache_hit_percent, exact_tokens, human_tokens};
 use crate::theme;
 
 impl Shell {
